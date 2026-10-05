@@ -72,19 +72,23 @@ def describe(runs):
 
 
 def fetch_runs(repository, workflow, sha, token, api_url="https://api.github.com"):
-    query = urllib.parse.urlencode({"head_sha": sha, "per_page": 100})
-    url = f"{api_url}/repos/{repository}/actions/workflows/{workflow}/runs?{query}"
-    request = urllib.request.Request(
-        url,
-        headers={
+    runs = []
+    page = 1
+    while True:
+        query = urllib.parse.urlencode({"head_sha": sha, "per_page": 100, "page": page})
+        url = f"{api_url}/repos/{repository}/actions/workflows/{workflow}/runs?{query}"
+        request = urllib.request.Request(url, headers={
             "Accept": "application/vnd.github+json",
             "Authorization": f"Bearer {token}",
             "X-GitHub-Api-Version": "2022-11-28",
             "User-Agent": "temps-release-test-gate",
-        },
-    )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return json.load(response).get("workflow_runs", [])
+        })
+        with urllib.request.urlopen(request, timeout=30) as response:
+            batch = json.load(response).get("workflow_runs", [])
+        runs.extend(batch)
+        if len(batch) < 100:
+            return runs
+        page += 1
 
 
 def guidance(state, workflow, sha, ref_name):

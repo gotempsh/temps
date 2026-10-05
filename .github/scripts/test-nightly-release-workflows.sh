@@ -91,9 +91,12 @@ abort "release tarballs must get provenance and SBOM attestations before publica
 abort "public release can precede required daemon images" unless
   publish.fetch("needs").include?("runtime-image-manifest") &&
   publish.fetch("needs").include?("promote-runtime-images") && !publish.key?("if")
+%w[daemon-images build-and-push-sandbox-images build-and-push-preview-gateway].each do |name|
+  abort "#{name} publishes before tests" unless Array(release.dig("jobs", name, "needs")).include?("require-tests")
+end
 daemon_call = release.dig("jobs", "daemon-images")
 abort "daemon staging must follow ref validation without moving channel tags" unless
-  daemon_call["needs"] == "validate-release-ref" &&
+  daemon_call["needs"].sort == %w[validate-release-ref require-tests].sort &&
   daemon_call.dig("with", "revision_only") == true && !daemon_call.key?("continue-on-error")
 manifest = release.dig("jobs", "runtime-image-manifest")
 abort "manifest can precede one of the required image sets" unless

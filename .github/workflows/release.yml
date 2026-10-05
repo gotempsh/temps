@@ -58,7 +58,7 @@ permissions: {}
 
 jobs:
   daemon-images:
-    needs: validate-release-ref
+    needs: [validate-release-ref, require-tests]
     uses: ./.github/workflows/daemon-images.yml
     permissions:
       contents: read
@@ -1255,7 +1255,7 @@ jobs:
 
   build-and-push-sandbox-images:
     name: Build sandbox image (${{ matrix.runtime }})
-    needs: [validate-release-ref, prepare-sandbox-context]
+    needs: [validate-release-ref, require-tests, prepare-sandbox-context]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -1373,7 +1373,7 @@ jobs:
 
   build-and-push-preview-gateway:
     name: Build preview gateway image
-    needs: [validate-release-ref, prepare-sandbox-context]
+    needs: [validate-release-ref, require-tests, prepare-sandbox-context]
     runs-on: ubuntu-latest
     permissions:
       contents: read

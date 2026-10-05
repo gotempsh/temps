@@ -10,7 +10,7 @@ from unittest.mock import patch
 import io
 from contextlib import redirect_stderr, redirect_stdout
 
-from release_test_gate import classify, guidance, print_state, wait
+from release_test_gate import fetch_runs, classify, guidance, print_state, wait
 
 SHA = "a" * 40
 
@@ -48,6 +48,18 @@ class FakeClock:
 
     def sleep(self, seconds):
         self.now += seconds
+
+
+class FetchTests(unittest.TestCase):
+    def test_success_on_second_page_is_not_lost(self):
+        import json
+        responses = [io.BytesIO(json.dumps({"workflow_runs": [run(conclusion="failure")] * 100}).encode()),
+                     io.BytesIO(json.dumps({"workflow_runs": [run()]}).encode())]
+        with patch("urllib.request.urlopen", side_effect=responses) as fetch:
+            runs = fetch_runs("owner/repo", "rust-tests.yml", SHA, "test-token")
+        self.assertEqual(classify(runs), "success")
+        self.assertEqual(fetch.call_count, 2)
+        self.assertIn("page=2", fetch.call_args.args[0].full_url)
 
 
 class ClassifyTests(unittest.TestCase):

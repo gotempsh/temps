@@ -151,7 +151,7 @@ warn_if_stable_predates_beta() {
                grep -oE '"tag_name": *"[^"]*"' |
                sed -E 's/.*"([^"]+)"$/\1/' |
                grep -v -- '-nightly\.' |
-               head -n 1)
+               head -n 1 || true)
     if [[ -n "$beta_tag" ]] && core_version_lt "$stable_tag" "$beta_tag"; then
         warning "$stable_tag is the newest stable release, but it predates the current beta
 line (newest: $beta_tag). Temps is in beta, and most installs track the beta channel.

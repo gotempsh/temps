@@ -39,6 +39,20 @@ class ReleaseLookupTests(unittest.TestCase):
         self.assertNotIn("unexpected download", result.stderr)
         return result.stdout + result.stderr
 
+    def test_nightly_only_optional_warning_does_not_abort_stable_install(self):
+        source = INSTALLER.read_text()
+        begin = source.index("warn_if_stable_predates_beta()")
+        end = source.index("\n# Explain", begin)
+        script = "set -euo pipefail\n" + source[begin:end] + "\n" + r'''
+github_api_get() { api_status=200; api_body='[{"tag_name":"v0.1.0-nightly.20261005"}]'; }
+warning() { echo warning; }
+warn_if_stable_predates_beta v1.0.0
+echo stable-install-continues
+'''
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("stable-install-continues", result.stdout)
+
     def test_missing_stable_explains_beta_opt_in(self):
         output = self.run_lookup("404")
         self.assertIn("has not published a stable release yet", output)
