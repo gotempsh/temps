@@ -53,12 +53,16 @@ pub(crate) async fn insert_alert_rule_within_limit(
     let db_err = |source: sea_orm::DbErr| AlertRuleCreateError::Database { service_id, source };
 
     let txn = db.begin().await.map_err(db_err)?;
-    external_services::Entity::find_by_id(service_id)
+    if external_services::Entity::find_by_id(service_id)
         .lock_exclusive()
         .one(&txn)
         .await
         .map_err(db_err)?
-        .ok_or(AlertRuleCreateError::ServiceNotFound { service_id })?;
+        .is_none()
+    {
+        txn.rollback().await.map_err(db_err)?;
+        return Err(AlertRuleCreateError::ServiceNotFound { service_id });
+    }
 
     let existing = monitoring_alert_rules::Entity::find()
         .filter(monitoring_alert_rules::Column::ServiceId.eq(service_id))
@@ -66,6 +70,7 @@ pub(crate) async fn insert_alert_rule_within_limit(
         .await
         .map_err(db_err)?;
     if existing >= limit {
+        txn.rollback().await.map_err(db_err)?;
         return Err(AlertRuleCreateError::LimitReached {
             service_id,
             existing,
