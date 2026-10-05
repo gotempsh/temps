@@ -157,7 +157,7 @@ jobs:
           retention-days: 1
       - name: Set up Cosign for runtime image
         if: ${{ steps.metadata.outputs.publish == 'true' }}
-        uses: sigstore/cosign-installer@ba7bc0a3fef59531c69a25acd34668d6d3fe6f22 # v4.1.0
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Sign published runtime image digest
         if: ${{ steps.metadata.outputs.publish == 'true' }}
