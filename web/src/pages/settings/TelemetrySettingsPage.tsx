@@ -23,6 +23,7 @@ import {
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
+  cacheSavedTelemetryPreference,
   groupTelemetryEvents,
   summarizeTelemetryState,
   telemetryToggleState,
@@ -292,9 +293,9 @@ export function TelemetrySettingsPage() {
 
   const update = useMutation({
     ...updateTelemetrySettingsMutation(),
-    onSuccess: (data) => {
-      queryClient.setQueryData(getTelemetrySettingsQueryKey(), data)
-    },
+    onMutate: () =>
+      queryClient.cancelQueries({ queryKey: getTelemetrySettingsQueryKey() }),
+    onSuccess: (data) => cacheSavedTelemetryPreference(queryClient, data),
     onError: (error) => {
       toast.error(`Telemetry setting not saved: ${errorMessage(error)}`)
     },

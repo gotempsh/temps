@@ -2,7 +2,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, it } from 'bun:test'
+import { QueryClient } from '@tanstack/react-query'
+import { getTelemetrySettingsQueryKey } from '@/api/client/@tanstack/react-query.gen'
+import type { TelemetryStatusResponse } from '@/api/client/types.gen'
 import {
+  cacheSavedTelemetryPreference,
   groupTelemetryEvents,
   summarizeTelemetryState,
   telemetryToggleState,
@@ -127,4 +131,39 @@ describe('groupTelemetryEvents', () => {
   it('returns nothing for an empty catalog', () => {
     expect(groupTelemetryEvents([])).toEqual([])
   })
+})
+
+it('an older status request cannot overwrite an acknowledged saved opt-out', async () => {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  const queryKey = getTelemetrySettingsQueryKey()
+  const oldStatus: TelemetryStatusResponse = {
+    ...base,
+    env_opted_out: false,
+    events: [],
+    privacy_doc_url: 'https://temps.sh/privacy',
+  }
+  const saved: TelemetryStatusResponse = {
+    ...oldStatus,
+    enabled: false,
+    admin_preference: false,
+    source: 'admin_setting',
+  }
+  let resolve!: (status: TelemetryStatusResponse) => void
+  const request = queryClient
+    .fetchQuery({
+      queryKey,
+      queryFn: () =>
+        new Promise<TelemetryStatusResponse>((done) => {
+          resolve = done
+        }),
+    })
+    .catch(() => undefined)
+  await cacheSavedTelemetryPreference(queryClient, saved)
+  resolve(oldStatus)
+  await request
+  await Promise.resolve()
+  expect(queryClient.getQueryData<TelemetryStatusResponse>([...queryKey])).toEqual(saved)
+  queryClient.clear()
 })

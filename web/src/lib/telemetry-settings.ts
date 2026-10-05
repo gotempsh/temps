@@ -7,6 +7,18 @@ import type {
   TelemetryStatusResponse,
 } from '@/api/client/types.gen'
 import type { StatusTone } from '@temps-sdk/ds'
+import type { QueryClient } from '@tanstack/react-query'
+import { getTelemetrySettingsQueryKey } from '@/api/client/@tanstack/react-query.gen'
+
+/** Apply an acknowledged save after cancelling older status snapshots. */
+export async function cacheSavedTelemetryPreference(
+  queryClient: QueryClient,
+  status: TelemetryStatusResponse
+): Promise<void> {
+  const queryKey = getTelemetrySettingsQueryKey()
+  await queryClient.cancelQueries({ queryKey })
+  queryClient.setQueryData(queryKey, status)
+}
 
 /** Display order and wording for event categories. */
 export const TELEMETRY_CATEGORY_LABELS: Record<TelemetryEventCategory, string> =
