@@ -109,6 +109,34 @@ impl std::fmt::Debug for ClusterAuthSecrets {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum ClusterAuthError {
+    #[error("Cluster parameter '{key}' must be a non-empty alphanumeric string")]
+    InvalidParameter { key: String },
+    #[error("Both cluster infrastructure credentials must be present together")]
+    IncompleteCredentials,
+    #[error("Cluster service {service_id} not found")]
+    ServiceNotFound { service_id: i32 },
+    #[error("Failed to load cluster service {service_id}: {source}")]
+    Database {
+        service_id: i32,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+    #[error("Failed to decrypt cluster service {service_id} configuration: {source}")]
+    Decryption {
+        service_id: i32,
+        #[source]
+        source: anyhow::Error,
+    },
+    #[error("Failed to parse cluster service {service_id} configuration: {source}")]
+    Configuration {
+        service_id: i32,
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
 impl ClusterAuthSecrets {
     /// Generate a fresh pair of secrets.
     pub fn generate() -> Self {
@@ -120,23 +148,22 @@ impl ClusterAuthSecrets {
 
     /// Read the secrets from a cluster's decrypted parameters.
     ///
-    /// Returns `Ok(None)` when either key is absent (a cluster created before
+    /// Returns `Ok(None)` when both keys are absent (a cluster created before
     /// SCRAM auth), and an error when a stored value is not a non-empty
     /// alphanumeric string — which would mean the blob was edited by hand
     /// and must not be spliced into a URI or script.
     pub fn from_parameters(
         parameters: &HashMap<String, serde_json::Value>,
-    ) -> Result<Option<Self>> {
-        let read = |key: &str| -> Result<Option<String>> {
+    ) -> std::result::Result<Option<Self>, ClusterAuthError> {
+        let read = |key: &str| -> std::result::Result<Option<String>, ClusterAuthError> {
             match parameters.get(key) {
                 None | Some(serde_json::Value::Null) => Ok(None),
                 Some(serde_json::Value::String(value)) if is_valid_cluster_secret(value) => {
                     Ok(Some(value.clone()))
                 }
-                Some(_) => Err(anyhow::anyhow!(
-                    "Cluster parameter '{}' must be a non-empty alphanumeric string",
-                    key
-                )),
+                Some(_) => Err(ClusterAuthError::InvalidParameter {
+                    key: key.to_string(),
+                }),
             }
         };
         match (
@@ -147,7 +174,8 @@ impl ClusterAuthSecrets {
                 autoctl_node_password,
                 replication_password,
             })),
-            _ => Ok(None),
+            (None, None) => Ok(None),
+            _ => Err(ClusterAuthError::IncompleteCredentials),
         }
     }
 
@@ -187,40 +215,22 @@ pub async fn load_cluster_auth_secrets(
     db: &sea_orm::DatabaseConnection,
     encryption: &temps_core::EncryptionService,
     service_id: i32,
-) -> Result<Option<ClusterAuthSecrets>> {
+) -> std::result::Result<Option<ClusterAuthSecrets>, ClusterAuthError> {
     use sea_orm::EntityTrait;
-
     let service = temps_entities::external_services::Entity::find_by_id(service_id)
         .one(db)
         .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to load cluster service {} for auth: {}",
-                service_id,
-                e
-            )
-        })?
-        .ok_or_else(|| anyhow::anyhow!("Cluster service {} not found", service_id))?;
+        .map_err(|source| ClusterAuthError::Database { service_id, source })?
+        .ok_or(ClusterAuthError::ServiceNotFound { service_id })?;
     let Some(encrypted) = service.config else {
         return Ok(None);
     };
-    let decrypted = encryption.decrypt_string(&encrypted).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to decrypt config of cluster service {}: {}",
-            service_id,
-            e
-        )
-    })?;
-    let parameters: HashMap<String, serde_json::Value> =
-        serde_json::from_str(&decrypted).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to parse config of cluster service {}: {}",
-                service_id,
-                e
-            )
-        })?;
+    let decrypted = encryption
+        .decrypt_string(&encrypted)
+        .map_err(|source| ClusterAuthError::Decryption { service_id, source })?;
+    let parameters: HashMap<String, serde_json::Value> = serde_json::from_str(&decrypted)
+        .map_err(|source| ClusterAuthError::Configuration { service_id, source })?;
     ClusterAuthSecrets::from_parameters(&parameters)
-        .map_err(|e| anyhow::anyhow!("Cluster service {}: {}", service_id, e))
 }
 
 /// libpq connection string the control plane uses to read the monitor
@@ -1184,9 +1194,12 @@ mod tests {
             ClusterAuthSecrets::from_parameters(&params).unwrap(),
             Some(auth.clone())
         );
-        // Only one of the two keys: treated as not provisioned yet.
+        // A partial credential pair must not rotate an existing password.
         params.remove(REPLICATION_PASSWORD_PARAM);
-        assert_eq!(ClusterAuthSecrets::from_parameters(&params).unwrap(), None);
+        assert!(matches!(
+            ClusterAuthSecrets::from_parameters(&params),
+            Err(ClusterAuthError::IncompleteCredentials)
+        ));
     }
 
     #[test]
