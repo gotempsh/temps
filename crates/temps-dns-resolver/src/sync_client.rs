@@ -105,12 +105,24 @@ impl SyncClient {
             // plane verified by its reserved name rather than the URL's host
             // (its mesh address): the cluster CA also signs every worker's
             // leaf for its own addresses.
-            let tls = temps_core::node_pki::control_plane_client_config(pem).map_err(|e| {
-                ResolverError::Internal(format!(
-                    "control-plane CA for node {} DNS sync: {e}",
-                    config.node_id
-                ))
-            })?;
+            let pinned = config.control_plane_legacy_cert_pem.as_ref().and_then(|pin| {
+                match temps_core::node_pki::control_plane_client_config_with_legacy_pin(pem, pin) {
+                    Ok(tls) => Some(tls),
+                    Err(error) => {
+                        warn!(node_id = config.node_id, %error, "legacy DNS pin is unusable; retaining strict cluster-CA verification");
+                        None
+                    }
+                }
+            });
+            let tls = pinned
+                .map(Ok)
+                .unwrap_or_else(|| temps_core::node_pki::control_plane_client_config(pem))
+                .map_err(|e| {
+                    ResolverError::Internal(format!(
+                        "control-plane CA for node {} DNS sync: {e}",
+                        config.node_id
+                    ))
+                })?;
             builder = builder.use_preconfigured_tls(tls);
         }
         let http = builder
@@ -312,6 +324,7 @@ mod tests {
             upstream_resolvers: vec![],
             disable_sync: false,
             control_plane_ca_pem: None,
+            control_plane_legacy_cert_pem: None,
         }
     }
 

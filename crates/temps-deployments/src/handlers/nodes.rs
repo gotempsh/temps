@@ -1100,6 +1100,25 @@ async fn release_token_use(app_state: &NodeAppState, token_id: i32) {
     }
 }
 
+async fn claim_token_use(
+    app_state: &NodeAppState,
+    token: &str,
+    token_id: Option<i32>,
+) -> Result<(), Problem> {
+    if token_id.is_some() {
+        app_state
+            .enrollment_token_service
+            .validate_and_consume(token)
+            .await
+            .map_err(|error| {
+                problemdetails::new(StatusCode::FORBIDDEN)
+                    .with_title("Enrollment Token Not Usable")
+                    .with_detail(error.to_string())
+            })?;
+    }
+    Ok(())
+}
+
 /// Why a paired node could not complete its registration, and what to do.
 fn pairing_problem(error: &temps_network::mesh::MeshError) -> Problem {
     use temps_network::mesh::MeshError;
@@ -1397,30 +1416,26 @@ async fn register_node_inner(
                         .with_title("Invalid CSR")
                         .with_detail(format!("Failed to sign certificate signing request: {}", e))
                 })?;
-        // Validate the CSR first; reserve the signed addresses before the
-        // certificate can leave this request, even if the node is later deleted.
-        app_state
+        // Claim the token after CSR validation but before reserving addresses.
+        // A losing concurrent claim must never create certificate history.
+        claim_token_use(&app_state, provided_token, enrollment_token_id).await?;
+        if let Err(error) = app_state
             .node_service
             .reserve_certificate_addresses(&ca.cert_pem, &allowed_sans, request.name.trim())
             .await
-            .map_err(Problem::from)?;
+        {
+            if let Some(token_id) = enrollment_token_id {
+                release_token_use(&app_state, token_id).await;
+            }
+            return Err(Problem::from(error));
+        }
         (Some(signed.cert_pem), Some(ca.cert_pem))
     } else {
         (None, None)
     };
 
-    // All fallible input and certificate work precedes the atomic token claim.
-    // A reservation conflict must leave a single-use token available to retry.
-    if enrollment_token_id.is_some() {
-        app_state
-            .enrollment_token_service
-            .validate_and_consume(provided_token)
-            .await
-            .map_err(|error| {
-                problemdetails::new(StatusCode::FORBIDDEN)
-                    .with_title("Enrollment Token Not Usable")
-                    .with_detail(error.to_string())
-            })?;
+    if request.csr_pem.is_none() {
+        claim_token_use(&app_state, provided_token, enrollment_token_id).await?;
     }
 
     let register_request = RegisterNodeRequest {
@@ -4342,7 +4357,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn certificate_reservation_failure_does_not_consume_enrollment_token() {
+    async fn certificate_reservation_failure_restores_enrollment_token() {
         let ca = temps_core::node_pki::generate_cluster_ca().unwrap();
         let encryption = Arc::new(
             temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap(),
@@ -4366,6 +4381,15 @@ mod tests {
         let enrollment_db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results(vec![vec![pairing_token(41, "edge-1")]])
+                .append_query_results(vec![vec![pairing_token(41, "edge-1")]])
+                .append_query_results(vec![vec![pairing_token(41, "edge-1")]])
+                .append_exec_results(vec![
+                    sea_orm::MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1
+                    };
+                    2
+                ])
                 .into_connection(),
         );
         let app = make_app_with_enrollment(
@@ -4394,9 +4418,61 @@ mod tests {
             .into_transaction_log();
         assert!(!log.is_empty());
         assert!(
-            log.iter().all(|sql| !format!("{sql:?}").contains("UPDATE")),
+            log.iter()
+                .any(|sql| format!("{sql:?}").contains("used_count = used_count - 1")),
             "{log:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_losing_token_claim_never_reserves_certificate_addresses() {
+        let ca = temps_core::node_pki::generate_cluster_ca().unwrap();
+        let encryption = Arc::new(
+            temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap(),
+        );
+        let mut settings = settings_with_join_token();
+        settings.multi_node.cluster_ca_cert_pem = Some(ca.cert_pem);
+        settings.multi_node.cluster_ca_key_encrypted =
+            Some(encryption.encrypt(ca.key_pem.as_bytes()).unwrap());
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![Vec::<temps_entities::node_pairings::Model>::new()])
+                .into_connection(),
+        );
+        let enrollment_db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![pairing_token(41, "edge-1")]])
+                .append_query_results(vec![vec![pairing_token(41, "edge-1")]])
+                .append_exec_results(vec![sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 0,
+                }])
+                .into_connection(),
+        );
+        let app = make_app_with_enrollment(
+            db.clone(),
+            config_service_with(settings),
+            encryption,
+            enrollment_db,
+        );
+        let csr = temps_core::node_pki::generate_node_keypair_csr("edge-1", &["10.100.0.2".into()])
+            .unwrap();
+        let mut body = register_body("edge-1", "10.100.0.2");
+        body["join_token"] = serde_json::json!("pairing-join-token");
+        body["csr_pem"] = serde_json::json!(csr.csr_pem);
+        let response = post_register(app, &body).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            problem_of(response).await["title"],
+            "Enrollment Token Not Usable"
+        );
+        let log = Arc::try_unwrap(db).unwrap().into_transaction_log();
+        assert_eq!(
+            log.len(),
+            1,
+            "only the source check may reach the node DB: {log:?}"
+        );
+        assert!(!format!("{log:?}").contains("cluster_certificate_addresses"));
     }
 
     #[tokio::test]

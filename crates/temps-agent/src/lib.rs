@@ -122,7 +122,7 @@ pub enum ControlPlaneTrust {
 /// worker can hold one for the reserved name.
 #[derive(Clone)]
 pub struct ControlPlaneCa {
-    tls: rustls::ClientConfig,
+    tls: Option<rustls::ClientConfig>,
 }
 
 impl std::fmt::Debug for ControlPlaneCa {
@@ -140,14 +140,16 @@ impl ControlPlaneCa {
     /// The cluster CA certificate(s) in `pem`.
     pub fn from_pem(pem: &[u8]) -> Result<Self, temps_core::node_pki::PkiError> {
         Ok(Self {
-            tls: temps_core::node_pki::control_plane_client_config(pem)?,
+            tls: Some(temps_core::node_pki::control_plane_client_config(pem)?),
         })
     }
 
     /// The cluster CA certificate in `der`.
     pub fn from_der(der: &[u8]) -> Result<Self, temps_core::node_pki::PkiError> {
         Ok(Self {
-            tls: temps_core::node_pki::control_plane_client_config_from_der(der)?,
+            tls: Some(temps_core::node_pki::control_plane_client_config_from_der(
+                der,
+            )?),
         })
     }
 }
@@ -164,36 +166,33 @@ pub fn control_plane_ca(config: &AgentConfig) -> Option<ControlPlaneCa> {
         return None;
     }
     let Some(path) = config.cluster_ca_path.as_ref() else {
-        tracing::warn!(
-            node = %config.node_name,
-            "agent.json pins the control plane to the cluster CA but names no cluster_ca_path; \
-             control-plane calls trust only public roots until `temps join` is run again"
-        );
-        return None;
+        tracing::warn!(node = %config.node_name, "cluster-CA trust requires cluster_ca_path; control-plane TLS connections are refused");
+        return Some(ControlPlaneCa { tls: None });
     };
-    match std::fs::read(path)
+    let result = std::fs::read(path)
         .map_err(|error| error.to_string())
-        .and_then(|pem| match config.control_plane_legacy_cert_path.as_ref() {
-            Some(pin_path) => {
-                let pin = std::fs::read(pin_path).map_err(|error| {
-                    format!("cannot read legacy pin {}: {error}", pin_path.display())
-                })?;
-                temps_core::node_pki::control_plane_client_config_with_legacy_pin(&pem, &pin)
-                    .map(|tls| ControlPlaneCa { tls })
+        .and_then(|pem| {
+            if let Some(pin_path) = config.control_plane_legacy_cert_path.as_ref() {
+                let pinned = std::fs::read(pin_path)
                     .map_err(|error| error.to_string())
+                    .and_then(|pin| temps_core::node_pki::control_plane_client_config_with_legacy_pin(&pem, &pin)
+                        .map_err(|error| error.to_string()));
+                match pinned {
+                    Ok(tls) => return Ok(ControlPlaneCa { tls: Some(tls) }),
+                    Err(error) => tracing::warn!(path = %pin_path.display(), %error,
+                        "legacy pin is unusable; retaining strict cluster-CA reserved-name verification"),
+                }
             }
-            None => ControlPlaneCa::from_pem(&pem).map_err(|error| error.to_string()),
-        }) {
-        Ok(ca) => Some(ca),
+            ControlPlaneCa::from_pem(&pem).map_err(|error| error.to_string())
+        });
+    Some(match result {
+        Ok(ca) => ca,
         Err(error) => {
-            tracing::warn!(
-                path = %path.display(),
-                %error,
-                "the cluster CA or legacy pin is unusable; control-plane calls trust only public roots"
-            );
-            None
+            tracing::warn!(path = %path.display(), %error,
+                "cluster CA is unusable; control-plane TLS connections are refused");
+            ControlPlaneCa { tls: None }
         }
-    }
+    })
 }
 
 /// A client builder for calls to the control plane: see [`control_plane_ca`].
@@ -209,7 +208,8 @@ pub fn with_control_plane_trust(
     cluster_ca: Option<ControlPlaneCa>,
 ) -> reqwest::ClientBuilder {
     match cluster_ca {
-        Some(ca) => builder.use_preconfigured_tls(ca.tls),
+        Some(ControlPlaneCa { tls: Some(tls) }) => builder.use_preconfigured_tls(tls),
+        Some(ControlPlaneCa { tls: None }) => builder.tls_built_in_root_certs(false),
         None => builder,
     }
 }
@@ -1073,11 +1073,9 @@ mod tests {
                     };
                     let mut request = [0u8; 4096];
                     let _ = tls.read(&mut request).await;
-                    let _ = tls
-                        .write_all(
-                            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
-                        )
-                        .await;
+                    let body = r#"{"generation":0,"full_snapshot":false,"records":[]}"#;
+                    let response = format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+                    let _ = tls.write_all(response.as_bytes()).await;
                     let _ = tls.shutdown().await;
                 });
             }
@@ -1141,6 +1139,26 @@ mod tests {
             .unwrap()
             .status()
             .is_success());
+        let mut dns = temps_dns_resolver::ResolverConfig::new(
+            1,
+            "token".into(),
+            legacy_url.clone(),
+            "127.0.0.1".parse().unwrap(),
+            dir.path().join("dns"),
+        );
+        crate::network_sync::apply_dns_control_plane_trust(&config, &mut dns).await;
+        let sync = temps_dns_resolver::SyncClient::new(
+            dns,
+            std::sync::Arc::new(temps_dns_resolver::ZoneStore::new(
+                dir.path().join("zone.json"),
+            )),
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            std::sync::Arc::new(std::sync::RwLock::new(
+                temps_dns_resolver::SyncStatus::default(),
+            )),
+        )
+        .unwrap();
+        sync.tick_once().await.unwrap();
         let worker_url = https_server(&ca, &["127.0.0.1".into()]).await;
         assert!(client.get(worker_url).send().await.is_err());
         let new_url = https_server(
@@ -1157,11 +1175,72 @@ mod tests {
             .is_success());
     }
 
+    #[tokio::test]
+    async fn unusable_legacy_pins_keep_cluster_trust_for_http_and_dns() {
+        let (mut config, dir) = config_with_cluster_ca(ControlPlaneTrust::ClusterCa);
+        let ca = temps_core::node_pki::generate_cluster_ca().unwrap();
+        std::fs::write(config.cluster_ca_path.as_ref().unwrap(), &ca.cert_pem).unwrap();
+        let url = https_server(
+            &ca,
+            &temps_core::node_pki::control_plane_node_api_sans("127.0.0.1".parse().unwrap()),
+        )
+        .await;
+        config.control_plane_url = url.clone();
+        let pin_path = dir.path().join("missing-legacy.pem");
+        config.control_plane_legacy_cert_path = Some(pin_path.clone());
+        for malformed in [false, true] {
+            if malformed {
+                std::fs::write(&pin_path, "not a certificate").unwrap();
+            }
+            let trust = control_plane_ca(&config).unwrap();
+            assert!(trust.tls.is_some());
+            assert!(control_plane_client_builder(&config)
+                .build()
+                .unwrap()
+                .get(&url)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .is_success());
+            let mut dns = temps_dns_resolver::ResolverConfig::new(
+                1,
+                "token".into(),
+                url.clone(),
+                "127.0.0.1".parse().unwrap(),
+                dir.path().join("dns"),
+            );
+            crate::network_sync::apply_dns_control_plane_trust(&config, &mut dns).await;
+            let sync = temps_dns_resolver::SyncClient::new(
+                dns,
+                std::sync::Arc::new(temps_dns_resolver::ZoneStore::new(
+                    dir.path().join("zone.json"),
+                )),
+                std::sync::Arc::new(tokio::sync::Notify::new()),
+                std::sync::Arc::new(std::sync::RwLock::new(
+                    temps_dns_resolver::SyncStatus::default(),
+                )),
+            )
+            .unwrap();
+            sync.tick_once().await.unwrap();
+        }
+        // An unreadable CA also stays fail-closed instead of choosing public roots.
+        config.cluster_ca_path = Some(dir.path().join("missing-ca.pem"));
+        assert!(control_plane_ca(&config).unwrap().tls.is_none());
+        assert!(control_plane_client_builder(&config)
+            .build()
+            .unwrap()
+            .get(url)
+            .send()
+            .await
+            .is_err());
+    }
+
     #[test]
-    fn a_pinned_node_without_a_cluster_ca_path_gets_no_extra_root() {
+    fn a_pinned_node_without_a_cluster_ca_path_refuses_all_roots() {
         let mut config = config_with_dns_data_dir("/var/lib/temps/dns");
         config.control_plane_trust = Some(ControlPlaneTrust::ClusterCa);
-        assert!(control_plane_ca(&config).is_none());
+        assert!(control_plane_ca(&config).unwrap().tls.is_none());
     }
 
     #[test]

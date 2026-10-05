@@ -1671,6 +1671,32 @@ async fn sweep_overlay_container_routes(
 /// the agent's next heartbeat, closing the "silently fails, operator has to
 /// SSH in and read logs" gap this reconciliation loop was already built to
 /// self-heal but not to report.
+pub(crate) async fn apply_dns_control_plane_trust(
+    config: &AgentConfig,
+    dns_cfg: &mut DnsResolverConfig,
+) {
+    // Same rule as every other control-plane call: the cluster CA only for a
+    // node whose join pinned it (see `crate::control_plane_ca`).
+    dns_cfg.control_plane_ca_pem = match (
+        config.effective_control_plane_trust(),
+        config.cluster_ca_path.as_ref(),
+    ) {
+        (crate::ControlPlaneTrust::ClusterCa, path) => {
+            // Keep cluster trust fail-closed even when its configured CA cannot
+            // be read: an empty PEM makes resolver startup report the error.
+            Some(match path {
+                Some(path) => tokio::fs::read(path).await.unwrap_or_default(),
+                None => Vec::new(),
+            })
+        }
+        _ => None,
+    };
+    dns_cfg.control_plane_legacy_cert_pem = match config.control_plane_legacy_cert_path.as_ref() {
+        Some(path) => tokio::fs::read(path).await.ok(),
+        None => None,
+    };
+}
+
 async fn reconcile_resolver(
     cluster_dns_enabled: bool,
     bridge_address: IpAddr,
@@ -1720,15 +1746,7 @@ async fn reconcile_resolver(
         bridge_address,
         config.dns_data_dir.clone(),
     );
-    // Same rule as every other control-plane call: the cluster CA only for a
-    // node whose join pinned it (see `crate::control_plane_ca`).
-    dns_cfg.control_plane_ca_pem = match (
-        config.effective_control_plane_trust(),
-        config.cluster_ca_path.as_ref(),
-    ) {
-        (crate::ControlPlaneTrust::ClusterCa, Some(path)) => tokio::fs::read(path).await.ok(),
-        _ => None,
-    };
+    apply_dns_control_plane_trust(config, &mut dns_cfg).await;
     let snapshot_path = dns_cfg.snapshot_path();
     let mut start_error = None;
     match DnsResolverHandle::start(dns_cfg).await {
