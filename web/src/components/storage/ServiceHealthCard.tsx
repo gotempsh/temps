@@ -38,6 +38,17 @@ function statusLabel(status?: HealthStatus | null): string {
 }
 
 /**
+ * Toast for a manual check. No status means the service is not expected to
+ * answer yet (still starting, or stopped), which is not a failure.
+ */
+function manualCheckMessage(status?: HealthStatus | null): string {
+  if (!status) return 'No result yet: the service is not running'
+  if (status === 'operational') return 'Service is operational'
+  if (status === 'degraded') return 'Service is degraded'
+  return 'Service is down'
+}
+
+/**
  * Inline green/amber/red dot + label. Drops into the header next to the
  * "Running" pill on ServiceDetail.
  */
@@ -100,13 +111,7 @@ export function ServiceHealthCard({ serviceId }: { serviceId: number }) {
     onSuccess: (snapshot) => {
       queryClient.setQueryData(['service-health', serviceId], snapshot)
       queryClient.invalidateQueries({ queryKey: ['service-health-batch'] })
-      toast.success(
-        snapshot.status === 'operational'
-          ? 'Service is operational'
-          : snapshot.status === 'degraded'
-            ? 'Service is degraded'
-            : 'Service is down'
-      )
+      toast.success(manualCheckMessage(snapshot.status))
     },
     onError: (err: Error) => {
       toast.error('Health check failed', { description: err.message })

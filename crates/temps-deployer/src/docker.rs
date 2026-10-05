@@ -1045,6 +1045,55 @@ fn clamp_build_memory(requested_bytes: i64) -> (i32, bool) {
     }
 }
 
+/// Explain why a per-build memory cap was lowered before it was sent.
+///
+/// `requested_bytes` is what Settings > Build Limits (or, when no memory cap
+/// is set there, the half-of-host-RAM default) asked for; `sent_bytes` is
+/// the value actually sent. The message names both, where the requested value
+/// came from, and what the builder does with the sent value, so it never reads
+/// as if the larger number were still being requested.
+fn describe_clamped_build_memory(
+    image_name: &str,
+    requested_bytes: i64,
+    sent_bytes: i32,
+    from_settings: bool,
+    use_buildkit: bool,
+) -> String {
+    let requested_mb = requested_bytes / (1024 * 1024);
+    let sent_mb = i64::from(sent_bytes) / (1024 * 1024);
+    let source = if from_settings {
+        "set in Settings > Build Limits"
+    } else {
+        "the default of half this host's RAM, since Settings > Build Limits sets no memory cap"
+    };
+    let effect = if use_buildkit {
+        "BuildKit ignores this value, so the build is not memory-capped".to_string()
+    } else {
+        format!(
+            "the build is capped at {sent_mb} MB. To choose the cap explicitly, set a memory \
+             cap of at most {sent_mb} MB in Settings > Build Limits"
+        )
+    };
+    format!(
+        "Build {image_name}: the per-build memory cap of {requested_mb} MB ({source}) is larger \
+         than the {sent_mb} MB maximum the Docker build API client can send, so {sent_mb} MB \
+         was sent instead; {effect}."
+    )
+}
+
+/// The one-line build log summary of the memory cap sent with a build.
+fn describe_build_memory_request(image_name: &str, sent_bytes: i32, use_buildkit: bool) -> String {
+    let sent_mb = i64::from(sent_bytes) / (1024 * 1024);
+    if use_buildkit {
+        format!(
+            "Build {image_name}: sending a per-build memory cap of {sent_mb} MB; this host builds \
+             with BuildKit, which does not enforce it"
+        )
+    } else {
+        format!("Build {image_name}: per-build memory cap of {sent_mb} MB")
+    }
+}
+
 /// Whether a `DOCKER_HOST` value points at the daemon on this machine.
 /// Unset means the default local socket, as it does for bollard.
 fn docker_host_is_local(docker_host: Option<&str>) -> bool {
@@ -2192,18 +2241,26 @@ impl DockerRuntime {
     }
 
     /// The `memory` value to put on `BuildImageOptions` for a requested cap.
-    /// Warns when the request had to be reduced to what the API accepts.
+    ///
+    /// Logs the reduction when the request had to be lowered to what the API
+    /// accepts: as a warning on the legacy builder, which enforces the value,
+    /// and only at debug level on BuildKit, which ignores it (the build runs
+    /// uncapped either way, so a warning there would be noise on every build).
     fn effective_build_memory(&self, requested_bytes: i64, image_name: &str) -> i32 {
         let (memory, clamped) = clamp_build_memory(requested_bytes);
         if clamped {
-            warn!(
-                "Build {}: per-build memory cap of {} MB exceeds the {} MB the Docker build API \
-                 accepts through this client; requesting {} MB instead",
+            let message = describe_clamped_build_memory(
                 image_name,
-                requested_bytes / (1024 * 1024),
-                MAX_REQUESTABLE_BUILD_MEMORY_BYTES / (1024 * 1024),
-                i64::from(memory) / (1024 * 1024)
+                requested_bytes,
+                memory,
+                self.build_resource_override.is_some(),
+                self.use_buildkit,
             );
+            if self.use_buildkit {
+                debug!("{}", message);
+            } else {
+                warn!("{}", message);
+            }
         }
         memory
     }
@@ -2649,14 +2706,8 @@ impl ImageBuilder for DockerRuntime {
         let (memory_bytes, cpu_quota_us, cpu_period_us) = self.resolve_build_resource_caps();
         let memory_i32 = self.effective_build_memory(memory_bytes, &request.image_name);
         info!(
-            "Build {}: requesting a per-build memory cap of {} MB from the daemon{}",
-            request.image_name,
-            i64::from(memory_i32) / (1024 * 1024),
-            if self.use_buildkit {
-                ", which BuildKit does not enforce"
-            } else {
-                ""
-            }
+            "{}",
+            describe_build_memory_request(&request.image_name, memory_i32, self.use_buildkit)
         );
 
         let mut labels = HashMap::new();
@@ -2863,14 +2914,8 @@ impl ImageBuilder for DockerRuntime {
         let (memory_bytes, cpu_quota_us, cpu_period_us) = self.resolve_build_resource_caps();
         let memory_i32 = self.effective_build_memory(memory_bytes, &request.image_name);
         info!(
-            "Build {}: requesting a per-build memory cap of {} MB from the daemon{}",
-            request.image_name,
-            i64::from(memory_i32) / (1024 * 1024),
-            if self.use_buildkit {
-                ", which BuildKit does not enforce"
-            } else {
-                ""
-            }
+            "{}",
+            describe_build_memory_request(&request.image_name, memory_i32, self.use_buildkit)
         );
 
         let mut labels = HashMap::new();
@@ -6773,6 +6818,49 @@ CMD ["cat", "/hello.txt"]
         assert_eq!(clamp_build_memory(i32::MAX as i64), (i32::MAX, false));
         assert_eq!(clamp_build_memory(8 * 1024 * 1024 * 1024), (i32::MAX, true));
         assert_eq!(clamp_build_memory(-1), (0, false));
+    }
+
+    #[test]
+    fn clamped_build_memory_message_names_the_sent_value_not_the_requested_one() {
+        let requested = 262_144_i64 * 1024 * 1024;
+        let (sent, clamped) = clamp_build_memory(requested);
+        assert!(clamped);
+
+        let legacy = describe_clamped_build_memory("app:1", requested, sent, false, false);
+        assert!(legacy.contains("cap of 262144 MB"), "{legacy}");
+        assert!(legacy.contains("half this host's RAM"), "{legacy}");
+        assert!(legacy.contains("so 2047 MB was sent instead"), "{legacy}");
+        assert!(
+            legacy.contains("the build is capped at 2047 MB"),
+            "{legacy}"
+        );
+        // The old wording ended "requesting <requested> MB instead", which
+        // contradicted the reduction it was reporting.
+        assert!(!legacy.contains("requesting 262144 MB"), "{legacy}");
+
+        let configured = describe_clamped_build_memory("app:1", requested, sent, true, false);
+        assert!(
+            configured.contains("set in Settings > Build Limits"),
+            "{configured}"
+        );
+
+        let buildkit = describe_clamped_build_memory("app:1", requested, sent, false, true);
+        assert!(
+            buildkit.contains("BuildKit ignores this value, so the build is not memory-capped"),
+            "{buildkit}"
+        );
+        assert!(!buildkit.contains("capped at 2047 MB"), "{buildkit}");
+    }
+
+    #[test]
+    fn build_memory_request_summary_says_whether_the_cap_is_enforced() {
+        let sent = i32::MAX;
+        assert_eq!(
+            describe_build_memory_request("app:1", sent, false),
+            "Build app:1: per-build memory cap of 2047 MB"
+        );
+        assert!(describe_build_memory_request("app:1", sent, true)
+            .ends_with("BuildKit, which does not enforce it"));
     }
 
     #[test]

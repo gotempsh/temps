@@ -519,6 +519,16 @@ async fn collect_metrics(
             MetricKind::Gauge,
             HashMap::new(),
         ));
+        // Lifetime block accesses behind the ratio. A new server's first
+        // reads all miss the cache, so alert rules on the ratio are only
+        // evaluated once this is large enough to mean something. A gauge (not
+        // a `_total` counter) because the evaluator needs the absolute volume.
+        points.push(make_point(
+            "pg.cache_blocks_accessed",
+            total_blks as f64,
+            MetricKind::Gauge,
+            HashMap::new(),
+        ));
         points.push(make_point(
             "pg.tuple_fetch_ratio",
             instance_fetch_ratio,

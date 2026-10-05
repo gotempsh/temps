@@ -462,7 +462,7 @@ async fn complete_oidc_login(
     if user.mfa_enabled {
         let mfa_token = state
             .auth_service
-            .create_mfa_session(user.id, "oidc")
+            .create_mfa_session(user.id, &format!("oidc:{}", provider.id))
             .await
             .map_err(|e| OidcError::DiscoveryFailed {
                 issuer: provider.issuer_url.clone(),
@@ -543,7 +543,7 @@ async fn complete_oidc_login(
 
     let session_token = state
         .auth_service
-        .create_session(user.id)
+        .create_oidc_session(user.id, provider.id)
         .await
         .map_err(|e| OidcError::DiscoveryFailed {
             issuer: provider.issuer_url.clone(),

@@ -183,6 +183,7 @@ async fn run_async(args: CloudTelemetryBackfillArgs) -> anyhow::Result<()> {
     }
     let stateless = persisted_mode.is_stateless();
     if !stateless {
+        temps_database::ensure_no_unprotected_upgrade(db.as_ref()).await?;
         temps_database::run_migrations(db.as_ref()).await?;
     }
     let link = load_cloud_link(&data_dir, db.clone(), &args.database_url, stateless).await?;

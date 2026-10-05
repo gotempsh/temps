@@ -109,49 +109,123 @@ export function peakOf(
 
 // ── Disk projection ────────────────────────────────────────────────────
 
-export type DiskProjection = {
-  /** Bytes per day from a least-squares line through the window; ≤ 0 means "not growing". */
-  bytesPerDay: number
-  /** Days from the last sample until the critical line is reached. */
-  daysToLine: number
-  /** Days from the last sample until the disk is full. */
-  daysToFull: number
-}
+/** Fewest samples a projection is fitted through. */
+export const MIN_PROJECTION_SAMPLES = 6
+/**
+ * Shortest stretch of history a projection is extrapolated from. Disk usage
+ * moves in bursts — an image pull, a build cache, a log rotation — so a few
+ * minutes of samples turn one 2 GB pull into "growing 1 TB/day". Six hours
+ * averages over several such bursts.
+ */
+export const MIN_PROJECTION_SPAN_MS = 6 * 3_600_000
+/**
+ * How well the line must explain the samples (R²) before its slope is
+ * reported as growth. Below this, usage is going up and down, not filling.
+ */
+export const MIN_PROJECTION_FIT = 0.5
+
+export type DiskProjection =
+  /** Too little history to extrapolate from. */
+  | {
+      kind: 'insufficient'
+      samples: number
+      /** Milliseconds between the first and last sample. */
+      spanMs: number
+    }
+  /** Flat, shrinking, or fluctuating without a trend. */
+  | { kind: 'steady'; spanMs: number }
+  /**
+   * The fitted rate is implausible for this disk (it would fill the whole
+   * volume from empty in under a day) — almost always a burst, not a trend.
+   */
+  | { kind: 'unreliable'; spanMs: number; bytesPerDay: number }
+  | {
+      kind: 'growing'
+      spanMs: number
+      /** Bytes per day from a least-squares line through the window. */
+      bytesPerDay: number
+      /** Days from the last sample until the critical line is reached. */
+      daysToLine: number
+      /** Days from the last sample until the disk is full. */
+      daysToFull: number
+    }
 
 /**
- * Fit a line through the disk-used samples of the window and say when it
- * reaches the critical line and when it fills. Needs three samples and a
- * total; `daysTo*` are `Infinity` when usage is flat or shrinking.
+ * Fit a line through the disk-used samples and say when it reaches the
+ * critical line and when it fills — but only when the history can support
+ * it: at least {@link MIN_PROJECTION_SAMPLES} samples spanning
+ * {@link MIN_PROJECTION_SPAN_MS}, a line that explains the samples, and a
+ * rate the disk could physically sustain. Returns `null` without a total.
  */
 export function projectDisk(
   points: MetricDataPoint[] | undefined,
   totalBytes: number | null | undefined,
   criticalPercent = DISK_THRESHOLDS.poor
 ): DiskProjection | null {
-  if (!points || points.length < 3 || !totalBytes || totalBytes <= 0)
-    return null
-  const xs = points.map((p) => Date.parse(p.time))
-  const ys = points.map((p) => p.value)
+  if (!totalBytes || !(totalBytes > 0)) return null
+  const samples = (points ?? []).filter(
+    (p) => Number.isFinite(p.value) && !Number.isNaN(Date.parse(p.time))
+  )
+  const xs = samples.map((p) => Date.parse(p.time))
+  const ys = samples.map((p) => p.value)
   const n = xs.length
+  const spanMs = n > 1 ? Math.max(...xs) - Math.min(...xs) : 0
+  if (n < MIN_PROJECTION_SAMPLES || spanMs < MIN_PROJECTION_SPAN_MS) {
+    return { kind: 'insufficient', samples: n, spanMs }
+  }
+
   const x0 = xs[0]
   const mx = xs.reduce((a, x) => a + (x - x0), 0) / n
   const my = ys.reduce((a, y) => a + y, 0) / n
   let sxx = 0
   let sxy = 0
+  let syy = 0
   for (let i = 0; i < n; i++) {
     const dx = xs[i] - x0 - mx
+    const dy = ys[i] - my
     sxx += dx * dx
-    sxy += dx * (ys[i] - my)
+    sxy += dx * dy
+    syy += dy * dy
   }
-  if (sxx === 0) return null
+  if (sxx === 0) return { kind: 'insufficient', samples: n, spanMs }
   const bytesPerDay = (sxy / sxx) * 86_400_000
+  // Coefficient of determination. A perfectly flat series (syy = 0) has no
+  // trend to explain and is steady by definition.
+  const fit = syy === 0 ? 0 : (sxy * sxy) / (sxx * syy)
+  if (bytesPerDay <= 0 || fit < MIN_PROJECTION_FIT) {
+    return { kind: 'steady', spanMs }
+  }
+  if (bytesPerDay > totalBytes) {
+    return { kind: 'unreliable', spanMs, bytesPerDay }
+  }
+
   const last = ys[n - 1]
-  const daysTo = (target: number) =>
-    bytesPerDay <= 0 ? Infinity : Math.max(0, (target - last) / bytesPerDay)
+  const daysTo = (target: number) => Math.max(0, (target - last) / bytesPerDay)
   return {
+    kind: 'growing',
+    spanMs,
     bytesPerDay,
     daysToLine: daysTo(totalBytes * (criticalPercent / 100)),
     daysToFull: daysTo(totalBytes),
+  }
+}
+
+/** The disk card's caption: free space plus what the projection supports. */
+export function diskProjectionCaption(
+  freeBytes: number,
+  projection: DiskProjection | null
+): string {
+  const free = `${formatBytesDecimal(freeBytes)} free`
+  if (!projection) return free
+  switch (projection.kind) {
+    case 'insufficient':
+      return `${free} · collecting history to project growth (needs ${MIN_PROJECTION_SPAN_MS / 3_600_000} h)`
+    case 'steady':
+      return `${free} · no steady growth over the last ${formatAge(projection.spanMs / 1000)}`
+    case 'unreliable':
+      return `${free} · usage jumped recently; too irregular to project`
+    case 'growing':
+      return `${free} · growing ${formatBytesDecimal(projection.bytesPerDay)}/day over the last ${formatAge(projection.spanMs / 1000)}, full in ${formatDays(projection.daysToFull)}`
   }
 }
 

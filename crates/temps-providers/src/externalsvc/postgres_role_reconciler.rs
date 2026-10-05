@@ -8,7 +8,8 @@
 //!
 //! 1. Looks up the cluster's monitor in `service_members` by
 //!    `(service_id, role='monitor')`.
-//! 2. Connects to the monitor as `autoctl_node` (trust auth, no password).
+//! 2. Connects to the monitor as `autoctl_node` (SCRAM, with the cluster's
+//!    generated password; clusters not yet upgraded still accept no password).
 //! 3. Queries `pgautofailover.node` to discover the current primary,
 //!    secondaries, and their reported states.
 //! 4. Writes a single batch of [`EndpointDraft`]s for `owner_kind = service_role`
@@ -169,6 +170,9 @@ pub enum ReconcilerError {
     #[error("Monitor query failed for service {service_id}: {reason}")]
     MonitorQuery { service_id: i32, reason: String },
 
+    #[error("Failed to load monitor credentials for cluster service {service_id}: {reason}")]
+    ClusterAuth { service_id: i32, reason: String },
+
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
 
@@ -279,6 +283,7 @@ fn lookup_ip(
 /// [`run`].
 pub async fn reconcile_once(
     db: &DatabaseConnection,
+    encryption: &temps_core::EncryptionService,
     registry: &DnsRegistry,
     service_id: i32,
     service_name: &str,
@@ -359,10 +364,19 @@ pub async fn reconcile_once(
     }
 
     // ---- 2. Query monitor ----
-    let monitor_nodes = match query_monitor(service_id, &monitor_host, monitor_port).await {
-        Ok(rows) => rows,
-        Err(e) => return Err(e),
-    };
+    // Re-read per tick: an in-place SCRAM upgrade may add the secret while
+    // this reconciler is running.
+    let auth = super::postgres_cluster::load_cluster_auth_secrets(db, encryption, service_id)
+        .await
+        .map_err(|e| ReconcilerError::ClusterAuth {
+            service_id,
+            reason: e.to_string(),
+        })?;
+    let monitor_nodes =
+        match query_monitor(service_id, &monitor_host, monitor_port, auth.as_ref()).await {
+            Ok(rows) => rows,
+            Err(e) => return Err(e),
+        };
 
     debug!(
         service_id,
@@ -494,16 +508,12 @@ async fn query_monitor(
     service_id: i32,
     host: &str,
     port: i32,
+    auth: Option<&super::postgres_cluster::ClusterAuthSecrets>,
 ) -> Result<Vec<MonitorNode>, ReconcilerError> {
-    // SECURITY: this probe carries no password, and `sslmode=require`
-    // prevents the self-signed connector from silently accepting cleartext.
-    // pg_auto_failover only opens hba for `autoctl_node` over SSL
-    // (`hostssl pg_auto_failover autoctl_node 0.0.0.0/0 trust`), so there is no
-    // reusable credential for a forged monitor endpoint to collect.
-    let conn_str = format!(
-        "host={host} port={port} user=autoctl_node dbname=pg_auto_failover \
-         sslmode=require connect_timeout=3"
-    );
+    // SECURITY: `sslmode=require` prevents the self-signed connector from
+    // silently accepting cleartext, and SCRAM never sends the password
+    // itself. See `monitor_connection_string`.
+    let conn_str = super::postgres_cluster::monitor_connection_string(host, port, auth);
     let client = temps_query_postgres::connect_with_self_signed_tls(&conn_str)
         .await
         .map_err(|e| ReconcilerError::MonitorConnect {
@@ -570,13 +580,15 @@ async fn query_monitor(
 /// directly in tests without a real monitor connection.
 pub async fn run(
     db: Arc<DatabaseConnection>,
+    encryption: Arc<temps_core::EncryptionService>,
     registry: Arc<DnsRegistry>,
     service_id: i32,
     service_name: String,
     shutdown: Arc<ReconcilerShutdown>,
 ) {
     run_loop(&shutdown, service_id, &service_name, || async {
-        if let Err(e) = reconcile_once(&db, &registry, service_id, &service_name).await {
+        if let Err(e) = reconcile_once(&db, &encryption, &registry, service_id, &service_name).await
+        {
             // All errors are transient retries. Log at WARN, sleep, try
             // again. The only thing that stops the loop is shutdown.
             warn!(

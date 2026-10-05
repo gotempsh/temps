@@ -1087,6 +1087,8 @@ pub struct ProjectStats {
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct ProjectStatisticsResponse {
     pub total_count: i64,
+    /// Whether an accessible project's deployment has reached the ready state.
+    pub has_completed_deployment: bool,
 }
 
 // Add this struct with the other response types
@@ -1182,6 +1184,12 @@ impl From<ProjectError> for Problem {
             ProjectError::SlugAlreadyExists(slug) => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Slug Already Exists")
                 .with_detail(format!("A project with slug '{}' already exists", slug)),
+
+            err @ ProjectError::NameAlreadyExists { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Project Name Already Exists")
+                    .with_detail(err.to_string())
+            }
 
             ProjectError::SlugConflict { slug } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Slug Conflict")

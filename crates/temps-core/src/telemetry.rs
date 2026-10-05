@@ -194,6 +194,72 @@ impl TelemetryEventKind {
         }
     }
 
+    /// Coarse, human-readable group this event belongs to. Used by the
+    /// Settings › Telemetry page to show operators exactly which events this
+    /// binary can send, grouped by area. Exhaustive on purpose: adding an
+    /// event without deciding where it is disclosed fails to compile.
+    pub fn category(&self) -> TelemetryEventCategory {
+        use TelemetryEventCategory as C;
+        match self {
+            Self::InstanceStarted
+            | Self::InstanceHeartbeat
+            | Self::InstanceSetupCompleted
+            | Self::UpgradeCompleted
+            | Self::UpgradeFailed
+            | Self::WorkerNodeJoined
+            | Self::WorkerNodeJoinFailed => C::Instance,
+
+            Self::DeployAttempted
+            | Self::DeploySucceeded
+            | Self::DeployFailed
+            | Self::DeployCancelled
+            | Self::RollbackTriggered
+            | Self::FirstDeploySucceeded => C::Deployments,
+
+            Self::ProjectCreated
+            | Self::ProjectCreatedFromTemplate
+            | Self::EnvironmentCreated
+            | Self::ScaleToZeroConfigured
+            | Self::AutoDeployEnabled
+            | Self::AttackModeEnabled => C::Projects,
+
+            Self::GitProviderConnected | Self::GitProviderConnectFailed => C::Git,
+
+            Self::CustomDomainAdded | Self::SslCertificateIssued | Self::SslCertificateFailed => {
+                C::Domains
+            }
+
+            Self::ServiceCreated
+            | Self::ServiceClusterCreated
+            | Self::ServiceCreateFailed
+            | Self::PgMajorUpgradeCompleted
+            | Self::PgMajorUpgradeFailed
+            | Self::PitrRestoreTriggered
+            | Self::BackupConfigured
+            | Self::BackupSucceeded
+            | Self::BackupFailed
+            | Self::RestoreSucceeded
+            | Self::RestoreFailed => C::Services,
+
+            Self::AnalyticsFirstEventReceived
+            | Self::SessionReplayFirstSession
+            | Self::ErrorTrackingFirstError
+            | Self::AiGatewayFirstRequest => C::FeatureActivation,
+
+            Self::AiSreConversationStarted
+            | Self::AutofixerFixAccepted
+            | Self::AutofixerFixRejected => C::Ai,
+
+            Self::OidcProviderConfigured
+            | Self::ApiKeyCreated
+            | Self::VulnerabilityScanTriggered
+            | Self::EmailProviderConfigured
+            | Self::StatusPagePublished => C::Configuration,
+
+            Self::ErrorSummary => C::Health,
+        }
+    }
+
     /// Every known event name, used by tooling and tests to keep the central
     /// ingest API's accepted list in sync with the binary.
     pub fn all() -> &'static [TelemetryEventKind] {
@@ -248,6 +314,33 @@ impl TelemetryEventKind {
             Self::ErrorSummary,
         ]
     }
+}
+
+/// Area an event belongs to, for operator-facing disclosure (see
+/// [`TelemetryEventKind::category`]). Serialized as snake_case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TelemetryEventCategory {
+    /// Instance start, daily heartbeat, setup, upgrades, worker nodes.
+    Instance,
+    /// Deployment attempts and outcomes.
+    Deployments,
+    /// Project and environment creation and feature toggles.
+    Projects,
+    /// Git provider connections.
+    Git,
+    /// Custom domains and TLS certificates.
+    Domains,
+    /// Managed services, backups and restores.
+    Services,
+    /// First use of analytics, session replay, error tracking, AI gateway.
+    FeatureActivation,
+    /// AI assistant and autofixer usage.
+    Ai,
+    /// Auth, API keys, email, status pages, vulnerability scans.
+    Configuration,
+    /// Aggregated internal error counts.
+    Health,
 }
 
 /// Version of the [`OperationFailureCode`] taxonomy. Sent with every failure
@@ -679,6 +772,28 @@ impl TelemetryReporter for NoopTelemetryReporter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_event_has_a_disclosure_category() {
+        // `category()` is an exhaustive match, so this mostly guards the
+        // serialized form the console groups by.
+        for kind in TelemetryEventKind::all() {
+            let category = serde_json::to_value(kind.category()).expect("serialize category");
+            let label = category.as_str().expect("category is a string");
+            assert!(
+                label.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "category '{label}' must be snake_case"
+            );
+        }
+        assert_eq!(
+            TelemetryEventKind::InstanceHeartbeat.category(),
+            TelemetryEventCategory::Instance
+        );
+        assert_eq!(
+            TelemetryEventKind::ErrorSummary.category(),
+            TelemetryEventCategory::Health
+        );
+    }
 
     #[test]
     fn event_kind_wire_names_are_snake_case_and_unique() {

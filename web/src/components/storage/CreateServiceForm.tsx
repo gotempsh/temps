@@ -40,6 +40,7 @@ import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import * as z from 'zod'
 
+import { advancedParamsHint } from '@/lib/service-link-copy'
 import {
   completeServiceCreation,
   ServiceCreationSuccessMessage,
@@ -48,9 +49,10 @@ import {
 /**
  * Parameter names that get tucked into the "Advanced" collapsible by
  * default. Heroku/Render users were confused by `database`, `username`,
- * and `password` showing up at the top — Temps creates a per-project
- * `<project>_<env>` database for each linked project automatically, so
- * the default admin credentials are rarely what the user needs to edit.
+ * and `password` showing up at the top — Temps gives each linked project
+ * environment its own database, logical database, or bucket automatically
+ * (see `service-link-copy.ts`), so the default admin credentials are rarely
+ * what the user needs to edit.
  */
 const ADVANCED_PARAM_NAMES = new Set([
   'database',
@@ -93,11 +95,12 @@ function BackupWarning({
           Atomic backups only
         </p>
         <p className="text-xs text-amber-700 dark:text-amber-300">
-          This image does not include WAL-G. Logical backups must stage a
-          complete database dump on local disk before uploading to S3. For large
-          databases this can exhaust disk space and interrupt backup jobs. Use
-          the default image or a <code className="font-mono">gotempsh/</code>{' '}
-          image for streaming backups with constant disk usage.
+          This image does not include WAL-G. Each backup must stage a complete
+          copy of the data (a dump or snapshot) on local disk before uploading
+          to S3. For large datasets this can exhaust disk space and interrupt
+          backup jobs. Use the default image or a{' '}
+          <code className="font-mono">gotempsh/</code> image for streaming
+          backups with constant disk usage.
         </p>
       </div>
     </div>
@@ -476,8 +479,7 @@ export function CreateServiceForm({
                         )}
                         Advanced configuration
                         <span className="text-xs text-muted-foreground/70">
-                          (default DB / credentials — Temps auto-creates a
-                          per-project database for each linked project)
+                          {advancedParamsHint(serviceType)}
                         </span>
                       </button>
                     </CollapsibleTrigger>

@@ -16,8 +16,8 @@ use temps_core::{
     ForceRouteReloadJob, Job, ProjectCreatedJob, ProjectDeletedJob, ProjectUpdatedJob,
 };
 use temps_entities::{
-    delivery_profiles, dns_providers, domain_delivery_bindings, env_var_environments, env_vars,
-    environments, external_services, git_provider_connections, git_providers,
+    delivery_profiles, deployments, dns_providers, domain_delivery_bindings, env_var_environments,
+    env_vars, environments, external_services, git_provider_connections, git_providers,
     project_delivery_settings, project_services, projects, settings, types::ProjectType,
 };
 use temps_git::services::public_repo::{PublicRepoError, PublicRepoProviderFactory};
@@ -33,6 +33,44 @@ use super::{EnvVarService, EnvVarWithEnvironments};
 use crate::handlers::{UpdateDeploymentConfigRequest, UpdateServiceTemplateRuntimeRequest};
 use temps_core::docker_socket_grant::DeployCaller;
 // Placeholder functions - these should be implemented properly or imported from other services
+
+async fn has_ready_deployment(
+    db: &temps_database::DbConnection,
+    hidden: &[i32],
+) -> Result<bool, ProjectError> {
+    // last_deployment is stamped when a Git deployment starts, so it is
+    // not proof of activation. New completions preserve ready_at; older
+    // deployments can still be identified by their successful lifecycle state.
+    // Fetch one id, rather than counting or loading deployment history.
+    let completed = deployments::Entity::find().filter(
+        Condition::any()
+            .add(deployments::Column::ReadyAt.is_not_null())
+            .add(deployments::Column::State.is_in([
+                "completed",
+                "deployed",
+                "superseded",
+                "paused",
+            ])),
+    );
+    let completed = if hidden.is_empty() {
+        completed
+    } else {
+        completed.filter(deployments::Column::ProjectId.is_not_in(hidden.iter().copied()))
+    };
+    let completed = completed
+        .select_only()
+        .column(deployments::Column::Id)
+        .into_tuple::<i32>()
+        .one(db)
+        .await
+        .map_err(|e| {
+            ProjectError::DatabaseConnectionError(format!(
+                "Failed to check for a completed deployment in project statistics: {e}"
+            ))
+        })?
+        .is_some();
+    Ok(completed)
+}
 
 /// The delivery provider a new project starts with, and whether the caller
 /// asked for it or it was inherited from the instance-wide default.
@@ -1217,6 +1255,8 @@ impl ProjectService {
         let normalized_directory = normalize_project_directory(&request.directory)?;
 
         let validated_name = validate_project_name(&request.name)?;
+        self.ensure_project_name_available(&validated_name, None)
+            .await?;
         let project_slug = if let Some(expected_slug) = request.expected_slug.as_deref() {
             self.validate_expected_project_slug(&validated_name, expected_slug)
                 .await?;
@@ -1317,17 +1357,8 @@ impl ProjectService {
         // Insert the project. The slug column has a UNIQUE index — if a
         // concurrent request raced us to the same slug, surface a typed
         // SlugConflict (HTTP 409) instead of a generic 500.
-        let project_found_db = match project.insert(self.db.as_ref()).await {
-            Ok(model) => model,
-            Err(e) if super::types::is_unique_violation(&e) => {
-                return Err(ProjectError::SlugConflict { slug: project_slug });
-            }
-            Err(e) => {
-                return Err(ProjectError::DatabaseError {
-                    reason: e.to_string(),
-                })
-            }
-        };
+        let project_found_db = self.persist_named_project(project, true).await?;
+
         info!(
             "Created project id={} slug={} preset={}",
             project_found_db.id, project_found_db.slug, project_found_db.preset
@@ -2227,9 +2258,15 @@ impl ProjectService {
             project.preset_config.as_ref(),
         )?;
 
+        let name = validate_project_name(&request.name)?;
+        if name.to_lowercase() != project.name.to_lowercase() {
+            self.ensure_project_name_available(&name, Some(project_id))
+                .await?;
+        }
+
         // Update the project
         let mut active_project: projects::ActiveModel = project.into();
-        active_project.name = Set(validate_project_name(&request.name)?);
+        active_project.name = Set(name);
         active_project.repo_name = Set(request.repo_name.unwrap_or_else(|| "unknown".to_string()));
         active_project.repo_owner =
             Set(request.repo_owner.unwrap_or_else(|| "unknown".to_string()));
@@ -2238,7 +2275,7 @@ impl ProjectService {
         apply_resolved_preset(&mut active_project, resolved)?;
         active_project.updated_at = Set(chrono::Utc::now());
 
-        let project_found = active_project.update(self.db.as_ref()).await?;
+        let project_found = self.persist_named_project(active_project, false).await?;
 
         // Emit ProjectUpdated before reading anything else. Everything after
         // the commit is a fresh await point, and a cancelled request (client
@@ -2763,6 +2800,14 @@ impl ProjectService {
                 DeployCaller::from_instance_admin(caller.authority.may_claim_reserved_slug()),
             )?;
         }
+        // Refuse a rename onto another project's name before any of this
+        // request's independent writes commit.
+        if let Some(name_value) = new_name.as_deref() {
+            if name_value.to_lowercase() != project.name.to_lowercase() {
+                self.ensure_project_name_available(name_value, Some(project_id))
+                    .await?;
+            }
+        }
         // Update the slug if provided
         if let Some(slug_value) = new_slug {
             let slug_value = slugify(&slug_value);
@@ -3198,7 +3243,13 @@ impl ProjectService {
             // itself rides `active_project` below rather than a separate update.
             let mut rename = None;
             if let Some(ref name_value) = new_name {
-                rename = self.locked_rename(&txn, project_id, name_value).await?;
+                rename = match self.locked_rename(&txn, project_id, name_value).await {
+                    Ok(rename) => rename,
+                    Err(error) => {
+                        txn.rollback().await?;
+                        return Err(error);
+                    }
+                };
                 active_project.name = Set(name_value.clone());
             }
 
@@ -3262,7 +3313,13 @@ impl ProjectService {
         let mut rename = None;
         let final_project = if let Some(name_value) = new_name {
             let txn = self.db.begin().await?;
-            rename = self.locked_rename(&txn, project_id, &name_value).await?;
+            rename = match self.locked_rename(&txn, project_id, &name_value).await {
+                Ok(rename) => rename,
+                Err(error) => {
+                    txn.rollback().await?;
+                    return Err(error);
+                }
+            };
             if rename.is_some() {
                 let mut active_project = projects::ActiveModel {
                     id: Set(project_id),
@@ -3807,6 +3864,10 @@ impl ProjectService {
                 project_id
             )))?;
 
+        if locked.name.to_lowercase() != new_name.to_lowercase() {
+            self.lock_project_name_available(txn, new_name, Some(project_id))
+                .await?;
+        }
         Ok(if locked.name == new_name {
             None
         } else {
@@ -4670,7 +4731,12 @@ impl ProjectService {
             .map_err(|e| ProjectError::DatabaseConnectionError(e.to_string()))?
             as i64;
 
-        Ok(ProjectStatistics { total_count })
+        let has_completed_deployment = has_ready_deployment(self.db.as_ref(), hidden).await?;
+
+        Ok(ProjectStatistics {
+            total_count,
+            has_completed_deployment,
+        })
     }
 
     /// Reject `deployment_config` if it violates `app_settings`'s tenant
@@ -5466,6 +5532,128 @@ impl ProjectService {
         Ok(self.map_written_project(updated_project).await)
     }
 
+    /// Refuse a display name another active project already uses.
+    ///
+    /// Project names are not unique in the schema -- the slug is the
+    /// identifier -- but the name is what the console, CLI, notifications and
+    /// audit log show, so two active projects with the same name are
+    /// indistinguishable everywhere except their URL. A duplicate name used to
+    /// be accepted silently and given a random slug suffix (`whoami-3f9a1c`),
+    /// which is exactly that confusion. The comparison ignores case, since
+    /// `Whoami` and `whoami` read as the same project too.
+    ///
+    /// Deleted projects are ignored: their slug stays reserved (handled by
+    /// [`Self::generate_unique_project_slug`]), but their name is free to reuse.
+    /// `exclude_project_id` lets a project keep -- or re-case -- its own name.
+    /// Serialize create/rename writes by normalized display name. Existing
+    /// installations need no data-changing uniqueness migration.
+    async fn persist_named_project(
+        &self,
+        active: projects::ActiveModel,
+        inserting: bool,
+    ) -> Result<projects::Model, ProjectError> {
+        let name =
+            active.name.clone().take().ok_or_else(|| {
+                ProjectError::InvalidInput("Project name is required".to_string())
+            })?;
+        let id = active.id.clone().take();
+        let slug = active.slug.clone().take().unwrap_or_default();
+        let txn = self.db.begin().await?;
+        let changing_name = if !inserting {
+            let current = projects::Entity::find_by_id(id.ok_or_else(|| {
+                ProjectError::InvalidInput("Project ID is required for an update".to_string())
+            })?)
+            .lock_exclusive()
+            .one(&txn)
+            .await?
+            .ok_or_else(|| {
+                ProjectError::NotFound("Project disappeared during update".to_string())
+            })?;
+            current.name.to_lowercase() != name.to_lowercase()
+        } else {
+            true
+        };
+        // Legacy duplicate display names must not block unrelated edits or
+        // recasing. Only a new normalized name claims the shared namespace.
+        if changing_name {
+            if let Err(error) = self
+                .lock_project_name_available(&txn, &name, if inserting { None } else { id })
+                .await
+            {
+                txn.rollback().await?;
+                return Err(error);
+            }
+        }
+        let result = if inserting {
+            active.insert(&txn).await
+        } else {
+            active.update(&txn).await
+        };
+        let result = result.map_err(|e| {
+            if super::types::is_unique_violation(&e) {
+                ProjectError::SlugConflict { slug }
+            } else {
+                ProjectError::DatabaseError {
+                    reason: e.to_string(),
+                }
+            }
+        })?;
+        txn.commit().await?;
+        Ok(result)
+    }
+
+    async fn lock_project_name_available(
+        &self,
+        txn: &DatabaseTransaction,
+        name: &str,
+        exclude: Option<i32>,
+    ) -> Result<(), ProjectError> {
+        use sea_orm::sea_query::{Expr, Func};
+        txn.query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            [format!("temps-project-name:{}", name.to_lowercase()).into()],
+        ))
+        .await?;
+        let mut query = projects::Entity::find()
+            .filter(projects::Column::IsDeleted.eq(false))
+            .filter(
+                Expr::expr(Func::lower(Expr::col(projects::Column::Name))).eq(name.to_lowercase()),
+            );
+        if let Some(id) = exclude {
+            query = query.filter(projects::Column::Id.ne(id));
+        }
+        if query.one(txn).await?.is_some() {
+            return Err(ProjectError::NameAlreadyExists {
+                name: name.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn ensure_project_name_available(
+        &self,
+        name: &str,
+        exclude_project_id: Option<i32>,
+    ) -> Result<(), ProjectError> {
+        use sea_orm::sea_query::{Expr, Func};
+
+        let mut query = projects::Entity::find()
+            .filter(projects::Column::IsDeleted.eq(false))
+            .filter(
+                Expr::expr(Func::lower(Expr::col(projects::Column::Name))).eq(name.to_lowercase()),
+            );
+        if let Some(project_id) = exclude_project_id {
+            query = query.filter(projects::Column::Id.ne(project_id));
+        }
+        match query.one(self.db.as_ref()).await? {
+            Some(_) => Err(ProjectError::NameAlreadyExists {
+                name: name.to_string(),
+            }),
+            None => Ok(()),
+        }
+    }
+
     /// Generate a unique project slug by checking for collisions and appending a short UUID if needed.
     /// Slug is truncated to 40 chars max to keep DNS labels within the 63-char limit
     /// when combined with environment slug and service name prefix.
@@ -5516,8 +5704,14 @@ impl ProjectService {
         }
     }
 
+    /// Validate a new project's name and choose its slug, before any side
+    /// effect (a forked repository, provisioned services) of a multi-step
+    /// create. Refuses a name another active project uses, so a template
+    /// deploy fails here rather than after creating resources.
     pub async fn plan_project_slug(&self, name: &str) -> Result<String, ProjectError> {
         let validated_name = validate_project_name(name)?;
+        self.ensure_project_name_available(&validated_name, None)
+            .await?;
         self.generate_unique_project_slug(&validated_name).await
     }
 
@@ -6137,6 +6331,35 @@ fn base_project_slug(name: &str) -> String {
 mod tests {
     use super::*;
     use sea_orm::{ActiveModelTrait, Set};
+
+    #[tokio::test]
+    async fn first_deploy_signal_requires_ready_and_excludes_hidden_projects() {
+        use sea_orm::{DatabaseBackend, MockDatabase, Value};
+        let row = std::collections::BTreeMap::from([("id", Value::Int(Some(42)))]);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row]])
+            .into_connection();
+        assert!(has_ready_deployment(&db, &[7, 9]).await.unwrap());
+        let log = db.into_transaction_log();
+        let statements = &log[0].statements()[0].sql;
+        assert!(
+            statements.contains("ready_at\" IS NOT NULL"),
+            "{statements}"
+        );
+        assert!(statements.contains("project_id\" NOT IN"), "{statements}");
+        assert!(statements.contains("state\" IN"), "{statements}");
+        assert!(statements.contains("LIMIT"), "{statements}");
+        assert!(!statements.contains("last_deployment"), "{statements}");
+    }
+
+    #[tokio::test]
+    async fn first_deploy_signal_is_false_without_a_ready_deployment() {
+        use sea_orm::{DatabaseBackend, MockDatabase, Value};
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<std::collections::BTreeMap<&str, Value>>::new()])
+            .into_connection();
+        assert!(!has_ready_deployment(&db, &[]).await.unwrap());
+    }
 
     #[test]
     fn resolved_framework_and_nixpacks_presets_get_their_runtime_project_type() {
@@ -10362,6 +10585,235 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_project_rejects_a_name_another_active_project_uses() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+
+        let _first = project_service
+            .create_project(create_request("whoami"))
+            .await
+            .expect("the first project with a name is accepted");
+
+        // Same name in a different case: still the same project to a reader.
+        let error = match project_service
+            .create_project(create_request("  WhoAmI "))
+            .await
+        {
+            Ok(project) => panic!("duplicate name was accepted as slug {}", project.slug),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                error,
+                ProjectError::NameAlreadyExists { ref name }
+                    if name == "WhoAmI"
+            ),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !error.to_string().contains("slug"),
+            "collision must not disclose an inaccessible project identifier: {error}"
+        );
+
+        let count = projects::Entity::find()
+            .filter(projects::Column::IsDeleted.eq(false))
+            .count(db.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "no second project row may be created");
+    }
+
+    #[tokio::test]
+    async fn create_project_reuses_the_name_of_a_deleted_project() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+
+        let deleted = projects::ActiveModel {
+            name: Set("whoami".to_string()),
+            slug: Set("whoami".to_string()),
+            repo_name: Set("repo".to_string()),
+            repo_owner: Set("owner".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            is_deleted: Set(true),
+            deleted_at: Set(Some(chrono::Utc::now())),
+            ..Default::default()
+        };
+        deleted.insert(db.as_ref()).await.unwrap();
+
+        let project = project_service
+            .create_project(create_request("whoami"))
+            .await
+            .expect("a deleted project's name is free to reuse");
+        assert_eq!(project.name, "whoami");
+        // The deleted project's slug stays reserved.
+        assert_ne!(project.slug, "whoami");
+        assert!(project.slug.starts_with("whoami-"));
+    }
+
+    #[tokio::test]
+    async fn legacy_duplicate_names_allow_unrelated_updates_and_unchanged_settings() {
+        if !docker_available().await {
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let service = create_test_services(test_db.db.clone(), Arc::new(MockJobQueue::new())).await;
+        let first = service
+            .create_project(create_request("legacy"))
+            .await
+            .unwrap();
+        let second = service
+            .create_project(create_request("other"))
+            .await
+            .unwrap();
+        // Seed a state permitted before display-name uniqueness enforcement.
+        let second = projects::ActiveModel {
+            id: Set(second.id),
+            name: Set("legacy".to_string()),
+            ..Default::default()
+        };
+        second.update(test_db.db.as_ref()).await.unwrap();
+        let update = projects::ActiveModel {
+            id: Set(first.id),
+            name: Set("legacy".to_string()),
+            directory: Set("/changed".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            service
+                .persist_named_project(update, false)
+                .await
+                .unwrap()
+                .directory,
+            "/changed"
+        );
+        service
+            .update_project_settings(
+                first.id,
+                UpdateProjectSettingsParams {
+                    name: Some("legacy".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        service
+            .update_project_settings(
+                first.id,
+                UpdateProjectSettingsParams {
+                    name: Some("LEGACY".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_project_renames_keep_names_unique() {
+        if !docker_available().await {
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let service = create_test_services(test_db.db.clone(), Arc::new(MockJobQueue::new())).await;
+        let a = service
+            .create_project(create_request("first"))
+            .await
+            .unwrap();
+        let b = service
+            .create_project(create_request("second"))
+            .await
+            .unwrap();
+        // Both callers already loaded and validated their original rows.
+        let mut a = projects::ActiveModel {
+            id: Set(a.id),
+            ..Default::default()
+        };
+        let mut b = projects::ActiveModel {
+            id: Set(b.id),
+            ..Default::default()
+        };
+        a.name = Set("Shared".to_string());
+        b.name = Set("shared".to_string());
+        let (a, b) = tokio::join!(
+            service.persist_named_project(a, false),
+            service.persist_named_project(b, false)
+        );
+        assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
+        assert!(
+            matches!(a, Err(ProjectError::NameAlreadyExists { .. }))
+                || matches!(b, Err(ProjectError::NameAlreadyExists { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_onto_another_projects_name_is_rejected_but_recasing_is_not() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+
+        let _api = project_service
+            .create_project(create_request("api"))
+            .await
+            .expect("create api");
+        let web = project_service
+            .create_project(create_request("web"))
+            .await
+            .expect("create web");
+
+        let result = project_service
+            .update_project_settings(
+                web.id,
+                UpdateProjectSettingsParams {
+                    name: Some("API".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(
+            matches!(result, Err(ProjectError::NameAlreadyExists { .. })),
+            "renaming onto another project's name must be refused"
+        );
+        let reloaded = projects::Entity::find_by_id(web.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("web still exists");
+        assert_eq!(reloaded.name, "web");
+
+        // A project may change the case of its own name.
+        let updated = match project_service
+            .update_project_settings(
+                web.id,
+                UpdateProjectSettingsParams {
+                    name: Some("Web".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(updated) => updated,
+            Err(error) => panic!("re-casing its own name failed: {error}"),
+        };
+        assert_eq!(updated.project.name, "Web");
+    }
+
+    #[tokio::test]
     async fn test_create_project_succeeds_and_creates_default_environment() {
         if !docker_available().await {
             println!("Docker not available, skipping");
@@ -11495,7 +11947,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_project_with_duplicate_name_gets_suffixed_slug() {
+    async fn test_reusing_a_deleted_projects_name_gets_suffixed_slug() {
         if !docker_available().await {
             println!("Docker not available, skipping");
             return;
@@ -11509,6 +11961,22 @@ mod tests {
             .create_project(create_request("Duplicate Name"))
             .await
             .expect("first create should succeed");
+        // While the first project is active its name is taken...
+        assert!(matches!(
+            project_service.plan_project_slug("Duplicate Name").await,
+            Err(ProjectError::NameAlreadyExists { .. })
+        ));
+        // ...once deleted the name is free, but its slug stays reserved.
+        let mut deleted: projects::ActiveModel = projects::Entity::find_by_id(first.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("first project row")
+            .into();
+        deleted.is_deleted = Set(true);
+        deleted.deleted_at = Set(Some(chrono::Utc::now()));
+        deleted.update(db.as_ref()).await.unwrap();
+
         let planned_slug = project_service
             .plan_project_slug("Duplicate Name")
             .await
@@ -11518,7 +11986,7 @@ mod tests {
         let second = project_service
             .create_project(second_request)
             .await
-            .expect("second create with same name should succeed with suffixed slug");
+            .expect("reusing a deleted project's name should succeed with a suffixed slug");
 
         assert_eq!(first.slug, "duplicate-name");
         assert!(

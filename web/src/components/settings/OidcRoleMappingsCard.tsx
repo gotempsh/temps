@@ -38,8 +38,10 @@ function nextDefaultPriority(existing: OidcRoleMappingResponse[]): number {
 export function OidcRoleMappingsCard({
   providerId,
   defaultRole,
+  readOnly = false,
 }: {
   providerId: number
+  readOnly?: boolean
   defaultRole: string
 }) {
   const queryClient = useQueryClient()
@@ -156,7 +158,7 @@ export function OidcRoleMappingsCard({
                   <Button
                     variant="ghost"
                     size="sm"
-                    disabled={deleteMapping.isPending}
+                    disabled={readOnly || deleteMapping.isPending}
                     onClick={() => {
                       if (
                         !confirm(
@@ -223,7 +225,9 @@ export function OidcRoleMappingsCard({
               </div>
               <Button
                 onClick={handleAdd}
-                disabled={createMapping.isPending || !draftGroup.trim()}
+                disabled={
+                  readOnly || createMapping.isPending || !draftGroup.trim()
+                }
               >
                 <Plus className="mr-2 h-4 w-4" />
                 Add

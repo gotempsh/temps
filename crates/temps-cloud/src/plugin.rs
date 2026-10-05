@@ -102,6 +102,11 @@ impl TempsPlugin for CloudPlugin {
             ));
             context.register_service(link);
             context.register_service(service);
+            // ADR-045 §3: the console router does not exist yet at this point
+            // of startup, so register an empty dispatch slot the host process
+            // fills once it has assembled the router (see `temps-cli`'s
+            // console startup). The worker reads the slot per request.
+            context.register_service(Arc::new(temps_cloud_client::ConsoleDispatchSlot::new()));
             Ok(())
         })
     }
@@ -140,6 +145,12 @@ impl TempsPlugin for CloudPlugin {
                 );
                 service.start_backup_credential_rotation();
                 service.start_heartbeat_sender();
+                service.start_console_proxy_worker(
+                    context
+                        .require_service::<temps_cloud_client::ConsoleDispatchSlot>()
+                        .as_ref()
+                        .clone(),
+                );
                 service.start_backup_lifecycle_notify(
                     context.require_service::<dyn temps_core::JobQueue>(),
                 );

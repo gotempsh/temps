@@ -29,7 +29,9 @@ async function dev(): Promise<void> {
 
 export function registerDevCommand(program: Command): void {
   program
-    .command('dev')
+    // Not implemented yet: registered (so `temps dev` explains itself) but
+    // hidden from help, so the CLI does not advertise a missing command.
+    .command('dev', { hidden: true })
     .description('Start a local development tunnel (coming soon)')
     .option('-p, --project <project>', 'Project slug')
     .option('--port <port>', 'Local port to expose', '3000')

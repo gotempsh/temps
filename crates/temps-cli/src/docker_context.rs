@@ -20,8 +20,109 @@
 //! endpoint that fails.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use sha2::{Digest, Sha256};
+
+/// Outcome of [`adopt_active_docker_context`], kept so later diagnostics
+/// (the console startup failure, `temps doctor`) can say which endpoint was
+/// used and why, after `DOCKER_HOST` has already been rewritten.
+static ADOPTION: OnceLock<Result<AdoptedDockerContext, DockerContextSkip>> = OnceLock::new();
+
+/// Where the Docker endpoint every bollard client in this process connects
+/// to came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DockerEndpointSource {
+    /// `DOCKER_HOST` was set in the environment by the operator.
+    DockerHostEnv,
+    /// The active `docker context` was adopted at startup.
+    DockerContext { name: String },
+    /// Nothing configured: bollard's default socket.
+    Default,
+}
+
+/// The Docker endpoint in effect for this process, for diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DockerEndpoint {
+    /// `DOCKER_HOST` value, or bollard's default socket URL.
+    pub host: String,
+    pub source: DockerEndpointSource,
+    /// Why an active, non-default Docker context was *not* used, when that
+    /// explains a failure (e.g. its socket does not exist).
+    pub context_note: Option<String>,
+}
+
+impl DockerEndpoint {
+    /// One-line description, e.g.
+    /// `unix:///var/run/docker.sock (default socket; DOCKER_HOST is not set)`.
+    pub fn describe(&self) -> String {
+        let source = match &self.source {
+            DockerEndpointSource::DockerHostEnv => "from DOCKER_HOST".to_string(),
+            DockerEndpointSource::DockerContext { name } => {
+                format!("from the active Docker context '{name}'")
+            }
+            DockerEndpointSource::Default => {
+                "default socket; DOCKER_HOST is not set and no Docker context is active".to_string()
+            }
+        };
+        match &self.context_note {
+            Some(note) => format!("{} ({source}; {note})", self.host),
+            None => format!("{} ({source})", self.host),
+        }
+    }
+}
+
+/// The Docker endpoint this process uses, and where it came from.
+pub fn docker_endpoint() -> DockerEndpoint {
+    endpoint_from(std::env::var("DOCKER_HOST").ok().as_deref(), ADOPTION.get())
+}
+
+fn endpoint_from(
+    docker_host: Option<&str>,
+    adoption: Option<&Result<AdoptedDockerContext, DockerContextSkip>>,
+) -> DockerEndpoint {
+    let docker_host = docker_host.map(str::trim).filter(|host| !host.is_empty());
+    let context_note = match adoption {
+        Some(Err(DockerContextSkip::NotLocalUnixSocket { name, host })) => Some(format!(
+            "the active Docker context '{name}' points at {host}, which Temps cannot use; \
+             only local unix:// sockets are adopted"
+        )),
+        Some(Err(DockerContextSkip::SocketMissing { name, socket })) => Some(format!(
+            "the active Docker context '{name}' points at {}, which does not exist",
+            socket.display()
+        )),
+        Some(Err(DockerContextSkip::MetadataUnreadable { name, path })) => Some(format!(
+            "the active Docker context '{name}' could not be read from {}",
+            path.display()
+        )),
+        _ => None,
+    };
+    match (docker_host, adoption) {
+        (Some(host), Some(Ok(adopted))) if adopted.host == host => DockerEndpoint {
+            host: host.to_string(),
+            source: DockerEndpointSource::DockerContext {
+                name: adopted.name.clone(),
+            },
+            context_note: None,
+        },
+        (Some(host), _) => DockerEndpoint {
+            host: host.to_string(),
+            source: DockerEndpointSource::DockerHostEnv,
+            context_note: None,
+        },
+        (None, _) => DockerEndpoint {
+            host: DEFAULT_DOCKER_HOST.to_string(),
+            source: DockerEndpointSource::Default,
+            context_note,
+        },
+    }
+}
+
+/// bollard's default endpoint when `DOCKER_HOST` is unset.
+#[cfg(unix)]
+const DEFAULT_DOCKER_HOST: &str = "unix:///var/run/docker.sock";
+#[cfg(windows)]
+const DEFAULT_DOCKER_HOST: &str = "npipe:////./pipe/docker_engine";
 
 /// A Docker context that was exported as `DOCKER_HOST` for this process.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,13 +184,16 @@ pub fn adopt_active_docker_context() -> Result<AdoptedDockerContext, DockerConte
     let docker_context = std::env::var("DOCKER_CONTEXT").ok();
     let config_dir = docker_config_dir();
 
-    let adopted = resolve(&ContextEnv {
+    let outcome = resolve(&ContextEnv {
         docker_host: docker_host.as_deref(),
         docker_context: docker_context.as_deref(),
         config_dir: config_dir.as_deref(),
-    })?;
-    std::env::set_var("DOCKER_HOST", &adopted.host);
-    Ok(adopted)
+    });
+    if let Ok(adopted) = &outcome {
+        std::env::set_var("DOCKER_HOST", &adopted.host);
+    }
+    let _ = ADOPTION.set(outcome.clone());
+    outcome
 }
 
 /// `$DOCKER_CONFIG`, else `~/.docker`, matching the Docker CLI.
@@ -330,5 +434,59 @@ mod tests {
             fx.resolve(None, None),
             Err(DockerContextSkip::MetadataUnreadable { name, .. }) if name == "ghost"
         ));
+    }
+
+    #[test]
+    fn endpoint_reports_operator_docker_host() {
+        let endpoint = endpoint_from(Some("unix:///tmp/custom.sock"), None);
+        assert_eq!(endpoint.source, DockerEndpointSource::DockerHostEnv);
+        assert_eq!(endpoint.host, "unix:///tmp/custom.sock");
+        assert_eq!(
+            endpoint.describe(),
+            "unix:///tmp/custom.sock (from DOCKER_HOST)"
+        );
+    }
+
+    #[test]
+    fn endpoint_reports_an_adopted_context() {
+        let adoption = Ok(AdoptedDockerContext {
+            name: "colima".to_string(),
+            host: "unix:///home/op/.colima/docker.sock".to_string(),
+        });
+        let endpoint = endpoint_from(Some("unix:///home/op/.colima/docker.sock"), Some(&adoption));
+        assert_eq!(
+            endpoint.source,
+            DockerEndpointSource::DockerContext {
+                name: "colima".to_string()
+            }
+        );
+        assert!(endpoint
+            .describe()
+            .contains("active Docker context 'colima'"));
+    }
+
+    #[test]
+    fn endpoint_falls_back_to_default_socket_and_explains_a_broken_context() {
+        let adoption = Err(DockerContextSkip::SocketMissing {
+            name: "desktop".to_string(),
+            socket: PathBuf::from("/home/op/.docker/run/docker.sock"),
+        });
+        let endpoint = endpoint_from(None, Some(&adoption));
+        assert_eq!(endpoint.source, DockerEndpointSource::Default);
+        assert_eq!(endpoint.host, DEFAULT_DOCKER_HOST);
+        let described = endpoint.describe();
+        assert!(described.contains("default socket"), "{described}");
+        assert!(
+            described.contains("'desktop' points at /home/op/.docker/run/docker.sock"),
+            "{described}"
+        );
+    }
+
+    #[test]
+    fn endpoint_ignores_the_default_context_skip() {
+        let adoption = Err(DockerContextSkip::DefaultContext);
+        let endpoint = endpoint_from(Some(""), Some(&adoption));
+        assert_eq!(endpoint.source, DockerEndpointSource::Default);
+        assert!(endpoint.context_note.is_none());
     }
 }
