@@ -71,7 +71,7 @@ const COMPOSE_READY_POLL_INTERVAL: std::time::Duration = std::time::Duration::fr
 /// single phase of the deployment that should complete within minutes, not
 /// hours, on any reasonable network.
 const COMPOSE_PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
-const COMPOSE_BUILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
+const COMPOSE_BUILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1800);
 const COMPOSE_UP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Resolving the fully merged Compose model is local work and should complete
@@ -688,6 +688,11 @@ pub struct ComposeDeployRequest {
     /// Compose services explicitly exempted from Temps' generated runtime
     /// sandbox. Repository security validation still applies.
     pub unsandboxed_services: Vec<String>,
+    /// How long every service may take to become running (and healthy, when
+    /// it defines a healthcheck) after `up`. `None` uses
+    /// [`COMPOSE_READY_TIMEOUT`]; the project's startup-timeout setting
+    /// supplies an override.
+    pub ready_timeout: Option<std::time::Duration>,
 }
 
 /// Result for a single compose service after deployment.
@@ -1767,7 +1772,7 @@ impl ComposeExecutor {
                 &project_name,
                 &compose_file,
                 &redact_values,
-                COMPOSE_READY_TIMEOUT,
+                request.ready_timeout.unwrap_or(COMPOSE_READY_TIMEOUT),
             )
             .await
         {
@@ -9639,6 +9644,7 @@ services:
             compose_override: None,
             relaxed_capability_services: Vec::new(),
             unsandboxed_services: Vec::new(),
+            ready_timeout: None,
         };
         executor
             .write_compose_files(project_dir.path(), &request, "failed-test")
@@ -9764,6 +9770,7 @@ services:
             compose_override: None,
             relaxed_capability_services: Vec::new(),
             unsandboxed_services: Vec::new(),
+            ready_timeout: None,
         };
         executor
             .write_compose_files(project_dir.path(), &request, "quick-exit")
@@ -9872,6 +9879,7 @@ services:
             compose_override: None,
             relaxed_capability_services: Vec::new(),
             unsandboxed_services: Vec::new(),
+            ready_timeout: None,
         };
         executor
             .write_compose_files(project_dir.path(), &request, "failed-public-port")
@@ -10057,6 +10065,7 @@ services:
             compose_override: None,
             relaxed_capability_services: Vec::new(),
             unsandboxed_services: vec!["webserver".to_string()],
+            ready_timeout: None,
         };
 
         executor
@@ -10128,6 +10137,7 @@ services:
             compose_override: None,
             relaxed_capability_services: Vec::new(),
             unsandboxed_services: vec!["app".to_string()],
+            ready_timeout: None,
         };
 
         let err = executor
@@ -10172,6 +10182,7 @@ services:
             compose_override: None,
             relaxed_capability_services: Vec::new(),
             unsandboxed_services: vec!["app".to_string()],
+            ready_timeout: None,
         };
 
         let err = executor
@@ -10203,6 +10214,7 @@ services:
             compose_override: None,
             relaxed_capability_services: Vec::new(),
             unsandboxed_services: vec!["app".to_string()],
+            ready_timeout: None,
         };
 
         let err = executor
@@ -10236,6 +10248,7 @@ services:
             compose_override: None,
             relaxed_capability_services: Vec::new(),
             unsandboxed_services: vec!["app".to_string()],
+            ready_timeout: None,
         };
 
         executor
@@ -10338,6 +10351,7 @@ services:
             compose_override: None,
             relaxed_capability_services: Vec::new(),
             unsandboxed_services: Vec::new(),
+            ready_timeout: None,
         }
     }
 

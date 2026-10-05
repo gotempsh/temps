@@ -605,6 +605,10 @@ impl ProjectResponse {
                     .deployment_config
                     .clone()
                     .and_then(|c| c.max_concurrent_connections),
+                health_check_timeout_seconds: project
+                    .deployment_config
+                    .clone()
+                    .and_then(|c| c.health_check_timeout_seconds),
                 container_exec_enabled: project
                     .deployment_config
                     .clone()
@@ -767,6 +771,12 @@ pub struct UpdateDeploymentConfigRequest {
     /// issue #646.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_concurrent_connections: Option<i32>,
+    /// How long, in seconds (30-3600), a new deployment's containers may take
+    /// to start and pass their readiness check before the deployment fails.
+    /// Absent leaves the current value unchanged; the platform default is
+    /// 300 seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_check_timeout_seconds: Option<i32>,
 }
 
 /// Complete replacement for the editable runtime of a single-container
