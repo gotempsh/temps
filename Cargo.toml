@@ -426,9 +426,18 @@ debug = false
 #    - Reachability before the fix: none. No crate in this workspace or in relay
 #      instantiated BaggagePropagator or called a TextMapPropagator on inbound
 #      headers; the module was compiled but dead.
-#    - When bumping the relay rev: if relay starts importing opentelemetry_proto,
-#      relay-event-schema stops compiling against the empty crate. Then remove the
-#      patch and require a relay rev whose opentelemetry-proto pulls
+#    - When bumping the relay rev, two things can happen:
+#        * relay starts importing opentelemetry_proto: relay-event-schema stops
+#          compiling against the empty crate.
+#        * relay's requirement moves past 0.30 (e.g. to 0.31): the patch no longer
+#          matches, Cargo skips it with only an "unused patch" warning, and the
+#          real crate and a vulnerable SDK come back with no compile error.
+#      The second case is caught by the dependency_guard_tests in
+#      crates/temps-error-tracking/src/lib.rs, which read Cargo.lock and fail if
+#      opentelemetry_sdk < 0.32.1 is locked or relay's opentelemetry-proto is no
+#      longer the local stub. After a bump, also check
+#      `cargo tree -i opentelemetry_sdk --target all` matches nothing (or only
+#      >= 0.32.1). Remove the patch once relay's opentelemetry-proto pulls
 #      opentelemetry_sdk >= 0.32.1.
 #
 # 3. GHSA-xxx: libcrux-intrinsics 0.0.3 (HIGH severity, dev-dependency only)

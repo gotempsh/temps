@@ -12162,6 +12162,7 @@ dependencies = [
  "relay-protocol",
  "relay-protocol-derive",
  "sea-orm",
+ "semver",
  "serde",
  "serde_derive",
  "serde_json",
