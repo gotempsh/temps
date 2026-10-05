@@ -282,11 +282,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unprotected_existing_upgrade_is_refused_without_ledger_changes() {
+    async fn unprotected_existing_upgrade_is_refused_without_ledger_changes() -> anyhow::Result<()>
+    {
         use sea_orm::ConnectionTrait;
-        let test_db = crate::test_utils::TestDatabase::new()
-            .await
-            .expect("database");
+        let test_db = match crate::test_utils::TestDatabase::new().await {
+            Ok(db) => db,
+            Err(error)
+                if crate::test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                eprintln!("Skipping schema upgrade database test: {error}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         let db = test_db.db.as_ref();
         db.execute_unprepared(
             "CREATE TABLE seaql_migrations (version text PRIMARY KEY, applied_at bigint NOT NULL)",
@@ -307,6 +315,7 @@ mod tests {
         assert!(error.to_string().contains("Run `temps migrate`"));
         let after = read_applied_migrations(db).await.expect("unchanged ledger");
         assert_eq!(after.len(), 1);
+        Ok(())
     }
 
     #[test]
