@@ -408,27 +408,28 @@ debug = false
 #      PRs that each failed CI because Dependabot proposed bumping one pingora
 #      crate at a time, leaving the rest pinned to 0.8.1 and breaking compilation).
 #
-# 2b. GHSA-w9wp-h8wv-79jx: opentelemetry_sdk 0.30.0 (MEDIUM, dependabot-only)
-#    - Path: relay-event-schema (git pin getsentry/relay) → opentelemetry-proto 0.30
-#      → opentelemetry_sdk 0.30.0
-#    - Fix: needs opentelemetry_sdk >= 0.32.1, which requires opentelemetry-proto
-#      0.32. relay-event-schema enables `opentelemetry-proto = ["gen-tonic","trace"]`
-#      and the `trace` feature is what drags in opentelemetry_sdk; there is no
-#      [patch] override possible (0.30 -> 0.32 is semver-incompatible).
-#    - Upstream status (checked 2026-08-04): BUMPING THE RELAY REV DOES NOT FIX THIS.
-#      relay master @3215baa is on opentelemetry-proto 0.31, and 0.31's `trace`
-#      feature still resolves opentelemetry_sdk 0.31 -- below the 0.32.1 fix
-#      (verified by probe build). So the block is not "we haven't moved the pin":
-#      relay must first adopt opentelemetry-proto 0.32. Moving the pin 897 commits
-#      forward would buy relay-protocol API churn and still leave the alert open.
-#      Re-checked 2026-10-04: relay master @c4e9930 still declares
-#      opentelemetry-proto 0.31, so this remains blocked upstream.
-#    - Reachability: the unbounded-alloc bug is in the W3C BaggagePropagator. relay
-#      pulls opentelemetry-proto only for OTLP span TYPE conversion; the propagation
-#      module is compiled in (trace feature) but BaggagePropagator is never
-#      instantiated and .extract() is never called on attacker headers anywhere in
-#      the workspace -> not reachable. (re-verified 2026-08-04: no case-insensitive
-#      match for `baggage` anywhere under crates/.)
+# 2b. GHSA-w9wp-h8wv-79jx / CVE-2026-48504: opentelemetry_sdk 0.30.0 (MEDIUM)
+#    - RESOLVED 2026-10-05 by removing the dependency, not by upgrading it.
+#    - Path was: relay-event-schema (git pin getsentry/relay) → opentelemetry-proto
+#      0.30 → opentelemetry_sdk 0.30.0 (a non-optional dependency of
+#      opentelemetry-proto 0.30, so no feature selection could drop it).
+#    - An upgrade is not available: the fix is opentelemetry_sdk 0.32.1, and relay
+#      master (@417cfe9, 2026-10-05) still declares opentelemetry-proto 0.31,
+#      whose SDK is also vulnerable. 0.30 -> 0.32 is semver-incompatible, so a
+#      version [patch] cannot reach it either.
+#    - relay-event-schema at the pinned rev declares
+#      `opentelemetry-proto = { features = ["gen-tonic", "trace"] }` but never
+#      references `opentelemetry_proto` in its source. The [patch.crates-io] at
+#      the end of this file swaps it for an empty local crate
+#      (crates/patches/opentelemetry-proto-unused), which takes opentelemetry_sdk,
+#      opentelemetry 0.30 and tonic 0.13 out of Cargo.lock and the binary.
+#    - Reachability before the fix: none. No crate in this workspace or in relay
+#      instantiated BaggagePropagator or called a TextMapPropagator on inbound
+#      headers; the module was compiled but dead.
+#    - When bumping the relay rev: if relay starts importing opentelemetry_proto,
+#      relay-event-schema stops compiling against the empty crate. Then remove the
+#      patch and require a relay rev whose opentelemetry-proto pulls
+#      opentelemetry_sdk >= 0.32.1.
 #
 # 3. GHSA-xxx: libcrux-intrinsics 0.0.3 (HIGH severity, dev-dependency only)
 #    - Path: testcontainers → russh → libcrux-ml-kem → libcrux-intrinsics 0.0.3
@@ -545,3 +546,12 @@ debug = false
 #
 # All remaining items are transitive dependencies from third-party crates that we
 # cannot directly patch without forking. Monitoring upstream for updates.
+
+# ============================================================================
+# Patched dependencies
+# ============================================================================
+[patch.crates-io]
+# relay-event-schema declares opentelemetry-proto but never uses it; the real
+# crate drags in opentelemetry_sdk 0.30 (GHSA-w9wp-h8wv-79jx). See item 2b above
+# and crates/patches/opentelemetry-proto-unused/Cargo.toml.
+opentelemetry-proto = { path = "crates/patches/opentelemetry-proto-unused" }
