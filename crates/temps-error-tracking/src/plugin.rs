@@ -185,7 +185,9 @@ impl TempsPlugin for ErrorTrackingPlugin {
                             .with_metadata("first_seen", alert.first_seen.clone())
                             .with_metadata("last_seen", alert.last_seen.clone());
 
-                        if let Some(ref project) = alert.project_name {
+                        // Identify the project by slug, matching the alarm
+                        // notifications and the console URLs.
+                        if let Some(ref project) = alert.project_slug {
                             notification = notification.with_metadata("project", project.clone());
                         }
                         if let Some(ref env) = alert.environment_name {

@@ -3430,7 +3430,7 @@ impl AgentExecutor {
         )
         .with_priority(NotificationPriority::Normal)
         .with_metadata("run_id", run_id.to_string())
-        .with_metadata("project", project_name.to_string())
+        .with_metadata("project", project_slug.to_string())
         .with_metadata("deliverable", deliverable.to_string());
 
         if let Err(e) = self
