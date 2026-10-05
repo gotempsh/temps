@@ -291,7 +291,9 @@ jobs:
         env:
           PRUNE_MODE: ${{ github.ref == 'refs/heads/main' && steps.musl-cache.outputs.cache-hit != 'true' && '--apply' || '' }}
         run: |
-          python3 .github/scripts/prune-cargo-build-cache.py $PRUNE_MODE \
+          prune_args=()
+          if [[ -n "$PRUNE_MODE" ]]; then prune_args+=("$PRUNE_MODE"); fi
+          python3 .github/scripts/prune-cargo-build-cache.py "${prune_args[@]}" \
             --messages cargo-build-messages.json \
             --target-dir ci-build-cache/target \
             --registry ci-build-cache/cargo-registry \
@@ -319,7 +321,7 @@ jobs:
           rebuilt=$(jq -r 'select(.reason == "compiler-artifact" and .fresh == false) | .target.name' \
             cargo-verify-messages.json)
           if [ -n "$rebuilt" ]; then
-            echo "::warning::Pruning removed build output that was still in use (rebuilt before saving): $(echo $rebuilt)"
+            echo "::warning::Pruning removed build output that was still in use (rebuilt before saving): ${rebuilt//$'\n'/, }"
           else
             echo "All units fresh after pruning."
           fi
@@ -540,6 +542,12 @@ jobs:
       - name: Type check
         run: cd web && bunx tsc --noEmit
 
+      - name: Web unit tests
+        run: cd web && bun run test
+
+      - name: Web ESLint
+        run: cd web && bunx eslint . --quiet
+
   openapi-canonical:
     name: OpenAPI Spec Format
     runs-on: ubuntu-latest
@@ -564,12 +572,10 @@ jobs:
         run: bun apps/temps-cli/scripts/check-openapi.ts
 
   clippy:
-    name: Clippy (advisory)
+    name: Clippy
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
-    # Non-blocking: clippy warnings are reported but do not fail the build
-    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
