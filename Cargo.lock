@@ -848,9 +848,9 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-http-client"
-version = "1.4.2"
+version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7bd25384a4e437aa8d8f339afad4b69e786b936a7cb10db668a7aaf66717b1a8"
+checksum = "51c89cc3f1f281d659a67a519a1b5c6d445b5ce09fa7e5aee40c2c2707e9509d"
 dependencies = [
  "aws-smithy-async",
  "aws-smithy-runtime-api",
@@ -928,9 +928,9 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-runtime-api"
-version = "1.16.2"
+version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d881a7b7ad179fd6611680c9de89f716fb00ab40299a9a7b8c6913e8f7511a8"
+checksum = "c0730c16f91124c6a2abb4932c77e299288b3dd9f967ea2e9ec48cc6731e87a4"
 dependencies = [
  "aws-smithy-async",
  "aws-smithy-runtime-api-macros",
@@ -1983,9 +1983,9 @@ dependencies = [
 
 [[package]]
 name = "config"
-version = "0.15.26"
+version = "0.15.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "790374c727a4cb20877dd2cc99ce7011cbe03b0b8df083acccd37df0d161304d"
+checksum = "38e9fbc53afcec54441422f1c596cd054655b32e70e1cbac956651b7b175a404"
 dependencies = [
  "async-trait",
  "convert_case 0.6.0",
@@ -2654,9 +2654,9 @@ dependencies = [
 
 [[package]]
 name = "defguard_wireguard_rs"
-version = "0.12.1"
+version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6200ebad7ba02fc3272f9bd3883ef1aa187b95f0205491c1685b4168b22a3b8"
+checksum = "ed997d9067c268058aa41d9c585beea28366558b8c7ad89c0ead6a9895b1ef58"
 dependencies = [
  "base64 0.23.1",
  "defguard_boringtun",
@@ -5128,9 +5128,9 @@ dependencies = [
 
 [[package]]
 name = "lazy_static"
-version = "1.5.0"
+version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
+checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 dependencies = [
  "spin 0.9.8",
 ]
@@ -11220,6 +11220,7 @@ dependencies = [
  "serde_yaml",
  "sha2 0.11.0",
  "sqlx 0.8.6",
+ "tar",
  "tempfile",
  "temps-auth",
  "temps-backup-core",
@@ -11456,6 +11457,7 @@ name = "temps-cloud"
 version = "0.1.0-beta.56"
 dependencies = [
  "anyhow",
+ "async-trait",
  "aws-sdk-s3",
  "axum",
  "chrono",
@@ -11488,11 +11490,14 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.23.1",
+ "bytes",
  "chrono",
  "clickhouse",
  "futures",
  "futures-util",
  "hmac 0.13.0",
+ "hyper",
+ "hyper-util",
  "reqwest 0.12.28",
  "sea-orm",
  "serde",
@@ -11508,6 +11513,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.30.0",
  "tokio-util",
+ "tower",
  "tracing",
  "url",
  "uuid",
@@ -11517,6 +11523,7 @@ dependencies = [
 name = "temps-cloud-protocol"
 version = "0.1.0-beta.56"
 dependencies = [
+ "bytes",
  "chrono",
  "serde",
  "serde_json",
@@ -11636,6 +11643,7 @@ dependencies = [
  "temps-entities",
  "temps-migrations",
  "testcontainers",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -11715,7 +11723,7 @@ dependencies = [
  "libc",
  "mockall",
  "octocrab",
- "p256 0.13.2",
+ "p256 0.14.0",
  "rand 0.10.3",
  "rcgen",
  "regex",
@@ -13575,17 +13583,23 @@ dependencies = [
 name = "temps-telemetry"
 version = "0.1.0-beta.56"
 dependencies = [
+ "anyhow",
  "async-trait",
+ "axum",
  "chrono",
  "reqwest 0.12.28",
  "sea-orm",
  "serde",
  "serde_json",
+ "temps-auth",
  "temps-config",
  "temps-core",
+ "temps-entities",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "url",
+ "utoipa",
  "uuid",
 ]
 
@@ -14036,9 +14050,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-rustls"
-version = "0.26.5"
+version = "0.26.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0c85f2c3ef0b1cd58b36682f4b17aaa995f0e5db534d85692b4903abce21f67"
+checksum = "c9cc2678c2cdd569ef8215e2afd7954ada2ae20b4fdd2c5fe6139a3b02d105db"
 dependencies = [
  "rustls",
  "tokio",
@@ -15828,9 +15842,9 @@ checksum = "66fee0b777b0f5ac1c69bb06d361268faafa61cd4682ae064a171c16c433e9e4"
 
 [[package]]
 name = "xxhash-rust"
-version = "0.8.18"
+version = "0.8.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aee1b19627c7c60102ab80d3a9cbe18de90bfe03bfa6c3715447681f0e8c8af6"
+checksum = "550a2b930b62486a393c52d5c3b84bff264b28aa437ed64694d31e93b1757af7"
 
 [[package]]
 name = "y4m"

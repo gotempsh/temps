@@ -17,19 +17,29 @@
 //! - Reporting is fire-and-forget and time-bounded: a dead or slow endpoint has
 //!   zero effect on the running server.
 //!
-//! Operators opt out by setting `TEMPS_TELEMETRY=0` (also `false`/`off`/`no`).
-//! The ingest endpoint is overridable with `TEMPS_TELEMETRY_ENDPOINT`.
+//! Admins turn it on or off at runtime from Settings › Telemetry (stored in
+//! the settings row, audit-logged; see [`settings`] and [`handlers`]).
+//! `TEMPS_TELEMETRY=0` (also `false`/`off`/`no`/`disabled`) in the server
+//! environment is a host-level kill switch that always wins. The ingest
+//! endpoint is overridable with `TEMPS_TELEMETRY_ENDPOINT`.
 //!
 //! The abstraction (`TelemetryReporter`, `TelemetryEvent`, `TelemetryEventKind`)
 //! lives in [`temps_core::telemetry`] so feature crates depend on the trait,
 //! not on this crate.
 
+pub mod handlers;
 mod plugin;
 mod service;
+pub mod settings;
 
 pub use plugin::TelemetryPlugin;
 pub use service::{
-    TelemetryInitError, TelemetryService, ANONYMOUS_ID_FILE, DEFAULT_TELEMETRY_ENDPOINT,
+    effective_enabled, TelemetryInitError, TelemetryService, ANONYMOUS_ID_FILE,
+    DEFAULT_TELEMETRY_ENABLED, DEFAULT_TELEMETRY_ENDPOINT,
+};
+pub use settings::{
+    stored_preference, TelemetryPreferenceStore, TelemetrySettingsError, TelemetrySettingsService,
+    TelemetryStatus, TelemetryStatusSource,
 };
 
 // Convenience re-exports so consumers can pull the event vocabulary from one

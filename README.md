@@ -442,6 +442,18 @@ const files = await blob.list({ prefix: 'avatars/' });
 
 ---
 
+## Telemetry
+
+Temps sends **anonymous** product-usage events to `telemetry.temps.sh` so the maintainers can see whether self-hosted instances actually work (for example, how many deploys succeed versus fail). It is **on by default**.
+
+- **What is sent:** a random instance ID generated on your server, the event name (e.g. `deploy_succeeded`, `instance_heartbeat`), the Temps version, and non-identifying properties: counts, enum labels and coarse bands.
+- **What is never sent:** emails, IP addresses, repository names, domains, URLs, environment variables, error messages, stack traces or anything you typed. The receiving server derives a country code from the connection's IP and does not store the IP.
+- **Turn it off:** as an admin, open **Settings › Telemetry** in the console. The change applies immediately and is recorded in the audit log. That page also lists every event type the binary can send. To force it off for a whole host, regardless of the console, start the server with `TEMPS_TELEMETRY=0`.
+
+Your application data (analytics, logs, errors, session replays, backups) never leaves your server. Full details: [Data ownership & privacy](https://temps.sh/docs/data-ownership-and-privacy#anonymous-telemetry).
+
+---
+
 ## Community
 
 - [GitHub Discussions](https://github.com/gotempsh/temps/discussions) — questions, ideas, and show & tell

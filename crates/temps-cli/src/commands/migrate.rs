@@ -56,6 +56,19 @@ pub struct MigrateCommand {
     #[arg(long, short = 'y')]
     pub yes: bool,
 
+    /// Data directory of the installation (same as `temps serve`). The
+    /// automatic pre-migration backup is written to
+    /// `<data dir>/backups/pre-migration/`. Defaults to `~/.temps`.
+    #[arg(long, env = "TEMPS_DATA_DIR")]
+    pub data_dir: Option<std::path::PathBuf>,
+
+    /// Apply the migrations WITHOUT first taking the automatic pre-migration
+    /// backup. Without this flag, migrating an existing database first dumps
+    /// it to `<data dir>/backups/pre-migration/` and nothing is applied if
+    /// that dump fails. Use only after taking your own backup.
+    #[arg(long)]
+    pub skip_pre_migration_backup: bool,
+
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, env = "TEMPS_LOG_LEVEL", default_value = "info")]
     pub log_level: String,
@@ -307,6 +320,64 @@ impl MigrateCommand {
                 return Ok(());
             }
 
+            // Schema guard + pre-migration backup, after the operator agreed
+            // to the plan and before the first migration is applied.
+            let data_dir = resolve_data_dir(self.data_dir.as_deref())?;
+            if !use_json {
+                if self.skip_pre_migration_backup {
+                    println!(
+                        "{}",
+                        format!(
+                            "! Skipping the automatic pre-migration backup ({}).",
+                            crate::commands::schema_upgrade::SKIP_BACKUP_FLAG
+                        )
+                        .yellow()
+                    );
+                } else {
+                    println!(
+                        "{}",
+                        format!(
+                            "Backing up the database to {} before migrating…",
+                            temps_backup::pre_migration::pre_migration_backup_dir(&data_dir)
+                                .display()
+                        )
+                        .dimmed()
+                    );
+                }
+            }
+            let prepared = crate::commands::schema_upgrade::prepare_schema_upgrade(
+                &db,
+                &self.database_url,
+                &data_dir,
+                crate::commands::schema_upgrade::BackupPolicy::from_skip_flag(
+                    self.skip_pre_migration_backup,
+                ),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+            if let Some(backup) = &prepared.backup {
+                if use_json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&BackupCompletedLine {
+                            event: "backup_completed",
+                            path: backup.dump_path.display().to_string(),
+                            size_bytes: backup.size_bytes,
+                            elapsed_ms: backup.elapsed.as_millis() as u64,
+                        })?
+                    );
+                    let _ = std::io::stdout().flush();
+                } else {
+                    println!(
+                        "  {} {} ({}, {})",
+                        "✓".green(),
+                        backup.dump_path.display(),
+                        format_size(backup.size_bytes),
+                        format_elapsed(backup.elapsed)
+                    );
+                }
+            }
+
             if !use_json {
                 println!();
                 println!("{}", "Applying…".bold());
@@ -399,6 +470,40 @@ impl MigrateCommand {
             }
             Ok::<(), anyhow::Error>(())
         })
+    }
+}
+
+/// `backup_completed` NDJSON line for `--progress-format=json`.
+#[derive(serde::Serialize)]
+struct BackupCompletedLine {
+    event: &'static str,
+    path: String,
+    size_bytes: u64,
+    elapsed_ms: u64,
+}
+
+/// `--data-dir`/`TEMPS_DATA_DIR`, else `~/.temps` — the same resolution as
+/// `temps serve`.
+fn resolve_data_dir(configured: Option<&std::path::Path>) -> anyhow::Result<std::path::PathBuf> {
+    match configured {
+        Some(dir) => Ok(dir.to_path_buf()),
+        None => dirs::home_dir()
+            .map(|home| home.join(".temps"))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Cannot determine the data directory for the pre-migration backup: \
+                     no home directory. Pass --data-dir or set TEMPS_DATA_DIR."
+                )
+            }),
+    }
+}
+
+fn format_size(bytes: u64) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / MIB)
+    } else {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
     }
 }
 
@@ -748,6 +853,42 @@ fn format_elapsed(d: std::time::Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::{race_maintenance, MaintenanceRace};
+
+    #[test]
+    fn data_dir_prefers_the_configured_directory() {
+        let configured = std::path::Path::new("/srv/temps-data");
+        assert_eq!(
+            super::resolve_data_dir(Some(configured)).expect("configured dir"),
+            configured
+        );
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(
+                super::resolve_data_dir(None).expect("home default"),
+                home.join(".temps")
+            );
+        }
+    }
+
+    #[test]
+    fn backup_sizes_are_human_readable() {
+        assert_eq!(super::format_size(512), "0.5 KiB");
+        assert_eq!(super::format_size(3 * 1024 * 1024 + 512 * 1024), "3.5 MiB");
+    }
+
+    #[test]
+    fn backup_completed_line_is_ndjson_the_updater_ignores_safely() {
+        let line = serde_json::to_string(&super::BackupCompletedLine {
+            event: "backup_completed",
+            path: "/data/backups/pre-migration/x.dump".to_string(),
+            size_bytes: 10,
+            elapsed_ms: 5,
+        })
+        .expect("serializes");
+        assert_eq!(
+            line,
+            r#"{"event":"backup_completed","path":"/data/backups/pre-migration/x.dump","size_bytes":10,"elapsed_ms":5}"#
+        );
+    }
 
     #[tokio::test]
     async fn maintenance_race_observes_interrupts_after_migrations_finish() {

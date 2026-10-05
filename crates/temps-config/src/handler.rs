@@ -2210,6 +2210,11 @@ fn preserve_cloud_settings_not_sent_by_every_client(
     incoming.cloud.telemetry_enabled = current.cloud.telemetry_enabled;
     incoming.cloud.backups_enabled = current.cloud.backups_enabled;
     incoming.cloud.notifications_enabled = current.cloud.notifications_enabled;
+    // ADR-045 §5: same reasoning as the three consent flags above -- enabling
+    // console access requires `PATCH /cloud/features` (and, on the
+    // unattended bootstrap path, is set exactly once and audited there), so
+    // a generic settings write must never be able to flip it either way.
+    incoming.cloud.console_access_enabled = current.cloud.console_access_enabled;
 
     if !sent.backend_url {
         incoming.cloud.backend_url = current.cloud.backend_url.clone();
@@ -2881,6 +2886,9 @@ async fn update_settings(
             preserve_omitted_security_fields(&mut settings, &current_settings);
             settings.plugin_installation_reporting_enabled =
                 current_settings.plugin_installation_reporting_enabled;
+            // Anonymous product telemetry consent is owned by the SystemAdmin-only
+            // `PATCH /settings/telemetry` endpoint (audit-logged there).
+            settings.anonymous_telemetry_enabled = current_settings.anonymous_telemetry_enabled;
             // The `cloud` block was already merged, further up: the ADR-042
             // guard authorization depends on the merged value, so it cannot
             // wait until here.
@@ -3476,6 +3484,7 @@ mod tests {
             external_url: Some("https://temps.example.test".into()),
             console_version: Some("v9.9.9".into()),
             plugin_installation_reporting_enabled: true,
+            anonymous_telemetry_enabled: Some(false),
             trust_loopback_forwarded_ip: Some(true),
             self_update: Some(temps_core::SelfUpdateSettings {
                 enabled: false,
@@ -3530,6 +3539,7 @@ mod tests {
         preserve_self_recorded_fields(&mut merged, stored);
         preserve_omitted_security_fields(&mut merged, stored);
         merged.plugin_installation_reporting_enabled = stored.plugin_installation_reporting_enabled;
+        merged.anonymous_telemetry_enabled = stored.anonymous_telemetry_enabled;
         preserve_provider_credential_proof(&mut merged, stored);
         merged.geo.preserve_recorded_state(&stored.geo);
         preserve_masked_secrets(&mut merged, stored, node_failover_sent);
@@ -3608,6 +3618,27 @@ mod tests {
             incoming.multi_node.cluster_ca_key_encrypted,
             stored.multi_node.cluster_ca_key_encrypted
         );
+    }
+
+    #[test]
+    fn generic_settings_write_cannot_change_anonymous_telemetry_consent() {
+        // An admin turned telemetry off from Settings › Telemetry; a client
+        // that round-trips the whole document with the field flipped (or
+        // omitted) must not undo that decision.
+        let stored = AppSettings {
+            anonymous_telemetry_enabled: Some(false),
+            ..Default::default()
+        };
+        for body in [
+            serde_json::json!({
+                "preview_domain": "apps.example.test",
+                "anonymous_telemetry_enabled": true
+            }),
+            serde_json::json!({ "preview_domain": "apps.example.test" }),
+        ] {
+            let merged = merge_settings_put(body, &stored);
+            assert_eq!(merged.anonymous_telemetry_enabled, Some(false));
+        }
     }
 
     #[test]
@@ -4054,6 +4085,12 @@ mod tests {
         incoming.cloud.telemetry_enabled = true;
         incoming.cloud.backups_enabled = true;
         incoming.cloud.notifications_enabled = true;
+        // ADR-045 §5: console access is exactly as unwritable through this
+        // endpoint as the three consent flags above -- it is a
+        // resource-specific `PATCH /cloud/features` decision (or the
+        // bootstrap default), never a side effect of an unrelated settings
+        // save.
+        incoming.cloud.console_access_enabled = true;
 
         preserve_cloud_settings_not_sent_by_every_client(
             &mut incoming,
@@ -4064,6 +4101,7 @@ mod tests {
         assert!(!incoming.cloud.telemetry_enabled);
         assert!(!incoming.cloud.backups_enabled);
         assert!(!incoming.cloud.notifications_enabled);
+        assert!(!incoming.cloud.console_access_enabled);
     }
 
     #[test]
@@ -4072,6 +4110,7 @@ mod tests {
         current.cloud.telemetry_enabled = true;
         current.cloud.backups_enabled = true;
         current.cloud.notifications_enabled = true;
+        current.cloud.console_access_enabled = true;
         let mut incoming = AppSettings::default();
 
         preserve_cloud_settings_not_sent_by_every_client(
@@ -4083,6 +4122,7 @@ mod tests {
         assert!(incoming.cloud.telemetry_enabled);
         assert!(incoming.cloud.backups_enabled);
         assert!(incoming.cloud.notifications_enabled);
+        assert!(incoming.cloud.console_access_enabled);
     }
 
     /// A settings row whose operator-tuned Cloud fields have all been moved off

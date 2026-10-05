@@ -46,9 +46,11 @@ pub struct EnrollCloudRequest {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CloudFeatureSwitchesRequest {
-    pub telemetry_enabled: bool,
-    pub backups_enabled: bool,
-    pub notifications_enabled: bool,
+    pub telemetry_enabled: Option<bool>,
+    pub backups_enabled: Option<bool>,
+    pub notifications_enabled: Option<bool>,
+    /// Omitted switches retain their current value under the settings row lock.
+    pub console_access_enabled: Option<bool>,
 }
 
 /// Who performed a Cloud enrollment, for the audit trail.
@@ -114,6 +116,7 @@ struct CloudFeatureAuditValues {
     telemetry_enabled: bool,
     backups_enabled: bool,
     notifications_enabled: bool,
+    console_access_enabled: bool,
 }
 
 impl From<CloudFeatureSwitches> for CloudFeatureAuditValues {
@@ -122,6 +125,7 @@ impl From<CloudFeatureSwitches> for CloudFeatureAuditValues {
             telemetry_enabled: value.telemetry,
             backups_enabled: value.backups,
             notifications_enabled: value.notifications,
+            console_access_enabled: value.console_access,
         }
     }
 }
@@ -224,6 +228,7 @@ fn problem(error: CloudServiceError) -> Problem {
         | CloudServiceError::Database(_)
         | CloudServiceError::ManagedBackupCredential(_)
         | CloudServiceError::ConsoleOidcProvisioning(_)
+        | CloudServiceError::ConsoleOidcUnavailable
         | CloudServiceError::Client(
             temps_cloud_client::CloudError::InvalidBackendUrl { .. }
             | temps_cloud_client::CloudError::ClientConfiguration { .. },
@@ -283,24 +288,25 @@ async fn update_cloud_features(
     Json(request): Json<CloudFeatureSwitchesRequest>,
 ) -> Result<Json<CloudStatus>, Problem> {
     permission_guard!(auth, SettingsWrite);
-    if request.backups_enabled {
+    if request.backups_enabled == Some(true) {
         permission_guard!(auth, BackupsWrite);
     }
-    if request.notifications_enabled {
+    if request.notifications_enabled == Some(true) {
         permission_guard!(auth, NotificationProvidersWrite);
         permission_guard!(auth, NotificationProvidersCreate);
     }
     let previous = state.service.feature_switches();
-    let switches = CloudFeatureSwitches {
-        telemetry: request.telemetry_enabled,
-        backups: request.backups_enabled,
-        notifications: request.notifications_enabled,
-    };
     let result = state
         .service
-        .update_feature_switches(switches)
+        .patch_feature_switches(
+            request.telemetry_enabled,
+            request.backups_enabled,
+            request.notifications_enabled,
+            request.console_access_enabled,
+        )
         .await
         .map_err(problem)?;
+    let switches = state.service.feature_switches();
     audit(
         &state,
         &auth,
@@ -1296,6 +1302,7 @@ mod tests {
                     telemetry: false,
                     backups: false,
                     notifications: false,
+                    console_access: false,
                 }
                 .into(),
             ),
@@ -1304,6 +1311,7 @@ mod tests {
                     telemetry: true,
                     backups: true,
                     notifications: false,
+                    console_access: false,
                 }
                 .into(),
             ),

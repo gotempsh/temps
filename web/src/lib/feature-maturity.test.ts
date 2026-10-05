@@ -21,6 +21,11 @@ describe('feature maturity route mapping', () => {
     expect(featureKeyForPath('/ai-gateway/activity')).toBe('ai-gateway')
   })
 
+  test('labels the AI workspace prototype as an experimental chat surface', () => {
+    expect(featureKeyForPath('/ai-first')).toBe('ai-chat')
+    expect(featureKeyForPath('/ai-first?application=app_1')).toBe('ai-chat')
+  })
+
   test('does not label stable or unresolved surfaces', () => {
     expect(featureKeyForPath('/projects')).toBeUndefined()
     expect(featureKeyForPath('/mcp-servers')).toBeUndefined()

@@ -10,6 +10,7 @@ export const metadata = {
 export const sections = [
   { title: "Server Configuration", id: "server" },
   { title: "Database Configuration", id: "database" },
+  { title: "Anonymous Telemetry", id: "telemetry" },
   { title: "Application Environment Variables", id: "application" },
   { title: "CLI Configuration", id: "cli" },
   { title: "SDK Configuration", id: "sdk" },
@@ -176,6 +177,22 @@ Temps stores sensitive data in the data directory (`~/.temps` by default):
   **Important**: Back up these files! Losing them means you cannot decrypt
   existing data.
 </Note>
+
+---
+
+## Anonymous Telemetry {{ anchor: true, id: 'telemetry' }}
+
+Temps sends anonymous product-usage events (event names, counts and coarse labels under a random instance ID) to `telemetry.temps.sh`. It is **on by default**. An instance admin can turn it off or on at runtime from **Settings › Telemetry** in the console, which also lists every event type the binary can send. See [Data ownership & privacy](/docs/data-ownership-and-privacy#anonymous-telemetry) for exactly what is and is never collected.
+
+| Variable                   | Default                                | Description |
+| -------------------------- | -------------------------------------- | ----------- |
+| `TEMPS_TELEMETRY`          | (unset)                                | Set to `0`, `false`, `off`, `no` or `disabled` (case-insensitive) to force telemetry **off** for this server process. Host-level kill switch: it overrides the console setting, which then shows "Forced off by `TEMPS_TELEMETRY`". Any other value, or unset, leaves the decision to the console setting. Also disables the outbound deployment failure report. Read at startup; restart to change. |
+| `TEMPS_TELEMETRY_ENDPOINT` | `https://telemetry.temps.sh/v1/events` | Where events are sent, for pointing at your own ingest or a local sink while testing. |
+
+```bash
+# Never send anonymous telemetry from this host, whatever the console says
+export TEMPS_TELEMETRY=0
+```
 
 ---
 

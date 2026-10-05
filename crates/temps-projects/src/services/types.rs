@@ -447,6 +447,14 @@ pub enum ProjectError {
     #[error("A project with slug '{slug}' was created concurrently. Please retry.")]
     SlugConflict { slug: String },
 
+    /// Another active project already uses this display name. Names are what
+    /// the console, CLI and notifications show, so two projects called the
+    /// same thing are indistinguishable everywhere except their URL slug.
+    #[error(
+        "A project named '{name}' already exists. Choose a different name, or rename or delete the existing project first."
+    )]
+    NameAlreadyExists { name: String },
+
     #[error("Failed to create default environment for project {project_id}: {reason}")]
     EnvironmentCreationFailed { project_id: i32, reason: String },
 

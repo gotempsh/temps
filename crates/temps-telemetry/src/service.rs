@@ -8,12 +8,16 @@
 //! - persists a stable random `anonymous_id` in the data directory (local
 //!   installs) or reads the random one stored in PostgreSQL (stateless
 //!   control planes, whose replicas share no data directory),
-//! - honours the `TEMPS_TELEMETRY` opt-out env var,
+//! - honours the `TEMPS_TELEMETRY` opt-out env var (a host-level kill switch
+//!   that always wins) and the admin preference stored in the settings row
+//!   (`anonymous_telemetry_enabled`, applied at runtime via
+//!   [`TelemetryService::apply_admin_preference`]),
 //! - sends each event as a fire-and-forget timed HTTP POST so a dead endpoint
 //!   never affects the running server.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -28,6 +32,24 @@ pub const ANONYMOUS_ID_FILE: &str = "anonymous_id";
 /// Default central ingest endpoint. Overridable with `TEMPS_TELEMETRY_ENDPOINT`
 /// (e.g. when self-hosting your own ingest, or pointing at a local dev server).
 pub const DEFAULT_TELEMETRY_ENDPOINT: &str = "https://telemetry.temps.sh/v1/events";
+
+/// Whether anonymous telemetry is on when neither the environment kill switch
+/// nor an admin preference says otherwise. Opt-out by default; whether this
+/// stays `true` for GA is a maintainer decision tracked with the Settings ›
+/// Telemetry page that discloses it.
+pub const DEFAULT_TELEMETRY_ENABLED: bool = true;
+
+/// Encodings of the cached admin preference in [`Inner::admin_preference`].
+const PREFERENCE_UNSET: u8 = 0;
+const PREFERENCE_ON: u8 = 1;
+const PREFERENCE_OFF: u8 = 2;
+
+/// Resolve whether events are sent, from the two inputs that can decide it.
+/// The environment opt-out always wins; otherwise the admin preference, and
+/// failing that [`DEFAULT_TELEMETRY_ENABLED`].
+pub fn effective_enabled(env_opted_out: bool, admin_preference: Option<bool>) -> bool {
+    !env_opted_out && admin_preference.unwrap_or(DEFAULT_TELEMETRY_ENABLED)
+}
 
 /// How long a single telemetry POST is allowed to take before being abandoned.
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -59,7 +81,13 @@ pub struct TelemetryService {
 }
 
 struct Inner {
-    enabled: bool,
+    /// `TEMPS_TELEMETRY` set to an opt-out value at process start. Host-level
+    /// kill switch: nothing an admin does in the console can override it.
+    env_opted_out: bool,
+    /// Cached admin preference (`PREFERENCE_*`). An atomic so `is_enabled()`
+    /// stays a lock-free load on every call site, including hot paths that
+    /// gate `report_once` on it.
+    admin_preference: AtomicU8,
     anonymous_id: String,
     temps_version: String,
     endpoint: String,
@@ -104,7 +132,7 @@ impl TelemetryService {
         stateless_anonymous_id: Option<&str>,
     ) -> Result<Self, TelemetryInitError> {
         let version = temps_version.into();
-        let enabled = Self::enabled_from_env();
+        let env_opted_out = !Self::enabled_from_env();
         let endpoint = std::env::var("TEMPS_TELEMETRY_ENDPOINT")
             .ok()
             .filter(|s| !s.is_empty())
@@ -120,20 +148,10 @@ impl TelemetryService {
                 reason: e.to_string(),
             })?;
 
-        if enabled {
-            tracing::info!(
-                anonymous_id = %anonymous_id,
-                endpoint = %endpoint,
-                "Anonymous product telemetry is ENABLED. No PII is collected. \
-                 Disable with TEMPS_TELEMETRY=0."
-            );
-        } else {
-            tracing::info!("Anonymous product telemetry is DISABLED (TEMPS_TELEMETRY opt-out).");
-        }
-
         Ok(Self {
             inner: Arc::new(Inner {
-                enabled,
+                env_opted_out,
+                admin_preference: AtomicU8::new(PREFERENCE_UNSET),
                 anonymous_id,
                 temps_version: version,
                 endpoint,
@@ -156,9 +174,82 @@ impl TelemetryService {
         }
     }
 
+    /// Apply the admin preference stored in the settings row
+    /// (`anonymous_telemetry_enabled`). Takes effect for the next event: no
+    /// restart, and in-flight sends re-check before going out.
+    pub fn apply_admin_preference(&self, preference: Option<bool>) {
+        let encoded = match preference {
+            None => PREFERENCE_UNSET,
+            Some(true) => PREFERENCE_ON,
+            Some(false) => PREFERENCE_OFF,
+        };
+        let previous = self.inner.admin_preference.swap(encoded, Ordering::Relaxed);
+        if previous != encoded {
+            self.log_effective_state();
+        }
+    }
+
+    /// The cached admin preference (`None` = not chosen, default applies).
+    pub fn admin_preference(&self) -> Option<bool> {
+        match self.inner.admin_preference.load(Ordering::Relaxed) {
+            PREFERENCE_ON => Some(true),
+            PREFERENCE_OFF => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Whether `TEMPS_TELEMETRY` forced telemetry off for this process.
+    pub fn env_opted_out(&self) -> bool {
+        self.inner.env_opted_out
+    }
+
+    /// The ingest endpoint events are POSTed to.
+    pub fn endpoint(&self) -> &str {
+        &self.inner.endpoint
+    }
+
+    /// The version string stamped onto every event.
+    pub fn temps_version(&self) -> &str {
+        &self.inner.temps_version
+    }
+
+    /// Log one line stating whether telemetry is on and what decided it, so
+    /// the server log always tells the operator the current state and how to
+    /// change it.
+    pub fn log_effective_state(&self) {
+        if self.inner.env_opted_out {
+            tracing::info!(
+                "Anonymous product telemetry is DISABLED by TEMPS_TELEMETRY; \
+                 the environment variable overrides Settings > Telemetry."
+            );
+            return;
+        }
+        match self.admin_preference() {
+            Some(true) => tracing::info!(
+                anonymous_id = %self.inner.anonymous_id,
+                endpoint = %self.inner.endpoint,
+                "Anonymous product telemetry is ENABLED by an admin in Settings > Telemetry. \
+                 No PII is collected."
+            ),
+            Some(false) => tracing::info!(
+                "Anonymous product telemetry is DISABLED by an admin in Settings > Telemetry."
+            ),
+            None if DEFAULT_TELEMETRY_ENABLED => tracing::info!(
+                anonymous_id = %self.inner.anonymous_id,
+                endpoint = %self.inner.endpoint,
+                "Anonymous product telemetry is ENABLED (default). No PII is collected. \
+                 Turn it off in Settings > Telemetry or with TEMPS_TELEMETRY=0."
+            ),
+            None => tracing::info!(
+                "Anonymous product telemetry is DISABLED (default). \
+                 An admin can turn it on in Settings > Telemetry."
+            ),
+        }
+    }
+
     /// Read the `TEMPS_TELEMETRY` opt-out flag. Enabled by default; treats
     /// `0`/`false`/`off`/`no`/`disabled` (case-insensitive) as opt-out.
-    fn enabled_from_env() -> bool {
+    pub fn enabled_from_env() -> bool {
         match std::env::var("TEMPS_TELEMETRY") {
             Ok(v) => !matches!(
                 v.trim().to_lowercase().as_str(),
@@ -227,7 +318,7 @@ impl TelemetryService {
     /// as a failed startup, where a fire-and-forget task would never run.
     /// Never returns an error: telemetry must not change the caller's outcome.
     pub async fn send_now(&self, event: TelemetryEvent) {
-        if !self.inner.enabled {
+        if !self.is_enabled() {
             return;
         }
         let payload = EventPayload {
@@ -271,7 +362,7 @@ impl TelemetryService {
 #[async_trait::async_trait]
 impl TelemetryReporter for TelemetryService {
     fn report(&self, event: TelemetryEvent) {
-        if !self.inner.enabled {
+        if !self.is_enabled() {
             return;
         }
 
@@ -280,8 +371,14 @@ impl TelemetryReporter for TelemetryService {
         // detached task with its own timeout (the client is configured with
         // SEND_TIMEOUT).
         let inner = self.inner.clone();
+        let reporter = self.clone();
 
         tokio::spawn(async move {
+            // An admin may have turned telemetry off between `report()` and
+            // this task running; honour that rather than send one more event.
+            if !reporter.is_enabled() {
+                return;
+            }
             let payload = EventPayload {
                 anonymous_id: &inner.anonymous_id,
                 event_type: &event.event_type,
@@ -327,7 +424,7 @@ impl TelemetryReporter for TelemetryService {
     }
 
     fn report_once(&self, milestone: &'static str, event: TelemetryEvent) {
-        if !self.inner.enabled {
+        if !self.is_enabled() {
             return;
         }
 
@@ -407,7 +504,7 @@ impl TelemetryReporter for TelemetryService {
     }
 
     fn is_enabled(&self) -> bool {
-        self.inner.enabled
+        effective_enabled(self.inner.env_opted_out, self.admin_preference())
     }
 }
 
@@ -516,7 +613,11 @@ mod tests {
         let _env = lock_telemetry_env();
         let dir = temp_dir();
         std::env::remove_var("TEMPS_TELEMETRY");
+        // Never let a unit test reach the real ingest endpoint: the discard
+        // port on loopback refuses the connection immediately.
+        std::env::set_var("TEMPS_TELEMETRY_ENDPOINT", "http://127.0.0.1:9/v1/events");
         let svc = TelemetryService::new(&dir, "0.0.0-test").unwrap();
+        std::env::remove_var("TEMPS_TELEMETRY_ENDPOINT");
         assert!(svc.is_enabled());
 
         // Not claimed yet.
@@ -580,6 +681,103 @@ mod tests {
             svc.inner.claimed.lock().unwrap().is_empty(),
             "disabled reporter must not claim milestones"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Minimal local HTTP sink standing in for the ingest endpoint, so tests
+    /// can count what would have been sent without touching the network.
+    async fn spawn_counting_sink() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind sink");
+        let addr = listener.local_addr().expect("sink addr");
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let _ = socket.read(&mut buf).await;
+                counter.fetch_add(1, Ordering::SeqCst);
+                let _ = socket
+                    .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+        (format!("http://{addr}/v1/events"), hits)
+    }
+
+    fn service_with_endpoint(dir: &Path, endpoint: &str, env_opt_out: bool) -> TelemetryService {
+        let _env = lock_telemetry_env();
+        std::env::set_var("TEMPS_TELEMETRY_ENDPOINT", endpoint);
+        if env_opt_out {
+            std::env::set_var("TEMPS_TELEMETRY", "0");
+        } else {
+            std::env::remove_var("TEMPS_TELEMETRY");
+        }
+        let svc = TelemetryService::new(dir, "0.0.0-test").unwrap();
+        std::env::remove_var("TEMPS_TELEMETRY_ENDPOINT");
+        std::env::remove_var("TEMPS_TELEMETRY");
+        svc
+    }
+
+    #[test]
+    fn effective_enabled_precedence_env_then_admin_then_default() {
+        assert_eq!(effective_enabled(false, None), DEFAULT_TELEMETRY_ENABLED);
+        assert!(effective_enabled(false, Some(true)));
+        assert!(!effective_enabled(false, Some(false)));
+        // The environment kill switch wins over an admin opt-in.
+        assert!(!effective_enabled(true, Some(true)));
+        assert!(!effective_enabled(true, None));
+    }
+
+    #[tokio::test]
+    async fn admin_preference_switches_sending_at_runtime() {
+        let dir = temp_dir();
+        let (endpoint, hits) = spawn_counting_sink().await;
+        let svc = service_with_endpoint(&dir, &endpoint, false);
+        assert_eq!(svc.endpoint(), endpoint);
+
+        // Admin turns it off: no event of any kind leaves the process.
+        svc.apply_admin_preference(Some(false));
+        assert!(!svc.is_enabled());
+        svc.report(TelemetryEvent::new(TelemetryEventKind::InstanceHeartbeat));
+        svc.report_once(
+            "first_deploy_succeeded",
+            TelemetryEvent::new(TelemetryEventKind::FirstDeploySucceeded),
+        );
+        svc.send_now(TelemetryEvent::new(TelemetryEventKind::UpgradeFailed))
+            .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "disabled must send nothing");
+        assert!(
+            svc.inner.claimed.lock().unwrap().is_empty(),
+            "a disabled reporter must not burn milestones"
+        );
+
+        // Admin turns it back on: the very next event is sent, no restart.
+        svc.apply_admin_preference(Some(true));
+        assert!(svc.is_enabled());
+        svc.send_now(TelemetryEvent::new(TelemetryEventKind::InstanceHeartbeat))
+            .await;
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn env_opt_out_overrides_admin_opt_in() {
+        let dir = temp_dir();
+        let (endpoint, hits) = spawn_counting_sink().await;
+        let svc = service_with_endpoint(&dir, &endpoint, true);
+        assert!(svc.env_opted_out());
+
+        svc.apply_admin_preference(Some(true));
+        assert!(!svc.is_enabled(), "TEMPS_TELEMETRY=0 must win");
+        svc.send_now(TelemetryEvent::new(TelemetryEventKind::InstanceHeartbeat))
+            .await;
+        svc.report(TelemetryEvent::new(TelemetryEventKind::InstanceHeartbeat));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 

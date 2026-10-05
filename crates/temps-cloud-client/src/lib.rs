@@ -23,6 +23,9 @@
 
 #![forbid(unsafe_code)]
 
+/// ADR-045 §1–§3: the instance side of the console-proxy tunnel, on its own
+/// dedicated connection for the same reason [`heartbeat`] is split out.
+pub mod console_proxy;
 pub mod flusher;
 /// The liveness signal on the dedicated management channel -- see the module
 /// docs for why this is separate from telemetry shipment and backup mirroring.
@@ -38,6 +41,10 @@ pub mod state;
 pub mod status;
 pub mod status_provider;
 
+pub use console_proxy::{
+    ConsoleDispatchSlot, ConsoleDispatchTarget, ConsoleOidcSink, ConsoleProxyWorker,
+    ConsoleRouterHandle, NoopConsoleOidcSink,
+};
 pub use link::{
     CloudFallbackReason, CloudLink, CloudTelemetryFallback, EnrollmentKind, FirstLinkEnrollment,
     FlushOutcome, OutboxShipOutcome, SubmissionScope, SubmissionScopeBusy,
@@ -60,6 +67,10 @@ pub struct CloudFeatureSwitches {
     pub telemetry: bool,
     pub backups: bool,
     pub notifications: bool,
+    /// ADR-045 §5: console access through Temps Cloud's console-proxy
+    /// tunnel. Enrollment preserves consent; the operator explicitly enables
+    /// this through Settings or the CLI.
+    pub console_access: bool,
 }
 
 use std::{

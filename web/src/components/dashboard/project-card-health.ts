@@ -47,7 +47,7 @@ export interface ProjectHealthInput {
 
 /** The slice of `ProjectMonitorHealth` this indicator reads. */
 export interface ProjectMonitorHealthInput {
-  /** `operational` | `degraded` | `down` | `no_monitors` */
+  /** `operational` | `degraded` | `down` | `not_deployed` | `no_monitors` */
   status: string
 }
 
@@ -113,6 +113,15 @@ function monitorIndicator(
         label: 'Uptime down',
         detail:
           'Every production uptime monitor is failing its checks, or has not reported in over a day.',
+      }
+    case 'not_deployed':
+      // The monitor exists but production has no deployment for it to check,
+      // so there is no failure to report — only a next step.
+      return {
+        tone: 'idle',
+        label: 'Not deployed yet',
+        detail:
+          'Production has no deployment yet, so its uptime monitor has nothing to check. Uptime checks start with the first production deployment.',
       }
     default:
       // 'no_monitors', or a status this build does not know about.

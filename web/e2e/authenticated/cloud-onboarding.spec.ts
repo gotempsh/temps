@@ -18,6 +18,7 @@ const cloudStatus = (linked: boolean) => ({
   telemetry_enabled: false,
   backups_enabled: false,
   notifications_enabled: false,
+  console_access_enabled: false,
 })
 
 const routeCloudLifecycle = async (page: Page, rejected = false) => {
@@ -28,8 +29,9 @@ const routeCloudLifecycle = async (page: Page, rejected = false) => {
     telemetry_enabled: false,
     backups_enabled: false,
     notifications_enabled: false,
+    console_access_enabled: false,
   }
-  const featureUpdates: (typeof featureState)[] = []
+  const featureUpdates: Partial<typeof featureState>[] = []
 
   await page.route('**/cloud/capability', async (route) => {
     await route.fulfill({
@@ -76,8 +78,9 @@ const routeCloudLifecycle = async (page: Page, rejected = false) => {
     })
   })
   await page.route('**/cloud/features', async (route) => {
-    featureState = route.request().postDataJSON()
-    featureUpdates.push({ ...featureState })
+    const update: Partial<typeof featureState> = route.request().postDataJSON()
+    featureState = { ...featureState, ...update }
+    featureUpdates.push(update)
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
@@ -146,22 +149,12 @@ test.describe('Temps Cloud activation onboarding', () => {
     await expect(backups).toBeChecked()
     await notifications.click()
     await expect(notifications).toBeChecked()
+    await expect(telemetry).toBeChecked()
+    await expect(backups).toBeChecked()
     expect(cloud.featureUpdates).toEqual([
-      {
-        telemetry_enabled: true,
-        backups_enabled: false,
-        notifications_enabled: false,
-      },
-      {
-        telemetry_enabled: true,
-        backups_enabled: true,
-        notifications_enabled: false,
-      },
-      {
-        telemetry_enabled: true,
-        backups_enabled: true,
-        notifications_enabled: true,
-      },
+      { telemetry_enabled: true },
+      { backups_enabled: true },
+      { notifications_enabled: true },
     ])
 
     await page.getByRole('button', { name: 'Disconnect' }).click()

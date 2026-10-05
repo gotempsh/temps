@@ -1,0 +1,144 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+name: Upgrade Tests
+
+# Upgrade-from-previous-release test (scripts/test-upgrade-from-release.sh):
+# seed an installation with the latest published beta/stable release, upgrade
+# it in place with the candidate binary, and check that every seeded record is
+# intact, that a pre-migration backup was taken, that the schema guard refuses
+# a newer database, and that restoring the backup rolls back to the previous
+# release.
+#
+# - Pull requests and `main`: called from `rust-tests.yml` with the musl
+#   `fast` binary its `build-binary` job already compiled.
+# - Nightly (and manual runs): upgrades to the newest published nightly
+#   build, so the release-to-release path is exercised even on days without
+#   a code change to the test itself.
+on:
+  workflow_call:
+    inputs:
+      binary-artifact:
+        description: "Name of the artifact holding the candidate `temps` binary"
+        required: false
+        default: temps-binary-musl-fast
+        type: string
+  schedule:
+    # After nightly-release.yml (03:00 UTC) has had time to publish.
+    - cron: "30 6 * * *"
+  workflow_dispatch:
+    inputs:
+      previous-version:
+        description: "Release tag to upgrade from (default: newest non-nightly release)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  upgrade-from-release:
+    name: Upgrade from previous release
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    services:
+      timescaledb:
+        image: timescale/timescaledb-ha:pg18
+        env:
+          POSTGRES_DB: temps
+          POSTGRES_USER: temps
+          POSTGRES_PASSWORD: temps
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U temps -d temps"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Never report CI instances to product telemetry.
+      TEMPS_TELEMETRY: "0"
+      GH_TOKEN: ${{ github.token }}
+      PREVIOUS_VERSION: ${{ github.event.inputs.previous-version }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Download candidate binary (build artifact)
+        if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ${{ inputs.binary-artifact }}
+          path: candidate
+
+      - name: Download candidate binary (latest nightly release)
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          tag=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 200 \
+            --exclude-drafts --json tagName,publishedAt \
+            --jq '[.[] | select(.tagName | test("-nightly\\."))] | sort_by(.publishedAt) | last | .tagName')
+          test -n "$tag" && test "$tag" != "null"
+          echo "Candidate: $tag"
+          mkdir -p candidate
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'temps-linux-amd64.tar.gz' --dir candidate
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'temps-linux-amd64.tar.gz.sha256' --dir candidate
+          (cd candidate && sha256sum --strict --check temps-linux-amd64.tar.gz.sha256)
+          tar -xzf candidate/temps-linux-amd64.tar.gz -C candidate
+
+      - name: Download previous release
+        run: |
+          set -euo pipefail
+          tag="${PREVIOUS_VERSION:-}"
+          if [ -z "$tag" ]; then
+            # Newest published release that is not an automated nightly
+            # build: the version an operator is upgrading from.
+            tag=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 300 \
+              --exclude-drafts --json tagName,publishedAt \
+              --jq '[.[] | select(.tagName | test("-nightly\\.") | not)] | sort_by(.publishedAt) | last | .tagName')
+          fi
+          test -n "$tag" && test "$tag" != "null"
+          echo "Previous release: $tag"
+          mkdir -p previous
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'temps-linux-amd64.tar.gz' --dir previous
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'temps-linux-amd64.tar.gz.sha256' --dir previous
+          (cd previous && sha256sum --strict --check temps-linux-amd64.tar.gz.sha256)
+          tar -xzf previous/temps-linux-amd64.tar.gz -C previous
+
+      - name: Verify binaries run
+        run: |
+          chmod +x candidate/temps previous/temps
+          previous/temps --version
+          candidate/temps --version
+
+      # Pulled up front so a slow registry shows up here, not as a timeout
+      # inside the test. postgres:18 is what the pre-migration backup uses
+      # when no matching pg_dump is installed (the runner ships an older one).
+      - name: Pre-pull images
+        run: |
+          docker pull gotempsh/redis-walg:8-bookworm
+          docker pull postgres:18
+
+      - name: Upgrade, verify, guard and roll back
+        env:
+          OLD_BIN: previous/temps
+          NEW_BIN: candidate/temps
+          PG_CONTAINER: ${{ job.services.timescaledb.id }}
+          WORK_DIR: ${{ runner.temp }}/upgrade-test
+        run: scripts/test-upgrade-from-release.sh
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: upgrade-test-logs
+          path: ${{ runner.temp }}/upgrade-test/logs
+          retention-days: 7
+          if-no-files-found: ignore

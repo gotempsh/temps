@@ -88,6 +88,8 @@ fn next_post_migration_index_retry(current: std::time::Duration) -> std::time::D
 enum LocalStartupMigrationError {
     #[error(transparent)]
     InstallationMode(#[from] stateless::StatelessStartupError),
+    #[error(transparent)]
+    UpgradeSafety(#[from] crate::commands::schema_upgrade::SchemaUpgradeError),
     #[error(
         "Local startup database migration failed after installation-mode validation: {source}"
     )]
@@ -99,9 +101,20 @@ enum LocalStartupMigrationError {
 
 async fn run_local_mode_migrations(
     db: &sea_orm::DatabaseConnection,
+    database_url: &str,
     data_dir: &std::path::Path,
+    backup_policy: crate::commands::schema_upgrade::BackupPolicy,
 ) -> Result<Option<upgrade_telemetry::UpgradeProbe>, LocalStartupMigrationError> {
     stateless::reject_local_mode_for_managed_database(db).await?;
+    // Schema guard + pre-migration backup: before the first migration, and
+    // after the installation-mode check so a refused start writes nothing.
+    crate::commands::schema_upgrade::prepare_schema_upgrade(
+        db,
+        database_url,
+        data_dir,
+        backup_policy,
+    )
+    .await?;
     upgrade_telemetry::run_migrations_reporting_upgrade(db, data_dir)
         .await
         .map_err(|source| LocalStartupMigrationError::Migration { source })
@@ -255,6 +268,19 @@ pub struct ServeCommand {
     /// shows the manual command — only the "Update now" action is refused.
     #[arg(long)]
     pub disable_self_update: bool,
+
+    /// Apply pending database migrations on this start WITHOUT first taking
+    /// the automatic pre-migration backup.
+    ///
+    /// When this binary has migrations to apply to an existing database, it
+    /// normally dumps the database to `<data dir>/backups/pre-migration/`
+    /// first and refuses to migrate if that dump fails, because the dump is
+    /// what lets you roll back to the previous release. Pass this flag only
+    /// for the one start that needs it, after taking your own backup. It is
+    /// deliberately not an environment variable, so it cannot stay switched
+    /// on by accident.
+    #[arg(long)]
+    pub skip_pre_migration_backup: bool,
 
     /// Screenshot provider to use: "local" (headless Chrome), "remote", or "noop" (disabled)
     /// Use "noop" on servers without Chrome installed to skip screenshot functionality
@@ -478,6 +504,16 @@ impl ServeCommand {
                     .map(|(instance, storage)| (instance.as_str(), storage.as_str())),
             ))?;
             rt.block_on(stateless::prepare_storage())?;
+            // Stateless mode does not prove that provider backups exist. Require
+            // the same backup unless the operator explicitly opts out.
+            rt.block_on(crate::commands::schema_upgrade::prepare_schema_upgrade(
+                db.as_ref(),
+                &self.database_url,
+                &serve_config.data_dir,
+                crate::commands::schema_upgrade::BackupPolicy::from_skip_flag(
+                    self.skip_pre_migration_backup,
+                ),
+            ))?;
             rt.block_on(upgrade_telemetry::run_migrations_reporting_upgrade(
                 db.as_ref(),
                 &serve_config.data_dir,
@@ -489,7 +525,11 @@ impl ServeCommand {
             // start.
             rt.block_on(run_local_mode_migrations(
                 db.as_ref(),
+                &self.database_url,
                 &serve_config.data_dir,
+                crate::commands::schema_upgrade::BackupPolicy::from_skip_flag(
+                    self.skip_pre_migration_backup,
+                ),
             ))?
         };
         if let Some((instance_id, storage_identity)) = storage_identity {
@@ -1525,9 +1565,14 @@ mod post_migration_tests {
         .await
         .expect("mark the stateless migration pending without removing its binding");
 
-        let error = run_local_mode_migrations(db, &std::env::temp_dir())
-            .await
-            .expect_err("local startup must reject a stateless-bound database");
+        let error = run_local_mode_migrations(
+            db,
+            &database.database_url,
+            &std::env::temp_dir(),
+            crate::commands::schema_upgrade::BackupPolicy::SkippedByOperator,
+        )
+        .await
+        .expect_err("local startup must reject a stateless-bound database");
         assert!(matches!(
             error,
             LocalStartupMigrationError::InstallationMode(
@@ -1556,9 +1601,14 @@ mod post_migration_tests {
         .await
         .expect("restore the pre-identity schema");
 
-        run_local_mode_migrations(db, &std::env::temp_dir())
-            .await
-            .expect("fresh local startup should apply migrations");
+        run_local_mode_migrations(
+            db,
+            &database.database_url,
+            &std::env::temp_dir(),
+            crate::commands::schema_upgrade::BackupPolicy::SkippedByOperator,
+        )
+        .await
+        .expect("fresh local startup should apply migrations");
         assert!(
             !temps_database::get_pending_migration_names(db)
                 .await

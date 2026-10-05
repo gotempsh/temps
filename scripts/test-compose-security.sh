@@ -347,7 +347,7 @@ docker exec --user root temps-postgres \
   sh -c 'echo 17 > /var/lib/postgresql/data/PG_VERSION'
 upgrade_block() {
   awk -v pattern="$1" '
-    /^### Upgrading an Existing Docker Compose Stack/ { section = 1; next }
+    /^### Docker Compose stack/ { section = 1; next }
     section && /^#{2,3} / { exit }
     section && /^```bash$/ { block = ""; inside = 1; next }
     section && inside && /^```$/ {

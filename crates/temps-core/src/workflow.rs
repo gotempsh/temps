@@ -164,6 +164,19 @@ impl WorkflowError {
             | Self::Other(_) => false,
         }
     }
+
+    /// The failure text without the "Job execution failed:" prefix that
+    /// [`WorkflowError::JobExecutionFailed`] adds when displayed.
+    ///
+    /// Job failures are wrapped again when they stop a workflow, so using
+    /// `to_string()` at each level repeats that prefix in the reason a user
+    /// finally reads. Every other variant keeps its full display text.
+    pub fn detail(&self) -> String {
+        match self {
+            WorkflowError::JobExecutionFailed(message) => message.clone(),
+            other => other.to_string(),
+        }
+    }
 }
 
 /// Trait for writing logs in real-time during workflow execution
@@ -787,6 +800,23 @@ impl Default for WorkflowBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workflow_error_detail_drops_only_the_job_execution_prefix() {
+        let failed = WorkflowError::JobExecutionFailed("Failed to build image".to_string());
+        assert_eq!(
+            failed.to_string(),
+            "Job execution failed: Failed to build image"
+        );
+        assert_eq!(failed.detail(), "Failed to build image");
+
+        let other = WorkflowError::Other("disk full".to_string());
+        assert_eq!(other.detail(), other.to_string());
+        assert_eq!(
+            WorkflowError::WorkflowCancelled.detail(),
+            "Workflow was cancelled"
+        );
+    }
 
     #[derive(Debug)]
     struct TestJob {
