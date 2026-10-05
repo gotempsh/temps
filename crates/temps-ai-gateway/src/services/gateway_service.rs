@@ -71,6 +71,13 @@ pub struct GatewayService {
 }
 
 impl GatewayService {
+    pub(crate) fn encrypt_native_key(&self, key: &str) -> Result<String, AiGatewayError> {
+        self.provider_key_service.encrypt_api_key(key)
+    }
+    pub(crate) fn decrypt_native_key(&self, key: &str) -> Result<String, AiGatewayError> {
+        self.provider_key_service.decrypt_api_key(key)
+    }
+
     pub fn new(provider_key_service: Arc<ProviderKeyService>) -> Self {
         let mut providers: HashMap<&'static str, Box<dyn AiProvider>> = HashMap::new();
 

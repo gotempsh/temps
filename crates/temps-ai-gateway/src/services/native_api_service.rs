@@ -11,8 +11,8 @@
 //! the operator's OpenAI account, a namespace every gateway caller shares.
 //! Each one is recorded in `ai_gateway_objects` with its creator, and every
 //! later read, download, cancel or delete is refused unless the caller is
-//! that creator. Objects created with the caller's own key are not recorded:
-//! OpenAI already scopes them to the caller's account.
+//! that creator. BYOK uploads and batches also retain accounting metadata
+//! and encrypted credentials so completed work is reconciled without client polling.
 
 use std::collections::HashSet;
 use std::pin::Pin;
@@ -23,9 +23,11 @@ use futures_util::StreamExt;
 use reqwest::Method;
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
-    ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, TransactionTrait,
+    ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder,
+    QuerySelect, TransactionTrait,
 };
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use temps_entities::ai_gateway_objects::{self, KIND_BATCH, KIND_FILE};
 use tokio::io::AsyncWriteExt;
 use tokio_stream::Stream;
@@ -33,7 +35,8 @@ use tracing::{error, info, warn};
 
 use crate::error::AiGatewayError;
 use crate::native_types::{
-    BatchObject, CreateBatchRequest, FileObject, ResponseObject, ResponseUsage, ResponsesRequest,
+    BatchObject, BatchUsage, CreateBatchRequest, FileObject, ResponseObject, ResponseUsage,
+    ResponsesRequest,
 };
 use crate::providers::openai_native::{
     read_reply, validate_upstream_id, OpenAiNativeClient, UpstreamReply,
@@ -342,6 +345,86 @@ impl NativeApiService {
         }
     }
 
+    /// One worker per app state; a weak reference lets it stop when the plugin is dropped.
+    pub fn start_reconciler(service: &Arc<Self>) {
+        let service = Arc::downgrade(service);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                let Some(service) = service.upgrade() else {
+                    break;
+                };
+                if let Err(error) = service.reconcile_due_batches().await {
+                    warn!(error = %error, "Batch reconciliation failed; due jobs will retry");
+                }
+            }
+        });
+    }
+
+    async fn reconcile_due_batches(&self) -> Result<(), AiGatewayError> {
+        let now = chrono::Utc::now();
+        let due = ai_gateway_objects::Entity::find()
+            .filter(ai_gateway_objects::Column::NextPollAt.lte(now))
+            .order_by_asc(ai_gateway_objects::Column::NextPollAt)
+            .order_by_asc(ai_gateway_objects::Column::Id)
+            .limit(25)
+            .all(self.db.as_ref())
+            .await?;
+        for record in due {
+            let claimed = ai_gateway_objects::Entity::update_many()
+                .col_expr(
+                    ai_gateway_objects::Column::NextPollAt,
+                    Expr::value(now + chrono::Duration::minutes(5)),
+                )
+                .filter(ai_gateway_objects::Column::Id.eq(record.id))
+                .filter(ai_gateway_objects::Column::NextPollAt.lte(now))
+                .exec(self.db.as_ref())
+                .await?;
+            if claimed.rows_affected != 1 {
+                continue;
+            }
+            // Bound each job as well as rows per tick. A failed/aborted job keeps its durable retry lease.
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                self.reconcile_batch(&record),
+            )
+            .await;
+            if !matches!(result, Ok(Ok(()))) {
+                warn!(
+                    object_id = record.id,
+                    "Batch reconciliation incomplete; retry scheduled"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn reconcile_batch(
+        &self,
+        record: &ai_gateway_objects::Model,
+    ) -> Result<(), AiGatewayError> {
+        let credentials = self.record_credentials(record).await?;
+        let reply = self
+            .client
+            .send_buffered(
+                Method::GET,
+                &self.base_url(&credentials)?,
+                &credentials.api_key,
+                &format!("batches/{}", record.upstream_id),
+                None,
+            )
+            .await?;
+        if !reply.is_success() {
+            return Err(AiGatewayError::Validation {
+                message: "Provider could not retrieve tracked batch".into(),
+            });
+        }
+        let batch = parse_reply(&reply, "batches")?;
+        self.observe_batch(record, &batch).await
+    }
+
     /// Bound simultaneous spool files and validator memory; reject overload
     /// immediately instead of retaining queued request bodies.
     pub fn acquire_upload_slot(&self) -> Result<tokio::sync::OwnedSemaphorePermit, AiGatewayError> {
@@ -536,7 +619,7 @@ impl NativeApiService {
             return Ok(reply);
         }
 
-        if let Some(key_id) = credentials.system_key_id {
+        {
             let uploaded: FileObject = parse_reply(&reply, "files")?;
             validate_upstream_id(KIND_FILE, &uploaded.id)?;
             if let Err(record_error) = self
@@ -544,7 +627,7 @@ impl NativeApiService {
                     owner,
                     KIND_FILE,
                     &uploaded.id,
-                    key_id,
+                    &credentials,
                     Some(summary.model.clone()),
                     Some(summary.endpoint.clone()),
                 )
@@ -692,23 +775,10 @@ impl NativeApiService {
             }
         })?);
 
-        if let Some(credentials) = Self::byok_credentials(byok)? {
-            let base_url = self.base_url(&credentials)?;
-            return self
-                .client
-                .send_buffered(
-                    Method::POST,
-                    &base_url,
-                    &credentials.api_key,
-                    "batches",
-                    Some(body),
-                )
-                .await;
-        }
-
-        let input = self
-            .owned_object(owner, KIND_FILE, &request.input_file_id)
+        let (input_credentials, input) = self
+            .object_credentials(owner, byok, KIND_FILE, &request.input_file_id)
             .await?;
+        let input = input.ok_or_else(|| AiGatewayError::Validation { message: "Upload batch input through the gateway so model and accounting metadata are available".into() })?;
         let (Some(model), Some(endpoint)) = (input.model.clone(), input.endpoint.clone()) else {
             return Err(AiGatewayError::Validation {
                 message: format!(
@@ -727,17 +797,20 @@ impl NativeApiService {
         }
         // Re-check the catalog: the model may have been disabled since the
         // file was uploaded, and the batch must run on the key holding it.
-        let credentials = self
-            .gateway_service
-            .resolve_credentials(
-                &model,
-                &ByokOverride {
-                    api_key: None,
-                    base_url: None,
-                    system_key_id: Some(input.provider_key_id),
-                },
-            )
-            .await?;
+        let credentials = if input.provider_key_id.is_some() {
+            self.gateway_service
+                .resolve_credentials(
+                    &model,
+                    &ByokOverride {
+                        api_key: None,
+                        base_url: None,
+                        system_key_id: input.provider_key_id,
+                    },
+                )
+                .await?
+        } else {
+            input_credentials
+        };
         let base_url = self.base_url(&credentials)?;
         let reply = self
             .client
@@ -759,7 +832,7 @@ impl NativeApiService {
                 owner,
                 KIND_BATCH,
                 &batch.id,
-                input.provider_key_id,
+                &credentials,
                 Some(model.clone()),
                 Some(endpoint),
             )
@@ -849,6 +922,14 @@ impl NativeApiService {
         record: &ai_gateway_objects::Model,
         batch: &BatchObject,
     ) -> Result<(), AiGatewayError> {
+        if batch.id != record.upstream_id {
+            return Err(AiGatewayError::Validation {
+                message: "Provider returned a different batch id".into(),
+            });
+        }
+        if record.usage_recorded_at.is_some() {
+            return Ok(());
+        }
         let owner = Owner {
             user_id: record.owner_user_id,
             project_id: record.owner_project_id,
@@ -857,12 +938,12 @@ impl NativeApiService {
             .into_iter()
             .flatten()
         {
-            if validate_upstream_id("file", file_id).is_ok() {
+            if record.provider_key_id.is_some() && validate_upstream_id("file", file_id).is_ok() {
                 self.record(
                     owner,
                     KIND_FILE,
                     file_id,
-                    record.provider_key_id,
+                    &self.record_credentials(record).await?,
                     None,
                     None,
                 )
@@ -870,14 +951,30 @@ impl NativeApiService {
             }
         }
 
-        if !batch.is_terminal() || record.usage_recorded_at.is_some() || batch.usage.is_none() {
+        if !batch.is_terminal() {
             return Ok(());
+        }
+        let Some(usage) = self.terminal_usage(record, batch).await? else {
+            return Ok(());
+        };
+        if usage.input_tokens < 0 || usage.output_tokens < 0 {
+            return Err(AiGatewayError::Validation {
+                message: "Provider returned negative batch usage".into(),
+            });
         }
         let transaction = self.db.begin().await?;
         let claimed = ai_gateway_objects::Entity::update_many()
             .col_expr(
                 ai_gateway_objects::Column::UsageRecordedAt,
                 Expr::value(chrono::Utc::now()),
+            )
+            .col_expr(
+                ai_gateway_objects::Column::NextPollAt,
+                Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
+            )
+            .col_expr(
+                ai_gateway_objects::Column::ByokKeyEncrypted,
+                Expr::value(Option::<String>::None),
             )
             .filter(ai_gateway_objects::Column::Id.eq(record.id))
             .filter(ai_gateway_objects::Column::UsageRecordedAt.is_null())
@@ -887,7 +984,6 @@ impl NativeApiService {
             transaction.commit().await?;
             return Ok(()); // another poll recorded it first
         }
-        let usage = batch.usage.clone().unwrap_or_default();
         if usage.input_tokens == 0 && usage.output_tokens == 0 {
             transaction.commit().await?;
             return Ok(());
@@ -917,12 +1013,84 @@ impl NativeApiService {
                 0,
                 200,
                 false,
-                false,
+                record.provider_key_id.is_none(),
                 &context,
             )
             .await?;
         transaction.commit().await?;
         Ok(())
+    }
+
+    /// Some providers omit aggregate usage. Sum the streamed JSONL output instead,
+    /// including partial results from cancelled/expired batches, without buffering the file.
+    async fn terminal_usage(
+        &self,
+        record: &ai_gateway_objects::Model,
+        batch: &BatchObject,
+    ) -> Result<Option<BatchUsage>, AiGatewayError> {
+        if let Some(usage) = &batch.usage {
+            return Ok(Some(usage.clone()));
+        }
+        let Some(file_id) = &batch.output_file_id else {
+            if batch
+                .request_counts
+                .as_ref()
+                .is_some_and(|counts| counts.completed == 0)
+            {
+                return Ok(Some(BatchUsage::default()));
+            }
+            // Missing evidence is not zero consumption. Keep the durable retry pending.
+            return Ok(None);
+        };
+        validate_upstream_id(KIND_FILE, file_id)?;
+        let credentials = self.record_credentials(record).await?;
+        let response = self
+            .client
+            .send(
+                Method::GET,
+                &self.base_url(&credentials)?,
+                &credentials.api_key,
+                &format!("files/{file_id}/content"),
+                None,
+                true,
+            )
+            .await?;
+        if !response.status().is_success() {
+            return Err(AiGatewayError::Validation {
+                message: "Batch output is not yet available for accounting".into(),
+            });
+        }
+        let mut chunks = response.bytes_stream();
+        let mut line = Vec::new();
+        let mut usage = BatchUsage::default();
+        let mut lines = 0;
+        while let Some(chunk) = chunks.next().await {
+            let chunk = chunk.map_err(|error| AiGatewayError::Internal {
+                message: error.without_url().to_string(),
+            })?;
+            for part in chunk.split_inclusive(|byte| *byte == b'\n') {
+                if line.len() + part.len() > MAX_BATCH_LINE_BYTES {
+                    return Err(AiGatewayError::Validation {
+                        message: "Batch output line exceeds accounting limit".into(),
+                    });
+                }
+                line.extend_from_slice(part);
+                if part.last() == Some(&b'\n') {
+                    add_output_usage(&line, &mut usage)?;
+                    line.clear();
+                    lines += 1;
+                    if lines > MAX_BATCH_REQUESTS {
+                        return Err(AiGatewayError::Validation {
+                            message: "Batch output exceeds request limit".into(),
+                        });
+                    }
+                }
+            }
+        }
+        if !line.is_empty() {
+            add_output_usage(&line, &mut usage)?;
+        }
+        Ok(Some(usage))
     }
 
     /// Undo a provider operation when its ownership row could not be saved.
@@ -974,14 +1142,63 @@ impl NativeApiService {
         upstream_id: &str,
     ) -> Result<(ResolvedCredentials, Option<ai_gateway_objects::Model>), AiGatewayError> {
         if let Some(credentials) = Self::byok_credentials(byok)? {
-            return Ok((credentials, None));
+            let record = self
+                .find_owned_object(
+                    owner,
+                    kind,
+                    upstream_id,
+                    Some(&self.credential_scope(&credentials)?),
+                )
+                .await?;
+            return Ok((credentials, record));
         }
         let record = self.owned_object(owner, kind, upstream_id).await?;
-        let credentials = self
-            .gateway_service
-            .system_key_credentials(record.provider_key_id)
-            .await?;
+        // BYOK objects always require the caller to provide their own key.
+        if record.provider_key_id.is_none() {
+            return Err(AiGatewayError::ObjectNotFound {
+                kind: kind.into(),
+                id: upstream_id.into(),
+            });
+        }
+        let credentials = self.record_credentials(&record).await?;
         Ok((credentials, Some(record)))
+    }
+
+    fn credential_scope(
+        &self,
+        credentials: &ResolvedCredentials,
+    ) -> Result<String, AiGatewayError> {
+        if let Some(id) = credentials.system_key_id {
+            return Ok(format!("system:{id}"));
+        }
+        let mut hash = Sha256::new();
+        hash.update(credentials.api_key.as_bytes());
+        hash.update([0]);
+        hash.update(self.base_url(credentials)?.trim_end_matches('/').as_bytes());
+        Ok(format!("byok:{}", hex::encode(hash.finalize())))
+    }
+
+    async fn record_credentials(
+        &self,
+        record: &ai_gateway_objects::Model,
+    ) -> Result<ResolvedCredentials, AiGatewayError> {
+        if let Some(id) = record.provider_key_id {
+            return self.gateway_service.system_key_credentials(id).await;
+        }
+        let encrypted =
+            record
+                .byok_key_encrypted
+                .as_deref()
+                .ok_or_else(|| AiGatewayError::Validation {
+                    message: "BYOK reconciliation credential has already been released".into(),
+                })?;
+        Ok(ResolvedCredentials {
+            provider_id: OPENAI,
+            api_key: self.gateway_service.decrypt_native_key(encrypted)?,
+            base_url: record.byok_base_url.clone(),
+            credential_type: CredentialType::Byok,
+            system_key_id: None,
+        })
     }
 
     /// The caller's record of an object. Objects owned by someone else are
@@ -992,28 +1209,40 @@ impl NativeApiService {
         kind: &str,
         upstream_id: &str,
     ) -> Result<ai_gateway_objects::Model, AiGatewayError> {
+        self.find_owned_object(owner, kind, upstream_id, None)
+            .await?
+            .ok_or_else(|| AiGatewayError::ObjectNotFound {
+                kind: kind.into(),
+                id: upstream_id.into(),
+            })
+    }
+
+    async fn find_owned_object(
+        &self,
+        owner: Owner,
+        kind: &str,
+        upstream_id: &str,
+        scope: Option<&str>,
+    ) -> Result<Option<ai_gateway_objects::Model>, AiGatewayError> {
         let mut query = ai_gateway_objects::Entity::find()
             .filter(ai_gateway_objects::Column::Kind.eq(kind))
             .filter(ai_gateway_objects::Column::UpstreamId.eq(upstream_id));
+        query = if let Some(scope) = scope {
+            query.filter(ai_gateway_objects::Column::CredentialScope.eq(scope))
+        } else {
+            query.filter(ai_gateway_objects::Column::ProviderKeyId.is_not_null())
+        };
         query = match (owner.user_id, owner.project_id) {
-            (Some(user_id), _) => query.filter(ai_gateway_objects::Column::OwnerUserId.eq(user_id)),
-            (None, Some(project_id)) => {
-                query.filter(ai_gateway_objects::Column::OwnerProjectId.eq(project_id))
-            }
-            (None, None) => {
+            (Some(id), _) => query.filter(ai_gateway_objects::Column::OwnerUserId.eq(id)),
+            (None, Some(id)) => query.filter(ai_gateway_objects::Column::OwnerProjectId.eq(id)),
+            _ => {
                 return Err(AiGatewayError::ObjectNotFound {
-                    kind: kind.to_string(),
-                    id: upstream_id.to_string(),
+                    kind: kind.into(),
+                    id: upstream_id.into(),
                 })
             }
         };
-        query
-            .one(self.db.as_ref())
-            .await?
-            .ok_or_else(|| AiGatewayError::ObjectNotFound {
-                kind: kind.to_string(),
-                id: upstream_id.to_string(),
-            })
+        Ok(query.one(self.db.as_ref()).await?)
     }
 
     async fn record(
@@ -1021,7 +1250,7 @@ impl NativeApiService {
         owner: Owner,
         kind: &str,
         upstream_id: &str,
-        provider_key_id: i32,
+        credentials: &ResolvedCredentials,
         model: Option<String>,
         endpoint: Option<String>,
     ) -> Result<(), AiGatewayError> {
@@ -1036,7 +1265,24 @@ impl NativeApiService {
             kind: Set(kind.to_string()),
             upstream_id: Set(upstream_id.to_string()),
             provider: Set(OPENAI.to_string()),
-            provider_key_id: Set(provider_key_id),
+            provider_key_id: Set(credentials.system_key_id),
+            byok_key_encrypted: Set(
+                if credentials.system_key_id.is_none() && kind == KIND_BATCH {
+                    Some(
+                        self.gateway_service
+                            .encrypt_native_key(&credentials.api_key)?,
+                    )
+                } else {
+                    None
+                },
+            ),
+            byok_base_url: Set(credentials.base_url.clone()),
+            credential_scope: Set(self.credential_scope(credentials)?),
+            next_poll_at: Set(if kind == KIND_BATCH {
+                Some(chrono::Utc::now())
+            } else {
+                None
+            }),
             owner_user_id: Set(owner.user_id),
             owner_project_id: Set(if owner.user_id.is_some() {
                 None
@@ -1052,7 +1298,7 @@ impl NativeApiService {
         ai_gateway_objects::Entity::insert(row)
             .on_conflict(
                 OnConflict::columns([
-                    ai_gateway_objects::Column::ProviderKeyId,
+                    ai_gateway_objects::Column::CredentialScope,
                     ai_gateway_objects::Column::Kind,
                     ai_gateway_objects::Column::UpstreamId,
                 ])
@@ -1063,6 +1309,71 @@ impl NativeApiService {
             .await?;
         Ok(())
     }
+}
+
+/// Require exact token evidence for successful results; never silently count malformed usage as zero.
+fn add_output_usage(line: &[u8], total: &mut BatchUsage) -> Result<(), AiGatewayError> {
+    if line.iter().all(u8::is_ascii_whitespace) {
+        return Ok(());
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(line).map_err(|_| AiGatewayError::Validation {
+            message: "Invalid JSONL batch result".into(),
+        })?;
+    let response = &value["response"];
+    if response.is_null() && !value["error"].is_null() {
+        return Ok(());
+    }
+    if response["status_code"].as_u64().is_none() {
+        return Err(AiGatewayError::Validation {
+            message: "Batch result is missing response status".into(),
+        });
+    }
+    if !response["status_code"]
+        .as_u64()
+        .is_some_and(|status| (200..300).contains(&status))
+    {
+        return Ok(());
+    }
+    let usage = &response["body"]["usage"];
+    let input = usage["input_tokens"]
+        .as_i64()
+        .or_else(|| usage["prompt_tokens"].as_i64());
+    let output = usage["output_tokens"]
+        .as_i64()
+        .or_else(|| usage["completion_tokens"].as_i64())
+        .or_else(|| {
+            if response["body"]["object"] == "list" {
+                Some(0)
+            } else {
+                None
+            }
+        });
+    let (Some(input), Some(output)) = (input, output) else {
+        return Err(AiGatewayError::Validation {
+            message: "Successful batch result is missing token usage".into(),
+        });
+    };
+    if input < 0 || output < 0 {
+        return Err(AiGatewayError::Validation {
+            message: "Negative token usage in batch output".into(),
+        });
+    }
+    total.input_tokens =
+        total
+            .input_tokens
+            .checked_add(input)
+            .ok_or_else(|| AiGatewayError::Validation {
+                message: "Batch input token count overflow".into(),
+            })?;
+    total.output_tokens =
+        total
+            .output_tokens
+            .checked_add(output)
+            .ok_or_else(|| AiGatewayError::Validation {
+                message: "Batch output token count overflow".into(),
+            })?;
+    Ok(())
 }
 
 /// Requests that read state stored in the provider account. With the shared
@@ -1243,7 +1554,11 @@ mod tests {
             kind: KIND_BATCH.into(),
             upstream_id: "batch_test".into(),
             provider: OPENAI.into(),
-            provider_key_id: 2,
+            provider_key_id: Some(2),
+            byok_key_encrypted: None,
+            byok_base_url: None,
+            credential_scope: "system:2".into(),
+            next_poll_at: Some(chrono::Utc::now()),
             owner_user_id: Some(4),
             owner_project_id: None,
             model: Some("gpt-4o".into()),
@@ -1259,6 +1574,180 @@ mod tests {
             "usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn byok_batch_is_reconciled_without_a_client_poll() {
+        use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
+        use wiremock::{
+            matchers::{header, method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/batches/batch_test"))
+            .and(header("authorization", "Bearer test-reconciliation-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id":"batch_test", "object":"batch", "status":"cancelled",
+                "usage":{"input_tokens":10,"output_tokens":5}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut record = batch_record();
+        record.provider_key_id = None;
+        record.credential_scope = "byok:test".into();
+        record.byok_base_url = Some(format!("{}/v1", server.uri()));
+        record.byok_key_encrypted = Some(
+            temps_core::EncryptionService::new("01234567890123456789012345678901")
+                .unwrap()
+                .encrypt_string("test-reconciliation-key")
+                .unwrap(),
+        );
+        let log = temps_entities::ai_usage_logs::Model {
+            id: 1,
+            timestamp: chrono::Utc::now(),
+            user_id: Some(4),
+            provider: OPENAI.into(),
+            model: "gpt-4o".into(),
+            input_tokens: 10,
+            output_tokens: 5,
+            latency_ms: 0,
+            estimated_cost_microcents: 0,
+            status: 200,
+            is_streaming: false,
+            is_byok: true,
+            conversation_id: None,
+            tags: vec!["batch".into()],
+            request_id: Some("batch_test".into()),
+            trace_id: None,
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![record]])
+                .append_query_results([vec![log]])
+                .append_exec_results([
+                    MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1,
+                    },
+                    MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1,
+                    },
+                ])
+                .into_connection(),
+        );
+        let mut svc = service(db.clone());
+        svc.client = OpenAiNativeClient::for_test();
+        svc.reconcile_due_batches().await.unwrap();
+        drop(svc);
+        let sql = format!("{:?}", Arc::try_unwrap(db).unwrap().into_transaction_log());
+        assert!(
+            sql.contains("ai_usage_logs") && sql.contains("COMMIT"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("byok_key_encrypted") && sql.contains("next_poll_at"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("Bool(Some(true))"),
+            "BYOK flag was not logged: {sql}"
+        );
+    }
+
+    #[tokio::test]
+    async fn byok_lookup_binds_owner_and_credential_account() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<ai_gateway_objects::Model>::new()])
+                .into_connection(),
+        );
+        let svc = service(db.clone());
+        let key = ByokOverride {
+            api_key: Some("test-key".into()),
+            ..Default::default()
+        };
+        let (_, record) = svc
+            .object_credentials(
+                Owner {
+                    user_id: Some(4),
+                    project_id: None,
+                },
+                &key,
+                KIND_BATCH,
+                "batch_test",
+            )
+            .await
+            .unwrap();
+        assert!(record.is_none());
+        let first = svc
+            .credential_scope(&ResolvedCredentials {
+                provider_id: OPENAI,
+                api_key: "first".into(),
+                base_url: None,
+                credential_type: CredentialType::Byok,
+                system_key_id: None,
+            })
+            .unwrap();
+        let second = svc
+            .credential_scope(&ResolvedCredentials {
+                provider_id: OPENAI,
+                api_key: "second".into(),
+                base_url: None,
+                credential_type: CredentialType::Byok,
+                system_key_id: None,
+            })
+            .unwrap();
+        assert_ne!(first, second);
+        drop(svc);
+        let sql = format!("{:?}", Arc::try_unwrap(db).unwrap().into_transaction_log());
+        assert!(
+            sql.contains("owner_user_id") && sql.contains("credential_scope"),
+            "{sql}"
+        );
+        assert!(!sql.contains("test-key"), "credential leaked to SQL");
+    }
+
+    #[tokio::test]
+    async fn cancelled_batch_without_aggregate_usage_reads_partial_results() {
+        use wiremock::{matchers::path, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let output = concat!(
+            "{\"response\":{\"status_code\":200,\"body\":{\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}}}\n",
+            "{\"response\":{\"status_code\":200,\"body\":{\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}}"
+        );
+        Mock::given(path("/v1/files/file-output/content"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(output))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut svc = service(Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        ));
+        svc.client = OpenAiNativeClient::for_test();
+        let mut record = batch_record();
+        record.provider_key_id = None;
+        record.byok_key_encrypted =
+            Some(svc.gateway_service.encrypt_native_key("test-key").unwrap());
+        record.byok_base_url = Some(format!("{}/v1", server.uri()));
+        let mut batch = finished_batch();
+        batch.status = "cancelled".into();
+        batch.usage = None;
+        batch.output_file_id = Some("file-output".into());
+        let usage = svc.terminal_usage(&record, &batch).await.unwrap().unwrap();
+        assert_eq!((usage.input_tokens, usage.output_tokens), (9, 4));
+    }
+
+    #[test]
+    fn malformed_successful_result_is_not_silently_counted_as_zero() {
+        let mut usage = BatchUsage::default();
+        assert!(
+            add_output_usage(br#"{"response":{"status_code":200,"body":{}}}"#, &mut usage).is_err()
+        );
+        assert!(add_output_usage(br#"{"response":{"status_code":200,"body":{"usage":{"input_tokens":-1,"output_tokens":0}}}}"#, &mut usage).is_err());
     }
 
     #[tokio::test]

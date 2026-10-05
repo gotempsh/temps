@@ -45,6 +45,7 @@ pub async fn create_ai_gateway_app_state(
         gateway_service.clone(),
         usage_service.clone(),
     ));
+    NativeApiService::start_reconciler(&native_api_service);
     Arc::new(AiGatewayAppState {
         db,
         gateway_service,

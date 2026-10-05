@@ -42796,6 +42796,25 @@
         ],
         "description": "A response object as returned by the provider."
       },
+      "ResponseStreamEvent": {
+        "allOf": [
+          {
+            "type": "object"
+          },
+          {
+            "properties": {
+              "type": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          }
+        ],
+        "description": "One JSON payload in the Responses SSE stream. Event-specific fields are retained."
+      },
       "ResponseUsage": {
         "description": "Token usage of a response.",
         "properties": {
@@ -64935,9 +64954,14 @@
                 "schema": {
                   "$ref": "#/components/schemas/ResponseObject"
                 }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResponseStreamEvent"
+                }
               }
             },
-            "description": "Response object, or `text/event-stream` when `stream` is true"
+            "description": "JSON when stream=false, SSE when stream=true. Generated SDKs use the explicit /json and /stream operations."
           },
           "400": {
             "content": {
@@ -64995,6 +65019,100 @@
             "bearer_auth": []
           }
         ],
+        "tags": [
+          "AI Gateway"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/v1/responses/json": {
+      "post": {
+        "operationId": "create_response_json",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResponsesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResponseObject"
+                }
+              }
+            },
+            "description": "Complete response object; forces stream=false"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Explicit JSON contract for generated clients; the standard OpenAI route remains polymorphic.",
+        "tags": [
+          "AI Gateway"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/v1/responses/stream": {
+      "post": {
+        "operationId": "create_response_stream",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResponsesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResponseStreamEvent"
+                }
+              }
+            },
+            "description": "Incremental Responses events; forces stream=true"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Explicit SSE contract for generated clients; never buffers a successful event stream.",
         "tags": [
           "AI Gateway"
         ],

@@ -56,6 +56,8 @@ const FORWARDED_UPLOAD_FIELDS: [&str; 2] = ["expires_after[anchor]", "expires_af
 #[openapi(
     paths(
         create_response,
+        create_response_json,
+        create_response_stream,
         upload_file,
         retrieve_file,
         delete_file,
@@ -68,6 +70,7 @@ const FORWARDED_UPLOAD_FIELDS: [&str; 2] = ["expires_after[anchor]", "expires_af
         ResponsesRequest,
         ResponseObject,
         ResponseUsage,
+        ResponseStreamEvent,
         UploadFileForm,
         FileObject,
         FileDeletedResponse,
@@ -85,6 +88,8 @@ pub struct AiGatewayNativeApiDoc;
 pub fn configure_native_routes() -> Router<Arc<AiGatewayAppState>> {
     Router::new()
         .route("/ai/v1/responses", post(create_response))
+        .route("/ai/v1/responses/json", post(create_response_json))
+        .route("/ai/v1/responses/stream", post(create_response_stream))
         .route(
             "/ai/v1/files",
             post(upload_file).layer(DefaultBodyLimit::max(UPLOAD_BODY_LIMIT)),
@@ -282,13 +287,45 @@ fn byok_for(
 // Responses
 // ============================================================================
 
+/// Explicit JSON contract for generated clients; the standard OpenAI route remains polymorphic.
+#[utoipa::path(tag = "AI Gateway", post, path = "/ai/v1/responses/json",
+    request_body = ResponsesRequest,
+    responses((status = 200, description = "Complete response object; forces stream=false", body = ResponseObject),
+        (status = 400, description = "Invalid request", body = OpenAiErrorResponse)),
+    security(("bearer_auth" = [])))]
+async fn create_response_json(
+    auth: RequireAuth,
+    state: State<Arc<AiGatewayAppState>>,
+    headers: HeaderMap,
+    Json(mut request): Json<ResponsesRequest>,
+) -> Result<Response, Problem> {
+    request.stream = false;
+    create_response(auth, state, headers, Json(request)).await
+}
+
+/// Explicit SSE contract for generated clients; never buffers a successful event stream.
+#[utoipa::path(tag = "AI Gateway", post, path = "/ai/v1/responses/stream",
+    request_body = ResponsesRequest,
+    responses((status = 200, description = "Incremental Responses events; forces stream=true", body = ResponseStreamEvent, content_type = "text/event-stream"),
+        (status = 400, description = "Invalid request", body = OpenAiErrorResponse)),
+    security(("bearer_auth" = [])))]
+async fn create_response_stream(
+    auth: RequireAuth,
+    state: State<Arc<AiGatewayAppState>>,
+    headers: HeaderMap,
+    Json(mut request): Json<ResponsesRequest>,
+) -> Result<Response, Problem> {
+    request.stream = true;
+    create_response(auth, state, headers, Json(request)).await
+}
+
 #[utoipa::path(
     tag = "AI Gateway",
     post,
     path = "/ai/v1/responses",
     request_body = ResponsesRequest,
     responses(
-        (status = 200, description = "Response object, or `text/event-stream` when `stream` is true", body = ResponseObject),
+        (status = 200, description = "JSON when stream=false, SSE when stream=true. Generated SDKs use the explicit /json and /stream operations.", content((ResponseObject = "application/json"), (ResponseStreamEvent = "text/event-stream"))),
         (status = 400, description = "Invalid request, or the model is not served by OpenAI", body = OpenAiErrorResponse),
         (status = 401, description = "Unauthorized", body = OpenAiErrorResponse),
         (status = 403, description = "Model not allowed", body = OpenAiErrorResponse),
@@ -849,6 +886,24 @@ async fn cancel_batch(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn responses_media_contracts_distinguish_json_and_incremental_events() {
+        use utoipa::OpenApi;
+        let document = serde_json::to_value(super::AiGatewayNativeApiDoc::openapi()).unwrap();
+        let responses =
+            &document["paths"]["/ai/v1/responses"]["post"]["responses"]["200"]["content"];
+        assert!(responses.get("application/json").is_some());
+        assert!(responses.get("text/event-stream").is_some());
+        let stream =
+            &document["paths"]["/ai/v1/responses/stream"]["post"]["responses"]["200"]["content"];
+        assert!(stream.get("text/event-stream").is_some());
+        assert!(stream.get("application/json").is_none());
+        let json =
+            &document["paths"]["/ai/v1/responses/json"]["post"]["responses"]["200"]["content"];
+        assert!(json.get("application/json").is_some());
+        assert!(json.get("text/event-stream").is_none());
+    }
+
     use super::*;
 
     #[test]

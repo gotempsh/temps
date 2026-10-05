@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Ownership of provider-side files and batches created through the AI
-//! gateway with an administrator-configured provider key.
+//! gateway, including BYOK batch accounting metadata.
 
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -25,7 +25,14 @@ pub struct Model {
     /// Provider that holds the object, e.g. `openai`
     pub provider: String,
     /// Administrator-configured key the object was created with
-    pub provider_key_id: i32,
+    pub provider_key_id: Option<i32>,
+    /// Encrypted BYOK batch credential, cleared once accounting commits.
+    pub byok_key_encrypted: Option<String>,
+    pub byok_base_url: Option<String>,
+    /// SHA-256 of credential and canonical endpoint; never exposes the key.
+    pub credential_scope: String,
+    /// Due time for durable batch reconciliation; NULL after accounting.
+    pub next_poll_at: Option<DBDateTime>,
     /// Creating user; `None` when a deployment token created it
     pub owner_user_id: Option<i32>,
     /// Creating project, for deployment tokens

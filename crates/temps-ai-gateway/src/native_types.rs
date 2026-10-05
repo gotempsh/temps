@@ -48,6 +48,15 @@ pub struct ResponsesRequest {
     pub extra: Map<String, Value>,
 }
 
+/// One JSON payload in the Responses SSE stream. Event-specific fields are retained.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResponseStreamEvent {
+    pub r#type: String,
+    #[serde(flatten)]
+    #[schema(value_type = Object)]
+    pub extra: Map<String, Value>,
+}
+
 /// Token usage of a response.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct ResponseUsage {

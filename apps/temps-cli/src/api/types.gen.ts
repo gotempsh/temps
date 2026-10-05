@@ -19743,6 +19743,15 @@ export type ResponseObject = {
 };
 
 /**
+ * One JSON payload in the Responses SSE stream. Event-specific fields are retained.
+ */
+export type ResponseStreamEvent = {
+    [key: string]: unknown;
+} & {
+    type: string;
+};
+
+/**
  * Token usage of a response.
  */
 export type ResponseUsage = {
@@ -30147,46 +30156,55 @@ export type ListModelsResponses = {
 
 export type ListModelsResponse = ListModelsResponses[keyof ListModelsResponses];
 
-export type CreateResponseData = {
+export type CreateResponseJsonData = {
     body: ResponsesRequest;
     path?: never;
     query?: never;
-    url: '/ai/v1/responses';
+    url: '/ai/v1/responses/json';
 };
 
-export type CreateResponseErrors = {
+export type CreateResponseJsonErrors = {
     /**
-     * Invalid request, or the model is not served by OpenAI
+     * Invalid request
      */
     400: OpenAiErrorResponse;
-    /**
-     * Unauthorized
-     */
-    401: OpenAiErrorResponse;
-    /**
-     * Model not allowed
-     */
-    403: OpenAiErrorResponse;
-    /**
-     * Model or provider not configured
-     */
-    404: OpenAiErrorResponse;
-    /**
-     * Internal error
-     */
-    500: OpenAiErrorResponse;
 };
 
-export type CreateResponseError = CreateResponseErrors[keyof CreateResponseErrors];
+export type CreateResponseJsonError = CreateResponseJsonErrors[keyof CreateResponseJsonErrors];
 
-export type CreateResponseResponses = {
+export type CreateResponseJsonResponses = {
     /**
-     * Response object, or `text/event-stream` when `stream` is true
+     * Complete response object; forces stream=false
      */
     200: ResponseObject;
 };
 
-export type CreateResponseResponse = CreateResponseResponses[keyof CreateResponseResponses];
+export type CreateResponseJsonResponse = CreateResponseJsonResponses[keyof CreateResponseJsonResponses];
+
+export type CreateResponseStreamData = {
+    body: ResponsesRequest;
+    path?: never;
+    query?: never;
+    url: '/ai/v1/responses/stream';
+};
+
+export type CreateResponseStreamErrors = {
+    /**
+     * Invalid request
+     */
+    400: OpenAiErrorResponse;
+};
+
+export type CreateResponseStreamError = CreateResponseStreamErrors[keyof CreateResponseStreamErrors];
+
+export type CreateResponseStreamResponses = {
+    /**
+     * Incremental Responses events; forces stream=true
+     */
+    200: ResponseStreamEvent;
+};
+
+export type CreateResponseStreamResponse = CreateResponseStreamResponses[keyof CreateResponseStreamResponses];
 
 export type GetGlobalAiWorkspaceData = {
     body?: never;
