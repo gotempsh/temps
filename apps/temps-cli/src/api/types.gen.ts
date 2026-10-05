@@ -2686,6 +2686,58 @@ export type BackupScheduleResponse = {
     updated_at: number;
 };
 
+/**
+ * A batch object as returned by the provider.
+ */
+export type BatchObject = {
+    [key: string]: unknown;
+} & {
+    completion_window?: string;
+    created_at?: number;
+    endpoint?: string;
+    /**
+     * Results of the failed requests.
+     */
+    error_file_id?: string | null;
+    id: string;
+    input_file_id?: string;
+    model?: string | null;
+    /**
+     * Always `batch`
+     */
+    object: string;
+    /**
+     * Results of the successful requests; download with
+     * `GET /ai/v1/files/{file_id}/content`.
+     */
+    output_file_id?: string | null;
+    request_counts?: BatchRequestCounts | null;
+    /**
+     * `validating`, `in_progress`, `finalizing`, `completed`, `failed`,
+     * `expired`, `cancelling` or `cancelled`
+     */
+    status: string;
+    usage?: BatchUsage | null;
+};
+
+/**
+ * Progress counters of a batch.
+ */
+export type BatchRequestCounts = {
+    completed?: number;
+    failed?: number;
+    total?: number;
+};
+
+/**
+ * Token usage of a finished batch, summed over its requests.
+ */
+export type BatchUsage = {
+    input_tokens?: number;
+    output_tokens?: number;
+    total_tokens?: number;
+};
+
 export type BindApplicationGitConnectionRequest = {
     connectionId: number;
     projectId: number;
@@ -5278,6 +5330,30 @@ export type CreateBackupScheduleRequest = {
      * Omit to use the default.
      */
     target_all_services?: boolean | null;
+};
+
+/**
+ * Request body of `POST /ai/v1/batches`.
+ */
+export type CreateBatchRequest = {
+    [key: string]: unknown;
+} & {
+    /**
+     * Currently only `24h`.
+     */
+    completion_window: string;
+    /**
+     * Endpoint every request in the input file targets: `/v1/responses`,
+     * `/v1/chat/completions` or `/v1/embeddings`.
+     */
+    endpoint: string;
+    /**
+     * A file uploaded through `POST /ai/v1/files` by the same caller.
+     */
+    input_file_id: string;
+    metadata?: {
+        [key: string]: string;
+    } | null;
 };
 
 export type CreateBitbucketRequest = {
@@ -10430,6 +10506,38 @@ export type FieldResponse = {
      * Whether the field is nullable
      */
     nullable: boolean;
+};
+
+/**
+ * Reply of `DELETE /ai/v1/files/{file_id}`.
+ */
+export type FileDeletedResponse = {
+    deleted: boolean;
+    id: string;
+    /**
+     * Always `file`
+     */
+    object: string;
+};
+
+/**
+ * A file object as returned by the provider.
+ */
+export type FileObject = {
+    [key: string]: unknown;
+} & {
+    bytes?: number;
+    created_at?: number;
+    filename?: string;
+    id: string;
+    /**
+     * Always `file`
+     */
+    object: string;
+    /**
+     * `batch` for uploads, `batch_output` for batch results
+     */
+    purpose?: string;
 };
 
 export type Finding = {
@@ -19724,6 +19832,77 @@ export type ResponseField = {
 };
 
 /**
+ * A response object as returned by the provider.
+ */
+export type ResponseObject = {
+    [key: string]: unknown;
+} & {
+    id: string;
+    model: string;
+    /**
+     * Always `response`
+     */
+    object: string;
+    /**
+     * `completed`, `incomplete`, `failed`, `in_progress`, …
+     */
+    status?: string | null;
+    usage?: ResponseUsage | null;
+};
+
+/**
+ * One JSON payload in the Responses SSE stream. Event-specific fields are retained.
+ */
+export type ResponseStreamEvent = {
+    [key: string]: unknown;
+} & {
+    type: string;
+};
+
+/**
+ * Token usage of a response.
+ */
+export type ResponseUsage = {
+    input_tokens?: number;
+    output_tokens?: number;
+    total_tokens?: number;
+};
+
+/**
+ * Request body of `POST /ai/v1/responses`, OpenAI's Responses API.
+ */
+export type ResponsesRequest = {
+    [key: string]: unknown;
+} & {
+    /**
+     * Run asynchronously and poll for the result. Requires your own
+     * provider key: the result is fetched from the provider account.
+     */
+    background?: boolean | null;
+    /**
+     * Attach the response to a stored conversation. Requires your own
+     * provider key, for the same reason as `previous_response_id`.
+     */
+    conversation?: {
+        [key: string]: unknown;
+    } | null;
+    /**
+     * Model to run, e.g. `gpt-6-luna`. Must be served by OpenAI.
+     */
+    model: string;
+    /**
+     * Continue from a stored response. Requires your own provider key
+     * (`X-Provider-Api-Key`), because stored responses live in the
+     * provider account that created them.
+     */
+    previous_response_id?: string | null;
+    /**
+     * Stream the reply as server-sent events.
+     */
+    stream?: boolean;
+};
+
+/**
  * Capabilities a service exposes for the generic restore framework.
  *
  * Each engine overrides `ExternalService::restore_capabilities` to declare
@@ -25804,6 +25983,21 @@ export type UpgradeServiceTemplateRequest = {
     target_version: string;
 };
 
+/**
+ * `multipart/form-data` body of `POST /ai/v1/files`.
+ */
+export type UploadFileForm = {
+    /**
+     * A JSONL batch input file: one request per line, every line targeting
+     * the same model and endpoint. At most 200 MB and 50,000 requests.
+     */
+    file: Blob | File;
+    /**
+     * Must be `batch`.
+     */
+    purpose: string;
+};
+
 export type UpsertAgentRequest = {
     /**
      * Preferred model identifier for the CLI. `Some("")` clears the stored value.
@@ -29836,6 +30030,107 @@ export type GetUsageTopModelsResponses = {
 
 export type GetUsageTopModelsResponse = GetUsageTopModelsResponses[keyof GetUsageTopModelsResponses];
 
+export type CreateBatchData = {
+    body: CreateBatchRequest;
+    path?: never;
+    query?: never;
+    url: '/ai/v1/batches';
+};
+
+export type CreateBatchErrors = {
+    /**
+     * Invalid request
+     */
+    400: OpenAiErrorResponse;
+    /**
+     * Unauthorized
+     */
+    401: OpenAiErrorResponse;
+    /**
+     * Input file not found for the caller
+     */
+    404: OpenAiErrorResponse;
+};
+
+export type CreateBatchError = CreateBatchErrors[keyof CreateBatchErrors];
+
+export type CreateBatchResponses = {
+    /**
+     * Batch created
+     */
+    200: BatchObject;
+};
+
+export type CreateBatchResponse = CreateBatchResponses[keyof CreateBatchResponses];
+
+export type RetrieveBatchData = {
+    body?: never;
+    path: {
+        /**
+         * Provider batch id, e.g. batch_abc123
+         */
+        batch_id: string;
+    };
+    query?: never;
+    url: '/ai/v1/batches/{batch_id}';
+};
+
+export type RetrieveBatchErrors = {
+    /**
+     * Unauthorized
+     */
+    401: OpenAiErrorResponse;
+    /**
+     * No such batch created by the caller
+     */
+    404: OpenAiErrorResponse;
+};
+
+export type RetrieveBatchError = RetrieveBatchErrors[keyof RetrieveBatchErrors];
+
+export type RetrieveBatchResponses = {
+    /**
+     * Batch object
+     */
+    200: BatchObject;
+};
+
+export type RetrieveBatchResponse = RetrieveBatchResponses[keyof RetrieveBatchResponses];
+
+export type CancelBatchData = {
+    body?: never;
+    path: {
+        /**
+         * Provider batch id, e.g. batch_abc123
+         */
+        batch_id: string;
+    };
+    query?: never;
+    url: '/ai/v1/batches/{batch_id}/cancel';
+};
+
+export type CancelBatchErrors = {
+    /**
+     * Unauthorized
+     */
+    401: OpenAiErrorResponse;
+    /**
+     * No such batch created by the caller
+     */
+    404: OpenAiErrorResponse;
+};
+
+export type CancelBatchError = CancelBatchErrors[keyof CancelBatchErrors];
+
+export type CancelBatchResponses = {
+    /**
+     * Batch is cancelling
+     */
+    200: BatchObject;
+};
+
+export type CancelBatchResponse = CancelBatchResponses[keyof CancelBatchResponses];
+
 export type ChatCompletionsData = {
     body: ChatCompletionRequest;
     path?: never;
@@ -29906,6 +30201,153 @@ export type EmbeddingsResponses = {
 
 export type EmbeddingsResponse = EmbeddingsResponses[keyof EmbeddingsResponses];
 
+export type UploadFileData = {
+    body: UploadFileForm;
+    path?: never;
+    query?: never;
+    url: '/ai/v1/files';
+};
+
+export type UploadFileErrors = {
+    /**
+     * Invalid batch input file
+     */
+    400: OpenAiErrorResponse;
+    /**
+     * Unauthorized
+     */
+    401: OpenAiErrorResponse;
+    /**
+     * Model not allowed
+     */
+    403: OpenAiErrorResponse;
+    /**
+     * Model or provider not configured
+     */
+    404: OpenAiErrorResponse;
+    /**
+     * File larger than 200 MB
+     */
+    413: OpenAiErrorResponse;
+    /**
+     * Concurrent upload capacity reached; retry later
+     */
+    429: OpenAiErrorResponse;
+};
+
+export type UploadFileError = UploadFileErrors[keyof UploadFileErrors];
+
+export type UploadFileResponses = {
+    /**
+     * Uploaded file
+     */
+    200: FileObject;
+};
+
+export type UploadFileResponse = UploadFileResponses[keyof UploadFileResponses];
+
+export type DeleteFileData = {
+    body?: never;
+    path: {
+        /**
+         * Provider file id, e.g. file-abc123
+         */
+        file_id: string;
+    };
+    query?: never;
+    url: '/ai/v1/files/{file_id}';
+};
+
+export type DeleteFileErrors = {
+    /**
+     * Unauthorized
+     */
+    401: OpenAiErrorResponse;
+    /**
+     * No such file created by the caller
+     */
+    404: OpenAiErrorResponse;
+};
+
+export type DeleteFileError = DeleteFileErrors[keyof DeleteFileErrors];
+
+export type DeleteFileResponses = {
+    /**
+     * File deleted
+     */
+    200: FileDeletedResponse;
+};
+
+export type DeleteFileResponse = DeleteFileResponses[keyof DeleteFileResponses];
+
+export type RetrieveFileData = {
+    body?: never;
+    path: {
+        /**
+         * Provider file id, e.g. file-abc123
+         */
+        file_id: string;
+    };
+    query?: never;
+    url: '/ai/v1/files/{file_id}';
+};
+
+export type RetrieveFileErrors = {
+    /**
+     * Unauthorized
+     */
+    401: OpenAiErrorResponse;
+    /**
+     * No such file created by the caller
+     */
+    404: OpenAiErrorResponse;
+};
+
+export type RetrieveFileError = RetrieveFileErrors[keyof RetrieveFileErrors];
+
+export type RetrieveFileResponses = {
+    /**
+     * File object
+     */
+    200: FileObject;
+};
+
+export type RetrieveFileResponse = RetrieveFileResponses[keyof RetrieveFileResponses];
+
+export type FileContentData = {
+    body?: never;
+    path: {
+        /**
+         * Provider file id, e.g. a batch's output_file_id
+         */
+        file_id: string;
+    };
+    query?: never;
+    url: '/ai/v1/files/{file_id}/content';
+};
+
+export type FileContentErrors = {
+    /**
+     * Unauthorized
+     */
+    401: OpenAiErrorResponse;
+    /**
+     * No such file created by the caller
+     */
+    404: OpenAiErrorResponse;
+};
+
+export type FileContentError = FileContentErrors[keyof FileContentErrors];
+
+export type FileContentResponses = {
+    /**
+     * File content (JSONL for batch files), streamed
+     */
+    200: Blob | File;
+};
+
+export type FileContentResponse = FileContentResponses[keyof FileContentResponses];
+
 export type ListModelsData = {
     body?: never;
     path?: never;
@@ -29930,6 +30372,56 @@ export type ListModelsResponses = {
 };
 
 export type ListModelsResponse = ListModelsResponses[keyof ListModelsResponses];
+
+export type CreateResponseJsonData = {
+    body: ResponsesRequest;
+    path?: never;
+    query?: never;
+    url: '/ai/v1/responses/json';
+};
+
+export type CreateResponseJsonErrors = {
+    /**
+     * Invalid request
+     */
+    400: OpenAiErrorResponse;
+};
+
+export type CreateResponseJsonError = CreateResponseJsonErrors[keyof CreateResponseJsonErrors];
+
+export type CreateResponseJsonResponses = {
+    /**
+     * Complete response object; forces stream=false
+     */
+    200: ResponseObject;
+};
+
+export type CreateResponseJsonResponse = CreateResponseJsonResponses[keyof CreateResponseJsonResponses];
+
+export type CreateResponseStreamData = {
+    body: ResponsesRequest;
+    path?: never;
+    query?: never;
+    url: '/ai/v1/responses/stream';
+};
+
+export type CreateResponseStreamErrors = {
+    /**
+     * Invalid request
+     */
+    400: OpenAiErrorResponse;
+};
+
+export type CreateResponseStreamError = CreateResponseStreamErrors[keyof CreateResponseStreamErrors];
+
+export type CreateResponseStreamResponses = {
+    /**
+     * Incremental Responses events; forces stream=true
+     */
+    200: ResponseStreamEvent;
+};
+
+export type CreateResponseStreamResponse = CreateResponseStreamResponses[keyof CreateResponseStreamResponses];
 
 export type GetGlobalAiWorkspaceData = {
     body?: never;

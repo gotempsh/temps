@@ -54,7 +54,7 @@ Temps doesn't create a database for you. To use PostgreSQL, add one as described
 | ------- | -------------------- |
 | Install | uv, Poetry, Pipenv or pip, chosen from your lockfile or manifest (for example `pip install -r requirements.txt`) |
 | WSGI server | Gunicorn with its default settings (one worker); set your own command in a `Procfile` |
-| Static files | Not collected automatically — see [Required Settings](#required-settings) |
+| Static files | Collected during the build on recent versions; needs `STATIC_ROOT` — see [Required Settings](#required-settings) |
 | HTTPS | Let's Encrypt certificate, auto-renewed |
 | Port | `PORT` env var injected, defaults to 8000 |
 | Health checks | HTTP check on `/` at deploy time, or the path set in `.temps.yaml` |
@@ -124,7 +124,7 @@ MIDDLEWARE = [
 ]
 ```
 
-Temps doesn't run `collectstatic`. Collect the files when the container starts by adding a `Procfile` to your repository root, replacing `myproject` with your project's package name:
+Recent Temps versions run `python manage.py collectstatic --noinput` during the build, so `STATIC_ROOT` must be set as above. On older versions, collect the files when the container starts by adding a `Procfile` to your repository root, replacing `myproject` with your project's package name:
 
 ```text {{ title: 'Procfile' }}
 web: python manage.py collectstatic --noinput && gunicorn myproject.wsgi:application --bind 0.0.0.0:$PORT

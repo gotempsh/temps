@@ -145,6 +145,12 @@ impl ProviderKeyService {
         Ok(())
     }
 
+    pub(crate) fn encrypt_api_key(&self, key: &str) -> Result<String, AiGatewayError> {
+        self.encryption_service
+            .encrypt_string(key)
+            .map_err(|e| AiGatewayError::Encryption(e.to_string()))
+    }
+
     /// Decrypt the API key from the stored encrypted value
     pub fn decrypt_api_key(&self, encrypted: &str) -> Result<String, AiGatewayError> {
         self.encryption_service
@@ -199,6 +205,16 @@ impl ProviderKeyService {
 
     pub async fn delete(&self, id: i32) -> Result<(), AiGatewayError> {
         let _ = self.get_by_id(id).await?;
+        if temps_entities::ai_gateway_objects::Entity::find()
+            .filter(temps_entities::ai_gateway_objects::Column::ProviderKeyId.eq(id))
+            .one(self.db.as_ref())
+            .await?
+            .is_some()
+        {
+            return Err(AiGatewayError::Validation {
+                message: "This key still owns gateway files or batches. Keep it configured to retrieve results, cancel jobs, and reconcile usage.".into(),
+            });
+        }
         ai_provider_keys::Entity::delete_by_id(id)
             .exec(self.db.as_ref())
             .await?;
@@ -314,6 +330,29 @@ mod tests {
 
         let decrypted = service.decrypt_api_key(&encrypted).unwrap();
         assert_eq!(decrypted, "sk-test-key-12345");
+    }
+
+    #[tokio::test]
+    async fn deleting_key_with_provider_objects_is_rejected_without_deleting() {
+        let object: temps_entities::ai_gateway_objects::Model = serde_json::from_value(serde_json::json!({
+            "id":1,"kind":"batch","upstream_id":"batch_test","provider":"openai","provider_key_id":1,
+            "credential_scope":"system:1","owner_user_id":1,"owner_project_id":null,"model":null,"endpoint":null,
+            "usage_recorded_at":null,"byok_key_encrypted":null,"byok_base_url":null,"next_poll_at":null,"created_at":chrono::Utc::now()
+        })).unwrap();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![sample_key()]])
+                .append_query_results([vec![object]])
+                .into_connection(),
+        );
+        let service = ProviderKeyService::new(db.clone(), test_encryption());
+        assert!(matches!(
+            service.delete(1).await,
+            Err(AiGatewayError::Validation { .. })
+        ));
+        drop(service);
+        let sql = format!("{:?}", Arc::try_unwrap(db).unwrap().into_transaction_log());
+        assert!(!sql.contains("DELETE"), "{sql}");
     }
 
     #[tokio::test]

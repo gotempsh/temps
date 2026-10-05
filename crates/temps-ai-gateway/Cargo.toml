@@ -42,6 +42,7 @@ uuid = { workspace = true }
 moka = { version = "0.12", features = ["future"] }
 sha2 = { workspace = true }
 hex = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
 sea-orm = { workspace = true, features = ["mock"] }

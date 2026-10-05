@@ -242,32 +242,33 @@ impl DoctorCommand {
     async fn check_version(&self, report: &mut DiagnosticReport) {
         let current = upgrade::current_version_tag();
         report.add("Current version", CheckResult::Info(current.clone()));
+        // The exact string `temps --version` prints, so the two are visibly
+        // the same build (tag, commit, build time).
+        report.add(
+            "Build",
+            CheckResult::Info(env!("TEMPS_VERSION").to_string()),
+        );
 
-        // Doctor wants visibility into "is anything newer out there?"
-        // regardless of channel — `Beta` includes both stable and beta
-        // releases, so it gives the absolute latest tag. The label below
-        // surfaces `(prerelease)` if the newest happens to be a beta.
-        match upgrade::fetch_latest_release_in_channel(upgrade::UpgradeChannel::Beta).await {
+        // Compare within the channel this build came from -- a nightly
+        // against nightlies, a beta against betas (and stable), stable
+        // against stable -- the same inference the server's update notifier
+        // uses when no channel is pinned in Settings.
+        let channel = upgrade::UpgradeChannel::for_installed_version(&current);
+        match upgrade::fetch_latest_release_in_channel(channel).await {
             Ok(release) => {
-                let latest = &release.tag_name;
-                if latest == &current {
-                    report.add("Update", CheckResult::Pass("Up to date".to_string()));
-                } else {
-                    let label = if release.prerelease {
-                        format!("{} available (prerelease)", latest)
-                    } else {
-                        format!("{} available", latest)
-                    };
-                    report.add(
-                        "Update",
-                        CheckResult::Warn(format!("{} - run `temps upgrade` to update", label)),
-                    );
-                }
+                report.add(
+                    "Update",
+                    update_check_result(&current, channel, &release.tag_name),
+                );
             }
             Err(e) => {
                 report.add(
                     "Update check",
-                    CheckResult::Warn(format!("Could not check for updates: {}", e)),
+                    CheckResult::Warn(format!(
+                        "Could not check the {} channel for updates: {}",
+                        channel.as_str(),
+                        e
+                    )),
                 );
             }
         }
@@ -1379,9 +1380,89 @@ fn mask_database_url(url: &str) -> String {
     url.to_string()
 }
 
+/// Turn "newest release on the channel" into a doctor line. Only a strictly
+/// newer release is reported as an update, and the suggested command names
+/// the channel so it installs what was suggested (plain `temps upgrade`
+/// tracks stable).
+fn update_check_result(
+    current: &str,
+    channel: upgrade::UpgradeChannel,
+    latest: &str,
+) -> CheckResult {
+    let channel_name = channel.as_str();
+    match upgrade::update_verdict(current, latest) {
+        upgrade::UpdateVerdict::UpToDate => {
+            CheckResult::Pass(format!("Up to date on the {channel_name} channel"))
+        }
+        upgrade::UpdateVerdict::Available => CheckResult::Warn(format!(
+            "{latest} available on the {channel_name} channel - run \
+             `temps upgrade --channel {channel_name}` to update"
+        )),
+        upgrade::UpdateVerdict::AheadOfChannel => CheckResult::Pass(format!(
+            "Up to date on the {channel_name} channel ({current} is newer than the newest \
+             published {channel_name} release, {latest})"
+        )),
+        upgrade::UpdateVerdict::Incomparable => CheckResult::Info(format!(
+            "Newest {channel_name} release is {latest}; this build ({current}) is not a \
+             release tag, so it cannot be compared"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_update_check_nightly_is_not_offered_an_older_beta() {
+        // Previously: "v0.1.0-beta.56 available (prerelease) - run `temps upgrade`".
+        let current = "v0.1.0-nightly.20261004.32a8e9c1";
+        let channel = upgrade::UpgradeChannel::for_installed_version(current);
+        assert_eq!(channel, upgrade::UpgradeChannel::Nightly);
+        match update_check_result(current, channel, "v0.1.0-beta.56") {
+            CheckResult::Pass(msg) => assert!(msg.contains("nightly channel"), "{msg}"),
+            other => panic!("expected Pass, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_update_check_suggests_channel_specific_upgrade() {
+        match update_check_result(
+            "v0.1.0-nightly.20261003.6f74680e",
+            upgrade::UpgradeChannel::Nightly,
+            "v0.1.0-nightly.20261004.32a8e9c1",
+        ) {
+            CheckResult::Warn(msg) => {
+                assert!(msg.contains("v0.1.0-nightly.20261004.32a8e9c1"), "{msg}");
+                assert!(msg.contains("temps upgrade --channel nightly"), "{msg}");
+            }
+            other => panic!("expected Warn, got {other:?}"),
+        }
+        match update_check_result(
+            "v0.1.0-beta.55",
+            upgrade::UpgradeChannel::Beta,
+            "v0.1.0-beta.56",
+        ) {
+            CheckResult::Warn(msg) => assert!(msg.contains("--channel beta"), "{msg}"),
+            other => panic!("expected Warn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_update_check_same_version_is_up_to_date() {
+        assert!(matches!(
+            update_check_result("v0.1.0", upgrade::UpgradeChannel::Stable, "v0.1.0"),
+            CheckResult::Pass(_)
+        ));
+    }
+
+    #[test]
+    fn test_update_check_dev_build_is_informational() {
+        assert!(matches!(
+            update_check_result("dev", upgrade::UpgradeChannel::Stable, "v0.1.0"),
+            CheckResult::Info(_)
+        ));
+    }
 
     #[test]
     fn test_mask_database_url_with_password() {
