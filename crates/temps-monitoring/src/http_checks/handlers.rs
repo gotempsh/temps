@@ -376,6 +376,7 @@ pub async fn secret_history(
     Query(query): Query<ListQuery>,
 ) -> Result<Json<VariableHistoryList>, Problem> {
     permission_guard!(auth, EnvironmentsRead);
+    permission_guard!(auth, SecretsRead);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
     Ok(Json(
@@ -575,6 +576,18 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn secret_history_requires_secret_read_before_querying() {
+        let (status, _) = call(
+            MockDatabase::new(DatabaseBackend::Postgres),
+            Some(session(temps_auth::Role::User)),
+            "GET",
+            "/projects/10/secrets/5/history",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn secret_detection_requires_secret_read_and_never_returns_the_value() {
         let (status, _) = call(
             MockDatabase::new(DatabaseBackend::Postgres),
@@ -604,7 +617,7 @@ mod tests {
         let (status, body) = call(
             MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results([Vec::<temps_entities::secrets::Model>::new()]),
-            Some(session(temps_auth::Role::User)),
+            Some(session(temps_auth::Role::Admin)),
             "GET",
             "/projects/10/secrets/5/history",
         )
