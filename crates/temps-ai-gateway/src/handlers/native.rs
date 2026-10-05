@@ -28,11 +28,11 @@ use temps_core::{AuditOperation, RequestMetadata};
 use tracing::{error, info};
 use utoipa::OpenApi;
 
+use super::sse_usage::UsageKind;
 use crate::error::AiGatewayError;
 use crate::handlers::gateway::{
     credential_type_str, error_to_response, extract_ai_context, extract_byok,
-    extract_responses_usage_from_sse_line, reject_deployment_token_base_url,
-    wrap_stream_with_usage_tracking,
+    reject_deployment_token_base_url, wrap_stream_with_usage_tracking,
 };
 use crate::handlers::types::AiGatewayAppState;
 use crate::native_types::*;
@@ -502,7 +502,7 @@ async fn create_response(
                 start,
                 is_byok,
                 ai_context,
-                extract_responses_usage_from_sse_line,
+                UsageKind::Responses,
             );
             let response = Response::builder()
                 .status(StatusCode::OK)

@@ -6,6 +6,7 @@ pub mod native;
 pub mod pricing;
 pub mod provider_status;
 pub mod providers;
+mod sse_usage;
 pub mod structured_output;
 pub mod types;
 pub mod usage;

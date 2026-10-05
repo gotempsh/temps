@@ -18,6 +18,7 @@ use temps_core::problemdetails::Problem;
 use tracing::{debug, error, info};
 use utoipa::OpenApi;
 
+use super::sse_usage::{SseUsage, UsageKind};
 use crate::error::AiGatewayError;
 use crate::handlers::types::AiGatewayAppState;
 use crate::services::gateway_service::{ByokOverride, CredentialType};
@@ -95,67 +96,28 @@ pub(crate) fn reject_deployment_token_base_url(
 // Streaming usage extraction
 // ============================================================================
 
-/// Extract usage info from an SSE `data: {...}` line.
-/// OpenAI sends usage in the final chunk when `stream_options.include_usage` is set.
-/// Anthropic's translator already puts usage in `message_delta` chunks.
-/// Returns `(prompt_tokens, completion_tokens)` if found.
+#[cfg(test)]
 fn extract_usage_from_sse_line(line: &str) -> Option<(i64, i64)> {
-    let json_str = line.strip_prefix("data: ")?.trim();
-    if json_str == "[DONE]" {
-        return None;
-    }
-    let parsed: serde_json::Value = serde_json::from_str(json_str).ok()?;
-    let usage = parsed.get("usage")?;
-    let prompt = usage
-        .get("prompt_tokens")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let completion = usage
-        .get("completion_tokens")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    if prompt > 0 || completion > 0 {
-        Some((prompt, completion))
-    } else {
-        None
-    }
+    extract_line(line, UsageKind::ChatCompletions)
 }
 
-/// Extract usage from a Responses API SSE line. The terminal event
-/// (`response.completed`, `response.incomplete` or `response.failed`)
-/// carries the whole response, including its `usage`.
-/// Returns `(input_tokens, output_tokens)` if found.
-pub(crate) fn extract_responses_usage_from_sse_line(line: &str) -> Option<(i64, i64)> {
-    let json_str = line.strip_prefix("data:")?.trim();
-    // Only the terminal event carries usage; skip parsing every delta.
-    if !json_str.contains("\"usage\"") {
-        return None;
-    }
-    let parsed: serde_json::Value = serde_json::from_str(json_str).ok()?;
-    let event_type = parsed.get("type")?.as_str()?;
-    if !matches!(
-        event_type,
-        "response.completed" | "response.incomplete" | "response.failed"
-    ) {
-        return None;
-    }
-    let usage = parsed.get("response")?.get("usage")?;
-    let input = usage
-        .get("input_tokens")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let output = usage
-        .get("output_tokens")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    (input > 0 || output > 0).then_some((input, output))
+#[cfg(test)]
+fn extract_responses_usage_from_sse_line(line: &str) -> Option<(i64, i64)> {
+    extract_line(line, UsageKind::Responses)
+}
+
+#[cfg(test)]
+fn extract_line(line: &str, kind: UsageKind) -> Option<(i64, i64)> {
+    let mut parser = SseUsage::new(kind);
+    parser.push(line.as_bytes(), |_, _| {});
+    parser.finish_line()
 }
 
 /// Wraps an upstream SSE byte stream to transparently intercept usage data
-/// from the final chunks, then logs it after the stream ends. `extract_usage`
-/// reads `(input, output)` tokens from one SSE line.
+/// from the final chunks, then logs it after the stream ends. Only usage fields
+/// and bounded JSON structure are retained, even for very large output events.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn wrap_stream_with_usage_tracking(
+pub(super) fn wrap_stream_with_usage_tracking(
     inner: std::pin::Pin<
         Box<dyn tokio_stream::Stream<Item = Result<Bytes, AiGatewayError>> + Send>,
     >,
@@ -166,55 +128,33 @@ pub(crate) fn wrap_stream_with_usage_tracking(
     start: Instant,
     is_byok: bool,
     ai_context: AiRequestContext,
-    extract_usage: fn(&str) -> Option<(i64, i64)>,
+    usage_kind: UsageKind,
 ) -> std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<Bytes, AiGatewayError>> + Send>> {
     use tokio_stream::StreamExt;
 
     let prompt_tokens = Arc::new(std::sync::atomic::AtomicI64::new(0));
     let completion_tokens = Arc::new(std::sync::atomic::AtomicI64::new(0));
-    // Buffer for incomplete SSE lines split across chunks. Bytes rather than
-    // text, so a multi-byte character split between chunks is not lost.
-    // Large output events are forwarded but skipped for usage parsing. No
-    // upstream can grow this per-stream scratch buffer without a bound.
-    const MAX_SSE_LINE_BYTES: usize = 32 * 1024 * 1024;
-    let mut line_buf = Vec::<u8>::new();
-    let mut skipping_line = false;
     let pt = prompt_tokens.clone();
     let ct = completion_tokens.clone();
-
-    let mapped = inner.map(move |result| {
-        if let Ok(ref bytes) = result {
-            let mut remaining = bytes.as_ref();
-            while !remaining.is_empty() {
-                let newline = remaining.iter().position(|byte| *byte == b'\n');
-                let end = newline.unwrap_or(remaining.len());
-                if !skipping_line {
-                    if line_buf.len().saturating_add(end) > MAX_SSE_LINE_BYTES {
-                        line_buf.clear();
-                        skipping_line = true;
-                    } else {
-                        line_buf.extend_from_slice(&remaining[..end]);
-                    }
-                }
-                if newline.is_some() {
-                    if !skipping_line {
-                        if let Ok(line) = std::str::from_utf8(&line_buf) {
-                            if let Some((p, c)) = extract_usage(line.trim()) {
-                                pt.store(p, std::sync::atomic::Ordering::Relaxed);
-                                ct.store(c, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        }
-                    }
-                    line_buf.clear();
-                    skipping_line = false;
-                    remaining = &remaining[end + 1..];
-                } else {
-                    break;
-                }
+    let mapped = async_stream::stream! {
+        let mut inner = inner;
+        let mut parser = SseUsage::new(usage_kind);
+        while let Some(result) = inner.next().await {
+            if let Ok(ref bytes) = result {
+                parser.push(bytes, |input, output| {
+                    pt.store(input, std::sync::atomic::Ordering::Relaxed);
+                    ct.store(output, std::sync::atomic::Ordering::Relaxed);
+                });
             }
+            yield result;
         }
-        result
-    });
+        // Providers normally terminate SSE lines with LF. Retain accounting
+        // for a complete final JSON event even when the last LF is omitted.
+        if let Some((input, output)) = parser.finish_line() {
+            pt.store(input, std::sync::atomic::Ordering::Relaxed);
+            ct.store(output, std::sync::atomic::Ordering::Relaxed);
+        }
+    };
 
     // When the stream ends, log usage
     let pt_final = prompt_tokens;
@@ -531,7 +471,7 @@ async fn chat_completions(
                     start,
                     cred_type == CredentialType::Byok,
                     ai_context.clone(),
-                    extract_usage_from_sse_line,
+                    UsageKind::ChatCompletions,
                 );
                 let body = Body::from_stream(wrapped);
 
@@ -1241,7 +1181,7 @@ mod tests {
             Instant::now(),
             false,
             AiRequestContext::default(),
-            extract_responses_usage_from_sse_line,
+            UsageKind::Responses,
         );
         let forwarded: Vec<u8> = wrapped
             .collect::<Vec<_>>()
@@ -1250,6 +1190,118 @@ mod tests {
             .flat_map(|chunk| chunk.expect("chunk").to_vec())
             .collect();
         assert_eq!(forwarded, bytes);
+    }
+
+    #[tokio::test]
+    async fn oversized_terminal_events_forward_unchanged_and_log_usage_once() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        use temps_entities::ai_usage_logs;
+        use tokio_stream::StreamExt;
+
+        for (index, event_type) in [
+            "response.completed",
+            "response.incomplete",
+            "response.failed",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for is_byok in [false, true] {
+                let usage = "\"usage\":{\"input_tokens\":74122,\"output_tokens\":32989}";
+                // Exercise counts both before and after >32 MiB of output.
+                let prefix = if index == 1 {
+                    format!("data: {{\"response\":{{{usage},\"output_text\":\"")
+                } else {
+                    format!("data: {{\"type\":\"{event_type}\",\"response\":{{\"output_text\":\"")
+                };
+                let suffix = if index == 1 {
+                    format!("\"}},\"type\":\"{event_type}\"}}\r\n\n")
+                } else {
+                    // Also handle a complete final event without a trailing LF.
+                    format!("\",{usage}}}}}")
+                };
+                let prefix = Bytes::from(prefix);
+                let suffix = Bytes::from(suffix);
+                let repeated = Bytes::from(vec![b'x'; 4096]);
+                let chunks = 8193;
+                let source_prefix = prefix.clone();
+                let source_suffix = suffix.clone();
+                let source_repeated = repeated.clone();
+                let source = async_stream::stream! {
+                    yield Ok(source_prefix);
+                    for _ in 0..chunks {
+                        yield Ok(source_repeated.clone());
+                    }
+                    yield Ok(source_suffix);
+                };
+                let db = Arc::new(
+                    MockDatabase::new(DatabaseBackend::Postgres)
+                        .append_query_results([vec![ai_usage_logs::Model {
+                            id: 1,
+                            timestamp: chrono::Utc::now(),
+                            user_id: Some(42),
+                            provider: "openai".into(),
+                            model: "streaming-test-model".into(),
+                            input_tokens: 74122,
+                            output_tokens: 32989,
+                            latency_ms: 0,
+                            estimated_cost_microcents: 0,
+                            status: 200,
+                            is_streaming: true,
+                            is_byok,
+                            conversation_id: None,
+                            tags: vec![],
+                            request_id: None,
+                            trace_id: None,
+                        }]])
+                        .into_connection(),
+                );
+                let mut wrapped = wrap_stream_with_usage_tracking(
+                    Box::pin(source),
+                    Arc::new(UsageService::new(db.clone())),
+                    Some(42),
+                    "openai".into(),
+                    "streaming-test-model".into(),
+                    Instant::now(),
+                    is_byok,
+                    AiRequestContext::default(),
+                    UsageKind::Responses,
+                );
+                let mut forwarded = 0;
+                while let Some(chunk) = wrapped.next().await {
+                    let chunk = chunk.expect("upstream bytes");
+                    let expected = if forwarded == 0 {
+                        &prefix
+                    } else if forwarded <= chunks {
+                        &repeated
+                    } else {
+                        &suffix
+                    };
+                    assert_eq!(&chunk, expected, "{event_type}, BYOK={is_byok}");
+                    forwarded += 1;
+                }
+                assert_eq!(forwarded, chunks + 2);
+                drop(wrapped);
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    while Arc::strong_count(&db) > 1 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("usage insert finished");
+                let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
+                assert_eq!(transactions.len(), 1, "exactly one usage insert");
+                let statements = transactions[0].statements();
+                assert_eq!(statements.len(), 1);
+                let statement = &statements[0];
+                assert!(statement.sql.starts_with("INSERT INTO \"ai_usage_logs\""));
+                let values = &statement.values.as_ref().expect("insert bindings").0;
+                assert_eq!(values[4], sea_orm::Value::BigInt(Some(74122)));
+                assert_eq!(values[5], sea_orm::Value::BigInt(Some(32989)));
+                assert_eq!(values[9], sea_orm::Value::Bool(Some(true)));
+                assert_eq!(values[10], sea_orm::Value::Bool(Some(is_byok)));
+            }
+        }
     }
 
     #[test]
