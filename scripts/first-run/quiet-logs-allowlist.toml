@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# Known, tracked log lines the quiet-logs soak tolerates while they are being
+# fixed. The goal is an empty file: every entry is a log line an operator sees
+# on an idle server, and each one needs an open issue to remove it.
+#
+# Entry format (all keys except `target` are required):
+#
+#   [[allow]]
+#   level   = "ERROR"                      # or "WARN"
+#   target  = "temps_example::module"      # optional: module path prefix
+#   pattern = "regex searched in the line" # Python regex, ANSI codes stripped
+#   issue   = "https://github.com/gotempsh/temps/issues/<n>"
+#   reason  = "why it is logged and what the fix is"
+#
+# An allowlisted WARN does not count towards its module's WARN-per-hour
+# budget. Entries that match nothing are listed in the soak summary so they
+# can be deleted once the fix lands.

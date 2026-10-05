@@ -8,9 +8,10 @@ use moka::future::Cache;
 use sea_orm::{prelude::*, QueryFilter, QueryOrder, QuerySelect, Set};
 use std::sync::Arc;
 use std::time::Duration;
+use temps_core::log_transitions::{FailureLatch, FailureLog, DEFAULT_REMINDER_INTERVAL};
 use temps_core::UtcDateTime;
 use temps_entities::ip_geolocations;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Max number of distinct IPs held in the geolocation cache. Bounds memory while
 /// covering the working set of a busy proxy (bots + real visitors).
@@ -18,6 +19,60 @@ const GEO_CACHE_MAX_ENTRIES: u64 = 100_000;
 /// How long a cached IP -> geolocation mapping stays valid. Geolocation is stable,
 /// so a long TTL collapses repeated lookups for the same IP into a single DB hit.
 const GEO_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Whether the GeoIP database is currently failing lookups it should be able
+/// to answer (a corrupt or truncated `.mmdb`, an undecodable record).
+///
+/// Process-wide on purpose: the proxy and the console API each build their
+/// own `IpAddressService` over the same database file, and a broken database
+/// is one condition, not one per caller. It is degraded functionality — the
+/// IP row is still stored, just without a location — so it is reported once
+/// at WARN when it starts (plus an hourly reminder) instead of once per new
+/// visitor IP.
+static GEO_LOOKUP_FAILURES: FailureLatch = FailureLatch::new(DEFAULT_REMINDER_INTERVAL);
+
+/// Report a lookup the database should have answered but could not.
+fn report_geo_lookup_failure(
+    latch: &FailureLatch,
+    ip_address: &str,
+    error: &crate::geoip_service::GeoIpError,
+) -> FailureLog {
+    let outcome = latch.record_failure();
+    match outcome {
+        FailureLog::Started => warn!(
+            ip_address,
+            error = %error,
+            "IP geolocation is degraded: the GeoIP database could not answer a lookup; \
+             new IPs are stored without location data until it recovers \
+             (repeat failures are logged at debug)"
+        ),
+        FailureLog::Reminder { consecutive } => warn!(
+            ip_address,
+            error = %error,
+            consecutive_failures = consecutive,
+            "IP geolocation is still degraded: the GeoIP database keeps failing lookups"
+        ),
+        FailureLog::Suppressed { consecutive } => debug!(
+            ip_address,
+            error = %error,
+            consecutive_failures = consecutive,
+            "failed to geolocate IP; storing it without location data"
+        ),
+    }
+    outcome
+}
+
+/// Report a successful lookup, logging the recovery if lookups were failing.
+fn report_geo_lookup_success(latch: &FailureLatch) -> Option<u64> {
+    let recovered = latch.record_success();
+    if let Some(failed_lookups) = recovered {
+        info!(
+            failed_lookups,
+            "IP geolocation recovered: the GeoIP database is answering lookups again"
+        );
+    }
+    recovered
+}
 
 #[derive(Debug, Clone)]
 pub struct IpAddressInfo {
@@ -153,7 +208,10 @@ impl IpAddressService {
                 })?)
                 .await
             {
-                Ok(data) => Some(data),
+                Ok(data) => {
+                    report_geo_lookup_success(&GEO_LOOKUP_FAILURES);
+                    Some(data)
+                }
                 // A private address, or a public one the database does not
                 // cover: the row is still stored, just without a location.
                 Err(e) if e.is_expected_miss() => {
@@ -161,11 +219,7 @@ impl IpAddressService {
                     None
                 }
                 Err(e) => {
-                    error!(
-                        ip_address = ip_address_str,
-                        error = %e,
-                        "failed to geolocate IP; storing it without location data"
-                    );
+                    report_geo_lookup_failure(&GEO_LOOKUP_FAILURES, ip_address_str, &e);
                     None
                 }
             };
@@ -389,6 +443,23 @@ fn geolocation_differs(stored: &ip_geolocations::Model, resolved: &GeoLocation) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn broken_geo_database_is_reported_once_until_it_recovers() {
+        let latch = FailureLatch::new(DEFAULT_REMINDER_INTERVAL);
+        let error = crate::geoip_service::GeoIpError::Other("Failed to decode city data".into());
+
+        assert_eq!(
+            report_geo_lookup_failure(&latch, "203.0.113.7", &error),
+            FailureLog::Started
+        );
+        // Every further new IP while the database is broken stays quiet.
+        for _ in 0..100 {
+            assert!(!report_geo_lookup_failure(&latch, "203.0.113.8", &error).should_log());
+        }
+        assert_eq!(report_geo_lookup_success(&latch), Some(101));
+        assert_eq!(report_geo_lookup_success(&latch), None);
+    }
 
     fn stored_row(now: UtcDateTime) -> ip_geolocations::Model {
         ip_geolocations::Model {

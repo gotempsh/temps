@@ -22,6 +22,23 @@ pub const ENCRYPTION_KEY_FILE: &str = "encryption_key";
 pub const AUTH_SECRET_FILE: &str = "auth_secret";
 pub const SQLITE_DB_NAME: &str = "temps.db";
 
+/// Read only telemetry consent, independently of unrelated settings sections.
+pub async fn anonymous_telemetry_preference(
+    db: &DbConnection,
+) -> Result<Option<bool>, ConfigServiceError> {
+    let model = settings::Entity::find_by_id(1).one(db).await?;
+    match model
+        .as_ref()
+        .and_then(|row| row.data.get("anonymous_telemetry_enabled"))
+    {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Bool(enabled)) => Ok(Some(*enabled)),
+        Some(_) => Err(ConfigServiceError::MalformedSettingsSection {
+            section: "anonymous_telemetry_enabled",
+        }),
+    }
+}
+
 /// Key of the geolocation section inside the singleton `settings.data`
 /// document. Named once so the surgical, geo-only writer below cannot drift
 /// from `AppSettings`' serde field name.
@@ -1324,6 +1341,9 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         // settings save must not undo a consent update committed before this lock.
         settings.plugin_installation_reporting_enabled =
             locked_settings.plugin_installation_reporting_enabled;
+        // Anonymous product telemetry consent likewise has its own locked,
+        // audit-logged write path (`set_anonymous_telemetry_enabled`).
+        settings.anonymous_telemetry_enabled = locked_settings.anonymous_telemetry_enabled;
         // CA lifecycle and join tokens have dedicated, locked write paths. Generic
         // settings saves must neither erase them nor revert a concurrent rotation.
         settings.multi_node.cluster_ca_cert_pem =
@@ -1832,9 +1852,10 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     /// the whole document would lose concurrent unrelated changes.
     pub async fn update_cloud_features(
         &self,
-        telemetry_enabled: bool,
-        backups_enabled: bool,
-        notifications_enabled: bool,
+        telemetry_enabled: Option<bool>,
+        backups_enabled: Option<bool>,
+        notifications_enabled: Option<bool>,
+        console_access_enabled: Option<bool>,
     ) -> Result<AppSettings, ConfigServiceError> {
         let transaction = self.db.begin().await?;
         let query = settings::Entity::find_by_id(1);
@@ -1848,9 +1869,18 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             .as_ref()
             .map(|model| AppSettings::from_json(model.data.clone()))
             .unwrap_or_default();
-        current.cloud.telemetry_enabled = telemetry_enabled;
-        current.cloud.backups_enabled = backups_enabled;
-        current.cloud.notifications_enabled = notifications_enabled;
+        if let Some(value) = telemetry_enabled {
+            current.cloud.telemetry_enabled = value;
+        }
+        if let Some(value) = backups_enabled {
+            current.cloud.backups_enabled = value;
+        }
+        if let Some(value) = notifications_enabled {
+            current.cloud.notifications_enabled = value;
+        }
+        if let Some(value) = console_access_enabled {
+            current.cloud.console_access_enabled = value;
+        }
         let now = Utc::now();
         if let Some(model) = existing {
             let merged = current.to_json_merged(&model.data);
@@ -1872,6 +1902,47 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         // Invalidate instead of publishing this transaction's clone: another
         // writer may commit later but update the cache earlier, and publishing
         // here would then regress the cache out of commit order.
+        self.invalidate_settings_cache().await;
+        Ok(current)
+    }
+
+    /// Persist only the console-access switch under the shared settings lock.
+    /// Used when an operator explicitly configures remote console access.
+    pub async fn set_console_access_enabled(
+        &self,
+        enabled: bool,
+    ) -> Result<AppSettings, ConfigServiceError> {
+        let transaction = self.db.begin().await?;
+        let query = settings::Entity::find_by_id(1);
+        let query = if self.is_postgres() {
+            query.lock_exclusive()
+        } else {
+            query
+        };
+        let existing = query.one(&transaction).await?;
+        let mut current = existing
+            .as_ref()
+            .map(|model| AppSettings::from_json(model.data.clone()))
+            .unwrap_or_default();
+        current.cloud.console_access_enabled = enabled;
+        let now = Utc::now();
+        if let Some(model) = existing {
+            let merged = current.to_json_merged(&model.data);
+            let mut active: settings::ActiveModel = model.into();
+            active.data = Set(merged);
+            active.updated_at = Set(now);
+            active.update(&transaction).await?;
+        } else {
+            settings::ActiveModel {
+                id: Set(1),
+                data: Set(current.to_json()),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&transaction)
+            .await?;
+        }
+        transaction.commit().await?;
         self.invalidate_settings_cache().await;
         Ok(current)
     }
@@ -1926,6 +1997,69 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         // here would then regress the cache out of commit order.
         self.invalidate_settings_cache().await;
         Ok(current)
+    }
+
+    /// Read the consent key without decoding or caching unrelated settings.
+    pub async fn anonymous_telemetry_preference(&self) -> Result<Option<bool>, ConfigServiceError> {
+        anonymous_telemetry_preference(self.db.as_ref()).await
+    }
+
+    /// Persist the admin's anonymous product telemetry preference
+    /// (`anonymous_telemetry_enabled`) and return the stored value.
+    ///
+    /// Only that one key of the shared settings document is rewritten, under
+    /// the row lock, so a concurrent unrelated settings write is never lost
+    /// and a malformed unrelated section is never reset to defaults. The
+    /// `settings_change` trigger notifies every other process, whose
+    /// telemetry reporters pick the new value up without a restart.
+    pub async fn set_anonymous_telemetry_enabled(
+        &self,
+        enabled: bool,
+    ) -> Result<Option<bool>, ConfigServiceError> {
+        let transaction = self.db.begin().await?;
+        let query = settings::Entity::find_by_id(1);
+        let query = if self.is_postgres() {
+            query.lock_exclusive()
+        } else {
+            query
+        };
+        let existing = query.one(&transaction).await?;
+        let now = Utc::now();
+
+        let mut document = existing
+            .as_ref()
+            .map(|model| model.data.clone())
+            .unwrap_or_else(|| AppSettings::default().to_json());
+        let fields =
+            document
+                .as_object_mut()
+                .ok_or(ConfigServiceError::MalformedSettingsSection {
+                    section: "settings",
+                })?;
+        fields.insert(
+            "anonymous_telemetry_enabled".to_string(),
+            serde_json::Value::Bool(enabled),
+        );
+
+        if let Some(model) = existing {
+            let mut active: settings::ActiveModel = model.into();
+            active.data = Set(document);
+            active.updated_at = Set(now);
+            active.update(&transaction).await?;
+        } else {
+            settings::ActiveModel {
+                id: Set(1),
+                data: Set(document),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&transaction)
+            .await?;
+        }
+
+        transaction.commit().await?;
+        self.invalidate_settings_cache().await;
+        Ok(Some(enabled))
     }
 
     /// Atomically update only the geolocation section of the shared settings
@@ -2797,6 +2931,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn telemetry_consent_read_ignores_malformed_unrelated_sections_on_each_backend() {
+        for backend in [
+            DatabaseBackend::Postgres,
+            DatabaseBackend::Sqlite,
+            DatabaseBackend::MySql,
+        ] {
+            let mut row = settings_row("kept.example.com");
+            row.data["rate_limiting"] = serde_json::json!("invalid");
+            row.data["anonymous_telemetry_enabled"] = serde_json::json!(false);
+            let db = MockDatabase::new(backend)
+                .append_query_results(vec![vec![row]])
+                .into_connection();
+            assert_eq!(
+                anonymous_telemetry_preference(&db).await.unwrap(),
+                Some(false)
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_settings_fallback_and_reserialization_keep_opt_out() {
+        let raw =
+            serde_json::json!({"rate_limiting":"invalid", "anonymous_telemetry_enabled":false});
+        let decoded = AppSettings::from_json(raw.clone());
+        assert_eq!(decoded.anonymous_telemetry_enabled, Some(false));
+        assert_eq!(
+            decoded.to_json_merged(&raw)["anonymous_telemetry_enabled"],
+            false
+        );
+    }
+
+    #[tokio::test]
+    async fn set_anonymous_telemetry_enabled_rewrites_only_its_own_key() {
+        // A malformed unrelated section must survive the write untouched: a
+        // whole-document decode would reset it (and everything else) to
+        // defaults.
+        let mut locked = settings_row("kept.example.com");
+        locked.data["rate_limiting"] = serde_json::json!("not-an-object");
+        let mut written = locked.clone();
+        written.data["anonymous_telemetry_enabled"] = serde_json::json!(false);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                .append_query_results(vec![
+                    vec![locked],
+                    vec![written.clone()],
+                    vec![written.clone()],
+                    vec![written],
+                ])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let svc = ConfigService::new(test_config(), db.clone());
+
+        let stored = svc
+            .set_anonymous_telemetry_enabled(false)
+            .await
+            .expect("telemetry preference saved");
+        assert_eq!(stored, Some(false));
+        drop(svc);
+
+        let statements = Arc::try_unwrap(db)
+            .expect("test should release database connection")
+            .into_transaction_log();
+        let update_sql = statements
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(ToString::to_string)
+            .find(|sql| sql.starts_with("UPDATE "))
+            .expect("settings update statement");
+        assert!(
+            update_sql.contains(r#""anonymous_telemetry_enabled":false"#),
+            "{update_sql}"
+        );
+        assert!(update_sql.contains("kept.example.com"), "{update_sql}");
+        assert!(update_sql.contains("not-an-object"), "{update_sql}");
+    }
+
+    #[tokio::test]
     async fn agent_sandbox_getter_ignores_malformed_unrelated_settings() {
         let mut row = settings_row("example.test");
         let mut sandbox = AgentSandboxSettings::default();
@@ -3053,6 +3268,7 @@ mod tests {
         let mut locked = settings_row("old.example.com");
         let mut locked_settings = AppSettings::from_json(locked.data.clone());
         locked_settings.plugin_installation_reporting_enabled = true;
+        locked_settings.anonymous_telemetry_enabled = Some(false);
         locked_settings.agent_sandbox.providers.insert(
             "codex_cli".into(),
             temps_core::ProviderConfig {
@@ -3094,6 +3310,7 @@ mod tests {
         let cached = svc.get_settings().await.expect("rebased cache");
         assert_eq!(cached.preview_domain, "new.example.com");
         assert!(cached.plugin_installation_reporting_enabled);
+        assert_eq!(cached.anonymous_telemetry_enabled, Some(false));
         let provider = &cached.agent_sandbox.providers["codex_cli"];
         assert_eq!(provider.auth_type, "subscription");
         assert_eq!(
@@ -4823,5 +5040,113 @@ mod tests {
             .await
             .expect("query")
             .is_some());
+    }
+
+    fn settings_row_with_document(document: serde_json::Value) -> settings::Model {
+        settings::Model {
+            id: 1,
+            data: document,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_console_access_enabled_persists_true_without_touching_other_cloud_fields() {
+        let mut document = AppSettings::default().to_json();
+        if let Some(cloud) = document
+            .get_mut("cloud")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            cloud.insert("telemetry_enabled".to_string(), serde_json::json!(true));
+        }
+        let row = settings_row_with_document(document);
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                // Locked read, then the row Sea-ORM re-selects after UPDATE
+                // (same shape as `update_geo_settings`'s own test above).
+                .append_query_results(vec![vec![row.clone()], vec![row]])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let svc = ConfigService::new(test_config(), db);
+
+        let updated = svc
+            .set_console_access_enabled(true)
+            .await
+            .expect("setting console access must succeed");
+
+        assert!(updated.cloud.console_access_enabled);
+        // Confirms this is a narrow, single-field update: an unrelated
+        // consent flag already `true` in the stored document must survive
+        // untouched, the same guarantee `update_cloud_features` gives the
+        // fields it does not own.
+        assert!(updated.cloud.telemetry_enabled);
+    }
+
+    #[tokio::test]
+    async fn a_fresh_instance_defaults_console_access_to_off() {
+        // The unattended first-boot bootstrap is the *only* path that turns
+        // this on -- calling it is a distinct, explicit step
+        // (`CloudService::enable_console_access_for_unattended_bootstrap`)
+        // never reached merely by loading settings. An instance that has
+        // never taken that step (including one enrolled by an operator
+        // pasting a code) must read back `false`.
+        assert!(!AppSettings::default().cloud.console_access_enabled);
+    }
+
+    #[tokio::test]
+    async fn partial_cloud_update_preserves_unrelated_consent() {
+        let mut settings = AppSettings::default();
+        settings.cloud.telemetry_enabled = true;
+        settings.cloud.console_access_enabled = true;
+        let row = settings_row_with_document(settings.to_json());
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                .append_query_results(vec![vec![row.clone()], vec![row]])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let service = ConfigService::new(test_config(), db);
+        let updated = service
+            .update_cloud_features(None, Some(true), None, None)
+            .await
+            .unwrap();
+        assert!(updated.cloud.backups_enabled);
+        assert!(updated.cloud.console_access_enabled);
+        assert!(updated.cloud.telemetry_enabled);
+    }
+
+    #[tokio::test]
+    async fn update_cloud_features_sets_console_access_enabled_explicitly() {
+        let row = settings_row_with_document(AppSettings::default().to_json());
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                // Locked read, then the row Sea-ORM re-selects after UPDATE
+                // (same shape as `update_geo_settings`'s own test above).
+                .append_query_results(vec![vec![row.clone()], vec![row]])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let svc = ConfigService::new(test_config(), db);
+
+        let updated = svc
+            .update_cloud_features(Some(false), Some(false), Some(false), Some(true))
+            .await
+            .expect("update_cloud_features must succeed");
+        assert!(
+            updated.cloud.console_access_enabled,
+            "the 4th positional argument must map to console_access_enabled"
+        );
     }
 }

@@ -22,6 +22,7 @@ pub mod node;
 pub mod proxy;
 pub mod reset_password;
 pub mod sandbox;
+pub mod schema_upgrade;
 pub mod serve;
 pub mod services;
 pub mod setup;

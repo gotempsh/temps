@@ -40,6 +40,55 @@ pub enum GitOpsError {
         subdirectory: String,
         reason: String,
     },
+
+    #[error("Failed to read the checked-out commit in {repo_path}: {reason}")]
+    ReadHeadFailed { repo_path: String, reason: String },
+}
+
+/// The commit a working copy has checked out, read from its own `.git`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadCommit {
+    /// Full hexadecimal object id of the commit.
+    pub sha: String,
+    /// Commit message, if it is valid UTF-8.
+    pub message: Option<String>,
+    /// Author name, if it is valid UTF-8.
+    pub author: Option<String>,
+}
+
+/// Read the commit `HEAD` points at in the working copy rooted at `repo_dir`.
+///
+/// Returns `Ok(None)` when `repo_dir` is not itself a git working copy (for
+/// example a provider archive download, which carries no `.git`). Parent
+/// directories are deliberately not searched: a checkout extracted somewhere
+/// inside another repository must not report that repository's commit.
+pub fn read_head_commit(repo_dir: &Path) -> Result<Option<HeadCommit>, GitOpsError> {
+    let read_failed = |reason: String| GitOpsError::ReadHeadFailed {
+        repo_path: repo_dir.display().to_string(),
+        reason,
+    };
+
+    let repo = match Repository::open_ext(
+        repo_dir,
+        git2::RepositoryOpenFlags::NO_SEARCH,
+        std::iter::empty::<&std::ffi::OsStr>(),
+    ) {
+        Ok(repo) => repo,
+        Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(None),
+        Err(e) => return Err(read_failed(e.message().to_string())),
+    };
+
+    let commit = repo
+        .head()
+        .and_then(|head| head.peel_to_commit())
+        .map_err(|e| read_failed(e.message().to_string()))?;
+
+    let author = commit.author().name().ok().map(str::to_string);
+    Ok(Some(HeadCommit {
+        sha: commit.id().to_string(),
+        message: commit.message().ok().map(|m| m.trim_end().to_string()),
+        author,
+    }))
 }
 
 fn clone_failed(url: &str, reason: String) -> GitOpsError {
@@ -231,6 +280,71 @@ fn clone_repo_with_credentials_inner(
     builder
         .clone(url, target_dir)
         .map_err(|e| clone_failed(url, e.message().to_string()))
+}
+
+/// Clone a named branch or tag shallowly, with cancellable transport processes.
+/// Credentials use process-local Git configuration, never argv or repository config.
+pub async fn clone_named_ref_with_credentials(
+    url: &str,
+    target: &Path,
+    username: &str,
+    token: &str,
+    reference: &str,
+) -> Result<(), GitOpsError> {
+    let credentials = Some((username, token));
+    let mut init = git_command();
+    init.args(["init", "--quiet", "--"]).arg(target);
+    run_git(init, "initialize shallow checkout")
+        .await
+        .map_err(|e| clone_failed(url, e))?;
+    let mut remote = git_command();
+    remote
+        .arg("-C")
+        .arg(target)
+        .args(["remote", "add", "origin", url]);
+    run_git(remote, "configure shallow checkout remote")
+        .await
+        .map_err(|e| clone_failed(url, e))?;
+
+    let fetch = |selected: String| async move {
+        let mut command = git_command();
+        command
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .arg("-C")
+            .arg(target)
+            .args(["fetch", "--depth=1", "--no-tags", "origin"])
+            .arg(format!("+{selected}:{selected}"));
+        apply_git_http_credentials(&mut command, credentials);
+        run_git(command, "fetch shallow checkout ref").await
+    };
+    let selected = if reference.starts_with("refs/") {
+        fetch(reference.to_string())
+            .await
+            .map_err(|e| clone_failed(url, e))?;
+        reference.to_string()
+    } else {
+        let branch = format!("refs/heads/{reference}");
+        match fetch(branch.clone()).await {
+            Ok(()) => branch,
+            Err(branch_error) => {
+                let tag = format!("refs/tags/{reference}");
+                fetch(tag.clone()).await.map_err(|tag_error| {
+                    clone_failed(url, format!("{branch_error}; {tag_error}"))
+                })?;
+                tag
+            }
+        }
+    };
+    let mut checkout = git_command();
+    checkout.arg("-C").arg(target).arg("checkout");
+    if let Some(branch) = selected.strip_prefix("refs/heads/") {
+        checkout.args(["-B", branch, &selected]);
+    } else {
+        checkout.args(["--detach", &selected]);
+    }
+    run_git(checkout, "checkout shallow ref")
+        .await
+        .map_err(|e| clone_failed(url, e))
 }
 
 /// Create a new local branch at HEAD and check it out. Equivalent to
@@ -648,6 +762,72 @@ mod tests {
     }
 
     #[test]
+    fn read_head_commit_returns_the_checked_out_commit() {
+        let (temp_dir, repo) = create_test_repo();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+
+        let commit = read_head_commit(temp_dir.path())
+            .expect("reading HEAD must succeed")
+            .expect("a working copy has a HEAD commit");
+
+        assert_eq!(commit.sha, head.id().to_string());
+        assert_eq!(commit.sha.len(), 40);
+        assert_eq!(commit.message.as_deref(), Some("add file"));
+        assert_eq!(commit.author.as_deref(), Some("Test"));
+    }
+
+    #[test]
+    fn read_head_commit_follows_a_detached_checkout() {
+        let (temp_dir, repo) = create_test_repo();
+        let first = repo
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .parent(0)
+            .unwrap()
+            .id()
+            .to_string();
+        checkout_ref(&repo, &first).unwrap();
+
+        let commit = read_head_commit(temp_dir.path()).unwrap().unwrap();
+
+        assert_eq!(commit.sha, first);
+        assert_eq!(commit.message.as_deref(), Some("initial commit"));
+    }
+
+    #[test]
+    fn read_head_commit_is_none_without_git_metadata() {
+        // An archive download has the files but no `.git`.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("main.go"), "package main").unwrap();
+
+        assert_eq!(read_head_commit(dir.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn read_head_commit_does_not_report_an_enclosing_repository() {
+        let (temp_dir, _repo) = create_test_repo();
+        let nested = temp_dir.path().join("extracted");
+        std::fs::create_dir(&nested).unwrap();
+
+        assert_eq!(read_head_commit(&nested).unwrap(), None);
+    }
+
+    #[test]
+    fn read_head_commit_errors_on_a_repository_without_commits() {
+        let dir = TempDir::new().unwrap();
+        Repository::init(dir.path()).unwrap();
+
+        let error = read_head_commit(dir.path()).unwrap_err();
+
+        assert!(matches!(error, GitOpsError::ReadHeadFailed { .. }));
+        assert!(error
+            .to_string()
+            .contains(&dir.path().display().to_string()));
+    }
+
+    #[test]
     fn test_checkout_ref_by_commit_sha() {
         let (_temp_dir, repo) = create_test_repo();
 
@@ -724,6 +904,112 @@ mod tests {
             result.unwrap_err(),
             GitOpsError::CheckoutFailed { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn authenticated_branch_clone_is_shallow_and_keeps_head_metadata() {
+        struct Daemon(std::process::Child);
+        impl Drop for Daemon {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let (source, repo) = create_test_repo();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("selected", &head, false).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let child = std::process::Command::new("git")
+            .args([
+                "daemon",
+                "--reuseaddr",
+                "--export-all",
+                "--listen=127.0.0.1",
+            ])
+            .arg(format!("--port={port}"))
+            .arg(format!(
+                "--base-path={}",
+                source.path().parent().unwrap().display()
+            ))
+            .arg(source.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("git CLI must be available for the clone regression test");
+        let mut daemon = Daemon(child);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                break;
+            }
+            assert!(daemon.0.try_wait().unwrap().is_none(), "git daemon exited");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "git daemon did not become ready"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let target = TempDir::new().unwrap();
+        let url = format!(
+            "git://127.0.0.1:{port}/{}",
+            source.path().file_name().unwrap().to_string_lossy()
+        );
+        let cloned =
+            clone_repo_with_credentials(&url, target.path(), "example", "unused", Some("selected"))
+                .unwrap();
+        assert!(
+            cloned.is_shallow(),
+            "branch clone must not download full history"
+        );
+        assert_eq!(cloned.head().unwrap().target(), Some(head.id()));
+        assert_eq!(
+            read_head_commit(target.path()).unwrap().unwrap().sha,
+            head.id().to_string()
+        );
+        let mut walk = cloned.revwalk().unwrap();
+        walk.push_head().unwrap();
+        assert_eq!(walk.count(), 1);
+        repo.tag_lightweight("release-only", head.as_object(), false)
+            .unwrap();
+        let first = head.parent(0).unwrap();
+        repo.tag_lightweight("selected", first.as_object(), false)
+            .unwrap();
+        for reference in [
+            "selected",
+            "refs/heads/selected",
+            "refs/tags/release-only",
+            "refs/tags/selected",
+        ] {
+            let target = TempDir::new().unwrap();
+            clone_named_ref_with_credentials(&url, target.path(), "example", "unused", reference)
+                .await
+                .unwrap();
+            let cloned = Repository::open(target.path()).unwrap();
+            let expected = if reference == "refs/tags/selected" {
+                first.id()
+            } else {
+                head.id()
+            };
+            assert!(cloned.is_shallow(), "{reference}");
+            assert_eq!(
+                cloned.head().unwrap().target(),
+                Some(expected),
+                "{reference}"
+            );
+            if !reference.starts_with("refs/tags/") {
+                assert!(cloned.head().unwrap().is_branch(), "{reference}");
+                assert_eq!(cloned.head().unwrap().shorthand().unwrap(), "selected");
+            } else {
+                assert!(cloned.head_detached().unwrap());
+            }
+            assert_eq!(
+                target.path().join("file.txt").exists(),
+                expected == head.id(),
+                "{reference}"
+            );
+        }
     }
 
     #[test]

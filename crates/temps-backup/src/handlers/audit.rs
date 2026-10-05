@@ -112,6 +112,12 @@ pub struct RestoreRunAudit {
     pub source_backup_id: i32,
     pub mode: String,
     pub target_service_name: Option<String>,
+    /// Services recorded as having produced the backup (empty when unknown).
+    pub backup_origin_service_ids: Vec<i32>,
+    /// Whether the restore targets a service other than the backup's origin.
+    pub cross_service: bool,
+    /// Whether the caller explicitly confirmed a cross-service restore.
+    pub cross_service_confirmed: bool,
 }
 
 /// Security audit record for a PostgreSQL major-upgrade mutation.

@@ -46,6 +46,8 @@ import {
 import { useEffect, useState } from 'react'
 import { Link, useNavigate } from 'react-router'
 import { serviceCreateHref } from '@/lib/service-project-link'
+import type { ServiceLinkChange } from '@/lib/service-link-redeploy'
+import { ServiceLinkRedeployPrompt } from './ServiceLinkRedeployPrompt'
 import { projectServiceResourcePath } from '@/lib/database-provisioning'
 import { toast } from 'sonner'
 
@@ -306,6 +308,9 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
   const [search, setSearch] = useState('')
   const [servicePendingLink, setServicePendingLink] =
     useState<ExternalServiceInfo | null>(null)
+  // The last link change, until the operator redeploys or dismisses it: the
+  // running app only sees the new variables after its next deployment.
+  const [linkChange, setLinkChange] = useState<ServiceLinkChange | null>(null)
   const providers = useQuery({ ...getProvidersMetadataOptions(), retry: false })
 
   useEffect(() => {
@@ -351,6 +356,9 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
     onSuccess: () => refetchServicesLinked(),
   })
 
+  const serviceName = (serviceId: number) =>
+    services?.find((item) => item.id === serviceId)?.name ?? 'The service'
+
   const linkService = async (
     serviceId: number,
     selection?: DatabaseProvisioningSelection
@@ -365,6 +373,7 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
       error: 'Failed to link service',
     })
     await promise
+    setLinkChange({ kind: 'linked', serviceName: serviceName(serviceId) })
     await refetchServicesLinked()
   }
 
@@ -380,7 +389,14 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
         success: 'Service unlinked',
         error: 'Failed to unlink service',
       })
-      await promise.catch(() => {})
+      await promise.then(
+        () =>
+          setLinkChange({
+            kind: 'unlinked',
+            serviceName: serviceName(serviceId),
+          }),
+        () => {}
+      )
     } else {
       const service = services?.find((item) => item.id === serviceId)
       if (
@@ -584,8 +600,14 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
         <p className="text-sm text-muted-foreground">
           Choose an existing database below, or create a new database of any
           supported type. Linking makes its connection settings available to
-          this project.
+          this project from its next deployment.
         </p>
+
+        <ServiceLinkRedeployPrompt
+          project={project}
+          change={linkChange}
+          onDismiss={() => setLinkChange(null)}
+        />
 
         {linkedServices.length > 0 ? (
           <section>

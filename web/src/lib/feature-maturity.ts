@@ -43,6 +43,8 @@ export function featureKeyForPath(pathname: string): string | undefined {
   if (pathname.startsWith('/settings/plugins')) return 'plugin-system'
   if (pathname.startsWith('/ai-gateway')) return 'ai-gateway'
   if (pathname.startsWith('/chat')) return 'ai-chat'
+  // The AI workspace is the chat-driven surface over harness sessions.
+  if (pathname.startsWith('/ai-first')) return 'ai-chat'
   if (pathname.startsWith('/ai-workflows')) return 'ai-agents-workflows'
   if (pathname.startsWith('/agent-sandbox')) return 'agent-execution-sandbox'
   if (pathname.startsWith('/revenue')) return 'revenue-tracking'

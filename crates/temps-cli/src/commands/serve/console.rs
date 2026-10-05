@@ -240,8 +240,6 @@ fn spawn_heartbeat_task(
     reporter: std::sync::Arc<dyn temps_core::telemetry::TelemetryReporter>,
     db: std::sync::Arc<sea_orm::DatabaseConnection>,
 ) {
-    use temps_core::telemetry::TelemetryEventKind;
-
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
         // The first tick completes immediately; skip it so the first heartbeat
@@ -250,12 +248,28 @@ fn spawn_heartbeat_task(
         interval.tick().await;
         loop {
             interval.tick().await;
-            let event =
-                build_instance_event(TelemetryEventKind::InstanceHeartbeat, db.as_ref()).await;
-            reporter.report(event);
-            tracing::debug!("emitted anonymous instance_heartbeat telemetry event");
+            emit_heartbeat(reporter.as_ref(), db.as_ref()).await;
         }
     });
+}
+
+/// One heartbeat tick. Checks the *current* telemetry state first: an admin
+/// can turn telemetry off (or on) at runtime from Settings > Telemetry, so the
+/// loop always runs and each tick decides. When disabled nothing is built or
+/// sent -- not even the count queries run. Returns whether an event was sent.
+async fn emit_heartbeat(
+    reporter: &dyn temps_core::telemetry::TelemetryReporter,
+    db: &sea_orm::DatabaseConnection,
+) -> bool {
+    use temps_core::telemetry::TelemetryEventKind;
+
+    if !reporter.is_enabled() {
+        return false;
+    }
+    let event = build_instance_event(TelemetryEventKind::InstanceHeartbeat, db).await;
+    reporter.report(event);
+    tracing::debug!("emitted anonymous instance_heartbeat telemetry event");
+    true
 }
 
 /// Interval between anonymous `error_summary` flushes. Shorter than the daily
@@ -278,9 +292,14 @@ fn spawn_error_summary_task(
         interval.tick().await;
         loop {
             interval.tick().await;
+            // Always drain, so counts accumulated while telemetry was off are
+            // discarded rather than reported after an admin turns it back on.
             let Some(summary) = temps_core::error_metrics::global().drain() else {
                 continue;
             };
+            if !reporter.is_enabled() {
+                continue;
+            }
             reporter.report(build_error_summary_event(&summary));
             tracing::debug!("emitted anonymous error_summary telemetry event");
         }
@@ -1066,7 +1085,7 @@ fn bootstrap_cloud_enrollment_from_env(
         let already_linked_service = cloud_service.clone();
         let apply_backend_url_service = cloud_service.clone();
         let enroll_service = cloud_service.clone();
-        let provision_service = cloud_service;
+        let provision_service = cloud_service.clone();
         let backend_url_audit = audit_logger.clone();
         let link_audit = audit_logger.clone();
         let backup_audit = audit_logger;
@@ -1111,6 +1130,8 @@ fn bootstrap_cloud_enrollment_from_env(
                          registered; the CLOUD_LINK_CONNECTED audit record was not written"
                     ),
                 }
+                // Enrollment preserves console consent. Enable remote console
+                // access explicitly from Settings > Temps Cloud or the CLI.
             },
             move || async move {
                 provision_service
@@ -3574,16 +3595,18 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     {
         if reporter.is_enabled() {
             report_instance_started(reporter.as_ref(), db.as_ref()).await;
-            // Keep "active instances" honest: a daily heartbeat so a live-but-idle
-            // instance still checks in even when it isn't deploying. No-op when
-            // telemetry is disabled (guarded above + report() no-ops anyway).
-            spawn_heartbeat_task(reporter.clone(), db.clone());
-            // Periodic aggregated error_summary flush (ERROR logs / console
-            // 5xx / panics — counts only, never messages). Only spawned when
-            // telemetry is enabled; the counters themselves are just bounded
-            // in-process memory either way.
-            spawn_error_summary_task(reporter.clone());
         }
+        // Telemetry can be switched on or off at runtime from Settings >
+        // Telemetry, so the periodic tasks always run and every tick checks the
+        // current state: nothing is built or sent while it is off.
+        //
+        // Keep "active instances" honest: a daily heartbeat so a live-but-idle
+        // instance still checks in even when it isn't deploying.
+        spawn_heartbeat_task(reporter.clone(), db.clone());
+        // Periodic aggregated error_summary flush (ERROR logs / console
+        // 5xx / panics — counts only, never messages). The counters are
+        // bounded in-process memory and are drained every tick either way.
+        spawn_error_summary_task(reporter.clone());
     }
     if let Some(user_service) = service_context.get_service::<temps_auth::UserService>() {
         // Always ensure the system user (id=0) exists — needed for webhook-created
@@ -4550,6 +4573,19 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let plugin_api_router =
         Router::new().nest("/api", public_router.clone().merge(admin_router.clone()));
 
+    // ADR-045 §3: a second clone of `admin_router`, shaped exactly like
+    // `admin_app` below (`nest("/api", ..)` + the static-file fallback) but
+    // taken *before* that router is wrapped in the admin IP-allowlist gate —
+    // for the same reason `plugin_api_router` above omits it: authorization
+    // for a console-proxied request comes from Cloud's own auth plus the
+    // browser's session cookie, not from network topology. Installed into
+    // the shared `ConsoleDispatchSlot` near the `RouterHostApi` wiring below,
+    // for `temps-cloud-client::console_proxy::ConsoleProxyWorker` (started
+    // elsewhere, once the `cloud.console_access_enabled` setting exists) to
+    // drive in-process.
+    let console_router = Router::new()
+        .nest("/api", admin_router.clone())
+        .fallback(serve_static_file);
     // Nodes paired from the control plane reach it over the WireGuard mesh
     // (ADR 048 D3); that listener serves only the routes nodes call.
     super::node_api::spawn(
@@ -4635,6 +4671,33 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     }
 
     info!("Plugin system initialized successfully with static file serving");
+
+    // ADR-045 §3: install the just-assembled `console_router` into a shared
+    // slot for the console-proxy dispatcher — the same "shared slot, filled
+    // post-construction" shape `RouterHostApi`'s bridge uses just below, and
+    // for the same reason: the router does not exist until this point in
+    // startup. The Cloud plugin registers the slot (and starts
+    // `ConsoleProxyWorker` reading from it) during service registration;
+    // this fills it. The fallback only exists for builds without that
+    // plugin, so the console still starts — nothing reads the slot then.
+    let console_dispatch_slot = match plugin_manager
+        .service_context()
+        .get_service::<temps_cloud_client::ConsoleDispatchSlot>()
+    {
+        Some(slot) => slot.as_ref().clone(),
+        None => {
+            let slot = temps_cloud_client::ConsoleDispatchSlot::new();
+            plugin_manager
+                .service_context()
+                .register_service(Arc::new(slot.clone()));
+            slot
+        }
+    };
+    console_dispatch_slot
+        .set(Arc::new(temps_cloud_client::ConsoleRouterHandle::new(
+            console_router,
+        )))
+        .await;
 
     let external_plugins_service = plugin_manager
         .service_context()
@@ -6086,6 +6149,61 @@ mod ai_tool_allowlist_tests {
                  fields carry unlabeled/different units — got: {description:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_tests {
+    use super::*;
+    use sea_orm::{DatabaseBackend, MockDatabase};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+    use temps_core::telemetry::{TelemetryEvent, TelemetryReporter};
+
+    /// Reporter whose enabled state a test can flip, recording what it was
+    /// asked to send.
+    #[derive(Default)]
+    struct SwitchableReporter {
+        enabled: AtomicBool,
+        sent: Mutex<Vec<String>>,
+    }
+
+    impl TelemetryReporter for SwitchableReporter {
+        fn report(&self, event: TelemetryEvent) {
+            self.sent.lock().unwrap().push(event.event_type);
+        }
+
+        fn is_enabled(&self) -> bool {
+            self.enabled.load(Ordering::SeqCst)
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_is_not_built_or_sent_while_telemetry_is_disabled() {
+        let reporter = SwitchableReporter::default();
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+
+        assert!(!emit_heartbeat(&reporter, &db).await);
+        assert!(reporter.sent.lock().unwrap().is_empty());
+        // Nothing was queried either: the instance counts are only gathered
+        // for an event that will actually be sent.
+        assert!(db.into_transaction_log().is_empty());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_follows_a_runtime_change_without_restart() {
+        let reporter = SwitchableReporter::default();
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+
+        reporter.enabled.store(true, Ordering::SeqCst);
+        assert!(emit_heartbeat(&reporter, &db).await);
+        reporter.enabled.store(false, Ordering::SeqCst);
+        assert!(!emit_heartbeat(&reporter, &db).await);
+
+        assert_eq!(
+            *reporter.sent.lock().unwrap(),
+            vec!["instance_heartbeat".to_string()]
+        );
     }
 }
 

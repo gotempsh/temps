@@ -2380,13 +2380,13 @@ impl ExternalService for S3Service {
         // cannot break out of the quoting context and inject commands.
         // See `RESTORE_IN_PLACE_SCRIPT` for the static script text.
         //
-        // TODO(security): No service-identity validation — a caller with
-        // BackupsWrite + ExternalServicesWrite can restore service A's backup
-        // onto service B's live MinIO. A full fix needs an optional
-        // `confirm_target_service_id` field on `StartRestoreRequest` checked
-        // against the URL `{id}`. Deferred because it requires the shared
-        // restore-framework code well beyond S3's scope (tracked: PR #595
-        // description, "MINOR: no service-identity binding" finding).
+        // Service-identity binding is enforced by the shared restore
+        // framework before this runs: `POST /external-services/{id}/restore`
+        // requires access to both the backup's origin service(s) and the
+        // target, and refuses a destructive restore onto a service that did
+        // not produce the backup (or whose origin is unknown) unless the
+        // caller sets `confirm_cross_service`, which is audited
+        // (`RestoreOriginBinding::require_confirmation`).
         let backup_prefix = format!(
             "bkp/{}/{}",
             ctx.s3_source.bucket_name,

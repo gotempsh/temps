@@ -25,6 +25,7 @@ pub use notifier::BackupNotificationAdapter;
 pub use reconcile::reconcile_orphan_backups;
 pub use restore::{
     BackupProducerServices, BackupSelector, PlanSourceBackup, PlanTarget, RestoreError,
-    RestorePlan, RestoreRequestMode, RestoreRunView, RestoreService, RestoreServiceIdentity,
+    RestoreOriginBinding, RestorePlan, RestoreRequestMode, RestoreRunView, RestoreService,
+    RestoreServiceIdentity,
 };
 pub use s3_lifecycle::{ReconcileOutcome, S3LifecycleService};

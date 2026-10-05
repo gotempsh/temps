@@ -3,6 +3,7 @@
 
 //! providers services and utilities
 
+mod alert_rule_service;
 pub mod continuous_archive;
 pub mod env_vars_provider_impl;
 pub mod externalsvc;

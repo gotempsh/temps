@@ -39,6 +39,8 @@ import { envVarsScenarioCommand } from './commands/env-vars-scenario.ts'
 import { apiKeyScenarioCommand } from './commands/api-key-scenario.ts'
 import { multinodeJoinScenarioCommand } from './commands/multinode-join-scenario.ts'
 import { markdownCommand } from './commands/markdown.ts'
+import { firstRunScenarioCommand, FIRST_RUN_STEPS } from './commands/first-run-scenario.ts'
+import { quietLogsFixtureCommand } from './commands/quiet-logs-fixture.ts'
 import { aiChatPromptsCommand } from './commands/ai-chat-prompts.ts'
 
 const program = new Command()
@@ -574,6 +576,44 @@ program
   .option('--json', 'machine-readable output')
   .action(async (opts) => {
     await markdownCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('first-run-scenario')
+  .description(
+    'First-run suite: deploy a public image, a git Dockerfile app, a Node preset app, a compose stack and a static site, then link managed Postgres + Redis -- each timed to its first response through the proxy',
+  )
+  .option('--only <steps...>', `run only these steps (${FIRST_RUN_STEPS.join(', ')})`)
+  .option('--skip <steps...>', 'skip these steps')
+  .option('--image <ref>', 'public image for the docker-image step', 'traefik/whoami:v1.10')
+  .option('--image-port <port>', 'container port of --image', '80')
+  .option('--git-url <url>', 'public https git URL holding examples/first-run', 'https://github.com/gotempsh/temps.git')
+  .option('--git-branch <branch>', 'branch to deploy from --git-url', 'main')
+  .option('--git-directory <dir>', 'directory with the Dockerfile app', 'examples/first-run/dockerfile-app')
+  .option('--examples-dir <dir>', 'local examples/first-run directory (default: resolved from this checkout)')
+  .option('--deploy-timeout <ms>', 'max wait for an image/compose/static deployment', '300000')
+  .option('--build-timeout <ms>', 'max wait for a deployment that builds from source', '900000')
+  .option('--report <file>', 'write the JSON report here (and a Markdown summary next to it)')
+  .option('--keep', 'do not tear down created resources')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await firstRunScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('quiet-logs-fixture')
+  .description(
+    'Create (or --teardown) the quiet-logs soak workload: one deployed app, one linked managed Postgres, one alert rule and one uptime monitor',
+  )
+  .requiredOption('--state <file>', 'file recording the created resource ids')
+  .option('--teardown', 'delete the resources recorded in --state')
+  .option('--verify', 'verify the recorded workload is still healthy')
+  .option('--image <ref>', 'public image to deploy', 'traefik/whoami:v1.10')
+  .option('--image-port <port>', 'container port of --image', '80')
+  .option('--deploy-timeout <ms>', 'max wait for the deployment / service', '300000')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await quietLogsFixtureCommand({ ...opts, connection: connection() })
   })
 
 program.parseAsync().catch((err: unknown) => {

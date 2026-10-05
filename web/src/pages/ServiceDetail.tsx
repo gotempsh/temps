@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { linkedResourceCopy } from '@/lib/service-link-copy'
 import {
   deleteServiceMutation,
   getProjectsOptions,
@@ -128,6 +129,7 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useLocation, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
+import { toastRedeployAfterLinkChange } from '@/lib/service-link-redeploy'
 
 /**
  * Pick the role label to render for a cluster member.
@@ -298,9 +300,13 @@ export function ServiceDetail() {
   // refreshed or shared link reproduces the same backups page.
   const { get: getBackupsUrlState, patch: patchBackupsUrlState } =
     useUrlState<'backupsPage'>()
-  const backupsPage = Math.max(1, Number(getBackupsUrlState('backupsPage') ?? '1') || 1)
+  const backupsPage = Math.max(
+    1,
+    Number(getBackupsUrlState('backupsPage') ?? '1') || 1
+  )
   const setBackupsPage = useCallback(
-    (page: number) => patchBackupsUrlState({ backupsPage: page <= 1 ? undefined : page }),
+    (page: number) =>
+      patchBackupsUrlState({ backupsPage: page <= 1 ? undefined : page }),
     [patchBackupsUrlState]
   )
   const BACKUPS_PAGE_SIZE = 5
@@ -360,10 +366,20 @@ export function ServiceDetail() {
   const linkService = useMutation({
     ...linkServiceToProjectMutation(),
     meta: { errorTitle: 'Failed to link project' },
-    onSuccess: () => {
+    onSuccess: (_data, variables) => {
       toast.success('Project linked successfully')
       refetchLinkedProjects()
       setIsLinkPopoverOpen(false)
+      const project = allProjectsData?.projects?.find(
+        (candidate) => candidate.id === variables.body.project_id
+      )
+      if (project && service) {
+        void toastRedeployAfterLinkChange(
+          project,
+          { kind: 'linked', serviceName: service.service.name },
+          toast
+        )
+      }
     },
   })
 
@@ -625,21 +641,30 @@ export function ServiceDetail() {
   // the Detail template's single verdict, derived from the record's own
   // status field. `creating` maps to the `running` tone (spinner) since
   // that's the tone family for "in progress".
-  const SERVICE_STATUS_VERDICT: Record<string, { tone: StatusTone; label: string }> = {
+  const SERVICE_STATUS_VERDICT: Record<
+    string,
+    { tone: StatusTone; label: string }
+  > = {
     running: { tone: 'ok', label: 'Running' },
     stopped: { tone: 'idle', label: 'Stopped' },
+    pending: { tone: 'running', label: 'Pending' },
     creating: { tone: 'running', label: 'Creating' },
     failed: { tone: 'error', label: 'Failed' },
   }
-  const verdict =
-    SERVICE_STATUS_VERDICT[service.service.status] ?? { tone: 'idle' as StatusTone, label: service.service.status }
+  const verdict = SERVICE_STATUS_VERDICT[service.service.status] ?? {
+    tone: 'idle' as StatusTone,
+    label: service.service.status,
+  }
 
   const facts: DetailFact[] = [
     {
       label: 'Type',
       value: (
         <span className="inline-flex items-center gap-1.5">
-          <ServiceLogo service={service.service.service_type} className="h-3.5 w-3.5" />
+          <ServiceLogo
+            service={service.service.service_type}
+            className="h-3.5 w-3.5"
+          />
           {service.service.service_type}
         </span>
       ),
@@ -707,13 +732,9 @@ export function ServiceDetail() {
                   <p className="text-xs font-medium text-muted-foreground">
                     Linked projects
                   </p>
-                  <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">
-                    Linking creates a dedicated{' '}
-                    <code className="rounded bg-muted px-1 py-0.5 font-mono">
-                      {'<project>_<env>'}
-                    </code>{' '}
-                    database per environment. No extra services are spun up.
-                  </p>
+                  <LinkedResourceNote
+                    serviceType={service.service.service_type}
+                  />
                   {linkedProjectsLoading ? (
                     <div className="mt-2 flex items-center gap-2 text-xs text-muted-foreground">
                       <Loader2 className="h-3 w-3 animate-spin" />
@@ -918,626 +939,643 @@ export function ServiceDetail() {
               <ServiceHealthCard serviceId={parseInt(id!)} />
             ) : null}
 
-          {/*
+            {/*
             Postgres-only WAL bloat / archive misconfiguration surface. Renders
             nothing when there are no warnings, so it's safe to mount
             unconditionally for non-Postgres services (the component itself
             checks the type and bails before fetching).
           */}
-          {service.service.status === 'running' ? (
-            <WalHealthPanel
-              serviceId={parseInt(id!)}
-              serviceType={service.service.service_type}
-              onUpgrade={() => setIsUpgradeDialogOpen(true)}
-            />
-          ) : null}
+            {service.service.status === 'running' ? (
+              <WalHealthPanel
+                serviceId={parseInt(id!)}
+                serviceType={service.service.service_type}
+                onUpgrade={() => setIsUpgradeDialogOpen(true)}
+              />
+            ) : null}
 
-          {service.service.status === 'running' && (
-            <MonitoringCard
-              serviceId={service.service.id}
-              engine={service.service.service_type}
-              dockerImage={
-                service.current_parameters?.docker_image ?? undefined
-              }
-              metricsEnabled={service.service.metrics_enabled ?? false}
-              onMonitoringChange={() => refetch()}
-            />
-          )}
-
-          {/* Cluster Creation Progress */}
-          {service.service.topology === 'cluster' &&
-            service.service.status === 'creating' && (
-              <Callout tone="info" title="Creating cluster members…">
-                This may take a minute. Members will appear below as they are
-                provisioned.
-              </Callout>
+            {service.service.status === 'running' && (
+              <MonitoringCard
+                serviceId={service.service.id}
+                engine={service.service.service_type}
+                dockerImage={
+                  service.current_parameters?.docker_image ?? undefined
+                }
+                metricsEnabled={service.service.metrics_enabled ?? false}
+                onMonitoringChange={() => refetch()}
+              />
             )}
 
-          {/* Cluster Creation Failed */}
-          {service.service.topology === 'cluster' &&
-            service.service.status === 'failed' && (
-              <Callout tone="error" title="Cluster creation failed">
-                <div className="flex items-center justify-between gap-4">
-                  <span>
-                    {(service.service as Record<string, unknown>).error_message
-                      ? String(
-                          (service.service as Record<string, unknown>)
-                            .error_message
-                        )
-                      : 'An unknown error occurred.'}
-                  </span>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    busy={retryCluster.isPending}
-                    busyLabel="Retrying…"
-                    onClick={() => {
-                      // Reconstruct members from preserved service_members records,
-                      // or send empty array to let the backend reconstruct.
-                      const members =
-                        service.service.members &&
-                        service.service.members.length > 0
-                          ? service.service.members.map(
-                              (m: {
-                                role: string
-                                node_id?: number | null
-                              }) => ({
-                                role: m.role,
-                                node_id: m.node_id ?? undefined,
-                              })
-                            )
-                          : []
-                      retryCluster.mutate({
-                        path: { id: parseInt(id!) },
-                        body: { members },
-                      })
-                    }}
-                  >
-                    <RefreshCcw className="h-4 w-4 mr-1" />
-                    Retry
-                  </Button>
-                </div>
-              </Callout>
-            )}
+            {/* Cluster Creation Progress */}
+            {service.service.topology === 'cluster' &&
+              service.service.status === 'creating' && (
+                <Callout tone="info" title="Creating cluster members…">
+                  This may take a minute. Members will appear below as they are
+                  provisioned.
+                </Callout>
+              )}
 
-          {/* Cluster Members Section */}
-          {service.service.topology === 'cluster' &&
-            service.service.members &&
-            service.service.members.length > 0 && (
-              <Card>
-                <CardHeader>
-                  <div className="flex items-start justify-between gap-2">
-                    <div>
-                      <CardTitle className="flex items-center gap-2">
-                        <span>Cluster Members</span>
-                        <Badge variant="outline">
-                          {service.service.members.length}
-                        </Badge>
-                      </CardTitle>
-                      <CardDescription>
-                        pg_auto_failover cluster nodes
-                      </CardDescription>
-                    </div>
-                    {/* Scaling is only safe while the cluster is healthy and
+            {/* Cluster Creation Failed */}
+            {service.service.topology === 'cluster' &&
+              service.service.status === 'failed' && (
+                <Callout tone="error" title="Cluster creation failed">
+                  <div className="flex items-center justify-between gap-4">
+                    <span>
+                      {(service.service as Record<string, unknown>)
+                        .error_message
+                        ? String(
+                            (service.service as Record<string, unknown>)
+                              .error_message
+                          )
+                        : 'An unknown error occurred.'}
+                    </span>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      busy={retryCluster.isPending}
+                      busyLabel="Retrying…"
+                      onClick={() => {
+                        // Reconstruct members from preserved service_members records,
+                        // or send empty array to let the backend reconstruct.
+                        const members =
+                          service.service.members &&
+                          service.service.members.length > 0
+                            ? service.service.members.map(
+                                (m: {
+                                  role: string
+                                  node_id?: number | null
+                                }) => ({
+                                  role: m.role,
+                                  node_id: m.node_id ?? undefined,
+                                })
+                              )
+                            : []
+                        retryCluster.mutate({
+                          path: { id: parseInt(id!) },
+                          body: { members },
+                        })
+                      }}
+                    >
+                      <RefreshCcw className="h-4 w-4 mr-1" />
+                      Retry
+                    </Button>
+                  </div>
+                </Callout>
+              )}
+
+            {/* Cluster Members Section */}
+            {service.service.topology === 'cluster' &&
+              service.service.members &&
+              service.service.members.length > 0 && (
+                <Card>
+                  <CardHeader>
+                    <div className="flex items-start justify-between gap-2">
+                      <div>
+                        <CardTitle className="flex items-center gap-2">
+                          <span>Cluster Members</span>
+                          <Badge variant="outline">
+                            {service.service.members.length}
+                          </Badge>
+                        </CardTitle>
+                        <CardDescription>
+                          pg_auto_failover cluster nodes
+                        </CardDescription>
+                      </div>
+                      {/* Scaling is only safe while the cluster is healthy and
                         a monitor exists. Hide the button entirely otherwise
                         rather than opening a dialog that will fail. */}
-                    {service.service.status === 'running' &&
-                      service.service.service_type === 'postgres' &&
-                      service.service.members.some(
-                        (m) => m.role === 'monitor'
-                      ) && (
-                        <Button variant="outline" size="sm" asChild>
-                          <Link to={`/storage/${id}/members/add`}>
-                            <Plus className="h-4 w-4 mr-1" />
-                            Add Replica
-                          </Link>
-                        </Button>
-                      )}
-                  </div>
-                </CardHeader>
-                <CardContent>
-                  <div className="space-y-2">
-                    {service.service.members.map((member) => {
-                      // The backend rejects removal of monitor + current
-                      // primary + members below quorum; mirror those rules
-                      // here so the UI doesn't show a button that will
-                      // 400. Quorum check uses the wire-side member list:
-                      // 2 data members minimum to keep HA.
-                      const dataMembers = (
-                        service.service.members ?? []
-                      ).filter((m) => m.role !== 'monitor')
-                      const wouldBreakQuorum =
-                        member.role !== 'monitor' && dataMembers.length <= 2
-                      // "Is this currently the primary?" is a runtime
-                      // question — read live_state, not the stored role
-                      // (which is now `replica` for every data node).
-                      const isLivePrimary =
-                        memberDisplayRole(member) === 'primary'
-                      const removable =
-                        member.role !== 'monitor' &&
-                        !isLivePrimary &&
-                        !wouldBreakQuorum &&
-                        service.service.status === 'running'
-                      // Promote: any running data member that isn't
-                      // already the primary or the monitor. Backend
-                      // re-validates so this is purely UI courtesy.
-                      const promotable =
-                        member.role !== 'monitor' &&
-                        !isLivePrimary &&
-                        member.status === 'running' &&
-                        service.service.status === 'running'
-                      return (
-                        <div
-                          key={member.id}
-                          className="flex items-center justify-between gap-2 p-3 rounded-md border border-border"
-                        >
-                          <div className="flex items-center gap-3 min-w-0">
-                            {member.status === 'creating' ? (
-                              <Loader2 className="h-4 w-4 animate-spin text-muted-foreground flex-shrink-0" />
-                            ) : (
-                              <Server className="h-4 w-4 text-muted-foreground flex-shrink-0" />
-                            )}
-                            <div className="flex flex-col min-w-0">
-                              <div className="flex items-center gap-2">
-                                <span className="font-mono text-sm truncate">
-                                  {member.container_name}
-                                </span>
-                                <Badge
-                                  variant={
-                                    memberDisplayRole(member) === 'primary'
-                                      ? 'default'
-                                      : 'secondary'
-                                  }
-                                  className="capitalize text-xs"
-                                >
-                                  {memberDisplayRole(member)}
-                                </Badge>
-                              </div>
-                              <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                                {member.hostname && (
-                                  <span>{member.hostname}</span>
-                                )}
-                                {member.port && <span>:{member.port}</span>}
-                                {member.node_id && (
-                                  <span className="ml-1">
-                                    (node {member.node_id})
+                      {service.service.status === 'running' &&
+                        service.service.service_type === 'postgres' &&
+                        service.service.members.some(
+                          (m) => m.role === 'monitor'
+                        ) && (
+                          <Button variant="outline" size="sm" asChild>
+                            <Link to={`/storage/${id}/members/add`}>
+                              <Plus className="h-4 w-4 mr-1" />
+                              Add Replica
+                            </Link>
+                          </Button>
+                        )}
+                    </div>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="space-y-2">
+                      {service.service.members.map((member) => {
+                        // The backend rejects removal of monitor + current
+                        // primary + members below quorum; mirror those rules
+                        // here so the UI doesn't show a button that will
+                        // 400. Quorum check uses the wire-side member list:
+                        // 2 data members minimum to keep HA.
+                        const dataMembers = (
+                          service.service.members ?? []
+                        ).filter((m) => m.role !== 'monitor')
+                        const wouldBreakQuorum =
+                          member.role !== 'monitor' && dataMembers.length <= 2
+                        // "Is this currently the primary?" is a runtime
+                        // question — read live_state, not the stored role
+                        // (which is now `replica` for every data node).
+                        const isLivePrimary =
+                          memberDisplayRole(member) === 'primary'
+                        const removable =
+                          member.role !== 'monitor' &&
+                          !isLivePrimary &&
+                          !wouldBreakQuorum &&
+                          service.service.status === 'running'
+                        // Promote: any running data member that isn't
+                        // already the primary or the monitor. Backend
+                        // re-validates so this is purely UI courtesy.
+                        const promotable =
+                          member.role !== 'monitor' &&
+                          !isLivePrimary &&
+                          member.status === 'running' &&
+                          service.service.status === 'running'
+                        return (
+                          <div
+                            key={member.id}
+                            className="flex items-center justify-between gap-2 p-3 rounded-md border border-border"
+                          >
+                            <div className="flex items-center gap-3 min-w-0">
+                              {member.status === 'creating' ? (
+                                <Loader2 className="h-4 w-4 animate-spin text-muted-foreground flex-shrink-0" />
+                              ) : (
+                                <Server className="h-4 w-4 text-muted-foreground flex-shrink-0" />
+                              )}
+                              <div className="flex flex-col min-w-0">
+                                <div className="flex items-center gap-2">
+                                  <span className="font-mono text-sm truncate">
+                                    {member.container_name}
                                   </span>
-                                )}
+                                  <Badge
+                                    variant={
+                                      memberDisplayRole(member) === 'primary'
+                                        ? 'default'
+                                        : 'secondary'
+                                    }
+                                    className="capitalize text-xs"
+                                  >
+                                    {memberDisplayRole(member)}
+                                  </Badge>
+                                </div>
+                                <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                                  {member.hostname && (
+                                    <span>{member.hostname}</span>
+                                  )}
+                                  {member.port && <span>:{member.port}</span>}
+                                  {member.node_id && (
+                                    <span className="ml-1">
+                                      (node {member.node_id})
+                                    </span>
+                                  )}
+                                </div>
                               </div>
                             </div>
-                          </div>
-                          <div className="flex items-center gap-2 flex-shrink-0">
-                            <Badge
-                              variant={
-                                member.status === 'running'
-                                  ? 'default'
-                                  : member.status === 'failed'
-                                    ? 'destructive'
-                                    : member.status === 'creating'
-                                      ? 'outline'
-                                      : 'secondary'
-                              }
-                              className="capitalize"
-                            >
-                              {member.status === 'creating' && (
-                                <Loader2 className="h-3 w-3 animate-spin mr-1" />
+                            <div className="flex items-center gap-2 flex-shrink-0">
+                              <Badge
+                                variant={
+                                  member.status === 'running'
+                                    ? 'default'
+                                    : member.status === 'failed'
+                                      ? 'destructive'
+                                      : member.status === 'creating'
+                                        ? 'outline'
+                                        : 'secondary'
+                                }
+                                className="capitalize"
+                              >
+                                {member.status === 'creating' && (
+                                  <Loader2 className="h-3 w-3 animate-spin mr-1" />
+                                )}
+                                {member.status}
+                              </Badge>
+                              {promotable && (
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className="h-8 w-8 text-muted-foreground hover:text-foreground"
+                                  aria-label={`Promote ${member.container_name} to primary`}
+                                  title="Promote to primary"
+                                  onClick={() =>
+                                    setMemberToPromote({
+                                      id: member.id,
+                                      container_name: member.container_name,
+                                    })
+                                  }
+                                >
+                                  <ArrowUpCircle className="h-4 w-4" />
+                                </Button>
                               )}
-                              {member.status}
-                            </Badge>
-                            {promotable && (
-                              <Button
-                                variant="ghost"
-                                size="icon"
-                                className="h-8 w-8 text-muted-foreground hover:text-foreground"
-                                aria-label={`Promote ${member.container_name} to primary`}
-                                title="Promote to primary"
-                                onClick={() =>
-                                  setMemberToPromote({
-                                    id: member.id,
-                                    container_name: member.container_name,
-                                  })
-                                }
-                              >
-                                <ArrowUpCircle className="h-4 w-4" />
-                              </Button>
-                            )}
-                            {removable && (
-                              <Button
-                                variant="ghost"
-                                size="icon"
-                                className="h-8 w-8 text-muted-foreground hover:text-destructive"
-                                aria-label={`Remove ${member.container_name}`}
-                                onClick={() =>
-                                  setMemberToRemove({
-                                    id: member.id,
-                                    container_name: member.container_name,
-                                    role: member.role,
-                                  })
-                                }
-                              >
-                                <Trash2 className="h-4 w-4" />
-                              </Button>
-                            )}
+                              {removable && (
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className="h-8 w-8 text-muted-foreground hover:text-destructive"
+                                  aria-label={`Remove ${member.container_name}`}
+                                  onClick={() =>
+                                    setMemberToRemove({
+                                      id: member.id,
+                                      container_name: member.container_name,
+                                      role: member.role,
+                                    })
+                                  }
+                                >
+                                  <Trash2 className="h-4 w-4" />
+                                </Button>
+                              )}
+                            </div>
                           </div>
-                        </div>
-                      )
-                    })}
+                        )
+                      })}
+                    </div>
+                  </CardContent>
+                </Card>
+              )}
+
+            {/* Per-cluster live health panel — reads from pg_auto_failover monitor */}
+            {service.service.topology === 'cluster' &&
+              service.service.service_type === 'postgres' && (
+                <ClusterHealthPanel serviceId={service.service.id} />
+              )}
+
+            {/* Resources: container runtime, live CPU/mem, applied limits */}
+            <ServiceResourcesPanel
+              serviceId={service.service.id}
+              serviceName={service.service.name}
+            />
+
+            {/* Backups Section */}
+            <Card>
+              <CardHeader>
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                  <div className="space-y-1.5 min-w-0">
+                    <CardTitle className="flex items-center gap-2">
+                      <span>Backups</span>
+                      <Badge variant="outline">
+                        {isLoadingBackups ? (
+                          <Loader2 className="h-3 w-3 animate-spin" />
+                        ) : (
+                          (serviceBackupsData?.total ?? 0)
+                        )}
+                      </Badge>
+                    </CardTitle>
+                    <CardDescription>
+                      Backups of this service stored across your S3 sources
+                    </CardDescription>
                   </div>
-                </CardContent>
-              </Card>
-            )}
-
-          {/* Per-cluster live health panel — reads from pg_auto_failover monitor */}
-          {service.service.topology === 'cluster' &&
-            service.service.service_type === 'postgres' && (
-              <ClusterHealthPanel serviceId={service.service.id} />
-            )}
-
-          {/* Resources: container runtime, live CPU/mem, applied limits */}
-          <ServiceResourcesPanel
-            serviceId={service.service.id}
-            serviceName={service.service.name}
-          />
-
-          {/* Backups Section */}
-          <Card>
-            <CardHeader>
-              <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-                <div className="space-y-1.5 min-w-0">
-                  <CardTitle className="flex items-center gap-2">
-                    <span>Backups</span>
-                    <Badge variant="outline">
-                      {isLoadingBackups ? (
-                        <Loader2 className="h-3 w-3 animate-spin" />
-                      ) : (
-                        (serviceBackupsData?.total ?? 0)
-                      )}
-                    </Badge>
-                  </CardTitle>
-                  <CardDescription>
-                    Backups of this service stored across your S3 sources
-                  </CardDescription>
+                  <div className="flex shrink-0 items-center gap-2">
+                    <Button
+                      variant="outline"
+                      size="icon"
+                      className="h-9 w-9"
+                      aria-label="Refresh backups"
+                      title="Refresh backups"
+                      onClick={() => void refetchBackups()}
+                      disabled={isFetchingBackups}
+                    >
+                      <RefreshCcw
+                        className={cn(
+                          'h-4 w-4',
+                          isFetchingBackups && 'animate-spin'
+                        )}
+                      />
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="gap-2"
+                      onClick={() => setIsBackupDialogOpen(true)}
+                    >
+                      <HardDrive className="h-4 w-4" />
+                      <span className="hidden sm:inline">Trigger backup</span>
+                      <span className="sm:hidden">Backup</span>
+                    </Button>
+                  </div>
                 </div>
-                <div className="flex shrink-0 items-center gap-2">
-                  <Button
-                    variant="outline"
-                    size="icon"
-                    className="h-9 w-9"
-                    aria-label="Refresh backups"
-                    title="Refresh backups"
-                    onClick={() => void refetchBackups()}
-                    disabled={isFetchingBackups}
-                  >
-                    <RefreshCcw
-                      className={cn(
-                        'h-4 w-4',
-                        isFetchingBackups && 'animate-spin'
-                      )}
-                    />
-                  </Button>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="gap-2"
-                    onClick={() => setIsBackupDialogOpen(true)}
-                  >
-                    <HardDrive className="h-4 w-4" />
-                    <span className="hidden sm:inline">Trigger backup</span>
-                    <span className="sm:hidden">Backup</span>
-                  </Button>
-                </div>
-              </div>
-            </CardHeader>
-            <CardContent>
-              {isLoadingBackups ? (
-                <div className="flex items-center justify-center py-8">
-                  <Loader2 className="h-4 w-4 animate-spin mr-2" />
-                  <span className="text-sm text-muted-foreground">
-                    Loading backups...
-                  </span>
-                </div>
-              ) : serviceBackups.length === 0 ? (
-                <div className="text-sm text-muted-foreground text-center py-8">
-                  No backups found for this service yet. Trigger one or
-                  configure a schedule from an S3 source.
-                </div>
-              ) : (
-                <ul role="list" className="divide-y divide-border">
-                  {paginatedBackups.map((backup) => {
-                    const key =
-                      backup.backup_id ||
-                      String(backup.external_service_backup_id)
-                    const state = backup.state || 'unknown'
-                    const isCompleted = state === 'completed'
-                    const isFailed = state === 'failed'
-                    const isRunning = state === 'running' || state === 'pending'
+              </CardHeader>
+              <CardContent>
+                {isLoadingBackups ? (
+                  <div className="flex items-center justify-center py-8">
+                    <Loader2 className="h-4 w-4 animate-spin mr-2" />
+                    <span className="text-sm text-muted-foreground">
+                      Loading backups...
+                    </span>
+                  </div>
+                ) : serviceBackups.length === 0 ? (
+                  <div className="text-sm text-muted-foreground text-center py-8">
+                    No backups found for this service yet. Trigger one or
+                    configure a schedule from an S3 source.
+                  </div>
+                ) : (
+                  <ul role="list" className="divide-y divide-border">
+                    {paginatedBackups.map((backup) => {
+                      const key =
+                        backup.backup_id ||
+                        String(backup.external_service_backup_id)
+                      const state = backup.state || 'unknown'
+                      const isCompleted = state === 'completed'
+                      const isFailed = state === 'failed'
+                      const isRunning =
+                        state === 'running' || state === 'pending'
 
-                    // Duration only when we have both endpoints. Sub-second
-                    // backups render as `<1s` rather than `0s` so the user
-                    // sees "yes, it really did finish".
-                    const startedMs = new Date(backup.started_at).getTime()
-                    const finishedMs = backup.finished_at
-                      ? new Date(backup.finished_at).getTime()
-                      : null
-                    const durationLabel =
-                      finishedMs && finishedMs > startedMs
-                        ? formatShortDuration(finishedMs - startedMs)
+                      // Duration only when we have both endpoints. Sub-second
+                      // backups render as `<1s` rather than `0s` so the user
+                      // sees "yes, it really did finish".
+                      const startedMs = new Date(backup.started_at).getTime()
+                      const finishedMs = backup.finished_at
+                        ? new Date(backup.finished_at).getTime()
                         : null
+                      const durationLabel =
+                        finishedMs && finishedMs > startedMs
+                          ? formatShortDuration(finishedMs - startedMs)
+                          : null
 
-                    const linkTo = backup.backup_id
-                      ? `/backups/s3-sources/${backup.s3_source_id}/backups/${backup.backup_id}`
-                      : `/backups/s3-sources/${backup.s3_source_id}`
+                      const linkTo = backup.backup_id
+                        ? `/backups/s3-sources/${backup.s3_source_id}/backups/${backup.backup_id}`
+                        : `/backups/s3-sources/${backup.s3_source_id}`
 
-                    // All backups in this list belong to the current
-                    // service, so the icon is the service type (postgres
-                    // -> Database, mongodb -> Leaf, redis -> Server, …).
-                    // Using `service.service.service_type` directly keeps
-                    // the row in lock-step with the page header even when
-                    // the backend hasn't surfaced an `engine` field on
-                    // this entry yet (legacy rows).
-                    const ServiceIcon = iconForServiceType(
-                      service.service.service_type
-                    )
+                      // All backups in this list belong to the current
+                      // service, so the icon is the service type (postgres
+                      // -> Database, mongodb -> Leaf, redis -> Server, …).
+                      // Using `service.service.service_type` directly keeps
+                      // the row in lock-step with the page header even when
+                      // the backend hasn't surfaced an `engine` field on
+                      // this entry yet (legacy rows).
+                      const ServiceIcon = iconForServiceType(
+                        service.service.service_type
+                      )
 
-                    return (
-                      <li key={key}>
-                        <Link
-                          to={linkTo}
-                          className="flex items-center gap-3 py-3 transition-colors hover:bg-muted/40 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:rounded-md sm:gap-4 -mx-2 px-2"
-                        >
-                          <div className="flex size-9 shrink-0 items-center justify-center rounded-md bg-muted">
-                            <ServiceIcon className="size-4 text-muted-foreground" />
-                          </div>
+                      return (
+                        <li key={key}>
+                          <Link
+                            to={linkTo}
+                            className="flex items-center gap-3 py-3 transition-colors hover:bg-muted/40 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:rounded-md sm:gap-4 -mx-2 px-2"
+                          >
+                            <div className="flex size-9 shrink-0 items-center justify-center rounded-md bg-muted">
+                              <ServiceIcon className="size-4 text-muted-foreground" />
+                            </div>
 
-                          {/* Title + meta. Lead with the human-readable
+                            {/* Title + meta. Lead with the human-readable
                               service/source line, secondary line packs the
                               actionable detail (exact time, duration, size,
                               short UUID, error preview). */}
-                          <div className="min-w-0 flex-1">
-                            <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                              <p className="truncate text-sm font-medium">
-                                <TimeAgo date={backup.started_at} />
-                              </p>
-                              <span
-                                className="hidden text-xs text-muted-foreground sm:inline"
-                                aria-hidden
-                              >
-                                ·
-                              </span>
-                              <span className="font-mono text-xs text-muted-foreground tabular-nums hidden sm:inline">
-                                {fmtDateTime(backup.started_at)}
-                              </span>
-                              {backup.backup_type ? (
-                                <Badge variant="outline" className="text-xs">
-                                  {backup.backup_type}
-                                </Badge>
-                              ) : null}
-                              {isCompleted ? (
-                                <Badge
-                                  variant="outline"
-                                  className="gap-1 border-emerald-500/50 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 text-xs"
+                            <div className="min-w-0 flex-1">
+                              <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                                <p className="truncate text-sm font-medium">
+                                  <TimeAgo date={backup.started_at} />
+                                </p>
+                                <span
+                                  className="hidden text-xs text-muted-foreground sm:inline"
+                                  aria-hidden
                                 >
-                                  <CheckCircle2 className="h-3 w-3" />
-                                  Completed
-                                </Badge>
-                              ) : isRunning ? (
-                                <Badge
-                                  variant="secondary"
-                                  className="gap-1 text-xs"
-                                >
-                                  <Radio className="h-3 w-3 animate-pulse" />
-                                  {state === 'pending' ? 'Pending' : 'Running'}
-                                </Badge>
-                              ) : isFailed ? (
-                                <Badge
-                                  variant="destructive"
-                                  className="gap-1 text-xs"
-                                >
-                                  <XCircle className="h-3 w-3" />
-                                  Failed
-                                </Badge>
-                              ) : (
-                                <Badge variant="outline" className="text-xs">
-                                  {state}
-                                </Badge>
-                              )}
-                            </div>
-                            <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-muted-foreground tabular-nums">
-                              <span className="truncate">
-                                {backup.s3_source_name}
-                              </span>
-                              {backup.size_bytes && backup.size_bytes > 0 ? (
-                                <span className="inline-flex items-center gap-1">
-                                  <HardDrive className="h-3 w-3" />
-                                  {fmtBytes(backup.size_bytes)}
+                                  ·
                                 </span>
-                              ) : null}
-                              {durationLabel ? (
-                                <span className="inline-flex items-center gap-1">
-                                  <Clock className="h-3 w-3" />
-                                  {durationLabel}
+                                <span className="font-mono text-xs text-muted-foreground tabular-nums hidden sm:inline">
+                                  {fmtDateTime(backup.started_at)}
                                 </span>
-                              ) : null}
-                              {backup.backup_id ? (
-                                <span className="font-mono">
-                                  #{backup.backup_id.slice(0, 8)}
+                                {backup.backup_type ? (
+                                  <Badge variant="outline" className="text-xs">
+                                    {backup.backup_type}
+                                  </Badge>
+                                ) : null}
+                                {isCompleted ? (
+                                  <Badge
+                                    variant="outline"
+                                    className="gap-1 border-emerald-500/50 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 text-xs"
+                                  >
+                                    <CheckCircle2 className="h-3 w-3" />
+                                    Completed
+                                  </Badge>
+                                ) : isRunning ? (
+                                  <Badge
+                                    variant="secondary"
+                                    className="gap-1 text-xs"
+                                  >
+                                    <Radio className="h-3 w-3 animate-pulse" />
+                                    {state === 'pending'
+                                      ? 'Pending'
+                                      : 'Running'}
+                                  </Badge>
+                                ) : isFailed ? (
+                                  <Badge
+                                    variant="destructive"
+                                    className="gap-1 text-xs"
+                                  >
+                                    <XCircle className="h-3 w-3" />
+                                    Failed
+                                  </Badge>
+                                ) : (
+                                  <Badge variant="outline" className="text-xs">
+                                    {state}
+                                  </Badge>
+                                )}
+                              </div>
+                              <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-muted-foreground tabular-nums">
+                                <span className="truncate">
+                                  {backup.s3_source_name}
                                 </span>
-                              ) : null}
-                            </div>
-                            {/* Error preview — only when the backup actually
+                                {backup.size_bytes && backup.size_bytes > 0 ? (
+                                  <span className="inline-flex items-center gap-1">
+                                    <HardDrive className="h-3 w-3" />
+                                    {fmtBytes(backup.size_bytes)}
+                                  </span>
+                                ) : null}
+                                {durationLabel ? (
+                                  <span className="inline-flex items-center gap-1">
+                                    <Clock className="h-3 w-3" />
+                                    {durationLabel}
+                                  </span>
+                                ) : null}
+                                {backup.backup_id ? (
+                                  <span className="font-mono">
+                                    #{backup.backup_id.slice(0, 8)}
+                                  </span>
+                                ) : null}
+                              </div>
+                              {/* Error preview — only when the backup actually
                                 failed. Hard-caps the rendered string at ~160
                                 chars and clips with CSS `truncate` so a long
                                 stack trace can't blow out the card width even
                                 if a parent flex container forgets `min-w-0`.
                                 Full message is on the BackupDetail page (and
                                 surfaced via `title` on hover). */}
-                            {isFailed && backup.error_message ? (
-                              <p
-                                className="mt-1 truncate text-xs text-destructive"
-                                title={backup.error_message}
-                              >
-                                {backup.error_message.length > 160
-                                  ? `${backup.error_message.slice(0, 160)}…`
-                                  : backup.error_message}
-                              </p>
-                            ) : null}
-                          </div>
+                              {isFailed && backup.error_message ? (
+                                <p
+                                  className="mt-1 truncate text-xs text-destructive"
+                                  title={backup.error_message}
+                                >
+                                  {backup.error_message.length > 160
+                                    ? `${backup.error_message.slice(0, 160)}…`
+                                    : backup.error_message}
+                                </p>
+                              ) : null}
+                            </div>
 
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            className="hidden gap-2 sm:flex"
-                            tabIndex={-1}
-                            asChild={false}
-                          >
-                            View
-                            <ArrowLeft className="h-4 w-4 rotate-180" />
-                          </Button>
-                        </Link>
-                      </li>
-                    )
-                  })}
-                </ul>
-              )}
-              {backupsTotalPages > 1 && (
-                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between mt-4">
-                  <div className="text-sm text-muted-foreground">
-                    <span className="hidden sm:inline tabular-nums">
-                      Showing {(backupsPage - 1) * BACKUPS_PAGE_SIZE + 1} to{' '}
-                      {Math.min(
-                        backupsPage * BACKUPS_PAGE_SIZE,
-                        serviceBackupsData?.total ?? 0
-                      )}{' '}
-                      of {serviceBackupsData?.total ?? 0} backups
-                    </span>
-                    <span className="sm:hidden tabular-nums">
-                      {backupsPage} / {backupsTotalPages}
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => setBackupsPage(Math.max(1, backupsPage - 1))}
-                      disabled={backupsPage === 1}
-                    >
-                      <ChevronLeft className="h-4 w-4" />
-                      <span className="hidden sm:inline">Previous</span>
-                    </Button>
-                    <div className="hidden sm:flex items-center gap-1">
-                      {backupsPageWindow.map((pageNum) => (
-                        <Button
-                          key={pageNum}
-                          variant={
-                            pageNum === backupsPage ? 'default' : 'outline'
-                          }
-                          size="sm"
-                          onClick={() => setBackupsPage(pageNum)}
-                          className="w-10"
-                        >
-                          {pageNum}
-                        </Button>
-                      ))}
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="hidden gap-2 sm:flex"
+                              tabIndex={-1}
+                              asChild={false}
+                            >
+                              View
+                              <ArrowLeft className="h-4 w-4 rotate-180" />
+                            </Button>
+                          </Link>
+                        </li>
+                      )
+                    })}
+                  </ul>
+                )}
+                {backupsTotalPages > 1 && (
+                  <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between mt-4">
+                    <div className="text-sm text-muted-foreground">
+                      <span className="hidden sm:inline tabular-nums">
+                        Showing {(backupsPage - 1) * BACKUPS_PAGE_SIZE + 1} to{' '}
+                        {Math.min(
+                          backupsPage * BACKUPS_PAGE_SIZE,
+                          serviceBackupsData?.total ?? 0
+                        )}{' '}
+                        of {serviceBackupsData?.total ?? 0} backups
+                      </span>
+                      <span className="sm:hidden tabular-nums">
+                        {backupsPage} / {backupsTotalPages}
+                      </span>
                     </div>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() =>
-                        setBackupsPage(Math.min(backupsTotalPages, backupsPage + 1))
-                      }
-                      disabled={backupsPage === backupsTotalPages}
-                    >
-                      <span className="hidden sm:inline">Next</span>
-                      <ChevronRight className="h-4 w-4" />
-                    </Button>
-                  </div>
-                </div>
-              )}
-            </CardContent>
-          </Card>
-
-          {isPostgres && pgUpgrades && pgUpgrades.length > 0 ? (
-            <Card>
-              <CardHeader>
-                <CardTitle className="flex items-center gap-2">
-                  <ArrowUpCircle className="h-5 w-5" />
-                  Major Version Upgrades
-                </CardTitle>
-                <CardDescription>
-                  History of PostgreSQL major-version upgrades for this service.
-                  Click a row to see phase progress and logs.
-                </CardDescription>
-              </CardHeader>
-              <CardContent>
-                <div className="space-y-2">
-                  {pgUpgrades.map((u) => {
-                    const totalPhases = PG_UPGRADE_PHASES.length - 1 // exclude "completed"
-                    const pct =
-                      u.status === 'completed'
-                        ? 100
-                        : Math.round((phaseIndex(u.phase) / totalPhases) * 100)
-                    const statusVariant =
-                      u.status === 'completed'
-                        ? 'default'
-                        : u.status === 'failed'
-                          ? 'destructive'
-                          : u.status === 'cancelled' ||
-                              u.status === 'rolled_back'
-                            ? 'secondary'
-                            : 'outline'
-                    const isActive = !isTerminal(u.status)
-                    return (
-                      <Link
-                        key={u.id}
-                        to={`/storage/${id}/upgrades/${u.id}`}
-                        className="block rounded-lg border p-3 hover:bg-muted/50 transition-colors"
+                    <div className="flex items-center gap-2">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() =>
+                          setBackupsPage(Math.max(1, backupsPage - 1))
+                        }
+                        disabled={backupsPage === 1}
                       >
-                        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-                          <div className="flex flex-wrap items-center gap-2 min-w-0">
-                            <span className="font-medium text-sm">#{u.id}</span>
-                            <span className="text-sm text-muted-foreground truncate">
-                              {u.from_version} → {u.to_version}
-                            </span>
-                            {isActive ? (
-                              <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />
-                            ) : null}
-                          </div>
-                          <div className="flex items-center gap-2">
-                            <Badge variant={statusVariant} className="text-xs">
-                              {u.status}
-                            </Badge>
-                            <span className="text-xs text-muted-foreground whitespace-nowrap">
-                              <TimeAgo date={u.created_at} />
-                            </span>
-                          </div>
-                        </div>
-                        {isActive ? (
-                          <div className="mt-2">
-                            <div className="flex justify-between text-xs text-muted-foreground mb-1">
-                              <span className="truncate">Phase: {u.phase}</span>
-                              <span className="whitespace-nowrap ml-2">
-                                {pct}%
-                              </span>
-                            </div>
-                            <div className="h-1.5 bg-muted rounded overflow-hidden">
-                              <div
-                                className="h-full bg-primary transition-all"
-                                style={{ width: `${pct}%` }}
-                              />
-                            </div>
-                          </div>
-                        ) : u.error_message ? (
-                          <p className="mt-2 text-xs text-destructive line-clamp-2">
-                            {u.error_message}
-                          </p>
-                        ) : null}
-                      </Link>
-                    )
-                  })}
-                </div>
+                        <ChevronLeft className="h-4 w-4" />
+                        <span className="hidden sm:inline">Previous</span>
+                      </Button>
+                      <div className="hidden sm:flex items-center gap-1">
+                        {backupsPageWindow.map((pageNum) => (
+                          <Button
+                            key={pageNum}
+                            variant={
+                              pageNum === backupsPage ? 'default' : 'outline'
+                            }
+                            size="sm"
+                            onClick={() => setBackupsPage(pageNum)}
+                            className="w-10"
+                          >
+                            {pageNum}
+                          </Button>
+                        ))}
+                      </div>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() =>
+                          setBackupsPage(
+                            Math.min(backupsTotalPages, backupsPage + 1)
+                          )
+                        }
+                        disabled={backupsPage === backupsTotalPages}
+                      >
+                        <span className="hidden sm:inline">Next</span>
+                        <ChevronRight className="h-4 w-4" />
+                      </Button>
+                    </div>
+                  </div>
+                )}
               </CardContent>
             </Card>
-          ) : null}
+
+            {isPostgres && pgUpgrades && pgUpgrades.length > 0 ? (
+              <Card>
+                <CardHeader>
+                  <CardTitle className="flex items-center gap-2">
+                    <ArrowUpCircle className="h-5 w-5" />
+                    Major Version Upgrades
+                  </CardTitle>
+                  <CardDescription>
+                    History of PostgreSQL major-version upgrades for this
+                    service. Click a row to see phase progress and logs.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div className="space-y-2">
+                    {pgUpgrades.map((u) => {
+                      const totalPhases = PG_UPGRADE_PHASES.length - 1 // exclude "completed"
+                      const pct =
+                        u.status === 'completed'
+                          ? 100
+                          : Math.round(
+                              (phaseIndex(u.phase) / totalPhases) * 100
+                            )
+                      const statusVariant =
+                        u.status === 'completed'
+                          ? 'default'
+                          : u.status === 'failed'
+                            ? 'destructive'
+                            : u.status === 'cancelled' ||
+                                u.status === 'rolled_back'
+                              ? 'secondary'
+                              : 'outline'
+                      const isActive = !isTerminal(u.status)
+                      return (
+                        <Link
+                          key={u.id}
+                          to={`/storage/${id}/upgrades/${u.id}`}
+                          className="block rounded-lg border p-3 hover:bg-muted/50 transition-colors"
+                        >
+                          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                            <div className="flex flex-wrap items-center gap-2 min-w-0">
+                              <span className="font-medium text-sm">
+                                #{u.id}
+                              </span>
+                              <span className="text-sm text-muted-foreground truncate">
+                                {u.from_version} → {u.to_version}
+                              </span>
+                              {isActive ? (
+                                <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />
+                              ) : null}
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <Badge
+                                variant={statusVariant}
+                                className="text-xs"
+                              >
+                                {u.status}
+                              </Badge>
+                              <span className="text-xs text-muted-foreground whitespace-nowrap">
+                                <TimeAgo date={u.created_at} />
+                              </span>
+                            </div>
+                          </div>
+                          {isActive ? (
+                            <div className="mt-2">
+                              <div className="flex justify-between text-xs text-muted-foreground mb-1">
+                                <span className="truncate">
+                                  Phase: {u.phase}
+                                </span>
+                                <span className="whitespace-nowrap ml-2">
+                                  {pct}%
+                                </span>
+                              </div>
+                              <div className="h-1.5 bg-muted rounded overflow-hidden">
+                                <div
+                                  className="h-full bg-primary transition-all"
+                                  style={{ width: `${pct}%` }}
+                                />
+                              </div>
+                            </div>
+                          ) : u.error_message ? (
+                            <p className="mt-2 text-xs text-destructive line-clamp-2">
+                              {u.error_message}
+                            </p>
+                          ) : null}
+                        </Link>
+                      )
+                    })}
+                  </div>
+                </CardContent>
+              </Card>
+            ) : null}
           </>
         }
         aside={
@@ -1673,7 +1711,9 @@ export function ServiceDetail() {
                                         )
                                       ) {
                                         setRevealingParameters((prev) => {
-                                          if (prev[key]?.token !== requestToken) {
+                                          if (
+                                            prev[key]?.token !== requestToken
+                                          ) {
                                             return prev
                                           }
                                           const next = { ...prev }
@@ -1755,8 +1795,8 @@ export function ServiceDetail() {
                       maxHeight="20rem"
                     />
                     <p className="text-xs text-muted-foreground text-center mt-3">
-                      These variables are automatically available to projects that
-                      use this service
+                      These variables are automatically available to projects
+                      that use this service
                     </p>
                   </>
                 ) : null}
@@ -1999,5 +2039,23 @@ export function ServiceDetail() {
         }}
       />
     </>
+  )
+}
+
+/** What linking gives a project, worded for this service's engine. */
+function LinkedResourceNote({ serviceType }: { serviceType: string }) {
+  const copy = linkedResourceCopy(serviceType)
+  return (
+    <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">
+      {copy.lead}{' '}
+      {copy.example ? (
+        <>
+          <code className="rounded bg-muted px-1 py-0.5 font-mono">
+            {copy.example}
+          </code>{' '}
+        </>
+      ) : null}
+      {copy.trail}
+    </p>
   )
 }

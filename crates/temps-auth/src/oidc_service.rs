@@ -459,8 +459,9 @@ impl OidcService {
             .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 "DELETE FROM sessions WHERE user_id IN \
-                 (SELECT id FROM users WHERE oidc_provider_id = $1 AND deleted_at IS NULL)",
-                vec![provider_id.into()],
+                 (SELECT id FROM users WHERE oidc_provider_id = $1 AND deleted_at IS NULL) \
+                 OR mfa_pending_origin = $2",
+                vec![provider_id.into(), format!("oidc:{provider_id}").into()],
             ))
             .await?;
 
@@ -650,15 +651,15 @@ impl OidcService {
     /// names, so a login routed through the shadow row skips
     /// `admin_only_role_required` entirely even though the IdP itself is the
     /// one Cloud provisioned for instance-admin access. Comparing the
-    /// normalized issuer (both sides run through [`normalize_issuer_url`],
-    /// so this is a byte-for-byte comparison of the canonical form) closes
-    /// that gap regardless of what name or template the shadow row uses.
+    /// issuer conservatively without a trailing slash closes that gap
+    /// regardless of the provider name or template. OIDC discovery still
+    /// preserves the exact issuer required for metadata verification.
     async fn assert_issuer_not_shadowing_managed_cloud_provider(
         &self,
         issuer_url: &str,
     ) -> Result<(), OidcError> {
         if let Some(managed) = self.managed_cloud_provider().await? {
-            if managed.issuer_url == issuer_url {
+            if managed.issuer_url.trim_end_matches('/') == issuer_url.trim_end_matches('/') {
                 return Err(OidcError::IssuerMatchesManagedCloudProvider {
                     issuer_url: issuer_url.to_string(),
                 });
@@ -717,10 +718,13 @@ impl OidcService {
         // console access stays unprovisioned until the operator removes the
         // duplicate: fail closed, not "gate silently bypassable".
         if let Some(conflict) = oidc_providers::Entity::find()
-            .filter(oidc_providers::Column::IssuerUrl.eq(issuer_url.clone()))
             .filter(oidc_providers::Column::ManagedByCloud.eq(false))
-            .one(&txn)
+            .all(&txn)
             .await?
+            .into_iter()
+            .find(|provider| {
+                provider.issuer_url.trim_end_matches('/') == issuer_url.trim_end_matches('/')
+            })
         {
             return Err(OidcError::ManagedIssuerAlreadyUsed {
                 provider_id: conflict.id,
@@ -3423,5 +3427,54 @@ mod tests {
             Err(other) => panic!("expected StateNotFound, got {other}"),
             Ok(_) => panic!("a login state for a revoked provider must no longer be consumable"),
         }
+    }
+
+    #[tokio::test]
+    async fn managed_provider_rejects_preexisting_shadow_and_mapping_edits() {
+        let Some((db, service)) = test_oidc_service().await else {
+            return;
+        };
+        let mut ordinary = cloud_managed_provider_fixture(123);
+        ordinary.name = "ordinary".into();
+        ordinary.managed_by_cloud = false;
+        ordinary.admin_only_role_required = false;
+        let ordinary: oidc_providers::ActiveModel = ordinary.into();
+        let ordinary = ordinary.insert(db.db.as_ref()).await.unwrap();
+        assert!(matches!(
+            service
+                .upsert_managed_cloud_provider(managed_config("https://cloud.example.com/"))
+                .await,
+            Err(OidcError::ManagedIssuerAlreadyUsed { .. })
+        ));
+        oidc_providers::Entity::delete_by_id(ordinary.id)
+            .exec(db.db.as_ref())
+            .await
+            .unwrap();
+        let provider = service
+            .upsert_managed_cloud_provider(managed_config("https://cloud.example.com"))
+            .await
+            .unwrap();
+        let mappings = service.list_role_mappings(provider.id).await.unwrap();
+        assert!(matches!(
+            service
+                .create_role_mapping(
+                    provider.id,
+                    CreateOidcRoleMappingRequest {
+                        priority: 0,
+                        idp_group: "*".into(),
+                        role: "admin".into()
+                    }
+                )
+                .await,
+            Err(OidcError::ManagedByCloudRoleMapping { .. })
+        ));
+        assert!(matches!(
+            service.delete_role_mapping(mappings[0].id).await,
+            Err(OidcError::ManagedByCloudRoleMapping { .. })
+        ));
+        assert_eq!(
+            service.list_role_mappings(provider.id).await.unwrap().len(),
+            mappings.len()
+        );
     }
 }

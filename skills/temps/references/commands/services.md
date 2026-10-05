@@ -507,6 +507,7 @@ Restore a service from a backup (in-place, new service, or PITR)
 | `--backup-id <id>` | Backup ID to restore from (see `list-backups`) | - | Yes |
 | `--new-service [name]` | Clone into a new service. Omit the value or pass "auto" to accept the auto-suggested name. | - | No |
 | `--pitr <iso>` | Point-in-time recovery target, ISO 8601 timestamp (requires a PITR-capable backup). Combine with --new-service to route PITR into a new service. | - | No |
+| `--confirm-cross-service` | Confirm an in-place (or PITR in-place) restore of a backup produced by a different service. Required by the server for such restores; recorded in the audit log. | - | No |
 | `-y, --yes` | Skip confirmation | - | No |
 | `--no-wait` | Return immediately without polling run status | - | No |
 | `--json` | Output in JSON format | - | No |

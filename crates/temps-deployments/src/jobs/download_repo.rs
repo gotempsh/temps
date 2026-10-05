@@ -5,11 +5,13 @@
 //!
 //! Downloads repository source code using git provider manager
 
+use crate::services::deployment_commit::{is_unresolved_commit, record_checked_out_commit};
 use async_trait::async_trait;
 use std::path::PathBuf;
 use std::sync::Arc;
 use temps_core::url_validation::{redact_url_password, validate_git_url};
 use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
+use temps_database::DbConnection;
 use temps_git::GitProviderManagerTrait;
 use temps_logs::{LogLevel, LogService};
 
@@ -168,6 +170,8 @@ pub struct DownloadRepoJob {
     git_provider_manager: Arc<dyn GitProviderManagerTrait>,
     log_id: Option<String>,
     log_service: Option<Arc<LogService>>,
+    /// Records the checked-out commit on a deployment queued without one.
+    db: Option<Arc<DbConnection>>,
 }
 
 // Manual Debug implementation since trait objects don't auto-derive Debug
@@ -216,6 +220,7 @@ impl DownloadRepoJob {
             git_provider_manager,
             log_id: None,
             log_service: None,
+            db: None,
         }
     }
 
@@ -242,6 +247,7 @@ impl DownloadRepoJob {
             git_provider_manager,
             log_id: None,
             log_service: None,
+            db: None,
         }
     }
 
@@ -292,6 +298,82 @@ impl DownloadRepoJob {
         self
     }
 
+    pub fn with_db(mut self, db: Arc<DbConnection>) -> Self {
+        self.db = Some(db);
+        self
+    }
+
+    /// Read the commit the checkout landed on, publish it as the
+    /// `commit_sha` output, and record it on the deployment when the
+    /// deployment was queued without a concrete commit.
+    ///
+    /// Archive downloads carry no `.git`, so there is nothing to read; that
+    /// and every other failure here is reported but never fails the
+    /// deployment, which already has its source.
+    async fn resolve_checked_out_commit(
+        &self,
+        context: &mut WorkflowContext,
+        repo_dir: &std::path::Path,
+    ) -> Result<(), WorkflowError> {
+        let dir = repo_dir.to_path_buf();
+        let head = tokio::task::spawn_blocking(move || {
+            temps_git::services::git_ops::read_head_commit(&dir)
+        })
+        .await
+        .map_err(|e| {
+            WorkflowError::JobExecutionFailed(format!(
+                "Task reading the checked-out commit in {} panicked: {}",
+                repo_dir.display(),
+                e
+            ))
+        })?;
+
+        let commit = match head {
+            Ok(Some(commit)) => commit,
+            Ok(None) => return Ok(()),
+            Err(e) => {
+                tracing::warn!(
+                    deployment_id = context.deployment_id,
+                    "Could not read the checked-out commit: {}",
+                    e
+                );
+                self.log(
+                    context,
+                    format!("⚠️ Could not determine the checked-out commit: {}", e),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
+        self.log(context, format!("Checked out commit {}", commit.sha))
+            .await?;
+        context.set_output(&self.job_id, "commit_sha", &commit.sha)?;
+
+        let Some(db) = self.db.as_ref() else {
+            return Ok(());
+        };
+        match record_checked_out_commit(db, context.deployment_id, &commit).await {
+            Ok(true) => {
+                tracing::info!(
+                    deployment_id = context.deployment_id,
+                    commit_sha = %commit.sha,
+                    "Recorded checked-out commit on deployment queued without one"
+                );
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(
+                    deployment_id = context.deployment_id,
+                    commit_sha = %commit.sha,
+                    "Failed to record checked-out commit on deployment: {}",
+                    e
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Write log message to both job-specific log file and context log writer
     async fn log(&self, context: &WorkflowContext, message: String) -> Result<(), WorkflowError> {
         // Detect log level from message content/emojis
@@ -339,7 +421,11 @@ impl DownloadRepoJob {
         }
 
         if let Some(ref tag) = self.tag_ref {
-            return tag.clone();
+            return if tag.starts_with("refs/tags/") {
+                tag.clone()
+            } else {
+                format!("refs/tags/{tag}")
+            };
         }
 
         if let Some(ref branch) = self.branch_ref {
@@ -652,6 +738,40 @@ impl DownloadRepoJob {
             return Ok(repo_dir);
         }
 
+        // A provider archive has no .git metadata. When a deployment was
+        // queued without a concrete commit, clone the requested ref instead so
+        // we can record the exact revision that supplied the build sources.
+        if is_unresolved_commit(self.commit_sha.as_deref()) {
+            self.log(
+                context,
+                "Cloning to resolve the deployment commit".to_string(),
+            )
+            .await?;
+            std::fs::remove_dir_all(&repo_dir).map_err(WorkflowError::IoError)?;
+            self.git_provider_manager
+                .clone_repository(
+                    connection_id,
+                    &self.repo_owner,
+                    &self.repo_name,
+                    &repo_dir,
+                    Some(&checkout_ref),
+                )
+                .await
+                .map_err(|e| {
+                    WorkflowError::JobExecutionFailed(format!(
+                        "Failed to clone repository at {}: {}",
+                        checkout_ref, e
+                    ))
+                })?;
+            if !repo_dir.exists() || std::fs::read_dir(&repo_dir)?.next().is_none() {
+                return Err(WorkflowError::JobExecutionFailed(
+                    "Repository directory is empty after resolving its commit".to_string(),
+                ));
+            }
+            temp_dir_guard.disarm();
+            return Ok(repo_dir);
+        }
+
         // Try download archive first (faster). Wire a progress channel so the
         // download — which can take minutes on a slow link for a large repo —
         // shows steady movement in the deployment log instead of appearing stuck.
@@ -847,6 +967,8 @@ impl WorkflowTask for DownloadRepoJob {
         )?;
         context.set_output(&self.job_id, "repo_owner", &self.repo_owner)?;
         context.set_output(&self.job_id, "repo_name", &self.repo_name)?;
+        self.resolve_checked_out_commit(&mut context, &repo_dir)
+            .await?;
 
         // Set artifacts
         context.set_artifact(&self.job_id, "source_code", repo_dir.clone());
@@ -940,6 +1062,7 @@ pub struct DownloadRepoBuilder {
     pull_only_root_directory: bool,
     log_id: Option<String>,
     log_service: Option<Arc<LogService>>,
+    db: Option<Arc<DbConnection>>,
 }
 
 impl DownloadRepoBuilder {
@@ -958,6 +1081,7 @@ impl DownloadRepoBuilder {
             pull_only_root_directory: false,
             log_id: None,
             log_service: None,
+            db: None,
         }
     }
 
@@ -1026,6 +1150,11 @@ impl DownloadRepoBuilder {
         self
     }
 
+    pub fn db(mut self, db: Arc<DbConnection>) -> Self {
+        self.db = Some(db);
+        self
+    }
+
     pub fn build(
         self,
         git_provider_manager: Arc<dyn GitProviderManagerTrait>,
@@ -1089,6 +1218,9 @@ impl DownloadRepoBuilder {
         }
         if let Some(log_service) = self.log_service {
             job = job.with_log_service(log_service);
+        }
+        if let Some(db) = self.db {
+            job = job.with_db(db);
         }
 
         Ok(job)
@@ -1556,5 +1688,350 @@ mod tests {
         for entry in kept {
             let _ = std::fs::remove_dir_all(entry.path());
         }
+    }
+
+    use temps_entities::deployments;
+    use temps_git::services::git_ops::HeadCommit;
+
+    fn deployment_model(
+        id: i32,
+        commit_sha: Option<&str>,
+        commit_message: Option<&str>,
+    ) -> deployments::Model {
+        let now = chrono::Utc::now();
+        deployments::Model {
+            id,
+            project_id: 1,
+            environment_id: 1,
+            slug: format!("app-{id}"),
+            state: "running".to_string(),
+            metadata: None,
+            deploying_at: None,
+            ready_at: None,
+            started_at: None,
+            finished_at: None,
+            context_vars: None,
+            branch_ref: Some("main".to_string()),
+            tag_ref: None,
+            commit_sha: commit_sha.map(str::to_string),
+            commit_message: commit_message.map(str::to_string),
+            commit_author: None,
+            commit_json: None,
+            cancelled_reason: None,
+            static_dir_location: None,
+            screenshot_location: None,
+            image_name: None,
+            deployment_config: None,
+            promoted_from_deployment_id: None,
+            upload_request_id: None,
+            docker_socket_mounted: false,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    const CHECKED_OUT_SHA: &str = "7f05d217867b2af52b0a28c6d1c91df97e1b5b39";
+
+    fn checked_out_commit() -> HeadCommit {
+        HeadCommit {
+            sha: CHECKED_OUT_SHA.to_string(),
+            message: Some("Add health endpoint".to_string()),
+            author: Some("Example Author".to_string()),
+        }
+    }
+
+    fn statements(db: sea_orm::DatabaseConnection) -> Vec<String> {
+        db.into_transaction_log()
+            .into_iter()
+            .map(|transaction| format!("{transaction:?}"))
+            .collect()
+    }
+
+    #[test]
+    fn only_missing_or_symbolic_commits_are_unresolved() {
+        assert!(is_unresolved_commit(None));
+        assert!(is_unresolved_commit(Some("")));
+        assert!(is_unresolved_commit(Some("HEAD")));
+        assert!(is_unresolved_commit(Some(" head ")));
+        assert!(!is_unresolved_commit(Some(CHECKED_OUT_SHA)));
+        assert!(!is_unresolved_commit(Some("7f05d21")));
+    }
+
+    #[tokio::test]
+    async fn records_the_checked_out_commit_on_a_deployment_without_one() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        let mut updated = deployment_model(42, Some(CHECKED_OUT_SHA), Some("Add health endpoint"));
+        updated.commit_author = Some("Example Author".to_string());
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![deployment_model(42, None, None)]])
+            .append_query_results([vec![updated]])
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 1,
+                rows_affected: 1,
+            }])
+            .into_connection();
+
+        let recorded = record_checked_out_commit(&db, 42, &checked_out_commit())
+            .await
+            .expect("record commit");
+
+        assert!(recorded);
+        let log = statements(db).join("\n");
+        assert!(log.contains("UPDATE"), "{log:?}");
+        assert!(log.contains("DEPLOYMENT_COMMIT_RESOLVED"), "{log:?}");
+        let audit_insert = log
+            .lines()
+            .find(|line| line.contains("INSERT") && line.contains("audit_logs"))
+            .unwrap();
+        assert!(audit_insert.contains("created_at"), "{audit_insert}");
+        assert!(log.contains("temps-deployment-workflow"), "{log:?}");
+        assert!(log.contains(CHECKED_OUT_SHA), "{log:?}");
+        assert!(log.contains("Add health endpoint"), "{log:?}");
+        assert!(log.contains("Example Author"), "{log:?}");
+    }
+
+    #[tokio::test]
+    async fn replaces_a_symbolic_head_but_keeps_provider_details() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![deployment_model(
+                7,
+                Some("HEAD"),
+                Some("Message from the provider API"),
+            )]])
+            .append_query_results([vec![deployment_model(
+                7,
+                Some(CHECKED_OUT_SHA),
+                Some("Message from the provider API"),
+            )]])
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 1,
+                rows_affected: 1,
+            }])
+            .into_connection();
+
+        let recorded = record_checked_out_commit(&db, 7, &checked_out_commit())
+            .await
+            .expect("record commit");
+
+        assert!(recorded);
+        let log = statements(db).join("\n");
+        assert!(log.contains(CHECKED_OUT_SHA), "{log:?}");
+        assert!(!log.contains("Add health endpoint"), "{log:?}");
+    }
+
+    #[tokio::test]
+    async fn leaves_a_concrete_commit_untouched() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![deployment_model(
+                9,
+                Some("0123456789abcdef0123456789abcdef01234567"),
+                None,
+            )]])
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 1,
+                rows_affected: 1,
+            }])
+            .into_connection();
+
+        let recorded = record_checked_out_commit(&db, 9, &checked_out_commit())
+            .await
+            .expect("lookup succeeds");
+
+        assert!(!recorded);
+        let log = statements(db).join("\n");
+        assert!(
+            !log.contains("sql: \"UPDATE "),
+            "no UPDATE for a concrete commit: {log}"
+        );
+        assert!(!log.contains("DEPLOYMENT_COMMIT_RESOLVED"));
+    }
+
+    #[tokio::test]
+    async fn missing_deployment_is_not_an_error() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<deployments::Model>::new()])
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 1,
+                rows_affected: 1,
+            }])
+            .into_connection();
+
+        let recorded = record_checked_out_commit(&db, 404, &checked_out_commit())
+            .await
+            .expect("lookup succeeds");
+
+        assert!(!recorded);
+    }
+
+    /// "Clones" by copying a local repository, so the download job's clone
+    /// path runs end to end without a network or provider.
+    struct LocalCloneGitProviderManager {
+        source: PathBuf,
+    }
+
+    #[async_trait]
+    impl GitProviderManagerTrait for LocalCloneGitProviderManager {
+        async fn get_connection_access_token(
+            &self,
+            _connection_id: i32,
+        ) -> Result<(String, String), GitProviderManagerError> {
+            Ok(("unused".to_string(), "generic".to_string()))
+        }
+
+        async fn clone_repository(
+            &self,
+            _connection_id: i32,
+            _repo_owner: &str,
+            _repo_name: &str,
+            target_dir: &Path,
+            _branch_or_ref: Option<&str>,
+        ) -> Result<(), GitProviderManagerError> {
+            let source = self.source.to_string_lossy().to_string();
+            temps_git::services::git_ops::clone_repo(&source, target_dir, None)
+                .map(|_| ())
+                .map_err(|e| GitProviderManagerError::Other(e.to_string()))
+        }
+
+        async fn get_repository_info(
+            &self,
+            _connection_id: i32,
+            _repo_owner: &str,
+            _repo_name: &str,
+        ) -> Result<temps_git::RepositoryInfo, GitProviderManagerError> {
+            Err(GitProviderManagerError::Other("unused".into()))
+        }
+
+        async fn download_archive(
+            &self,
+            _connection_id: i32,
+            _repo_owner: &str,
+            _repo_name: &str,
+            _branch_or_ref: &str,
+            _archive_path: &Path,
+            _progress: Option<&temps_git::ArchiveProgressSender>,
+        ) -> Result<(), GitProviderManagerError> {
+            panic!("unknown commit must use git clone, never an archive")
+        }
+
+        async fn push_files_and_create_pr(
+            &self,
+            _connection_id: i32,
+            _owner: &str,
+            _repo: &str,
+            _branch: &str,
+            _base_branch: &str,
+            _files: Vec<(String, Vec<u8>)>,
+            _commit_message: &str,
+            _pr_title: &str,
+            _pr_body: &str,
+        ) -> Result<temps_git::PullRequest, temps_git::GitProviderManagerError> {
+            Err(GitProviderManagerError::Other("unused".into()))
+        }
+
+        async fn mint_scoped_repo_token(
+            &self,
+            _: i32,
+            _: &str,
+            _: &str,
+            _: temps_git::ScopedTokenOp,
+        ) -> Result<temps_git::ScopedTokenGrant, temps_git::GitProviderManagerError> {
+            Err(GitProviderManagerError::Other("unused".into()))
+        }
+    }
+
+    /// A one-commit repository built with the git CLI, returning its SHA.
+    fn local_repository_with_commit(dir: &Path) -> Option<String> {
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Example Author",
+                    "-c",
+                    "user.email=author@example.com",
+                ])
+                .args([
+                    "-c",
+                    "init.defaultBranch=main",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+        };
+        git(&["init", "-q"])?;
+        std::fs::write(dir.join("main.go"), "package main\n").ok()?;
+        git(&["add", "main.go"])?;
+        git(&["commit", "-q", "-m", "Add health endpoint"])?;
+        let head = git(&["rev-parse", "HEAD"])?;
+        Some(String::from_utf8_lossy(&head.stdout).trim().to_string())
+    }
+
+    #[tokio::test]
+    async fn clone_keeps_git_metadata_and_records_the_checked_out_commit() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        let source = tempfile::tempdir().unwrap();
+        let Some(sha) = local_repository_with_commit(source.path()) else {
+            println!("git CLI unavailable; skipping");
+            return;
+        };
+
+        let deployment_id = 900_000 + (std::process::id() as i32 % 50_000);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![deployment_model(deployment_id, None, None)]])
+                .append_query_results([vec![deployment_model(
+                    deployment_id,
+                    Some(&sha),
+                    Some("Add health endpoint"),
+                )]])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let job = DownloadRepoBuilder::new()
+            .repo_owner("example".to_string())
+            .repo_name("service".to_string())
+            .git_provider_connection_id(1)
+            .branch_ref("main".to_string())
+            .db(db.clone())
+            .build(Arc::new(LocalCloneGitProviderManager {
+                source: source.path().to_path_buf(),
+            }))
+            .unwrap();
+        let context = crate::test_utils::create_test_context(
+            "wf-commit-resolution".to_string(),
+            deployment_id,
+            1,
+            1,
+        );
+
+        let result = job.execute(context).await.expect("download succeeds");
+        let context = result.context;
+        let repo_dir: String = context
+            .get_output("download_repo", "repo_dir")
+            .unwrap()
+            .unwrap();
+        let commit: Option<String> = context.get_output("download_repo", "commit_sha").unwrap();
+        let has_git = Path::new(&repo_dir).join(".git").is_dir();
+        job.cleanup(&context).await.unwrap();
+        if let Some(work_dir) = &context.work_dir {
+            let _ = std::fs::remove_dir_all(work_dir);
+        }
+
+        // The checkout keeps `.git`, so builds that read VCS metadata work.
+        assert!(has_git, "cloned checkout must keep .git");
+        assert_eq!(commit.as_deref(), Some(sha.as_str()));
+        drop(job);
+        let db = Arc::try_unwrap(db).expect("job released the connection");
+        let log = statements(db).join("\n");
+        assert!(log.contains(&sha), "{log:?}");
     }
 }

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { createAndLinkDescription } from '@/lib/service-link-copy'
 import {
   adminListNodesOptions,
   createServiceMutation,
@@ -597,9 +598,7 @@ export function CreateService() {
               {projectQuery.data?.name ?? `project ${projectId}`}
             </AlertTitle>
             <AlertDescription>
-              Temps will create the service, provision this project&apos;s
-              database and runtime variables, and update its application sandbox
-              network as one operation.
+              {createAndLinkDescription(serviceType ?? '')}
             </AlertDescription>
           </Alert>
         )}

@@ -1630,6 +1630,23 @@ export type AppSettings = {
      */
     ai_workspace_file_limits?: AiWorkspaceFileLimitsSettings;
     /**
+     * Admin preference for anonymous product telemetry (the events sent to
+     * the Temps maintainers by `temps-telemetry`; unrelated to Temps Cloud
+     * mirroring in `cloud.telemetry_enabled` and to OpenTelemetry ingest).
+     *
+     * - `None` (default) — the operator has not chosen; the built-in default
+     * applies (see `temps_telemetry::DEFAULT_TELEMETRY_ENABLED`).
+     * - `Some(true)` / `Some(false)` — an admin turned it on/off from
+     * Settings › Telemetry. Applied at runtime without a restart.
+     *
+     * The `TEMPS_TELEMETRY=0` environment variable is a host-level kill
+     * switch that wins over this value unconditionally. The dedicated
+     * `PATCH /settings/telemetry` endpoint is the only write path: the
+     * generic settings save restores the stored value under the row lock, so
+     * an older client round-tripping the whole document cannot flip it.
+     */
+    anonymous_telemetry_enabled?: boolean | null;
+    /**
      * Build-time resource limits applied on the control plane to prevent
      * `docker build` from saturating host CPU/RAM. Worker nodes are
      * intentionally NOT subject to these limits (each worker is dedicated
@@ -3600,9 +3617,13 @@ export type CloudDeliveryGapResponse = {
 };
 
 export type CloudFeatureSwitchesRequest = {
-    backups_enabled: boolean;
-    notifications_enabled: boolean;
-    telemetry_enabled: boolean;
+    backups_enabled?: boolean | null;
+    /**
+     * Omitted switches retain their current value under the settings row lock.
+     */
+    console_access_enabled?: boolean | null;
+    notifications_enabled?: boolean | null;
+    telemetry_enabled?: boolean | null;
 };
 
 /**
@@ -3627,6 +3648,14 @@ export type CloudSettings = {
      * Explicit consent to export completed backup objects.
      */
     backups_enabled?: boolean;
+    /**
+     * Explicit operator consent to let Temps Cloud open this instance's
+     * console over the outbound relay, using managed OIDC authentication.
+     * Default off for every enrollment path. Linking, including unattended
+     * bootstrap, never enables console access; enable it explicitly in
+     * Settings > Temps Cloud or with `temps cloud console-access enable`.
+     */
+    console_access_enabled?: boolean;
     /**
      * Explicit consent to send notifications through managed providers.
      */
@@ -3711,6 +3740,11 @@ export type CloudStatus = {
     account_email?: string | null;
     backend_url: string;
     backups_enabled: boolean;
+    /**
+     * ADR-045 §5: whether this instance currently permits Temps Cloud to
+     * open its console over the console-proxy tunnel.
+     */
+    console_access_enabled: boolean;
     health: string;
     health_message: string;
     instance_id?: string | null;
@@ -6888,6 +6922,16 @@ export type DeploymentConfig = {
      */
     exposedPort?: number | null;
     /**
+     * How long, in seconds, a new container may take to start and pass its
+     * readiness check before the deployment fails. Covers apps that boot
+     * slowly (migrations, JIT warm-up, large model loads). `None` = the
+     * platform default ([`DEFAULT_HEALTH_CHECK_TIMEOUT_SECONDS`]); valid
+     * overrides are [`MIN_HEALTH_CHECK_TIMEOUT_SECONDS`]..=
+     * [`MAX_HEALTH_CHECK_TIMEOUT_SECONDS`]. Environments inherit the project
+     * value and may override it.
+     */
+    healthCheckTimeoutSeconds?: number | null;
+    /**
      * Seconds of inactivity before containers are stopped in on-demand mode.
      * Only used when `on_demand` is true. Min: 60, Max: 86400 (24h).
      * Default: 300 (5 minutes).
@@ -7156,6 +7200,57 @@ export type DeploymentEnvironmentResponse = {
     slug: string;
 };
 
+/**
+ * Allowlisted failure codes. Wire values are `snake_case` and stable; add new
+ * variants rather than renaming existing ones.
+ */
+export type DeploymentFailureCode = 'out_of_memory' | 'disk_exhausted' | 'timeout' | 'health_check_failed' | 'repository_authentication' | 'repository_not_found' | 'repository_clone' | 'dns_resolution' | 'network_connection' | 'dependency_lockfile_out_of_sync' | 'dependency_resolution' | 'dependency_download' | 'runtime_version_unsupported' | 'missing_build_script' | 'compile_error' | 'dockerfile_invalid' | 'base_image_pull' | 'image_missing' | 'static_output_missing' | 'port_unavailable' | 'permission_denied' | 'invalid_configuration' | 'container_start' | 'build_error' | 'platform_internal' | 'cancelled' | 'build_timeout' | 'source_timeout' | 'image_pull_timeout' | 'health_check_timeout' | 'app_not_listening' | 'container_exited' | 'image_not_found' | 'registry_authentication' | 'registry_rate_limited' | 'image_platform_mismatch' | 'compose_file_invalid' | 'compose_variable_missing' | 'compose_policy_rejected' | 'compose_build_failed' | 'compose_up_failed' | 'compose_unavailable' | 'volume_mount' | 'route_activation' | 'unknown';
+
+/**
+ * API view of a failed deployment's classification.
+ */
+export type DeploymentFailureInfo = {
+    /**
+     * Version of the classifier that produced this view.
+     */
+    classifier_version: number;
+    /**
+     * Allowlisted failure code.
+     */
+    code: DeploymentFailureCode;
+    /**
+     * Pipeline job that failed (e.g. `build_image`, `deploy_compose`).
+     */
+    failed_job?: string | null;
+    /**
+     * Concrete, actionable fix.
+     */
+    remediation: string;
+    settings_section?: FailureSettingsSection | null;
+    /**
+     * Pipeline stage the deployment failed in.
+     */
+    stage: DeploymentFailureStage;
+    /**
+     * How long the timed-out step ran, in seconds, when the reason states it.
+     */
+    timeout_elapsed_seconds?: number | null;
+    /**
+     * Time limit that was hit, in seconds, when the failure is a timeout and
+     * the reason states it.
+     */
+    timeout_limit_seconds?: number | null;
+    /**
+     * Short human title, e.g. "Image tag not found".
+     */
+    title: string;
+};
+
+/**
+ * The pipeline stage a deployment failed in.
+ */
+export type DeploymentFailureStage = 'source' | 'configuration' | 'dependency_install' | 'build' | 'image' | 'deploy' | 'runtime' | 'health_check' | 'resource' | 'platform' | 'unknown';
+
 export type DeploymentJobResponse = {
     created_at: number;
     dependencies?: unknown;
@@ -7304,6 +7399,7 @@ export type DeploymentResponse = {
     deployment_config?: DeploymentConfigSnapshot | null;
     environment: DeploymentEnvironmentResponse;
     environment_id: number;
+    failure?: DeploymentFailureInfo | null;
     finished_at?: number | null;
     id: number;
     is_current: boolean;
@@ -10307,6 +10403,12 @@ export type FailureReportPreviewResponse = {
      */
     reporting_enabled: boolean;
 };
+
+/**
+ * Settings surface that fixes a given failure. The console maps each value to
+ * a deep link; the API stays independent of console routes.
+ */
+export type FailureSettingsSection = 'source' | 'build' | 'deploy' | 'environment_variables' | 'git' | 'docker_registry' | 'build_limits';
 
 export type FeatureMaturity = {
     docs_path: string;
@@ -17746,7 +17848,9 @@ export type ProjectInfo = {
 export type ProjectMonitorHealth = {
     project_id: number;
     /**
-     * Overall status: "operational", "degraded", "down", or "no_monitors"
+     * Overall status: "operational", "degraded", "down", "not_deployed"
+     * (monitors exist but the environment has no deployment to check yet),
+     * or "no_monitors"
      */
     status: string;
 };
@@ -20007,6 +20111,12 @@ export type RestoreCapabilitiesResponse = RestoreCapabilities & {
  * committing to a destructive action.
  */
 export type RestorePlan = {
+    /**
+     * Whether the backup was produced by a service other than the target
+     * (or its origin is unknown). A destructive cross-service restore must
+     * be confirmed explicitly with `confirm_cross_service: true`.
+     */
+    cross_service: boolean;
     /**
      * Whether any step overwrites existing data on the target service.
      */
@@ -23080,6 +23190,17 @@ export type StartRestoreRequest = RestoreRequestMode & {
      */
     backup_location?: string | null;
     /**
+     * Explicit confirmation for a destructive cross-service restore.
+     *
+     * Restoring in place (or PITR in place) onto a service that did not
+     * produce the backup — or from a raw backup location whose origin is
+     * unknown — overwrites the target with another service's data. Such a
+     * request is rejected with `409 Conflict` unless this is `true`. The
+     * confirmation is recorded in the audit log. Ignored for modes that
+     * provision a new service and for same-service restores.
+     */
+    confirm_cross_service?: boolean;
+    /**
      * S3 source the `backup_location` lives in. Ignored when `backup_id`
      * is used.
      */
@@ -23587,6 +23708,23 @@ export type TeamResponse = {
 export type TeamRole = 'owner' | 'admin' | 'deployer' | 'viewer';
 
 /**
+ * Area an event belongs to, for operator-facing disclosure (see
+ * [`TelemetryEventKind::category`]). Serialized as snake_case.
+ */
+export type TelemetryEventCategory = 'instance' | 'deployments' | 'projects' | 'git' | 'domains' | 'services' | 'feature_activation' | 'ai' | 'configuration' | 'health';
+
+/**
+ * One event this binary can send.
+ */
+export type TelemetryEventInfo = {
+    category: TelemetryEventCategory;
+    /**
+     * Wire name, e.g. `deploy_succeeded`.
+     */
+    name: string;
+};
+
+/**
  * A gap window as the client renders it.
  */
 export type TelemetryGapWindowResponse = {
@@ -23602,6 +23740,67 @@ export type TelemetryGapWindowResponse = {
     reason: TelemetryWriteIntervalReason;
     started_at: string;
 };
+
+/**
+ * Current anonymous telemetry state and disclosure.
+ */
+export type TelemetryStatusResponse = {
+    /**
+     * The admin's stored choice; `null` when nobody has chosen yet.
+     */
+    admin_preference?: boolean | null;
+    /**
+     * Random identifier events are reported under. Not derived from the
+     * host, domain or any account. `null` if the reporter could not start.
+     */
+    anonymous_id?: string | null;
+    /**
+     * Whether the caller may change the setting (instance admins only).
+     */
+    can_manage: boolean;
+    /**
+     * The built-in default that applies when nobody has chosen.
+     */
+    default_enabled: boolean;
+    /**
+     * Whether this server is sending anonymous telemetry right now.
+     */
+    enabled: boolean;
+    /**
+     * Host events are sent to.
+     */
+    endpoint_host?: string | null;
+    /**
+     * `TEMPS_TELEMETRY` forces telemetry off on this server. The console
+     * cannot override it; remove the variable and restart to change.
+     */
+    env_opted_out: boolean;
+    /**
+     * Name of the environment variable that forces telemetry off.
+     */
+    env_var: string;
+    /**
+     * Every event this binary can send.
+     */
+    events: Array<TelemetryEventInfo>;
+    /**
+     * Documentation of what is collected and what is never collected.
+     */
+    privacy_doc_url: string;
+    /**
+     * What decided `enabled`.
+     */
+    source: TelemetryStatusSource;
+    /**
+     * Version string stamped on every event.
+     */
+    temps_version?: string | null;
+};
+
+/**
+ * What decided the current telemetry state.
+ */
+export type TelemetryStatusSource = 'environment' | 'admin_setting' | 'default' | 'unavailable';
 
 /**
  * Why an interval opened.
@@ -25030,6 +25229,13 @@ export type UpdateDeploymentConfigRequest = {
     crossArchitectureBuilds?: boolean | null;
     exposedPort?: number | null;
     /**
+     * How long, in seconds (30-3600), a new deployment's containers may take
+     * to start and pass their readiness check before the deployment fails.
+     * Absent leaves the current value unchanged; the platform default is
+     * 300 seconds.
+     */
+    healthCheckTimeoutSeconds?: number | null;
+    /**
      * Project-level default cap on concurrent in-flight requests to a
      * single environment's upstream (0 = unlimited). Environments may
      * override this. Absent leaves the current value unchanged. See
@@ -25891,6 +26097,13 @@ export type UpdateStatusResponse = {
 export type UpdateTeamRequest = {
     description?: string | null;
     name?: string | null;
+};
+
+/**
+ * Turn anonymous telemetry on or off.
+ */
+export type UpdateTelemetrySettingsRequest = {
+    enabled: boolean;
 };
 
 export type UpdateTokenRequest = {
@@ -38910,6 +39123,10 @@ export type ExternalServiceMetricsCreateAlertRuleErrors = {
      */
     403: unknown;
     /**
+     * The service already has the maximum number of alert rules
+     */
+    409: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -39606,6 +39823,10 @@ export type StartRestoreErrors = {
      * Backup or service not found
      */
     404: ProblemDetails;
+    /**
+     * Destructive cross-service restore requires explicit confirmation
+     */
+    409: ProblemDetails;
 };
 
 export type StartRestoreError = StartRestoreErrors[keyof StartRestoreErrors];
@@ -64377,6 +64598,76 @@ export type DownloadGlobalSkillArchiveResponses = {
 };
 
 export type DownloadGlobalSkillArchiveResponse = DownloadGlobalSkillArchiveResponses[keyof DownloadGlobalSkillArchiveResponses];
+
+export type GetTelemetrySettingsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/settings/telemetry';
+};
+
+export type GetTelemetrySettingsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Stored preference could not be read
+     */
+    500: ProblemDetails;
+};
+
+export type GetTelemetrySettingsError = GetTelemetrySettingsErrors[keyof GetTelemetrySettingsErrors];
+
+export type GetTelemetrySettingsResponses = {
+    /**
+     * Current telemetry state
+     */
+    200: TelemetryStatusResponse;
+};
+
+export type GetTelemetrySettingsResponse = GetTelemetrySettingsResponses[keyof GetTelemetrySettingsResponses];
+
+export type UpdateTelemetrySettingsData = {
+    body: UpdateTelemetrySettingsRequest;
+    path?: never;
+    query?: never;
+    url: '/settings/telemetry';
+};
+
+export type UpdateTelemetrySettingsErrors = {
+    /**
+     * Invalid request body
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Instance admin required
+     */
+    403: ProblemDetails;
+    /**
+     * Setting could not be saved
+     */
+    500: ProblemDetails;
+};
+
+export type UpdateTelemetrySettingsError = UpdateTelemetrySettingsErrors[keyof UpdateTelemetrySettingsErrors];
+
+export type UpdateTelemetrySettingsResponses = {
+    /**
+     * Setting saved; returns the new state
+     */
+    200: TelemetryStatusResponse;
+};
+
+export type UpdateTelemetrySettingsResponse = UpdateTelemetrySettingsResponses[keyof UpdateTelemetrySettingsResponses];
 
 export type GetUpdateCapabilityData = {
     body?: never;

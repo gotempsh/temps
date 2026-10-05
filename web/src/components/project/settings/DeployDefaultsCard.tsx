@@ -19,6 +19,7 @@ import {
   FormField,
   FormItem,
   FormLabel,
+  FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
@@ -35,6 +36,18 @@ const schema = z.object({
   memoryLimit: z.string().optional(),
   replicas: z.string().optional(),
   port: z.string().optional(),
+  healthCheckTimeout: z
+    .string()
+    .optional()
+    .refine(
+      (value) =>
+        !value ||
+        value.trim() === '' ||
+        (Number.isInteger(Number(value)) &&
+          Number(value) >= 30 &&
+          Number(value) <= 3600),
+      { message: 'Enter a whole number of seconds between 30 and 3600' }
+    ),
   automaticDeploy: z.boolean(),
 })
 
@@ -88,6 +101,8 @@ export function DeployDefaultsCard({
       memoryLimit: project?.deployment_config?.memoryLimit?.toString() ?? '',
       replicas: project?.deployment_config?.replicas?.toString() ?? '',
       port: project?.deployment_config?.exposedPort?.toString() ?? '',
+      healthCheckTimeout:
+        project?.deployment_config?.healthCheckTimeoutSeconds?.toString() ?? '',
       automaticDeploy: project?.deployment_config?.automaticDeploy ?? false,
     },
   })
@@ -104,6 +119,8 @@ export function DeployDefaultsCard({
           memoryLimit: optionalInt(values.memoryLimit),
           replicas: optionalInt(values.replicas),
           exposedPort: optionalInt(values.port),
+          healthCheckTimeoutSeconds:
+            optionalInt(values.healthCheckTimeout) ?? 300,
           automaticDeploy: values.automaticDeploy,
         },
       }),
@@ -257,6 +274,31 @@ export function DeployDefaultsCard({
                       <FormDescription className="text-muted-foreground">
                         Default port your application listens on
                       </FormDescription>
+                    </FormItem>
+                  )}
+                />
+
+                <FormField
+                  control={form.control}
+                  name="healthCheckTimeout"
+                  render={({ field }) => (
+                    <FormItem id="startup-timeout">
+                      <FormLabel>Startup timeout (seconds)</FormLabel>
+                      <FormControl>
+                        <Input
+                          {...field}
+                          type="number"
+                          min="30"
+                          max="3600"
+                          placeholder="300"
+                        />
+                      </FormControl>
+                      <FormDescription className="text-muted-foreground">
+                        How long a new deployment may take to start and pass its
+                        health check before it fails. Raise it for apps that run
+                        migrations or warm caches on boot. Default 300.
+                      </FormDescription>
+                      <FormMessage />
                     </FormItem>
                   )}
                 />

@@ -412,9 +412,8 @@ pub struct DeploymentService {
     /// Late-bound Compose executor (the `Arc<bollard::Docker>` client it needs
     /// is only constructed later in plugin init, after `DeploymentService`
     /// itself). Set via [`Self::set_compose_executor`]. Used by
-    /// `cleanup_containers` to sweep Compose-managed volumes/networks -- which
-    /// individual `deployer.remove_container` calls never touch -- when a
-    /// project/environment that deployed via Docker Compose is deleted.
+    /// `cleanup_containers` preserves ambiguous Compose resources until an
+    /// operator verifies their ownership before reclaiming them.
     compose_executor: std::sync::OnceLock<Arc<temps_deployer::compose::ComposeExecutor>>,
     /// Audit sink for deploy-path security events (late-bound, optional).
     ///
@@ -811,10 +810,80 @@ impl DeploymentService {
             }
         })?;
 
-        let recorded_container_ids: std::collections::HashSet<String> = containers
-            .iter()
-            .map(|container| container.container_id.clone())
-            .collect();
+        let recorded_ids: HashSet<&str> =
+            containers.iter().map(|c| c.container_id.as_str()).collect();
+        let expected_project = project_id.to_string();
+        let expected_environment = environment_id.map(|id| id.to_string());
+        // Discovery identifies ambiguity; it never authorizes destruction.
+        for runtime in self.deployer.list_containers().await.unwrap_or_else(|error| {
+            warn!(project_id, environment_id, %error, "Could not list unrecorded containers; preserving them and continuing recorded cleanup");
+            Vec::new()
+        }) {
+            if runtime.labels.get("sh.temps.managed").map(String::as_str) == Some("true")
+                && runtime.labels.get("sh.temps.project_id") == Some(&expected_project)
+                && expected_environment
+                    .as_ref()
+                    .is_none_or(|id| runtime.labels.get("sh.temps.environment") == Some(id))
+                && !recorded_ids.contains(runtime.container_id.as_str())
+            {
+                warn!(project_id, environment_id, container_id = %runtime.container_id,
+                    "Preserving unrecorded container with ambiguous database-local labels; only recorded container IDs will be removed");
+            }
+        }
+
+        if self.compose_executor.get().is_some() {
+            if let Some(docker) = self.docker_handle.get() {
+                let mut query = environments::Entity::find()
+                    .filter(environments::Column::ProjectId.eq(project_id));
+                if let Some(id) = environment_id {
+                    query = query.filter(environments::Column::Id.eq(id));
+                }
+                let envs = query.all(self.db.as_ref()).await.unwrap_or_else(|error| {
+                    warn!(project_id, environment_id, %error, "Could not list Compose environments; preserving their resources and continuing recorded cleanup");
+                    Vec::new()
+                });
+                for env in envs {
+                    let compose_name = format!("temps-{project_id}-{}", env.id);
+                    let filters = HashMap::from([(
+                        "label".to_string(),
+                        vec![format!("com.docker.compose.project={compose_name}")],
+                    )]);
+                    let networks = docker
+                        .list_networks(Some(
+                            bollard::query_parameters::ListNetworksOptionsBuilder::new()
+                                .filters(&filters)
+                                .build(),
+                        ))
+                        .await
+                        .unwrap_or_else(|error| {
+                            warn!(project_id, environment_id, %error, "Could not list Compose networks; preserving them and continuing recorded cleanup");
+                            Vec::new()
+                        });
+                    let volumes = docker
+                        .list_volumes(Some(
+                            bollard::query_parameters::ListVolumesOptionsBuilder::new()
+                                .filters(&filters)
+                                .build(),
+                        ))
+                        .await
+                        .map(|response| response.volumes.unwrap_or_default())
+                        .unwrap_or_else(|error| {
+                            warn!(project_id, environment_id, %error, "Could not list Compose volumes; preserving them and continuing recorded cleanup");
+                            Vec::new()
+                        });
+                    let resources: Vec<String> = networks
+                        .into_iter()
+                        .filter_map(|n| n.id.map(|id| format!("network {id}")))
+                        .chain(volumes.into_iter().map(|v| format!("volume {}", v.name)))
+                        .collect();
+                    if !resources.is_empty() {
+                        warn!(project_id, environment_id, compose_project = %compose_name,
+                            resources = ?resources,
+                            "Preserving Compose networks and volumes without durable ownership records; reclaim only after verifying ownership with docker inspect");
+                    }
+                }
+            }
+        }
 
         let deployment_ids: Vec<i32> = containers
             .iter()
@@ -983,108 +1052,12 @@ impl DeploymentService {
             );
         }
 
-        // Compose can create labeled containers before the deployment rows are
-        // registered. Discover those runtime-owned containers as well so a
-        // concurrent cancellation/deletion cannot orphan an unrecorded stack.
-        let runtime_containers = self.deployer.list_containers().await.map_err(|error| {
-            temps_core::ContainerCleanupError::Discovery {
-                project_id,
-                environment_id,
-                reason: format!("failed to discover labeled runtime containers: {error}"),
-            }
-        })?;
-        let expected_project = project_id.to_string();
-        let expected_environment = environment_id.map(|id| id.to_string());
-        for container in runtime_containers {
-            if recorded_container_ids.contains(&container.container_id)
-                || container.labels.get("sh.temps.managed").map(String::as_str) != Some("true")
-                || container.labels.get("sh.temps.project_id") != Some(&expected_project)
-                || expected_environment.as_ref().is_some_and(|expected| {
-                    container.labels.get("sh.temps.environment") != Some(expected)
-                })
-            {
-                continue;
-            }
-            let container_environment_id = container
-                .labels
-                .get("sh.temps.environment")
-                .and_then(|value| value.parse::<i32>().ok())
-                .ok_or_else(|| temps_core::ContainerCleanupError::Discovery {
-                    project_id,
-                    environment_id,
-                    reason: format!(
-                        "managed container '{}' has an invalid environment label",
-                        container.container_id
-                    ),
-                })?;
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                self.deployer.remove_container(&container.container_id),
-            )
-            .await
-            {
-                Ok(Ok(())) | Ok(Err(temps_deployer::DeployerError::ContainerNotFound(_))) => {
-                    removed += 1;
-                }
-                Ok(Err(error)) => {
-                    return Err(temps_core::ContainerCleanupError::Removal {
-                        project_id,
-                        environment_id: container_environment_id,
-                        container_id: container.container_id,
-                        node_id: None,
-                        reason: error.to_string(),
-                    });
-                }
-                Err(_) => {
-                    return Err(temps_core::ContainerCleanupError::Removal {
-                        project_id,
-                        environment_id: container_environment_id,
-                        container_id: container.container_id,
-                        node_id: None,
-                        reason: "runtime container removal timed out after 30 seconds".to_string(),
-                    });
-                }
-            }
-        }
-
-        // Individual `deployer.remove_container` calls above remove Compose
-        // containers themselves, but never the volumes/networks `docker
-        // compose up` also creates for the stack -- those only carry the
-        // `com.docker.compose.project` label. Sweep them per environment
-        // (compose project names are `temps-{project_id}-{environment_id}`,
-        // see `DeployComposeJob`). Best-effort: a stuck volume/network must
-        // not block the deletion the caller is otherwise done with.
-        if let Some(compose_executor) = self.compose_executor.get() {
-            let compose_environment_ids: Vec<i32> = match environment_id {
-                Some(id) => vec![id],
-                None => environments::Entity::find()
-                    .filter(environments::Column::ProjectId.eq(project_id))
-                    .select_only()
-                    .column(environments::Column::Id)
-                    .into_tuple()
-                    .all(self.db.as_ref())
-                    .await
-                    .map_err(|error| temps_core::ContainerCleanupError::Discovery {
-                        project_id,
-                        environment_id,
-                        reason: format!(
-                            "failed to enumerate environments for Compose resource cleanup: {error}"
-                        ),
-                    })?,
-            };
-            for env_id in compose_environment_ids {
-                let compose_project_name = format!("temps-{project_id}-{env_id}");
-                if let Err(error) = compose_executor.destroy(&compose_project_name).await {
-                    warn!(
-                        project_id,
-                        environment_id = env_id,
-                        compose_project = %compose_project_name,
-                        %error,
-                        "Failed to clean up Compose-managed volumes/networks (best-effort)"
-                    );
-                }
-            }
-        }
+        // Numeric project/environment IDs and Compose project names are local
+        // to one database, not ownership proof on a shared Docker host. Never
+        // discover or destroy additional resources by those labels: another
+        // Temps instance can have the same IDs. Only the exact container IDs
+        // recorded above are safe to remove. Unrecorded legacy Compose resources
+        // require manual cleanup until durable ownership is recorded.
 
         Ok(removed)
     }
@@ -7032,6 +7005,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_does_not_discover_foreign_containers_with_colliding_database_ids(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping cleanup isolation integration test");
+            return Ok(());
+        }
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, _environment, _deployment, container) = setup_test_deployment(&db).await?;
+        deployment_containers::Entity::delete_by_id(container.id)
+            .exec(db.as_ref())
+            .await?;
+        // Another database can own live containers carrying identical numeric
+        // project/environment labels. Discovery is not an ownership authority.
+        let mut deployer = MockContainerDeployer::new();
+        let label = project.id.to_string();
+        deployer.expect_list_containers().returning(move || {
+            Ok(vec![temps_deployer::ContainerInfo {
+                container_id: "foreign-container".to_string(),
+                labels: HashMap::from([
+                    ("sh.temps.managed".to_string(), "true".to_string()),
+                    ("sh.temps.project_id".to_string(), label.clone()),
+                ]),
+                ..Default::default()
+            }])
+        });
+        deployer.expect_get_container_info().never();
+        deployer.expect_remove_container().never();
+        let service = create_cleanup_service_for_test(db.clone(), Arc::new(deployer));
+        let result = temps_core::DeploymentContainerCleaner::cleanup_project_containers(
+            &service, project.id,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "recorded cleanup should finish while preserving ambiguous resources: {result:?}"
+        );
+        assert!(projects::Entity::find_by_id(project.id)
+            .one(db.as_ref())
+            .await?
+            .is_some());
+        Ok(())
+    }
+
+    struct DisposableNetwork(String);
+    impl Drop for DisposableNetwork {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("docker")
+                .args(["network", "rm", &self.0])
+                .output();
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_preserves_ambiguous_compose_network_with_executor_initialized(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            return Ok(());
+        }
+        let docker = match bollard::Docker::connect_with_local_defaults() {
+            Ok(docker) if docker.ping().await.is_ok() => docker,
+            _ => return Ok(()),
+        };
+        if !tokio::process::Command::new("docker")
+            .arg("info")
+            .output()
+            .await
+            .is_ok_and(|output| output.status.success())
+        {
+            return Ok(());
+        }
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        // Use a random high database-local ID so even a regressed teardown
+        // cannot select another live instance's ordinary Compose namespace.
+        let nonce = uuid::Uuid::new_v4();
+        let project_sequence = 1_000_000_000_i64
+            + i64::from(
+                u32::from_be_bytes(nonce.as_bytes()[..4].try_into().unwrap()) % 900_000_000,
+            );
+        db.query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT setval(pg_get_serial_sequence('projects', 'id'), $1)",
+            [project_sequence.into()],
+        ))
+        .await?;
+
+        let (project, environment, _deployment, container) = setup_test_deployment(&db).await?;
+        deployment_containers::Entity::delete_by_id(container.id)
+            .exec(db.as_ref())
+            .await?;
+        let network_name = format!("temps-cleanup-isolation-{}", uuid::Uuid::new_v4());
+        let label = format!(
+            "com.docker.compose.project=temps-{}-{}",
+            project.id, environment.id
+        );
+        let created = tokio::process::Command::new("docker")
+            .args(["network", "create", "--label", &label, &network_name])
+            .output()
+            .await?;
+        assert!(
+            created.status.success(),
+            "create disposable network: {}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let _network_guard = DisposableNetwork(network_name.clone());
+        let mut deployer = MockContainerDeployer::new();
+        deployer.expect_list_containers().returning(|| Ok(vec![]));
+        deployer.expect_remove_container().never();
+        let service = create_cleanup_service_for_test(db.clone(), Arc::new(deployer));
+        let directory = tempfile::tempdir()?;
+        service.set_compose_executor(Arc::new(temps_deployer::compose::ComposeExecutor::new(
+            Arc::new(docker),
+            directory.path().to_path_buf(),
+        )));
+        let result = temps_core::DeploymentContainerCleaner::cleanup_project_containers(
+            &service, project.id,
+        )
+        .await;
+        let survived = tokio::process::Command::new("docker")
+            .args(["network", "inspect", &network_name])
+            .output()
+            .await?;
+        let cleanup = tokio::process::Command::new("docker")
+            .args(["network", "rm", &network_name])
+            .output()
+            .await?;
+        assert!(
+            cleanup.status.success(),
+            "remove only the disposable network"
+        );
+        assert!(
+            survived.status.success(),
+            "cleanup must preserve the ambiguous foreign network"
+        );
+        assert!(
+            result.is_ok(),
+            "recorded cleanup should finish while preserving ambiguous resources: {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn cleanup_project_containers_removes_container_before_database_cascade(
     ) -> Result<(), Box<dyn std::error::Error>> {
         if !database_integration_tests_available().await {
@@ -7078,6 +7194,62 @@ mod tests {
             "the database cascade must happen only after external cleanup succeeds"
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cleanup_proceeds_when_optional_resource_listings_fail(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            return Ok(());
+        }
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, _deployment, container) = setup_test_deployment(&db).await?;
+        let expected_id = container.container_id.clone();
+        let mut deployer = MockContainerDeployer::new();
+        deployer.expect_list_containers().returning(|| {
+            Err(temps_deployer::DeployerError::Other(
+                "listing unavailable".into(),
+            ))
+        });
+        expect_owned_container_info(&mut deployer, project.id, environment.id);
+        deployer
+            .expect_remove_container()
+            .withf(move |id| id == expected_id)
+            .times(1)
+            .returning(|_| Ok(()));
+        let mut service = create_cleanup_service_for_test(db.clone(), Arc::new(deployer));
+        // A closed loopback endpoint fails both optional Compose list calls.
+        // The recorded container's independent executor still works.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        drop(listener);
+        let docker = Arc::new(bollard::Docker::connect_with_http(
+            &format!("http://{address}"),
+            1,
+            bollard::API_DEFAULT_VERSION,
+        )?);
+        service.docker_handle = Arc::new(temps_core::DockerHandle::available(docker.clone()));
+        let directory = tempfile::tempdir()?;
+        service.set_compose_executor(Arc::new(temps_deployer::compose::ComposeExecutor::new(
+            docker,
+            directory.path().to_path_buf(),
+        )));
+        let removed = temps_core::DeploymentContainerCleaner::cleanup_project_containers(
+            &service, project.id,
+        )
+        .await?;
+        assert_eq!(removed, 1);
+        assert_eq!(
+            deployment_containers::Entity::find_by_id(container.id)
+                .one(db.as_ref())
+                .await?
+                .unwrap()
+                .status
+                .as_deref(),
+            Some("removed")
+        );
         Ok(())
     }
 

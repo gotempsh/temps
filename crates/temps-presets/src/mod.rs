@@ -24,6 +24,7 @@ pub mod registry_prefix;
 mod rsbuild;
 mod rust_preset;
 mod vite;
+mod workspace_manifests;
 
 // Preset configuration schemas
 // Source abstraction for file access
@@ -132,6 +133,47 @@ impl PackageManager {
             "COPY pnpm-workspace.yaml ./\n"
         } else {
             ""
+        }
+    }
+
+    /// Where this package manager keeps downloaded packages, as
+    /// `(directory, environment variables pointing it there)`.
+    ///
+    /// The directory is a BuildKit cache mount on the install step, so a
+    /// lockfile change only downloads what changed instead of every package.
+    /// Each manager is pointed at the directory explicitly rather than
+    /// relying on its default, because the defaults move between versions.
+    pub(crate) fn store_cache(&self) -> (&'static str, &'static [(&'static str, &'static str)]) {
+        match self {
+            PackageManager::Npm => ("/cache/npm", &[("npm_config_cache", "/cache/npm")]),
+            // pnpm 10 and earlier read `npm_config_*`; pnpm 11 only reads
+            // `pnpm_config_*`. Each version ignores the other's variable.
+            PackageManager::Pnpm => (
+                "/cache/pnpm",
+                &[
+                    ("npm_config_store_dir", "/cache/pnpm"),
+                    ("pnpm_config_store_dir", "/cache/pnpm"),
+                ],
+            ),
+            // Yarn 1 reads YARN_CACHE_FOLDER. Yarn 2+ uses its global cache
+            // under YARN_GLOBAL_FOLDER by default (enableGlobalCache).
+            PackageManager::Yarn => (
+                "/cache/yarn",
+                &[
+                    ("YARN_CACHE_FOLDER", "/cache/yarn/v1"),
+                    ("YARN_GLOBAL_FOLDER", "/cache/yarn/berry"),
+                ],
+            ),
+            PackageManager::Bun => ("/cache/bun", &[("BUN_INSTALL_CACHE_DIR", "/cache/bun")]),
+        }
+    }
+
+    pub(crate) fn id(&self) -> &'static str {
+        match self {
+            PackageManager::Bun => "bun",
+            PackageManager::Yarn => "yarn",
+            PackageManager::Npm => "npm",
+            PackageManager::Pnpm => "pnpm",
         }
     }
 
@@ -673,6 +715,8 @@ pub struct DetectedPreset {
 /// available without a Git checkout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectCandidate {
+    /// Explicit build provider for languages without a standalone preset.
+    pub build_provider: Option<NixpacksProvider>,
     pub path: String,
     pub preset: PresetType,
     pub confidence: &'static str,
@@ -685,6 +729,15 @@ pub struct ProjectCandidate {
 }
 
 impl ProjectCandidate {
+    /// Human-readable candidate label, including an explicitly selected language.
+    pub fn label(&self) -> &'static str {
+        match self.build_provider {
+            Some(NixpacksProvider::Ruby) => "Ruby",
+            Some(NixpacksProvider::Php) => "PHP",
+            _ => self.preset.display_name(),
+        }
+    }
+
     /// Return the public preset catalog slug that can be passed to project
     /// creation for this detected candidate.
     ///
@@ -692,6 +745,9 @@ impl ProjectCandidate {
     /// preset yet. Those projects are still zero-config deployable through
     /// the matching Nixpacks provider.
     pub fn catalog_slug(&self) -> &'static str {
+        if let Some(provider) = self.build_provider {
+            return provider.variant_slug();
+        }
         match self.preset {
             PresetType::Astro
             | PresetType::Nuxt
@@ -733,15 +789,10 @@ fn dir_basename(directory: &str) -> &str {
     directory.rsplit('/').next().unwrap_or(directory)
 }
 
-/// Detect deployable project roots from normalized archive entries.
-///
-/// `files` maps slash-separated relative paths to the contents of small text
-/// manifests. Binary and large files may be represented by an empty string.
-pub fn detect_project_candidates(
-    files: &std::collections::BTreeMap<String, String>,
-) -> Vec<ProjectCandidate> {
-    use std::collections::{BTreeMap, BTreeSet};
-
+/// Whether a normalized archive directory can contain a deployable project root.
+/// ZIP inspection uses the same filter so dependency/build manifests consume no
+/// project-manifest budget. Archive path and credential checks still apply.
+pub fn is_project_candidate_directory(directory: &str) -> bool {
     /// Directories that never contain a *deployable* root — they hold
     /// dependencies, build output, or VCS metadata. Without this a ZIP that
     /// shipped its `node_modules` offers thousands of bogus candidates.
@@ -759,6 +810,21 @@ pub fn detect_project_candidates(
     /// a pathological archive from turning detection into an O(n^2) walk.
     const MAX_ROOT_DEPTH: usize = 4;
 
+    !directory
+        .split('/')
+        .any(|segment| SKIP_SEGMENTS.contains(&segment))
+        && (directory == "." || directory.split('/').count() <= MAX_ROOT_DEPTH)
+}
+
+/// Detect deployable project roots from normalized archive entries.
+///
+/// `files` maps slash-separated relative paths to the contents of small text
+/// manifests. Binary and large files may be represented by an empty string.
+pub fn detect_project_candidates(
+    files: &std::collections::BTreeMap<String, String>,
+) -> Vec<ProjectCandidate> {
+    use std::collections::{BTreeMap, BTreeSet};
+
     // Index every path by its directory ONCE. The previous implementation
     // rescanned all of `files` for each root, which is O(roots x files) — a
     // 20k-entry archive turned into ~4x10^8 string comparisons per request.
@@ -768,13 +834,7 @@ pub fn detect_project_candidates(
             Some((directory, name)) => (directory, name),
             None => (".", path.as_str()),
         };
-        if directory
-            .split('/')
-            .any(|segment| SKIP_SEGMENTS.contains(&segment))
-        {
-            continue;
-        }
-        if directory != "." && directory.split('/').count() > MAX_ROOT_DEPTH {
+        if !is_project_candidate_directory(directory) {
             continue;
         }
         by_directory.entry(directory).or_default().push(name);
@@ -792,6 +852,8 @@ pub fn detect_project_candidates(
             matches!(
                 *name,
                 "package.json"
+                    | "Gemfile"
+                    | "composer.json"
                     | "docker-compose.yml"
                     | "docker-compose.yaml"
                     | "compose.yml"
@@ -842,8 +904,7 @@ pub fn detect_project_candidates(
         };
         let names = by_directory.get(root).map(Vec::as_slice).unwrap_or(&[]);
         let has = |name: &str| names.contains(&name);
-        let has_extension =
-            |extension: &str| names.iter().any(|name| name.ends_with(extension));
+        let has_extension = |extension: &str| names.iter().any(|name| name.ends_with(extension));
 
         let detected = if has("docker-compose.yml")
             || has("docker-compose.yaml")
@@ -891,8 +952,16 @@ pub fn detect_project_candidates(
             None
         };
 
+        let explicit_docker = detected.as_ref().is_some_and(|(preset, _, _)| {
+            matches!(preset, PresetType::DockerCompose | PresetType::Dockerfile)
+        });
+        // Preserve specific framework detection when another language manifest
+        // is only tooling. Offer each language independently rather than force
+        // a single provider on an ambiguous directory.
+        let mut root_candidates = Vec::new();
         if let Some((preset, confidence, reason)) = detected {
-            candidates.push(ProjectCandidate {
+            root_candidates.push(ProjectCandidate {
+                build_provider: None,
                 path: root.to_string(),
                 preset,
                 confidence,
@@ -900,6 +969,39 @@ pub fn detect_project_candidates(
                 dockerfile_path: None,
             });
         }
+        if !explicit_docker {
+            for (manifest, provider, reason) in [
+                (
+                    "composer.json",
+                    NixpacksProvider::Php,
+                    "PHP composer.json found (server preset)",
+                ),
+                (
+                    "Gemfile",
+                    NixpacksProvider::Ruby,
+                    "Ruby Gemfile found (server preset)",
+                ),
+            ] {
+                if has(manifest) {
+                    root_candidates.push(ProjectCandidate {
+                        build_provider: Some(provider),
+                        path: root.to_string(),
+                        preset: PresetType::Nixpacks,
+                        confidence: "high",
+                        reason: reason.to_string(),
+                        dockerfile_path: None,
+                    });
+                }
+            }
+            // Vite assets and a generic JS manifest are common in server apps.
+            // Prefer the server language, while keeping the JS option available.
+            root_candidates.sort_by_key(|candidate| {
+                candidate.preset == PresetType::Vite
+                    || candidate.preset == PresetType::Static
+                    || (candidate.preset == PresetType::NodeJs && candidate.confidence == "medium")
+            });
+        }
+        candidates.extend(root_candidates);
     }
 
     // Every orphaned Dockerfile becomes a build option rooted at the
@@ -909,10 +1011,13 @@ pub fn detect_project_candidates(
     orphan_dockerfile_dirs.sort_unstable();
     for dir in orphan_dockerfile_dirs {
         candidates.push(ProjectCandidate {
+            build_provider: None,
             path: ".".to_string(),
             preset: PresetType::Dockerfile,
             confidence: "medium",
-            reason: format!("Dockerfile found in {dir}/ (build context defaults to the repository root)"),
+            reason: format!(
+                "Dockerfile found in {dir}/ (build context defaults to the repository root)"
+            ),
             dockerfile_path: Some(format!("{dir}/Dockerfile")),
         });
     }
@@ -950,6 +1055,10 @@ fn detect_package_json_preset(content: &str) -> Option<(PresetType, &'static str
         (PresetType::Remix, "@remix-run/react")
     } else if has_dependency("@sveltejs/kit") {
         (PresetType::SvelteKit, "@sveltejs/kit")
+    } else if has_dependency("@tanstack/react-start") {
+        (PresetType::NodeJs, "@tanstack/react-start")
+    } else if has_dependency("@tanstack/solid-start") {
+        (PresetType::NodeJs, "@tanstack/solid-start")
     } else if has_dependency("vite") {
         (PresetType::Vite, "vite")
     } else {
@@ -1157,6 +1266,127 @@ mod uploaded_source_detection_tests {
         let mut runtime = image_runtime();
         runtime.image_ref = "registry.example/image:tag with-space".to_string();
         assert!(validate_image_runtime_config(&runtime).is_err());
+    }
+
+    #[test]
+    fn server_manifests_win_over_vite_and_resolve_to_explicit_language_providers() {
+        for (manifest, content, slug, label) in [
+            ("Gemfile", "gem 'rails'", "nixpacks-ruby", "Ruby"),
+            (
+                "composer.json",
+                r#"{"require":{"laravel/framework":"^12"}}"#,
+                "nixpacks-php",
+                "PHP",
+            ),
+        ] {
+            for root in [".", "apps/server"] {
+                let prefix = if root == "." {
+                    String::new()
+                } else {
+                    format!("{root}/")
+                };
+                let files = BTreeMap::from([
+                    (format!("{prefix}{manifest}"), content.to_string()),
+                    (
+                        format!("{prefix}package.json"),
+                        r#"{"devDependencies":{"vite":"7"}}"#.to_string(),
+                    ),
+                ]);
+                let candidates = detect_project_candidates(&files);
+                assert_eq!(candidates.len(), 2);
+                assert_eq!(candidates[0].path, root);
+                assert_eq!(candidates[0].catalog_slug(), slug);
+                assert_eq!(candidates[0].label(), label);
+                let resolved = resolve_preset_slug(slug, None).unwrap();
+                assert_eq!(resolved.preset, PresetType::Nixpacks);
+                let Some(StoredPresetConfig::Nixpacks(config)) = resolved.config else {
+                    panic!("candidate must persist its explicit build provider");
+                };
+                assert_eq!(config.providers, vec![candidates[0].build_provider.unwrap()]);
+                // A user-authored Dockerfile still takes precedence.
+                let mut with_docker = files.clone();
+                with_docker.insert(format!("{prefix}Dockerfile"), "FROM scratch".to_string());
+                assert_eq!(
+                    detect_project_candidates(&with_docker)[0].catalog_slug(),
+                    "dockerfile"
+                );
+                // Ruby/PHP-only projects are deployable without a JS manifest.
+                let only_manifest =
+                    BTreeMap::from([(format!("{prefix}{manifest}"), content.to_string())]);
+                assert_eq!(
+                    detect_project_candidates(&only_manifest)[0].catalog_slug(),
+                    slug
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn incidental_language_manifests_do_not_hide_specific_node_frameworks() {
+        for dependency in ["next", "@tanstack/react-start"] {
+            let files = BTreeMap::from([
+                ("Gemfile".to_string(), "gem 'tooling'".to_string()),
+                ("composer.json".to_string(), "{}".to_string()),
+                (
+                    "package.json".to_string(),
+                    serde_json::json!({
+                        "dependencies": {dependency: "1"}, "devDependencies": {"vite": "7"}
+                    })
+                    .to_string(),
+                ),
+            ]);
+            let candidates = detect_project_candidates(&files);
+            assert_eq!(candidates.len(), 3);
+            assert_eq!(candidates[0].build_provider, None);
+            assert_eq!(
+                candidates[0].catalog_slug(),
+                if dependency == "next" {
+                    "nextjs"
+                } else {
+                    "nixpacks-node"
+                }
+            );
+            assert!(candidates
+                .iter()
+                .any(|candidate| candidate.catalog_slug() == "nixpacks-ruby"));
+            assert!(candidates
+                .iter()
+                .any(|candidate| candidate.catalog_slug() == "nixpacks-php"));
+        }
+        let candidates = detect_project_candidates(&BTreeMap::from([
+            ("Gemfile".to_string(), "gem 'rails'".to_string()),
+            ("composer.json".to_string(), "{}".to_string()),
+        ]));
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.build_provider == Some(NixpacksProvider::Ruby)));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.build_provider == Some(NixpacksProvider::Php)));
+    }
+
+    #[test]
+    fn tanstack_start_is_a_server_but_vite_spa_remains_static() {
+        for dependency in ["@tanstack/react-start", "@tanstack/solid-start"] {
+            let files = BTreeMap::from([(
+                "package.json".to_string(),
+                serde_json::json!({
+                    "dependencies": {dependency: "1"},
+                    "devDependencies": {"vite": "7"}
+                })
+                .to_string(),
+            )]);
+            assert_eq!(
+                detect_project_candidates(&files)[0].catalog_slug(),
+                "nixpacks-node"
+            );
+        }
+        let files = BTreeMap::from([(
+            "package.json".to_string(),
+            r#"{"devDependencies":{"vite":"7"}}"#.to_string(),
+        )]);
+        assert_eq!(detect_project_candidates(&files)[0].catalog_slug(), "vite");
     }
 
     #[test]

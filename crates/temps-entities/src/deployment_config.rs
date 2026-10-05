@@ -419,6 +419,46 @@ pub struct DeploymentConfig {
     /// deliberate choice and the platform should respect it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent_connections: Option<i32>,
+
+    /// How long, in seconds, a new container may take to start and pass its
+    /// readiness check before the deployment fails. Covers apps that boot
+    /// slowly (migrations, JIT warm-up, large model loads). `None` = the
+    /// platform default ([`DEFAULT_HEALTH_CHECK_TIMEOUT_SECONDS`]); valid
+    /// overrides are [`MIN_HEALTH_CHECK_TIMEOUT_SECONDS`]..=
+    /// [`MAX_HEALTH_CHECK_TIMEOUT_SECONDS`]. Environments inherit the project
+    /// value and may override it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_check_timeout_seconds: Option<i32>,
+}
+
+/// Default readiness budget for a new deployment's containers, in seconds.
+pub const DEFAULT_HEALTH_CHECK_TIMEOUT_SECONDS: i32 = 300;
+/// Smallest accepted readiness-budget override, in seconds.
+pub const MIN_HEALTH_CHECK_TIMEOUT_SECONDS: i32 = 30;
+/// Largest accepted readiness-budget override, in seconds (1 hour).
+pub const MAX_HEALTH_CHECK_TIMEOUT_SECONDS: i32 = 3600;
+
+/// Effective readiness budget in seconds for a resolved override: clamped to
+/// the accepted range, or the platform default when unset. Stored values are
+/// validated on write; the clamp keeps a hand-edited row from disabling the
+/// health gate (0) or parking a deployment for days.
+pub fn resolve_health_check_timeout_seconds(configured: Option<i32>) -> u64 {
+    let seconds = configured
+        .map(|s| {
+            s.clamp(
+                MIN_HEALTH_CHECK_TIMEOUT_SECONDS,
+                MAX_HEALTH_CHECK_TIMEOUT_SECONDS,
+            )
+        })
+        .unwrap_or(DEFAULT_HEALTH_CHECK_TIMEOUT_SECONDS);
+    u64::from(seconds.unsigned_abs())
+}
+
+impl DeploymentConfig {
+    /// Effective readiness budget in seconds for this config alone.
+    pub fn effective_health_check_timeout_seconds(&self) -> u64 {
+        resolve_health_check_timeout_seconds(self.health_check_timeout_seconds)
+    }
 }
 
 /// Deployment configuration snapshot for deployments
@@ -514,6 +554,7 @@ impl Default for DeploymentConfig {
             sse_idle_timeout_seconds: None,
             websocket_idle_timeout_seconds: None,
             max_concurrent_connections: None,
+            health_check_timeout_seconds: None,
         }
     }
 }
@@ -635,6 +676,9 @@ impl DeploymentConfig {
             max_concurrent_connections: other
                 .max_concurrent_connections
                 .or(self.max_concurrent_connections),
+            health_check_timeout_seconds: other
+                .health_check_timeout_seconds
+                .or(self.health_check_timeout_seconds),
         }
     }
 
@@ -748,6 +792,17 @@ impl DeploymentConfig {
                 return Err(format!(
                     "max_concurrent_connections cannot be negative, got {}",
                     max_conn
+                ));
+            }
+        }
+
+        if let Some(seconds) = self.health_check_timeout_seconds {
+            if !(MIN_HEALTH_CHECK_TIMEOUT_SECONDS..=MAX_HEALTH_CHECK_TIMEOUT_SECONDS)
+                .contains(&seconds)
+            {
+                return Err(format!(
+                    "Startup health-check timeout {seconds} is not in valid range \
+                     ({MIN_HEALTH_CHECK_TIMEOUT_SECONDS}-{MAX_HEALTH_CHECK_TIMEOUT_SECONDS} seconds)"
                 ));
             }
         }
@@ -1137,6 +1192,44 @@ mod tests {
         assert_eq!(config.request_timeout_seconds, None);
         assert_eq!(config.sse_idle_timeout_seconds, None);
         assert_eq!(config.websocket_idle_timeout_seconds, None);
+    }
+
+    #[test]
+    fn health_check_timeout_defaults_validates_and_merges() {
+        let project = DeploymentConfig::default();
+        assert_eq!(project.effective_health_check_timeout_seconds(), 300);
+
+        let project = DeploymentConfig {
+            health_check_timeout_seconds: Some(900),
+            ..Default::default()
+        };
+        assert!(project.validate().is_ok());
+        assert_eq!(project.effective_health_check_timeout_seconds(), 900);
+
+        // Environment inherits the project value, and may override it.
+        let env = DeploymentConfig::default();
+        assert_eq!(project.merge(&env).health_check_timeout_seconds, Some(900));
+        let env = DeploymentConfig {
+            health_check_timeout_seconds: Some(60),
+            ..Default::default()
+        };
+        assert_eq!(project.merge(&env).health_check_timeout_seconds, Some(60));
+
+        for bad in [0, 29, 3601, -5] {
+            let config = DeploymentConfig {
+                health_check_timeout_seconds: Some(bad),
+                ..Default::default()
+            };
+            let err = config.validate().unwrap_err();
+            assert!(err.contains("30-3600"), "{err}");
+            // Even an unvalidated stored value is clamped when applied.
+            let applied = config.effective_health_check_timeout_seconds();
+            assert!((30..=3600).contains(&applied), "{applied}");
+        }
+
+        // Old rows without the key deserialize to "inherit".
+        let legacy: DeploymentConfig = serde_json::from_str(r#"{"replicas":1}"#).unwrap();
+        assert_eq!(legacy.health_check_timeout_seconds, None);
     }
 
     #[test]

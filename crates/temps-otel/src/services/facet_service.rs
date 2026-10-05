@@ -543,11 +543,7 @@ impl FacetService {
             })?;
 
         // 4. Insert the Postgres row.
-        let backend = if self.ch_client.is_some() {
-            FacetBackendKind::Clickhouse
-        } else {
-            FacetBackendKind::Timescaledb
-        };
+        let backend = self.active_backend();
         let now = Utc::now();
         let active = ActiveModel {
             attribute_key: Set(key.clone()),
@@ -627,6 +623,11 @@ impl FacetService {
 
         let mut active: ActiveModel = model.into();
         active.status = Set(FacetStatus::Pending.as_db_str().to_string());
+        // Re-target the backfill at the backend that is active *now*. A facet
+        // created while ClickHouse was configured would otherwise keep
+        // failing on an instance that has since moved to TimescaleDB, and the
+        // retry the failure message asks for could never succeed.
+        active.backend = Set(self.active_backend().as_db_str().to_string());
         active.error_message = Set(None);
         active.ch_mutation_id = Set(None);
         // Restart from the top: we don't know how much of a partial
@@ -735,12 +736,7 @@ impl FacetService {
     /// "running with no mutation_id" state is ever persisted.
     async fn ch_issue_backfill(&self, facet: Model) -> Result<(), FacetError> {
         let Some(ch) = self.ch_client.as_ref() else {
-            error!(
-                attribute_key = %facet.attribute_key,
-                "Facet backend=clickhouse but no ClickHouse client is configured \
-                 (config changed since this facet was created?); stuck until resolved"
-            );
-            return Ok(());
+            return self.fail_clickhouse_unconfigured(&facet).await;
         };
 
         let column = facet_column_name(facet.slot as u8);
@@ -790,9 +786,12 @@ impl FacetService {
     /// clear, so a slot can't be reused with stale data still in it.
     async fn ch_issue_clear(&self, facet: Model) -> Result<(), FacetError> {
         let Some(ch) = self.ch_client.as_ref() else {
-            // No ClickHouse configured means there's nothing to clear —
-            // finish the delete outright.
-            return self.finalize_delete(facet.id).await;
+            // Preserve the occupied slot until the old backend can confirm clearance.
+            tracing::debug!(
+                facet_id = facet.id,
+                "ClickHouse unavailable; retaining facet slot pending clearance"
+            );
+            return Ok(());
         };
 
         let column = facet_column_name(facet.slot as u8);
@@ -830,7 +829,14 @@ impl FacetService {
     /// (-> `completed`) or a slot clear (-> hard-delete the row).
     async fn ch_check_mutation(&self, facet: Model, is_delete: bool) -> Result<(), FacetError> {
         let Some(ch) = self.ch_client.as_ref() else {
-            return Ok(());
+            // A disconnected ClickHouse backend may still hold this slot's
+            // data. Retain deleting rows until clearing can be verified; new
+            // backfills fail visibly because they cannot run.
+            return if is_delete {
+                Ok(())
+            } else {
+                self.fail_clickhouse_unconfigured(&facet).await
+            };
         };
         let Some(mutation_id) = facet.ch_mutation_id.clone() else {
             return Ok(());
@@ -1072,8 +1078,32 @@ impl FacetService {
         Ok(())
     }
 
+    /// A facet created against ClickHouse on an instance that no longer has
+    /// a ClickHouse client configured can never be backfilled there.
+    ///
+    /// This is a configuration state, not a fault, and used to be logged at
+    /// ERROR on every 5-second poller tick while the row stayed `pending`
+    /// forever. Instead, move it to `failed` once — a terminal state the
+    /// poller skips — with a message that says what is missing and how to
+    /// fix it. `retry_backfill` re-targets the facet at whichever backend is
+    /// active at retry time, so retrying is the fix on either path.
+    async fn fail_clickhouse_unconfigured(&self, facet: &Model) -> Result<(), FacetError> {
+        warn!(
+            facet_id = facet.id,
+            attribute_key = %facet.attribute_key,
+            "OTel facet was created for the ClickHouse backend, but no ClickHouse client is \
+             configured; marking its backfill as failed (retry it to backfill on the active backend)"
+        );
+        self.persist_failed(facet.id, clickhouse_unconfigured_message())
+            .await
+    }
+
     async fn set_failed(&self, id: i32, message: String) -> Result<(), FacetError> {
         error!(facet_id = id, error = %message, "OTel facet backfill failed");
+        self.persist_failed(id, message).await
+    }
+
+    async fn persist_failed(&self, id: i32, message: String) -> Result<(), FacetError> {
         let mut active = ActiveModel {
             id: Set(id),
             ..Default::default()
@@ -1105,11 +1135,30 @@ impl FacetService {
 
     /// The slot-clear finished: hard-delete the row (freeing the slot for
     /// reuse) and refresh the cache.
+    /// The storage backend new facet work runs against on this instance.
+    fn active_backend(&self) -> FacetBackendKind {
+        if self.ch_client.is_some() {
+            FacetBackendKind::Clickhouse
+        } else {
+            FacetBackendKind::Timescaledb
+        }
+    }
+
     async fn finalize_delete(&self, id: i32) -> Result<(), FacetError> {
         Entity::delete_by_id(id).exec(self.db.as_ref()).await?;
         self.refresh_cache().await?;
         Ok(())
     }
+}
+
+/// Stored on a facet whose ClickHouse backfill cannot run because ClickHouse
+/// is not configured. Says what is missing and what to do about it.
+fn clickhouse_unconfigured_message() -> String {
+    "This facet was created for the ClickHouse storage backend, but ClickHouse is not \
+     configured on this instance, so its historical backfill cannot run. New spans are \
+     still indexed. Retry the backfill to run it on the storage backend that is active now, \
+     or configure ClickHouse again and retry."
+        .to_string()
 }
 
 fn is_stale(updated_at: DateTime<Utc>) -> bool {
@@ -1330,7 +1379,7 @@ mod tests {
 
     // ── retry_backfill / advance_one ─────────────────────────────────────────
 
-    use sea_orm::{DatabaseBackend as MockBackend, MockDatabase, MockExecResult};
+    use sea_orm::{DatabaseBackend as MockBackend, MockDatabase};
 
     fn facet_model(id: i32, status: &str, backend: &str, ch_mutation_id: Option<&str>) -> Model {
         Model {
@@ -1422,35 +1471,92 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn advance_one_pending_clickhouse_without_client_is_noop() {
+    async fn advance_one_pending_clickhouse_without_client_marks_failed_once() {
         // backend=clickhouse but the service has no ch_client configured
-        // (e.g. TEMPS_CLICKHOUSE_* unset since this facet was created) —
-        // ch_issue_backfill must log and return Ok without any DB access.
+        // (e.g. TEMPS_CLICKHOUSE_* unset since this facet was created). It
+        // used to stay `pending` and log an ERROR every poller tick; now it
+        // moves to the terminal `failed` state once, with an actionable
+        // message, and the poller stops touching it.
         let model = facet_model(1, "pending", "clickhouse", None);
-        let db = MockDatabase::new(MockBackend::Postgres).into_connection();
-        let service = FacetService::new(Arc::new(db), None, empty_cache());
+        let mut failed = facet_model(1, "failed", "clickhouse", None);
+        failed.error_message = Some(clickhouse_unconfigured_message());
+        let db = Arc::new(
+            MockDatabase::new(MockBackend::Postgres)
+                .append_query_results(vec![vec![failed.clone()]])
+                .into_connection(),
+        );
+        let service = FacetService::new(db.clone(), None, empty_cache());
 
-        let result = service.advance_one(model).await;
-        assert!(result.is_ok());
+        service.advance_one(model).await.unwrap();
+        drop(service);
+
+        let log = Arc::try_unwrap(db)
+            .expect("service dropped its handle")
+            .into_transaction_log();
+        assert_eq!(log.len(), 1, "exactly one status write");
+        let sql = format!("{:?}", log[0]);
+        assert!(sql.contains("UPDATE"), "expected an UPDATE, got {sql}");
+        assert!(sql.contains("failed"), "expected status=failed, got {sql}");
+
+        // Terminal: the next tick is a no-op without any DB access.
+        let idle = MockDatabase::new(MockBackend::Postgres).into_connection();
+        let service = FacetService::new(Arc::new(idle), None, empty_cache());
+        service.advance_one(failed).await.unwrap();
     }
 
     #[tokio::test]
-    async fn advance_one_deleting_clickhouse_without_client_finalizes_delete() {
-        // backend=clickhouse, deleting, no mutation_id yet, no ch_client ->
-        // ch_issue_clear short-circuits straight to finalize_delete (nothing
-        // to clear on a backend that was never configured).
-        let model = facet_model(1, "deleting", "clickhouse", None);
+    async fn advance_one_running_clickhouse_without_client_marks_failed() {
+        let model = facet_model(1, "running", "clickhouse", Some("mutation_7.txt"));
         let db = MockDatabase::new(MockBackend::Postgres)
-            .append_exec_results(vec![MockExecResult {
-                last_insert_id: 0,
-                rows_affected: 1,
-            }])
-            // refresh_cache() reload after the delete
-            .append_query_results(vec![Vec::<Model>::new()])
+            .append_query_results(vec![vec![facet_model(1, "failed", "clickhouse", None)]])
             .into_connection();
         let service = FacetService::new(Arc::new(db), None, empty_cache());
 
-        let result = service.advance_one(model).await;
-        assert!(result.is_ok());
+        service.advance_one(model).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retry_backfill_retargets_the_active_backend() {
+        let failed = facet_model(1, "failed", "clickhouse", None);
+        let db = Arc::new(
+            MockDatabase::new(MockBackend::Postgres)
+                .append_query_results(vec![vec![failed]])
+                .append_query_results(vec![vec![facet_model(1, "pending", "timescaledb", None)]])
+                .into_connection(),
+        );
+        // No ClickHouse client: the active backend is TimescaleDB.
+        let service = FacetService::new(db.clone(), None, empty_cache());
+
+        let info = service.retry_backfill("enduser.id").await.unwrap();
+        assert_eq!(info.status, FacetStatus::Pending);
+        drop(service);
+
+        let log = Arc::try_unwrap(db)
+            .expect("service dropped its handle")
+            .into_transaction_log();
+        let update = format!("{:?}", log.last().expect("an update was issued"));
+        assert!(
+            update.contains("timescaledb"),
+            "retry must re-stamp the backend, got {update}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_clickhouse_facets_keep_their_slots_without_a_client() {
+        let db = Arc::new(MockDatabase::new(MockBackend::Postgres).into_connection());
+        let service = FacetService::new(db.clone(), None, empty_cache());
+        for mutation in [None, Some("mutation-1")] {
+            let mut model = facet_model(1, "deleting", "clickhouse", None);
+            model.ch_mutation_id = mutation.map(str::to_string);
+            service.advance_one(model).await.unwrap();
+        }
+        drop(service);
+        assert!(
+            Arc::try_unwrap(db)
+                .unwrap()
+                .into_transaction_log()
+                .is_empty(),
+            "a disconnected backend must not free slots or delete rows"
+        );
     }
 }

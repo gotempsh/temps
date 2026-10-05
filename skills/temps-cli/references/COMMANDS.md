@@ -80,10 +80,8 @@ Use this index or search for a top-level command heading to load only the releva
 - [`facets`](#facets) - Manage OTel span attribute facets — attribute keys promoted to a fast-filterable column (ClickHouse or TimescaleDB, whichever backend is active; see ADR-039). Facets are platform-global, not per-project, since the underlying spans table is shared across every project. Historical backfill runs asynchronously — check `temps facets list` for status.
 - [`otel-forward`](#otel-forward) - Manage OTel forwarding destinations that relay ingested traces, metrics, and logs to an external OTLP-compatible collector
 - [`otel`](#otel) - Inspect the OTLP ingest pipeline itself — throughput, drops and failure reasons (server-wide, not project-scoped; see "temps metrics" to query ingested application metrics)
-- [`kv`](#kv) - KV store commands (coming soon)
 - [`flags`](#flags) - Manage feature flags (runtime config that changes without a redeploy)
 - [`data`](#data) - Browse the data inside a service (tables, collections, keys, objects) — read-only
-- [`blob`](#blob) - Blob storage commands (coming soon)
 - [`dsn`](#dsn) - Manage Data Source Names (DSNs) for error tracking and analytics
 - [`scans`](#scans) - Manage vulnerability scans
 - [`custom-domains`](#custom-domains) - Manage project custom domains
@@ -126,8 +124,6 @@ Use this index or search for a top-level command heading to load only the releva
 - [`env:push`](#envpush) - Push environment variables from a .env file
 - [`rollback`](#rollback) - Rollback to a previous deployment
 - [`open`](#open) - Open project URL in browser
-- [`exec`](#exec) - Execute a command in a running container (coming soon)
-- [`dev`](#dev) - Start a local development tunnel (coming soon)
 - [`cloud`](#cloud) - Temps Cloud
 - [`plugin`](#plugin) - Create, install, update and build TypeScript plugins
 - [`setup`](#setup) - PoC: install Temps on an existing Linux VPS over SSH and save a client context
@@ -2588,6 +2584,7 @@ Restore a service from a backup (in-place, new service, or PITR)
 | `--backup-id <id>` | Backup ID to restore from (see `list-backups`) | - | Yes |
 | `--new-service [name]` | Clone into a new service. Omit the value or pass "auto" to accept the auto-suggested name. | - | No |
 | `--pitr <iso>` | Point-in-time recovery target, ISO 8601 timestamp (requires a PITR-capable backup). Combine with --new-service to route PITR into a new service. | - | No |
+| `--confirm-cross-service` | Confirm an in-place (or PITR in-place) restore of a backup produced by a different service. Required by the server for such restores; recorded in the audit log. | - | No |
 | `-y, --yes` | Skip confirmation | - | No |
 | `--no-wait` | Return immediately without polling run status | - | No |
 | `--json` | Output in JSON format | - | No |
@@ -4393,135 +4390,6 @@ Show pipeline counter trends over time (received/stored/dropped per signal)
 | `--end-time <iso>` | Explicit window end (RFC 3339) — overrides --period | - | No |
 | `--json` | Output in JSON format | - | No |
 
-## `kv`
-
-KV store commands (coming soon)
-
-**Subcommands:**
-
-- `get` - Get a value by key
-- `set` - Set a key-value pair
-- `del` (`delete`) - Delete a key
-- `keys` (`ls`) - List keys
-- `ttl` - Get the TTL (time-to-live) for a key
-- `expire` - Set expiry on an existing key
-- `incr` - Increment a numeric value
-- `enable` - Enable KV store for a project
-- `disable` - Disable KV store for a project
-- `status` - Get KV store status for a project
-
-### `kv get`
-
-Get a value by key
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `--project-id <id>` | Project ID | - | Yes |
-| `--key <key>` | Key to retrieve | - | Yes |
-
-### `kv set`
-
-Set a key-value pair
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `--project-id <id>` | Project ID | - | Yes |
-| `--key <key>` | Key to set | - | Yes |
-| `--value <value>` | Value to set | - | Yes |
-| `--ttl <seconds>` | Time-to-live in seconds | - | No |
-
-### `kv del` (alias: `delete`)
-
-Delete a key
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `--project-id <id>` | Project ID | - | Yes |
-| `--key <key>` | Key to delete | - | Yes |
-
-### `kv keys` (alias: `ls`)
-
-List keys
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `--project-id <id>` | Project ID | - | Yes |
-| `--pattern <pattern>` | Key pattern to filter by (e.g., "user:*") | - | No |
-| `--json` | Output in JSON format | - | No |
-
-### `kv ttl`
-
-Get the TTL (time-to-live) for a key
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `--project-id <id>` | Project ID | - | Yes |
-| `--key <key>` | Key to check | - | Yes |
-
-### `kv expire`
-
-Set expiry on an existing key
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `--project-id <id>` | Project ID | - | Yes |
-| `--key <key>` | Key to set expiry on | - | Yes |
-| `--ttl <seconds>` | Time-to-live in seconds | - | Yes |
-
-### `kv incr`
-
-Increment a numeric value
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `--project-id <id>` | Project ID | - | Yes |
-| `--key <key>` | Key to increment | - | Yes |
-
-### `kv enable`
-
-Enable KV store for a project
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `--project-id <id>` | Project ID | - | Yes |
-
-### `kv disable`
-
-Disable KV store for a project
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `--project-id <id>` | Project ID | - | Yes |
-
-### `kv status`
-
-Get KV store status for a project
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `--project-id <id>` | Project ID | - | Yes |
-| `--json` | Output in JSON format | - | No |
-
 ## `flags` (alias: `flag`)
 
 Manage feature flags (runtime config that changes without a redeploy)
@@ -4743,126 +4611,6 @@ Show or set whether the built-in AI assistant may read this service's rows
 |------|-------------|---------|----------|
 | `--enable` | Allow the built-in assistant to read row data | - | No |
 | `--disable` | Stop the built-in assistant reading row data | - | No |
-| `--json` | Output in JSON format | - | No |
-
-## `blob`
-
-Blob storage commands (coming soon)
-
-**Subcommands:**
-
-- `list` (`ls`) - List blobs in a project
-- `upload` (`put`) - Upload a file as a blob
-- `delete` (`rm`) - Delete a blob
-- `copy` (`cp`) - Copy a blob to a new key
-- `download` (`get`) - Download a blob to a local file
-- `head` - Get blob metadata (size, content type, etc.)
-- `enable` - Enable blob storage for a project
-- `disable` - Disable blob storage for a project
-- `status` - Get blob storage status for a project
-
-### `blob list` (alias: `ls`)
-
-List blobs in a project
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `--project-id <id>` | Project ID | - | Yes |
-| `--prefix <prefix>` | Filter by key prefix | - | No |
-| `--json` | Output in JSON format | - | No |
-
-### `blob upload` (alias: `put`)
-
-Upload a file as a blob
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `--project-id <id>` | Project ID | - | Yes |
-| `--key <key>` | Blob key (path) | - | Yes |
-| `--file <path>` | Local file path to upload | - | Yes |
-
-### `blob delete` (alias: `rm`)
-
-Delete a blob
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `--project-id <id>` | Project ID | - | Yes |
-| `--key <key>` | Blob key to delete | - | Yes |
-| `-f, --force` | Skip confirmation | - | No |
-| `-y, --yes` | Skip confirmation (alias for --force) | - | No |
-
-### `blob copy` (alias: `cp`)
-
-Copy a blob to a new key
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `--project-id <id>` | Project ID | - | Yes |
-| `--source <key>` | Source blob key | - | Yes |
-| `--dest <key>` | Destination blob key | - | Yes |
-
-### `blob download` (alias: `get`)
-
-Download a blob to a local file
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `--project-id <id>` | Project ID | - | Yes |
-| `--key <key>` | Blob key to download | - | Yes |
-| `--output <path>` | Local file path to save to | - | Yes |
-
-### `blob head`
-
-Get blob metadata (size, content type, etc.)
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `--project-id <id>` | Project ID | - | Yes |
-| `--key <key>` | Blob key | - | Yes |
-| `--json` | Output in JSON format | - | No |
-
-### `blob enable`
-
-Enable blob storage for a project
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `--project-id <id>` | Project ID | - | Yes |
-
-### `blob disable`
-
-Disable blob storage for a project
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `--project-id <id>` | Project ID | - | Yes |
-
-### `blob status`
-
-Get blob storage status for a project
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `--project-id <id>` | Project ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
 ## `dsn`
@@ -8305,28 +8053,6 @@ Open project URL in browser
 | `-e, --environment <env>` | Open specific environment | - | No |
 | `--dashboard` | Open the dashboard instead of the project URL | - | No |
 
-## `exec` (alias: `ssh`)
-
-Execute a command in a running container (coming soon)
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug | - | No |
-| `-e, --environment <env>` | Target environment | - | No |
-
-## `dev`
-
-Start a local development tunnel (coming soon)
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug | - | No |
-| `--port <port>` | Local port to expose | `3000` | No |
-
 ## `cloud`
 
 Temps Cloud
@@ -8342,6 +8068,7 @@ Temps Cloud
 - `backup-schedule` - The backup schedule that writes to the Temps Cloud destination
 - `vps` - Manage cloud VPS instances
 - `billing` - Manage Temps Cloud billing and subscription
+- `console-access` - Console access through Temps Cloud (ADR-045) -- Cloud members with the owner/admin role can open this console with no inbound port
 - `telemetry` - Where a project’s spans are written — this instance, or Temps Cloud (ADR-041)
 
 ### `cloud login`
@@ -8543,6 +8270,46 @@ Upgrade your plan
 |------|-------------|---------|----------|
 | `--yearly` | Use yearly billing cycle (default: monthly) | - | No |
 | `--no-browser` | Don't open browser, just show the URL | - | No |
+
+### `cloud console-access`
+
+Console access through Temps Cloud (ADR-045) -- Cloud members with the owner/admin role can open this console with no inbound port
+
+**Subcommands:**
+
+- `status` - Show whether Temps Cloud can open this console
+- `enable` - Allow Temps Cloud to open this console
+- `disable` - Stop Temps Cloud from opening this console (revokes its sign-in provider and sessions immediately)
+
+#### `cloud console-access status`
+
+Show whether Temps Cloud can open this console
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output JSON | - | No |
+
+#### `cloud console-access enable`
+
+Allow Temps Cloud to open this console
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output JSON | - | No |
+
+#### `cloud console-access disable`
+
+Stop Temps Cloud from opening this console (revokes its sign-in provider and sessions immediately)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output JSON | - | No |
 
 ### `cloud telemetry`
 

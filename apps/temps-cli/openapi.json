@@ -3529,6 +3529,14 @@
             },
             "description": "Transfer and preview limits for files in persistent AI workspaces.\nThese are runtime settings because operators have different control\nplane memory budgets and commonly work with very different asset sizes."
           },
+          "anonymous_telemetry_enabled": {
+            "default": null,
+            "description": "Admin preference for anonymous product telemetry (the events sent to\nthe Temps maintainers by `temps-telemetry`; unrelated to Temps Cloud\nmirroring in `cloud.telemetry_enabled` and to OpenTelemetry ingest).\n\n- `None` (default) — the operator has not chosen; the built-in default\n  applies (see `temps_telemetry::DEFAULT_TELEMETRY_ENABLED`).\n- `Some(true)` / `Some(false)` — an admin turned it on/off from\n  Settings › Telemetry. Applied at runtime without a restart.\n\nThe `TEMPS_TELEMETRY=0` environment variable is a host-level kill\nswitch that wins over this value unconditionally. The dedicated\n`PATCH /settings/telemetry` endpoint is the only write path: the\ngeneric settings save restores the stored value under the row lock, so\nan older client round-tripping the whole document cannot flip it.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "build_limits": {
             "$ref": "#/components/schemas/BuildLimitsSettings",
             "default": {
@@ -3548,6 +3556,7 @@
             "default": {
               "backend_url": "https://app.temps.sh",
               "backups_enabled": false,
+              "console_access_enabled": false,
               "notifications_enabled": false,
               "telemetry_bulk_anomaly_factor": null,
               "telemetry_bulk_rate_limit_spans_per_sec": null,
@@ -7813,20 +7822,31 @@
       "CloudFeatureSwitchesRequest": {
         "properties": {
           "backups_enabled": {
-            "type": "boolean"
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "console_access_enabled": {
+            "description": "Omitted switches retain their current value under the settings row lock.",
+            "type": [
+              "boolean",
+              "null"
+            ]
           },
           "notifications_enabled": {
-            "type": "boolean"
+            "type": [
+              "boolean",
+              "null"
+            ]
           },
           "telemetry_enabled": {
-            "type": "boolean"
+            "type": [
+              "boolean",
+              "null"
+            ]
           }
         },
-        "required": [
-          "telemetry_enabled",
-          "backups_enabled",
-          "notifications_enabled"
-        ],
         "type": "object"
       },
       "CloudProvider": {
@@ -7852,6 +7872,11 @@
           "backups_enabled": {
             "default": false,
             "description": "Explicit consent to export completed backup objects.",
+            "type": "boolean"
+          },
+          "console_access_enabled": {
+            "default": false,
+            "description": "Explicit operator consent to let Temps Cloud open this instance's\nconsole over the outbound relay, using managed OIDC authentication.\nDefault off for every enrollment path. Linking, including unattended\nbootstrap, never enables console access; enable it explicitly in\nSettings > Temps Cloud or with `temps cloud console-access enable`.",
             "type": "boolean"
           },
           "notifications_enabled": {
@@ -7912,6 +7937,10 @@
           "backups_enabled": {
             "type": "boolean"
           },
+          "console_access_enabled": {
+            "description": "ADR-045 §5: whether this instance currently permits Temps Cloud to\nopen its console over the console-proxy tunnel.",
+            "type": "boolean"
+          },
           "health": {
             "type": "string"
           },
@@ -7954,6 +7983,7 @@
           "telemetry_enabled",
           "backups_enabled",
           "notifications_enabled",
+          "console_access_enabled",
           "managed_backup_setup"
         ],
         "type": "object"
@@ -14540,6 +14570,14 @@
               "null"
             ]
           },
+          "healthCheckTimeoutSeconds": {
+            "description": "How long, in seconds, a new container may take to start and pass its\nreadiness check before the deployment fails. Covers apps that boot\nslowly (migrations, JIT warm-up, large model loads). `None` = the\nplatform default ([`DEFAULT_HEALTH_CHECK_TIMEOUT_SECONDS`]); valid\noverrides are [`MIN_HEALTH_CHECK_TIMEOUT_SECONDS`]..=\n[`MAX_HEALTH_CHECK_TIMEOUT_SECONDS`]. Environments inherit the project\nvalue and may override it.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "idleTimeoutSeconds": {
             "description": "Seconds of inactivity before containers are stopped in on-demand mode.\nOnly used when `on_demand` is true. Min: 60, Max: 86400 (24h).\nDefault: 300 (5 minutes).",
             "format": "int32",
@@ -14977,6 +15015,145 @@
         ],
         "type": "object"
       },
+      "DeploymentFailureCode": {
+        "description": "Allowlisted failure codes. Wire values are `snake_case` and stable; add new\nvariants rather than renaming existing ones.",
+        "enum": [
+          "out_of_memory",
+          "disk_exhausted",
+          "timeout",
+          "health_check_failed",
+          "repository_authentication",
+          "repository_not_found",
+          "repository_clone",
+          "dns_resolution",
+          "network_connection",
+          "dependency_lockfile_out_of_sync",
+          "dependency_resolution",
+          "dependency_download",
+          "runtime_version_unsupported",
+          "missing_build_script",
+          "compile_error",
+          "dockerfile_invalid",
+          "base_image_pull",
+          "image_missing",
+          "static_output_missing",
+          "port_unavailable",
+          "permission_denied",
+          "invalid_configuration",
+          "container_start",
+          "build_error",
+          "platform_internal",
+          "cancelled",
+          "build_timeout",
+          "source_timeout",
+          "image_pull_timeout",
+          "health_check_timeout",
+          "app_not_listening",
+          "container_exited",
+          "image_not_found",
+          "registry_authentication",
+          "registry_rate_limited",
+          "image_platform_mismatch",
+          "compose_file_invalid",
+          "compose_variable_missing",
+          "compose_policy_rejected",
+          "compose_build_failed",
+          "compose_up_failed",
+          "compose_unavailable",
+          "volume_mount",
+          "route_activation",
+          "unknown"
+        ],
+        "type": "string"
+      },
+      "DeploymentFailureInfo": {
+        "description": "API view of a failed deployment's classification.",
+        "properties": {
+          "classifier_version": {
+            "description": "Version of the classifier that produced this view.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "code": {
+            "$ref": "#/components/schemas/DeploymentFailureCode",
+            "description": "Allowlisted failure code."
+          },
+          "failed_job": {
+            "description": "Pipeline job that failed (e.g. `build_image`, `deploy_compose`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "remediation": {
+            "description": "Concrete, actionable fix.",
+            "type": "string"
+          },
+          "settings_section": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/FailureSettingsSection",
+                "description": "Settings surface that fixes it, when one exists."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "stage": {
+            "$ref": "#/components/schemas/DeploymentFailureStage",
+            "description": "Pipeline stage the deployment failed in."
+          },
+          "timeout_elapsed_seconds": {
+            "description": "How long the timed-out step ran, in seconds, when the reason states it.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "timeout_limit_seconds": {
+            "description": "Time limit that was hit, in seconds, when the failure is a timeout and\nthe reason states it.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "title": {
+            "description": "Short human title, e.g. \"Image tag not found\".",
+            "type": "string"
+          }
+        },
+        "required": [
+          "stage",
+          "code",
+          "title",
+          "remediation",
+          "classifier_version"
+        ],
+        "type": "object"
+      },
+      "DeploymentFailureStage": {
+        "description": "The pipeline stage a deployment failed in.",
+        "enum": [
+          "source",
+          "configuration",
+          "dependency_install",
+          "build",
+          "image",
+          "deploy",
+          "runtime",
+          "health_check",
+          "resource",
+          "platform",
+          "unknown"
+        ],
+        "type": "string"
+      },
       "DeploymentJobResponse": {
         "properties": {
           "created_at": {
@@ -15350,6 +15527,17 @@
           "environment_id": {
             "format": "int32",
             "type": "integer"
+          },
+          "failure": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DeploymentFailureInfo",
+                "description": "Classified cause of a failed deployment: the stage it failed in, a\nstable failure code, and a concrete fix. Present only when `status` is\n`failed` and a failure reason was recorded. Derived from\n`cancelled_reason` at read time, so older deployments are classified\nby the current classifier too."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "finished_at": {
             "format": "int64",
@@ -22071,6 +22259,19 @@
           "github_issue_body"
         ],
         "type": "object"
+      },
+      "FailureSettingsSection": {
+        "description": "Settings surface that fixes a given failure. The console maps each value to\na deep link; the API stays independent of console routes.",
+        "enum": [
+          "source",
+          "build",
+          "deploy",
+          "environment_variables",
+          "git",
+          "docker_registry",
+          "build_limits"
+        ],
+        "type": "string"
       },
       "FeatureMaturity": {
         "properties": {
@@ -37970,7 +38171,7 @@
             "type": "integer"
           },
           "status": {
-            "description": "Overall status: \"operational\", \"degraded\", \"down\", or \"no_monitors\"",
+            "description": "Overall status: \"operational\", \"degraded\", \"down\", \"not_deployed\"\n(monitors exist but the environment has no deployment to check yet),\nor \"no_monitors\"",
             "type": "string"
           }
         },
@@ -42596,6 +42797,10 @@
       "RestorePlan": {
         "description": "Preview of a restore operation. Answers \"what will happen if I click\nstart?\" with engine-level specificity so the user can confirm before\ncommitting to a destructive action.",
         "properties": {
+          "cross_service": {
+            "description": "Whether the backup was produced by a service other than the target\n(or its origin is unknown). A destructive cross-service restore must\nbe confirmed explicitly with `confirm_cross_service: true`.",
+            "type": "boolean"
+          },
           "destructive": {
             "description": "Whether any step overwrites existing data on the target service.",
             "type": "boolean"
@@ -42651,6 +42856,7 @@
           "warnings",
           "errors",
           "destructive",
+          "cross_service",
           "mode"
         ],
         "type": "object"
@@ -49304,6 +49510,10 @@
                   "null"
                 ]
               },
+              "confirm_cross_service": {
+                "description": "Explicit confirmation for a destructive cross-service restore.\n\nRestoring in place (or PITR in place) onto a service that did not\nproduce the backup — or from a raw backup location whose origin is\nunknown — overwrites the target with another service's data. Such a\nrequest is rejected with `409 Conflict` unless this is `true`. The\nconfirmation is recorded in the audit log. Ignored for modes that\nprovision a new service and for same-service restores.",
+                "type": "boolean"
+              },
               "s3_source_id": {
                 "description": "S3 source the `backup_location` lives in. Ignored when `backup_id`\nis used.",
                 "format": "int32",
@@ -50500,6 +50710,40 @@
         ],
         "type": "string"
       },
+      "TelemetryEventCategory": {
+        "description": "Area an event belongs to, for operator-facing disclosure (see\n[`TelemetryEventKind::category`]). Serialized as snake_case.",
+        "enum": [
+          "instance",
+          "deployments",
+          "projects",
+          "git",
+          "domains",
+          "services",
+          "feature_activation",
+          "ai",
+          "configuration",
+          "health"
+        ],
+        "type": "string"
+      },
+      "TelemetryEventInfo": {
+        "description": "One event this binary can send.",
+        "properties": {
+          "category": {
+            "$ref": "#/components/schemas/TelemetryEventCategory"
+          },
+          "name": {
+            "description": "Wire name, e.g. `deploy_succeeded`.",
+            "example": "deploy_succeeded",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "category"
+        ],
+        "type": "object"
+      },
       "TelemetryGapWindowResponse": {
         "description": "A gap window as the client renders it.",
         "properties": {
@@ -50541,6 +50785,97 @@
           "message"
         ],
         "type": "object"
+      },
+      "TelemetryStatusResponse": {
+        "description": "Current anonymous telemetry state and disclosure.",
+        "properties": {
+          "admin_preference": {
+            "description": "The admin's stored choice; `null` when nobody has chosen yet.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "anonymous_id": {
+            "description": "Random identifier events are reported under. Not derived from the\nhost, domain or any account. `null` if the reporter could not start.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "can_manage": {
+            "description": "Whether the caller may change the setting (instance admins only).",
+            "type": "boolean"
+          },
+          "default_enabled": {
+            "description": "The built-in default that applies when nobody has chosen.",
+            "type": "boolean"
+          },
+          "enabled": {
+            "description": "Whether this server is sending anonymous telemetry right now.",
+            "type": "boolean"
+          },
+          "endpoint_host": {
+            "description": "Host events are sent to.",
+            "example": "telemetry.temps.sh",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "env_opted_out": {
+            "description": "`TEMPS_TELEMETRY` forces telemetry off on this server. The console\ncannot override it; remove the variable and restart to change.",
+            "type": "boolean"
+          },
+          "env_var": {
+            "description": "Name of the environment variable that forces telemetry off.",
+            "example": "TEMPS_TELEMETRY",
+            "type": "string"
+          },
+          "events": {
+            "description": "Every event this binary can send.",
+            "items": {
+              "$ref": "#/components/schemas/TelemetryEventInfo"
+            },
+            "type": "array"
+          },
+          "privacy_doc_url": {
+            "description": "Documentation of what is collected and what is never collected.",
+            "type": "string"
+          },
+          "source": {
+            "$ref": "#/components/schemas/TelemetryStatusSource",
+            "description": "What decided `enabled`."
+          },
+          "temps_version": {
+            "description": "Version string stamped on every event.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "enabled",
+          "source",
+          "env_opted_out",
+          "env_var",
+          "default_enabled",
+          "can_manage",
+          "events",
+          "privacy_doc_url"
+        ],
+        "type": "object"
+      },
+      "TelemetryStatusSource": {
+        "description": "What decided the current telemetry state.",
+        "enum": [
+          "environment",
+          "admin_setting",
+          "default",
+          "unavailable"
+        ],
+        "type": "string"
       },
       "TelemetryWriteIntervalReason": {
         "description": "Why an interval opened.",
@@ -53513,6 +53848,14 @@
               "null"
             ]
           },
+          "healthCheckTimeoutSeconds": {
+            "description": "How long, in seconds (30-3600), a new deployment's containers may take\nto start and pass their readiness check before the deployment fails.\nAbsent leaves the current value unchanged; the platform default is\n300 seconds.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "maxConcurrentConnections": {
             "description": "Project-level default cap on concurrent in-flight requests to a\nsingle environment's upstream (0 = unlimited). Environments may\noverride this. Absent leaves the current value unchanged. See\nissue #646.",
             "format": "int32",
@@ -55298,6 +55641,18 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "UpdateTelemetrySettingsRequest": {
+        "description": "Turn anonymous telemetry on or off.",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
         "type": "object"
       },
       "UpdateTokenRequest": {
@@ -78162,6 +78517,9 @@
           "403": {
             "description": "Insufficient permissions"
           },
+          "409": {
+            "description": "The service already has the maximum number of alert rules"
+          },
           "500": {
             "description": "Internal server error"
           }
@@ -79153,6 +79511,16 @@
               }
             },
             "description": "Backup or service not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Destructive cross-service restore requires explicit confirmation"
           }
         },
         "security": [
@@ -119408,6 +119776,138 @@
         ]
       }
     },
+    "/settings/telemetry": {
+      "get": {
+        "description": "Reports whether this server sends anonymous product telemetry, what decided\nit (environment kill switch, admin setting or default), the random instance\nID, the destination host, and every event type the binary can send.",
+        "operationId": "get_telemetry_settings",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TelemetryStatusResponse"
+                }
+              }
+            },
+            "description": "Current telemetry state"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Stored preference could not be read"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Anonymous telemetry status and disclosure",
+        "tags": [
+          "Telemetry"
+        ]
+      },
+      "patch": {
+        "description": "Instance admins only. Persisted in the settings row, audit-logged as\n`TELEMETRY_SETTING_UPDATED`, and applied without a restart. When\n`TEMPS_TELEMETRY` forces telemetry off, the choice is still saved but has\nno effect until the variable is removed; the response says so via\n`source = environment`.",
+        "operationId": "update_telemetry_settings",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateTelemetrySettingsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TelemetryStatusResponse"
+                }
+              }
+            },
+            "description": "Setting saved; returns the new state"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request body"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Instance admin required"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Setting could not be saved"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Turn anonymous telemetry on or off",
+        "tags": [
+          "Telemetry"
+        ]
+      }
+    },
     "/settings/update": {
       "get": {
         "operationId": "get_update_capability",
@@ -125006,6 +125506,10 @@
     }
   ],
   "tags": [
+    {
+      "description": "Anonymous product telemetry status and opt-out",
+      "name": "Telemetry"
+    },
     {
       "description": "Analytics events tracking endpoints",
       "name": "Events"

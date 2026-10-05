@@ -5537,13 +5537,51 @@ impl GitProviderManagerTrait for GitProviderManager {
         //      its recorded expiry.
         // libgit2's credential callback only fires once, so we have to retry
         // the whole operation rather than refreshing inside the callback.
-        let target_str = target_dir.to_str().ok_or_else(|| {
+        target_dir.to_str().ok_or_else(|| {
             TraitError::CloneError("target directory contains invalid UTF-8".to_string())
         })?;
-        let clone_result = provider_service
-            .clone_repository(&repo.clone_url, target_str, Some(&access_token))
-            .await;
-
+        // Branch/tag deployments only need the selected tip, not every
+        // historical object. Keep full clones for pinned commit checkouts.
+        let shallow_ref = branch_or_ref.filter(|reference| {
+            !reference.eq_ignore_ascii_case("HEAD")
+                && !(matches!(reference.len(), 7..=64)
+                    && reference.bytes().all(|b| b.is_ascii_hexdigit()))
+        });
+        let username =
+            Self::clone_username_for_provider_type(&provider_service.provider_type().to_string());
+        let clone_with_token = |token: String| {
+            let provider_service = provider_service.clone();
+            let clone_url = repo.clone_url.clone();
+            let target_dir = target_dir.to_path_buf();
+            let shallow_ref = shallow_ref.map(str::to_string);
+            async move {
+                if let Some(reference) = shallow_ref {
+                    // Dropping this future terminates Git and its transport
+                    // process group before the checkout can be cleaned up.
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(300),
+                        super::git_ops::clone_named_ref_with_credentials(
+                            &clone_url,
+                            &target_dir,
+                            username,
+                            &token,
+                            &reference,
+                        ),
+                    )
+                    .await
+                    .map_err(|_| {
+                        TraitError::CloneError("Git shallow clone timed out after 300s".to_string())
+                    })?
+                    .map_err(|error| TraitError::CloneError(error.to_string()))
+                } else {
+                    provider_service
+                        .clone_repository(&clone_url, &target_dir.to_string_lossy(), Some(&token))
+                        .await
+                        .map_err(|error| TraitError::CloneError(error.to_string()))
+                }
+            }
+        };
+        let clone_result = clone_with_token(access_token.clone()).await;
         if let Err(e) = clone_result {
             if Self::is_auth_failure(&e.to_string()) {
                 tracing::warn!(
@@ -5576,12 +5614,9 @@ impl GitProviderManagerTrait for GitProviderManager {
                     .await
                     .map_err(|err| TraitError::DecryptionError(err.to_string()))?;
 
-                provider_service
-                    .clone_repository(&repo.clone_url, target_str, Some(&refreshed))
-                    .await
-                    .map_err(|err| {
-                        TraitError::CloneError(format!("Failed to clone after refresh: {}", err))
-                    })?;
+                clone_with_token(refreshed).await.map_err(|err| {
+                    TraitError::CloneError(format!("Failed to clone after refresh: {}", err))
+                })?;
             } else {
                 return Err(TraitError::CloneError(format!("Failed to clone: {}", e)));
             }
@@ -5589,7 +5624,7 @@ impl GitProviderManagerTrait for GitProviderManager {
 
         // Checkout specific ref if provided
         if let Some(ref_name) = branch_or_ref {
-            if ref_name != repo.default_branch {
+            if shallow_ref.is_none() && ref_name != repo.default_branch {
                 let target_dir_owned = target_dir.to_path_buf();
                 let ref_name_owned = ref_name.to_string();
                 tokio::task::spawn_blocking(move || {
