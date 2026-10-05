@@ -7690,8 +7690,12 @@ CMD ["cat", "/hello.txt"]
 
         let entries = archive_build_context(checkout.path());
 
-        assert!(entries.iter().all(|(path, _, _)| !path.starts_with(".git/")
-            && path.trim_end_matches('/') != ".git"));
+        assert!(
+            entries
+                .iter()
+                .all(|(path, _, _)| !path.starts_with(".git/")
+                    && path.trim_end_matches('/') != ".git")
+        );
         assert!(entries.iter().any(|(path, _, _)| path == "cmd/app/main.go"));
     }
 
