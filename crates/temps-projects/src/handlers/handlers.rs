@@ -581,7 +581,9 @@ static DROP_INSPECTIONS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 /// Upper bound on how many deployable roots a single Drop inspection reports.
 /// The response drives a picker, so a 20k-entry list is neither usable nor
 /// safe to serialise.
-const MAX_DROP_CANDIDATES: usize = 50;
+const MAX_DROP_PROJECT_ROOTS: usize = 50;
+// Each root can offer its existing preset plus Ruby and PHP alternatives.
+const MAX_DROP_CANDIDATES: usize = MAX_DROP_PROJECT_ROOTS * 3;
 
 struct DropInspectionPermit;
 
@@ -722,14 +724,7 @@ pub async fn inspect_drop_archive(
     let candidates = tokio::task::spawn_blocking(move || {
         let _inspection_permit = inspection_permit;
         let manifests = inspect_zip_manifests(&archive_path)?;
-        let mut candidates = temps_presets::detect_project_candidates(&manifests)
-            .into_iter()
-            .map(|candidate| drop_preset_candidate_from(&manifests, candidate))
-            .collect::<Vec<_>>();
-        // The response is rendered as a picker; an unbounded list is neither
-        // useful to a human nor safe to serialise.
-        candidates.truncate(MAX_DROP_CANDIDATES);
-        Ok::<_, Problem>(candidates)
+        Ok::<_, Problem>(drop_inspection_candidates(&manifests))
     })
     .await
     .map_err(|error| {
@@ -757,6 +752,28 @@ pub async fn inspect_drop_archive(
         suggested_name,
         candidates,
     }))
+}
+
+/// Bound the picker without letting one root's alternatives crowd out later
+/// applications. Keep the first choice for each of the first 50 roots, then
+/// fill the remaining bounded allowance with alternatives in detection order.
+fn drop_inspection_candidates(manifests: &BTreeMap<String, String>) -> Vec<DropPresetCandidate> {
+    let mut roots = BTreeSet::new();
+    let mut primary = Vec::new();
+    let mut alternatives = Vec::new();
+    for candidate in temps_presets::detect_project_candidates(manifests) {
+        if roots.contains(&candidate.path) {
+            if alternatives.len() < MAX_DROP_CANDIDATES {
+                alternatives.push(drop_preset_candidate_from(manifests, candidate));
+            }
+        } else if roots.len() < MAX_DROP_PROJECT_ROOTS {
+            roots.insert(candidate.path.clone());
+            primary.push(drop_preset_candidate_from(manifests, candidate));
+        }
+    }
+    let remaining = MAX_DROP_CANDIDATES.saturating_sub(primary.len());
+    primary.extend(alternatives.into_iter().take(remaining));
+    primary
 }
 
 /// Convert a detected project candidate into the response DTO for the
@@ -4103,14 +4120,14 @@ mod tests {
     use super::{
         authorize_storage_service_scopes, canonicalize_template_environment_variables,
         canonicalize_template_upgrade_environment_variables, compose_path_for_candidate,
-        drop_preset_candidate_from, image_deployment_dispatch_feedback,
+        drop_inspection_candidates, drop_preset_candidate_from, image_deployment_dispatch_feedback,
         image_template_preset_config, inspect_zip_manifests,
         missing_required_template_configuration, parse_owner_repo_from_git_url,
         production_environment_variable_names, project_created_from_template_telemetry_event,
         require_git_settings_permissions, require_template_creation_permissions,
         resolve_image_template_runtime, service_template_changes,
         validate_template_service_selection, DropPresetCandidate, TemplateEnvironmentError,
-        TemplateRuntimeOverrideError, TemplateServiceSelectionError,
+        TemplateRuntimeOverrideError, TemplateServiceSelectionError, MAX_DROP_CANDIDATES,
     };
     use axum::http::StatusCode;
     use chrono::Utc;
@@ -4701,6 +4718,50 @@ mod tests {
         let oversized = "x".repeat(1024 * 1024 + 1);
         let zip = drop_test_zip(&[("composer.json", &oversized)]);
         assert!(inspect_zip_manifests(zip.path()).is_err());
+    }
+
+    #[test]
+    fn drop_picker_preserves_roots_before_filling_alternative_preset_allowance() {
+        for count in [26, 50, 51] {
+            let mut manifests = BTreeMap::new();
+            for index in 0..count {
+                let root = format!("apps/app-{index:02}");
+                manifests.insert(format!("{root}/composer.json"), "{}".to_string());
+                manifests.insert(
+                    format!("{root}/package.json"),
+                    r#"{"devDependencies":{"vite":"7"}}"#.to_string(),
+                );
+                if count != 26 {
+                    manifests.insert(format!("{root}/Gemfile"), "gem 'tooling'".to_string());
+                }
+            }
+            let candidates = drop_inspection_candidates(&manifests);
+            let roots: BTreeSet<_> = candidates
+                .iter()
+                .map(|candidate| candidate.directory.as_str())
+                .collect();
+            assert_eq!(roots.len(), count.min(50));
+            assert_eq!(
+                candidates.len(),
+                if count == 26 { 52 } else { MAX_DROP_CANDIDATES }
+            );
+            for index in 0..count.min(50) {
+                let root = format!("apps/app-{index:02}");
+                assert!(candidates
+                    .iter()
+                    .any(|candidate| candidate.directory == root
+                        && candidate.preset == "nixpacks-php"));
+                assert!(candidates
+                    .iter()
+                    .any(|candidate| candidate.directory == root && candidate.preset == "vite"));
+                if count != 26 {
+                    assert!(candidates
+                        .iter()
+                        .any(|candidate| candidate.directory == root
+                            && candidate.preset == "nixpacks-ruby"));
+                }
+            }
+        }
     }
 
     #[test]
