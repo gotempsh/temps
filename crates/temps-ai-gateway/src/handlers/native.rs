@@ -21,7 +21,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use temps_auth::{permission_guard, AuthContext, RequireAuth};
 use temps_core::problemdetails::Problem;
 use temps_core::{AuditOperation, RequestMetadata};
@@ -39,7 +39,7 @@ use crate::native_types::*;
 use crate::providers::openai_native::UpstreamReply;
 use crate::services::gateway_service::CredentialType;
 use crate::services::native_api_service::{
-    spool_batch_file, ResponsesOutcome, MAX_BATCH_FILE_BYTES,
+    spool_batch_file, validate_model_id, ResponsesOutcome, MAX_BATCH_FILE_BYTES,
 };
 use crate::services::Owner;
 use crate::types::OpenAiErrorResponse;
@@ -115,15 +115,60 @@ fn owner_of(auth: &AuthContext) -> Owner {
     }
 }
 
-/// Forward a provider reply unchanged.
+/// Simple browser requests can carry cookies from a sibling application origin.
+/// Bearer-token clients are unaffected; cookie-authenticated uploads and cancels
+/// must originate on the console itself, before any file I/O or provider call.
+fn validate_session_action_origin(
+    auth: &AuthContext,
+    metadata: &RequestMetadata,
+) -> Result<(), (StatusCode, Json<OpenAiErrorResponse>)> {
+    if !matches!(&auth.source, temps_auth::AuthSource::Session { .. })
+        || session_action_origin_is_allowed(&metadata.headers, &metadata.base_url)
+    {
+        return Ok(());
+    }
+    Err((
+        StatusCode::FORBIDDEN,
+        Json(OpenAiErrorResponse::invalid_request(
+            "Cookie-authenticated uploads and batch cancellation require a same-origin Origin header; SDK clients should use a bearer token",
+            "invalid_origin",
+        )),
+    ))
+}
+
+fn session_action_origin_is_allowed(headers: &HeaderMap, base_url: &str) -> bool {
+    if headers
+        .get("sec-fetch-site")
+        .is_some_and(|site| site != "same-origin")
+    {
+        return false;
+    }
+    let Some(origin) = headers.get("origin").and_then(|value| value.to_str().ok()) else {
+        return false;
+    };
+    let (Ok(origin), Ok(expected)) = (reqwest::Url::parse(origin), reqwest::Url::parse(base_url))
+    else {
+        return false;
+    };
+    matches!(origin.scheme(), "http" | "https")
+        && origin.username().is_empty()
+        && origin.password().is_none()
+        && origin.path() == "/"
+        && origin.query().is_none()
+        && origin.fragment().is_none()
+        && origin.origin() == expected.origin()
+}
+
+/// Preserve provider status and bytes while enforcing the API response MIME contract.
 fn forward(reply: UpstreamReply, credential_type: Option<CredentialType>) -> Response {
     let status = StatusCode::from_u16(reply.status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let mut builder = Response::builder().status(status).header(
-        "content-type",
-        reply
-            .content_type
-            .unwrap_or_else(|| "application/json".to_string()),
-    );
+    // A custom provider is untrusted. Never let its MIME type turn an API
+    // reply into active content on the authenticated Temps origin.
+    let mut builder = Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .header("x-content-type-options", "nosniff")
+        .header("cache-control", "no-store");
     if let Some(credential_type) = credential_type {
         builder = builder.header(
             "x-temps-credential-type",
@@ -140,6 +185,27 @@ fn forward(reply: UpstreamReply, credential_type: Option<CredentialType>) -> Res
             .into_response()
         }
     }
+}
+
+/// Batch result bytes are downloads, even if a custom provider labels them HTML/SVG.
+fn download_response(
+    stream: crate::services::native_api_service::ByteStream,
+    credential_type: CredentialType,
+) -> Result<Response, axum::http::Error> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/octet-stream")
+        .header(
+            "content-disposition",
+            "attachment; filename=\"batch-results.jsonl\"",
+        )
+        .header("x-content-type-options", "nosniff")
+        .header("cache-control", "no-store")
+        .header(
+            "x-temps-credential-type",
+            credential_type_str(credential_type),
+        )
+        .body(Body::from_stream(stream))
 }
 
 fn credential_kind(headers: &HeaderMap) -> CredentialType {
@@ -231,6 +297,23 @@ impl AuditOperation for AiGatewayObjectAudit {
     }
 }
 
+/// Prefer the validated request id; bound provider ids before writing them to the audit log.
+fn audit_object_id(reply: &UpstreamReply, fallback_id: Option<&str>) -> String {
+    use crate::providers::openai_native::validate_upstream_id;
+    if let Some(id) = fallback_id.filter(|id| validate_upstream_id("object", id).is_ok()) {
+        return id.into();
+    }
+    #[derive(Deserialize)]
+    struct AuditId {
+        id: String,
+    }
+    serde_json::from_slice::<AuditId>(&reply.body)
+        .ok()
+        .map(|object| object.id)
+        .filter(|id| validate_upstream_id("object", id).is_ok())
+        .unwrap_or_default()
+}
+
 /// Audit a successful create/delete/cancel. Failures are logged, never
 /// surfaced: the provider operation already happened.
 async fn audit_object(
@@ -245,17 +328,7 @@ async fn audit_object(
     if !reply.is_success() {
         return;
     }
-    let object_id =
-        serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&reply.body)
-            .ok()
-            .and_then(|object| {
-                object
-                    .get("id")
-                    .and_then(|id| id.as_str())
-                    .map(str::to_string)
-            })
-            .or_else(|| fallback_id.map(str::to_string))
-            .unwrap_or_default();
+    let object_id = audit_object_id(reply, fallback_id);
     let audit = AiGatewayObjectAudit {
         operation,
         user_id: auth.user_id_opt(),
@@ -342,11 +415,8 @@ async fn create_response(
 ) -> Result<Response, Problem> {
     permission_guard!(auth, AiGatewayExecute);
 
-    if request.model.trim().is_empty() {
-        return Ok(error_to_response(AiGatewayError::Validation {
-            message: "model field is required".to_string(),
-        })
-        .into_response());
+    if let Err(error) = validate_model_id(&request.model) {
+        return Ok(error_to_response(error).into_response());
     }
     let byok = match byok_for(&auth, &headers) {
         Ok(byok) => byok,
@@ -437,7 +507,8 @@ async fn create_response(
             let response = Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "text/event-stream")
-                .header("cache-control", "no-cache")
+                .header("cache-control", "no-store")
+                .header("x-content-type-options", "nosniff")
                 .header("x-temps-provider", "openai")
                 .header(
                     "x-temps-credential-type",
@@ -486,6 +557,9 @@ async fn upload_file(
     mut multipart: Multipart,
 ) -> Result<Response, Problem> {
     permission_guard!(auth, AiGatewayExecute);
+    if let Err(rejection) = validate_session_action_origin(&auth, &metadata) {
+        return Ok(rejection.into_response());
+    }
     let byok = match byok_for(&auth, &headers) {
         Ok(byok) => byok,
         Err(error) => return Ok(error_to_response(error).into_response()),
@@ -722,18 +796,8 @@ async fn file_content(
         .file_content(owner_of(&auth), &byok, &file_id)
         .await
     {
-        Ok(Ok((content_type, stream))) => {
-            let response = Response::builder()
-                .status(StatusCode::OK)
-                .header(
-                    "content-type",
-                    content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-                )
-                .header(
-                    "x-temps-credential-type",
-                    credential_type_str(credential_type),
-                )
-                .body(Body::from_stream(stream));
+        Ok(Ok((_content_type, stream))) => {
+            let response = download_response(stream, credential_type);
             match response {
                 Ok(response) => Ok(response),
                 Err(build_error) => {
@@ -857,6 +921,9 @@ async fn cancel_batch(
     Path(batch_id): Path<String>,
 ) -> Result<Response, Problem> {
     permission_guard!(auth, AiGatewayExecute);
+    if let Err(rejection) = validate_session_action_origin(&auth, &metadata) {
+        return Ok(rejection.into_response());
+    }
     let byok = match byok_for(&auth, &headers) {
         Ok(byok) => byok,
         Err(error) => return Ok(error_to_response(error).into_response()),
@@ -905,6 +972,54 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn cookie_actions_reject_sibling_origins_and_require_the_same_scheme_and_port() {
+        let mut headers = HeaderMap::new();
+        let console = "https://console.example:8443";
+        assert!(!session_action_origin_is_allowed(&headers, console));
+        for origin in [
+            "null",
+            "https://app.example:8443",
+            "https://console.example",
+            "http://console.example:8443",
+            "https://user@console.example:8443",
+            "https://console.example:8443/path",
+            "https://console.example:8443?query=value",
+            "https://console.example:8443#fragment",
+        ] {
+            headers.insert("origin", origin.parse().unwrap());
+            assert!(
+                !session_action_origin_is_allowed(&headers, console),
+                "{origin}"
+            );
+        }
+        headers.insert("origin", console.parse().unwrap());
+        assert!(session_action_origin_is_allowed(&headers, console));
+        headers.insert("sec-fetch-site", "same-site".parse().unwrap());
+        assert!(!session_action_origin_is_allowed(&headers, console));
+        headers.insert("sec-fetch-site", "cross-site".parse().unwrap());
+        assert!(!session_action_origin_is_allowed(&headers, console));
+        headers.insert("sec-fetch-site", "same-origin".parse().unwrap());
+        assert!(session_action_origin_is_allowed(&headers, console));
+    }
+
+    #[test]
+    fn token_authenticated_actions_do_not_require_browser_origin_headers() {
+        let auth = AuthContext::new_deployment_token(12, None, None, 3, "app-token".into(), vec![]);
+        let metadata = RequestMetadata {
+            ip_address: "127.0.0.1".into(),
+            user_agent: "SDK".into(),
+            headers: HeaderMap::new(),
+            visitor_id_cookie: None,
+            session_id_cookie: None,
+            base_url: "https://console.example".into(),
+            scheme: "https".into(),
+            host: "console.example".into(),
+            is_secure: true,
+        };
+        assert!(validate_session_action_origin(&auth, &metadata).is_ok());
+    }
 
     #[test]
     fn openapi_registers_every_native_route_and_wire_schema() {
@@ -978,8 +1093,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn audit_ids_are_bounded_and_use_the_requested_object() {
+        let reply = UpstreamReply {
+            status: reqwest::StatusCode::OK,
+            content_type: None,
+            body: bytes::Bytes::from(
+                serde_json::to_vec(&serde_json::json!({"id":"x".repeat(100_000)})).unwrap(),
+            ),
+        };
+        assert_eq!(audit_object_id(&reply, None), "");
+        assert_eq!(
+            audit_object_id(&reply, Some("batch-requested")),
+            "batch-requested"
+        );
+    }
+
     #[tokio::test]
-    async fn forwarded_replies_keep_status_body_and_content_type() {
+    async fn untrusted_html_is_never_served_as_active_content() {
+        let payload = bytes::Bytes::from_static(b"<script>example()</script>");
+        let response = forward(
+            UpstreamReply {
+                status: reqwest::StatusCode::OK,
+                content_type: Some("text/html".into()),
+                body: payload.clone(),
+            },
+            Some(CredentialType::Byok),
+        );
+        assert_eq!(response.headers()["content-type"], "application/json");
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap(),
+            payload
+        );
+        let stream = Box::pin(tokio_stream::iter([Ok(payload.clone())]));
+        let download = download_response(stream, CredentialType::Byok).unwrap();
+        assert_eq!(
+            download.headers()["content-type"],
+            "application/octet-stream"
+        );
+        assert!(download.headers()["content-disposition"]
+            .to_str()
+            .unwrap()
+            .starts_with("attachment;"));
+        assert_eq!(download.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(download.headers()["cache-control"], "no-store");
+        assert_eq!(
+            axum::body::to_bytes(download.into_body(), 1024)
+                .await
+                .unwrap(),
+            payload
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarded_json_replies_keep_status_and_body() {
         let reply = UpstreamReply {
             status: reqwest::StatusCode::TOO_MANY_REQUESTS,
             content_type: Some("application/json".to_string()),

@@ -57,6 +57,7 @@ pub const MAX_BATCH_REQUESTS: usize = 50_000;
 pub const MAX_BATCH_LINE_BYTES: usize = 32 * 1024 * 1024;
 /// Longest `custom_id`, bounding the duplicate-detection set.
 const MAX_CUSTOM_ID_LEN: usize = 512;
+const MAX_MODEL_ID_BYTES: usize = 256;
 /// Endpoints a batch may target through the gateway.
 pub const BATCH_ENDPOINTS: [&str; 3] = ["/v1/responses", "/v1/chat/completions", "/v1/embeddings"];
 
@@ -187,20 +188,18 @@ impl BatchFileValidator {
         if parsed.method != "POST" {
             return Err(invalid_file(format!(
                 "line {number}: method '{}' is not supported, use POST",
-                parsed.method
+                parsed.method.chars().take(16).collect::<String>()
             )));
         }
         if !BATCH_ENDPOINTS.contains(&parsed.url.as_str()) {
             return Err(invalid_file(format!(
                 "line {number}: url '{}' is not supported, use one of {}",
-                parsed.url,
+                parsed.url.chars().take(128).collect::<String>(),
                 BATCH_ENDPOINTS.join(", ")
             )));
         }
         reject_shared_state(&serde_json::Value::Object(parsed.body.extra.clone()))?;
-        if parsed.body.model.trim().is_empty() {
-            return Err(invalid_file(format!("line {number}: body.model is empty")));
-        }
+        validate_model_id(&parsed.body.model).map_err(|_| invalid_file(format!("line {number}: body.model must be a nonempty name of at most {MAX_MODEL_ID_BYTES} bytes")))?;
         match &self.model {
             None => self.model = Some(parsed.body.model),
             Some(model) if *model != parsed.body.model => {
@@ -229,6 +228,15 @@ impl BatchFileValidator {
         }
         Ok(())
     }
+}
+
+pub(crate) fn validate_model_id(model: &str) -> Result<(), AiGatewayError> {
+    if model.trim().is_empty() || model.len() > MAX_MODEL_ID_BYTES {
+        return Err(AiGatewayError::Validation {
+            message: format!("model must be a nonempty name of at most {MAX_MODEL_ID_BYTES} bytes"),
+        });
+    }
+    Ok(())
 }
 
 fn invalid_file(reason: String) -> AiGatewayError {
@@ -435,16 +443,30 @@ impl NativeApiService {
     }
 
     fn base_url(&self, credentials: &ResolvedCredentials) -> Result<String, AiGatewayError> {
-        match credentials.base_url.as_deref() {
-            Some(base_url) => Ok(base_url.to_string()),
+        let base_url = match credentials.base_url.as_deref() {
+            Some(base_url) => base_url.to_string(),
             None => self
                 .gateway_service
                 .default_base_url(credentials.provider_id)
                 .map(str::to_string)
                 .ok_or_else(|| AiGatewayError::ProviderNotConfigured {
-                    provider: credentials.provider_id.to_string(),
-                }),
+                    provider: credentials.provider_id.into(),
+                })?,
+        };
+        let parsed =
+            reqwest::Url::parse(&base_url).map_err(|_| AiGatewayError::InvalidProviderUrl {
+                reason: "Native provider base URL is malformed".into(),
+            })?;
+        // Credentials belong in X-Provider-Api-Key. The base URL is persisted
+        // as routing metadata and must never contain plaintext credentials.
+        if !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return Err(AiGatewayError::InvalidProviderUrl { reason: "Native provider base URL must not include user info, query parameters, or a fragment; provide credentials in X-Provider-Api-Key".into() });
         }
+        Ok(base_url)
     }
 
     fn require_openai(
@@ -498,6 +520,7 @@ impl NativeApiService {
         request: &ResponsesRequest,
         byok: &ByokOverride,
     ) -> Result<(ResponsesOutcome, CredentialType), AiGatewayError> {
+        validate_model_id(&request.model)?;
         let credentials = self
             .gateway_service
             .resolve_credentials(&request.model, byok)
@@ -760,7 +783,7 @@ impl NativeApiService {
             return Err(AiGatewayError::Validation {
                 message: format!(
                     "endpoint '{}' is not supported for batches, use one of {}",
-                    request.endpoint,
+                    request.endpoint.chars().take(128).collect::<String>(),
                     BATCH_ENDPOINTS.join(", ")
                 ),
             });
@@ -1475,6 +1498,40 @@ mod tests {
             Arc::new(GatewayService::new(keys)),
             Arc::new(UsageService::new(db)),
         )
+    }
+
+    #[test]
+    fn identifiers_cannot_amplify_validation_errors() {
+        assert!(validate_model_id(&"gpt-".repeat(1000)).is_err());
+        let request = serde_json::json!({"custom_id":"one","method":"x".repeat(100_000),"url":"/v1/responses","body":{"model":"gpt-4o"}});
+        let error = validate(&serde_json::to_string(&request).unwrap()).unwrap_err();
+        assert!(error.to_string().len() < 512);
+        let request = serde_json::json!({"custom_id":"one","method":"POST","url":"x".repeat(100_000),"body":{"model":"gpt-4o"}});
+        let error = validate(&serde_json::to_string(&request).unwrap()).unwrap_err();
+        assert!(error.to_string().len() < 512);
+    }
+
+    #[test]
+    fn native_urls_cannot_persist_or_log_embedded_credentials() {
+        let svc = service(Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        ));
+        for url in [
+            "https://user:example-secret@provider.example/v1",
+            "https://provider.example/v1?key=example-secret",
+            "https://provider.example/v1#example-secret",
+        ] {
+            let credentials = ResolvedCredentials {
+                provider_id: OPENAI,
+                api_key: "example-key".into(),
+                base_url: Some(url.into()),
+                credential_type: CredentialType::Byok,
+                system_key_id: None,
+            };
+            let error = svc.base_url(&credentials).unwrap_err();
+            assert!(matches!(error, AiGatewayError::InvalidProviderUrl { .. }));
+            assert!(!error.to_string().contains("example-secret"));
+        }
     }
 
     #[tokio::test]
