@@ -379,6 +379,11 @@ const McpServerPage = lazy(() =>
     default: m.McpServerPage,
   }))
 )
+const TelemetrySettingsPage = lazy(() =>
+  import('./pages/settings/TelemetrySettingsPage').then((m) => ({
+    default: m.TelemetrySettingsPage,
+  }))
+)
 const NodeDetailPage = lazy(() =>
   import('./pages/settings/NodesPage').then((m) => ({
     default: m.NodeDetailPage,
@@ -758,6 +763,10 @@ const FullAppRoutes = () => {
                         element={<MetricsMonitoringPage />}
                       />
                       <Route path="cloud" element={<CloudSettingsPage />} />
+                      <Route
+                        path="telemetry"
+                        element={<TelemetrySettingsPage />}
+                      />
                       <Route path="nodes" element={<NodesPage />} />
                       <Route
                         path="nodes/:nodeId"

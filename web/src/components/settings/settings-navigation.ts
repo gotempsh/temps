@@ -16,6 +16,7 @@ import {
   KeyRound,
   Monitor,
   Puzzle,
+  RadioTower,
   Server,
   Settings2,
   Shield,
@@ -64,6 +65,12 @@ export const settingsNavigationGroups: SettingsNavigationGroup[] = [
       { title: 'Version', url: '/settings/version', icon: ArrowUpCircle },
       { title: 'Notifications', url: '/settings/notifications', icon: Bell },
       { title: 'Temps Cloud', url: '/settings/cloud', icon: Cloud },
+      {
+        title: 'Telemetry',
+        url: '/settings/telemetry',
+        icon: RadioTower,
+        keywords: ['privacy', 'anonymous', 'usage data', 'opt out'],
+      },
     ],
   },
   {

@@ -201,6 +201,12 @@ async fn send_before_exit(db: &DatabaseConnection, data_dir: &Path, event: Telem
         ) else {
             return;
         };
+        // Honour an admin's opt-out from Settings > Telemetry. If the
+        // preference cannot be read, send nothing: it may be an opt-out.
+        let Ok(preference) = temps_telemetry::stored_preference(db).await else {
+            return;
+        };
+        reporter.apply_admin_preference(preference);
         reporter.send_now(event).await;
     };
     if tokio::time::timeout(SEND_BEFORE_EXIT_TIMEOUT, send)

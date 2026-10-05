@@ -240,8 +240,6 @@ fn spawn_heartbeat_task(
     reporter: std::sync::Arc<dyn temps_core::telemetry::TelemetryReporter>,
     db: std::sync::Arc<sea_orm::DatabaseConnection>,
 ) {
-    use temps_core::telemetry::TelemetryEventKind;
-
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
         // The first tick completes immediately; skip it so the first heartbeat
@@ -250,12 +248,28 @@ fn spawn_heartbeat_task(
         interval.tick().await;
         loop {
             interval.tick().await;
-            let event =
-                build_instance_event(TelemetryEventKind::InstanceHeartbeat, db.as_ref()).await;
-            reporter.report(event);
-            tracing::debug!("emitted anonymous instance_heartbeat telemetry event");
+            emit_heartbeat(reporter.as_ref(), db.as_ref()).await;
         }
     });
+}
+
+/// One heartbeat tick. Checks the *current* telemetry state first: an admin
+/// can turn telemetry off (or on) at runtime from Settings > Telemetry, so the
+/// loop always runs and each tick decides. When disabled nothing is built or
+/// sent -- not even the count queries run. Returns whether an event was sent.
+async fn emit_heartbeat(
+    reporter: &dyn temps_core::telemetry::TelemetryReporter,
+    db: &sea_orm::DatabaseConnection,
+) -> bool {
+    use temps_core::telemetry::TelemetryEventKind;
+
+    if !reporter.is_enabled() {
+        return false;
+    }
+    let event = build_instance_event(TelemetryEventKind::InstanceHeartbeat, db).await;
+    reporter.report(event);
+    tracing::debug!("emitted anonymous instance_heartbeat telemetry event");
+    true
 }
 
 /// Interval between anonymous `error_summary` flushes. Shorter than the daily
@@ -278,9 +292,14 @@ fn spawn_error_summary_task(
         interval.tick().await;
         loop {
             interval.tick().await;
+            // Always drain, so counts accumulated while telemetry was off are
+            // discarded rather than reported after an admin turns it back on.
             let Some(summary) = temps_core::error_metrics::global().drain() else {
                 continue;
             };
+            if !reporter.is_enabled() {
+                continue;
+            }
             reporter.report(build_error_summary_event(&summary));
             tracing::debug!("emitted anonymous error_summary telemetry event");
         }
@@ -3573,16 +3592,18 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     {
         if reporter.is_enabled() {
             report_instance_started(reporter.as_ref(), db.as_ref()).await;
-            // Keep "active instances" honest: a daily heartbeat so a live-but-idle
-            // instance still checks in even when it isn't deploying. No-op when
-            // telemetry is disabled (guarded above + report() no-ops anyway).
-            spawn_heartbeat_task(reporter.clone(), db.clone());
-            // Periodic aggregated error_summary flush (ERROR logs / console
-            // 5xx / panics — counts only, never messages). Only spawned when
-            // telemetry is enabled; the counters themselves are just bounded
-            // in-process memory either way.
-            spawn_error_summary_task(reporter.clone());
         }
+        // Telemetry can be switched on or off at runtime from Settings >
+        // Telemetry, so the periodic tasks always run and every tick checks the
+        // current state: nothing is built or sent while it is off.
+        //
+        // Keep "active instances" honest: a daily heartbeat so a live-but-idle
+        // instance still checks in even when it isn't deploying.
+        spawn_heartbeat_task(reporter.clone(), db.clone());
+        // Periodic aggregated error_summary flush (ERROR logs / console
+        // 5xx / panics — counts only, never messages). The counters are
+        // bounded in-process memory and are drained every tick either way.
+        spawn_error_summary_task(reporter.clone());
     }
     if let Some(user_service) = service_context.get_service::<temps_auth::UserService>() {
         // Always ensure the system user (id=0) exists — needed for webhook-created
@@ -6083,6 +6104,61 @@ mod ai_tool_allowlist_tests {
                  fields carry unlabeled/different units — got: {description:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_tests {
+    use super::*;
+    use sea_orm::{DatabaseBackend, MockDatabase};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+    use temps_core::telemetry::{TelemetryEvent, TelemetryReporter};
+
+    /// Reporter whose enabled state a test can flip, recording what it was
+    /// asked to send.
+    #[derive(Default)]
+    struct SwitchableReporter {
+        enabled: AtomicBool,
+        sent: Mutex<Vec<String>>,
+    }
+
+    impl TelemetryReporter for SwitchableReporter {
+        fn report(&self, event: TelemetryEvent) {
+            self.sent.lock().unwrap().push(event.event_type);
+        }
+
+        fn is_enabled(&self) -> bool {
+            self.enabled.load(Ordering::SeqCst)
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_is_not_built_or_sent_while_telemetry_is_disabled() {
+        let reporter = SwitchableReporter::default();
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+
+        assert!(!emit_heartbeat(&reporter, &db).await);
+        assert!(reporter.sent.lock().unwrap().is_empty());
+        // Nothing was queried either: the instance counts are only gathered
+        // for an event that will actually be sent.
+        assert!(db.into_transaction_log().is_empty());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_follows_a_runtime_change_without_restart() {
+        let reporter = SwitchableReporter::default();
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+
+        reporter.enabled.store(true, Ordering::SeqCst);
+        assert!(emit_heartbeat(&reporter, &db).await);
+        reporter.enabled.store(false, Ordering::SeqCst);
+        assert!(!emit_heartbeat(&reporter, &db).await);
+
+        assert_eq!(
+            *reporter.sent.lock().unwrap(),
+            vec!["instance_heartbeat".to_string()]
+        );
     }
 }
 

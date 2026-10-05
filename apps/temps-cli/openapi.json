@@ -3529,6 +3529,14 @@
             },
             "description": "Transfer and preview limits for files in persistent AI workspaces.\nThese are runtime settings because operators have different control\nplane memory budgets and commonly work with very different asset sizes."
           },
+          "anonymous_telemetry_enabled": {
+            "default": null,
+            "description": "Admin preference for anonymous product telemetry (the events sent to\nthe Temps maintainers by `temps-telemetry`; unrelated to Temps Cloud\nmirroring in `cloud.telemetry_enabled` and to OpenTelemetry ingest).\n\n- `None` (default) — the operator has not chosen; the built-in default\n  applies (see `temps_telemetry::DEFAULT_TELEMETRY_ENABLED`).\n- `Some(true)` / `Some(false)` — an admin turned it on/off from\n  Settings › Telemetry. Applied at runtime without a restart.\n\nThe `TEMPS_TELEMETRY=0` environment variable is a host-level kill\nswitch that wins over this value unconditionally. The dedicated\n`PATCH /settings/telemetry` endpoint is the only write path: the\ngeneric settings save restores the stored value under the row lock, so\nan older client round-tripping the whole document cannot flip it.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "build_limits": {
             "$ref": "#/components/schemas/BuildLimitsSettings",
             "default": {
@@ -50495,6 +50503,40 @@
         ],
         "type": "string"
       },
+      "TelemetryEventCategory": {
+        "description": "Area an event belongs to, for operator-facing disclosure (see\n[`TelemetryEventKind::category`]). Serialized as snake_case.",
+        "enum": [
+          "instance",
+          "deployments",
+          "projects",
+          "git",
+          "domains",
+          "services",
+          "feature_activation",
+          "ai",
+          "configuration",
+          "health"
+        ],
+        "type": "string"
+      },
+      "TelemetryEventInfo": {
+        "description": "One event this binary can send.",
+        "properties": {
+          "category": {
+            "$ref": "#/components/schemas/TelemetryEventCategory"
+          },
+          "name": {
+            "description": "Wire name, e.g. `deploy_succeeded`.",
+            "example": "deploy_succeeded",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "category"
+        ],
+        "type": "object"
+      },
       "TelemetryGapWindowResponse": {
         "description": "A gap window as the client renders it.",
         "properties": {
@@ -50536,6 +50578,97 @@
           "message"
         ],
         "type": "object"
+      },
+      "TelemetryStatusResponse": {
+        "description": "Current anonymous telemetry state and disclosure.",
+        "properties": {
+          "admin_preference": {
+            "description": "The admin's stored choice; `null` when nobody has chosen yet.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "anonymous_id": {
+            "description": "Random identifier events are reported under. Not derived from the\nhost, domain or any account. `null` if the reporter could not start.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "can_manage": {
+            "description": "Whether the caller may change the setting (instance admins only).",
+            "type": "boolean"
+          },
+          "default_enabled": {
+            "description": "The built-in default that applies when nobody has chosen.",
+            "type": "boolean"
+          },
+          "enabled": {
+            "description": "Whether this server is sending anonymous telemetry right now.",
+            "type": "boolean"
+          },
+          "endpoint_host": {
+            "description": "Host events are sent to.",
+            "example": "telemetry.temps.sh",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "env_opted_out": {
+            "description": "`TEMPS_TELEMETRY` forces telemetry off on this server. The console\ncannot override it; remove the variable and restart to change.",
+            "type": "boolean"
+          },
+          "env_var": {
+            "description": "Name of the environment variable that forces telemetry off.",
+            "example": "TEMPS_TELEMETRY",
+            "type": "string"
+          },
+          "events": {
+            "description": "Every event this binary can send.",
+            "items": {
+              "$ref": "#/components/schemas/TelemetryEventInfo"
+            },
+            "type": "array"
+          },
+          "privacy_doc_url": {
+            "description": "Documentation of what is collected and what is never collected.",
+            "type": "string"
+          },
+          "source": {
+            "$ref": "#/components/schemas/TelemetryStatusSource",
+            "description": "What decided `enabled`."
+          },
+          "temps_version": {
+            "description": "Version string stamped on every event.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "enabled",
+          "source",
+          "env_opted_out",
+          "env_var",
+          "default_enabled",
+          "can_manage",
+          "events",
+          "privacy_doc_url"
+        ],
+        "type": "object"
+      },
+      "TelemetryStatusSource": {
+        "description": "What decided the current telemetry state.",
+        "enum": [
+          "environment",
+          "admin_setting",
+          "default",
+          "unavailable"
+        ],
+        "type": "string"
       },
       "TelemetryWriteIntervalReason": {
         "description": "Why an interval opened.",
@@ -55293,6 +55426,18 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "UpdateTelemetrySettingsRequest": {
+        "description": "Turn anonymous telemetry on or off.",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
         "type": "object"
       },
       "UpdateTokenRequest": {
@@ -119386,6 +119531,138 @@
         ]
       }
     },
+    "/settings/telemetry": {
+      "get": {
+        "description": "Reports whether this server sends anonymous product telemetry, what decided\nit (environment kill switch, admin setting or default), the random instance\nID, the destination host, and every event type the binary can send.",
+        "operationId": "get_telemetry_settings",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TelemetryStatusResponse"
+                }
+              }
+            },
+            "description": "Current telemetry state"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Stored preference could not be read"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Anonymous telemetry status and disclosure",
+        "tags": [
+          "Telemetry"
+        ]
+      },
+      "patch": {
+        "description": "Instance admins only. Persisted in the settings row, audit-logged as\n`TELEMETRY_SETTING_UPDATED`, and applied without a restart. When\n`TEMPS_TELEMETRY` forces telemetry off, the choice is still saved but has\nno effect until the variable is removed; the response says so via\n`source = environment`.",
+        "operationId": "update_telemetry_settings",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateTelemetrySettingsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TelemetryStatusResponse"
+                }
+              }
+            },
+            "description": "Setting saved; returns the new state"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request body"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Instance admin required"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Setting could not be saved"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Turn anonymous telemetry on or off",
+        "tags": [
+          "Telemetry"
+        ]
+      }
+    },
     "/settings/update": {
       "get": {
         "operationId": "get_update_capability",
@@ -124984,6 +125261,10 @@
     }
   ],
   "tags": [
+    {
+      "description": "Anonymous product telemetry status and opt-out",
+      "name": "Telemetry"
+    },
     {
       "description": "Analytics events tracking endpoints",
       "name": "Events"

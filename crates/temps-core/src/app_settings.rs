@@ -217,6 +217,23 @@ pub struct AppSettings {
     #[serde(default)]
     pub plugin_installation_reporting_enabled: bool,
 
+    /// Admin preference for anonymous product telemetry (the events sent to
+    /// the Temps maintainers by `temps-telemetry`; unrelated to Temps Cloud
+    /// mirroring in `cloud.telemetry_enabled` and to OpenTelemetry ingest).
+    ///
+    /// - `None` (default) — the operator has not chosen; the built-in default
+    ///   applies (see `temps_telemetry::DEFAULT_TELEMETRY_ENABLED`).
+    /// - `Some(true)` / `Some(false)` — an admin turned it on/off from
+    ///   Settings › Telemetry. Applied at runtime without a restart.
+    ///
+    /// The `TEMPS_TELEMETRY=0` environment variable is a host-level kill
+    /// switch that wins over this value unconditionally. The dedicated
+    /// `PATCH /settings/telemetry` endpoint is the only write path: the
+    /// generic settings save restores the stored value under the row lock, so
+    /// an older client round-tripping the whole document cannot flip it.
+    #[serde(default)]
+    pub anonymous_telemetry_enabled: Option<bool>,
+
     /// One-click "Update now" from the console. Enabled by default; an admin
     /// can turn it off here to keep upgrades on the CLI/config-management path.
     ///
@@ -2001,6 +2018,7 @@ impl Default for AppSettings {
             setup_complete: false,
             require_mfa_for_admins: false,
             plugin_installation_reporting_enabled: false,
+            anonymous_telemetry_enabled: None,
             self_update: None,
             console_version: None,
         }

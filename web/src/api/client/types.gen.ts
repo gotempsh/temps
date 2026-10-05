@@ -1630,6 +1630,23 @@ export type AppSettings = {
      */
     ai_workspace_file_limits?: AiWorkspaceFileLimitsSettings;
     /**
+     * Admin preference for anonymous product telemetry (the events sent to
+     * the Temps maintainers by `temps-telemetry`; unrelated to Temps Cloud
+     * mirroring in `cloud.telemetry_enabled` and to OpenTelemetry ingest).
+     *
+     * - `None` (default) — the operator has not chosen; the built-in default
+     * applies (see `temps_telemetry::DEFAULT_TELEMETRY_ENABLED`).
+     * - `Some(true)` / `Some(false)` — an admin turned it on/off from
+     * Settings › Telemetry. Applied at runtime without a restart.
+     *
+     * The `TEMPS_TELEMETRY=0` environment variable is a host-level kill
+     * switch that wins over this value unconditionally. The dedicated
+     * `PATCH /settings/telemetry` endpoint is the only write path: the
+     * generic settings save restores the stored value under the row lock, so
+     * an older client round-tripping the whole document cannot flip it.
+     */
+    anonymous_telemetry_enabled?: boolean | null;
+    /**
      * Build-time resource limits applied on the control plane to prevent
      * `docker build` from saturating host CPU/RAM. Worker nodes are
      * intentionally NOT subject to these limits (each worker is dedicated
@@ -23583,6 +23600,23 @@ export type TeamResponse = {
 export type TeamRole = 'owner' | 'admin' | 'deployer' | 'viewer';
 
 /**
+ * Area an event belongs to, for operator-facing disclosure (see
+ * [`TelemetryEventKind::category`]). Serialized as snake_case.
+ */
+export type TelemetryEventCategory = 'instance' | 'deployments' | 'projects' | 'git' | 'domains' | 'services' | 'feature_activation' | 'ai' | 'configuration' | 'health';
+
+/**
+ * One event this binary can send.
+ */
+export type TelemetryEventInfo = {
+    category: TelemetryEventCategory;
+    /**
+     * Wire name, e.g. `deploy_succeeded`.
+     */
+    name: string;
+};
+
+/**
  * A gap window as the client renders it.
  */
 export type TelemetryGapWindowResponse = {
@@ -23598,6 +23632,67 @@ export type TelemetryGapWindowResponse = {
     reason: TelemetryWriteIntervalReason;
     started_at: string;
 };
+
+/**
+ * Current anonymous telemetry state and disclosure.
+ */
+export type TelemetryStatusResponse = {
+    /**
+     * The admin's stored choice; `null` when nobody has chosen yet.
+     */
+    admin_preference?: boolean | null;
+    /**
+     * Random identifier events are reported under. Not derived from the
+     * host, domain or any account. `null` if the reporter could not start.
+     */
+    anonymous_id?: string | null;
+    /**
+     * Whether the caller may change the setting (instance admins only).
+     */
+    can_manage: boolean;
+    /**
+     * The built-in default that applies when nobody has chosen.
+     */
+    default_enabled: boolean;
+    /**
+     * Whether this server is sending anonymous telemetry right now.
+     */
+    enabled: boolean;
+    /**
+     * Host events are sent to.
+     */
+    endpoint_host?: string | null;
+    /**
+     * `TEMPS_TELEMETRY` forces telemetry off on this server. The console
+     * cannot override it; remove the variable and restart to change.
+     */
+    env_opted_out: boolean;
+    /**
+     * Name of the environment variable that forces telemetry off.
+     */
+    env_var: string;
+    /**
+     * Every event this binary can send.
+     */
+    events: Array<TelemetryEventInfo>;
+    /**
+     * Documentation of what is collected and what is never collected.
+     */
+    privacy_doc_url: string;
+    /**
+     * What decided `enabled`.
+     */
+    source: TelemetryStatusSource;
+    /**
+     * Version string stamped on every event.
+     */
+    temps_version?: string | null;
+};
+
+/**
+ * What decided the current telemetry state.
+ */
+export type TelemetryStatusSource = 'environment' | 'admin_setting' | 'default' | 'unavailable';
 
 /**
  * Why an interval opened.
@@ -25887,6 +25982,13 @@ export type UpdateStatusResponse = {
 export type UpdateTeamRequest = {
     description?: string | null;
     name?: string | null;
+};
+
+/**
+ * Turn anonymous telemetry on or off.
+ */
+export type UpdateTelemetrySettingsRequest = {
+    enabled: boolean;
 };
 
 export type UpdateTokenRequest = {
@@ -64363,6 +64465,76 @@ export type DownloadGlobalSkillArchiveResponses = {
 };
 
 export type DownloadGlobalSkillArchiveResponse = DownloadGlobalSkillArchiveResponses[keyof DownloadGlobalSkillArchiveResponses];
+
+export type GetTelemetrySettingsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/settings/telemetry';
+};
+
+export type GetTelemetrySettingsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Stored preference could not be read
+     */
+    500: ProblemDetails;
+};
+
+export type GetTelemetrySettingsError = GetTelemetrySettingsErrors[keyof GetTelemetrySettingsErrors];
+
+export type GetTelemetrySettingsResponses = {
+    /**
+     * Current telemetry state
+     */
+    200: TelemetryStatusResponse;
+};
+
+export type GetTelemetrySettingsResponse = GetTelemetrySettingsResponses[keyof GetTelemetrySettingsResponses];
+
+export type UpdateTelemetrySettingsData = {
+    body: UpdateTelemetrySettingsRequest;
+    path?: never;
+    query?: never;
+    url: '/settings/telemetry';
+};
+
+export type UpdateTelemetrySettingsErrors = {
+    /**
+     * Invalid request body
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Instance admin required
+     */
+    403: ProblemDetails;
+    /**
+     * Setting could not be saved
+     */
+    500: ProblemDetails;
+};
+
+export type UpdateTelemetrySettingsError = UpdateTelemetrySettingsErrors[keyof UpdateTelemetrySettingsErrors];
+
+export type UpdateTelemetrySettingsResponses = {
+    /**
+     * Setting saved; returns the new state
+     */
+    200: TelemetryStatusResponse;
+};
+
+export type UpdateTelemetrySettingsResponse = UpdateTelemetrySettingsResponses[keyof UpdateTelemetrySettingsResponses];
 
 export type GetUpdateCapabilityData = {
     body?: never;
