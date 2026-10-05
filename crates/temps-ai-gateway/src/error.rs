@@ -47,6 +47,25 @@ pub enum AiGatewayError {
 
     #[error("Invalid provider base URL: {reason}")]
     InvalidProviderUrl { reason: String },
+
+    #[error(
+        "{endpoint} is only available for OpenAI models; model '{model}' is served by provider \
+         '{provider}'. Use /ai/v1/chat/completions for this model instead."
+    )]
+    UnsupportedEndpoint {
+        endpoint: String,
+        model: String,
+        provider: String,
+    },
+
+    #[error("AI batch input file exceeds the {limit_bytes}-byte upload limit")]
+    UploadTooLarge { limit_bytes: u64 },
+
+    #[error("AI batch upload capacity reached; retry when an upload finishes")]
+    UploadCapacity,
+
+    #[error("No {kind} with id '{id}' was created through this gateway by the caller")]
+    ObjectNotFound { kind: String, id: String },
 }
 
 impl From<reqwest::Error> for AiGatewayError {

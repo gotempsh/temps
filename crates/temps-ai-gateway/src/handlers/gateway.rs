@@ -26,7 +26,7 @@ use crate::services::UsageService;
 use crate::types::*;
 
 /// Extract BYOK overrides from request headers.
-fn extract_byok(headers: &HeaderMap) -> ByokOverride {
+pub(crate) fn extract_byok(headers: &HeaderMap) -> ByokOverride {
     ByokOverride {
         api_key: headers
             .get("x-provider-api-key")
@@ -41,7 +41,7 @@ fn extract_byok(headers: &HeaderMap) -> ByokOverride {
 }
 
 /// Extract AI request context (conversation, tags, trace) from request headers.
-fn extract_ai_context(headers: &HeaderMap) -> AiRequestContext {
+pub(crate) fn extract_ai_context(headers: &HeaderMap) -> AiRequestContext {
     AiRequestContext {
         conversation_id: headers
             .get("x-conversation-id")
@@ -71,14 +71,14 @@ fn extract_ai_context(headers: &HeaderMap) -> AiRequestContext {
     }
 }
 
-fn credential_type_str(ct: CredentialType) -> &'static str {
+pub(crate) fn credential_type_str(ct: CredentialType) -> &'static str {
     match ct {
         CredentialType::System => "system",
         CredentialType::Byok => "byok",
     }
 }
 
-fn reject_deployment_token_base_url(
+pub(crate) fn reject_deployment_token_base_url(
     auth: &temps_auth::AuthContext,
     byok: &ByokOverride,
 ) -> Option<AiGatewayError> {
@@ -121,10 +121,41 @@ fn extract_usage_from_sse_line(line: &str) -> Option<(i64, i64)> {
     }
 }
 
+/// Extract usage from a Responses API SSE line. The terminal event
+/// (`response.completed`, `response.incomplete` or `response.failed`)
+/// carries the whole response, including its `usage`.
+/// Returns `(input_tokens, output_tokens)` if found.
+pub(crate) fn extract_responses_usage_from_sse_line(line: &str) -> Option<(i64, i64)> {
+    let json_str = line.strip_prefix("data:")?.trim();
+    // Only the terminal event carries usage; skip parsing every delta.
+    if !json_str.contains("\"usage\"") {
+        return None;
+    }
+    let parsed: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    let event_type = parsed.get("type")?.as_str()?;
+    if !matches!(
+        event_type,
+        "response.completed" | "response.incomplete" | "response.failed"
+    ) {
+        return None;
+    }
+    let usage = parsed.get("response")?.get("usage")?;
+    let input = usage
+        .get("input_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let output = usage
+        .get("output_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    (input > 0 || output > 0).then_some((input, output))
+}
+
 /// Wraps an upstream SSE byte stream to transparently intercept usage data
-/// from the final chunks, then logs it after the stream ends.
+/// from the final chunks, then logs it after the stream ends. `extract_usage`
+/// reads `(input, output)` tokens from one SSE line.
 #[allow(clippy::too_many_arguments)]
-fn wrap_stream_with_usage_tracking(
+pub(crate) fn wrap_stream_with_usage_tracking(
     inner: std::pin::Pin<
         Box<dyn tokio_stream::Stream<Item = Result<Bytes, AiGatewayError>> + Send>,
     >,
@@ -135,32 +166,50 @@ fn wrap_stream_with_usage_tracking(
     start: Instant,
     is_byok: bool,
     ai_context: AiRequestContext,
+    extract_usage: fn(&str) -> Option<(i64, i64)>,
 ) -> std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<Bytes, AiGatewayError>> + Send>> {
     use tokio_stream::StreamExt;
 
     let prompt_tokens = Arc::new(std::sync::atomic::AtomicI64::new(0));
     let completion_tokens = Arc::new(std::sync::atomic::AtomicI64::new(0));
-    // Buffer for incomplete SSE lines split across chunks
-    let line_buf = Arc::new(std::sync::Mutex::new(String::new()));
-
+    // Buffer for incomplete SSE lines split across chunks. Bytes rather than
+    // text, so a multi-byte character split between chunks is not lost.
+    // Large output events are forwarded but skipped for usage parsing. No
+    // upstream can grow this per-stream scratch buffer without a bound.
+    const MAX_SSE_LINE_BYTES: usize = 32 * 1024 * 1024;
+    let mut line_buf = Vec::<u8>::new();
+    let mut skipping_line = false;
     let pt = prompt_tokens.clone();
     let ct = completion_tokens.clone();
-    let lb = line_buf.clone();
 
     let mapped = inner.map(move |result| {
         if let Ok(ref bytes) = result {
-            if let Ok(text) = std::str::from_utf8(bytes) {
-                let mut buf = lb.lock().unwrap_or_else(|e| e.into_inner());
-                buf.push_str(text);
-
-                // Process complete lines
-                while let Some(newline_pos) = buf.find('\n') {
-                    let line: String = buf.drain(..=newline_pos).collect();
-                    let line = line.trim();
-                    if let Some((p, c)) = extract_usage_from_sse_line(line) {
-                        pt.store(p, std::sync::atomic::Ordering::Relaxed);
-                        ct.store(c, std::sync::atomic::Ordering::Relaxed);
+            let mut remaining = bytes.as_ref();
+            while !remaining.is_empty() {
+                let newline = remaining.iter().position(|byte| *byte == b'\n');
+                let end = newline.unwrap_or(remaining.len());
+                if !skipping_line {
+                    if line_buf.len().saturating_add(end) > MAX_SSE_LINE_BYTES {
+                        line_buf.clear();
+                        skipping_line = true;
+                    } else {
+                        line_buf.extend_from_slice(&remaining[..end]);
                     }
+                }
+                if newline.is_some() {
+                    if !skipping_line {
+                        if let Ok(line) = std::str::from_utf8(&line_buf) {
+                            if let Some((p, c)) = extract_usage(line.trim()) {
+                                pt.store(p, std::sync::atomic::Ordering::Relaxed);
+                                ct.store(c, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    line_buf.clear();
+                    skipping_line = false;
+                    remaining = &remaining[end + 1..];
+                } else {
+                    break;
                 }
             }
         }
@@ -293,8 +342,16 @@ pub fn configure_gateway_routes() -> Router<Arc<AiGatewayAppState>> {
 // Error conversion to OpenAI-compatible JSON errors
 // ============================================================================
 
-fn error_to_response(error: AiGatewayError) -> impl IntoResponse {
+pub(crate) fn error_to_response(error: AiGatewayError) -> impl IntoResponse {
     let (status, body) = match &error {
+        AiGatewayError::UploadTooLarge { .. } => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            OpenAiErrorResponse::invalid_request(error.to_string(), "file_too_large"),
+        ),
+        AiGatewayError::UploadCapacity => (
+            StatusCode::TOO_MANY_REQUESTS,
+            OpenAiErrorResponse::invalid_request(error.to_string(), "upload_capacity"),
+        ),
         AiGatewayError::ModelNotFound { model } => (
             StatusCode::NOT_FOUND,
             OpenAiErrorResponse::invalid_request(
@@ -341,6 +398,14 @@ fn error_to_response(error: AiGatewayError) -> impl IntoResponse {
                 format!("Invalid X-Provider-Base-URL: {}", reason),
                 "invalid_provider_url",
             ),
+        ),
+        AiGatewayError::UnsupportedEndpoint { .. } => (
+            StatusCode::BAD_REQUEST,
+            OpenAiErrorResponse::invalid_request(error.to_string(), "unsupported_endpoint"),
+        ),
+        AiGatewayError::ObjectNotFound { .. } => (
+            StatusCode::NOT_FOUND,
+            OpenAiErrorResponse::invalid_request(error.to_string(), "not_found"),
         ),
         _ => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -466,6 +531,7 @@ async fn chat_completions(
                     start,
                     cred_type == CredentialType::Byok,
                     ai_context.clone(),
+                    extract_usage_from_sse_line,
                 );
                 let body = Body::from_stream(wrapped);
 
@@ -1108,6 +1174,82 @@ mod tests {
     fn test_extract_usage_from_sse_zero_tokens_ignored() {
         let line = r#"data: {"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}"#;
         assert_eq!(extract_usage_from_sse_line(line), None);
+    }
+
+    #[test]
+    fn test_extract_responses_usage_from_completed_event() {
+        let line = r#"data: {"type":"response.completed","sequence_number":9,"response":{"id":"resp_1","object":"response","status":"completed","usage":{"input_tokens":120,"input_tokens_details":{"cached_tokens":64},"output_tokens":30,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":150}}}"#;
+        assert_eq!(extract_responses_usage_from_sse_line(line), Some((120, 30)));
+    }
+
+    #[test]
+    fn test_extract_responses_usage_from_incomplete_event() {
+        let line = r#"data: {"type":"response.incomplete","response":{"usage":{"input_tokens":50,"output_tokens":4096}}}"#;
+        assert_eq!(
+            extract_responses_usage_from_sse_line(line),
+            Some((50, 4096))
+        );
+    }
+
+    #[test]
+    fn test_extract_responses_usage_ignores_deltas_and_other_lines() {
+        assert_eq!(
+            extract_responses_usage_from_sse_line(
+                r#"data: {"type":"response.output_text.delta","delta":"usage"}"#
+            ),
+            None
+        );
+        // An in-progress snapshot has usage: null and is not terminal.
+        assert_eq!(
+            extract_responses_usage_from_sse_line(
+                r#"data: {"type":"response.created","response":{"usage":null}}"#
+            ),
+            None
+        );
+        assert_eq!(
+            extract_responses_usage_from_sse_line("event: response.completed"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_usage_tracker_forwards_bytes_split_inside_a_character() {
+        use tokio_stream::StreamExt;
+        // "é" is two bytes; split the stream between them, mid-line. The
+        // tracker buffers bytes, so the caller still gets every byte.
+        let line = "data: {\"type\":\"response.completed\",\"response\":{\"output_text\":\"caf\u{e9}\",\"usage\":{\"input_tokens\":7,\"output_tokens\":3}}}\n\n";
+        let bytes = line.as_bytes();
+        let split = line.find('\u{e9}').expect("accented character") + 1;
+        assert_eq!(
+            extract_responses_usage_from_sse_line(line.lines().next().unwrap_or("")),
+            Some((7, 3))
+        );
+
+        let chunks: Vec<Result<Bytes, AiGatewayError>> = vec![
+            Ok(Bytes::copy_from_slice(&bytes[..split])),
+            Ok(Bytes::copy_from_slice(&bytes[split..])),
+        ];
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        );
+        let wrapped = wrap_stream_with_usage_tracking(
+            Box::pin(tokio_stream::iter(chunks)),
+            Arc::new(UsageService::new(db)),
+            None,
+            "openai".into(),
+            "gpt-6-luna".into(),
+            Instant::now(),
+            false,
+            AiRequestContext::default(),
+            extract_responses_usage_from_sse_line,
+        );
+        let forwarded: Vec<u8> = wrapped
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .flat_map(|chunk| chunk.expect("chunk").to_vec())
+            .collect();
+        assert_eq!(forwarded, bytes);
     }
 
     #[test]

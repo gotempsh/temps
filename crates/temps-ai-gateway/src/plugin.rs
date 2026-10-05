@@ -663,6 +663,7 @@ impl TempsPlugin for AiGatewayPlugin {
             .merge(handlers::configure_usage_routes())
             .merge(handlers::configure_pricing_routes())
             .merge(handlers::configure_gateway_routes())
+            .merge(handlers::configure_native_routes())
             .merge(handlers::configure_provider_status_routes())
             .merge(handlers::configure_structured_output_routes())
             .with_state(app_state);
@@ -672,6 +673,8 @@ impl TempsPlugin for AiGatewayPlugin {
 
     fn openapi_schema(&self) -> Option<OpenApi> {
         let mut schema = <handlers::gateway::AiGatewayApiDoc as OpenApiTrait>::openapi();
+        let native_schema = <handlers::native::AiGatewayNativeApiDoc as OpenApiTrait>::openapi();
+        schema.merge(native_schema);
         let admin_schema = <handlers::providers::AiGatewayAdminApiDoc as OpenApiTrait>::openapi();
         schema.merge(admin_schema);
         let usage_schema = <handlers::usage::AiGatewayUsageApiDoc as OpenApiTrait>::openapi();

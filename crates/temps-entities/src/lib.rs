@@ -9,6 +9,7 @@ pub mod ai_application_workspaces;
 pub mod ai_applications;
 pub mod ai_conversations;
 pub mod ai_gateway_config;
+pub mod ai_gateway_objects;
 pub mod ai_messages;
 pub mod ai_pending_actions;
 pub mod ai_provider_keys;

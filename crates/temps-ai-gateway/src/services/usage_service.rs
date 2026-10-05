@@ -292,6 +292,41 @@ impl UsageService {
         is_byok: bool,
         context: &AiRequestContext,
     ) -> Result<(), AiGatewayError> {
+        self.log_usage_on_connection(
+            self.db.as_ref(),
+            user_id,
+            provider,
+            model,
+            input_tokens,
+            output_tokens,
+            latency_ms,
+            estimated_cost_microcents,
+            status,
+            is_streaming,
+            is_byok,
+            context,
+        )
+        .await
+    }
+
+    /// Write usage on the caller's transaction so batch accounting and its
+    /// idempotency marker commit together.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn log_usage_on_connection<C: sea_orm::ConnectionTrait>(
+        &self,
+        connection: &C,
+        user_id: Option<i32>,
+        provider: &str,
+        model: &str,
+        input_tokens: i64,
+        output_tokens: i64,
+        latency_ms: i32,
+        estimated_cost_microcents: i64,
+        status: i16,
+        is_streaming: bool,
+        is_byok: bool,
+        context: &AiRequestContext,
+    ) -> Result<(), AiGatewayError> {
         let record = ai_usage_logs::ActiveModel {
             timestamp: Set(chrono::Utc::now()),
             user_id: Set(user_id),
@@ -311,7 +346,7 @@ impl UsageService {
             ..Default::default()
         };
 
-        record.insert(self.db.as_ref()).await?;
+        record.insert(connection).await?;
         Ok(())
     }
 

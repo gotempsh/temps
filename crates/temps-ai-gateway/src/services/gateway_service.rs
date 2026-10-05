@@ -36,6 +36,32 @@ pub struct ByokOverride {
     pub system_key_id: Option<i32>,
 }
 
+/// Provider and credentials resolved for one request.
+#[derive(Clone)]
+pub struct ResolvedCredentials {
+    /// Canonical provider ID, e.g. "openai"
+    pub provider_id: &'static str,
+    /// Decrypted (or caller-supplied) provider API key
+    pub api_key: String,
+    /// Upstream base URL override; `None` means the adapter default
+    pub base_url: Option<String>,
+    pub credential_type: CredentialType,
+    /// Administrator-configured key that was used; `None` for BYOK
+    pub system_key_id: Option<i32>,
+}
+
+impl std::fmt::Debug for ResolvedCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print the API key.
+        f.debug_struct("ResolvedCredentials")
+            .field("provider_id", &self.provider_id)
+            .field("base_url", &self.base_url)
+            .field("credential_type", &self.credential_type)
+            .field("system_key_id", &self.system_key_id)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The core gateway service that routes requests to the appropriate provider,
 /// handles key decryption, and coordinates the entire request lifecycle.
 pub struct GatewayService {
@@ -236,16 +262,41 @@ impl GatewayService {
         model: &str,
         byok: &ByokOverride,
     ) -> Result<(&dyn AiProvider, String, Option<String>, CredentialType), AiGatewayError> {
+        let resolved = self.resolve_credentials(model, byok).await?;
+        let provider = self.providers.get(resolved.provider_id).ok_or_else(|| {
+            AiGatewayError::ProviderNotConfigured {
+                provider: resolved.provider_id.to_string(),
+            }
+        })?;
+        Ok((
+            provider.as_ref(),
+            resolved.api_key,
+            resolved.base_url,
+            resolved.credential_type,
+        ))
+    }
+
+    /// Resolve the provider and credentials that serve `model`, without
+    /// sending anything upstream.
+    ///
+    /// Applies the same rules as every inference request: BYOK keys are used
+    /// as supplied (with their base URL validated), system keys must be
+    /// active and must allow the model.
+    pub async fn resolve_credentials(
+        &self,
+        model: &str,
+        byok: &ByokOverride,
+    ) -> Result<ResolvedCredentials, AiGatewayError> {
         let provider_id =
             route_model_to_provider(model).ok_or_else(|| AiGatewayError::ModelNotFound {
                 model: model.to_string(),
             })?;
 
-        let provider = self.providers.get(provider_id).ok_or_else(|| {
-            AiGatewayError::ProviderNotConfigured {
+        if !self.providers.contains_key(provider_id) {
+            return Err(AiGatewayError::ProviderNotConfigured {
                 provider: provider_id.to_string(),
-            }
-        })?;
+            });
+        }
 
         // BYOK: caller supplied their own key — skip DB lookup entirely
         if let Some(ref user_key) = byok.api_key {
@@ -266,12 +317,13 @@ impl GatewayService {
                 credential_type = "byok",
                 "Routing request to provider (BYOK)"
             );
-            return Ok((
-                provider.as_ref(),
-                user_key.clone(),
-                byok.base_url.clone(),
-                CredentialType::Byok,
-            ));
+            return Ok(ResolvedCredentials {
+                provider_id,
+                api_key: user_key.clone(),
+                base_url: byok.base_url.clone(),
+                credential_type: CredentialType::Byok,
+                system_key_id: None,
+            });
         }
 
         // System key: look up from database
@@ -323,12 +375,60 @@ impl GatewayService {
             "Routing request to provider"
         );
 
-        Ok((
-            provider.as_ref(),
-            decrypted_key,
-            key_record.base_url,
-            CredentialType::System,
-        ))
+        Ok(ResolvedCredentials {
+            provider_id,
+            api_key: decrypted_key,
+            base_url: key_record.base_url,
+            credential_type: CredentialType::System,
+            system_key_id: Some(key_record.id),
+        })
+    }
+
+    /// Credentials of one administrator-configured key, for operating on an
+    /// object the gateway already created with it (a batch input file, a
+    /// batch). Fails closed when the key was deactivated or removed since.
+    pub async fn system_key_credentials(
+        &self,
+        key_id: i32,
+    ) -> Result<ResolvedCredentials, AiGatewayError> {
+        let key = self.provider_key_service.get_by_id(key_id).await?;
+        if !key.is_active {
+            return Err(AiGatewayError::Validation {
+                message: format!("AI provider key {key_id} is inactive"),
+            });
+        }
+        let provider_id = self
+            .providers
+            .get_key_value(key.provider.as_str())
+            .map(|(id, _)| *id)
+            .ok_or_else(|| AiGatewayError::ProviderNotConfigured {
+                provider: key.provider.clone(),
+            })?;
+        if let Some(base_url) = key.base_url.as_deref() {
+            temps_core::url_validation::validate_external_url(base_url).map_err(|error| {
+                AiGatewayError::InvalidProviderUrl {
+                    reason: error.to_string(),
+                }
+            })?;
+        }
+        let api_key = self
+            .provider_key_service
+            .decrypt_api_key(&key.api_key_encrypted)?;
+        Ok(ResolvedCredentials {
+            provider_id,
+            api_key,
+            base_url: key.base_url,
+            credential_type: CredentialType::System,
+            system_key_id: Some(key.id),
+        })
+    }
+
+    /// Default upstream base URL of a provider adapter, e.g.
+    /// `https://api.openai.com/v1`.
+    pub fn default_base_url(&self, provider_id: &str) -> Option<&'static str> {
+        self.providers
+            .get(provider_id)
+            .map(|provider| provider.info().default_base_url)
     }
 
     /// Execute a chat completion request (non-streaming)
