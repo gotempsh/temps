@@ -6329,6 +6329,8 @@ impl ProxyHttp for LoadBalancer {
                 ctx.project.as_ref().map_or(0, |p| p.id),
                 ctx.environment.as_ref().map_or(0, |e| e.id),
             );
+            // Only an actual upstream response proves recovery. Selecting a
+            // route or starting a retry must not re-arm the failure warning.
             if let Some(failures) = self.upstream_failures.record_success(&key) {
                 info!(
                     project_id = key.0,
