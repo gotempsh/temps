@@ -359,8 +359,18 @@ pub fn install_crypto_provider() {
 /// Best-effort: if the platform doesn't support argv scrubbing, the process
 /// continues normally. The flag is still accepted; it may remain visible in
 /// the process table, which is no worse than before this change.
-fn scrub_sensitive_argv() {
-    const SENSITIVE_FLAGS: &[&str] = &["--database-url"];
+///
+/// `sensitive_values` are secrets clap parsed from a positional argument
+/// (no flag precedes them, e.g. the join token in `temps join <url>
+/// <token>`): any argv entry equal to one of them is overwritten too.
+fn scrub_sensitive_argv(sensitive_values: &[String]) {
+    /// `--pair` carries a one-time pairing secret (`--pair -` reads it
+    /// from stdin instead; overwriting the `-` is harmless).
+    const SENSITIVE_FLAGS: &[&str] = &["--database-url", "--pair"];
+    let sensitive_values: Vec<&str> = sensitive_values.iter().map(String::as_str).collect();
+    // Without a supported platform below there is nothing to scrub with.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let _ = sensitive_values;
 
     // macOS: use the stable _NSGetArgc/_NSGetArgv APIs from libSystem.
     #[cfg(target_os = "macos")]
@@ -373,7 +383,12 @@ fn scrub_sensitive_argv() {
             let argc_ptr = _NSGetArgc();
             let argv_ptr = _NSGetArgv();
             if !argc_ptr.is_null() && !argv_ptr.is_null() {
-                scrub_argv_raw(*argc_ptr as usize, *argv_ptr, SENSITIVE_FLAGS);
+                scrub_argv_raw(
+                    *argc_ptr as usize,
+                    *argv_ptr,
+                    SENSITIVE_FLAGS,
+                    &sensitive_values,
+                );
             }
         }
     }
@@ -420,18 +435,40 @@ fn scrub_sensitive_argv() {
             if first_bytes != cmdline_first {
                 return;
             }
-            scrub_argv_raw(argc, argv, SENSITIVE_FLAGS);
+            scrub_argv_raw(argc, argv, SENSITIVE_FLAGS, &sensitive_values);
         }
     }
 }
 
-/// Overwrite sensitive flag values in a raw C argv array in-place.
+/// Shortest positional value scrubbed by exact match: a secret is never
+/// this short, and a short value could be an unrelated argument.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const MIN_SCRUBBED_VALUE_LEN: usize = 8;
+
+/// Secrets the parsed command line received as positional arguments, so
+/// [`scrub_sensitive_argv`] can find them without a flag to key on.
+fn positional_secrets(cli: &Cli) -> Vec<String> {
+    match &cli.command {
+        // The join token may also come from TEMPS_JOIN_TOKEN, in which case
+        // it matches no argv entry and nothing is overwritten.
+        Commands::Join(join_cmd) => join_cmd.token.iter().cloned().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Overwrite sensitive flag values, and arguments equal to one of
+/// `sensitive_values`, in a raw C argv array in-place.
 ///
 /// # Safety
 /// `argv` must point to a valid array of `argc` writable C strings
 /// (i.e. the actual process argv, not a copy).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-unsafe fn scrub_argv_raw(argc: usize, argv: *mut *mut libc::c_char, sensitive_flags: &[&str]) {
+unsafe fn scrub_argv_raw(
+    argc: usize,
+    argv: *mut *mut libc::c_char,
+    sensitive_flags: &[&str],
+    sensitive_values: &[&str],
+) {
     use std::ffi::CStr;
 
     let mut i = 0usize;
@@ -441,7 +478,16 @@ unsafe fn scrub_argv_raw(argc: usize, argv: *mut *mut libc::c_char, sensitive_fl
             i += 1;
             continue;
         }
-        let arg = CStr::from_ptr(ptr).to_string_lossy();
+        let arg = CStr::from_ptr(ptr).to_string_lossy().into_owned();
+
+        // A positional secret: the whole argument is the value.
+        if i > 0
+            && sensitive_values
+                .iter()
+                .any(|value| value.len() >= MIN_SCRUBBED_VALUE_LEN && arg == *value)
+        {
+            std::ptr::write_bytes(ptr, b'x', libc::strlen(ptr));
+        }
 
         // `--flag=value` form: overwrite only the value part after `=`.
         for flag in sensitive_flags {
@@ -457,7 +503,7 @@ unsafe fn scrub_argv_raw(argc: usize, argv: *mut *mut libc::c_char, sensitive_fl
 
         // `--flag value` form: the next argv slot holds the value.
         for flag in sensitive_flags {
-            if arg.as_ref() == *flag && i + 1 < argc {
+            if arg == *flag && i + 1 < argc {
                 let next = *argv.add(i + 1);
                 if !next.is_null() {
                     let len = libc::strlen(next);
@@ -482,7 +528,7 @@ pub fn run(extra_plugins: Vec<Box<dyn temps_core::plugin::TempsPlugin>>) -> anyh
     let cli = Cli::parse();
     // Scrub sensitive flag values from argv *after* clap has parsed them so
     // they no longer appear in `pgrep -af` or /proc/self/cmdline.
-    scrub_sensitive_argv();
+    scrub_sensitive_argv(&positional_secrets(&cli));
     install_tracing(&cli.log_level, &cli.log_format);
     match docker_context {
         Ok(adopted) => tracing::info!(
@@ -493,6 +539,87 @@ pub fn run(extra_plugins: Vec<Box<dyn temps_core::plugin::TempsPlugin>>) -> anyh
         Err(skip) => tracing::debug!("Not adopting a Docker context: {:?}", skip),
     }
     dispatch(cli, extra_plugins)
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod argv_scrub_tests {
+    use std::ffi::CString;
+
+    use clap::Parser;
+
+    use super::{positional_secrets, scrub_argv_raw, Cli};
+
+    /// Run [`scrub_argv_raw`] over an owned copy of `args`, as the process
+    /// argv would be, and return what is left.
+    fn scrubbed(args: &[&str], flags: &[&str], values: &[&str]) -> Vec<String> {
+        let mut argv: Vec<*mut libc::c_char> = args
+            .iter()
+            .map(|arg| CString::new(*arg).map(CString::into_raw))
+            .collect::<Result<_, _>>()
+            .unwrap();
+        unsafe { scrub_argv_raw(argv.len(), argv.as_mut_ptr(), flags, values) };
+        argv.into_iter()
+            .map(|ptr| unsafe { CString::from_raw(ptr) }.into_string().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_pairing_code_after_pair_is_overwritten_in_both_forms() {
+        let flags = &["--database-url", "--pair"];
+        assert_eq!(
+            scrubbed(&["temps", "join", "--pair", "tpair1.secret"], flags, &[]),
+            ["temps", "join", "--pair", "xxxxxxxxxxxxx"]
+        );
+        assert_eq!(
+            scrubbed(&["temps", "join", "--pair=tpair1.secret"], flags, &[]),
+            ["temps", "join", "--pair=xxxxxxxxxxxxx"]
+        );
+    }
+
+    #[test]
+    fn a_positional_join_token_is_overwritten_by_value() {
+        let token = "tjoin_0123456789abcdef";
+        assert_eq!(
+            scrubbed(
+                &[
+                    "temps",
+                    "join",
+                    "https://cp.example.test",
+                    token,
+                    "--name",
+                    "w1"
+                ],
+                &["--pair"],
+                &[token],
+            ),
+            [
+                "temps",
+                "join",
+                "https://cp.example.test",
+                "xxxxxxxxxxxxxxxxxxxxxx",
+                "--name",
+                "w1"
+            ]
+        );
+        assert_eq!(token.len(), 22);
+    }
+
+    #[test]
+    fn short_values_and_the_program_name_are_never_matched_by_value() {
+        assert_eq!(
+            scrubbed(&["temps", "join", "abc"], &[], &["abc", "temps"]),
+            ["temps", "join", "abc"]
+        );
+    }
+
+    #[test]
+    fn the_join_token_is_the_only_positional_secret() {
+        let cli =
+            Cli::try_parse_from(["temps", "join", "https://cp.example.test", "tjoin_tok"]).unwrap();
+        assert_eq!(positional_secrets(&cli), ["tjoin_tok"]);
+        let cli = Cli::try_parse_from(["temps", "join", "--pair", "-"]).unwrap();
+        assert!(positional_secrets(&cli).is_empty());
+    }
 }
 
 #[cfg(test)]

@@ -143,7 +143,7 @@ impl RouteSyncClient {
         node_token: String,
         store: SharedRouteStore,
         shutdown: Arc<Notify>,
-        control_plane_ca: Option<reqwest::Certificate>,
+        control_plane_ca: Option<crate::ControlPlaneCa>,
     ) -> Result<Self, reqwest::Error> {
         let http = crate::with_control_plane_trust(
             reqwest::Client::builder().timeout(Duration::from_secs(60)),

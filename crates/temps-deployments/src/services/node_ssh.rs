@@ -22,6 +22,13 @@ use zeroize::Zeroizing;
 
 /// How long connecting and the key exchange may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long logging in may take, every agent key tried included. russh's
+/// inactivity timeout does not bound it: keepalives reset that, so a server
+/// that answers them but never the login would hold the enrollment forever.
+const AUTH_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long opening a command's channel, starting the command and sending its
+/// stdin may take, before the command's own timeout starts.
+const CHANNEL_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Short commands (checks) may take this long.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(60);
 /// Installing `temps` downloads a release.
@@ -51,6 +58,20 @@ const LINE_TRUNCATED: &str = "[line truncated]";
 /// Where the official installer puts the binary for root (`sudo -H`).
 const ROOT_INSTALL_PATH: &str = "/root/.temps/bin/temps";
 pub const INSTALL_COMMAND: &str = "curl -fsSL https://temps.sh/install.sh | bash";
+/// The longest a whole enrollment may run, every step included, before it is
+/// failed. Each step has its own bound, but a server can string many slow
+/// steps together; this caps how long one enrollment holds a running slot
+/// and its credentials in memory. Generous: well past the sum of the longest
+/// legitimate steps (the install and the pairing, plus every check).
+pub const ENROLLMENT_TIMEOUT: Duration = Duration::from_secs(45 * 60);
+const _: () = assert!(
+    ENROLLMENT_TIMEOUT.as_secs()
+        > CONNECT_TIMEOUT.as_secs()
+            + AUTH_TIMEOUT.as_secs()
+            + INSTALL_TIMEOUT.as_secs()
+            + PAIRING_TIMEOUT.as_secs()
+            + 10 * (CHECK_TIMEOUT.as_secs() + CHANNEL_SETUP_TIMEOUT.as_secs())
+);
 
 /// A server's SSH host key, as the operator confirms it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,7 +112,15 @@ impl SshAuth {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SshError {
-    #[error("could not connect to {address}: {reason}")]
+    /// Connecting or the key exchange failed. The message is the same for
+    /// every cause (refused, filtered, timed out, not an SSH server): telling
+    /// them apart would make reading a host key a port scanner for whoever
+    /// may call it. `reason` (the precise cause) is logged on the server.
+    #[error(
+        "could not open an SSH connection to the server: it is unreachable from this control \
+         plane, refused the connection, did not answer in time, or is not an SSH server. Check \
+         the host and port, and that SSH on it is open to this control plane"
+    )]
     Connect { address: SocketAddr, reason: String },
     #[error(
         "the server's host key is {presented}, not the {expected} you confirmed. If the server \
@@ -105,6 +134,39 @@ pub enum SshError {
     Remote(String),
     #[error("the SSH session failed: {0}")]
     Session(String),
+    /// A step the server controls took longer than its bound.
+    #[error(
+        "{what} took longer than {secs}s: the server stopped answering. Check that it is \
+         healthy and reachable, then try again"
+    )]
+    TimedOut { what: String, secs: u64 },
+}
+
+/// `step`, failed with `SshError::TimedOut` naming `what` if it takes longer
+/// than `limit`.
+pub async fn within<T>(
+    limit: Duration,
+    what: impl Into<String>,
+    step: impl std::future::Future<Output = Result<T, SshError>>,
+) -> Result<T, SshError> {
+    match tokio::time::timeout(limit, step).await {
+        Ok(result) => result,
+        Err(_) => Err(SshError::TimedOut {
+            what: what.into(),
+            secs: limit.as_secs(),
+        }),
+    }
+}
+
+/// A connect-stage failure: logged with its precise cause, reported without
+/// it (see `SshError::Connect`).
+fn connect_failed(address: SocketAddr, reason: String) -> SshError {
+    tracing::warn!(
+        %address,
+        reason = %reason,
+        "SSH connection to a server being read or enrolled failed"
+    );
+    SshError::Connect { address, reason }
 }
 
 /// What happened with the agent once the node joined.
@@ -181,14 +243,11 @@ async fn connect(
     let connected =
         tokio::time::timeout(CONNECT_TIMEOUT, client::connect(config(), address, handler))
             .await
-            .map_err(|_| SshError::Connect {
-                address,
-                reason: format!(
-                    "no SSH answer within {}s; check the address and that port {} is open to this \
-                 control plane",
-                    CONNECT_TIMEOUT.as_secs(),
-                    address.port()
-                ),
+            .map_err(|_| {
+                connect_failed(
+                    address,
+                    format!("no SSH answer within {}s", CONNECT_TIMEOUT.as_secs()),
+                )
             })?;
     let seen = presented.lock().ok().and_then(|slot| slot.clone());
     match (connected, seen, expected) {
@@ -199,13 +258,11 @@ async fn connect(
                 presented: key.fingerprint,
             })
         }
-        (Ok(_), None, _) => Err(SshError::Session(
+        (Ok(_), None, _) => Err(connect_failed(
+            address,
             "the server presented no host key".to_string(),
         )),
-        (Err(error), _, _) => Err(SshError::Connect {
-            address,
-            reason: error.to_string(),
-        }),
+        (Err(error), _, _) => Err(connect_failed(address, error.to_string())),
     }
 }
 
@@ -243,7 +300,12 @@ pub async fn enroll(request: Enrollment, progress: &dyn Progress) -> Result<Agen
     ));
 
     progress.step("authenticating");
-    authenticate(&mut handle, &request.user, &request.auth).await?;
+    within(
+        AUTH_TIMEOUT,
+        format!("Logging in as {}", request.user),
+        authenticate(&mut handle, &request.user, &request.auth),
+    )
+    .await?;
     progress.log(&format!(
         "Logged in as {} ({}).",
         request.user,
@@ -258,6 +320,7 @@ pub async fn enroll(request: Enrollment, progress: &dyn Progress) -> Result<Agen
         },
         redactor: Redactor::for_enrollment(&request),
         progress,
+        setup_timeout: CHANNEL_SETUP_TIMEOUT,
     };
 
     progress.step("checking the server");
@@ -461,16 +524,42 @@ enum Privilege {
     Root,
     /// `sudo -n`: no password needed.
     Sudo,
-    /// `sudo -S`: the login password on stdin.
-    SudoWithPassword,
+    /// `sudo -S`: the login password on stdin, then `marker` (see
+    /// [`SUDO_DRAIN`]).
+    SudoWithPassword {
+        marker: String,
+    },
 }
 
+/// What sudo runs when it is given the login password: a root shell that
+/// reads stdin up to the line `$0` (the privilege's marker), then runs the
+/// command (`"$@"`) on what is left.
+///
+/// sudo does not always read the password: a `NOPASSWD` rule for the command
+/// skips the prompt, and the password line would then be the first line of
+/// the command's stdin (`temps join --pair -` would take it for the pairing
+/// code). Whether sudo consumed it or not, this shell consumes everything up
+/// to the marker, so the password never reaches the command. The shell's
+/// `read` takes one byte at a time from a pipe, so the rest of stdin is left
+/// whole for the command. Fixed text: the marker and the command are
+/// arguments, never part of the script.
+const SUDO_DRAIN: &str =
+    r#"while IFS= read -r line; do [ "$line" = "$0" ] && break; done; exec "$@""#;
+
 impl Privilege {
+    /// The privilege that runs commands through sudo with the login
+    /// password, with a fresh marker no password can be.
+    fn sudo_with_password() -> Self {
+        Self::SudoWithPassword {
+            marker: format!("temps-sudo-{}", uuid::Uuid::new_v4().simple()),
+        }
+    }
+
     fn describe(&self) -> &'static str {
         match self {
             Self::Root => "as root",
             Self::Sudo => "through sudo",
-            Self::SudoWithPassword => "through sudo with the login password",
+            Self::SudoWithPassword { .. } => "through sudo with the login password",
         }
     }
 
@@ -480,9 +569,39 @@ impl Privilege {
         match self {
             Self::Root => command.to_string(),
             Self::Sudo => format!("sudo -n -H {command}"),
-            // -k: ignore cached credentials, so sudo always reads the
-            // password line and never leaves it for the command's stdin.
-            Self::SudoWithPassword => format!("sudo -k -S -p '' -H {command}"),
+            // -k: ignore cached credentials, so sudo reads the password line
+            // whenever its policy asks for one. When it does not, the drain
+            // shell takes the line instead (see `SUDO_DRAIN`).
+            Self::SudoWithPassword { marker } => {
+                format!("sudo -k -S -p '' -H sh -c '{SUDO_DRAIN}' {marker} {command}")
+            }
+        }
+    }
+
+    /// The stdin `wrap(command)` needs for a command whose own stdin is
+    /// `stdin`: with the login password, the password and the marker first.
+    /// The password is consumed by sudo or by the drain shell, never by the
+    /// command.
+    fn stdin(
+        &self,
+        password: Option<&Zeroizing<String>>,
+        stdin: Option<Zeroizing<String>>,
+    ) -> Option<Zeroizing<String>> {
+        match (self, password) {
+            (Self::SudoWithPassword { marker }, Some(password)) => {
+                let mut combined = Zeroizing::new(String::with_capacity(
+                    password.len() + marker.len() + 2 + stdin.as_ref().map_or(0, |s| s.len()),
+                ));
+                combined.push_str(password);
+                combined.push('\n');
+                combined.push_str(marker);
+                combined.push('\n');
+                if let Some(stdin) = stdin {
+                    combined.push_str(&stdin);
+                }
+                Some(combined)
+            }
+            _ => stdin,
         }
     }
 }
@@ -505,6 +624,8 @@ struct Remote<'a> {
     /// Applied to every line of remote output before it is logged or kept.
     redactor: Redactor,
     progress: &'a dyn Progress,
+    /// The bound on opening a command's channel and sending its stdin.
+    setup_timeout: Duration,
 }
 
 /// Masks the secrets an enrollment holds wherever they appear in the
@@ -862,15 +983,20 @@ impl Remote<'_> {
                  passwordless sudo, or log in with {user}'s password so it can be used for sudo."
             )));
         };
-        let mut stdin = Zeroizing::new(password.to_string());
-        stdin.push('\n');
+        // Checked the way commands will run: through the drain shell.
+        let privilege = Privilege::sudo_with_password();
         if self
-            .exec("sudo -k -S -p '' true", Some(stdin), CHECK_TIMEOUT, false)
+            .exec(
+                &privilege.wrap("true"),
+                privilege.stdin(Some(password), None),
+                CHECK_TIMEOUT,
+                false,
+            )
             .await?
             .code
             == 0
         {
-            return Ok(Privilege::SudoWithPassword);
+            return Ok(privilege);
         }
         Err(SshError::Remote(format!(
             "{user} cannot use sudo with its password on this server. Log in as root or as a \
@@ -878,8 +1004,9 @@ impl Remote<'_> {
         )))
     }
 
-    /// Run `command` as root, with `stdin` after the sudo password if one is
-    /// needed.
+    /// Run `command` as root with `stdin`. With the login password for sudo,
+    /// the password goes first on the channel's stdin but only sudo (or the
+    /// drain shell) reads it: the command gets `stdin` alone.
     async fn run(
         &self,
         privilege: &Privilege,
@@ -910,17 +1037,7 @@ impl Remote<'_> {
         timeout: Duration,
         stream: bool,
     ) -> Result<Output, SshError> {
-        let stdin = match (privilege, &self.sudo_password) {
-            (Privilege::SudoWithPassword, Some(password)) => {
-                let mut combined = Zeroizing::new(password.to_string());
-                combined.push('\n');
-                if let Some(stdin) = stdin {
-                    combined.push_str(&stdin);
-                }
-                Some(combined)
-            }
-            _ => stdin,
-        };
+        let stdin = privilege.stdin(self.sudo_password.as_ref(), stdin);
         self.exec(&privilege.wrap(command), stdin, timeout, stream)
             .await
     }
@@ -991,17 +1108,27 @@ impl Remote<'_> {
         stream: bool,
     ) -> Result<Output, SshError> {
         let session = |error: russh::Error| SshError::Session(error.to_string());
-        let mut channel = self.handle.channel_open_session().await.map_err(session)?;
-        channel.exec(true, command).await.map_err(session)?;
-        // stdin carries secrets (the sudo password, the pairing code): it is
-        // sent and never logged or kept.
-        if let Some(stdin) = stdin {
-            channel
-                .data_bytes(stdin.as_bytes().to_vec())
-                .await
-                .map_err(session)?;
-        }
-        channel.eof().await.map_err(session)?;
+        // Bounded on its own: the command's timeout below only starts once
+        // it runs, and russh's inactivity timeout is reset by keepalives.
+        let mut channel = within(
+            self.setup_timeout,
+            format!("Starting `{command}` on the server"),
+            async {
+                let channel = self.handle.channel_open_session().await.map_err(session)?;
+                channel.exec(true, command).await.map_err(session)?;
+                // stdin carries secrets (the sudo password, the pairing
+                // code): it is sent and never logged or kept.
+                if let Some(stdin) = stdin {
+                    channel
+                        .data_bytes(stdin.as_bytes().to_vec())
+                        .await
+                        .map_err(session)?;
+                }
+                channel.eof().await.map_err(session)?;
+                Ok(channel)
+            },
+        )
+        .await?;
         let mut code = None;
         let mut output = Collector::new(&self.redactor);
         let deadline = tokio::time::Instant::now() + timeout;
@@ -1088,10 +1215,148 @@ mod tests {
             Privilege::Sudo.wrap("temps join --pair -"),
             "sudo -n -H temps join --pair -"
         );
+        let privilege = Privilege::SudoWithPassword {
+            marker: "temps-sudo-m".into(),
+        };
         assert_eq!(
-            Privilege::SudoWithPassword.wrap("true"),
-            "sudo -k -S -p '' -H true"
+            privilege.wrap("temps join --pair -"),
+            format!("sudo -k -S -p '' -H sh -c '{SUDO_DRAIN}' temps-sudo-m temps join --pair -")
         );
+    }
+
+    #[test]
+    fn each_password_sudo_gets_its_own_marker() {
+        let (Privilege::SudoWithPassword { marker: a }, Privilege::SudoWithPassword { marker: b }) = (
+            Privilege::sudo_with_password(),
+            Privilege::sudo_with_password(),
+        ) else {
+            panic!("expected SudoWithPassword");
+        };
+        assert_ne!(a, b);
+        // Safe as a bare shell word.
+        assert!(a.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+    }
+
+    #[test]
+    fn only_password_sudo_puts_the_password_on_stdin_then_the_marker() {
+        let password = Zeroizing::new("pw-1234".to_string());
+        let payload = || Some(Zeroizing::new("tpair1.code\n".to_string()));
+        let privilege = Privilege::SudoWithPassword {
+            marker: "m-1".into(),
+        };
+        assert_eq!(
+            privilege
+                .stdin(Some(&password), payload())
+                .as_deref()
+                .map(String::as_str),
+            Some("pw-1234\nm-1\ntpair1.code\n")
+        );
+        assert_eq!(
+            privilege
+                .stdin(Some(&password), None)
+                .as_deref()
+                .map(String::as_str),
+            Some("pw-1234\nm-1\n")
+        );
+        for other in [Privilege::Root, Privilege::Sudo] {
+            assert_eq!(
+                other
+                    .stdin(Some(&password), payload())
+                    .as_deref()
+                    .map(String::as_str),
+                Some("tpair1.code\n")
+            );
+            assert_eq!(other.stdin(Some(&password), None), None);
+        }
+    }
+
+    /// Run `privilege.wrap(command)` with a local `sh`, a stand-in `sudo`
+    /// first on PATH, and `stdin`; what the command printed.
+    #[cfg(unix)]
+    fn run_wrapped_locally(
+        fake_sudo: &str,
+        privilege: &Privilege,
+        command: &str,
+        stdin: &str,
+    ) -> String {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "temps-node-ssh-sudo-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sudo = dir.join("sudo");
+        std::fs::write(&sudo, fake_sudo).unwrap();
+        std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(privilege.wrap(command))
+            .env("PATH", path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    /// Skips sudo's options, then runs the command: `-p ''` takes a value.
+    #[cfg(unix)]
+    const SUDO_OPTIONS: &str =
+        r#"while [ $# -gt 0 ]; do case "$1" in -p) shift 2;; -*) shift;; *) break;; esac; done"#;
+
+    /// The wrapped command never sees the sudo password on its stdin,
+    /// whether sudo asks for it or a NOPASSWD rule makes it skip the prompt;
+    /// and it still gets its own stdin (the pairing code) whole.
+    #[cfg(unix)]
+    #[test]
+    fn the_sudo_password_never_reaches_the_wrapped_command() {
+        // sudo asks for the password: reads one line, as `sudo -S` does.
+        let asks = format!("#!/bin/sh\n{SUDO_OPTIONS}\nIFS= read -r password\nexec \"$@\"\n");
+        // A NOPASSWD rule for the command: sudo reads nothing.
+        let skips = format!("#!/bin/sh\n{SUDO_OPTIONS}\nexec \"$@\"\n");
+        let password = Zeroizing::new("hunter2-sudo-password".to_string());
+        let privilege = Privilege::sudo_with_password();
+        for fake_sudo in [&asks, &skips] {
+            // The command reads its stdin: what `temps join --pair -` gets.
+            let stdin = privilege
+                .stdin(
+                    Some(&password),
+                    Some(Zeroizing::new("tpair1.code\n".into())),
+                )
+                .unwrap();
+            let seen = run_wrapped_locally(fake_sudo, &privilege, "cat", &stdin);
+            assert_eq!(seen, "tpair1.code\n", "{fake_sudo}");
+
+            // A command without stdin of its own gets none, not the password.
+            let stdin = privilege.stdin(Some(&password), None).unwrap();
+            let seen = run_wrapped_locally(fake_sudo, &privilege, "cat", &stdin);
+            assert_eq!(seen, "", "{fake_sudo}");
+
+            // Quoted arguments still reach the command as they were.
+            let stdin = privilege.stdin(Some(&password), None).unwrap();
+            let seen = run_wrapped_locally(
+                fake_sudo,
+                &privilege,
+                "sh -c 'printf \"%s|\" \"$0\" \"$1\"' '{{.ServerVersion}}' 'a b'",
+                &stdin,
+            );
+            assert_eq!(seen, "{{.ServerVersion}}|a b|", "{fake_sudo}");
+        }
     }
 
     #[test]
@@ -1623,10 +1888,32 @@ mod tests {
             pub seen: Arc<Seen>,
         }
 
+        /// Where a hostile server stops answering, while still keeping the
+        /// connection open.
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        pub enum Hang {
+            /// Never answers a password login.
+            Login,
+            /// Logs in, then never answers a request to open a channel.
+            Channels,
+        }
+
         /// An SSH server on 127.0.0.1 that accepts `PASSWORD` and answers
         /// commands with `script`, once the client has sent their stdin.
         pub async fn start(
             script: impl Fn(&str, &[u8]) -> Reply + Send + Sync + 'static,
+        ) -> Server {
+            start_with(script, None).await
+        }
+
+        /// A server that stops answering at `hang`.
+        pub async fn start_hanging(hang: Hang) -> Server {
+            start_with(|_, _| Reply::ok(""), Some(hang)).await
+        }
+
+        async fn start_with(
+            script: impl Fn(&str, &[u8]) -> Reply + Send + Sync + 'static,
+            hang: Option<Hang>,
         ) -> Server {
             let key = russh::keys::PrivateKey::from(
                 russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[7; 32]),
@@ -1649,6 +1936,7 @@ mod tests {
                         seen: serving.clone(),
                         script: script.clone(),
                         running: HashMap::new(),
+                        hang,
                     };
                     let config = config.clone();
                     tokio::spawn(async move {
@@ -1669,6 +1957,7 @@ mod tests {
             seen: Arc<Seen>,
             script: Script,
             running: HashMap<ChannelId, (String, Vec<u8>)>,
+            hang: Option<Hang>,
         }
 
         impl Handler {
@@ -1691,6 +1980,9 @@ mod tests {
                 password: &str,
             ) -> Result<Auth, Self::Error> {
                 self.attempt();
+                if self.hang == Some(Hang::Login) {
+                    std::future::pending::<()>().await;
+                }
                 Ok(if password == PASSWORD {
                     Auth::Accept
                 } else {
@@ -1722,6 +2014,9 @@ mod tests {
                 reply: server::ChannelOpenHandle,
                 _session: &mut Session,
             ) -> Result<(), Self::Error> {
+                if self.hang == Some(Hang::Channels) {
+                    std::future::pending::<()>().await;
+                }
                 reply.accept().await;
                 Ok(())
             }
@@ -1814,6 +2109,116 @@ mod tests {
             sudo_password: sudo_password.map(|p| Zeroizing::new(p.to_string())),
             redactor,
             progress,
+            setup_timeout: CHANNEL_SETUP_TIMEOUT,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_step_past_its_bound_fails_naming_it() {
+        let error = within(
+            Duration::from_millis(20),
+            "Adding the server",
+            std::future::pending::<Result<(), SshError>>(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&error, SshError::TimedOut { what, secs: 0 } if what == "Adding the server"),
+            "{error:?}"
+        );
+        assert!(error
+            .to_string()
+            .starts_with("Adding the server took longer than"));
+        // Within the bound, the step's own result comes through.
+        assert_eq!(
+            within(Duration::from_secs(5), "x", async { Ok::<_, SshError>(7) })
+                .await
+                .unwrap(),
+            7
+        );
+        assert!(matches!(
+            within(Duration::from_secs(5), "x", async {
+                Err::<(), _>(SshError::Auth("refused".into()))
+            })
+            .await,
+            Err(SshError::Auth(_))
+        ));
+    }
+
+    #[test]
+    fn the_whole_enrollment_is_bounded_past_its_longest_legitimate_run() {
+        assert!(ENROLLMENT_TIMEOUT > INSTALL_TIMEOUT + PAIRING_TIMEOUT + AUTH_TIMEOUT);
+        assert!(ENROLLMENT_TIMEOUT > LONGEST_STEP);
+    }
+
+    #[tokio::test]
+    async fn a_server_that_never_answers_the_login_is_given_up_on() {
+        let server = loopback::start_hanging(loopback::Hang::Login).await;
+        let (mut handle, _) = connect(server.address, Some(&server.fingerprint))
+            .await
+            .unwrap();
+        let error = within(
+            Duration::from_millis(300),
+            "Logging in as deploy",
+            authenticate(
+                &mut handle,
+                "deploy",
+                &SshAuth::Password(Zeroizing::new(loopback::PASSWORD.into())),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&error, SshError::TimedOut { what, .. } if what == "Logging in as deploy"),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_that_never_opens_a_channel_is_given_up_on() {
+        let server = loopback::start_hanging(loopback::Hang::Channels).await;
+        let handle = logged_in(&server).await;
+        let progress = Recorded::default();
+        let mut remote = remote(&handle, None, Redactor::new(vec![]), &progress);
+        remote.setup_timeout = Duration::from_millis(300);
+        let error = remote.check("uname -sm").await.unwrap_err();
+        assert!(
+            matches!(&error, SshError::TimedOut { what, .. } if what.contains("`uname -sm`")),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_failures_all_read_the_same_and_name_no_address_or_cause() {
+        // Nothing listens on a port that was just freed: refused.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed = listener.local_addr().unwrap();
+        drop(listener);
+        let refused = host_key(closed).await.unwrap_err();
+
+        // Something that is not SSH: answers, then hangs up.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let not_ssh = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::AsyncWriteExt;
+                let _ = socket.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+            }
+        });
+        let wrong_protocol = host_key(not_ssh).await.unwrap_err();
+
+        let (SshError::Connect { reason: a, .. }, SshError::Connect { reason: b, .. }) =
+            (&refused, &wrong_protocol)
+        else {
+            panic!("expected Connect errors, got {refused:?} and {wrong_protocol:?}");
+        };
+        // The precise causes differ (and are logged) ...
+        assert_ne!(a, b);
+        // ... but what the caller sees is one message, without the address.
+        assert_eq!(refused.to_string(), wrong_protocol.to_string());
+        for address in [closed, not_ssh] {
+            assert!(!refused.to_string().contains(&address.ip().to_string()));
+            assert!(!refused.to_string().contains(&address.port().to_string()));
         }
     }
 
@@ -1897,12 +2302,19 @@ mod tests {
 
     #[tokio::test]
     async fn sudo_with_the_login_password_gets_it_on_stdin() {
-        let server = loopback::start(|command, stdin| match command {
-            "id -u" => Reply::ok("1000\n"),
-            "sudo -k -S -p '' true" if stdin == format!("{}\n", loopback::PASSWORD).as_bytes() => {
-                Reply::ok("")
+        let server = loopback::start(|command, stdin| {
+            let password_first = stdin.starts_with(format!("{}\n", loopback::PASSWORD).as_bytes());
+            match command {
+                "id -u" => Reply::ok("1000\n"),
+                command
+                    if command.starts_with("sudo -k -S -p '' -H sh -c ")
+                        && command.ends_with(" true")
+                        && password_first =>
+                {
+                    Reply::ok("")
+                }
+                _ => Reply::failed(),
             }
-            _ => Reply::failed(),
         })
         .await;
         let handle = logged_in(&server).await;
@@ -1913,16 +2325,17 @@ mod tests {
             Redactor::new(vec![]),
             &progress,
         );
-        assert_eq!(
-            remote.privilege("deploy").await.unwrap(),
-            Privilege::SudoWithPassword
-        );
+        let privilege = remote.privilege("deploy").await.unwrap();
+        let Privilege::SudoWithPassword { marker } = &privilege else {
+            panic!("expected SudoWithPassword, got {privilege:?}");
+        };
         let commands = server.seen.commands();
+        // Checked through the same drain shell commands then run in.
         assert_eq!(
             commands.last().unwrap(),
             &(
-                "sudo -k -S -p '' true".to_string(),
-                format!("{}\n", loopback::PASSWORD)
+                privilege.wrap("true"),
+                format!("{}\n{marker}\n", loopback::PASSWORD)
             )
         );
         // The password is never part of a command line.
@@ -1979,10 +2392,13 @@ mod tests {
             &progress,
         );
         let payload = || Some(Zeroizing::new("tpair1.code\n".to_string()));
+        let with_password = Privilege::SudoWithPassword {
+            marker: "temps-sudo-m".into(),
+        };
 
         remote
             .run(
-                &Privilege::SudoWithPassword,
+                &with_password,
                 "temps join --pair -",
                 payload(),
                 CHECK_TIMEOUT,
@@ -1990,7 +2406,7 @@ mod tests {
             .await
             .unwrap();
         remote
-            .run(&Privilege::SudoWithPassword, "true", None, CHECK_TIMEOUT)
+            .run(&with_password, "true", None, CHECK_TIMEOUT)
             .await
             .unwrap();
         remote
@@ -2016,12 +2432,14 @@ mod tests {
             server.seen.commands(),
             vec![
                 (
-                    "sudo -k -S -p '' -H temps join --pair -".to_string(),
-                    format!("{}\ntpair1.code\n", loopback::PASSWORD)
+                    format!(
+                        "sudo -k -S -p '' -H sh -c '{SUDO_DRAIN}' temps-sudo-m temps join --pair -"
+                    ),
+                    format!("{}\ntemps-sudo-m\ntpair1.code\n", loopback::PASSWORD)
                 ),
                 (
-                    "sudo -k -S -p '' -H true".to_string(),
-                    format!("{}\n", loopback::PASSWORD)
+                    format!("sudo -k -S -p '' -H sh -c '{SUDO_DRAIN}' temps-sudo-m true"),
+                    format!("{}\ntemps-sudo-m\n", loopback::PASSWORD)
                 ),
                 (
                     "sudo -n -H temps join --pair -".to_string(),

@@ -20,7 +20,7 @@ use sea_orm::{
 };
 use temps_entities::network_config;
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::allocator::{AllocatorError, PostgresAllocator};
 use crate::{NetworkConfig, NetworkError, NetworkManager, NodeAlloc, Peer, Transport};
@@ -255,8 +255,42 @@ async fn tend_mesh(end: &MeshEnd, db: &DatabaseConnection) -> bool {
     // Every tick: another tool flushing the ruleset (a firewalld reload,
     // `nft flush ruleset`) must not leave the mesh open for long. Checking
     // is one `nft list`.
-    if let Err(error) = crate::mesh::ensure_lockdown(&end.lockdown(relay)).await {
-        warn!(error = %error, "could not verify the WireGuard mesh lockdown");
+    let lockdown = crate::mesh::ensure_lockdown(&end.lockdown(relay)).await;
+    tend_mesh_after_lockdown(end, db, relay, lockdown).await
+}
+
+/// [`tend_mesh`] once the lockdown check has run.
+///
+/// Fails closed, like a worker's mesh sync: without a verified lockdown no
+/// peer is added or changed and relaying is not touched, so the tunnel
+/// never grows into an open way into this host. Peers already on the
+/// interface stay: they were admitted under a verified lockdown, removing
+/// them would cut every node (and its node API) off the mesh over what is
+/// often a transient `nft` failure, and the next tick that verifies the
+/// lockdown reconciles them. The control plane stops counting as a hub
+/// that can relay, so no pair is routed through it until then.
+async fn tend_mesh_after_lockdown(
+    end: &MeshEnd,
+    db: &DatabaseConnection,
+    relay: bool,
+    lockdown: Result<bool, NetworkError>,
+) -> bool {
+    if let Err(lockdown_error) = lockdown {
+        error!(
+            error = %lockdown_error,
+            mesh = %end.settings.cidr,
+            relay,
+            "could not verify the WireGuard mesh firewall lockdown; not reconciling mesh peers \
+             or relaying until it is verified"
+        );
+        crate::mesh_links::record_control_plane_relay(relay, false);
+        crate::mesh::forget_relay();
+        // Database only: moves pairs off this control plane while it is the
+        // hub and cannot relay.
+        if let Err(error) = evaluate_mesh_links(db).await {
+            warn!(error = %error, "could not re-evaluate the WireGuard mesh links");
+        }
+        return false;
     }
     // Route pairs that cannot reach each other through the hub (ADR 048
     // D4), from the handshakes every member reports and our own.
@@ -776,5 +810,38 @@ mod tests {
             .append_query_results([Vec::<temps_entities::network_config::Model>::new()])
             .into_connection();
         assert!(!is_hub(&empty).await);
+    }
+
+    #[tokio::test]
+    async fn an_unverified_lockdown_leaves_the_peers_alone() {
+        let key_dir = tempfile::tempdir().unwrap();
+        let cidr: Ipv4Net = "10.201.0.0/24".parse().unwrap();
+        let end = MeshEnd {
+            interface: temps_wireguard::mesh::MeshInterface {
+                address: crate::mesh::control_plane_mesh_address(cidr),
+                prefix_len: cidr.prefix_len(),
+                listen_port: 51820,
+                mtu: 1420,
+            },
+            key: temps_wireguard::mesh::MeshKey::load_or_create(key_dir.path()).unwrap(),
+            endpoint: None,
+            settings: crate::mesh::MeshSettings {
+                cidr,
+                port: 51820,
+                node_api_port: 51820,
+            },
+            vxlan_port: 4789,
+        };
+        // Nothing queued: reading the peers to reconcile would be a query.
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let lockdown = Err(NetworkError::UnsupportedPlatform { target: "test" });
+
+        // Not the hub, so the process-wide relay flag other tests read stays
+        // as it was.
+        assert!(!tend_mesh_after_lockdown(&end, &db, false, lockdown).await);
+        assert!(
+            db.into_transaction_log().is_empty(),
+            "the mesh peers were read for reconciliation despite the failed lockdown"
+        );
     }
 }

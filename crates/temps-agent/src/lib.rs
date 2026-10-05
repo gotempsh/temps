@@ -111,14 +111,55 @@ pub enum ControlPlaneTrust {
     ClusterCa,
 }
 
+/// The cluster CA as the only trust root for calls to the control plane, with
+/// the control plane verified by its reserved name
+/// ([`temps_core::node_pki::CONTROL_PLANE_SERVER_NAME`]) rather than by the
+/// address in `control_plane_url`.
+///
+/// The cluster CA signs every worker's leaf for the name and addresses that
+/// worker registered, so checking the URL's address (the control plane's mesh
+/// address) would accept any worker that holds a leaf for that address. No
+/// worker can hold one for the reserved name.
+#[derive(Clone)]
+pub struct ControlPlaneCa {
+    tls: rustls::ClientConfig,
+}
+
+impl std::fmt::Debug for ControlPlaneCa {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlPlaneCa")
+            .field(
+                "server_name",
+                &temps_core::node_pki::CONTROL_PLANE_SERVER_NAME,
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl ControlPlaneCa {
+    /// The cluster CA certificate(s) in `pem`.
+    pub fn from_pem(pem: &[u8]) -> Result<Self, temps_core::node_pki::PkiError> {
+        Ok(Self {
+            tls: temps_core::node_pki::control_plane_client_config(pem)?,
+        })
+    }
+
+    /// The cluster CA certificate in `der`.
+    pub fn from_der(der: &[u8]) -> Result<Self, temps_core::node_pki::PkiError> {
+        Ok(Self {
+            tls: temps_core::node_pki::control_plane_client_config_from_der(der)?,
+        })
+    }
+}
+
 /// The cluster CA as the trust root for calls to the control plane, when this
 /// node's join pinned it ([`ControlPlaneTrust::ClusterCa`]) and it holds it.
 /// `None` for every other node, which verifies the control plane against the
 /// public roots only.
 ///
-/// A client given this certificate must also drop the public roots, as
+/// A client given this trust root uses it instead of the public roots, as
 /// [`with_control_plane_trust`] does.
-pub fn control_plane_ca(config: &AgentConfig) -> Option<reqwest::Certificate> {
+pub fn control_plane_ca(config: &AgentConfig) -> Option<ControlPlaneCa> {
     if config.effective_control_plane_trust() != ControlPlaneTrust::ClusterCa {
         return None;
     }
@@ -132,9 +173,9 @@ pub fn control_plane_ca(config: &AgentConfig) -> Option<reqwest::Certificate> {
     };
     match std::fs::read(path)
         .map_err(|error| error.to_string())
-        .and_then(|pem| reqwest::Certificate::from_pem(&pem).map_err(|error| error.to_string()))
+        .and_then(|pem| ControlPlaneCa::from_pem(&pem).map_err(|error| error.to_string()))
     {
-        Ok(certificate) => Some(certificate),
+        Ok(ca) => Some(ca),
         Err(error) => {
             tracing::warn!(
                 path = %path.display(),
@@ -151,16 +192,15 @@ pub fn control_plane_client_builder(config: &AgentConfig) -> reqwest::ClientBuil
     with_control_plane_trust(reqwest::Client::builder(), control_plane_ca(config))
 }
 
-/// Apply the trust from [`control_plane_ca`] to `builder`: the cluster CA
-/// *instead of* the public roots when given, the public roots otherwise.
+/// Apply the trust from [`control_plane_ca`] to `builder`: the cluster CA,
+/// verifying the control plane by its reserved name, *instead of* the public
+/// roots when given; the public roots otherwise.
 pub fn with_control_plane_trust(
     builder: reqwest::ClientBuilder,
-    cluster_ca: Option<reqwest::Certificate>,
+    cluster_ca: Option<ControlPlaneCa>,
 ) -> reqwest::ClientBuilder {
     match cluster_ca {
-        Some(certificate) => builder
-            .tls_built_in_root_certs(false)
-            .add_root_certificate(certificate),
+        Some(ca) => builder.use_preconfigured_tls(ca.tls),
         None => builder,
     }
 }
@@ -966,6 +1006,94 @@ mod tests {
         let (config, _dir) = config_with_cluster_ca(ControlPlaneTrust::ClusterCa);
         assert!(control_plane_ca(&config).is_some());
         assert!(control_plane_client_builder(&config).build().is_ok());
+    }
+
+    /// An HTTPS server on 127.0.0.1 presenting a leaf the cluster CA in
+    /// `ca` signed for `sans`, answering every request with 200.
+    async fn https_server(ca: &temps_core::node_pki::ClusterCa, sans: &[String]) -> String {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let csr = temps_core::node_pki::generate_node_keypair_csr("leaf", sans).unwrap();
+        let leaf =
+            temps_core::node_pki::sign_node_csr(&ca.cert_pem, &ca.key_pem, &csr.csr_pem, sans)
+                .unwrap();
+        let chain: Vec<CertificateDer<'static>> = [leaf.cert_pem.as_str(), &ca.cert_pem]
+            .iter()
+            .flat_map(|pem| rustls_pemfile::certs(&mut pem.as_bytes()).collect::<Vec<_>>())
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut csr.key_pem.as_bytes())
+            .unwrap()
+            .unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(chain, key)
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let mut request = [0u8; 4096];
+                    let _ = tls.read(&mut request).await;
+                    let _ = tls
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                        )
+                        .await;
+                    let _ = tls.shutdown().await;
+                });
+            }
+        });
+        format!("https://{address}")
+    }
+
+    /// The control plane is reached at an address (its mesh address), but a
+    /// pinned node verifies it by the reserved name: a worker leaf the same
+    /// CA signed for that address -- e.g. one registered with it before the
+    /// mesh existed -- cannot stand in for the control plane.
+    #[tokio::test]
+    async fn a_pinned_node_verifies_the_control_plane_by_its_reserved_name() {
+        let (mut config, _dir) = config_with_cluster_ca(ControlPlaneTrust::ClusterCa);
+        let ca_pem = std::fs::read(config.cluster_ca_path.as_ref().unwrap()).unwrap();
+        // The same CA, with its key, to sign the server leaves.
+        let ca = temps_core::node_pki::generate_cluster_ca().unwrap();
+        std::fs::write(config.cluster_ca_path.as_ref().unwrap(), &ca.cert_pem).unwrap();
+        assert_ne!(ca_pem, ca.cert_pem.as_bytes());
+        let address: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+
+        let control_plane = https_server(
+            &ca,
+            &temps_core::node_pki::control_plane_node_api_sans(address),
+        )
+        .await;
+        config.control_plane_url = control_plane.clone();
+        let client = control_plane_client_builder(&config).build().unwrap();
+        let response = client
+            .get(format!("{control_plane}/api/internal/nodes/1/heartbeat"))
+            .send()
+            .await
+            .expect("the control plane's leaf verifies by the reserved name");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        let impostor = https_server(&ca, &["127.0.0.1".to_string(), "worker-7".to_string()]).await;
+        let client = control_plane_client_builder(&config).build().unwrap();
+        let error = client
+            .get(format!("{impostor}/api/internal/nodes/1/heartbeat"))
+            .send()
+            .await
+            .expect_err("a worker leaf for the control plane's address is refused");
+        assert!(error.is_connect(), "{error:?}");
     }
 
     #[test]

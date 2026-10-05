@@ -5731,7 +5731,7 @@ export type CreateNodePairingRequest = {
  */
 export type CreateNodePairingResponse = {
     /**
-     * Run this on the node, as root: `temps join --pair <code>`.
+     * Run this on the node, as root. It pipes the pairing code into `temps join --pair -`, so the code stays out of the process list and shell history.
      */
     join_command: string;
     pairing: NodePairingResponse;

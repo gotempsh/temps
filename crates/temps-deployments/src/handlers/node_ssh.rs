@@ -21,31 +21,34 @@ use axum::{
     Extension, Json,
 };
 use serde::{Deserialize, Serialize};
-use temps_auth::{permission_guard, require_sensitive_action, RequireAuth};
+use temps_auth::{permission_guard, require_sensitive_action, AuthContext, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
 use temps_core::{
     AuditContext, AuditLogger, RequestMetadata, SensitiveAction, SensitiveActionAuthorizer,
 };
 use temps_entities::node_ssh_enrollments;
 use temps_network::mesh::MeshError;
-use tracing::error;
+use tracing::{debug, error, warn};
 use utoipa::{IntoParams, ToSchema};
 use zeroize::Zeroizing;
 
-use crate::handlers::audit::NodeSshEnrollmentStartedAudit;
+use crate::handlers::audit::{NodeSshEnrollmentStartedAudit, NodeSshHostKeyProbedAudit};
 use crate::handlers::node_pairings::{pairing_problem, parse_node_endpoint, start_pairing_audited};
 use crate::handlers::types::AppState;
 use crate::services::node_pairing_admin as admin;
 use crate::services::node_ssh::{self, Enrollment, SshAuth, SshError};
 use crate::services::node_ssh_enrollment::{
-    EnrollmentJob, EnrollmentSummary, NewEnrollment, NodeSshEnrollmentError,
-    NodeSshEnrollmentService,
+    self as enrollment_service, EnrollmentJob, EnrollmentSummary, NewEnrollment,
+    NodeSshEnrollmentError, NodeSshEnrollmentService, ReservedNetwork,
 };
 
 const DEFAULT_SSH_PORT: u16 = 22;
 /// Enrollments per page unless asked otherwise, and at most.
 const DEFAULT_PER_PAGE: u64 = 20;
 const MAX_PER_PAGE: u64 = 100;
+/// The host as recorded in a probe's audit entry is cut at this many
+/// characters (a refused one can be anything the caller sent).
+const AUDITED_HOST_CHARS: usize = 256;
 
 /// A server to read the SSH host key of.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -261,6 +264,9 @@ pub trait SshEnrollmentPairings: Send + Sync {
         node_endpoint: SocketAddr,
         name: Option<&str>,
     ) -> Result<StartedPairing, Problem>;
+    /// The networks Temps addresses itself (the compute pool, the mesh
+    /// pool): never a server to connect to over SSH.
+    async fn reserved_networks(&self) -> Result<Vec<ReservedNetwork>, Problem>;
 }
 
 struct MeshPairings(Arc<AppState>);
@@ -294,6 +300,12 @@ impl SshEnrollmentPairings for MeshPairings {
             name: pairing.name,
             code,
         })
+    }
+
+    async fn reserved_networks(&self) -> Result<Vec<ReservedNetwork>, Problem> {
+        enrollment_service::reserved_networks(self.0.db.as_ref())
+            .await
+            .map_err(enrollment_problem)
     }
 }
 
@@ -349,6 +361,29 @@ fn enrollment_problem(error: NodeSshEnrollmentError) -> Problem {
     }
 }
 
+/// The one message for every hostname that does not lead to a usable
+/// address. Which of those it is (no such name, or a name for a loopback,
+/// metadata or Temps-internal address) is logged, never returned: a caller
+/// could otherwise map this control plane's DNS view and internal networks.
+fn unusable_hostname(host: &str) -> Problem {
+    bad_request(
+        "Cannot Connect To This Host",
+        format!(
+            "'{host}' does not resolve to an address this control plane connects to over SSH. \
+             Check the name, or use the server's IP address."
+        ),
+    )
+}
+
+/// Whether `host` is an IP address rather than a name.
+fn is_ip_literal(host: &str) -> bool {
+    host.trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<IpAddr>()
+        .is_ok()
+}
+
 /// The address to connect to for `host`. Hostnames are resolved; like node
 /// endpoints, loopback, link-local and cloud metadata addresses are refused,
 /// and private ones allowed (servers on a LAN or VPC are added by those).
@@ -374,38 +409,131 @@ async fn resolve(host: &str, port: Option<u16>) -> Result<SocketAddr, Problem> {
     let ip = match literal {
         Some(ip) => ip,
         None => {
-            let addresses: Vec<SocketAddr> = tokio::time::timeout(
+            let looked_up = tokio::time::timeout(
                 Duration::from_secs(5),
                 tokio::net::lookup_host((bare, port)),
             )
-            .await
-            .map_err(|_| bad_request("Unknown Host", format!("Resolving '{bare}' timed out.")))?
-            .map_err(|error| {
-                bad_request(
-                    "Unknown Host",
-                    format!("'{bare}' does not resolve ({error})."),
-                )
-            })?
-            .collect();
-            addresses
+            .await;
+            let addresses: Vec<SocketAddr> = match looked_up {
+                Ok(Ok(addresses)) => addresses.collect(),
+                Ok(Err(error)) => {
+                    debug!(host = bare, %error, "SSH target hostname does not resolve");
+                    return Err(unusable_hostname(bare));
+                }
+                Err(_) => {
+                    debug!(host = bare, "resolving an SSH target hostname timed out");
+                    return Err(unusable_hostname(bare));
+                }
+            };
+            match addresses
                 .iter()
                 .find(|address| address.is_ipv4())
                 .or_else(|| addresses.first())
-                .map(|address| address.ip())
-                .ok_or_else(|| bad_request("Unknown Host", format!("'{bare}' has no addresses.")))?
+            {
+                Some(address) => address.ip(),
+                None => {
+                    debug!(host = bare, "SSH target hostname has no addresses");
+                    return Err(unusable_hostname(bare));
+                }
+            }
         }
     };
     temps_network::mesh::parse_endpoint(&SocketAddr::new(ip.to_canonical(), port).to_string())
-        .map_err(|error| match error {
-            MeshError::InvalidEndpoint { reason, .. } => bad_request(
-                "Cannot Connect To This Host",
-                match literal {
-                    Some(_) => format!("{ip} {reason}"),
-                    None => format!("{host} resolves to {ip}, which {reason}"),
-                },
-            ),
-            other => bad_request("Cannot Connect To This Host", other.to_string()),
+        .map_err(|error| match (error, literal) {
+            (MeshError::InvalidEndpoint { reason, .. }, Some(_)) => {
+                bad_request("Cannot Connect To This Host", format!("{ip} {reason}"))
+            }
+            (error, None) => {
+                debug!(host = bare, %ip, %error, "SSH target hostname resolves to an unusable address");
+                unusable_hostname(bare)
+            }
+            (other, Some(_)) => bad_request("Cannot Connect To This Host", other.to_string()),
         })
+}
+
+/// `resolve`, then refuse an address inside a network Temps addresses itself
+/// (`reserved`): the control plane's SSH client must not be pointed at its
+/// own containers or mesh. Ordinary private ranges stay allowed.
+fn refuse_reserved(
+    host: &str,
+    address: SocketAddr,
+    reserved: &[ReservedNetwork],
+) -> Result<SocketAddr, Problem> {
+    let Some(network) = ReservedNetwork::containing(reserved, address.ip()) else {
+        return Ok(address);
+    };
+    if is_ip_literal(host) {
+        Err(bad_request(
+            "Cannot Connect To This Host",
+            format!(
+                "{} is in {} ({}), which Temps uses for its own addresses. Use the server's own \
+                 address.",
+                address.ip(),
+                network.name,
+                network.cidr
+            ),
+        ))
+    } else {
+        debug!(
+            host = host.trim(),
+            ip = %address.ip(),
+            network = network.name,
+            cidr = %network.cidr,
+            "SSH target hostname resolves into a network Temps uses itself"
+        );
+        Err(unusable_hostname(host.trim()))
+    }
+}
+
+/// The address to connect to for `host`: resolved, and outside the networks
+/// Temps uses itself.
+async fn resolve_target(
+    pairings: &dyn SshEnrollmentPairings,
+    host: &str,
+    port: Option<u16>,
+) -> Result<SocketAddr, Problem> {
+    let address = resolve(host, port).await?;
+    let reserved = pairings.reserved_networks().await?;
+    refuse_reserved(host, address, &reserved)
+}
+
+/// Whether `auth` may log in to a server with the control plane's own SSH
+/// agent: only the instance's full Admin, signed in to the console.
+///
+/// The agent offers every key loaded in the `temps serve` process to the
+/// server, as any user the caller names, so it can reach everything those
+/// keys open. API keys, CLI tokens and deployment tokens skip the
+/// sensitive-action re-verification, and a platform admin is not meant to
+/// hold the host's own credentials: none of them may use it.
+fn may_use_control_plane_agent(auth: &AuthContext) -> bool {
+    auth.is_session() && auth.is_admin()
+}
+
+fn agent_not_allowed(auth: &AuthContext) -> Problem {
+    let principal = if auth.is_api_key() {
+        "an API key"
+    } else if auth.is_cli_token() {
+        "a CLI token"
+    } else if auth.is_deployment_token() {
+        "a deployment token"
+    } else {
+        "a console session"
+    };
+    warn!(
+        user = auth.user_id(),
+        principal,
+        role = %auth.effective_role,
+        "refused adding a server over SSH with the control plane's SSH agent"
+    );
+    problemdetails::new(StatusCode::FORBIDDEN)
+        .with_title("SSH Agent Not Allowed")
+        .with_detail(format!(
+            "Logging in with this control plane's SSH agent offers every key loaded in its \
+             `temps serve` process to the server, so only an instance admin signed in to the \
+             console may use it. This request is authenticated with {principal} (role {}). Use \
+             a password or a private key instead.",
+            auth.effective_role
+        ))
 }
 
 fn ssh_problem(error: SshError) -> Problem {
@@ -415,9 +543,10 @@ fn ssh_problem(error: SshError) -> Problem {
         // Not the key the operator confirmed.
         SshError::HostKeyChanged { .. } => StatusCode::CONFLICT,
         // The server could not be reached or talked to.
-        SshError::Connect { .. } | SshError::Remote(_) | SshError::Session(_) => {
-            StatusCode::BAD_GATEWAY
-        }
+        SshError::Connect { .. }
+        | SshError::Remote(_)
+        | SshError::Session(_)
+        | SshError::TimedOut { .. } => StatusCode::BAD_GATEWAY,
     };
     problemdetails::new(status)
         .with_title("SSH Connection Failed")
@@ -464,6 +593,7 @@ fn valid_fingerprint(fingerprint: &str) -> bool {
 pub async fn node_ssh_host_key(
     RequireAuth(auth): RequireAuth,
     State(state): State<NodeSshState>,
+    Extension(metadata): Extension<RequestMetadata>,
     Json(request): Json<SshHostKeyRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
@@ -475,13 +605,56 @@ pub async fn node_ssh_host_key(
         SensitiveAction::AddNodeOverSsh,
     )
     .await?;
-    let address = resolve(&request.host, request.port).await?;
-    let key = node_ssh::host_key(address).await.map_err(ssh_problem)?;
+    let (address, read) =
+        match resolve_target(state.pairings.as_ref(), &request.host, request.port).await {
+            Ok(address) => (
+                Some(address),
+                node_ssh::host_key(address)
+                    .await
+                    .map(|key| (address, key))
+                    .map_err(ssh_problem),
+            ),
+            Err(problem) => (None, Err(problem)),
+        };
+
+    // Every attempt is recorded, whatever came of it.
+    let audit = NodeSshHostKeyProbedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        host: request
+            .host
+            .trim()
+            .chars()
+            .take(AUDITED_HOST_CHARS)
+            .collect(),
+        port: request.port.unwrap_or(DEFAULT_SSH_PORT),
+        address: address.map(|address| address.to_string()),
+        outcome: probe_outcome(&read).to_string(),
+        fingerprint: read.as_ref().ok().map(|(_, key)| key.fingerprint.clone()),
+    };
+    if let Err(error) = state.audit_service.create_audit_log(&audit).await {
+        error!(%error, host = %audit.host, "SSH host key read but its audit record failed");
+    }
+
+    let (address, key) = read?;
     Ok(Json(SshHostKeyResponse {
         address: address.to_string(),
         algorithm: key.algorithm,
         fingerprint: key.fingerprint,
     }))
+}
+
+/// What came of reading a host key, as its audit record names it.
+fn probe_outcome<T>(read: &Result<T, Problem>) -> &'static str {
+    match read {
+        Ok(_) => "host_key_read",
+        Err(problem) if problem.status_code == StatusCode::BAD_REQUEST => "refused_target",
+        Err(problem) if problem.status_code == StatusCode::BAD_GATEWAY => "unreachable",
+        Err(_) => "error",
+    }
 }
 
 /// Add a server over SSH: log in with the given credentials, install `temps`
@@ -511,6 +684,9 @@ pub async fn create_node_ssh_enrollment(
     Json(request): Json<CreateSshEnrollmentRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
+    if matches!(request.credentials, SshCredentials::Agent) && !may_use_control_plane_agent(&auth) {
+        return Err(agent_not_allowed(&auth));
+    }
     require_sensitive_action(
         state.sensitive_action_authorizer.as_ref(),
         &auth,
@@ -546,7 +722,7 @@ pub async fn create_node_ssh_enrollment(
             limit: crate::services::node_ssh_enrollment::MAX_RUNNING,
         }));
     }
-    let ssh_address = resolve(&request.host, request.port).await?;
+    let ssh_address = resolve_target(state.pairings.as_ref(), &request.host, request.port).await?;
     let node_endpoint = match request
         .node_address
         .as_deref()
@@ -868,9 +1044,13 @@ mod tests {
         }
     }
 
-    /// (operation, ip, user agent) of every audit record.
+    /// (operation, ip, user agent) of every audit record, and each record's
+    /// serialized payload.
     #[derive(Default)]
-    struct Audits(Mutex<Vec<(String, Option<String>, String)>>);
+    struct Audits(
+        Mutex<Vec<(String, Option<String>, String)>>,
+        Mutex<Vec<serde_json::Value>>,
+    );
 
     #[async_trait]
     impl AuditLogger for Audits {
@@ -883,6 +1063,10 @@ mod tests {
                 operation.ip_address(),
                 operation.user_agent().to_string(),
             ));
+            self.1
+                .lock()
+                .unwrap()
+                .push(serde_json::from_str(&operation.serialize()?)?);
             Ok(())
         }
     }
@@ -890,6 +1074,7 @@ mod tests {
     /// A mesh that is on, whose pairings always start.
     struct Pairings {
         mesh_on: bool,
+        reserved: Vec<ReservedNetwork>,
     }
 
     #[async_trait]
@@ -912,6 +1097,9 @@ mod tests {
                 name: "worker-a".into(),
                 code: Zeroizing::new("tpair1.test".into()),
             })
+        }
+        async fn reserved_networks(&self) -> Result<Vec<ReservedNetwork>, Problem> {
+            Ok(self.reserved.clone())
         }
     }
 
@@ -960,6 +1148,7 @@ mod tests {
         db: DatabaseConnection,
         decision: SensitiveActionDecision,
         mesh_on: bool,
+        reserved: Vec<ReservedNetwork>,
         audits: Arc<Audits>,
     }
 
@@ -969,6 +1158,7 @@ mod tests {
                 db: db.into_connection(),
                 decision: SensitiveActionDecision::Allow,
                 mesh_on: true,
+                reserved: Vec::new(),
                 audits: Arc::new(Audits::default()),
             }
         }
@@ -984,6 +1174,7 @@ mod tests {
                 ),
                 pairings: Arc::new(Pairings {
                     mesh_on: self.mesh_on,
+                    reserved: self.reserved,
                 }),
                 audit_service: self.audits,
                 sensitive_action_authorizer: Arc::new(Authorizer(self.decision)),
@@ -1311,5 +1502,226 @@ mod tests {
         let (status, body) = call(app, get_request("/nodes/ssh/enrollments/99")).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["title"], "Enrollment Not Found");
+    }
+
+    // ── Logging in with the control plane's SSH agent ───────────────────
+
+    fn agent_body() -> serde_json::Value {
+        let mut body = enrollment_body("198.51.100.7");
+        body["credentials"] = serde_json::json!({"method": "agent"});
+        body
+    }
+
+    #[tokio::test]
+    async fn the_control_plane_agent_is_refused_to_api_keys_cli_tokens_and_non_admins() {
+        let principals = [
+            (
+                "admin API key",
+                AuthContext::new_api_key(user("admin"), Some(Role::Admin), None, "ci".into(), 4),
+            ),
+            (
+                "admin CLI token",
+                AuthContext::new_cli_token(user("admin"), Role::Admin),
+            ),
+            (
+                "platform admin session",
+                AuthContext::new_persisted_session(user("platform"), Role::PlatformAdmin, 1),
+            ),
+        ];
+        for (name, auth) in principals {
+            let (app, audits) = Harness::new(empty_db()).app(Some(auth));
+            let (status, body) = call(app, post_json("/nodes/ssh/enrollments", agent_body())).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{name}: {body}");
+            assert_eq!(body["title"], "SSH Agent Not Allowed", "{name}");
+            let detail = body["detail"].as_str().unwrap_or_default();
+            assert!(
+                detail.contains("password or a private key"),
+                "{name}: {detail}"
+            );
+            assert!(audits.0.lock().unwrap().is_empty(), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_control_plane_agent_is_refused_before_the_step_up() {
+        let mut harness = Harness::new(empty_db());
+        harness.decision = SensitiveActionDecision::RequireVerification {
+            mfa_setup_required: false,
+        };
+        let (app, _) = harness.app(Some(AuthContext::new_api_key(
+            user("admin"),
+            Some(Role::Admin),
+            None,
+            "ci".into(),
+            4,
+        )));
+        let (status, body) = call(app, post_json("/nodes/ssh/enrollments", agent_body())).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["title"], "SSH Agent Not Allowed");
+    }
+
+    #[tokio::test]
+    async fn an_admin_console_session_may_use_the_control_plane_agent() {
+        // Past the gate, the request goes on: here to the mesh being off.
+        let mut harness = Harness::new(empty_db());
+        harness.mesh_on = false;
+        let (app, _) = harness.app(Some(admin()));
+        let (status, body) = call(app, post_json("/nodes/ssh/enrollments", agent_body())).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    }
+
+    #[tokio::test]
+    async fn other_credentials_are_not_gated_on_the_principal() {
+        let mut harness = Harness::new(empty_db());
+        harness.mesh_on = false;
+        let (app, _) = harness.app(Some(AuthContext::new_api_key(
+            user("admin"),
+            Some(Role::Admin),
+            None,
+            "ci".into(),
+            4,
+        )));
+        let (status, body) = call(
+            app,
+            post_json("/nodes/ssh/enrollments", enrollment_body("198.51.100.7")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    }
+
+    // ── Reading a host key: no oracle, always audited ────────────────────
+
+    fn mesh_pool() -> ReservedNetwork {
+        ReservedNetwork {
+            name: "the WireGuard mesh pool",
+            cidr: "10.201.0.0/16".parse().unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn reading_a_host_key_refuses_the_networks_temps_uses_itself() {
+        let mut harness = Harness::new(empty_db());
+        harness.reserved = vec![mesh_pool()];
+        let (app, audits) = harness.app(Some(admin()));
+        let (status, body) = call(
+            app,
+            post_json(
+                "/nodes/ssh/host-key",
+                serde_json::json!({"host": "10.201.0.5", "port": 2222}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["title"], "Cannot Connect To This Host");
+        assert!(body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("the WireGuard mesh pool"));
+
+        let recorded = audits.1.lock().unwrap().clone();
+        assert_eq!(audits.0.lock().unwrap()[0].0, "NODE_SSH_HOST_KEY_PROBED");
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0]["host"], "10.201.0.5");
+        assert_eq!(recorded[0]["port"], 2222);
+        assert_eq!(recorded[0]["address"], serde_json::Value::Null);
+        assert_eq!(recorded[0]["outcome"], "refused_target");
+        assert_eq!(recorded[0]["fingerprint"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn enrolling_refuses_the_networks_temps_uses_itself() {
+        let db = empty_db().append_query_results([vec![count_row("running", 0)]]);
+        let mut harness = Harness::new(db);
+        harness.reserved = vec![mesh_pool()];
+        let (app, audits) = harness.app(Some(admin()));
+        let (status, body) = call(
+            app,
+            post_json("/nodes/ssh/enrollments", enrollment_body("10.201.3.4")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["title"], "Cannot Connect To This Host");
+        assert!(audits.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ordinary_private_addresses_are_not_reserved() {
+        let reserved = [mesh_pool()];
+        for host in ["10.0.0.5", "192.168.1.20", "172.16.4.2"] {
+            let address = SocketAddr::new(host.parse().unwrap(), 22);
+            assert_eq!(refuse_reserved(host, address, &reserved).unwrap(), address);
+        }
+    }
+
+    #[tokio::test]
+    async fn hostnames_never_reveal_what_they_resolve_to() {
+        // `localhost` resolves to loopback; a name in the mesh pool is
+        // refused the same way, and a name that does not resolve too.
+        let detail_of = |problem: Problem| {
+            problem.body["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+        let loopback = detail_of(resolve("localhost", None).await.unwrap_err());
+        let missing = detail_of(resolve("no-such-host.invalid", None).await.unwrap_err());
+        let reserved = detail_of(
+            refuse_reserved(
+                "worker.internal",
+                "10.201.0.9:22".parse().unwrap(),
+                &[mesh_pool()],
+            )
+            .unwrap_err(),
+        );
+        for (detail, host) in [
+            (&loopback, "localhost"),
+            (&missing, "no-such-host.invalid"),
+            (&reserved, "worker.internal"),
+        ] {
+            assert_eq!(*detail, unusable_hostname_detail(host), "{host}");
+            for leaked in ["127.0.0.1", "::1", "10.201", "mesh", "loopback"] {
+                assert!(!detail.contains(leaked), "{host}: {detail}");
+            }
+        }
+    }
+
+    fn unusable_hostname_detail(host: &str) -> String {
+        unusable_hostname(host).body["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn a_connect_failure_reports_no_cause_or_address() {
+        let problem = ssh_problem(SshError::Connect {
+            address: "198.51.100.7:2222".parse().unwrap(),
+            reason: "Connection refused (os error 61)".into(),
+        });
+        assert_eq!(problem.status_code, StatusCode::BAD_GATEWAY);
+        let detail = problem.body["detail"].as_str().unwrap_or_default();
+        for leaked in ["refused (os", "198.51.100.7", "2222"] {
+            assert!(!detail.contains(leaked), "{detail}");
+        }
+    }
+
+    #[test]
+    fn probe_outcomes_name_what_happened() {
+        assert_eq!(probe_outcome::<()>(&Ok(())), "host_key_read");
+        assert_eq!(
+            probe_outcome::<()>(&Err(bad_request("Invalid Host", "x"))),
+            "refused_target"
+        );
+        assert_eq!(
+            probe_outcome::<()>(&Err(ssh_problem(SshError::Session("reset".into())))),
+            "unreachable"
+        );
+        assert_eq!(
+            probe_outcome::<()>(&Err(enrollment_problem(NodeSshEnrollmentError::Database {
+                operation: "load the network configuration",
+                source: sea_orm::DbErr::Custom("x".into()),
+            }))),
+            "error"
+        );
     }
 }

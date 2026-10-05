@@ -120,6 +120,33 @@ pub enum NodeError {
     ControlPlaneIdentity { claimed: String, role: String },
 
     #[error(
+        "Node '{node_name}' cannot register with '{claimed}': it is {holder}. A node registers \
+         with its own underlay or public address and the control plane assigns its mesh \
+         address, or the cluster CA would sign the node a certificate for a mesh identity"
+    )]
+    MeshIdentityReserved {
+        node_name: String,
+        claimed: String,
+        holder: temps_network::mesh::MeshIdentityHolder,
+    },
+
+    #[error(
+        "Node '{node_name}' presented the enrollment token {token_id} of pairing \
+         '{pairing_name}' (id {pairing_id}) from {arrived}; a pairing's token is only accepted \
+         over the WireGuard mesh from the address the pairing reserved ({reserved_address}). \
+         Run `temps join --pair` with the pairing code on the machine being paired"
+    )]
+    PairingSourceRefused {
+        node_name: String,
+        token_id: i32,
+        pairing_id: i32,
+        pairing_name: String,
+        reserved_address: String,
+        /// Where the registration came from, phrased for the message.
+        arrived: String,
+    },
+
+    #[error(
         "Node '{node_name}' could not complete the pairing of enrollment token {token_id}: {source}"
     )]
     Pairing {
@@ -460,7 +487,7 @@ fn validate_registration(request: &RegisterNodeRequest) -> Result<(), NodeError>
     // Restrict to a DNS-label-style charset. The name is surfaced in logs
     // and injected into every container's `TEMPS_NODE_NAME` env var, so
     // reject shell metacharacters / newlines / control chars defensively.
-    if request.name.len() > 63
+    if request.name.len() > temps_core::node_pki::MAX_NODE_NAME_LEN
         || !request
             .name
             .bytes()
@@ -476,6 +503,25 @@ fn validate_registration(request: &RegisterNodeRequest) -> Result<(), NodeError>
             message: "Node address cannot be empty".into(),
         });
     }
+
+    // The control plane's node API is verified by this name (ADR 048 D3); a
+    // node holding a leaf for it could impersonate the control plane. It is
+    // longer than any node name, so the length rule above already refuses it
+    // as a name; the address fields are checked here too, for callers that
+    // reach the service without the handler's IP validation.
+    for value in [
+        request.name.as_str(),
+        request.address.as_str(),
+        request.private_address.as_str(),
+    ] {
+        let host = node_address_host(value);
+        if temps_core::node_pki::is_reserved_control_plane_name(&host) {
+            return Err(NodeError::ControlPlaneIdentity {
+                claimed: host,
+                role: "reserved TLS server name".to_string(),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -489,6 +535,12 @@ pub struct RegistrationContext {
     /// node may not register under them, or the cluster CA would sign it a
     /// certificate valid for the control plane.
     pub control_plane_hosts: Vec<String>,
+    /// The TCP peer address, when the registration arrived on the control
+    /// plane's mesh node API (ADR 048 D3); `None` on every other listener.
+    /// Set from the connection, never from anything the client sends. A
+    /// pairing's enrollment token is only accepted with this set to the
+    /// address the pairing reserved.
+    pub node_api_peer: Option<std::net::IpAddr>,
 }
 
 /// The first of `claimed` that is one of `reserved`, compared
@@ -626,31 +678,97 @@ impl NodeService {
             .filter(|host| !host.is_empty())
             .map(|host| (host, "host"))
             .collect();
-        let mut conflict = reserved_identity_claimed(&claimed, &hosts)
-            .map(|(claimed, role)| (claimed, role.to_string()));
-        if conflict.is_none() {
-            let mesh = temps_network::mesh::load_settings(self.db.as_ref())
-                .await
-                .map_err(|source| NodeError::MeshSettings {
-                    node_name: request.name.clone(),
-                    source,
-                })?;
-            if let Some(mesh) = mesh {
-                let address = [(mesh.control_plane_address().to_string(), "mesh address")];
-                conflict = reserved_identity_claimed(&claimed, &address)
-                    .map(|(claimed, role)| (claimed, role.to_string()));
-            }
-        }
-        if let Some((claimed, role)) = conflict {
+        if let Some((claimed, role)) = reserved_identity_claimed(&claimed, &hosts) {
             tracing::warn!(
                 node_name = %request.name,
                 claimed = %claimed,
                 role = %role,
                 "Rejected node registration: it claims the control plane's own identity"
             );
-            return Err(NodeError::ControlPlaneIdentity { claimed, role });
+            return Err(NodeError::ControlPlaneIdentity {
+                claimed,
+                role: role.to_string(),
+            });
         }
-        Ok(())
+
+        // Mesh identities are reserved whether or not the mesh is on: a leaf
+        // is never revoked, so one signed now for the control plane's future
+        // mesh address, or a future member's, would outlive any later check.
+        let mesh_claim = temps_network::mesh::mesh_identity_claimed(self.db.as_ref(), &claimed)
+            .await
+            .map_err(|source| NodeError::MeshSettings {
+                node_name: request.name.clone(),
+                source,
+            })?;
+        let Some(mesh_claim) = mesh_claim else {
+            return Ok(());
+        };
+        tracing::warn!(
+            node_name = %request.name,
+            claimed = %mesh_claim.claimed,
+            holder = %mesh_claim.holder,
+            "Rejected node registration: it claims a WireGuard mesh identity"
+        );
+        Err(match mesh_claim.holder {
+            // Same error as a claim on the control plane's host: the leaf
+            // would let the node impersonate the control plane.
+            temps_network::mesh::MeshIdentityHolder::ControlPlane { .. } => {
+                NodeError::ControlPlaneIdentity {
+                    claimed: mesh_claim.claimed,
+                    role: "mesh address".to_string(),
+                }
+            }
+            holder => NodeError::MeshIdentityReserved {
+                node_name: request.name.clone(),
+                claimed: mesh_claim.claimed,
+                holder,
+            },
+        })
+    }
+
+    /// Refuse a registration that redeems a pairing's enrollment token
+    /// anywhere but over the mesh node API from the pairing's reserved mesh
+    /// address (ADR 048: a leaked pairing code only pairs from that address).
+    /// `Ok(())` when the token was not minted for a pairing.
+    async fn assert_pairing_source(
+        &self,
+        node_name: &str,
+        token_id: i32,
+        node_api_peer: Option<std::net::IpAddr>,
+    ) -> Result<(), NodeError> {
+        let pairing = temps_network::pairing::for_enrollment_token(self.db.as_ref(), token_id)
+            .await
+            .map_err(|source| NodeError::Pairing {
+                node_name: node_name.to_string(),
+                token_id,
+                source,
+            })?;
+        let Some(pairing) = pairing else {
+            return Ok(());
+        };
+        if temps_network::pairing::registration_source_matches(&pairing, node_api_peer) {
+            return Ok(());
+        }
+        let arrived = match node_api_peer {
+            Some(peer) => format!("mesh address {peer}"),
+            None => "outside the mesh node API".to_string(),
+        };
+        tracing::warn!(
+            node_name,
+            token_id,
+            pairing = pairing.id,
+            reserved_address = %pairing.mesh_address,
+            arrived = %arrived,
+            "Rejected node registration: a pairing's enrollment token was redeemed away from the paired address"
+        );
+        Err(NodeError::PairingSourceRefused {
+            node_name: node_name.to_string(),
+            token_id,
+            pairing_id: pairing.id,
+            pairing_name: pairing.name,
+            reserved_address: pairing.mesh_address,
+            arrived,
+        })
     }
 
     /// Register a node with the checks that need the caller's context: it
@@ -675,6 +793,8 @@ impl NodeService {
         // Refuse before creating the node, so a pairing that cannot complete
         // never leaves a half-registered node behind.
         let node_name = request.name.clone();
+        self.assert_pairing_source(&node_name, token_id, context.node_api_peer)
+            .await?;
         temps_network::pairing::check_linkable(self.db.as_ref(), token_id)
             .await
             .map_err(|source| NodeError::Pairing {
@@ -2205,6 +2325,282 @@ mod tests {
             "no record may point at a removed node: {:?}",
             zone.records
         );
+    }
+
+    /// A registration context on the public API, with no control-plane host.
+    fn public_context() -> RegistrationContext {
+        RegistrationContext::default()
+    }
+
+    /// A registration of `name` whose address and private address are both
+    /// `address`.
+    fn register_at(name: &str, address: &str) -> RegisterNodeRequest {
+        let mut request = register_req(
+            name,
+            &format!("hash-{name}"),
+            &format!("https://{address}:3100"),
+        );
+        request.private_address = address.to_string();
+        request
+    }
+
+    #[tokio::test]
+    async fn the_reserved_control_plane_name_is_refused_before_any_database_work() {
+        // An empty mock: any query would fail the test with a database error.
+        let service = NodeService::new(Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+        ));
+        let reserved = temps_core::node_pki::CONTROL_PLANE_SERVER_NAME;
+
+        // As a name it is longer than any node name may be.
+        let error = service
+            .register_with_context(register_at(reserved, "10.100.0.2"), &public_context())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, NodeError::Validation { .. }), "{error:?}");
+
+        // As an address (any case, with a root dot), through the service
+        // without the handler's IP validation.
+        let mut request = register_at("worker-1", "10.100.0.2");
+        request.address = format!("https://{}.:3100", reserved.to_uppercase());
+        let error = service
+            .register_with_context(request, &public_context())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                NodeError::ControlPlaneIdentity { role, .. } if role == "reserved TLS server name"
+            ),
+            "{error:?}"
+        );
+    }
+
+    /// While the mesh is off, its pool (the default one here) is reserved
+    /// all the same: the control plane's future mesh address and every other
+    /// address in it, as a name, address or private address.
+    #[tokio::test]
+    async fn registration_reserves_the_mesh_pool_while_the_mesh_is_off() {
+        let Some(test_db) = migrated_test_db().await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        assert!(temps_network::mesh::load_settings(db.as_ref())
+            .await
+            .unwrap()
+            .is_none());
+        let service = NodeService::new(db.clone());
+
+        let error = service
+            .register_with_context(register_at("worker-1", "10.201.0.1"), &public_context())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                NodeError::ControlPlaneIdentity { claimed, role }
+                    if claimed == "10.201.0.1" && role == "mesh address"
+            ),
+            "{error:?}"
+        );
+
+        let mut named = register_at("10.201.4.4", "10.100.0.2");
+        named.name = "10.201.4.4".into();
+        let mut private = register_at("worker-2", "10.100.0.3");
+        private.private_address = "10.201.9.9".into();
+        for request in [named, private] {
+            let error = service
+                .register_with_context(request, &public_context())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    &error,
+                    NodeError::MeshIdentityReserved {
+                        holder: temps_network::mesh::MeshIdentityHolder::Pool { .. },
+                        ..
+                    }
+                ),
+                "{error:?}"
+            );
+            assert!(error.to_string().contains("10.201.0.0/16"), "{error}");
+        }
+
+        // Outside the pool registers as before.
+        service
+            .register_with_context(register_at("worker-3", "10.100.0.4"), &public_context())
+            .await
+            .unwrap();
+    }
+
+    /// Another member's mesh address, or one a pending pairing reserved, is
+    /// refused even when it lies outside the current pool (rows written
+    /// before the pool was frozen for pending pairings).
+    #[tokio::test]
+    async fn registration_refuses_another_members_mesh_address() {
+        use sea_orm::ConnectionTrait;
+        let Some(test_db) = migrated_test_db().await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        let service = NodeService::new(db.clone());
+        db.execute_unprepared(
+            "UPDATE network_config SET wireguard_cidr = '10.202.0.0/16' WHERE id = 1",
+        )
+        .await
+        .unwrap();
+
+        let member = service
+            .register_with_context(register_at("worker-1", "10.100.0.2"), &public_context())
+            .await
+            .unwrap();
+        let mut active: nodes::ActiveModel = member.clone().into();
+        active.mesh_wg_address = Set(Some("10.201.0.5".into()));
+        active.update(db.as_ref()).await.unwrap();
+
+        let error = service
+            .register_with_context(register_at("worker-2", "10.201.0.5"), &public_context())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                NodeError::MeshIdentityReserved {
+                    holder: temps_network::mesh::MeshIdentityHolder::Node { node_id, .. },
+                    ..
+                } if *node_id == member.id
+            ),
+            "{error:?}"
+        );
+
+        let now = chrono::Utc::now();
+        let token = temps_entities::node_enrollment_tokens::ActiveModel {
+            token_hash: Set("hash-edge-1".into()),
+            max_uses: Set(1),
+            used_count: Set(0),
+            expires_at: Set(now + chrono::Duration::minutes(30)),
+            bound_node_name: Set(Some("edge-1".into())),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let pairing = temps_entities::node_pairings::ActiveModel {
+            pairing_id: Set("pairing-edge-1".into()),
+            name: Set("edge-1".into()),
+            node_endpoint: Set("10.100.0.9:51820".into()),
+            mesh_address: Set("10.201.0.6".into()),
+            secret_encrypted: Set("encrypted".into()),
+            enrollment_token_id: Set(token.id),
+            status: Set(temps_network::pairing::STATUS_WAITING.into()),
+            expires_at: Set(now + chrono::Duration::minutes(30)),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let error = service
+            .register_with_context(register_at("worker-3", "10.201.0.6"), &public_context())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                NodeError::MeshIdentityReserved {
+                    holder: temps_network::mesh::MeshIdentityHolder::Pairing { pairing_id, .. },
+                    ..
+                } if *pairing_id == pairing.id
+            ),
+            "{error:?}"
+        );
+    }
+
+    /// ADR 048: a pairing's enrollment token is accepted only over the mesh
+    /// node API, from the address the pairing reserved.
+    #[tokio::test]
+    async fn a_pairing_token_is_redeemed_only_from_the_pairings_mesh_address() {
+        use base64::Engine;
+        let Some(test_db) = migrated_test_db().await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        let service = NodeService::new(db.clone());
+        temps_network::mesh::enable(db.as_ref(), None, None, None)
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        let token = temps_entities::node_enrollment_tokens::ActiveModel {
+            token_hash: Set("hash-edge-1".into()),
+            max_uses: Set(1),
+            used_count: Set(0),
+            expires_at: Set(now + chrono::Duration::minutes(30)),
+            bound_node_name: Set(Some("edge-1".into())),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let pairing = temps_network::pairing::create(
+            db.as_ref(),
+            temps_network::pairing::NewPairing {
+                pairing_id: "pairing-edge-1".into(),
+                name: "edge-1".into(),
+                node_endpoint: "10.100.0.9:51820".parse().unwrap(),
+                secret_encrypted: "encrypted".into(),
+                enrollment_token_id: token.id,
+                expires_at: now + chrono::Duration::minutes(30),
+                created_by_user_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let key = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        temps_network::pairing::record_key(db.as_ref(), pairing.id, &key)
+            .await
+            .unwrap();
+        let reserved: std::net::IpAddr = pairing.mesh_address.parse().unwrap();
+        let context = |node_api_peer: Option<std::net::IpAddr>| RegistrationContext {
+            pairing_token_id: Some(token.id),
+            control_plane_hosts: Vec::new(),
+            node_api_peer,
+        };
+
+        for peer in [None, Some("10.201.0.200".parse().unwrap())] {
+            let error = service
+                .register_with_context(register_at("edge-1", "10.100.0.9"), &context(peer))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    &error,
+                    NodeError::PairingSourceRefused { pairing_id, token_id, .. }
+                        if *pairing_id == pairing.id && *token_id == token.id
+                ),
+                "{peer:?}: {error:?}"
+            );
+        }
+        // Nothing was registered by the refused attempts.
+        assert!(service.get_by_name("edge-1").await.is_err());
+
+        let node = service
+            .register_with_context(
+                register_at("edge-1", "10.100.0.9"),
+                &context(Some(reserved)),
+            )
+            .await
+            .expect("the paired node registers from its reserved mesh address");
+        let linked = temps_network::pairing::get(db.as_ref(), pairing.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(linked.node_id, Some(node.id));
+        assert_eq!(linked.status, temps_network::pairing::STATUS_COMPLETED);
     }
 
     #[tokio::test]

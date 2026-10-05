@@ -60,8 +60,12 @@ export function SshEnrollNode({ mesh }: { mesh: WireguardMeshStatusResponse }) {
   const portNumber = Number.parseInt(port, 10) || 22
   const target = { host: host.trim(), port: portNumber }
 
+  // gcTime 0: a mutation nobody observes any more (after `reset()` or
+  // unmount) leaves the cache at once instead of keeping its variables, which
+  // for `create` are the credentials, for five minutes.
   const probe = useMutation({
     ...nodeSshHostKeyMutation(),
+    gcTime: 0,
     onSuccess: (data) => setHostKey(data),
     onError: (error, variables) => {
       handleSensitiveActionError(error, () => probe.mutate(variables))
@@ -76,9 +80,12 @@ export function SshEnrollNode({ mesh }: { mesh: WireguardMeshStatusResponse }) {
 
   const create = useMutation({
     ...nodeSshEnrollmentCreateMutation(),
+    gcTime: 0,
     onSuccess: async (data) => {
       clearSecrets()
-      setHostKey(null)
+      // The enrollment holds the credentials now: drop the mutations' copies
+      // of them (`create.variables`) and of the target.
+      resetHostKey()
       setEnrollmentId(data.id)
       await queryClient.invalidateQueries({
         queryKey: nodeSshEnrollmentListOptions().queryKey,
@@ -105,9 +112,11 @@ export function SshEnrollNode({ mesh }: { mesh: WireguardMeshStatusResponse }) {
     method === 'agent' ||
     (method === 'password' ? password !== '' : privateKey.trim() !== '')
 
-  const resetHostKey = () => {
+  // Also forgets the last enrollment request, credentials included.
+  function resetHostKey() {
     setHostKey(null)
     probe.reset()
+    create.reset()
   }
 
   return (

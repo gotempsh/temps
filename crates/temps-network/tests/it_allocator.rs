@@ -1458,3 +1458,124 @@ async fn pairings_refuse_taken_keys_and_link_atomically() {
         Some(mesh_key(5).as_str())
     );
 }
+
+/// Enabling the mesh refuses a pool that holds an address a node registered
+/// as its own: the cluster CA signed that node a leaf for it, valid for the
+/// control plane's mesh address or whichever member gets the address.
+#[tokio::test]
+async fn enabling_the_mesh_refuses_a_pool_holding_a_registered_node_address() {
+    use temps_network::mesh::{self, MeshError};
+
+    let Some(fx) = fixture().await else { return };
+    let db = fx.db.clone();
+    let squatter = insert_node(db.as_ref(), "squatter", None).await;
+    let mut active: nodes::ActiveModel = nodes::Entity::find_by_id(squatter)
+        .one(db.as_ref())
+        .await
+        .unwrap()
+        .unwrap()
+        .into();
+    active.private_address = Set("10.201.0.1".into());
+    active.update(db.as_ref()).await.unwrap();
+
+    let error = mesh::enable(&db, None, None, None).await.unwrap_err();
+    let MeshError::InvalidCidr { value, reason } = &error else {
+        panic!("expected InvalidCidr, got {error:?}");
+    };
+    assert_eq!(value, "10.201.0.0/16");
+    assert!(
+        reason.contains(&format!("node 'squatter' (id {squatter})")),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("the control plane's mesh address"),
+        "{reason}"
+    );
+    assert!(
+        mesh::load_settings(&db).await.unwrap().is_none(),
+        "a refused enable leaves the mesh off"
+    );
+
+    // Anywhere inside the pool, and through the agent URL too.
+    let mut active: nodes::ActiveModel = nodes::Entity::find_by_id(squatter)
+        .one(db.as_ref())
+        .await
+        .unwrap()
+        .unwrap()
+        .into();
+    active.private_address = Set("10.0.0.1".into());
+    active.address = Set("https://10.201.3.3:3100".into());
+    active.update(db.as_ref()).await.unwrap();
+    let error = mesh::enable(&db, None, None, None).await.unwrap_err();
+    assert!(
+        matches!(&error, MeshError::InvalidCidr { reason, .. } if reason.contains("inside this pool")),
+        "{error:?}"
+    );
+
+    // A pool clear of every node's addresses is fine.
+    let settings = mesh::enable(&db, Some("10.202.0.0/24"), None, None)
+        .await
+        .unwrap();
+    assert_eq!(settings.cidr.to_string(), "10.202.0.0/24");
+}
+
+/// A pending pairing holds an address of the current pool and its code
+/// carries the pool and port, so neither can change until it finishes.
+#[tokio::test]
+async fn the_pool_and_port_stay_put_while_a_pairing_is_pending() {
+    use temps_network::{
+        mesh::{self, MeshError},
+        pairing,
+    };
+
+    let Some(fx) = fixture().await else { return };
+    let db = fx.db.clone();
+    mesh::enable(&db, Some("10.205.0.0/24"), Some(51820), None)
+        .await
+        .unwrap();
+    let token = enrollment_token("pending-a")
+        .insert(db.as_ref())
+        .await
+        .unwrap()
+        .id;
+    let pending = pairing::create(
+        &db,
+        new_pairing(
+            "pending-a",
+            token,
+            "198.51.100.30:51820",
+            chrono::Duration::minutes(30),
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        mesh::enable(&db, Some("10.206.0.0/24"), None, None).await,
+        Err(MeshError::InUse {
+            setting: "pool",
+            assigned: 1,
+            ..
+        })
+    ));
+    assert!(matches!(
+        mesh::enable(&db, None, Some(51821), None).await,
+        Err(MeshError::InUse {
+            setting: "port",
+            assigned: 1,
+            ..
+        })
+    ));
+    // Unchanged settings are still fine.
+    mesh::enable(&db, Some("10.205.0.0/24"), Some(51820), None)
+        .await
+        .unwrap();
+
+    // Once the pairing is no longer pending, the pool can move.
+    assert!(pairing::cancel(&db, pending.id).await.unwrap());
+    let moved = mesh::enable(&db, Some("10.206.0.0/24"), Some(51821), None)
+        .await
+        .unwrap();
+    assert_eq!(moved.cidr.to_string(), "10.206.0.0/24");
+    assert_eq!(moved.port, 51821);
+}

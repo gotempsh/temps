@@ -197,6 +197,22 @@ struct ControlPlaneClient {
     trust: temps_agent::ControlPlaneTrust,
 }
 
+/// The relay receives the join token, so it is only contacted over HTTPS.
+/// No loopback exception: there is no local relay to develop against, and a
+/// token sent in clear text to the wrong port is still leaked.
+fn require_https_relay(relay_url: &str) -> anyhow::Result<()> {
+    let relay = url::Url::parse(relay_url)
+        .map_err(|error| anyhow::anyhow!("the relay URL '{relay_url}' is invalid: {error}"))?;
+    if relay.scheme() != "https" || relay.host_str().is_none_or(str::is_empty) {
+        anyhow::bail!(
+            "the relay URL '{relay_url}' must be https://<host>: the join token is sent to the \
+             relay and is not sent over plain HTTP. Pass --relay-url https://... (or set \
+             TEMPS_RELAY_URL)."
+        );
+    }
+    Ok(())
+}
+
 /// Decide, before anything is sent, whether the join token may go to the
 /// control-plane URL the relay returned.
 ///
@@ -285,10 +301,18 @@ async fn pinned_client_for(url: &url::Url, fingerprint: &str) -> anyhow::Result<
              man-in-the-middle)."
         )
     })?;
-    Ok(reqwest::Client::builder()
-        .tls_built_in_root_certs(false)
-        .add_root_certificate(reqwest::Certificate::from_der(&ca)?)
-        .build()?)
+    cluster_ca_client(&ca)
+}
+
+/// A client for the control plane that trusts only the cluster CA in
+/// `ca_der` and verifies the control plane by its reserved name
+/// (`temps_core::node_pki::CONTROL_PLANE_SERVER_NAME`), the same way the agent
+/// does after the join, rather than by the URL's host: the cluster CA also
+/// signs every worker's leaf for its own addresses.
+fn cluster_ca_client(ca_der: &[u8]) -> anyhow::Result<reqwest::Client> {
+    let trust = temps_agent::ControlPlaneCa::from_der(ca_der)
+        .map_err(|error| anyhow::anyhow!("the pinned cluster CA is unusable: {error}"))?;
+    Ok(temps_agent::with_control_plane_trust(reqwest::Client::builder(), Some(trust)).build()?)
 }
 
 /// The certificate chain a TLS server presents (DER), without trusting it.
@@ -513,15 +537,7 @@ fn write_node_certs(
     let cert_path = dir.join("node.cert.pem");
     let ca_path = dir.join("cluster-ca.pem");
 
-    std::fs::write(&key_path, key_pem)
-        .map_err(|e| anyhow::anyhow!("could not write node key '{}': {e}", key_path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).map_err(
-            |e| anyhow::anyhow!("could not restrict node key '{}': {e}", key_path.display()),
-        )?;
-    }
+    write_private_key(&key_path, key_pem)?;
     std::fs::write(&cert_path, cert_pem).map_err(|e| {
         anyhow::anyhow!(
             "could not write node certificate '{}': {e}",
@@ -531,6 +547,47 @@ fn write_node_certs(
     std::fs::write(&ca_path, ca_cert_pem)
         .map_err(|e| anyhow::anyhow!("could not write cluster CA '{}': {e}", ca_path.display()))?;
     Ok((cert_path, key_path, ca_path))
+}
+
+/// Write a private key readable by its owner only, from the moment the file
+/// exists: a fresh file created 0600 (not chmodded after the write, which
+/// leaves it readable under the process umask meanwhile) and renamed over
+/// the old key, so no descriptor opened on an older, looser file ever sees
+/// the new key.
+fn write_private_key(path: &std::path::Path, key_pem: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    let failed =
+        |e: std::io::Error| anyhow::anyhow!("could not write node key '{}': {e}", path.display());
+    let temporary = path.with_extension("pem.tmp");
+    // Left behind by an interrupted run.
+    match std::fs::remove_file(&temporary) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(failed(e)),
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let written = options.open(&temporary).and_then(|mut file| {
+        #[cfg(unix)]
+        {
+            // Exactly 0600 whatever the umask removed.
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(key_pem.as_bytes())?;
+        file.sync_all()
+    });
+    if let Err(e) = written.and_then(|()| std::fs::rename(&temporary, path)) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(failed(e));
+    }
+    Ok(())
 }
 
 /// Persist the signed leaf + cluster CA from the register response, returning
@@ -1009,10 +1066,9 @@ impl JoinCommand {
         );
         println!("Mesh is up. Reaching the control plane at {node_api} over it...");
         let ca_der = pinned_cluster_ca(node_api, &code.ca_fingerprint).await?;
-        let client = reqwest::Client::builder()
-            .tls_built_in_root_certs(false)
-            .add_root_certificate(reqwest::Certificate::from_der(&ca_der)?)
-            .build()?;
+        // Verified by the reserved control-plane name, not the mesh address:
+        // the cluster CA also signs workers' leaves for their addresses.
+        let client = cluster_ca_client(&ca_der)?;
         self.target = Some(format!("https://{node_api}"));
         self.token = Some(code.join_token.clone());
         self.ca_fingerprint = Some(code.ca_fingerprint.clone());
@@ -1042,6 +1098,8 @@ impl JoinCommand {
         platform: Option<&str>,
     ) -> anyhow::Result<()> {
         let relay_url = relay_url.trim_end_matches('/');
+        // The join token goes to the relay: refuse before anything is set up.
+        require_https_relay(relay_url)?;
         println!("Using relay mode via {}...", relay_url);
 
         // Step 1: Check if WireGuard is available
@@ -1059,8 +1117,9 @@ impl JoinCommand {
         let keypair = wg_manager.generate_keypair().await?;
         println!("Generated WireGuard keypair.");
 
-        // Step 3: Contact relay to join cluster
-        let client = reqwest::Client::new();
+        // Step 3: Contact relay to join cluster. HTTPS only, redirects
+        // included: the request carries the join token.
+        let client = reqwest::Client::builder().https_only(true).build()?;
 
         let join_url = format!("{}/api/relay/clusters/{}/join", relay_url, self.target());
 
@@ -1351,12 +1410,14 @@ async fn detect_public_endpoint(wg_port: u16) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::write_private_key;
     use super::{
         agent_listen_port, apply_saved_public_ingress_settings, find_pinned_ca,
         generate_public_ingress_key, pinned_client_for, pinned_cluster_ca,
         prior_token_for_reenrollment, public_ingress_listener_settings, read_code,
-        relay_registration_trust, saved_config_for_reenrollment, socket_authority,
-        RelayRegistrationTrust,
+        relay_registration_trust, require_https_relay, saved_config_for_reenrollment,
+        socket_authority, RelayRegistrationTrust,
     };
     use std::sync::Arc;
 
@@ -1459,6 +1520,14 @@ mod tests {
     }
 
     #[test]
+    fn the_pinned_cluster_ca_becomes_the_only_trust_for_the_control_plane() {
+        let pki = test_pki();
+        assert!(super::cluster_ca_client(&pki.ca_der).is_ok());
+        let error = super::cluster_ca_client(b"not a certificate").unwrap_err();
+        assert!(error.to_string().contains("pinned cluster CA"), "{error}");
+    }
+
+    #[test]
     fn an_empty_fingerprint_pins_nothing() {
         let pki = test_pki();
         assert_eq!(find_pinned_ca(vec![pki.ca_der.clone()], "  "), None);
@@ -1554,6 +1623,48 @@ mod tests {
             )
             .is_err());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_node_key_is_owner_only_from_creation_and_on_rewrite() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node.key.pem");
+        write_private_key(&path, "KEY-1").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "KEY-1");
+
+        // A key left world-readable by an older version is tightened, and
+        // the shorter new key leaves nothing of the old one behind.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_private_key(&path, "K2").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "K2");
+    }
+
+    #[test]
+    fn the_join_token_only_goes_to_an_https_relay() {
+        assert!(require_https_relay("https://relay.example.com").is_ok());
+        assert!(require_https_relay("https://relay.example.com:8443/base").is_ok());
+        for relay in [
+            "http://relay.example.com",
+            "http://127.0.0.1:8080",
+            "HTTP://relay.example.com",
+            "ws://relay.example.com",
+            "relay.example.com",
+            "not a url",
+            "",
+        ] {
+            let error = require_https_relay(relay).unwrap_err().to_string();
+            assert!(error.contains(&format!("'{relay}'")), "{relay}: {error}");
+        }
+        let error = require_https_relay("http://relay.example.com")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--relay-url https://"), "{error}");
     }
 
     #[test]

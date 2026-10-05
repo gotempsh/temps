@@ -379,8 +379,20 @@ async fn run(
             Ok(Some(payload)) => {
                 let on_mesh = payload.wireguard.is_some();
                 if let Some(wire) = &payload.wireguard {
-                    match reconcile_mesh(&client, &mesh_url, &config, wire, &mut mesh, offline)
-                        .await
+                    let compute_pool = payload
+                        .network
+                        .as_ref()
+                        .and_then(|network| Ipv4Net::from_str(&network.compute_pool_cidr).ok());
+                    match reconcile_mesh(
+                        &client,
+                        &mesh_url,
+                        &config,
+                        wire,
+                        compute_pool,
+                        &mut mesh,
+                        offline,
+                    )
+                    .await
                     {
                         Ok(MeshTick::Ready { rebuilt, report }) => {
                             if let Some(moved) =
@@ -636,6 +648,26 @@ struct MeshState {
     configured: Option<MeshInterface>,
     /// The interface MTU derived from this host's path MTU.
     mtu: Option<u32>,
+    /// The mesh pool last checked against this host's routes. A new pool
+    /// is checked again before it is applied.
+    preflighted: Option<Ipv4Net>,
+}
+
+/// The mesh pool from the control plane, held to the rules the control
+/// plane applies when an operator sets it (private IPv4 space, room for
+/// members, clear of the compute pool): the pool goes into this host's
+/// firewall lockdown and routes, so a corrupted, edited or hostile peer
+/// list must not widen them. `compute_pool` is `None` from a control plane
+/// too old to send it and before a paired node first reaches its control
+/// plane; the overlap check is then skipped.
+fn mesh_cidr(value: &str, compute_pool: Option<Ipv4Net>) -> Result<Ipv4Net, SyncError> {
+    // 0.0.0.0/32 is not private, so no valid mesh pool overlaps it: with it
+    // standing in for an unknown compute pool only the overlap check is
+    // skipped and every other rule is the control plane's own.
+    let compute_pool =
+        compute_pool.unwrap_or_else(|| Ipv4Net::from(std::net::Ipv4Addr::UNSPECIFIED));
+    temps_network::mesh::parse_mesh_cidr(value, compute_pool)
+        .map_err(|e| SyncError::WireParse(format!("wireguard.cidr: {e}")))
 }
 
 enum MeshTick {
@@ -665,6 +697,7 @@ async fn reconcile_mesh(
     registration_url: &str,
     config: &AgentConfig,
     wire: &WireMesh,
+    compute_pool: Option<Ipv4Net>,
     state: &mut MeshState,
     offline: bool,
 ) -> Result<MeshTick, SyncError> {
@@ -731,8 +764,7 @@ async fn reconcile_mesh(
         return Ok(MeshTick::Registered);
     };
 
-    let cidr = Ipv4Net::from_str(&wire.cidr)
-        .map_err(|e| SyncError::WireParse(format!("wireguard.cidr: {e}")))?;
+    let cidr = mesh_cidr(&wire.cidr, compute_pool)?;
     let address = std::net::Ipv4Addr::from_str(&me.address)
         .map_err(|e| SyncError::WireParse(format!("wireguard.self.address: {e}")))?;
     let desired = wire
@@ -769,13 +801,17 @@ async fn reconcile_mesh(
         listen_port: wire.listen_port,
         mtu,
     };
+    // On the first tick and whenever the control plane moves the pool: a
+    // pool that shadows one of this host's routes is refused before the
+    // interface takes it. Our own interface's routes are not conflicts.
+    if state.preflighted != Some(cidr) {
+        temps_network::mesh::preflight_routes(cidr)
+            .await
+            .map_err(|e| SyncError::Mesh(e.to_string()))?;
+        state.preflighted = Some(cidr);
+    }
     let mut rebuilt = false;
     if state.configured.as_ref() != Some(&interface) {
-        if state.configured.is_none() {
-            temps_network::mesh::preflight_routes(cidr)
-                .await
-                .map_err(|e| SyncError::Mesh(e.to_string()))?;
-        }
         let (apply_interface, apply_key) = (interface.clone(), key.clone());
         rebuilt = tokio::task::spawn_blocking(move || {
             temps_wireguard::mesh::ensure_interface(&apply_interface, &apply_key)
@@ -1163,7 +1199,9 @@ pub async fn bootstrap_mesh(
     let mut state = MeshState::default();
     // Offline: nothing is registered over HTTP; the snapshot names our key
     // and endpoint, so the interface comes up from it directly.
-    reconcile_mesh(&client, "", config, &wire, &mut state, true)
+    // The pairing carries no compute pool; the control plane's peer list
+    // brings it on the first sync.
+    reconcile_mesh(&client, "", config, &wire, None, &mut state, true)
         .await
         .map_err(MeshBootstrapError::Mesh)?;
     let snapshot = WirePeerListResponse {
@@ -2474,6 +2512,87 @@ mod tests {
         assert!(check_mesh_addresses(cidr, own, &[peer("10.201.0.4")]).is_err());
         assert!(
             check_mesh_addresses(cidr, own, &[peer("10.201.0.2"), peer("10.201.0.2")]).is_err()
+        );
+    }
+
+    #[test]
+    fn the_mesh_pool_is_held_to_the_control_planes_rules() {
+        let pool: Ipv4Net = "172.20.0.0/16".parse().unwrap();
+        assert_eq!(
+            mesh_cidr("10.201.0.0/24", Some(pool)).unwrap(),
+            "10.201.0.0/24".parse::<Ipv4Net>().unwrap()
+        );
+        assert!(mesh_cidr("10.201.0.0/24", None).is_ok());
+        for (value, why) in [
+            (
+                "8.8.8.0/24",
+                "public space would go into the lockdown and routes",
+            ),
+            ("0.0.0.0/0", "everything"),
+            ("10.0.0.0/7", "starts private but runs into 11/8"),
+            ("10.201.0.0/30", "no room for the members"),
+            ("not-a-cidr", "unparsable"),
+        ] {
+            let error = mesh_cidr(value, Some(pool)).unwrap_err();
+            assert!(
+                error.to_string().contains("wireguard.cidr"),
+                "{value}: {why}"
+            );
+            assert!(mesh_cidr(value, None).is_err(), "{value}: {why}");
+        }
+        assert!(
+            mesh_cidr("172.20.0.0/24", Some(pool)).is_err(),
+            "a pool inside the compute pool"
+        );
+        assert!(
+            mesh_cidr("172.16.0.0/12", Some(pool)).is_err(),
+            "a pool around the compute pool"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bad_mesh_pool_is_refused_before_the_host_is_touched() {
+        let key_dir = tempfile::tempdir().unwrap();
+        let key = MeshKey::load_or_create(key_dir.path()).unwrap();
+        let config = agent_config_joined_at("203.0.113.5");
+        let wire = WireMesh {
+            cidr: "198.51.100.0/24".into(),
+            listen_port: 51820,
+            self_entry: Some(WireMeshSelf {
+                public_key: key.public_key().to_string(),
+                endpoint: "203.0.113.5:51820".into(),
+                address: "198.51.100.4".into(),
+            }),
+            peers: Vec::new(),
+            hub: false,
+        };
+        let mut state = MeshState {
+            key: Some(key),
+            ..mesh_up_at("10.201.0.4")
+        };
+        let error = reconcile_mesh(
+            &reqwest::Client::new(),
+            "",
+            &config,
+            &wire,
+            None,
+            &mut state,
+            true,
+        )
+        .await
+        .err()
+        .expect("a public mesh pool is refused");
+        // Refused while parsing, before the lockdown, the preflight or the
+        // interface: none of them is attempted.
+        assert!(
+            matches!(&error, SyncError::WireParse(reason) if reason.contains("wireguard.cidr")),
+            "{error}"
+        );
+        assert_eq!(state.preflighted, None);
+        assert_eq!(
+            state.configured.as_ref().map(|interface| interface.address),
+            Some("10.201.0.4".parse().unwrap()),
+            "the interface already up is not reconfigured"
         );
     }
 

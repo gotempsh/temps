@@ -15,8 +15,10 @@
 //! and a malicious relay cannot substitute identities (the enrollment token
 //! carries the CA fingerprint, which the node verifies out of band).
 //!
-//! This module is transport-agnostic: it only produces/consumes PEM material.
-//! Wiring it into the agent's TLS listener, the control-plane client, and the
+//! This module mostly produces/consumes PEM material. The one piece of TLS
+//! wiring it owns is [`control_plane_client_config`]: every node verifies the
+//! control plane's node API by [`CONTROL_PLANE_SERVER_NAME`], so the rule
+//! lives in one place. Wiring the rest into the agent's TLS listener and the
 //! enrollment handshake happens in the respective crates.
 
 use rcgen::string::Ia5String;
@@ -25,7 +27,178 @@ use rcgen::{
     DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, SanType,
 };
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use thiserror::Error;
+
+/// The DNS name the control plane's node API certificate carries (ADR 048 D3),
+/// and the only name a node that trusts the cluster CA verifies the control
+/// plane by.
+///
+/// The cluster CA also signs every worker's leaf, for the name and addresses
+/// the worker registered. Verifying the control plane by the address it is
+/// reached at (its mesh address) would therefore accept any worker that ever
+/// got a leaf for that address: one that registered with it before the mesh
+/// existed, or whose row was later re-bound while the old leaf stayed valid
+/// (leaves are not revoked). This name can never be in a worker's leaf:
+///
+/// - it is longer than [`MAX_NODE_NAME_LEN`], so no registration, past or
+///   present, could have used it as a node name, and every address SAN is an
+///   IP literal;
+/// - registration also refuses it explicitly ([`is_reserved_control_plane_name`]);
+/// - it is under `.internal`, which never resolves publicly.
+///
+/// Changing it breaks every node that verifies by it until the control plane
+/// presents the new name: treat it as part of the wire protocol.
+pub const CONTROL_PLANE_SERVER_NAME: &str =
+    "temps-control-plane.node-api.reserved-identity.cluster-ca.temps.internal";
+
+/// Longest node name registration accepts (one DNS label). Node names become
+/// DNS SANs on the node's leaf, so [`CONTROL_PLANE_SERVER_NAME`] is kept
+/// longer than this.
+pub const MAX_NODE_NAME_LEN: usize = 63;
+
+/// Whether `value` names the control plane's reserved TLS identity, compared
+/// the way TLS compares DNS names: ASCII case-insensitively, ignoring a
+/// trailing root dot.
+pub fn is_reserved_control_plane_name(value: &str) -> bool {
+    let value = value.trim();
+    let value = value.strip_suffix('.').unwrap_or(value);
+    value.eq_ignore_ascii_case(CONTROL_PLANE_SERVER_NAME)
+}
+
+/// The Subject Alternative Names of the control plane's node API certificate
+/// when it is reached at `address`: [`CONTROL_PLANE_SERVER_NAME`], which nodes
+/// verify, and the address itself, which nodes enrolled before the reserved
+/// name existed still verify until they are upgraded.
+pub fn control_plane_node_api_sans(address: std::net::IpAddr) -> Vec<String> {
+    vec![CONTROL_PLANE_SERVER_NAME.to_string(), address.to_string()]
+}
+
+/// A TLS client configuration for calls to the control plane from a node that
+/// trusts the cluster CA: the certificates in `ca_pem` are the only roots, and
+/// the server must present a certificate for [`CONTROL_PLANE_SERVER_NAME`],
+/// whatever address or host the request URL names. See the constant for why
+/// the URL's host is not what is verified.
+pub fn control_plane_client_config(ca_pem: &[u8]) -> Result<rustls::ClientConfig, PkiError> {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::CertificateDer;
+
+    let certificates = CertificateDer::pem_slice_iter(ca_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| PkiError::PemParse {
+            context: "cluster CA for the control-plane client".into(),
+            reason: e.to_string(),
+        })?;
+    client_config_for_roots(certificates)
+}
+
+/// [`control_plane_client_config`] for a cluster CA certificate in DER (as
+/// found in the chain a pinned control plane presented at enrollment).
+pub fn control_plane_client_config_from_der(
+    ca_der: &[u8],
+) -> Result<rustls::ClientConfig, PkiError> {
+    client_config_for_roots(vec![rustls::pki_types::CertificateDer::from(
+        ca_der.to_vec(),
+    )])
+}
+
+fn client_config_for_roots(
+    certificates: Vec<rustls::pki_types::CertificateDer<'static>>,
+) -> Result<rustls::ClientConfig, PkiError> {
+    let mut roots = rustls::RootCertStore::empty();
+    for certificate in certificates {
+        roots.add(certificate).map_err(|e| PkiError::TlsConfig {
+            reason: format!("the cluster CA is not a usable trust root: {e}"),
+        })?;
+    }
+    if roots.is_empty() {
+        return Err(PkiError::PemParse {
+            context: "cluster CA for the control-plane client".into(),
+            reason: "no certificate found".into(),
+        });
+    }
+    // Named rather than taken from the process default, which only some
+    // binaries install and which rustls cannot infer with two providers
+    // compiled in.
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let inner = rustls::client::WebPkiServerVerifier::builder_with_provider(
+        Arc::new(roots),
+        provider.clone(),
+    )
+    .build()
+    .map_err(|e| PkiError::TlsConfig {
+        reason: format!("cannot build the certificate verifier: {e}"),
+    })?;
+    let server_name =
+        rustls::pki_types::ServerName::try_from(CONTROL_PLANE_SERVER_NAME).map_err(|e| {
+            PkiError::TlsConfig {
+                reason: format!("'{CONTROL_PLANE_SERVER_NAME}' is not a valid TLS name: {e}"),
+            }
+        })?;
+    let verifier = ReservedNameVerifier { inner, server_name };
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| PkiError::TlsConfig {
+            reason: format!("no usable TLS protocol versions: {e}"),
+        })?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_no_client_auth();
+    // What reqwest offers when it builds its own rustls config.
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(config)
+}
+
+/// Full WebPKI verification against the cluster CA, for
+/// [`CONTROL_PLANE_SERVER_NAME`] instead of the name the connection was opened
+/// for. Only the name is replaced: chain, validity, key usage and handshake
+/// signatures are checked by the standard verifier.
+#[derive(Debug)]
+struct ReservedNameVerifier {
+    inner: Arc<rustls::client::WebPkiServerVerifier>,
+    server_name: rustls::pki_types::ServerName<'static>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for ReservedNameVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            &self.server_name,
+            ocsp_response,
+            now,
+        )
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
 
 /// Classify a SAN string as an IP address or DNS name (rcgen needs typed SANs).
 fn san_from_str(s: &str) -> Result<SanType, PkiError> {
@@ -52,6 +225,9 @@ pub enum PkiError {
 
     #[error("Failed to sign node CSR: {reason}")]
     CsrSign { reason: String },
+
+    #[error("Failed to build the TLS client configuration for the control plane: {reason}")]
+    TlsConfig { reason: String },
 }
 
 /// A freshly minted per-cluster certificate authority. PEM-encoded.
@@ -294,6 +470,135 @@ mod tests {
         let ca = generate_cluster_ca().unwrap();
         let err = sign_node_csr(&ca.cert_pem, &ca.key_pem, "not a csr", &[]).unwrap_err();
         assert!(matches!(err, PkiError::PemParse { .. }));
+    }
+
+    #[test]
+    fn the_reserved_control_plane_name_can_never_be_a_node_name() {
+        // Longer than any node name registration has ever accepted, so no
+        // worker leaf can carry it as a DNS SAN.
+        assert!(CONTROL_PLANE_SERVER_NAME.len() > MAX_NODE_NAME_LEN);
+        // Still a valid DNS name (every label <= 63), or rustls would refuse
+        // to verify against it.
+        assert!(CONTROL_PLANE_SERVER_NAME
+            .split('.')
+            .all(|label| !label.is_empty() && label.len() <= 63));
+        assert!(rustls::pki_types::ServerName::try_from(CONTROL_PLANE_SERVER_NAME).is_ok());
+
+        assert!(is_reserved_control_plane_name(CONTROL_PLANE_SERVER_NAME));
+        assert!(is_reserved_control_plane_name(
+            &CONTROL_PLANE_SERVER_NAME.to_uppercase()
+        ));
+        assert!(is_reserved_control_plane_name(&format!(
+            " {CONTROL_PLANE_SERVER_NAME}. "
+        )));
+        assert!(!is_reserved_control_plane_name("temps-control-plane"));
+        assert!(!is_reserved_control_plane_name("worker-1"));
+        assert!(!is_reserved_control_plane_name(""));
+    }
+
+    /// A leaf from `ca` for `sans`, with its private key.
+    fn leaf(ca: &ClusterCa, sans: &[String]) -> (String, String) {
+        let csr = generate_node_keypair_csr("leaf", sans).unwrap();
+        let signed = sign_node_csr(&ca.cert_pem, &ca.key_pem, &csr.csr_pem, sans).unwrap();
+        (signed.cert_pem, csr.key_pem)
+    }
+
+    /// Run a TLS handshake in memory: a server presenting `cert_pem` (then the
+    /// CA) with `key_pem`, and a client using `client` that connects to
+    /// `address`, as the agent does when it calls `https://<mesh address>`.
+    fn handshake(
+        client: rustls::ClientConfig,
+        ca: &ClusterCa,
+        cert_pem: &str,
+        key_pem: &str,
+        address: std::net::IpAddr,
+    ) -> Result<(), rustls::Error> {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+
+        let chain: Vec<CertificateDer<'static>> = [cert_pem, ca.cert_pem.as_str()]
+            .iter()
+            .flat_map(|pem| CertificateDer::pem_slice_iter(pem.as_bytes()))
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).unwrap();
+        let server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(chain, key)
+        .unwrap();
+        let mut server = rustls::ServerConnection::new(Arc::new(server_config)).unwrap();
+        let mut client =
+            rustls::ClientConnection::new(Arc::new(client), ServerName::IpAddress(address.into()))
+                .unwrap();
+        for _ in 0..16 {
+            let mut buffer = Vec::new();
+            client.write_tls(&mut buffer).unwrap();
+            server.read_tls(&mut buffer.as_slice()).unwrap();
+            server.process_new_packets()?;
+            let mut buffer = Vec::new();
+            server.write_tls(&mut buffer).unwrap();
+            client.read_tls(&mut buffer.as_slice()).unwrap();
+            client.process_new_packets()?;
+            if !client.is_handshaking() && !server.is_handshaking() {
+                return Ok(());
+            }
+        }
+        panic!("handshake did not finish");
+    }
+
+    #[test]
+    fn nodes_verify_the_control_plane_by_its_reserved_name_not_its_address() {
+        let ca = generate_cluster_ca().unwrap();
+        let mesh_address: std::net::IpAddr = "10.201.0.1".parse().unwrap();
+        let client = || control_plane_client_config(ca.cert_pem.as_bytes()).unwrap();
+
+        // The control plane's node API leaf carries the reserved name (and
+        // the address, for nodes enrolled before the name existed).
+        let (cert, key) = leaf(&ca, &control_plane_node_api_sans(mesh_address));
+        handshake(client(), &ca, &cert, &key, mesh_address)
+            .expect("the control plane's leaf verifies");
+
+        // A worker leaf the same CA signed for the control plane's mesh
+        // address -- a worker that registered with it before the mesh existed
+        // -- is refused: the address is not what is verified.
+        let (cert, key) = leaf(&ca, &["10.201.0.1".to_string(), "worker-7".to_string()]);
+        let error = handshake(client(), &ca, &cert, &key, mesh_address).unwrap_err();
+        assert!(
+            matches!(error, rustls::Error::InvalidCertificate(_)),
+            "{error:?}"
+        );
+
+        // The reserved name signed by another cluster's CA is refused too.
+        let other = generate_cluster_ca().unwrap();
+        let (cert, key) = leaf(&other, &control_plane_node_api_sans(mesh_address));
+        let error = handshake(client(), &other, &cert, &key, mesh_address).unwrap_err();
+        assert!(
+            matches!(error, rustls::Error::InvalidCertificate(_)),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn the_control_plane_client_config_needs_a_certificate() {
+        assert!(matches!(
+            control_plane_client_config(b"not a certificate"),
+            Err(PkiError::PemParse { .. })
+        ));
+        assert!(matches!(
+            control_plane_client_config(b""),
+            Err(PkiError::PemParse { .. })
+        ));
+        assert!(matches!(
+            control_plane_client_config_from_der(b"not DER"),
+            Err(PkiError::TlsConfig { .. })
+        ));
+        let ca = generate_cluster_ca().unwrap();
+        let der = pem_to_der(&ca.cert_pem, "CA").unwrap();
+        assert!(control_plane_client_config_from_der(&der).is_ok());
     }
 
     #[test]

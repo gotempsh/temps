@@ -1000,6 +1000,15 @@ fn extract_bearer_token(headers: &HeaderMap) -> Result<String, Problem> {
     Ok(token.to_string())
 }
 
+/// Request extension set by the control plane's mesh node-API listener
+/// (ADR 048 D3, `temps serve`'s `node_api` module) on every request it
+/// serves: the TCP peer the connection came from. It is inserted by the
+/// listener from the accepted socket, never derived from anything the client
+/// sends (headers, body), so its presence proves the request arrived over the
+/// mesh listener. The public listeners never set it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeApiPeer(pub std::net::SocketAddr);
+
 /// Register a new worker node or reconnect an existing one
 #[utoipa::path(
     tag = "Nodes",
@@ -1019,12 +1028,14 @@ async fn register_node(
     // peer address is always present in production; unit tests inject it via a
     // `MockConnectInfo` layer.
     connect_info: ConnectInfo<std::net::SocketAddr>,
+    node_api_peer: Option<axum::Extension<NodeApiPeer>>,
     request: Json<RegisterNodeApiRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     // Every rejection below returns early, so the outcome is reported once
     // here rather than at each exit.
     let telemetry = app_state.telemetry.clone();
-    let result = register_node_inner(State(app_state), connect_info, request).await;
+    let node_api_peer = node_api_peer.map(|axum::Extension(NodeApiPeer(peer))| peer);
+    let result = register_node_inner(State(app_state), connect_info, node_api_peer, request).await;
     if let Err(problem) = &result {
         let title = problem.body.get("title").and_then(|t| t.as_str());
         if let Some(code) = node_join_failure_code(problem.status_code, title) {
@@ -1125,6 +1136,7 @@ fn pairing_problem(error: &temps_network::mesh::MeshError) -> Problem {
 async fn register_node_inner(
     State(app_state): State<Arc<NodeAppState>>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    node_api_peer: Option<std::net::SocketAddr>,
     Json(request): Json<RegisterNodeApiRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     // Rate-limit enrollment (ADR-020 WS-1.3 / enroll-3) before doing any work:
@@ -1409,6 +1421,7 @@ async fn register_node_inner(
             .map(node_address_host)
             .into_iter()
             .collect(),
+        node_api_peer: node_api_peer.map(|peer| peer.ip()),
     };
     let node = match app_state
         .node_service
@@ -1417,7 +1430,15 @@ async fn register_node_inner(
     {
         Ok(node) => node,
         Err(error) => {
-            if let (NodeError::Pairing { token_id, .. }, Some(_)) = (&error, enrollment_token_id) {
+            // A refused pairing gets its token's use back, so the real node
+            // can still register; in particular a leaked pairing token tried
+            // from elsewhere must not burn the single use.
+            if let (
+                NodeError::Pairing { token_id, .. }
+                | NodeError::PairingSourceRefused { token_id, .. },
+                Some(_),
+            ) = (&error, enrollment_token_id)
+            {
                 release_token_use(&app_state, *token_id).await;
             }
             return Err(Problem::from(error));
@@ -3466,6 +3487,12 @@ impl From<NodeError> for Problem {
             NodeError::ControlPlaneIdentity { .. } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Control Plane Identity")
                 .with_detail(error.to_string()),
+            NodeError::MeshIdentityReserved { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Mesh Address Reserved")
+                .with_detail(error.to_string()),
+            NodeError::PairingSourceRefused { .. } => problemdetails::new(StatusCode::FORBIDDEN)
+                .with_title("Pairing Token Outside The Mesh")
+                .with_detail(error.to_string()),
             NodeError::Pairing { ref source, .. } => pairing_problem(source),
             NodeError::MeshSettings { ref source, .. } => {
                 error!("Failed to read mesh settings in node operation: {}", source);
@@ -3739,6 +3766,31 @@ mod tests {
         settings: temps_core::AppSettings,
     ) -> axum::Router {
         let db = Arc::new(db);
+        let config_service = config_service_with(settings);
+        let encryption_service = Arc::new(
+            temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap(),
+        );
+        // The enrollment-token service gets its OWN mock DB that returns no
+        // matching token (-> InvalidToken), so the register tests exercise the
+        // legacy-shared-token fallback path while the main `db` keeps its own
+        // node-flow query sequence intact.
+        let test_db_for_enrollment = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results(vec![
+                    Vec::<temps_entities::node_enrollment_tokens::Model>::new(),
+                ])
+                .into_connection(),
+        );
+        make_app_with_enrollment(
+            db,
+            config_service,
+            encryption_service,
+            test_db_for_enrollment,
+        )
+    }
+
+    /// A `ConfigService` whose settings are `settings`.
+    fn config_service_with(settings: temps_core::AppSettings) -> Arc<temps_config::ConfigService> {
         // Create a separate mock DB for ConfigService that returns settings
         let settings_json = settings.to_json();
         let config_db = MockDatabase::new(DatabaseBackend::Postgres)
@@ -3774,25 +3826,21 @@ mod tests {
             clickhouse_password: None,
             docker_extra_networks: Vec::new(),
         });
-        let config_service = Arc::new(temps_config::ConfigService::new(
+        Arc::new(temps_config::ConfigService::new(
             server_config,
             Arc::new(config_db),
-        ));
+        ))
+    }
+
+    /// [`make_app_with_settings`] with the enrollment-token service on
+    /// `enrollment_db`, for tests that register with an enrollment token.
+    fn make_app_with_enrollment(
+        db: Arc<sea_orm::DatabaseConnection>,
+        config_service: Arc<temps_config::ConfigService>,
+        encryption_service: Arc<temps_core::EncryptionService>,
+        test_db_for_enrollment: Arc<sea_orm::DatabaseConnection>,
+    ) -> axum::Router {
         let node_service = Arc::new(NodeService::new(db.clone()));
-        let encryption_service = Arc::new(
-            temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap(),
-        );
-        // The enrollment-token service gets its OWN mock DB that returns no
-        // matching token (-> InvalidToken), so the register tests exercise the
-        // legacy-shared-token fallback path while the main `db` keeps its own
-        // node-flow query sequence intact.
-        let test_db_for_enrollment = Arc::new(
-            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
-                .append_query_results(vec![
-                    Vec::<temps_entities::node_enrollment_tokens::Model>::new(),
-                ])
-                .into_connection(),
-        );
         let app_state = Arc::new(NodeAppState {
             node_service,
             db,
@@ -4113,13 +4161,182 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_register_node_success() {
-        let node = sample_node();
+    async fn test_register_node_rejects_an_address_in_the_mesh_pool_while_the_mesh_is_off() {
+        // The pool is reserved before the mesh exists: a leaf signed now for
+        // 10.201.x.x would still be valid once those addresses are assigned.
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            // Control-plane identity guard: the mesh is off
             .append_query_results(vec![vec![
                 crate::handlers::wireguard_mesh::admin_test_support::network_config(false, false),
             ]])
+            .into_connection();
+        let app = make_app_with_settings(db, settings_with_join_token());
+
+        let response = post_register(app, &register_body("worker-9", "10.201.7.7")).await;
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(problem["title"], "Mesh Address Reserved");
+        let detail = problem["detail"].as_str().unwrap();
+        assert!(detail.contains("'10.201.7.7'"), "{detail}");
+        assert!(detail.contains("10.201.0.0/16"), "{detail}");
+    }
+
+    /// An enrollment token row for a pairing of the node `name`.
+    fn pairing_token(id: i32, name: &str) -> temps_entities::node_enrollment_tokens::Model {
+        let now = chrono::Utc::now();
+        temps_entities::node_enrollment_tokens::Model {
+            id,
+            token_hash: sha256_hash("pairing-join-token"),
+            max_uses: 1,
+            used_count: 0,
+            expires_at: now + chrono::Duration::minutes(30),
+            bound_node_name: Some(name.to_string()),
+            bound_labels: None,
+            created_by_user_id: None,
+            revoked_at: None,
+            ca_fingerprint: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// A registration of `edge-1` redeeming a pairing's enrollment token,
+    /// arriving with `node_api_peer` (as the mesh listener sets it) or
+    /// without it (any other listener). Returns the response and the SQL the
+    /// enrollment-token service ran.
+    async fn register_with_pairing_token(
+        node_api_peer: Option<std::net::SocketAddr>,
+    ) -> (axum::response::Response, Vec<String>) {
+        let token_id = 41;
+        let now = chrono::Utc::now();
+        let pairing = temps_entities::node_pairings::Model {
+            id: 5,
+            pairing_id: "pairing-id".into(),
+            name: "edge-1".into(),
+            node_endpoint: "10.100.0.2:51820".into(),
+            mesh_address: "10.201.0.7".into(),
+            secret_encrypted: "secret".into(),
+            enrollment_token_id: token_id,
+            public_key: Some("a2V5LWZvci10aGUtcGFpcmVkLW5vZGUtMzItYnl0ZXM=".into()),
+            status: "key_received".into(),
+            last_error: None,
+            last_rejection: None,
+            last_attempt_at: None,
+            key_received_at: Some(now),
+            expires_at: now + chrono::Duration::minutes(30),
+            node_id: None,
+            created_by_user_id: None,
+            dialing_until: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // Identity guards: the mesh is on, the addresses are outside its
+            // pool, no member or pairing holds them.
+            .append_query_results(vec![vec![
+                crate::handlers::wireguard_mesh::admin_test_support::network_config(true, true),
+            ]])
+            .append_query_results(vec![Vec::<nodes::Model>::new()])
+            .append_query_results(vec![Vec::<temps_entities::node_pairings::Model>::new()])
+            // The pairing the token was minted for.
+            .append_query_results(vec![vec![pairing]])
+            .into_connection();
+        let enrollment_db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![pairing_token(token_id, "edge-1")]])
+                .append_exec_results(vec![sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .append_query_results(vec![vec![pairing_token(token_id, "edge-1")]])
+                // The use given back.
+                .append_exec_results(vec![sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let encryption_service = Arc::new(
+            temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap(),
+        );
+        let mut app = make_app_with_enrollment(
+            Arc::new(db),
+            config_service_with(settings_with_join_token()),
+            encryption_service,
+            enrollment_db.clone(),
+        );
+        if let Some(peer) = node_api_peer {
+            app = app.layer(axum::Extension(NodeApiPeer(peer)));
+        }
+        let mut body = register_body("edge-1", "10.100.0.2");
+        body["join_token"] = serde_json::json!("pairing-join-token");
+        let response = post_register(app, &body).await;
+        let log = Arc::try_unwrap(enrollment_db)
+            .map(|db| {
+                db.into_transaction_log()
+                    .into_iter()
+                    .map(|transaction| format!("{transaction:?}"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        (response, log)
+    }
+
+    async fn problem_of(response: axum::response::Response) -> serde_json::Value {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_a_pairing_token_is_refused_on_the_public_api() {
+        // ADR 048: a leaked pairing code only pairs from the pairing's
+        // address. Its token reaching the public register endpoint, from
+        // anywhere, is refused -- and gets its single use back, so the real
+        // node can still pair.
+        let (response, log) = register_with_pairing_token(None).await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let problem = problem_of(response).await;
+        assert_eq!(problem["title"], "Pairing Token Outside The Mesh");
+        let detail = problem["detail"].as_str().unwrap();
+        assert!(detail.contains("pairing 'edge-1' (id 5)"), "{detail}");
+        assert!(detail.contains("outside the mesh node API"), "{detail}");
+        assert!(detail.contains("10.201.0.7"), "{detail}");
+        assert!(
+            log.iter()
+                .any(|sql| sql.contains("used_count = used_count - 1")),
+            "the token's use must be given back: {log:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_pairing_token_is_refused_from_another_mesh_member() {
+        let peer: std::net::SocketAddr = "10.201.0.9:40100".parse().unwrap();
+        let (response, _) = register_with_pairing_token(Some(peer)).await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let problem = problem_of(response).await;
+        let detail = problem["detail"].as_str().unwrap();
+        assert!(detail.contains("from mesh address 10.201.0.9"), "{detail}");
+        assert!(detail.contains("(10.201.0.7)"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn test_register_node_success() {
+        let node = sample_node();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // Control-plane identity guard: the mesh is off, the addresses
+            // are outside its pool, and no member or pairing holds them
+            .append_query_results(vec![vec![
+                crate::handlers::wireguard_mesh::admin_test_support::network_config(false, false),
+            ]])
+            .append_query_results(vec![Vec::<nodes::Model>::new()])
+            .append_query_results(vec![Vec::<temps_entities::node_pairings::Model>::new()])
             // Check for duplicate name (returns empty)
             .append_query_results(vec![Vec::<nodes::Model>::new()])
             // Identity guard: name/address not claimed by another node
@@ -4359,10 +4576,13 @@ mod tests {
     async fn test_register_node_with_valid_join_token_succeeds() {
         let node = sample_node();
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            // control-plane identity guard: the mesh is off
+            // Control-plane identity guard: the mesh is off, the addresses
+            // are outside its pool, and no member or pairing holds them
             .append_query_results(vec![vec![
                 crate::handlers::wireguard_mesh::admin_test_support::network_config(false, false),
             ]])
+            .append_query_results(vec![Vec::<nodes::Model>::new()])
+            .append_query_results(vec![Vec::<temps_entities::node_pairings::Model>::new()])
             .append_query_results(vec![Vec::<nodes::Model>::new()]) // duplicate name
             .append_query_results(vec![Vec::<nodes::Model>::new()]) // identity guard
             .append_query_results(vec![vec![node.clone()]])

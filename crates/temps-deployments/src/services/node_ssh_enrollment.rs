@@ -468,7 +468,16 @@ impl NodeSshEnrollmentService {
     ) -> Result<(AgentMode, i32), EnrollmentFailure> {
         let db = self.db.as_ref();
         let started = chrono::Utc::now();
-        let mode = match node_ssh::enroll(request, progress).await {
+        // Bounded as a whole: each step has its own bound, but a hostile
+        // server could string slow steps together while the heartbeat keeps
+        // the row fresh, holding a running slot and the credentials.
+        let enrolled = node_ssh::within(
+            node_ssh::ENROLLMENT_TIMEOUT,
+            "Adding the server",
+            node_ssh::enroll(request, progress),
+        )
+        .await;
+        let mode = match enrolled {
             Ok(mode) => mode,
             Err(error) => {
                 let pairing_report = node_pairings::Entity::find_by_id(pairing_id)
@@ -513,6 +522,69 @@ impl NodeSshEnrollmentService {
             tokio::time::sleep(Duration::from_secs(3)).await;
         }
     }
+}
+
+/// A network Temps itself addresses: never a server to log in to over SSH.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReservedNetwork {
+    /// What it is, for the operator: e.g. "the WireGuard mesh pool".
+    pub name: &'static str,
+    pub cidr: ipnet::Ipv4Net,
+}
+
+impl ReservedNetwork {
+    /// The reserved network `ip` is in, if any.
+    pub fn containing(networks: &[Self], ip: std::net::IpAddr) -> Option<Self> {
+        let std::net::IpAddr::V4(ip) = ip.to_canonical() else {
+            return None;
+        };
+        networks
+            .iter()
+            .find(|network| network.cidr.contains(&ip))
+            .copied()
+    }
+}
+
+/// The networks this installation configured for its own addresses: the
+/// container compute pool, the control plane's slice of it, and (while the
+/// mesh is on) the WireGuard mesh pool. Reading a host key or enrolling a
+/// server inside them would point the control plane's SSH client at its own
+/// workloads or tunnel, never at a server to add. A pool stored in a form
+/// that does not parse is skipped (and logged): the mesh and overlay code
+/// refuse it themselves.
+pub async fn reserved_networks(
+    db: &DatabaseConnection,
+) -> Result<Vec<ReservedNetwork>, NodeSshEnrollmentError> {
+    let Some(config) = temps_entities::network_config::Entity::find_by_id(1)
+        .one(db)
+        .await
+        .map_err(database("load the network configuration"))?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut configured = vec![
+        ("the container compute pool", Some(config.compute_pool_cidr)),
+        (
+            "the control plane's container network",
+            config.control_plane_compute_cidr,
+        ),
+    ];
+    if config.wireguard_enabled {
+        configured.push(("the WireGuard mesh pool", Some(config.wireguard_cidr)));
+    }
+    Ok(configured
+        .into_iter()
+        .filter_map(|(name, cidr)| {
+            let cidr = cidr?;
+            match cidr.trim().parse::<ipnet::Ipv4Net>() {
+                Ok(cidr) => Some(ReservedNetwork { name, cidr }),
+                Err(error) => {
+                    warn!(network = name, cidr = %cidr, %error, "a configured network does not parse; not refusing SSH targets in it");
+                    None
+                }
+            }
+        })
+        .collect())
 }
 
 /// Enrollments a process that is gone was running cannot finish: their SSH
@@ -1099,6 +1171,125 @@ mod tests {
     fn a_row_is_stale_only_after_the_longest_step() {
         assert!(STALE_AFTER > node_ssh::LONGEST_STEP);
         assert!(STALE_AFTER > HEARTBEAT_EVERY * 4);
+    }
+
+    #[test]
+    fn a_timed_out_enrollment_explains_itself() {
+        let failure = EnrollmentFailure::Ssh {
+            error: SshError::TimedOut {
+                what: "Adding the server".into(),
+                secs: node_ssh::ENROLLMENT_TIMEOUT.as_secs(),
+            },
+            pairing_report: None,
+        };
+        assert!(failure
+            .to_string()
+            .starts_with("Adding the server took longer than 2700s"));
+    }
+
+    fn network_config(
+        wireguard_enabled: bool,
+        compute_pool: &str,
+        control_plane: Option<&str>,
+    ) -> temps_entities::network_config::Model {
+        temps_entities::network_config::Model {
+            id: 1,
+            compute_pool_cidr: compute_pool.into(),
+            subnet_prefix_len: 24,
+            transport: "vxlan".into(),
+            vxlan_vni: 42,
+            vxlan_port: 4789,
+            underlay_mtu: 1500,
+            control_plane_compute_cidr: control_plane.map(str::to_string),
+            control_plane_underlay_address: None,
+            control_plane_overlay_ready: false,
+            control_plane_setup_generation: 0,
+            wireguard_enabled,
+            wireguard_cidr: "10.201.0.0/16".into(),
+            wireguard_port: 51820,
+            control_plane_wg_public_key: None,
+            control_plane_wg_endpoint: None,
+            node_api_port: None,
+            mesh_hub_node_id: None,
+            mesh_hub_control_plane: false,
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    async fn networks_of(
+        config: Vec<temps_entities::network_config::Model>,
+    ) -> Vec<ReservedNetwork> {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([config])
+            .into_connection();
+        reserved_networks(&db).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_compute_pool_and_an_enabled_mesh_pool_are_reserved() {
+        let networks = networks_of(vec![network_config(
+            true,
+            "172.20.0.0/16",
+            Some("172.20.255.0/24"),
+        )])
+        .await;
+        let cidrs: Vec<String> = networks.iter().map(|n| n.cidr.to_string()).collect();
+        assert_eq!(cidrs, ["172.20.0.0/16", "172.20.255.0/24", "10.201.0.0/16"]);
+        let ip = |text: &str| text.parse::<std::net::IpAddr>().unwrap();
+        assert_eq!(
+            ReservedNetwork::containing(&networks, ip("10.201.0.5")).map(|n| n.name),
+            Some("the WireGuard mesh pool")
+        );
+        assert_eq!(
+            ReservedNetwork::containing(&networks, ip("::ffff:172.20.3.4")).map(|n| n.name),
+            Some("the container compute pool")
+        );
+        // Ordinary private and public addresses stay usable: workers live
+        // on LANs and VPCs.
+        for usable in [
+            "10.0.0.5",
+            "192.168.1.20",
+            "172.16.0.9",
+            "198.51.100.7",
+            "2001:db8::1",
+        ] {
+            assert_eq!(
+                ReservedNetwork::containing(&networks, ip(usable)),
+                None,
+                "{usable}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_mesh_pool_that_is_off_is_not_reserved() {
+        let networks = networks_of(vec![network_config(false, "172.20.0.0/16", None)]).await;
+        assert_eq!(networks.len(), 1);
+        assert_eq!(networks[0].name, "the container compute pool");
+    }
+
+    #[tokio::test]
+    async fn unparseable_or_missing_configuration_reserves_nothing_from_it() {
+        let networks = networks_of(vec![network_config(true, "not-a-cidr", None)]).await;
+        assert_eq!(
+            networks.iter().map(|n| n.name).collect::<Vec<_>>(),
+            ["the WireGuard mesh pool"]
+        );
+        assert!(networks_of(Vec::new()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reading_the_network_configuration_failing_is_an_error() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([DbErr::Custom("connection lost".into())])
+            .into_connection();
+        let error = reserved_networks(&db).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("could not load the network configuration"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

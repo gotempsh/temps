@@ -177,11 +177,11 @@ bunx @temps-sdk/cli nodes pair create --address <worker-public-ip> --name worker
 It prints one command. Run it on the worker as root, then start the agent:
 
 ```bash
-temps join --pair tpair1.…
+ printf '%s\n' 'tpair1.…' | temps join --pair -
 temps agent service install
 ```
 
-`temps join --pair -` reads the code from stdin instead, which keeps it out of the process list and shell history.
+The command pipes the code to `temps join --pair -`, which reads it from stdin, so the code never appears in the process list; the leading space keeps the line out of the shell history in shells that honour it (bash with `HISTCONTROL=ignoreboth`, the Debian and Ubuntu default; zsh with `HIST_IGNORE_SPACE`). Not in a root shell? Put `sudo` right before `temps join`, after the `|`.
 
 The worker waits on UDP `51820` until the control plane reaches it (the command expires after 30 minutes). The two exchange WireGuard **public** keys over a message authenticated with a one-time secret in the command; no private key leaves either machine. The worker then registers over the mesh, trusting only the cluster CA whose fingerprint the command carries. Pairings in progress, with why a worker has not been reached yet, show on the same page and with `bunx @temps-sdk/cli nodes pair`.
 
@@ -194,7 +194,7 @@ bunx @temps-sdk/cli nodes ssh add --host 203.0.113.10 --user root
 ```
 
 1. The control plane connects and shows the server's SSH host key. Compare it with the server's own before continuing, from its console or a session you trust: `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`. The CLI asks you to confirm it; pass `--host-key SHA256:…` for automation. If the server presents another key during the setup, the setup stops.
-2. It logs in with a password, a private key (`--identity-file`, `--ask-passphrase`) or the SSH agent of the `temps serve` process (`--agent`). A user other than root needs sudo. If sudo asks for a password, log in with that user's password and it is used for sudo too.
+2. It logs in with a password or a private key (`--identity-file`, `--ask-passphrase`). From the console, an instance admin can also use the SSH agent of the `temps serve` process; API keys, CLI tokens and other roles cannot, since that agent holds the operator's own keys. A user other than root needs sudo. If sudo asks for a password, log in with that user's password and it is used for sudo too; it is only ever read by sudo, never by the command sudo runs.
 3. It checks the server runs Linux and Docker, installs Temps if missing, runs `temps join --pair -` with a pairing code on stdin, and installs the agent as `temps-agent.service`. Without systemd it starts the agent in the background and says so: that agent does not come back after a reboot.
 4. It waits for the node's first heartbeat. Progress and the server's output show on the page, and with `bunx @temps-sdk/cli nodes ssh show <id>`.
 
@@ -329,7 +329,7 @@ temps agent service status
 sudo temps agent service uninstall
 ```
 
-The unit runs this `temps` binary with the data directory `temps join` wrote (`--binary` and `--data-dir` override them; `--dry-run` prints the unit without installing it). The enrollment token and TLS key stay in that owner-only directory: the unit only points at it. It refuses to replace a `temps-agent.service` that Temps did not write. Without systemd, run `temps agent` under your own supervisor.
+The unit runs this `temps` binary with the data directory `temps join` wrote (`--binary` and `--data-dir` override them; `--dry-run` prints the unit without installing it). The enrollment token and TLS key stay in that owner-only directory: the unit only points at it. It refuses to replace a `temps-agent.service` that Temps did not write. Because the service runs as root, it also refuses a binary, data directory or `agent.json` that anyone but root could change, including through a directory above it; the error names the path and how to fix it (e.g. `sudo install -D -o root -g root -m 0755 ./temps /opt/temps/bin/temps`, then `--binary /opt/temps/bin/temps`). Without systemd, run `temps agent` under your own supervisor.
 
 The agent sends a **heartbeat** to the control plane every 30 seconds. If heartbeats stop (e.g., the agent is stopped or the machine goes down), the control plane marks the node as **offline** after 90 seconds and excludes it from scheduling.
 

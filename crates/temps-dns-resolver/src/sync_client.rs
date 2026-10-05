@@ -101,11 +101,17 @@ impl SyncClient {
     ) -> Result<Self, ResolverError> {
         let mut builder = reqwest::Client::builder().timeout(config.http_timeout);
         if let Some(pem) = &config.control_plane_ca_pem {
-            let certificate = reqwest::Certificate::from_pem(pem)
-                .map_err(|e| ResolverError::Internal(format!("control-plane CA: {e}")))?;
-            builder = builder
-                .tls_built_in_root_certs(false)
-                .add_root_certificate(certificate);
+            // The cluster CA instead of the public roots, with the control
+            // plane verified by its reserved name rather than the URL's host
+            // (its mesh address): the cluster CA also signs every worker's
+            // leaf for its own addresses.
+            let tls = temps_core::node_pki::control_plane_client_config(pem).map_err(|e| {
+                ResolverError::Internal(format!(
+                    "control-plane CA for node {} DNS sync: {e}",
+                    config.node_id
+                ))
+            })?;
+            builder = builder.use_preconfigured_tls(tls);
         }
         let http = builder
             .build()
@@ -307,6 +313,32 @@ mod tests {
             disable_sync: false,
             control_plane_ca_pem: None,
         }
+    }
+
+    #[test]
+    fn a_pinned_cluster_ca_is_used_for_the_control_plane() {
+        let ca = temps_core::node_pki::generate_cluster_ca().unwrap();
+        let mut config = config_for("https://10.201.0.1:51820");
+        config.control_plane_ca_pem = Some(ca.cert_pem.into_bytes());
+        let status = Arc::new(RwLock::new(SyncStatus::default()));
+        assert!(SyncClient::new(
+            config.clone(),
+            Arc::new(ZoneStore::new(PathBuf::from("/dev/null"))),
+            Arc::new(Notify::new()),
+            status.clone(),
+        )
+        .is_ok());
+
+        config.control_plane_ca_pem = Some(b"not a certificate".to_vec());
+        let error = SyncClient::new(
+            config,
+            Arc::new(ZoneStore::new(PathBuf::from("/dev/null"))),
+            Arc::new(Notify::new()),
+            status,
+        )
+        .err()
+        .expect("an unusable CA is refused, not silently replaced by public roots");
+        assert!(error.to_string().contains("control-plane CA"), "{error}");
     }
 
     #[tokio::test]

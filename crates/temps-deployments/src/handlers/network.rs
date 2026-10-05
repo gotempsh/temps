@@ -19,7 +19,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{ConnectInfo, Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
@@ -34,6 +34,7 @@ use temps_network::mesh::MeshError;
 use tracing::{error, warn};
 use utoipa::ToSchema;
 
+use crate::handlers::audit::NodeMeshKeyChangedAudit;
 use crate::handlers::nodes::NodeAppState;
 
 /// Wire-format peer entry. Matches `temps_network::config::Peer` but
@@ -419,24 +420,31 @@ pub async fn report_mesh_handshakes(
 )]
 pub async fn register_mesh(
     State(app_state): State<Arc<NodeAppState>>,
+    // The peer that sent the registration, recorded when it re-keys the
+    // node. Present in production (both listeners insert it) and injected
+    // by `MockConnectInfo` in tests.
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     Path(node_id): Path<i32>,
     Json(request): Json<RegisterWireguardMeshRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    authenticate_node(&app_state, &headers, node_id).await?;
+    // The node as it was before this call: its current mesh key, to tell a
+    // re-key from the agent's routine re-registration.
+    let node = authenticate_node(&app_state, &headers, node_id).await?;
     let endpoint = temps_network::mesh::parse_endpoint(&request.endpoint).map_err(|error| {
         problemdetails::new(StatusCode::BAD_REQUEST)
             .with_title("Invalid WireGuard Endpoint")
             .with_detail(error.to_string())
     })?;
-    let registration = temps_network::mesh::register_node(
-        &app_state.db,
-        node_id,
-        request.public_key.trim(),
-        endpoint,
-    )
-    .await
-    .map_err(|error| register_problem(node_id, error))?;
+    let public_key = request.public_key.trim();
+    let registration =
+        temps_network::mesh::register_node(&app_state.db, node_id, public_key, endpoint)
+            .await
+            .map_err(|error| register_problem(node_id, error))?;
+
+    if let Some(change) = mesh_key_change(&node, public_key, endpoint) {
+        record_mesh_key_change(app_state.audit_service.as_ref(), change, peer).await;
+    }
 
     // The mesh address is now the underlay; allocate the compute CIDR the
     // join skipped for a public registration address. `list_peers` retries
@@ -448,6 +456,80 @@ pub async fn register_mesh(
         prefix_len: registration.prefix_len,
         listen_port: registration.listen_port,
     }))
+}
+
+/// A node registering a mesh key other than the one on record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MeshKeyChange {
+    node_id: i32,
+    node_name: String,
+    old_public_key: String,
+    new_public_key: String,
+    old_endpoint: Option<String>,
+    new_endpoint: String,
+}
+
+/// The re-key `node` (as it was before the registration) undergoes by
+/// registering `public_key` at `endpoint`: `None` on a first registration
+/// or when the key is unchanged, so the agent's routine re-registration
+/// costs nothing.
+fn mesh_key_change(
+    node: &temps_entities::nodes::Model,
+    public_key: &str,
+    endpoint: std::net::SocketAddr,
+) -> Option<MeshKeyChange> {
+    let old_public_key = node.mesh_wg_public_key.as_deref()?;
+    (old_public_key != public_key).then(|| MeshKeyChange {
+        node_id: node.id,
+        node_name: node.name.clone(),
+        old_public_key: old_public_key.to_string(),
+        new_public_key: public_key.to_string(),
+        old_endpoint: node.mesh_wg_endpoint.clone(),
+        new_endpoint: endpoint.to_string(),
+    })
+}
+
+/// Log and audit a node's mesh re-key. Every mesh member trusts the key as
+/// this node, so a change is something an operator must be able to explain
+/// later: a reinstalled agent, or something else holding the node's token.
+async fn record_mesh_key_change(
+    audit_service: &dyn temps_core::AuditLogger,
+    change: MeshKeyChange,
+    peer: std::net::SocketAddr,
+) {
+    warn!(
+        node_id = change.node_id,
+        node_name = %change.node_name,
+        old_public_key = %change.old_public_key,
+        new_public_key = %change.new_public_key,
+        old_endpoint = change.old_endpoint.as_deref().unwrap_or("none"),
+        new_endpoint = %change.new_endpoint,
+        %peer,
+        "node {} ({}) replaced its WireGuard mesh key",
+        change.node_id,
+        change.node_name
+    );
+    let audit = NodeMeshKeyChangedAudit {
+        context: temps_core::AuditContext {
+            // No user: a node authenticating with its own token. `0` is the
+            // codebase's convention for an actor that isn't a user.
+            user_id: 0,
+            ip_address: Some(peer.ip().to_string()),
+            user_agent: format!("temps-agent/node-{}", change.node_id),
+        },
+        node_id: change.node_id,
+        node_name: change.node_name,
+        old_public_key: change.old_public_key,
+        new_public_key: change.new_public_key,
+        old_endpoint: change.old_endpoint,
+        new_endpoint: change.new_endpoint,
+    };
+    if let Err(error) = audit_service.create_audit_log(&audit).await {
+        error!(
+            node_id = audit.node_id,
+            "node mesh key changed but the audit record failed: {error}"
+        );
+    }
 }
 
 /// The problem for a failed mesh registration: the node's own mistakes and
@@ -753,6 +835,9 @@ mod tests {
                 put(report_mesh_handshakes),
             )
             .with_state(state)
+            .layer(axum::extract::connect_info::MockConnectInfo(
+                std::net::SocketAddr::from(([198, 51, 100, 9], 40000)),
+            ))
     }
 
     /// A database that knows node `id`, whose agent holds `token`.
@@ -903,6 +988,64 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(problem["title"], "Invalid WireGuard Endpoint");
+    }
+
+    const OLD_KEY: &str = "b2xkLWtleS0zMi1ieXRlcy1sb25nLXBhZGRlZCEhIQ==";
+    const NEW_KEY: &str = "bmV3LWtleS0zMi1ieXRlcy1sb25nLXBhZGRlZCEhIQ==";
+
+    fn on_mesh(key: Option<&str>) -> temps_entities::nodes::Model {
+        let mut node = node(4, "worker-4", NODE_1_TOKEN);
+        node.mesh_wg_public_key = key.map(str::to_string);
+        node.mesh_wg_endpoint = key.map(|_| "203.0.113.4:51820".to_string());
+        node
+    }
+
+    #[test]
+    fn only_replacing_a_registered_key_is_a_key_change() {
+        let endpoint: std::net::SocketAddr = "203.0.113.40:51820".parse().unwrap();
+        // First registration: nothing to replace.
+        assert_eq!(mesh_key_change(&on_mesh(None), NEW_KEY, endpoint), None);
+        // The agent's routine re-registration, even from a new endpoint.
+        assert_eq!(
+            mesh_key_change(&on_mesh(Some(OLD_KEY)), OLD_KEY, endpoint),
+            None
+        );
+        assert_eq!(
+            mesh_key_change(&on_mesh(Some(OLD_KEY)), NEW_KEY, endpoint),
+            Some(MeshKeyChange {
+                node_id: 4,
+                node_name: "worker-4".into(),
+                old_public_key: OLD_KEY.into(),
+                new_public_key: NEW_KEY.into(),
+                old_endpoint: Some("203.0.113.4:51820".into()),
+                new_endpoint: "203.0.113.40:51820".into(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_key_change_is_audited_with_the_peer_that_made_it() {
+        let audit =
+            crate::handlers::wireguard_mesh::admin_test_support::RecordingAuditLogger::default();
+        let change = mesh_key_change(
+            &on_mesh(Some(OLD_KEY)),
+            NEW_KEY,
+            "203.0.113.40:51820".parse().unwrap(),
+        )
+        .unwrap();
+        record_mesh_key_change(&audit, change, "198.51.100.9:40000".parse().unwrap()).await;
+
+        let records = audit.records();
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].operation, "NODE_MESH_KEY_CHANGED");
+        assert_eq!(records[0].ip_address.as_deref(), Some("198.51.100.9"));
+        assert_eq!(records[0].user_agent, "temps-agent/node-4");
+        let body: serde_json::Value = serde_json::from_str(&records[0].body).unwrap();
+        assert_eq!(body["node_id"], 4);
+        assert_eq!(body["old_public_key"], OLD_KEY);
+        assert_eq!(body["new_public_key"], NEW_KEY);
+        assert_eq!(body["old_endpoint"], "203.0.113.4:51820");
+        assert_eq!(body["new_endpoint"], "203.0.113.40:51820");
     }
 
     #[test]
