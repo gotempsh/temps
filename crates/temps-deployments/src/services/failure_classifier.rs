@@ -531,7 +531,7 @@ pub const fn guidance_for(code: DeploymentFailureCode) -> FailureGuidance {
         ),
         C::ContainerExited => (
             "Container exited during startup",
-            "The app process exited (or kept restarting) right after starting. Check the runtime logs for the crash, verify the start command and required environment variables, and that the image's entrypoint runs a long-lived server.",
+            "The app process exited (or kept restarting) right after starting. Check the runtime logs for the crash, verify the start command and required environment variables, and that the image's entrypoint runs a long-lived server. If the logs report exec format error, use an image and application binaries built for the host CPU architecture, or publish a multi-architecture image.",
             Some(S::EnvironmentVariables),
         ),
         C::ImageNotFound => (
@@ -1343,6 +1343,16 @@ mod tests {
     fn assert_class(reason: &str, stage: S, code: C) {
         let got = classify_failure_reason(Some(reason));
         assert_eq!((got.stage, got.code), (stage, code), "reason: {reason}");
+    }
+
+    #[test]
+    fn log_only_architecture_diagnostic_keeps_runtime_guidance_without_trusting_log_text() {
+        let reason = wrapped("deploy_compose", "Compose deploy failed: Compose stack 'temps-1-2' did not become ready within 300s: service 'api' exited\n\nContainer logs for unhealthy/stopped services:\nexec format error");
+        let result = classify_failure_reason(Some(&reason));
+        assert_eq!(result.code, C::ContainerExited);
+        let remediation = guidance_for(result.code).remediation;
+        assert!(remediation.contains("exec format error"));
+        assert!(remediation.contains("multi-architecture"));
     }
 
     #[test]
