@@ -152,7 +152,12 @@ pub enum ConsoleStreamEndReason {
     Unknown,
 }
 
-/// Either side → the other: no more data will follow for this stream.
+/// Either side → the other: no more data will follow in the sender's direction.
+/// Cloud sends `Complete` after the last request-body chunk (including for an
+/// empty body with no declared length). This half-closes the request body;
+/// the instance still sends response headers, chunks and its own stream end.
+/// A declared `Content-Length` also allows the instance to detect request EOF
+/// without waiting for this frame. Error endings abort the request instead.
 ///
 /// `reason` is flattened so its own `reason` tag key lands at the top level
 /// (`{"stream_id":..,"reason":"complete"}`) instead of nesting a second
