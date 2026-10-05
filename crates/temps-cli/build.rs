@@ -110,6 +110,21 @@ fn set_git_version_info() {
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_string()));
 
+    // The release workflow passes the tag it is publishing as TEMPS_VERSION
+    // (the same value the web console is built with). Prefer it over `git
+    // describe --exact-match`, which picks an arbitrary tag when several
+    // point at one commit -- e.g. a nightly and a beta cut from the same
+    // `main` SHA -- and would make the binary, `temps doctor` and the
+    // console disagree about which release is running. Anything that is not
+    // a release tag (a branch name on a dry run, unset locally) is ignored.
+    println!("cargo:rerun-if-env-changed=TEMPS_VERSION");
+    let ci_tag = env::var("TEMPS_VERSION")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| is_release_tag(value));
+    let git_tag = ci_tag.clone().or(git_tag);
+    let latest_tag = ci_tag.unwrap_or(latest_tag);
+
     // Get build timestamp
     let build_time = chrono::Utc::now()
         .format("%Y-%m-%d %H:%M:%S UTC")
@@ -137,6 +152,30 @@ fn set_git_version_info() {
         println!("cargo:rerun-if-changed=../.git/HEAD");
         println!("cargo:rerun-if-changed=../.git/refs");
     }
+}
+
+/// `v<major>.<minor>.<patch>[-<prerelease>]`, the shape release.yml accepts
+/// (see .github/scripts/validate-release-ref.sh).
+fn is_release_tag(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix('v') else {
+        return false;
+    };
+    let (core, pre) = match rest.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
+        None => (rest, None),
+    };
+    let numeric = core.split('.').collect::<Vec<_>>();
+    let core_ok = numeric.len() == 3
+        && numeric
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()));
+    let pre_ok = pre.is_none_or(|pre| {
+        !pre.is_empty()
+            && pre
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+    });
+    core_ok && pre_ok
 }
 
 fn build_web(web_dir: &std::path::Path, dist_dir: &std::path::Path) {

@@ -210,3 +210,26 @@ Keep the disk space alert enabled under **Settings → Disk Monitoring**. It fir
 - **Server logs.** Ship the standard output of `temps serve` to your log system. See [Troubleshooting](/docs/troubleshooting#logs) for where each kind of log lives.
 
 Temps does not expose a Prometheus `/metrics` endpoint for the control plane itself.
+
+
+---
+
+## Verify release artifacts {{ anchor: true, id: 'release-verification' }}
+
+Releases produced by the current publishing workflow attach GitHub build-provenance and SPDX SBOM attestations to binary tarballs. Verify a downloaded tarball before installing it:
+
+```bash
+gh attestation verify temps-linux-amd64.tar.gz --repo gotempsh/temps
+```
+
+The main `ghcr.io/gotempsh/temps` image includes BuildKit SBOM and provenance attestations for each platform. Its published multi-platform manifest is signed using GitHub Actions' OIDC identity. Resolve the digest and verify that the signing identity belongs to the release workflow:
+
+```bash
+image=ghcr.io/gotempsh/temps:latest
+digest=$(docker buildx imagetools inspect "$image" --format '{{.Manifest.Digest}}')
+cosign verify "ghcr.io/gotempsh/temps@$digest" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp '^https://github\.com/gotempsh/temps/\.github/workflows/release\.yml@refs/tags/v[[:alnum:]._-]+$'
+```
+
+Pin deployments to the verified digest to avoid a floating tag changing between verification and use. This does not retrofit signatures onto older releases, or cover the separately published sandbox, daemon and preview-gateway images.

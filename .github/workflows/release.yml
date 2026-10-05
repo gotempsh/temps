@@ -43,6 +43,11 @@ on:
         required: false
         type: boolean
         default: true
+      skip_test_gate:
+        description: "EMERGENCY ONLY: publish without a green rust-tests.yml run for this commit (logged in the run summary)"
+        required: false
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -53,11 +58,12 @@ permissions: {}
 
 jobs:
   daemon-images:
-    needs: validate-release-ref
+    needs: [validate-release-ref, require-tests]
     uses: ./.github/workflows/daemon-images.yml
     permissions:
       contents: read
       packages: write
+      id-token: write
     with:
       revision_only: true
       # Publish content-addressed dependencies before compiling the server.
@@ -79,6 +85,65 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
           REF_TYPE: ${{ github.ref_type }}
         run: .github/scripts/validate-release-ref.sh "$DRY_RUN" "$REF_TYPE" "$REF_NAME"
+
+  # The release runs no tests of its own, so it must not publish a commit the
+  # test workflow has not passed. Rather than re-running the whole suite here
+  # (hours of runner time, plus caches written to a tag scope nothing can
+  # read -- see the note at the top of this file), ask GitHub whether
+  # rust-tests.yml already succeeded for this exact SHA, waiting for an
+  # in-flight run (e.g. the `main` push that `scripts/release.sh` sends next
+  # to the tag). Builds start in parallel; only the jobs that make anything
+  # public (alias promotion, the GitHub Release and the server image after
+  # it) wait for this gate.
+  #
+  # Emergency bypass: a maintainer (workflow_dispatch needs write access)
+  # dispatches this workflow at the tag with
+  #   gh workflow run release.yml --ref <tag> -f dry_run=false -f skip_test_gate=true
+  # The bypass is recorded as a warning and in the run summary.
+  require-tests:
+    name: Require passing Rust Tests
+    needs: validate-release-ref
+    runs-on: ubuntu-latest
+    timeout-minutes: 200
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout release gate script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Wait for rust-tests.yml to pass for this commit
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          SKIP_TEST_GATE: ${{ inputs.skip_test_gate }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_SHA: ${{ github.sha }}
+          REF_NAME: ${{ github.ref_name }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        run: |
+          if [[ "$DRY_RUN" == "true" ]]; then
+            echo "Dry-run: nothing is published, so the test gate is not enforced."
+            exit 0
+          fi
+          if [[ "$SKIP_TEST_GATE" == "true" ]]; then
+            echo "::warning::Test gate BYPASSED by $TRIGGERING_ACTOR for $REF_NAME ($RELEASE_SHA)"
+            {
+              echo "## Release test gate bypassed"
+              echo ""
+              echo "\`$REF_NAME\` ($RELEASE_SHA) was published by **$TRIGGERING_ACTOR** with \`skip_test_gate=true\`,"
+              echo "without a verified green \`rust-tests.yml\` run for this commit."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python3 .github/scripts/release_test_gate.py \
+            --repository "$REPOSITORY" \
+            --sha "$RELEASE_SHA" \
+            --ref-name "$REF_NAME" \
+            --workflow rust-tests.yml \
+            --timeout-minutes 180
 
   build-web-assets:
     name: Build web assets (WASM + dist)
@@ -500,7 +565,7 @@ jobs:
 
   promote-runtime-images:
     name: Promote verified runtime aliases
-    needs: [build-linux-amd64, build-linux-arm64, build-darwin-amd64, build-darwin-arm64, runtime-image-manifest, prepare-sandbox-context]
+    needs: [require-tests, build-linux-amd64, build-linux-arm64, build-darwin-amd64, build-darwin-arm64, runtime-image-manifest, prepare-sandbox-context]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -534,49 +599,46 @@ jobs:
 
   create-release:
     name: Create Release
-    # All image sets, embedded manifests and binaries must succeed before publication.
-    needs: [build-linux-amd64, build-linux-arm64, build-darwin-amd64, build-darwin-arm64, runtime-image-manifest, promote-runtime-images]
+    # All image sets, embedded manifests and binaries must succeed before
+    # publication, and the commit must have passed rust-tests.yml.
+    needs: [require-tests, build-linux-amd64, build-linux-arm64, build-darwin-amd64, build-darwin-arm64, runtime-image-manifest, promote-runtime-images]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # Keyless signing of the provenance/SBOM attestations (no secrets).
+      id-token: write
+      attestations: write
     outputs:
       # Single source of truth for "is this a prerelease?" so every downstream
-      # job (server image, sandbox images, manifest merge) makes the same
-      # channel decision. Prereleases are tags containing a `-` (e.g.
-      # `v0.1.0-beta.6`); stable tags look like `v0.1.0`.
+      # job (server image, manifest merge) makes the same channel decision.
+      # Prereleases are tags containing a `-` (e.g. `v0.1.0-beta.6`); stable
+      # tags look like `v0.1.0`.
       is_prerelease: ${{ steps.channel.outputs.is_prerelease }}
-      # The floating channel tag stable -> "latest", prerelease -> "beta".
-      # Image jobs append this as an extra tag so operators can pin to a
-      # channel ("ghcr.io/.../temps:beta") instead of an exact version.
+      # The floating channel tag: stable -> "latest", `-beta.N`/`-rc.N` ->
+      # "beta", nightly -> "nightly", anything else -> "" (no floating tag).
+      # Image jobs append it so operators can pin to a channel
+      # ("ghcr.io/.../temps:beta") instead of an exact version.
       channel_tag: ${{ steps.channel.outputs.channel_tag }}
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # git-cliff needs the full history and every tag to find the
+          # previous release and group commits by version.
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Determine release channel
         id: channel
-        # Tag pushes: prerelease iff the tag contains a `-` (e.g. `v0.1.0-beta.6`).
-        # Dry-runs are always treated as prereleases so a test invocation
-        # cannot promote to the stable `:<version>` ref by accident. A
-        # non-dry-run dispatch at a tag (used by nightly-release.yml) follows
-        # the same tag-based channel selection as a tag push.
+        # Stable tags move `:latest`, real betas/RCs (`-beta.N`, `-rc.N`) move
+        # `:beta`, nightlies move `:nightly`, and any other prerelease moves
+        # no floating tag. Dry-runs are always prereleases so a test
+        # invocation cannot promote to stable by accident. See the script.
         env:
           DRY_RUN: ${{ inputs.dry_run }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          if [[ "$DRY_RUN" == "true" ]]; then
-            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
-            echo "channel_tag=beta" >> "$GITHUB_OUTPUT"
-            echo "Channel: beta (dry-run — never promotes to stable)"
-          elif [[ "$RELEASE_TAG" == *"-"* ]]; then
-            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
-            echo "channel_tag=beta" >> "$GITHUB_OUTPUT"
-            echo "Channel: beta (prerelease)"
-          else
-            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
-            echo "channel_tag=latest" >> "$GITHUB_OUTPUT"
-            echo "Channel: latest (stable)"
-          fi
+          .github/scripts/release-channel.sh "$DRY_RUN" "$RELEASE_TAG" | tee -a "$GITHUB_OUTPUT"
 
       - name: Download all artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -603,6 +665,46 @@ jobs:
           sha256sum runtime-images.json >> checksums.txt
           echo "Combined checksums:"
           cat checksums.txt
+
+      # Supply chain: an SPDX SBOM of what the binary is built from, plus
+      # keyless Sigstore-signed attestations (SLSA build provenance and the
+      # SBOM) for every published tarball. Keyless means no new secrets: the
+      # job's OIDC token (id-token: write) gets a short-lived certificate
+      # from the public-good Sigstore instance. Verify a download with
+      #   gh attestation verify temps-linux-amd64.tar.gz --repo gotempsh/temps
+      - name: Collect SBOM inputs
+        run: |
+          # Only the manifests that end up in the binary: the Rust workspace
+          # and the web console bundled into it. Scanning the whole checkout
+          # would also list examples, SDKs and test fixtures.
+          mkdir -p sbom-input/web
+          cp Cargo.lock sbom-input/
+          cp web/package.json web/bun.lock sbom-input/web/
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          path: ${{ github.workspace }}/sbom-input
+          format: spdx-json
+          output-file: release/temps-sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+          dependency-snapshot: false
+
+      - name: Attest build provenance for release tarballs
+        if: inputs.dry_run != true
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            release/temps-*.tar.gz
+            release/runtime-images.json
+
+      - name: Attest SBOM for release tarballs
+        if: inputs.dry_run != true
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: release/temps-*.tar.gz
+          sbom-path: release/temps-sbom.spdx.json
 
       - name: Copy install script to release
         run: |
@@ -642,13 +744,75 @@ jobs:
           echo "Generated formula:"
           cat release/temps.rb
 
+      # CHANGELOG.md is generated from Conventional Commits by git-cliff and
+      # never hand-edited (AGENTS.md). `scripts/release.sh` regenerates the
+      # committed copy for manual beta/stable cuts, but nightlies are tagged
+      # by CI and never touch it, so the in-repo file goes stale between
+      # betas. Generate both the notes for this release and the full
+      # changelog here, from the tag being released, and publish them with
+      # the release instead of linking to whatever the repo file says.
+      - name: Select changelog range
+        id: changelog
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if [[ "$DRY_RUN" == "true" ]]; then
+            echo "args=--strip all --unreleased" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ "$RELEASE_TAG" == *-nightly.* ]]; then
+            # A nightly lists what changed since the previous nightly.
+            previous="$(git describe --tags --abbrev=0 --match 'v*-nightly.*' "$RELEASE_TAG^" 2>/dev/null || true)"
+            ignore=""
+          else
+            # A beta/RC/stable lists everything since the previous non-nightly
+            # release; the nightlies in between are folded into this section.
+            previous="$(git describe --tags --abbrev=0 --exclude '*-nightly.*' "$RELEASE_TAG^" 2>/dev/null || true)"
+            # Quoted so the pattern survives the action's unquoted expansion
+            # of `args`; git-cliff matches it against the whole tag name.
+            ignore="--ignore-tags '.*-nightly\\..*'"
+          fi
+          range="$RELEASE_TAG"
+          if [[ -n "$previous" ]]; then
+            range="$previous..$RELEASE_TAG"
+          fi
+          echo "Changelog range: $range"
+          echo "args=--strip all $ignore $range" >> "$GITHUB_OUTPUT"
+
+      - name: Generate release changelog section
+        uses: orhun/git-cliff-action@a9a95522b26fe6403f7bb24031f21fb573d0f5ff # v4
+        with:
+          version: v2.14.2
+          config: cliff.toml
+          args: ${{ steps.changelog.outputs.args }}
+        env:
+          OUTPUT: release/release-section.md
+
+      - name: Generate full CHANGELOG.md
+        uses: orhun/git-cliff-action@a9a95522b26fe6403f7bb24031f21fb573d0f5ff # v4
+        with:
+          version: v2.14.2
+          config: cliff.toml
+          args: --verbose
+        env:
+          OUTPUT: release/CHANGELOG.md
+
       - name: Create release notes file
         run: |
-          cat > release/release-notes.md << 'EOF'
-          ## Changes
-
-          See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ github.ref }}/CHANGELOG.md) for details.
-
+          {
+            echo "## Changes"
+            echo ""
+            if grep -q '^- ' release/release-section.md; then
+              cat release/release-section.md
+            else
+              echo "_No changes with a Conventional Commit type were recorded for this release._"
+            fi
+            echo ""
+            echo "The complete, generated history is attached to this release as \`CHANGELOG.md\`."
+            echo ""
+          } > release/release-notes.md
+          cat >> release/release-notes.md << 'EOF'
           ## Installation
 
           ### Quick Install (Recommended)
@@ -741,6 +905,14 @@ jobs:
           # Verify checksum (Linux/macOS)
           sha256sum -c checksums.txt --ignore-missing
           ```
+
+          ### Provenance and SBOM
+          Every tarball carries a Sigstore-signed SLSA build provenance
+          attestation and an SBOM attestation (`temps-sbom.spdx.json`, also
+          attached to this release):
+          ```bash
+          gh attestation verify temps-linux-amd64.tar.gz --repo ${{ github.repository }}
+          ```
           EOF
 
           echo "Release notes created:"
@@ -784,6 +956,8 @@ jobs:
             release/runtime-images.json
             release/install.sh
             release/temps.rb
+            release/CHANGELOG.md
+            release/temps-sbom.spdx.json
           )
 
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
@@ -882,6 +1056,9 @@ jobs:
           context: .
           file: ./Dockerfile.release
           platforms: ${{ matrix.platform }}
+          # BuildKit attaches SPDX SBOMs and provenance to each platform manifest.
+          sbom: true
+          provenance: mode=max
           # Dry-run: build but don't push. Same guard used by the sandbox
           # and preview-gateway image jobs below — without it, every
           # workflow_dispatch (dry-run or not) overwrites the real
@@ -889,11 +1066,13 @@ jobs:
           # merges into the `:beta` channel operators pin to.
           push: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
           # Per-platform intermediate tags. The manifest-merge job below
-          # combines amd64+arm64 into the final multi-arch refs. Channel tag
-          # (`latest` for stable, `beta` for prereleases) keeps stable users
-          # from being upgraded by a beta release that happens to land later.
+          # combines amd64+arm64 into the final multi-arch refs. The channel
+          # tag (`latest`, `beta` or `nightly`) keeps stable users from being
+          # upgraded by a beta, and beta users from being moved onto a
+          # nightly. An empty channel tag adds no floating tag at all (blank
+          # lines are ignored by build-push-action).
           tags: |
-            ghcr.io/${{ github.repository_owner }}/temps:${{ needs.create-release.outputs.channel_tag }}-${{ steps.platform_tag.outputs.tag }}
+            ${{ needs.create-release.outputs.channel_tag != '' && format('ghcr.io/{0}/temps:{1}-{2}', github.repository_owner, needs.create-release.outputs.channel_tag, steps.platform_tag.outputs.tag) || '' }}
             ghcr.io/${{ github.repository_owner }}/temps:${{ steps.version.outputs.version }}-${{ steps.platform_tag.outputs.tag }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
@@ -917,7 +1096,14 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
     steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Cosign
+        uses: sigstore/cosign-installer@ba7bc0a3fef59531c69a25acd34668d6d3fe6f22 # v4.1.0
+
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
@@ -941,20 +1127,30 @@ jobs:
           echo "Version: $VERSION"
 
       # Merge per-platform tags into a multi-arch manifest under the channel
-      # ref (`:latest` for stable, `:beta` for prereleases). Operators that
-      # pin to `:latest` never receive a prerelease build by accident.
+      # ref (`:latest` for stable, `:beta` for betas/RCs, `:nightly` for
+      # nightlies). Operators that pin to `:latest` never receive a
+      # prerelease, and `:beta` never receives a nightly.
       - name: Create and push manifest for channel
+        if: needs.create-release.outputs.channel_tag != ''
+        env:
+          CHANNEL: ${{ needs.create-release.outputs.channel_tag }}
         run: |
-          CHANNEL="${{ needs.create-release.outputs.channel_tag }}"
-          docker buildx imagetools create -t ghcr.io/${{ github.repository_owner }}/temps:$CHANNEL \
-            ghcr.io/${{ github.repository_owner }}/temps:$CHANNEL-linux-amd64 \
-            ghcr.io/${{ github.repository_owner }}/temps:$CHANNEL-linux-arm64
+          docker buildx imagetools create -t "ghcr.io/${{ github.repository_owner }}/temps:${CHANNEL}" \
+            "ghcr.io/${{ github.repository_owner }}/temps:${CHANNEL}-linux-amd64" \
+            "ghcr.io/${{ github.repository_owner }}/temps:${CHANNEL}-linux-arm64"
 
       - name: Create and push manifest for version
         run: |
           docker buildx imagetools create -t ghcr.io/${{ github.repository_owner }}/temps:${{ steps.version.outputs.version }} \
             ghcr.io/${{ github.repository_owner }}/temps:${{ steps.version.outputs.version }}-linux-amd64 \
             ghcr.io/${{ github.repository_owner }}/temps:${{ steps.version.outputs.version }}-linux-arm64
+
+      - name: Sign published multi-platform images
+        env:
+          IMAGE_REPOSITORY: ghcr.io/${{ github.repository_owner }}/temps
+          IMAGE_VERSION: ${{ steps.version.outputs.version }}
+          IMAGE_CHANNEL: ${{ needs.create-release.outputs.channel_tag }}
+        run: bash .github/scripts/sign-release-image.sh
 
   # ─────────────────────────────────────────────────────────────────────────
   # Sandbox images and preview gateway
@@ -1059,11 +1255,12 @@ jobs:
 
   build-and-push-sandbox-images:
     name: Build sandbox image (${{ matrix.runtime }})
-    needs: [validate-release-ref, prepare-sandbox-context]
+    needs: [validate-release-ref, require-tests, prepare-sandbox-context]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -1125,6 +1322,8 @@ jobs:
         id: image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
+          sbom: true
+          provenance: mode=max
           context: ./build-context
           platforms: linux/amd64,linux/arm64
           # Dry-run: build but don't push. Used by `workflow_dispatch` with
@@ -1158,14 +1357,28 @@ jobs:
           name: runtime-image-sandbox_${{ matrix.runtime }}
           path: sandbox_${{ matrix.runtime }}.json
           retention-days: 1
+      - name: Set up Cosign for runtime image
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
+        uses: sigstore/cosign-installer@ba7bc0a3fef59531c69a25acd34668d6d3fe6f22 # v4.1.0
+
+      - name: Sign published runtime image digest
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
+        env:
+          IMAGE_REPOSITORY: ghcr.io/${{ github.repository_owner }}/temps-sandbox-${{ matrix.runtime }}
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]] || { echo "Invalid published image digest" >&2; exit 1; }
+          cosign sign --yes "$IMAGE_REPOSITORY@$IMAGE_DIGEST"
+
 
   build-and-push-preview-gateway:
     name: Build preview gateway image
-    needs: [validate-release-ref, prepare-sandbox-context]
+    needs: [validate-release-ref, require-tests, prepare-sandbox-context]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+      id-token: write
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -1203,6 +1416,8 @@ jobs:
         id: image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
+          sbom: true
+          provenance: mode=max
           context: ./crates/temps-preview-gateway
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
@@ -1230,3 +1445,15 @@ jobs:
           name: runtime-image-preview_gateway
           path: preview_gateway.json
           retention-days: 1
+      - name: Set up Cosign for runtime image
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
+        uses: sigstore/cosign-installer@ba7bc0a3fef59531c69a25acd34668d6d3fe6f22 # v4.1.0
+
+      - name: Sign published runtime image digest
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
+        env:
+          IMAGE_REPOSITORY: ghcr.io/${{ github.repository_owner }}/temps-preview-gateway
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]] || { echo "Invalid published image digest" >&2; exit 1; }
+          cosign sign --yes "$IMAGE_REPOSITORY@$IMAGE_DIGEST"
