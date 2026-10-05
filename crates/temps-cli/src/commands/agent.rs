@@ -603,6 +603,9 @@ impl AgentCommand {
             // saved agent.json alone (a legacy one is resolved from what its
             // join wrote, before any CLI override), and a node without a
             // saved config verifies the control plane against public roots.
+            control_plane_legacy_cert_path: saved
+                .as_ref()
+                .and_then(|config| config.control_plane_legacy_cert_path.clone()),
             control_plane_trust: saved
                 .as_ref()
                 .map(|config| config.effective_control_plane_trust()),

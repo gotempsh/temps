@@ -901,6 +901,7 @@ impl JoinCommand {
             mesh_key_dir: crate::commands::agent::agent_data_dir().join("wireguard"),
             wg_endpoint: wg_endpoint.map(|endpoint| endpoint.to_string()),
             control_plane_trust: Some(control_plane.trust),
+            control_plane_legacy_cert_path: None,
         };
         apply_saved_public_ingress_settings(&mut config, matching_saved);
         self.save_agent_config(&config)?;
@@ -1046,6 +1047,7 @@ impl JoinCommand {
             wg_endpoint: Some(code.node_endpoint.to_string()),
             // Only brings the mesh up; it never calls the control plane.
             control_plane_trust: Some(temps_agent::ControlPlaneTrust::PublicRoots),
+            control_plane_legacy_cert_path: None,
         };
         let cidr = ipnet::Ipv4Net::new(code.node_address, code.prefix_len)?.trunc();
         temps_agent::network_sync::bootstrap_mesh(
@@ -1305,6 +1307,7 @@ impl JoinCommand {
             mesh_key_dir: crate::commands::agent::agent_data_dir().join("wireguard"),
             wg_endpoint: None,
             control_plane_trust: Some(trust.agent_trust()),
+            control_plane_legacy_cert_path: None,
         };
         apply_saved_public_ingress_settings(&mut config, matching_saved);
         self.save_agent_config(&config)?;
@@ -1745,6 +1748,7 @@ mod tests {
             mesh_key_dir: std::path::PathBuf::from("/tmp/temps-wireguard"),
             wg_endpoint: None,
             control_plane_trust: Some(temps_agent::ControlPlaneTrust::PublicRoots),
+            control_plane_legacy_cert_path: None,
         }
     }
 

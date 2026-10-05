@@ -1235,15 +1235,6 @@ async fn register_node_inner(
                         ));
                 }
             }
-            app_state
-                .enrollment_token_service
-                .validate_and_consume(provided_token)
-                .await
-                .map_err(|error| {
-                    problemdetails::new(StatusCode::FORBIDDEN)
-                        .with_title("Enrollment Token Not Usable")
-                        .with_detail(error.to_string())
-                })?;
             enrollment_token_id = Some(token_row.id);
             info!(node = %request.name, "Node authorized via enrollment token");
         }
@@ -1418,6 +1409,20 @@ async fn register_node_inner(
         (None, None)
     };
 
+    // All fallible input and certificate work precedes the atomic token claim.
+    // A reservation conflict must leave a single-use token available to retry.
+    if enrollment_token_id.is_some() {
+        app_state
+            .enrollment_token_service
+            .validate_and_consume(provided_token)
+            .await
+            .map_err(|error| {
+                problemdetails::new(StatusCode::FORBIDDEN)
+                    .with_title("Enrollment Token Not Usable")
+                    .with_detail(error.to_string())
+            })?;
+    }
+
     let register_request = RegisterNodeRequest {
         name: request.name.trim().to_string(),
         token_hash,
@@ -1455,16 +1460,10 @@ async fn register_node_inner(
     {
         Ok(node) => node,
         Err(error) => {
-            // A refused pairing gets its token's use back, so the real node
-            // can still register; in particular a leaked pairing token tried
-            // from elsewhere must not burn the single use.
-            if let (
-                NodeError::Pairing { token_id, .. }
-                | NodeError::PairingSourceRefused { token_id, .. },
-                Some(_),
-            ) = (&error, enrollment_token_id)
-            {
-                release_token_use(&app_state, *token_id).await;
+            // No certificate is returned on registration failure. Restore
+            // the token claim so a corrected request can retry enrollment.
+            if let Some(token_id) = enrollment_token_id {
+                release_token_use(&app_state, token_id).await;
             }
             return Err(Problem::from(error));
         }
@@ -4340,6 +4339,64 @@ mod tests {
         let detail = problem["detail"].as_str().unwrap();
         assert!(detail.contains("from mesh address 10.201.0.9"), "{detail}");
         assert!(detail.contains("(10.201.0.7)"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn certificate_reservation_failure_does_not_consume_enrollment_token() {
+        let ca = temps_core::node_pki::generate_cluster_ca().unwrap();
+        let encryption = Arc::new(
+            temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap(),
+        );
+        let mut settings = settings_with_join_token();
+        settings.multi_node.cluster_ca_cert_pem = Some(ca.cert_pem);
+        settings.multi_node.cluster_ca_key_encrypted =
+            Some(encryption.encrypt(ca.key_pem.as_bytes()).unwrap());
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![Vec::<temps_entities::node_pairings::Model>::new()])
+                // A pool change has reserved the address before the certificate
+                // reservation obtains its lock. No certificate can leave the request.
+                .append_query_results(vec![vec![
+                    crate::handlers::wireguard_mesh::admin_test_support::network_config(
+                        false, false,
+                    ),
+                ]])
+                .into_connection(),
+        );
+        let enrollment_db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![pairing_token(41, "edge-1")]])
+                .into_connection(),
+        );
+        let app = make_app_with_enrollment(
+            db,
+            config_service_with(settings),
+            encryption,
+            enrollment_db.clone(),
+        );
+        let csr = temps_core::node_pki::generate_node_keypair_csr("edge-1", &["10.201.7.7".into()])
+            .unwrap();
+        let mut body = register_body("edge-1", "10.201.7.7");
+        body["join_token"] = serde_json::json!("pairing-join-token");
+        body["csr_pem"] = serde_json::json!(csr.csr_pem);
+        let response = post_register(app, &body).await;
+        assert!(!response.status().is_success());
+        let problem = problem_of(response).await;
+        assert!(
+            problem["detail"]
+                .as_str()
+                .unwrap()
+                .contains("reserved mesh pool"),
+            "{problem}"
+        );
+        let log = Arc::try_unwrap(enrollment_db)
+            .unwrap()
+            .into_transaction_log();
+        assert!(!log.is_empty());
+        assert!(
+            log.iter().all(|sql| !format!("{sql:?}").contains("UPDATE")),
+            "{log:?}"
+        );
     }
 
     #[tokio::test]

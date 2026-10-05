@@ -89,7 +89,7 @@ pub fn control_plane_client_config(ca_pem: &[u8]) -> Result<rustls::ClientConfig
             context: "cluster CA for the control-plane client".into(),
             reason: e.to_string(),
         })?;
-    client_config_for_roots(certificates)
+    client_config_for_roots(certificates, None)
 }
 
 /// [`control_plane_client_config`] for a cluster CA certificate in DER (as
@@ -97,13 +97,36 @@ pub fn control_plane_client_config(ca_pem: &[u8]) -> Result<rustls::ClientConfig
 pub fn control_plane_client_config_from_der(
     ca_der: &[u8],
 ) -> Result<rustls::ClientConfig, PkiError> {
-    client_config_for_roots(vec![rustls::pki_types::CertificateDer::from(
-        ca_der.to_vec(),
-    )])
+    client_config_for_roots(
+        vec![rustls::pki_types::CertificateDer::from(ca_der.to_vec())],
+        None,
+    )
+}
+
+/// Allow an older IP-only control plane only when its exact leaf certificate
+/// was independently pinned by the operator. This is never trust on first use.
+/// The chain, validity, IP identity and handshake signatures still verify.
+pub fn control_plane_client_config_with_legacy_pin(
+    ca_pem: &[u8],
+    legacy_leaf_pem: &[u8],
+) -> Result<rustls::ClientConfig, PkiError> {
+    use rustls::pki_types::{pem::PemObject, CertificateDer};
+    let roots = CertificateDer::pem_slice_iter(ca_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| PkiError::PemParse {
+            context: "cluster CA for the control-plane client".into(),
+            reason: e.to_string(),
+        })?;
+    let pin = CertificateDer::from_pem_slice(legacy_leaf_pem).map_err(|e| PkiError::PemParse {
+        context: "independently pinned legacy control-plane leaf".into(),
+        reason: e.to_string(),
+    })?;
+    client_config_for_roots(roots, Some(pin))
 }
 
 fn client_config_for_roots(
     certificates: Vec<rustls::pki_types::CertificateDer<'static>>,
+    legacy_pin: Option<rustls::pki_types::CertificateDer<'static>>,
 ) -> Result<rustls::ClientConfig, PkiError> {
     let mut roots = rustls::RootCertStore::empty();
     for certificate in certificates {
@@ -135,7 +158,11 @@ fn client_config_for_roots(
                 reason: format!("'{CONTROL_PLANE_SERVER_NAME}' is not a valid TLS name: {e}"),
             }
         })?;
-    let verifier = ReservedNameVerifier { inner, server_name };
+    let verifier = ReservedNameVerifier {
+        inner,
+        server_name,
+        legacy_pin,
+    };
     let mut config = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|e| PkiError::TlsConfig {
@@ -157,6 +184,7 @@ fn client_config_for_roots(
 struct ReservedNameVerifier {
     inner: Arc<rustls::client::WebPkiServerVerifier>,
     server_name: rustls::pki_types::ServerName<'static>,
+    legacy_pin: Option<rustls::pki_types::CertificateDer<'static>>,
 }
 
 impl rustls::client::danger::ServerCertVerifier for ReservedNameVerifier {
@@ -164,10 +192,23 @@ impl rustls::client::danger::ServerCertVerifier for ReservedNameVerifier {
         &self,
         end_entity: &rustls::pki_types::CertificateDer<'_>,
         intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
+        server_name: &rustls::pki_types::ServerName<'_>,
         ocsp_response: &[u8],
         now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        // Only a byte-for-byte operator pin permits IP verification. A worker
+        // with the same IP SAN and CA still cannot pass this branch.
+        if self.legacy_pin.as_ref() == Some(end_entity)
+            && matches!(server_name, rustls::pki_types::ServerName::IpAddress(_))
+        {
+            return self.inner.verify_server_cert(
+                end_entity,
+                intermediates,
+                server_name,
+                ocsp_response,
+                now,
+            );
+        }
         self.inner.verify_server_cert(
             end_entity,
             intermediates,
@@ -179,7 +220,7 @@ impl rustls::client::danger::ServerCertVerifier for ReservedNameVerifier {
             | rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForNameContext { .. }) => {
                 rustls::Error::InvalidCertificate(rustls::CertificateError::Other(
                     rustls::OtherError(Arc::new(std::io::Error::other(
-                        "control plane certificate lacks its reserved identity; upgrade and restart the control plane before upgrading workers. IP verification fallback is unsafe",
+                        "control plane certificate lacks its reserved identity; upgrade and restart the control plane before upgrading workers, or independently pin its exact legacy leaf certificate; automatic IP verification fallback is unsafe",
                     ))),
                 ))
             }
@@ -593,7 +634,7 @@ mod tests {
     }
 
     #[test]
-    fn an_old_control_plane_requires_a_control_plane_first_upgrade() {
+    fn an_unpinned_old_control_plane_requires_a_control_plane_first_upgrade() {
         let ca = generate_cluster_ca().unwrap();
         let address = "10.201.0.1".parse().unwrap();
         let (cert, key) = leaf(&ca, &["10.201.0.1".into()]);
@@ -605,6 +646,41 @@ mod tests {
                 .contains("upgrade and restart the control plane"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn an_independent_legacy_pin_allows_worker_first_upgrades_but_not_same_ip_workers() {
+        let ca = generate_cluster_ca().unwrap();
+        let address = "10.201.0.1".parse().unwrap();
+        let (legacy_cert, legacy_key) = leaf(&ca, &["10.201.0.1".into()]);
+        let client = || {
+            control_plane_client_config_with_legacy_pin(
+                ca.cert_pem.as_bytes(),
+                legacy_cert.as_bytes(),
+            )
+            .unwrap()
+        };
+        handshake(client(), &ca, &legacy_cert, &legacy_key, address).unwrap();
+        let (worker_cert, worker_key) = leaf(&ca, &["10.201.0.1".into()]);
+        assert!(handshake(client(), &ca, &worker_cert, &worker_key, address).is_err());
+        let (new_cert, new_key) = leaf(&ca, &control_plane_node_api_sans(address));
+        handshake(client(), &ca, &new_cert, &new_key, address).unwrap();
+        assert!(handshake(
+            client(),
+            &ca,
+            &legacy_cert,
+            &legacy_key,
+            "10.201.0.2".parse().unwrap()
+        )
+        .is_err());
+        // A pin must not bypass trust-chain verification.
+        let other = generate_cluster_ca().unwrap();
+        let untrusted_client = control_plane_client_config_with_legacy_pin(
+            other.cert_pem.as_bytes(),
+            legacy_cert.as_bytes(),
+        )
+        .unwrap();
+        assert!(handshake(untrusted_client, &ca, &legacy_cert, &legacy_key, address).is_err());
     }
 
     #[test]

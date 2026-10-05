@@ -173,14 +173,23 @@ pub fn control_plane_ca(config: &AgentConfig) -> Option<ControlPlaneCa> {
     };
     match std::fs::read(path)
         .map_err(|error| error.to_string())
-        .and_then(|pem| ControlPlaneCa::from_pem(&pem).map_err(|error| error.to_string()))
-    {
+        .and_then(|pem| match config.control_plane_legacy_cert_path.as_ref() {
+            Some(pin_path) => {
+                let pin = std::fs::read(pin_path).map_err(|error| {
+                    format!("cannot read legacy pin {}: {error}", pin_path.display())
+                })?;
+                temps_core::node_pki::control_plane_client_config_with_legacy_pin(&pem, &pin)
+                    .map(|tls| ControlPlaneCa { tls })
+                    .map_err(|error| error.to_string())
+            }
+            None => ControlPlaneCa::from_pem(&pem).map_err(|error| error.to_string()),
+        }) {
         Ok(ca) => Some(ca),
         Err(error) => {
             tracing::warn!(
                 path = %path.display(),
                 %error,
-                "the cluster CA is unreadable; control-plane calls trust only public roots"
+                "the cluster CA or legacy pin is unusable; control-plane calls trust only public roots"
             );
             None
         }
@@ -306,6 +315,10 @@ pub struct AgentConfig {
     /// [`AgentConfig::effective_control_plane_trust`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_plane_trust: Option<ControlPlaneTrust>,
+    /// Temporary, independently provisioned leaf pin for worker-first upgrades
+    /// against an older IP-only control plane. Never downloaded automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_plane_legacy_cert_path: Option<std::path::PathBuf>,
     /// X25519 private key used only to decrypt this node's certificate bundles.
     #[serde(default)]
     pub public_ingress_private_key: Option<String>,
@@ -800,6 +813,7 @@ mod tests {
             mesh_key_dir: default_mesh_key_dir(),
             wg_endpoint: None,
             control_plane_trust: Some(ControlPlaneTrust::PublicRoots),
+            control_plane_legacy_cert_path: None,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -985,11 +999,17 @@ mod tests {
 
     #[test]
     fn control_plane_trust_round_trips_through_agent_json() {
-        let (config, _dir) = config_with_cluster_ca(ControlPlaneTrust::ClusterCa);
+        let (mut config, _dir) = config_with_cluster_ca(ControlPlaneTrust::ClusterCa);
+        config.control_plane_legacy_cert_path =
+            Some("/var/lib/temps/control-plane-legacy.pem".into());
         let json = serde_json::to_value(&config).unwrap();
         assert_eq!(json["control_plane_trust"], "cluster_ca");
         let back: AgentConfig = serde_json::from_value(json).unwrap();
         assert_eq!(back.control_plane_trust, Some(ControlPlaneTrust::ClusterCa));
+        assert_eq!(
+            back.control_plane_legacy_cert_path,
+            config.control_plane_legacy_cert_path
+        );
     }
 
     #[test]
@@ -1011,6 +1031,13 @@ mod tests {
     /// An HTTPS server on 127.0.0.1 presenting a leaf the cluster CA in
     /// `ca` signed for `sans`, answering every request with 200.
     async fn https_server(ca: &temps_core::node_pki::ClusterCa, sans: &[String]) -> String {
+        https_server_with_leaf(ca, sans).await.0
+    }
+
+    async fn https_server_with_leaf(
+        ca: &temps_core::node_pki::ClusterCa,
+        sans: &[String],
+    ) -> (String, String) {
         use rustls::pki_types::{CertificateDer, PrivateKeyDer};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1055,7 +1082,7 @@ mod tests {
                 });
             }
         });
-        format!("https://{address}")
+        (format!("https://{address}"), leaf.cert_pem)
     }
 
     /// The control plane is reached at an address (its mesh address), but a
@@ -1094,6 +1121,40 @@ mod tests {
             .await
             .expect_err("a worker leaf for the control plane's address is refused");
         assert!(error.is_connect(), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn a_worker_first_upgrade_uses_only_the_independently_provisioned_legacy_leaf() {
+        let (mut config, dir) = config_with_cluster_ca(ControlPlaneTrust::ClusterCa);
+        let ca = temps_core::node_pki::generate_cluster_ca().unwrap();
+        std::fs::write(config.cluster_ca_path.as_ref().unwrap(), &ca.cert_pem).unwrap();
+        let (legacy_url, legacy_leaf) = https_server_with_leaf(&ca, &["127.0.0.1".into()]).await;
+        let pin_path = dir.path().join("control-plane-legacy.pem");
+        std::fs::write(&pin_path, legacy_leaf).unwrap();
+        config.control_plane_legacy_cert_path = Some(pin_path);
+        config.control_plane_url = legacy_url.clone();
+        let client = control_plane_client_builder(&config).build().unwrap();
+        assert!(client
+            .get(&legacy_url)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success());
+        let worker_url = https_server(&ca, &["127.0.0.1".into()]).await;
+        assert!(client.get(worker_url).send().await.is_err());
+        let new_url = https_server(
+            &ca,
+            &temps_core::node_pki::control_plane_node_api_sans("127.0.0.1".parse().unwrap()),
+        )
+        .await;
+        assert!(client
+            .get(new_url)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success());
     }
 
     #[test]
