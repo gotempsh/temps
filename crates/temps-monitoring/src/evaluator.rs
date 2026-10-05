@@ -1034,7 +1034,7 @@ fn alarm_type_for_rule(rule: &monitoring_alert_rules::Model) -> AlarmType {
 /// Error type for seeding operations — re-exported from `temps_metrics`.
 pub use temps_metrics::MetricsError;
 
-/// Insert a default set of alert rules for `service_id` if none exist yet.
+/// Install all missing built-in alert rules atomically within the service budget.
 ///
 /// Uses `INSERT … ON CONFLICT DO NOTHING` against the unique index
 /// `(service_id, metric_name)` so concurrent calls are safe — no TOCTOU race.
@@ -1055,11 +1055,25 @@ pub use temps_metrics::MetricsError;
 /// - Anything else — no rules inserted.
 pub const MAX_ALERT_RULES_PER_SERVICE: u64 = 100;
 
+/// Failure to install a complete set of built-in service alerts.
+#[derive(Debug, thiserror::Error)]
+pub enum DefaultRuleSeedError {
+    #[error("Database error: {0}")]
+    Database(#[from] sea_orm::DbErr),
+    #[error("Service {service_id} has {existing} alert rules and needs {missing} additional built-in rules; the limit is {limit}. Remove enough custom rules before enabling metrics.")]
+    Capacity {
+        service_id: i32,
+        existing: u64,
+        missing: u64,
+        limit: u64,
+    },
+}
+
 pub async fn seed_default_rules(
     db: &DatabaseConnection,
     service_id: i32,
     engine: &str,
-) -> Result<(), MetricsError> {
+) -> Result<(), DefaultRuleSeedError> {
     let seeds: Vec<RuleSeed> = match engine.to_lowercase().as_str() {
         "postgres" => postgres_default_seeds(),
         "redis" => redis_default_seeds(),
@@ -1077,34 +1091,55 @@ pub async fn seed_default_rules(
     use sea_orm::{
         ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QuerySelect, TransactionTrait,
     };
-    let transaction = db.begin().await.map_err(MetricsError::DatabaseError)?;
+    let transaction = db.begin().await.map_err(DefaultRuleSeedError::Database)?;
     if temps_entities::external_services::Entity::find_by_id(service_id)
         .lock_exclusive()
         .one(&transaction)
         .await
-        .map_err(MetricsError::DatabaseError)?
+        .map_err(DefaultRuleSeedError::Database)?
         .is_none()
     {
         transaction
             .rollback()
             .await
-            .map_err(MetricsError::DatabaseError)?;
+            .map_err(DefaultRuleSeedError::Database)?;
         return Ok(());
     }
-    let mut count = temps_entities::monitoring_alert_rules::Entity::find()
+    let count = temps_entities::monitoring_alert_rules::Entity::find()
         .filter(temps_entities::monitoring_alert_rules::Column::ServiceId.eq(service_id))
         .count(&transaction)
         .await
-        .map_err(MetricsError::DatabaseError)?;
+        .map_err(DefaultRuleSeedError::Database)?;
+
+    let existing_metrics = temps_entities::monitoring_alert_rules::Entity::find()
+        .filter(temps_entities::monitoring_alert_rules::Column::ServiceId.eq(service_id))
+        .all(&transaction)
+        .await?;
+    let missing = seeds
+        .iter()
+        .filter(|seed| {
+            !existing_metrics
+                .iter()
+                .any(|rule| rule.metric_name == seed.metric_name)
+        })
+        .map(|seed| seed.metric_name)
+        .collect::<std::collections::HashSet<_>>()
+        .len() as u64;
+    if count.saturating_add(missing) > MAX_ALERT_RULES_PER_SERVICE {
+        transaction.rollback().await?;
+        return Err(DefaultRuleSeedError::Capacity {
+            service_id,
+            existing: count,
+            missing,
+            limit: MAX_ALERT_RULES_PER_SERVICE,
+        });
+    }
 
     // Insert each rule individually with ON CONFLICT DO NOTHING so concurrent
     // invocations (e.g. rapid retries or parallel API calls) are safely handled
     // by the unique index on (service_id, metric_name).
     use sea_orm::ConnectionTrait;
     for seed in &seeds {
-        if count >= MAX_ALERT_RULES_PER_SERVICE {
-            break;
-        }
         let sql = format!(
             "INSERT INTO monitoring_alert_rules \
              (service_id, deployment_id, name, metric_name, threshold, comparator, severity, for_duration_secs, enabled) \
@@ -1119,19 +1154,18 @@ pub async fn seed_default_rules(
             for_duration = seed.for_duration_secs,
         );
 
-        let inserted = transaction
+        transaction
             .execute(sea_orm::Statement::from_string(
                 sea_orm::DatabaseBackend::Postgres,
                 sql,
             ))
             .await
-            .map_err(MetricsError::DatabaseError)?;
-        count += inserted.rows_affected();
+            .map_err(DefaultRuleSeedError::Database)?;
     }
     transaction
         .commit()
         .await
-        .map_err(MetricsError::DatabaseError)?;
+        .map_err(DefaultRuleSeedError::Database)?;
 
     info!(
         service_id,

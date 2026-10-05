@@ -971,13 +971,15 @@ async fn toggle_service_metrics(
         if let Err(e) =
             temps_monitoring::seed_default_rules(state.db.as_ref(), id, &service.service_type).await
         {
-            // Non-fatal — the user can create rules manually. Log but continue.
-            error!(
-                service_id = id,
-                engine = %service.service_type,
-                error = %e,
-                "Failed to seed default alert rules; continuing"
-            );
+            // Do not enable metrics while silently omitting built-in alerts.
+            return Err(match e {
+                temps_monitoring::DefaultRuleSeedError::Capacity { .. } => {
+                    bad_request().detail(e.to_string()).build()
+                }
+                temps_monitoring::DefaultRuleSeedError::Database(_) => internal_server_error()
+                    .detail("Failed to install built-in alert rules")
+                    .build(),
+            });
         }
 
         // For OTLP-push services (RustFS): provision an si_ ingest key and
@@ -2218,11 +2220,18 @@ mod tests {
                 MAX_ALERT_RULES_PER_SERVICE
             ),
         );
-        seeded.expect("default seeding at the cap is harmless");
+        assert!(matches!(
+            seeded,
+            Err(temps_monitoring::DefaultRuleSeedError::Capacity { .. })
+        ));
         assert!(custom.is_ok() || matches!(custom, Err(AlertRuleCreateError::LimitReached { .. })));
-        temps_monitoring::seed_default_rules(db.as_ref(), a, "postgres")
+        let error = temps_monitoring::seed_default_rules(db.as_ref(), a, "postgres")
             .await
-            .expect("idempotent seed at cap");
+            .expect_err("full custom-rule budget must report missing defaults");
+        assert!(matches!(
+            error,
+            temps_monitoring::DefaultRuleSeedError::Capacity { existing: 100, .. }
+        ));
         use sea_orm::PaginatorTrait;
         assert_eq!(
             monitoring_alert_rules::Entity::find()
@@ -2231,6 +2240,46 @@ mod tests {
                 .await
                 .unwrap(),
             MAX_ALERT_RULES_PER_SERVICE
+        );
+
+        // A failed seed inserts no partial default set. Free capacity and retry:
+        // all built-ins are installed, and the retry remains idempotent.
+        assert_eq!(
+            monitoring_alert_rules::Entity::find()
+                .filter(monitoring_alert_rules::Column::ServiceId.eq(a))
+                .filter(monitoring_alert_rules::Column::MetricName.like("pg.%"))
+                .count(db.as_ref())
+                .await
+                .unwrap(),
+            0
+        );
+        for index in 2..12 {
+            monitoring_alert_rules::Entity::delete_many()
+                .filter(monitoring_alert_rules::Column::ServiceId.eq(a))
+                .filter(monitoring_alert_rules::Column::MetricName.eq(format!("custom.{index}")))
+                .exec(db.as_ref())
+                .await
+                .unwrap();
+        }
+        temps_monitoring::seed_default_rules(db.as_ref(), a, "postgres")
+            .await
+            .expect("complete defaults fit after freeing capacity");
+        let after_seed = monitoring_alert_rules::Entity::find()
+            .filter(monitoring_alert_rules::Column::ServiceId.eq(a))
+            .count(db.as_ref())
+            .await
+            .unwrap();
+        assert!(after_seed > 90 && after_seed <= 100);
+        temps_monitoring::seed_default_rules(db.as_ref(), a, "postgres")
+            .await
+            .expect("idempotent retry");
+        assert_eq!(
+            monitoring_alert_rules::Entity::find()
+                .filter(monitoring_alert_rules::Column::ServiceId.eq(a))
+                .count(db.as_ref())
+                .await
+                .unwrap(),
+            after_seed
         );
 
         // The limit is per service: another service is unaffected.
