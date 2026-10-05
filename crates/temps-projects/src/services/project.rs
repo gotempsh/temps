@@ -2221,7 +2221,7 @@ impl ProjectService {
         )?;
 
         let name = validate_project_name(&request.name)?;
-        if name != project.name {
+        if name.to_lowercase() != project.name.to_lowercase() {
             self.ensure_project_name_available(&name, Some(project_id))
                 .await?;
         }
@@ -2765,7 +2765,7 @@ impl ProjectService {
         // Refuse a rename onto another project's name before any of this
         // request's independent writes commit.
         if let Some(name_value) = new_name.as_deref() {
-            if name_value != project.name {
+            if name_value.to_lowercase() != project.name.to_lowercase() {
                 self.ensure_project_name_available(name_value, Some(project_id))
                     .await?;
             }
@@ -3826,8 +3826,10 @@ impl ProjectService {
                 project_id
             )))?;
 
-        self.lock_project_name_available(txn, new_name, Some(project_id))
-            .await?;
+        if locked.name.to_lowercase() != new_name.to_lowercase() {
+            self.lock_project_name_available(txn, new_name, Some(project_id))
+                .await?;
+        }
         Ok(if locked.name == new_name {
             None
         } else {
@@ -5514,20 +5516,30 @@ impl ProjectService {
         let id = active.id.clone().take();
         let slug = active.slug.clone().take().unwrap_or_default();
         let txn = self.db.begin().await?;
-        if !inserting {
-            if let Some(id) = id {
-                projects::Entity::find_by_id(id)
-                    .lock_exclusive()
-                    .one(&txn)
-                    .await?;
+        let changing_name = if !inserting {
+            let current = projects::Entity::find_by_id(id.ok_or_else(|| {
+                ProjectError::InvalidInput("Project ID is required for an update".to_string())
+            })?)
+            .lock_exclusive()
+            .one(&txn)
+            .await?
+            .ok_or_else(|| {
+                ProjectError::NotFound("Project disappeared during update".to_string())
+            })?;
+            current.name.to_lowercase() != name.to_lowercase()
+        } else {
+            true
+        };
+        // Legacy duplicate display names must not block unrelated edits or
+        // recasing. Only a new normalized name claims the shared namespace.
+        if changing_name {
+            if let Err(error) = self
+                .lock_project_name_available(&txn, &name, if inserting { None } else { id })
+                .await
+            {
+                txn.rollback().await?;
+                return Err(error);
             }
-        }
-        if let Err(error) = self
-            .lock_project_name_available(&txn, &name, if inserting { None } else { id })
-            .await
-        {
-            txn.rollback().await?;
-            return Err(error);
         }
         let result = if inserting {
             active.insert(&txn).await
@@ -10570,6 +10582,64 @@ mod tests {
         // The deleted project's slug stays reserved.
         assert_ne!(project.slug, "whoami");
         assert!(project.slug.starts_with("whoami-"));
+    }
+
+    #[tokio::test]
+    async fn legacy_duplicate_names_allow_unrelated_updates_and_unchanged_settings() {
+        if !docker_available().await {
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let service = create_test_services(test_db.db.clone(), Arc::new(MockJobQueue::new())).await;
+        let first = service
+            .create_project(create_request("legacy"))
+            .await
+            .unwrap();
+        let second = service
+            .create_project(create_request("other"))
+            .await
+            .unwrap();
+        // Seed a state permitted before display-name uniqueness enforcement.
+        let second = projects::ActiveModel {
+            id: Set(second.id),
+            name: Set("legacy".to_string()),
+            ..Default::default()
+        };
+        second.update(test_db.db.as_ref()).await.unwrap();
+        let update = projects::ActiveModel {
+            id: Set(first.id),
+            name: Set("legacy".to_string()),
+            directory: Set("/changed".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            service
+                .persist_named_project(update, false)
+                .await
+                .unwrap()
+                .directory,
+            "/changed"
+        );
+        service
+            .update_project_settings(
+                first.id,
+                UpdateProjectSettingsParams {
+                    name: Some("legacy".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        service
+            .update_project_settings(
+                first.id,
+                UpdateProjectSettingsParams {
+                    name: Some("LEGACY".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
