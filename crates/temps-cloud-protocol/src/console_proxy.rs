@@ -152,10 +152,12 @@ pub enum ConsoleStreamEndReason {
     Unknown,
 }
 
-/// Either side → the other: no more data will follow in the sender's direction.
+/// Either side → the other: end an HTTP body or report stream termination.
 /// Cloud sends `Complete` after the last request-body chunk (including for an
 /// empty body with no declared length). This half-closes the request body;
 /// the instance still sends response headers, chunks and its own stream end.
+/// Request EOF never ends an upgraded WebSocket relay; relay termination uses
+/// WebSocket close frames or `ConsoleStreamCancel`.
 /// A declared `Content-Length` also allows the instance to detect request EOF
 /// without waiting for this frame. Error endings abort the request instead.
 ///

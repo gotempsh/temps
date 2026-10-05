@@ -613,6 +613,9 @@ async fn idle_watchdog(clock: &ActivityClock, timeout: Duration) {
 // ---------------------------------------------------------------------------
 
 struct StreamEntry {
+    /// Upgrade requests have no HTTP body channel. Their request EOF must
+    /// never close the sender later installed for WebSocket relay bytes.
+    upgrade_requested: bool,
     /// Where the next inbound data frame's payload goes: the request body
     /// channel before a response is sent, or the WebSocket relay-write
     /// channel afterward (swapped exactly once, on a successful upgrade).
@@ -890,6 +893,10 @@ async fn handle_envelope(
             let truncated = {
                 let table = shared.streams.lock().unwrap_or_else(|p| p.into_inner());
                 table.get(&end.stream_id).and_then(|entry| {
+                    if entry.upgrade_requested {
+                        entry.activity.touch();
+                        return None;
+                    }
                     let remaining = entry.remaining_inbound_bytes.load(Ordering::Acquire);
                     if remaining > 0 {
                         entry.abort.abort();
@@ -1116,6 +1123,7 @@ async fn handle_stream_open(shared: Arc<ConnectionShared>, open: ConsoleStreamOp
     ));
     let activity = Arc::new(ActivityClock::new());
 
+    let upgrade_requested = open.upgrade_requested;
     let stream_shared = shared.clone();
     let inbound_for_task = inbound.clone();
     let remaining_for_task = remaining_inbound_bytes.clone();
@@ -1147,6 +1155,7 @@ async fn handle_stream_open(shared: Arc<ConnectionShared>, open: ConsoleStreamOp
         .insert(
             stream_id,
             StreamEntry {
+                upgrade_requested,
                 inbound,
                 remaining_inbound_bytes,
                 outbound_credit,
@@ -2810,6 +2819,7 @@ mod tests {
             shared.streams.lock().unwrap().insert(
                 Uuid::new_v4(),
                 StreamEntry {
+                    upgrade_requested: false,
                     inbound: Arc::new(StdMutex::new(None)),
                     remaining_inbound_bytes: Arc::new(AtomicI64::new(-1)),
                     outbound_credit: Arc::new(tokio::sync::Semaphore::new(0)),
@@ -3089,7 +3099,10 @@ mod tests {
         let end: ConsoleStreamEnd = envelope.decode(ConsoleStreamEnd::KIND).unwrap();
         assert!(matches!(end.reason, ConsoleStreamEndReason::Error { .. }));
         assert!(
-            called_rx.try_recv().is_err(),
+            !matches!(
+                tokio::time::timeout(Duration::from_millis(200), called_rx.recv()).await,
+                Ok(Some(()))
+            ),
             "partial body must never execute the handler"
         );
         harness.cancel_tx.send(true).unwrap();
@@ -3610,6 +3623,16 @@ mod tests {
             .push(("sec-websocket-version".into(), "13".into()));
         send_control(&mut cloud, ConsoleStreamOpen::KIND, &open).await;
 
+        send_control(
+            &mut cloud,
+            ConsoleStreamEnd::KIND,
+            &ConsoleStreamEnd {
+                stream_id,
+                reason: ConsoleStreamEndReason::Complete,
+            },
+        )
+        .await;
+
         let envelope = recv_control(&mut cloud).await;
         assert_eq!(envelope.kind, ConsoleResponseHead::KIND);
         let head: ConsoleResponseHead = envelope
@@ -3624,10 +3647,16 @@ mod tests {
         // genuine RFC 6455 framing over the relay.
         let (to_instance_tx, mut to_instance_rx) = mpsc::channel::<bytes::Bytes>(64);
         let (from_instance_tx, from_instance_rx) = mpsc::channel::<bytes::Bytes>(64);
+        let (eof_tx, mut eof_rx) = mpsc::channel::<tokio::sync::oneshot::Sender<()>>(1);
         let pump = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     biased;
+                    Some(ack) = eof_rx.recv() => {
+                        send_control(&mut cloud, ConsoleStreamEnd::KIND,
+                            &ConsoleStreamEnd { stream_id, reason: ConsoleStreamEndReason::Complete }).await;
+                        let _ = ack.send(());
+                    }
                     outgoing = to_instance_rx.recv() => {
                         match outgoing {
                             Some(bytes) => {
@@ -3679,6 +3708,15 @@ mod tests {
             .expect("echo arrives")
             .expect("echo readable");
         assert_eq!(large_echo.into_data(), large_message);
+
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        eof_tx
+            .send(ack_tx)
+            .await
+            .expect("request EOF must reach pump");
+        ack_rx
+            .await
+            .expect("request EOF must be sent before the next WebSocket frame");
 
         ws.send(Message::Text("hello over the tunnel".into()))
             .await
