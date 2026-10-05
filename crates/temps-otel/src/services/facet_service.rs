@@ -786,9 +786,12 @@ impl FacetService {
     /// clear, so a slot can't be reused with stale data still in it.
     async fn ch_issue_clear(&self, facet: Model) -> Result<(), FacetError> {
         let Some(ch) = self.ch_client.as_ref() else {
-            // No ClickHouse configured means there's nothing to clear —
-            // finish the delete outright.
-            return self.finalize_delete(facet.id).await;
+            // Preserve the occupied slot until the old backend can confirm clearance.
+            tracing::debug!(
+                facet_id = facet.id,
+                "ClickHouse unavailable; retaining facet slot pending clearance"
+            );
+            return Ok(());
         };
 
         let column = facet_column_name(facet.slot as u8);
@@ -826,12 +829,11 @@ impl FacetService {
     /// (-> `completed`) or a slot clear (-> hard-delete the row).
     async fn ch_check_mutation(&self, facet: Model, is_delete: bool) -> Result<(), FacetError> {
         let Some(ch) = self.ch_client.as_ref() else {
-            // Same reasoning as `ch_issue_clear`/`ch_issue_backfill`: with no
-            // ClickHouse configured there is no mutation to poll. A delete has
-            // nothing left to clear; a backfill can never finish, so surface
-            // it as failed instead of leaving it `running` forever.
+            // A disconnected ClickHouse backend may still hold this slot's
+            // data. Retain deleting rows until clearing can be verified; new
+            // backfills fail visibly because they cannot run.
             return if is_delete {
-                self.finalize_delete(facet.id).await
+                Ok(())
             } else {
                 self.fail_clickhouse_unconfigured(&facet).await
             };
@@ -1377,7 +1379,7 @@ mod tests {
 
     // ── retry_backfill / advance_one ─────────────────────────────────────────
 
-    use sea_orm::{DatabaseBackend as MockBackend, MockDatabase, MockExecResult};
+    use sea_orm::{DatabaseBackend as MockBackend, MockDatabase};
 
     fn facet_model(id: i32, status: &str, backend: &str, ch_mutation_id: Option<&str>) -> Model {
         Model {
@@ -1540,22 +1542,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn advance_one_deleting_clickhouse_without_client_finalizes_delete() {
-        // backend=clickhouse, deleting, no mutation_id yet, no ch_client ->
-        // ch_issue_clear short-circuits straight to finalize_delete (nothing
-        // to clear on a backend that was never configured).
-        let model = facet_model(1, "deleting", "clickhouse", None);
-        let db = MockDatabase::new(MockBackend::Postgres)
-            .append_exec_results(vec![MockExecResult {
-                last_insert_id: 0,
-                rows_affected: 1,
-            }])
-            // refresh_cache() reload after the delete
-            .append_query_results(vec![Vec::<Model>::new()])
-            .into_connection();
-        let service = FacetService::new(Arc::new(db), None, empty_cache());
-
-        let result = service.advance_one(model).await;
-        assert!(result.is_ok());
+    async fn deleting_clickhouse_facets_keep_their_slots_without_a_client() {
+        let db = Arc::new(MockDatabase::new(MockBackend::Postgres).into_connection());
+        let service = FacetService::new(db.clone(), None, empty_cache());
+        for mutation in [None, Some("mutation-1")] {
+            let mut model = facet_model(1, "deleting", "clickhouse", None);
+            model.ch_mutation_id = mutation.map(str::to_string);
+            service.advance_one(model).await.unwrap();
+        }
+        drop(service);
+        assert!(
+            Arc::try_unwrap(db)
+                .unwrap()
+                .into_transaction_log()
+                .is_empty(),
+            "a disconnected backend must not free slots or delete rows"
+        );
     }
 }

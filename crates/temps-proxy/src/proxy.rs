@@ -1022,7 +1022,7 @@ pub struct LoadBalancer {
     /// histogram). Updated on every completed/failed request; drained by the
     /// background `ProxyMetricsSampler`, never read on the request path.
     proxy_metrics: Arc<crate::metrics::ProxyMetrics>,
-    upstream_failures: temps_core::log_transitions::KeyedFailureLatch<(i32, i32)>,
+    upstream_failures: temps_core::log_transitions::KeyedFailureLatch<(i32, i32, Option<String>)>,
     /// Startup state of the in-process console (`temps serve`). When set and
     /// the console failed to start, console-bound requests get a status page
     /// naming the cause instead of the generic 503 — see
@@ -1034,6 +1034,22 @@ pub struct LoadBalancer {
 /// Status recorded in proxy logs when the client disconnected before a
 /// response could be sent (the nginx convention).
 const CLIENT_CLOSED_REQUEST: u16 = 499;
+
+/// Project outages share a key; unscoped routes use their actual upstream.
+fn upstream_failure_key(
+    project_id: Option<i32>,
+    environment_id: Option<i32>,
+    upstream: Option<&str>,
+    host: &str,
+) -> (i32, i32, Option<String>) {
+    (
+        project_id.unwrap_or(0),
+        environment_id.unwrap_or(0),
+        project_id
+            .is_none()
+            .then(|| upstream.unwrap_or(host).to_owned()),
+    )
+}
 
 /// Who caused a proxy failure, which decides how loudly it is logged.
 ///
@@ -6464,9 +6480,11 @@ impl ProxyHttp for LoadBalancer {
         Self::CTX: Send + Sync,
     {
         {
-            let key = (
-                ctx.project.as_ref().map_or(0, |p| p.id),
-                ctx.environment.as_ref().map_or(0, |e| e.id),
+            let key = upstream_failure_key(
+                ctx.project.as_ref().map(|p| p.id),
+                ctx.environment.as_ref().map(|e| e.id),
+                ctx.upstream_host.as_deref(),
+                &ctx.host,
             );
             // Only an actual upstream response proves recovery. Selecting a
             // route or starting a retry must not re-arm the failure warning.
@@ -6981,9 +6999,11 @@ impl ProxyHttp for LoadBalancer {
         match failure {
             ProxyFailureKind::ClientGone => log_failure!(debug),
             ProxyFailureKind::Upstream => {
-                let key = (
-                    ctx.project.as_ref().map_or(0, |p| p.id),
-                    ctx.environment.as_ref().map_or(0, |e| e.id),
+                let key = upstream_failure_key(
+                    ctx.project.as_ref().map(|p| p.id),
+                    ctx.environment.as_ref().map(|e| e.id),
+                    ctx.upstream_host.as_deref(),
+                    &ctx.host,
                 );
                 if self
                     .upstream_failures
@@ -9630,6 +9650,7 @@ mod static_response_policy_tests {
 
 #[cfg(test)]
 mod proxy_failure_kind_tests {
+    use super::upstream_failure_key;
     use super::ProxyFailureKind;
     use pingora::{Error, ErrorSource, ErrorType};
 
@@ -9651,6 +9672,23 @@ mod proxy_failure_kind_tests {
                 ProxyFailureKind::ClientGone
             );
         }
+    }
+
+    #[test]
+    fn independent_unscoped_upstreams_keep_independent_outages() {
+        let latch = temps_core::log_transitions::KeyedFailureLatch::default();
+        let a = upstream_failure_key(None, None, Some("service-a:80"), "a.example.com");
+        let b = upstream_failure_key(None, None, Some("service-b:80"), "b.example.com");
+        assert!(latch.record_failure(a.clone()).should_log());
+        assert!(latch.record_failure(b.clone()).should_log());
+        assert!(!latch.record_failure(a.clone()).should_log());
+        latch.record_success(&a);
+        assert!(latch.is_failing(&b));
+        assert!(latch.record_failure(a).should_log());
+        assert_eq!(
+            upstream_failure_key(Some(1), Some(2), Some("host"), "route"),
+            (1, 2, None)
+        );
     }
 
     #[test]

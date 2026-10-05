@@ -442,6 +442,13 @@ impl ContainerHealthMonitor {
             .await
             .map_err(|e| format!("Failed to query deployment_containers: {}", e))?;
 
+        let active_nodes: std::collections::HashSet<i32> = containers
+            .iter()
+            .filter_map(|container| container.node_id)
+            .collect();
+        self.log_state
+            .unresolved_nodes
+            .retain(|id| active_nodes.contains(id));
         if containers.is_empty() {
             self.log_state
                 .retain_containers(&std::collections::HashSet::new());
@@ -994,10 +1001,8 @@ impl ContainerHealthMonitor {
                 // the earlier intentional stop and never alarm.
                 self.clear_user_stop_marker(container).await;
             }
-            _ => {
-                // Container is in a healthy state, nothing to do
-                self.note_container_up(container);
-            }
+            temps_deployer::ContainerStatus::Running => self.note_container_up(container),
+            _ => {}
         }
     }
 
@@ -2559,6 +2564,32 @@ mod tests {
         monitor
             .check_container_status(&container, &deployment, &info)
             .await;
+    }
+
+    #[tokio::test]
+    async fn paused_and_created_containers_do_not_report_recovery() {
+        let deployer = Arc::new(MockDeployer::new(0, ContainerStatus::Running));
+        let monitor = make_monitor(deployer.clone());
+        let container = make_container_model(1);
+        let deployment = make_deployment_model();
+        monitor.log_state.exited.record_failure(container.id);
+        let mut info = deployer.get_container_info("abc123").await.unwrap();
+        for status in [
+            ContainerStatus::Created,
+            ContainerStatus::Paused,
+            ContainerStatus::Stopped,
+        ] {
+            info.status = status;
+            monitor
+                .check_container_status(&container, &deployment, &info)
+                .await;
+            assert!(monitor.log_state.exited.is_failing(&container.id));
+        }
+        info.status = ContainerStatus::Running;
+        monitor
+            .check_container_status(&container, &deployment, &info)
+            .await;
+        assert!(!monitor.log_state.exited.is_failing(&container.id));
     }
 
     // ── Resource threshold tests ──────────────────────────────────────

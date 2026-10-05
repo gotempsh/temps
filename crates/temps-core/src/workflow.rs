@@ -146,8 +146,7 @@ impl WorkflowError {
     /// the executor, and uncategorised internal errors.
     pub fn is_workload_outcome(&self) -> bool {
         match self {
-            Self::JobExecutionFailed(_)
-            | Self::JobValidationFailed(_)
+            Self::JobValidationFailed(_)
             | Self::WorkflowCancelled
             | Self::BuildCancelled
             | Self::InvalidArchiveEntry { .. }
@@ -157,7 +156,8 @@ impl WorkflowError {
             | Self::LocalWorkloadsDisabled(_)
             | Self::DockerSocketNotMounted { .. }
             | Self::DockerSocketDeployRequiresAdmin { .. } => true,
-            Self::DependencyCycleDetected(_)
+            Self::JobExecutionFailed(_)
+            | Self::DependencyCycleDetected(_)
             | Self::JobNotFound(_)
             | Self::IoError(_)
             | Self::SerializationError(_)
@@ -888,7 +888,6 @@ mod tests {
     #[test]
     fn workload_outcomes_are_distinguished_from_internal_faults() {
         let outcomes = [
-            WorkflowError::JobExecutionFailed("build exited with code 1".into()),
             WorkflowError::JobValidationFailed("no Dockerfile".into()),
             WorkflowError::WorkflowCancelled,
             WorkflowError::BuildCancelled,
@@ -900,6 +899,9 @@ mod tests {
         }
 
         let faults = [
+            WorkflowError::JobExecutionFailed(
+                "database unavailable while loading security policy".into(),
+            ),
             WorkflowError::DependencyCycleDetected("a -> b -> a".into()),
             WorkflowError::JobNotFound("deploy".into()),
             WorkflowError::IoError(std::io::Error::other("disk full")),

@@ -277,6 +277,11 @@ struct MonitorProbeSnapshot {
 /// Process-wide because probes run in detached tasks that do not carry the
 /// service instance. Only failing monitors are stored, so it is bounded by
 /// the number of monitors.
+pub(super) fn clear_monitor_log_state(monitor_id: i32) {
+    MONITOR_DOWN.record_success(&monitor_id);
+    MONITOR_CHECK_ERRORS.record_success(&monitor_id);
+}
+
 static MONITOR_DOWN: LazyLock<KeyedFailureLatch<i32>> = LazyLock::new(KeyedFailureLatch::default);
 
 /// Monitors whose check could not run at all (see [`report_check_error`]).
@@ -306,7 +311,7 @@ fn report_check_outcome(
         }
         return None;
     }
-    let outcome = latch.record_failure(monitor_id);
+    let outcome = latch.record_failure_bounded(monitor_id, 4096);
     let error_message = error_message.unwrap_or("none");
     match outcome {
         FailureLog::Started => warn!(
@@ -342,7 +347,7 @@ fn report_check_error(
     monitor_id: i32,
     error: &StatusPageError,
 ) -> FailureLog {
-    let outcome = latch.record_failure(monitor_id);
+    let outcome = latch.record_failure_bounded(monitor_id, 4096);
     let is_configuration = matches!(
         error,
         StatusPageError::NotFound | StatusPageError::InvalidRequest(_)

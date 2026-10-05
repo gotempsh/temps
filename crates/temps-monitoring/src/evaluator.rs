@@ -640,6 +640,7 @@ impl AlertEvaluator {
 
         if rules.is_empty() {
             self.log_state.retain_rules(&HashSet::new());
+            self.log_state.metric_sources.retain(|_| false);
             debug!("AlertEvaluator: no enabled rules to evaluate");
             return Ok(());
         }
@@ -720,6 +721,10 @@ impl AlertEvaluator {
                 "invalid target: exactly one of service_id/deployment_id/node_id must be set",
             );
         }
+
+        self.log_state
+            .metric_sources
+            .retain(|key| source_groups.contains_key(key));
 
         // Evaluate each source group with a single query_latest call.
         for ((source_kind_str, source_id), group) in &source_groups {
@@ -1016,10 +1021,20 @@ impl AlertEvaluator {
                     );
                 }
                 Err(AlarmError::NotFound { .. }) => {
-                    // The alarm row is gone (deleted by a user or retention)
-                    // or no longer in this rule's scope. Retrying can never
-                    // succeed, and re-inserting it used to fail — and log an
-                    // ERROR — on every cycle forever. Stop tracking it.
+                    match temps_entities::alarms::Entity::find_by_id(alarm_id)
+                        .one(self.db.as_ref())
+                        .await
+                    {
+                        Ok(None) => {}
+                        _ => {
+                            self.log_state.report_alarm_write_failure(rule_id, "resolve_alarm", &format!("alarm {alarm_id} scope was unavailable; retrying verified resolution"));
+                            self.firing_alarms.write().await.insert(rule_id, alarm_id);
+                            return;
+                        }
+                    }
+
+                    // The alarm row is confirmed gone (deleted by a user or
+                    // retention). Stop tracking only after that verification.
                     self.log_state.report_alarm_write_success(rule_id);
                     info!(
                         rule_id,
@@ -2290,6 +2305,62 @@ mod tests {
             .map_err(|_| "evaluator still holds a connection reference")
             .expect("evaluator was dropped, so the connection must be uniquely owned")
             .into_transaction_log()
+    }
+
+    #[tokio::test]
+    async fn recovery_retries_when_context_is_missing_but_alarm_still_exists() {
+        use temps_entities::alarms;
+        let now = Utc::now();
+        let alarm = alarms::Model {
+            id: 9,
+            project_id: Some(1),
+            environment_id: None,
+            deployment_id: None,
+            container_id: None,
+            service_id: Some(1),
+            alarm_type: "database_metric_threshold".into(),
+            severity: "warning".into(),
+            status: "resolved".into(),
+            title: "Threshold".into(),
+            message: None,
+            metadata: None,
+            fired_at: now,
+            acknowledged_at: None,
+            acknowledged_by: None,
+            resolved_at: Some(now),
+            silenced_until: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let firing = alarms::Model {
+            status: "firing".into(),
+            resolved_at: None,
+            ..alarm.clone()
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_results(vec![
+                sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 0,
+                },
+                sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 0,
+                },
+            ])
+            .append_query_results(vec![Vec::<alarms::Model>::new(), vec![firing], vec![alarm]])
+            .into_connection();
+        let evaluator = evaluator_with_db(db);
+        let rule = make_rule(Some(1), None);
+        evaluator.firing_alarms.write().await.insert(rule.id, 9);
+        evaluator
+            .handle_recovery(&rule, (None, None, None, Some(1)))
+            .await;
+        assert_eq!(evaluator.firing_alarms.read().await.get(&rule.id), Some(&9));
+        evaluator
+            .handle_recovery(&rule, (Some(1), None, None, Some(1)))
+            .await;
+        assert!(!evaluator.firing_alarms.read().await.contains_key(&rule.id));
     }
 
     // ── breach state persistence ───────────────────────────────────────────────
