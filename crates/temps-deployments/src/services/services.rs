@@ -412,8 +412,8 @@ pub struct DeploymentService {
     /// Late-bound Compose executor (the `Arc<bollard::Docker>` client it needs
     /// is only constructed later in plugin init, after `DeploymentService`
     /// itself). Set via [`Self::set_compose_executor`]. Used by
-    /// `cleanup_containers` to detect ambiguous Compose resources and refuse
-    /// deletion until their ownership is verified and they are reclaimed.
+    /// `cleanup_containers` preserves ambiguous Compose resources until an
+    /// operator verifies their ownership before reclaiming them.
     compose_executor: std::sync::OnceLock<Arc<temps_deployer::compose::ComposeExecutor>>,
     /// Audit sink for deploy-path security events (late-bound, optional).
     ///
@@ -829,10 +829,8 @@ impl DeploymentService {
                     .is_none_or(|id| runtime.labels.get("sh.temps.environment") == Some(id))
                 && !recorded_ids.contains(runtime.container_id.as_str())
             {
-                return Err(temps_core::ContainerCleanupError::Discovery {
-                    project_id, environment_id,
-                    reason: format!("unrecorded container '{}' has ambiguous database-local ownership labels. Inspect it with docker inspect, verify which instance owns it, and stop/remove it manually only if it belongs to this project, then retry deletion", runtime.container_id),
-                });
+                warn!(project_id, environment_id, container_id = %runtime.container_id,
+                    "Preserving unrecorded container with ambiguous database-local labels; only recorded container IDs will be removed");
             }
         }
 
@@ -892,10 +890,9 @@ impl DeploymentService {
                         )
                         .collect();
                     if !resources.is_empty() {
-                        return Err(temps_core::ContainerCleanupError::Discovery {
-                            project_id, environment_id,
-                            reason: format!("Compose resource ownership is ambiguous for '{compose_name}': {}. Inspect these IDs with docker network inspect / docker volume inspect; reclaim only resources verified to belong to this instance, then retry deletion. No Compose teardown was run", resources.join(", ")),
-                        });
+                        warn!(project_id, environment_id, compose_project = %compose_name,
+                            resources = ?resources,
+                            "Preserving Compose networks and volumes without durable ownership records; reclaim only after verifying ownership with docker inspect");
                     }
                 }
             }
@@ -7054,10 +7051,10 @@ mod tests {
             &service, project.id,
         )
         .await;
-        assert!(matches!(
-            result,
-            Err(temps_core::ContainerCleanupError::Discovery { .. })
-        ));
+        assert!(
+            result.is_ok(),
+            "recorded cleanup should finish while preserving ambiguous resources: {result:?}"
+        );
         assert!(projects::Entity::find_by_id(project.id)
             .one(db.as_ref())
             .await?
@@ -7065,10 +7062,31 @@ mod tests {
         Ok(())
     }
 
+    struct DisposableNetwork(String);
+    impl Drop for DisposableNetwork {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("docker")
+                .args(["network", "rm", &self.0])
+                .output();
+        }
+    }
+
     #[tokio::test]
-    async fn cleanup_refuses_ambiguous_compose_network_with_executor_initialized(
+    async fn cleanup_preserves_ambiguous_compose_network_with_executor_initialized(
     ) -> Result<(), Box<dyn std::error::Error>> {
         if !database_integration_tests_available().await {
+            return Ok(());
+        }
+        let docker = match bollard::Docker::connect_with_local_defaults() {
+            Ok(docker) if docker.ping().await.is_ok() => docker,
+            _ => return Ok(()),
+        };
+        if !tokio::process::Command::new("docker")
+            .arg("info")
+            .output()
+            .await
+            .is_ok_and(|output| output.status.success())
+        {
             return Ok(());
         }
         let test_db = TestDatabase::with_migrations().await?;
@@ -7105,13 +7123,14 @@ mod tests {
             "create disposable network: {}",
             String::from_utf8_lossy(&created.stderr)
         );
+        let _network_guard = DisposableNetwork(network_name.clone());
         let mut deployer = MockContainerDeployer::new();
         deployer.expect_list_containers().returning(|| Ok(vec![]));
         deployer.expect_remove_container().never();
         let service = create_cleanup_service_for_test(db.clone(), Arc::new(deployer));
         let directory = tempfile::tempdir()?;
         service.set_compose_executor(Arc::new(temps_deployer::compose::ComposeExecutor::new(
-            Arc::new(bollard::Docker::connect_with_local_defaults()?),
+            Arc::new(docker),
             directory.path().to_path_buf(),
         )));
         let result = temps_core::DeploymentContainerCleaner::cleanup_project_containers(
@@ -7134,10 +7153,10 @@ mod tests {
             survived.status.success(),
             "cleanup must preserve the ambiguous foreign network"
         );
-        assert!(matches!(
-            result,
-            Err(temps_core::ContainerCleanupError::Discovery { .. })
-        ));
+        assert!(
+            result.is_ok(),
+            "recorded cleanup should finish while preserving ambiguous resources: {result:?}"
+        );
         Ok(())
     }
 
