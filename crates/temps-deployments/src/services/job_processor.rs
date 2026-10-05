@@ -2015,6 +2015,19 @@ fn is_automatic_deploy_enabled(
     effective.unwrap_or(false)
 }
 
+fn git_deployment_duplicate_key(job: &temps_core::GitPushEventJob) -> DeploymentDuplicateKey {
+    // Creation is user initiated too, but has no explicitly selected target:
+    // it must coalesce with a webhook for the same initial commit.
+    if job.manual_trigger
+        && job.target_environment_id.is_some()
+        && job.recovery_of_deployment_id.is_none()
+    {
+        DeploymentDuplicateKey::Manual
+    } else {
+        DeploymentDuplicateKey::Commit(job.commit.clone())
+    }
+}
+
 fn should_skip_git_push_for_auto_deploy(auto_deploy_enabled: bool, manual_trigger: bool) -> bool {
     !auto_deploy_enabled && !manual_trigger
 }
@@ -2267,11 +2280,7 @@ async fn process_git_push_event(
                 project.id,
                 environment.id,
                 job.recovery_of_deployment_id,
-                if job.manual_trigger && job.recovery_of_deployment_id.is_none() {
-                    DeploymentDuplicateKey::Manual
-                } else {
-                    DeploymentDuplicateKey::Commit(job.commit.clone())
-                },
+                git_deployment_duplicate_key(&job),
                 new_deployment,
             )
             .await
@@ -5115,6 +5124,35 @@ mod tests {
     #[test]
     fn webhook_push_is_skipped_when_auto_deploy_disabled_even_for_first_deploy() {
         assert!(should_skip_git_push_for_auto_deploy(false, false));
+    }
+
+    #[test]
+    fn initial_creation_coalesces_with_webhook_but_explicit_redeploy_does_not() {
+        let mut job = temps_core::GitPushEventJob {
+            owner: "owner".into(),
+            repo: "repo".into(),
+            branch: Some("main".into()),
+            tag: None,
+            commit: "abc123".into(),
+            project_id: 1,
+            manual_trigger: true,
+            rollback_from_deployment_id: None,
+            target_environment_id: None,
+            recovery_of_deployment_id: None,
+        };
+        assert!(
+            matches!(git_deployment_duplicate_key(&job), DeploymentDuplicateKey::Commit(ref commit) if commit == "abc123")
+        );
+        job.target_environment_id = Some(2);
+        assert!(matches!(
+            git_deployment_duplicate_key(&job),
+            DeploymentDuplicateKey::Manual
+        ));
+        job.recovery_of_deployment_id = Some(3);
+        assert!(matches!(
+            git_deployment_duplicate_key(&job),
+            DeploymentDuplicateKey::Commit(_)
+        ));
     }
 
     #[test]
