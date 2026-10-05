@@ -8,10 +8,11 @@ use sea_orm::{
     QuerySelect, Select, Set, TransactionTrait,
 };
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use temps_config::ConfigService;
-use temps_core::{Job, JobQueue, JobReceiver, StatusCheckCompletedJob};
+use temps_core::log_transitions::{FailureLog, KeyedFailureLatch};
+use temps_core::{Job, JobQueue, JobReceiver, QueueError, StatusCheckCompletedJob};
 use temps_entities::{
     deployment_containers, deployments, environments, projects, status_checks, status_monitors,
 };
@@ -264,6 +265,116 @@ struct MonitorProbeSnapshot {
 }
 
 /// Service for performing health checks on monitored environments
+/// Monitors whose most recent recorded check was not `operational`, keyed by
+/// monitor ID.
+///
+/// The monitored application is the user's workload: it being down is the
+/// outcome the monitor exists to record (in `status_checks`, outages and
+/// notifications), not a Temps fault. The server log gets one WARN when a
+/// monitor starts failing, an hourly reminder while it stays down, and an
+/// INFO when it recovers — not a line on every check of every down monitor.
+///
+/// Process-wide because probes run in detached tasks that do not carry the
+/// service instance. Only failing monitors are stored, so it is bounded by
+/// the number of monitors.
+pub(super) fn clear_monitor_log_state(monitor_id: i32) {
+    MONITOR_DOWN.record_success(&monitor_id);
+    MONITOR_CHECK_ERRORS.record_success(&monitor_id);
+}
+
+static MONITOR_DOWN: LazyLock<KeyedFailureLatch<i32>> = LazyLock::new(KeyedFailureLatch::default);
+
+/// Monitors whose check could not run at all (see [`report_check_error`]).
+static MONITOR_CHECK_ERRORS: LazyLock<KeyedFailureLatch<i32>> =
+    LazyLock::new(KeyedFailureLatch::default);
+
+/// Whole-sweep failures (the due-monitor query itself failed).
+static SWEEP_FAILURES: temps_core::log_transitions::FailureLatch =
+    temps_core::log_transitions::FailureLatch::new(
+        temps_core::log_transitions::DEFAULT_REMINDER_INTERVAL,
+    );
+
+/// Record the outcome of a persisted check for the server log.
+fn report_check_outcome(
+    latch: &KeyedFailureLatch<i32>,
+    monitor_id: i32,
+    status: &str,
+    error_message: Option<&str>,
+) -> Option<FailureLog> {
+    if status == "operational" {
+        if let Some(failures) = latch.record_success(&monitor_id) {
+            info!(
+                monitor_id,
+                previous_failed_checks = failures,
+                "Monitor is operational again"
+            );
+        }
+        return None;
+    }
+    let outcome = latch.record_failure_bounded(monitor_id, 4096);
+    let error_message = error_message.unwrap_or("none");
+    match outcome {
+        FailureLog::Started => warn!(
+            monitor_id,
+            status,
+            error_message,
+            "Monitor check is failing; the monitored application is not healthy"
+        ),
+        FailureLog::Reminder { consecutive } => warn!(
+            monitor_id,
+            status,
+            error_message,
+            consecutive_failed_checks = consecutive,
+            "Monitor is still failing"
+        ),
+        FailureLog::Suppressed { consecutive } => debug!(
+            monitor_id,
+            status,
+            error_message,
+            consecutive_failed_checks = consecutive,
+            "Monitor check is still failing"
+        ),
+    }
+    Some(outcome)
+}
+
+/// Log a check that could not run. A monitor without an environment, or
+/// whose environment is gone, is a configuration state of that monitor
+/// (WARN); anything else is a Temps fault (ERROR). Either way it is logged
+/// once per monitor until a check runs again, not on every interval.
+fn report_check_error(
+    latch: &KeyedFailureLatch<i32>,
+    monitor_id: i32,
+    error: &StatusPageError,
+) -> FailureLog {
+    let outcome = latch.record_failure_bounded(monitor_id, 4096);
+    let is_configuration = matches!(
+        error,
+        StatusPageError::NotFound | StatusPageError::InvalidRequest(_)
+    );
+    match (outcome.should_log(), is_configuration) {
+        (true, true) => warn!(
+            monitor_id,
+            consecutive_failures = outcome.consecutive(),
+            "Monitor cannot be checked: {}",
+            error
+        ),
+        (true, false) => error!(
+            monitor_id,
+            consecutive_failures = outcome.consecutive(),
+            "Health check failed: {:?}",
+            error
+        ),
+        (false, _) => debug!(
+            monitor_id,
+            consecutive_failures = outcome.consecutive(),
+            "Health check failed: {:?}",
+            error
+        ),
+    }
+    outcome
+}
+
 pub struct HealthCheckService {
     db: Arc<DatabaseConnection>,
     http_client: reqwest::Client,
@@ -496,12 +607,19 @@ impl HealthCheckService {
                 }
             };
 
+            let monitor_id = monitor.id;
             let task = tokio::spawn(async move {
                 let _permit = permit; // Hold permit until task completes
-                if let Err(e) =
-                    Self::check_monitor(db, http_client, config_service, monitor, job_queue).await
+                match Self::check_monitor(db, http_client, config_service, monitor, job_queue).await
                 {
-                    error!("Health check failed: {:?}", e);
+                    Ok(()) => {
+                        if MONITOR_CHECK_ERRORS.record_success(&monitor_id).is_some() {
+                            info!(monitor_id, "Monitor can be checked again");
+                        }
+                    }
+                    Err(e) => {
+                        report_check_error(&MONITOR_CHECK_ERRORS, monitor_id, &e);
+                    }
                 }
             });
 
@@ -578,9 +696,9 @@ impl HealthCheckService {
         // in the past and being re-selected on every single sweep.
 
         // Check if environment_id is set
+        // Logged (once per monitor) by the caller.
         let env_id = monitor.environment_id.ok_or_else(|| {
-            warn!("Monitor {} has no environment_id", monitor.id);
-            StatusPageError::InvalidRequest("Monitor has no environment_id".to_string())
+            StatusPageError::InvalidRequest(format!("monitor {} has no environment_id", monitor.id))
         })?;
 
         debug!("Checking monitor {} for environment {}", monitor.id, env_id);
@@ -920,8 +1038,9 @@ impl HealthCheckService {
                         continue;
                     }
 
-                    // Non-retryable error or final attempt
-                    warn!(
+                    // Non-retryable error or final attempt. The outcome is
+                    // logged on state transitions by `record_check`.
+                    debug!(
                         "Health check request failed for monitor {} after {} attempts: {:?}",
                         monitor.id,
                         attempt + 1,
@@ -961,7 +1080,7 @@ impl HealthCheckService {
                         continue;
                     }
 
-                    warn!(
+                    debug!(
                         "Health check timeout for monitor {} after {} attempts",
                         monitor.id,
                         attempt + 1
@@ -1073,6 +1192,12 @@ impl HealthCheckService {
                     if attempt > 0 {
                         debug!("Database insert succeeded after {} attempts", attempt + 1);
                     }
+                    report_check_outcome(
+                        &MONITOR_DOWN,
+                        probe.monitor_id,
+                        &status,
+                        error_message.as_deref(),
+                    );
 
                     // CRITICAL: Emit job for outage detection immediately after recording check
                     let job = Job::StatusCheckCompleted(StatusCheckCompletedJob {
@@ -1264,8 +1389,28 @@ impl HealthCheckService {
                 interval.tick().await;
                 let service = service_for_interval.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = service.run_all_checks().await {
-                        error!("Health check cycle failed: {:?}", e);
+                    // A failing sweep (database unreachable) repeats every
+                    // SCHEDULER_SWEEP_INTERVAL; log it once per outage.
+                    match service.run_all_checks().await {
+                        Ok(()) => {
+                            if let Some(failures) = SWEEP_FAILURES.record_success() {
+                                info!(
+                                    previous_failures = failures,
+                                    "Health check cycles recovered"
+                                );
+                            }
+                        }
+                        Err(e) => match SWEEP_FAILURES.record_failure() {
+                            FailureLog::Started => error!("Health check cycle failed: {:?}", e),
+                            FailureLog::Reminder { consecutive } => error!(
+                                consecutive_failures = consecutive,
+                                "Health check cycles are still failing: {:?}", e
+                            ),
+                            FailureLog::Suppressed { consecutive } => debug!(
+                                consecutive_failures = consecutive,
+                                "Health check cycle failed: {:?}", e
+                            ),
+                        },
                     }
                 });
             }
@@ -1327,8 +1472,20 @@ impl HealthCheckService {
                 Ok(_) => {
                     // Ignore other job types
                 }
+                Err(QueueError::ChannelClosed) => {
+                    // Retrying a closed channel would fail (and log) every
+                    // second forever. The periodic sweep keeps running; only
+                    // the immediate check of newly created monitors stops.
+                    error!(
+                        "Job queue closed; health check scheduler stops listening for MonitorCreated events"
+                    );
+                    break;
+                }
                 Err(e) => {
-                    error!("Error receiving job in health check scheduler: {:?}", e);
+                    // Lagging behind a burst of unrelated jobs: some
+                    // MonitorCreated events may have been skipped, and those
+                    // monitors are picked up by the next periodic sweep.
+                    warn!("Health check scheduler missed queued jobs: {:?}", e);
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
             }
@@ -1433,6 +1590,47 @@ impl HealthCheckService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn down_monitor_is_logged_on_transitions_only() {
+        let latch = KeyedFailureLatch::default();
+
+        assert_eq!(report_check_outcome(&latch, 5, "operational", None), None);
+        assert_eq!(
+            report_check_outcome(&latch, 5, "major_outage", Some("Connection failed")),
+            Some(FailureLog::Started)
+        );
+        // Every further check while the app stays down is quiet.
+        for _ in 0..30 {
+            let outcome =
+                report_check_outcome(&latch, 5, "major_outage", Some("Connection failed"))
+                    .expect("a failing check reports an outcome");
+            assert!(!outcome.should_log());
+        }
+        // Recovery re-arms it.
+        assert_eq!(report_check_outcome(&latch, 5, "operational", None), None);
+        assert!(!latch.is_failing(&5));
+        assert_eq!(
+            report_check_outcome(&latch, 5, "degraded", Some("HTTP 404")),
+            Some(FailureLog::Started)
+        );
+    }
+
+    #[test]
+    fn monitor_check_errors_are_logged_once_per_monitor() {
+        let latch = KeyedFailureLatch::default();
+        let missing_env = StatusPageError::InvalidRequest("monitor 9 has no environment_id".into());
+
+        assert_eq!(
+            report_check_error(&latch, 9, &missing_env),
+            FailureLog::Started
+        );
+        assert!(!report_check_error(&latch, 9, &missing_env).should_log());
+        assert_eq!(
+            report_check_error(&latch, 10, &StatusPageError::NotFound),
+            FailureLog::Started
+        );
+    }
     use std::io::BufReader;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

@@ -581,7 +581,9 @@ static DROP_INSPECTIONS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 /// Upper bound on how many deployable roots a single Drop inspection reports.
 /// The response drives a picker, so a 20k-entry list is neither usable nor
 /// safe to serialise.
-const MAX_DROP_CANDIDATES: usize = 50;
+const MAX_DROP_PROJECT_ROOTS: usize = 50;
+// Each root can offer its existing preset plus Ruby and PHP alternatives.
+const MAX_DROP_CANDIDATES: usize = MAX_DROP_PROJECT_ROOTS * 3;
 
 struct DropInspectionPermit;
 
@@ -722,14 +724,7 @@ pub async fn inspect_drop_archive(
     let candidates = tokio::task::spawn_blocking(move || {
         let _inspection_permit = inspection_permit;
         let manifests = inspect_zip_manifests(&archive_path)?;
-        let mut candidates = temps_presets::detect_project_candidates(&manifests)
-            .into_iter()
-            .map(|candidate| drop_preset_candidate_from(&manifests, candidate))
-            .collect::<Vec<_>>();
-        // The response is rendered as a picker; an unbounded list is neither
-        // useful to a human nor safe to serialise.
-        candidates.truncate(MAX_DROP_CANDIDATES);
-        Ok::<_, Problem>(candidates)
+        Ok::<_, Problem>(drop_inspection_candidates(&manifests))
     })
     .await
     .map_err(|error| {
@@ -759,6 +754,28 @@ pub async fn inspect_drop_archive(
     }))
 }
 
+/// Bound the picker without letting one root's alternatives crowd out later
+/// applications. Keep the first choice for each of the first 50 roots, then
+/// fill the remaining bounded allowance with alternatives in detection order.
+fn drop_inspection_candidates(manifests: &BTreeMap<String, String>) -> Vec<DropPresetCandidate> {
+    let mut roots = BTreeSet::new();
+    let mut primary = Vec::new();
+    let mut alternatives = Vec::new();
+    for candidate in temps_presets::detect_project_candidates(manifests) {
+        if roots.contains(&candidate.path) {
+            if alternatives.len() < MAX_DROP_CANDIDATES {
+                alternatives.push(drop_preset_candidate_from(manifests, candidate));
+            }
+        } else if roots.len() < MAX_DROP_PROJECT_ROOTS {
+            roots.insert(candidate.path.clone());
+            primary.push(drop_preset_candidate_from(manifests, candidate));
+        }
+    }
+    let remaining = MAX_DROP_CANDIDATES.saturating_sub(primary.len());
+    primary.extend(alternatives.into_iter().take(remaining));
+    primary
+}
+
 /// Convert a detected project candidate into the response DTO for the
 /// drop-inspection endpoint, resolving the compose file path alongside it.
 fn drop_preset_candidate_from(
@@ -767,11 +784,12 @@ fn drop_preset_candidate_from(
 ) -> DropPresetCandidate {
     let preset = candidate.catalog_slug().to_string();
     let compose_path = compose_path_for_candidate(manifests, &candidate);
+    let label = candidate.label().to_string();
     DropPresetCandidate {
         directory: candidate.path,
         preset,
         compose_path,
-        label: candidate.preset.display_name().to_string(),
+        label,
         confidence: candidate.confidence.to_string(),
         reason: candidate.reason,
         is_static: candidate.preset == temps_entities::preset::Preset::Static,
@@ -885,17 +903,20 @@ fn inspect_zip_manifests(path: &std::path::Path) -> Result<BTreeMap<String, Stri
                 .with_detail(format!("Symbolic link '{}' is not allowed", entry.name())));
         }
         let normalized = path.to_string_lossy().replace('\\', "/");
-        let basename = normalized.rsplit('/').next().unwrap_or(&normalized);
-        let should_read = matches!(
-            basename,
-            "package.json"
-                | "requirements.txt"
-                | "pyproject.toml"
-                | "Cargo.toml"
-                | "go.mod"
-                | "pom.xml"
-                | "build.gradle"
-        ) || basename.ends_with(".csproj");
+        let (directory, basename) = normalized.rsplit_once('/').unwrap_or((".", &normalized));
+        let should_read = temps_presets::is_project_candidate_directory(directory)
+            && (matches!(
+                basename,
+                "package.json"
+                    | "Gemfile"
+                    | "composer.json"
+                    | "requirements.txt"
+                    | "pyproject.toml"
+                    | "Cargo.toml"
+                    | "go.mod"
+                    | "pom.xml"
+                    | "build.gradle"
+            ) || basename.ends_with(".csproj"));
         total_path_bytes = total_path_bytes.saturating_add(normalized.len());
         if total_path_bytes > MAX_TOTAL_PATH_BYTES {
             return Err(problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
@@ -2129,6 +2150,12 @@ pub async fn update_project_deployment_config(
     if config.max_concurrent_connections.is_some() {
         updated_fields.insert(
             "max_concurrent_connections".to_string(),
+            "updated".to_string(),
+        );
+    }
+    if config.health_check_timeout_seconds.is_some() {
+        updated_fields.insert(
+            "health_check_timeout_seconds".to_string(),
             "updated".to_string(),
         );
     }
@@ -4099,13 +4126,14 @@ mod tests {
     use super::{
         authorize_storage_service_scopes, canonicalize_template_environment_variables,
         canonicalize_template_upgrade_environment_variables, compose_path_for_candidate,
-        drop_preset_candidate_from, image_deployment_dispatch_feedback,
-        image_template_preset_config, missing_required_template_configuration,
-        parse_owner_repo_from_git_url, production_environment_variable_names,
-        project_created_from_template_telemetry_event, require_git_settings_permissions,
-        require_template_creation_permissions, resolve_image_template_runtime,
-        service_template_changes, validate_template_service_selection, DropPresetCandidate,
-        TemplateEnvironmentError, TemplateRuntimeOverrideError, TemplateServiceSelectionError,
+        drop_inspection_candidates, drop_preset_candidate_from, image_deployment_dispatch_feedback,
+        image_template_preset_config, inspect_zip_manifests,
+        missing_required_template_configuration, parse_owner_repo_from_git_url,
+        production_environment_variable_names, project_created_from_template_telemetry_event,
+        require_git_settings_permissions, require_template_creation_permissions,
+        resolve_image_template_runtime, service_template_changes,
+        validate_template_service_selection, DropPresetCandidate, TemplateEnvironmentError,
+        TemplateRuntimeOverrideError, TemplateServiceSelectionError, MAX_DROP_CANDIDATES,
     };
     use axum::http::StatusCode;
     use chrono::Utc;
@@ -4616,6 +4644,130 @@ mod tests {
                     .expect("template lookup"),
             "database authorization must precede template/repository side effects"
         );
+    }
+
+    fn drop_test_zip(files: &[(&str, &str)]) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut zip = zip::ZipWriter::new(file.reopen().unwrap());
+        for (name, contents) in files {
+            zip.start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(contents.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+        file
+    }
+
+    #[test]
+    fn drop_zip_inspection_reads_ruby_and_php_and_exposes_server_candidates() {
+        for (manifest, content, slug, label) in [
+            ("Gemfile", "gem 'rails'", "nixpacks-ruby", "Ruby"),
+            (
+                "apps/php/composer.json",
+                r#"{"require":{"laravel/framework":"^12"}}"#,
+                "nixpacks-php",
+                "PHP",
+            ),
+        ] {
+            let zip = drop_test_zip(&[(manifest, content)]);
+            let manifests = inspect_zip_manifests(zip.path()).unwrap();
+            assert_eq!(manifests[manifest], content);
+            let candidate = temps_presets::detect_project_candidates(&manifests).remove(0);
+            let response = drop_preset_candidate_from(&manifests, candidate);
+            assert_eq!(response.preset, slug);
+            assert_eq!(response.label, label);
+            assert!(!response.is_static);
+        }
+        // Adding language manifests must not bypass the archive secret policy.
+        let zip = drop_test_zip(&[("composer.json", "{}"), (".env", "APP_KEY=fixture-only")]);
+        assert!(inspect_zip_manifests(zip.path()).is_err());
+    }
+
+    #[test]
+    fn drop_zip_ignores_dependency_manifests_but_checks_their_paths_for_secrets() {
+        let mut files = vec![("composer.json".to_string(), "{}".to_string())];
+        for index in 0..513 {
+            files.push((
+                format!("vendor/package-{index}/composer.json"),
+                "{}".to_string(),
+            ));
+        }
+        // Neither an oversized dependency nor a deeply nested manifest is a
+        // deployable root, so neither should consume the manifest-read budget.
+        files.push((
+            "vendor/large/composer.json".to_string(),
+            "x".repeat(1024 * 1024 + 1),
+        ));
+        files.push((
+            "a/b/c/d/e/composer.json".to_string(),
+            "x".repeat(1024 * 1024 + 1),
+        ));
+        let borrowed: Vec<_> = files
+            .iter()
+            .map(|(name, contents)| (name.as_str(), contents.as_str()))
+            .collect();
+        let zip = drop_test_zip(&borrowed);
+        let manifests = inspect_zip_manifests(zip.path()).unwrap();
+        assert_eq!(manifests["composer.json"], "{}");
+        assert!(manifests["vendor/large/composer.json"].is_empty());
+        assert!(manifests["a/b/c/d/e/composer.json"].is_empty());
+        let candidates = temps_presets::detect_project_candidates(&manifests);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].catalog_slug(), "nixpacks-php");
+        let zip = drop_test_zip(&[
+            ("composer.json", "{}"),
+            ("vendor/private/.env", "fixture-only"),
+        ]);
+        assert!(inspect_zip_manifests(zip.path()).is_err());
+        // The size cap remains enforced for an actual application manifest.
+        let oversized = "x".repeat(1024 * 1024 + 1);
+        let zip = drop_test_zip(&[("composer.json", &oversized)]);
+        assert!(inspect_zip_manifests(zip.path()).is_err());
+    }
+
+    #[test]
+    fn drop_picker_preserves_roots_before_filling_alternative_preset_allowance() {
+        for count in [26, 50, 51] {
+            let mut manifests = BTreeMap::new();
+            for index in 0..count {
+                let root = format!("apps/app-{index:02}");
+                manifests.insert(format!("{root}/composer.json"), "{}".to_string());
+                manifests.insert(
+                    format!("{root}/package.json"),
+                    r#"{"devDependencies":{"vite":"7"}}"#.to_string(),
+                );
+                if count != 26 {
+                    manifests.insert(format!("{root}/Gemfile"), "gem 'tooling'".to_string());
+                }
+            }
+            let candidates = drop_inspection_candidates(&manifests);
+            let roots: BTreeSet<_> = candidates
+                .iter()
+                .map(|candidate| candidate.directory.as_str())
+                .collect();
+            assert_eq!(roots.len(), count.min(50));
+            assert_eq!(
+                candidates.len(),
+                if count == 26 { 52 } else { MAX_DROP_CANDIDATES }
+            );
+            for index in 0..count.min(50) {
+                let root = format!("apps/app-{index:02}");
+                assert!(candidates
+                    .iter()
+                    .any(|candidate| candidate.directory == root
+                        && candidate.preset == "nixpacks-php"));
+                assert!(candidates
+                    .iter()
+                    .any(|candidate| candidate.directory == root && candidate.preset == "vite"));
+                if count != 26 {
+                    assert!(candidates
+                        .iter()
+                        .any(|candidate| candidate.directory == root
+                            && candidate.preset == "nixpacks-ruby"));
+                }
+            }
+        }
     }
 
     #[test]

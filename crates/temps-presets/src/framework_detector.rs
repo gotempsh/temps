@@ -19,6 +19,7 @@ pub enum NodeFramework {
     NestJs,
     Nuxt,
     Remix,
+    TanStackStart,
     Vite,
     Vue,
     Express,
@@ -34,6 +35,7 @@ impl NodeFramework {
             Self::NestJs => "NestJS",
             Self::Nuxt => "Nuxt",
             Self::Remix => "Remix",
+            Self::TanStackStart => "TanStack Start",
             Self::Vite => "Vite",
             Self::Vue => "Vue",
             Self::Express => "Express",
@@ -76,9 +78,8 @@ PORT = "3000"
 "#
                 .to_string(),
             ),
-            Self::NextJs => {
-                // Next.js works well with default nixpacks, no override needed
-                // It uses standalone output which is already optimized
+            Self::NextJs | Self::TanStackStart => {
+                // Server frameworks use the provider/app start command, not Vite preview.
                 None
             }
             Self::NestJs => Some(
@@ -215,7 +216,7 @@ pub fn detect_node_framework_from_package_json(package_json_content: &str) -> No
     };
 
     // Detection order matters - check most specific frameworks first
-    // Priority: Astro > Next.js > NestJS > Nuxt > Remix > Vite > Vue > Express
+    // Priority: server frameworks before their generic Vite build tool.
 
     if package_json.has_dependency("astro") {
         debug!("Detected Astro framework");
@@ -242,6 +243,13 @@ pub fn detect_node_framework_from_package_json(package_json_content: &str) -> No
         return NodeFramework::Remix;
     }
 
+    if package_json.has_dependency("@tanstack/react-start")
+        || package_json.has_dependency("@tanstack/solid-start")
+    {
+        debug!("Detected TanStack Start framework");
+        return NodeFramework::TanStackStart;
+    }
+
     if package_json.has_dependency("vite") {
         debug!("Detected Vite framework");
         return NodeFramework::Vite;
@@ -264,6 +272,24 @@ pub fn detect_node_framework_from_package_json(package_json_content: &str) -> No
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tanstack_start_does_not_generate_a_vite_preview_override() {
+        for dependency in ["@tanstack/react-start", "@tanstack/solid-start"] {
+            let package = serde_json::json!({
+                "dependencies": {dependency: "1"},
+                "devDependencies": {"vite": "7"}
+            });
+            let framework = detect_node_framework_from_package_json(&package.to_string());
+            assert_eq!(framework, NodeFramework::TanStackStart);
+            assert!(framework.nixpacks_config().is_none());
+        }
+        let framework =
+            detect_node_framework_from_package_json(r#"{"devDependencies":{"vite":"7"}}"#);
+        assert_eq!(framework, NodeFramework::Vite);
+        assert!(framework.nixpacks_config().unwrap().contains("preview"));
+    }
+
     use std::fs;
     use tempfile::TempDir;
 

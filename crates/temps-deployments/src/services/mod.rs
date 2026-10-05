@@ -77,6 +77,12 @@ pub use sensitive_envelope::*;
 pub mod log_redaction;
 pub use log_redaction::*;
 
+pub mod failure_classifier;
+pub use failure_classifier::{
+    describe_failure, DeploymentFailureCode, DeploymentFailureInfo, DeploymentFailureStage,
+    FailureSettingsSection,
+};
+
 pub mod failure_report_service;
 pub use failure_report_service::*;
 

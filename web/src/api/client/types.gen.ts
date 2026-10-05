@@ -6998,6 +6998,16 @@ export type DeploymentConfig = {
      */
     exposedPort?: number | null;
     /**
+     * How long, in seconds, a new container may take to start and pass its
+     * readiness check before the deployment fails. Covers apps that boot
+     * slowly (migrations, JIT warm-up, large model loads). `None` = the
+     * platform default ([`DEFAULT_HEALTH_CHECK_TIMEOUT_SECONDS`]); valid
+     * overrides are [`MIN_HEALTH_CHECK_TIMEOUT_SECONDS`]..=
+     * [`MAX_HEALTH_CHECK_TIMEOUT_SECONDS`]. Environments inherit the project
+     * value and may override it.
+     */
+    healthCheckTimeoutSeconds?: number | null;
+    /**
      * Seconds of inactivity before containers are stopped in on-demand mode.
      * Only used when `on_demand` is true. Min: 60, Max: 86400 (24h).
      * Default: 300 (5 minutes).
@@ -7266,6 +7276,57 @@ export type DeploymentEnvironmentResponse = {
     slug: string;
 };
 
+/**
+ * Allowlisted failure codes. Wire values are `snake_case` and stable; add new
+ * variants rather than renaming existing ones.
+ */
+export type DeploymentFailureCode = 'out_of_memory' | 'disk_exhausted' | 'timeout' | 'health_check_failed' | 'repository_authentication' | 'repository_not_found' | 'repository_clone' | 'dns_resolution' | 'network_connection' | 'dependency_lockfile_out_of_sync' | 'dependency_resolution' | 'dependency_download' | 'runtime_version_unsupported' | 'missing_build_script' | 'compile_error' | 'dockerfile_invalid' | 'base_image_pull' | 'image_missing' | 'static_output_missing' | 'port_unavailable' | 'permission_denied' | 'invalid_configuration' | 'container_start' | 'build_error' | 'platform_internal' | 'cancelled' | 'build_timeout' | 'source_timeout' | 'image_pull_timeout' | 'health_check_timeout' | 'app_not_listening' | 'container_exited' | 'image_not_found' | 'registry_authentication' | 'registry_rate_limited' | 'image_platform_mismatch' | 'compose_file_invalid' | 'compose_variable_missing' | 'compose_policy_rejected' | 'compose_build_failed' | 'compose_up_failed' | 'compose_unavailable' | 'volume_mount' | 'route_activation' | 'unknown';
+
+/**
+ * API view of a failed deployment's classification.
+ */
+export type DeploymentFailureInfo = {
+    /**
+     * Version of the classifier that produced this view.
+     */
+    classifier_version: number;
+    /**
+     * Allowlisted failure code.
+     */
+    code: DeploymentFailureCode;
+    /**
+     * Pipeline job that failed (e.g. `build_image`, `deploy_compose`).
+     */
+    failed_job?: string | null;
+    /**
+     * Concrete, actionable fix.
+     */
+    remediation: string;
+    settings_section?: FailureSettingsSection | null;
+    /**
+     * Pipeline stage the deployment failed in.
+     */
+    stage: DeploymentFailureStage;
+    /**
+     * How long the timed-out step ran, in seconds, when the reason states it.
+     */
+    timeout_elapsed_seconds?: number | null;
+    /**
+     * Time limit that was hit, in seconds, when the failure is a timeout and
+     * the reason states it.
+     */
+    timeout_limit_seconds?: number | null;
+    /**
+     * Short human title, e.g. "Image tag not found".
+     */
+    title: string;
+};
+
+/**
+ * The pipeline stage a deployment failed in.
+ */
+export type DeploymentFailureStage = 'source' | 'configuration' | 'dependency_install' | 'build' | 'image' | 'deploy' | 'runtime' | 'health_check' | 'resource' | 'platform' | 'unknown';
+
 export type DeploymentJobResponse = {
     created_at: number;
     dependencies?: unknown;
@@ -7414,6 +7475,7 @@ export type DeploymentResponse = {
     deployment_config?: DeploymentConfigSnapshot | null;
     environment: DeploymentEnvironmentResponse;
     environment_id: number;
+    failure?: DeploymentFailureInfo | null;
     finished_at?: number | null;
     id: number;
     is_current: boolean;
@@ -10417,6 +10479,12 @@ export type FailureReportPreviewResponse = {
      */
     reporting_enabled: boolean;
 };
+
+/**
+ * Settings surface that fixes a given failure. The console maps each value to
+ * a deep link; the API stays independent of console routes.
+ */
+export type FailureSettingsSection = 'source' | 'build' | 'deploy' | 'environment_variables' | 'git' | 'docker_registry' | 'build_limits';
 
 export type FeatureMaturity = {
     docs_path: string;
@@ -20223,6 +20291,12 @@ export type RestoreCapabilitiesResponse = RestoreCapabilities & {
  */
 export type RestorePlan = {
     /**
+     * Whether the backup was produced by a service other than the target
+     * (or its origin is unknown). A destructive cross-service restore must
+     * be confirmed explicitly with `confirm_cross_service: true`.
+     */
+    cross_service: boolean;
+    /**
      * Whether any step overwrites existing data on the target service.
      */
     destructive: boolean;
@@ -23295,6 +23369,17 @@ export type StartRestoreRequest = RestoreRequestMode & {
      */
     backup_location?: string | null;
     /**
+     * Explicit confirmation for a destructive cross-service restore.
+     *
+     * Restoring in place (or PITR in place) onto a service that did not
+     * produce the backup — or from a raw backup location whose origin is
+     * unknown — overwrites the target with another service's data. Such a
+     * request is rejected with `409 Conflict` unless this is `true`. The
+     * confirmation is recorded in the audit log. Ignored for modes that
+     * provision a new service and for same-service restores.
+     */
+    confirm_cross_service?: boolean;
+    /**
      * S3 source the `backup_location` lives in. Ignored when `backup_id`
      * is used.
      */
@@ -25322,6 +25407,13 @@ export type UpdateDeploymentConfigRequest = {
      */
     crossArchitectureBuilds?: boolean | null;
     exposedPort?: number | null;
+    /**
+     * How long, in seconds (30-3600), a new deployment's containers may take
+     * to start and pass their readiness check before the deployment fails.
+     * Absent leaves the current value unchanged; the platform default is
+     * 300 seconds.
+     */
+    healthCheckTimeoutSeconds?: number | null;
     /**
      * Project-level default cap on concurrent in-flight requests to a
      * single environment's upstream (0 = unlimited). Environments may
@@ -39523,6 +39615,10 @@ export type ExternalServiceMetricsCreateAlertRuleErrors = {
      */
     403: unknown;
     /**
+     * The service already has the maximum number of alert rules
+     */
+    409: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -40219,6 +40315,10 @@ export type StartRestoreErrors = {
      * Backup or service not found
      */
     404: ProblemDetails;
+    /**
+     * Destructive cross-service restore requires explicit confirmation
+     */
+    409: ProblemDetails;
 };
 
 export type StartRestoreError = StartRestoreErrors[keyof StartRestoreErrors];

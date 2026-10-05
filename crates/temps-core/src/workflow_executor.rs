@@ -309,7 +309,10 @@ impl WorkflowExecutor {
                     // Check if required job failed
                     if job_state.job_config.required && result.status == JobStatus::Failure {
                         if !config.continue_on_failure {
-                            error!("Required job '{}' failed, stopping workflow", job_id);
+                            // A failed job is a deployment outcome (the user's
+                            // build or app failed) recorded on the job row and
+                            // in its logs, not a fault in the executor.
+                            warn!("Required job '{}' failed, stopping workflow", job_id);
 
                             // Cancel all pending jobs before failing the workflow
                             if let Some(ref tracker) = self.job_tracker {
@@ -610,7 +613,11 @@ impl WorkflowExecutor {
                     .await
                 {
                     let error_msg = format!("Prerequisites not met for job '{}': {}", job_id, e);
-                    error!("{}", error_msg);
+                    if e.is_workload_outcome() {
+                        warn!("{}", error_msg);
+                    } else {
+                        error!("{}", error_msg);
+                    }
 
                     // Failed prerequisites are a real failure, not a silent skip — record
                     // them as Failure with the reason so the operator can act on it. This
@@ -727,6 +734,11 @@ impl WorkflowExecutor {
                             };
                             if is_cancellation {
                                 warn!("Job '{}' cancelled: {}", job_id_clone, e);
+                            } else if e.is_workload_outcome() {
+                                // The failure is recorded on the job and in
+                                // the deployment logs; it is the workload's
+                                // outcome, not an executor fault.
+                                warn!("Job '{}' failed: {}", job_id_clone, e);
                             } else {
                                 error!("Job '{}' failed: {}", job_id_clone, e);
                             }

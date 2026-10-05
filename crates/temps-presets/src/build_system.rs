@@ -1,13 +1,14 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::path::Path;
 use super::PackageManager;
+use std::path::Path;
 #[derive(Debug, Clone)]
 pub enum MonorepoTool {
     Lerna,
     Turbo,
     Nx,
+    Workspace,
     None,
 }
 
@@ -19,6 +20,14 @@ impl MonorepoTool {
             MonorepoTool::Turbo
         } else if path.join("nx.json").exists() {
             MonorepoTool::Nx
+        } else if path.join("pnpm-workspace.yaml").is_file()
+            || std::fs::read_to_string(path.join("package.json"))
+                .ok()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                .and_then(|manifest| manifest.get("workspaces").cloned())
+                .is_some_and(|workspaces| workspaces.is_array() || workspaces.is_object())
+        {
+            MonorepoTool::Workspace
         } else {
             MonorepoTool::None
         }
@@ -27,7 +36,7 @@ impl MonorepoTool {
     pub fn install_command(&self) -> &'static str {
         match self {
             MonorepoTool::Lerna => "npx lerna bootstrap",
-            MonorepoTool::Turbo => "npm install",  // Turbo uses the package manager's install
+            MonorepoTool::Turbo | MonorepoTool::Workspace => "npm install", // Turbo uses the package manager's install
             MonorepoTool::Nx => "npx nx exec -- npm install",
             MonorepoTool::None => "",
         }
@@ -56,6 +65,7 @@ impl MonorepoTool {
                     "npx nx run-many --target=build --all".to_string()
                 }
             }
+            MonorepoTool::Workspace => "npm run build".to_string(),
             MonorepoTool::None => "".to_string(),
         }
     }
@@ -67,11 +77,11 @@ impl std::fmt::Display for MonorepoTool {
             MonorepoTool::Lerna => write!(f, "lerna"),
             MonorepoTool::Turbo => write!(f, "turbo"),
             MonorepoTool::Nx => write!(f, "nx"),
+            MonorepoTool::Workspace => write!(f, "workspace"),
             MonorepoTool::None => write!(f, "none"),
         }
     }
 }
-
 
 #[derive(Debug, Clone)]
 pub struct BuildSystem {
@@ -104,7 +114,9 @@ impl BuildSystem {
             (PackageManager::Pnpm, MonorepoTool::Nx) => "npx nx exec -- pnpm install".to_string(),
             (PackageManager::Bun, MonorepoTool::Nx) => "npx nx exec -- bun install".to_string(),
 
-            (_, MonorepoTool::None) => self.package_manager.install_command().to_string(),
+            (_, MonorepoTool::None | MonorepoTool::Workspace) => {
+                self.package_manager.install_command().to_string()
+            }
         }
     }
 
@@ -197,7 +209,9 @@ impl BuildSystem {
                 }
             }
 
-            (_, MonorepoTool::None) => self.package_manager.build_command().to_string(),
+            (_, MonorepoTool::None | MonorepoTool::Workspace) => {
+                self.package_manager.build_command().to_string()
+            }
         }
     }
 }

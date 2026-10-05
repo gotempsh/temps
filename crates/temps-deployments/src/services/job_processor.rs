@@ -1018,7 +1018,8 @@ WHERE d.id = a.deployment_id
         {
             Ok(Some(p)) => p,
             Ok(None) => {
-                error!("DeployImageRequested: project {} not found", job.project_id);
+                // Deleted between the request and its processing.
+                warn!("DeployImageRequested: project {} not found", job.project_id);
                 return Ok(());
             }
             Err(e) => {
@@ -1057,7 +1058,9 @@ WHERE d.id = a.deployment_id
         };
 
         if environments.is_empty() {
-            error!(
+            // A request for an environment that does not exist (or is not
+            // deployable) is a caller/configuration problem, not a fault.
+            warn!(
                 "DeployImageRequested: project {} has no matching deployable environment (target_environment_id={:?})",
                 job.project_id,
                 job.target_environment_id
@@ -1433,10 +1436,19 @@ WHERE d.id = a.deployment_id
             .await
         {
             let error_message = format!("{}", e);
-            error!(
-                "Workflow execution failed for deployment {}: {}",
-                deployment_id, error_message
-            );
+            if e.is_workload_outcome() {
+                // A failed user build/app or a cancelled run: recorded on the
+                // deployment below, not a server fault.
+                warn!(
+                    "Workflow execution failed for deployment {}: {}",
+                    deployment_id, error_message
+                );
+            } else {
+                error!(
+                    "Workflow execution failed for deployment {}: {}",
+                    deployment_id, error_message
+                );
+            }
 
             // Re-read the current deployment state before writing "failed".
             // execute_deployment_workflow already skips its own "failed" write

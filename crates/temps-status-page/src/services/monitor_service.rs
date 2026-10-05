@@ -772,6 +772,9 @@ impl MonitorService {
         monitor.is_active = Set(is_active);
 
         let result = monitor.update(self.db.as_ref()).await?;
+        if !is_active {
+            super::health_check_service::clear_monitor_log_state(monitor_id);
+        }
         let response: MonitorResponse = result.into();
         Ok(self.populate_monitor_url(response).await)
     }
@@ -782,6 +785,7 @@ impl MonitorService {
             .exec(self.db.as_ref())
             .await?;
 
+        super::health_check_service::clear_monitor_log_state(monitor_id);
         Ok(())
     }
 

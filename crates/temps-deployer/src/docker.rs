@@ -3,6 +3,7 @@
 
 //! Docker implementation of ImageBuilder and ContainerDeployer traits
 
+use crate::build_timings::BuildStepTimer;
 use crate::static_ingestion::{MAX_STATIC_ENTRIES, MAX_STATIC_ENTRY_BYTES, MAX_STATIC_TOTAL_BYTES};
 use crate::{
     BuildMemoryDiagnosis, BuildRequest, BuildResult, BuilderError, ContainerDeployer,
@@ -40,6 +41,101 @@ const MAX_STATIC_ARCHIVE_STREAM_BYTES: u64 =
 /// retaining more on a worker only increases memory and transfer cost.
 const MAX_CONTAINER_LOG_BYTES: usize = 8 * 1024 * 1024;
 const LOG_TRUNCATION_NOTICE: &str = "[… earlier container logs truncated by worker …]\n";
+
+/// Write the build context under `root` into `archive` the way the Docker
+/// CLI sends it: paths the Dockerfile's ignore rules exclude are left out,
+/// symlinks are archived as links, and every entry is owned by root.
+///
+/// The CLI rewrites every context entry to uid/gid 0 before uploading it.
+/// Without that, the archive carries whatever user owns the checkout on this
+/// host, and BuildKit keeps those ids when it unpacks a tarball context, so a
+/// `COPY . .` lands files owned by an unrelated uid in the build stage. Git
+/// then refuses to touch the copied `.git` ("detected dubious ownership"):
+/// `go build` fails with `error obtaining VCS status: exit status 128`, and a
+/// `git describe` / `git rev-parse` in a Makefile fails the same way.
+///
+/// `.git` follows the ignore rules like any other path, as it does with the
+/// CLI: builds that read VCS metadata need it, and a `.dockerignore` entry
+/// keeps it out of builds that don't. File modes and modification times are
+/// kept, and entries are written in name order so the archive does not
+/// depend on directory iteration order.
+fn append_local_build_context<W: Write>(
+    archive: &mut tar::Builder<W>,
+    root: &Path,
+    relative: &Path,
+    filter: &crate::remote::ContextFilter,
+) -> Result<(), BuilderError> {
+    let mut entries = std::fs::read_dir(root.join(relative))
+        .map_err(BuilderError::IoError)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(BuilderError::IoError)?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = relative.join(entry.file_name());
+        let file_type = entry.file_type().map_err(BuilderError::IoError)?;
+        let included = filter.includes(&path);
+        if file_type.is_dir() {
+            if included {
+                append_root_owned_entry(archive, &entry.path(), &path)?;
+            }
+            if included || filter.must_descend(&path) {
+                append_local_build_context(archive, root, &path, filter)?;
+            }
+        } else if included {
+            if !file_type.is_file() && !file_type.is_symlink() {
+                return Err(BuilderError::InvalidContext(format!(
+                    "Unsupported build context entry '{}'",
+                    path.display()
+                )));
+            }
+            append_root_owned_entry(archive, &entry.path(), &path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Append one context entry as `name`, owned by uid/gid 0. A symlink is
+/// archived as a link, so nothing outside the checkout is read through it.
+fn append_root_owned_entry<W: Write>(
+    archive: &mut tar::Builder<W>,
+    source: &Path,
+    name: &Path,
+) -> Result<(), BuilderError> {
+    let metadata = std::fs::symlink_metadata(source).map_err(BuilderError::IoError)?;
+    let mut header = tar::Header::new_gnu();
+    header.set_metadata_in_mode(&metadata, tar::HeaderMode::Complete);
+    header.set_uid(0);
+    header.set_gid(0);
+    if metadata.file_type().is_symlink() {
+        let target = std::fs::read_link(source).map_err(BuilderError::IoError)?;
+        header.set_size(0);
+        archive
+            .append_link(&mut header, name, target)
+            .map_err(BuilderError::IoError)
+    } else if metadata.is_dir() {
+        archive
+            .append_data(&mut header, name, std::io::empty())
+            .map_err(BuilderError::IoError)
+    } else {
+        let file = std::fs::File::open(source).map_err(BuilderError::IoError)?;
+        archive
+            .append_data(&mut header, name, file)
+            .map_err(BuilderError::IoError)
+    }
+}
+
+fn docker_build_args(request: &BuildRequest, use_buildkit: bool) -> HashMap<String, String> {
+    let mut args = request.build_args.clone();
+    if use_buildkit {
+        args.extend(request.build_args_buildkit.clone());
+        // Make images usable as cache_from seeds on another builder. Inline
+        // metadata travels with the image; cache mounts remain local.
+        args.entry("BUILDKIT_INLINE_CACHE".to_string())
+            .or_insert_with(|| "1".to_string());
+    }
+    args.retain(|_, value| !value.is_empty());
+    args
+}
 
 fn parse_inspected_port_mappings(
     ports: HashMap<String, Option<Vec<bollard::models::PortBinding>>>,
@@ -1218,62 +1314,6 @@ fn read_kernel_log() -> Option<String> {
     None
 }
 
-/// Write the directory tree under `root` into `archive` as a Docker build
-/// context, owned by root the way the Docker CLI sends it.
-///
-/// The CLI rewrites every context entry to uid/gid 0 before uploading it.
-/// Without that, the archive carries whatever user owns the checkout on this
-/// host, and BuildKit keeps those ids when it unpacks a tarball context, so a
-/// `COPY . .` lands files owned by an unrelated uid in the build stage. Git
-/// then refuses to touch the copied `.git` ("detected dubious ownership"):
-/// `go build` fails with `error obtaining VCS status: exit status 128`, and a
-/// `git describe` / `git rev-parse` in a Makefile fails the same way, even
-/// though `git clone && docker build .` of the same repository works.
-///
-/// Everything else matches the `tar::Builder::append_dir_all` this replaces:
-/// symlinks are followed, and file modes and modification times are kept.
-/// Entries are written in name order so the archive does not depend on
-/// directory iteration order. Sockets and other special files, which a git
-/// checkout cannot contain, are skipped.
-fn append_build_context<W: Write>(
-    archive: &mut tar::Builder<W>,
-    root: &Path,
-) -> std::io::Result<()> {
-    let mut pending = vec![PathBuf::new()];
-    while let Some(relative_dir) = pending.pop() {
-        let mut entries =
-            std::fs::read_dir(root.join(&relative_dir))?.collect::<Result<Vec<_>, _>>()?;
-        entries.sort_by_key(|entry| entry.file_name());
-
-        for entry in entries {
-            let relative = relative_dir.join(entry.file_name());
-            let path = entry.path();
-            // `metadata` (not `symlink_metadata`): follow links, as before.
-            let metadata = std::fs::metadata(&path)?;
-
-            let mut header = tar::Header::new_gnu();
-            header.set_metadata_in_mode(&metadata, tar::HeaderMode::Complete);
-            header.set_uid(0);
-            header.set_gid(0);
-
-            if metadata.is_dir() {
-                archive.append_data(&mut header, &relative, std::io::empty())?;
-                pending.push(relative);
-            } else if metadata.is_file() {
-                let file = std::fs::File::open(&path)?;
-                archive.append_data(&mut header, &relative, file)?;
-            } else {
-                debug!(
-                    "Skipping special file '{}' in build context {}",
-                    relative.display(),
-                    root.display()
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
 /// The message a failed build stream carries, without bollard's
 /// `Docker stream error:` wrapper, which tells the user nothing.
 fn build_stream_error_text(error: &bollard::errors::Error) -> String {
@@ -2204,34 +2244,36 @@ impl DockerRuntime {
     async fn create_tar_context_body(
         &self,
         context_path: PathBuf,
-    ) -> Result<http_body_util::Full<bytes::Bytes>, BuilderError> {
-        use bytes::Bytes;
-        use http_body_util::Full;
-
-        // Write the tar archive to a temporary file to avoid holding the entire
-        // build context in memory. Keep its cleanup owner in the blocking
-        // task so cancellation cannot unlink then recreate an orphan archive.
+        dockerfile_path: Option<PathBuf>,
+    ) -> Result<ImageImportStream, BuilderError> {
         let tmp = tempfile::NamedTempFile::new().map_err(BuilderError::IoError)?;
-        let tmp_path = tmp.path().to_path_buf();
-
-        // Tar creation is synchronous and CPU-bound — run it on a blocking thread.
-        let ctx = context_path.clone();
-        let _tmp = tokio::task::spawn_blocking(move || {
+        // Keep ownership in the blocking task; cancellation must not leave
+        // an orphan archive. Read back in bounded chunks rather than a Vec.
+        let tmp = tokio::task::spawn_blocking(move || {
+            let dockerfile = dockerfile_path
+                .as_deref()
+                .and_then(|path| path.strip_prefix(&context_path).ok())
+                .unwrap_or_else(|| Path::new("Dockerfile"));
+            let filter = crate::remote::load_context_filter(&context_path, dockerfile)?;
             let file = tmp.reopen().map_err(BuilderError::IoError)?;
-            let mut tar_builder = tar::Builder::new(file);
-            append_build_context(&mut tar_builder, &ctx).map_err(BuilderError::IoError)?;
-            tar_builder.finish().map_err(BuilderError::IoError)?;
+            let mut archive = tar::Builder::new(file);
+            append_local_build_context(&mut archive, &context_path, Path::new(""), &filter)?;
+            archive.finish().map_err(BuilderError::IoError)?;
             Ok::<_, BuilderError>(tmp)
         })
         .await
-        .map_err(|e| BuilderError::Other(format!("Tar task panicked: {}", e)))??;
-
-        // Read the completed tar file back into memory for Bollard.
-        let tar_data = tokio::fs::read(&tmp_path)
-            .await
-            .map_err(BuilderError::IoError)?;
-
-        Ok(Full::new(Bytes::from(tar_data)))
+        .map_err(|error| {
+            BuilderError::Other(format!("Build context tar task failed: {error}"))
+        })??;
+        let file = tokio::fs::File::from_std(tmp.reopen().map_err(BuilderError::IoError)?);
+        Ok(Box::pin(
+            tokio_util::codec::FramedRead::new(file, tokio_util::codec::BytesCodec::new()).map(
+                move |result| {
+                    let _owner = &tmp;
+                    result.map(|chunk| chunk.freeze())
+                },
+            ),
+        ))
     }
 
     fn get_resource_limits() -> (usize, u64) {
@@ -2690,14 +2732,14 @@ impl ImageBuilder for DockerRuntime {
 
         // Create tar archive body from build context
         let tar_body = self
-            .create_tar_context_body(request.context_path.clone())
+            .create_tar_context_body(
+                request.context_path.clone(),
+                request.dockerfile_path.clone(),
+            )
             .await?;
 
         // Prepare build options using Bollard
-        let mut build_args = HashMap::new();
-        for (key, value) in request.build_args.iter().filter(|(_, v)| !v.is_empty()) {
-            build_args.insert(key.to_string(), value.to_string());
-        }
+        let build_args = docker_build_args(&request, self.use_buildkit);
 
         // Resolve effective build caps from settings (or fall back to the
         // legacy 50%-of-host heuristic when no override is set). The memory
@@ -2712,10 +2754,6 @@ impl ImageBuilder for DockerRuntime {
 
         let mut labels = HashMap::new();
         labels.insert("built-by".to_string(), "temps".to_string());
-        let mut build_args = Some(build_args.clone());
-        if self.use_buildkit && !request.build_args_buildkit.is_empty() {
-            build_args = Some(request.build_args_buildkit.clone());
-        }
         let build_options = bollard::query_parameters::BuildImageOptions {
             dockerfile: request
                 .dockerfile_path
@@ -2724,7 +2762,8 @@ impl ImageBuilder for DockerRuntime {
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|| "Dockerfile".to_string()),
             t: Some(request.image_name.clone()),
-            buildargs: build_args,
+            buildargs: Some(build_args),
+            cachefrom: Some(request.cache_from.clone()),
             labels: Some(labels),
             networkmode: if self.use_buildkit {
                 // BuildKit only supports "default", "host", or "none"
@@ -2767,16 +2806,21 @@ impl ImageBuilder for DockerRuntime {
         let mut build_stream = docker.build_image(
             build_options,
             None,
-            Some(http_body_util::Either::Left(tar_body)),
+            Some(bollard::body_try_stream(tar_body)),
         );
 
         // Stream build output and write to log
+        let mut step_timer = BuildStepTimer::new();
+        let mut build_error = None;
         while let Some(build_info) = build_stream.next().await {
             match build_info {
                 Ok(info) => {
                     if let Some(stream) = info.stream {
                         let _ = log_file.write_all(stream.as_bytes()).await;
                         debug!("Build: {}", stream.trim());
+                    }
+                    if let Some(bollard::models::BuildInfoAux::BuildKit(ref res)) = info.aux {
+                        step_timer.observe_vertices(&res.vertexes);
                     }
                     if let Some(error_detail) = info.error_detail {
                         let error = error_detail
@@ -2791,7 +2835,8 @@ impl ImageBuilder for DockerRuntime {
                         if let Some(line) = memory_line {
                             let _ = log_file.write_all(line.as_bytes()).await;
                         }
-                        return Err(err);
+                        build_error = Some(err);
+                        break;
                     }
                 }
                 Err(e) => {
@@ -2810,12 +2855,21 @@ impl ImageBuilder for DockerRuntime {
                     if let Some(line) = memory_line {
                         let _ = log_file.write_all(line.as_bytes()).await;
                     }
-                    return Err(err);
+                    build_error = Some(err);
+                    break;
                 }
             }
         }
 
+        if let Some(summary) = step_timer.summary(start_time.elapsed()) {
+            info!(image = %request.image_name, "Build step timings\n{}", summary.trim_end());
+            let _ = log_file.write_all(summary.as_bytes()).await;
+        }
         let _ = log_file.flush().await;
+
+        if let Some(error) = build_error {
+            return Err(error);
+        }
 
         let build_duration = start_time.elapsed().as_millis() as u64;
 
@@ -2902,14 +2956,14 @@ impl ImageBuilder for DockerRuntime {
 
         // Create tar archive body from build context
         let tar_body = self
-            .create_tar_context_body(request.context_path.clone())
+            .create_tar_context_body(
+                request.context_path.clone(),
+                request.dockerfile_path.clone(),
+            )
             .await?;
 
         // Prepare build options using Bollard
-        let mut build_args = HashMap::new();
-        for (key, value) in request.build_args.iter().filter(|(_, v)| !v.is_empty()) {
-            build_args.insert(key.to_string(), value.to_string());
-        }
+        let build_args = docker_build_args(&request, self.use_buildkit);
 
         let (memory_bytes, cpu_quota_us, cpu_period_us) = self.resolve_build_resource_caps();
         let memory_i32 = self.effective_build_memory(memory_bytes, &request.image_name);
@@ -2930,6 +2984,7 @@ impl ImageBuilder for DockerRuntime {
                 .unwrap_or_else(|| "Dockerfile".to_string()),
             t: Some(request.image_name.clone()),
             buildargs: Some(build_args),
+            cachefrom: Some(request.cache_from.clone()),
             labels: Some(labels),
             networkmode: if self.use_buildkit {
                 // BuildKit only supports "default", "host", or "none"
@@ -2973,10 +3028,12 @@ impl ImageBuilder for DockerRuntime {
         let mut build_stream = docker.build_image(
             build_options,
             None,
-            Some(http_body_util::Either::Left(tar_body)),
+            Some(bollard::body_try_stream(tar_body)),
         );
 
         // Stream build output and write to log and callback
+        let mut step_timer = BuildStepTimer::new();
+        let mut build_error = None;
         while let Some(build_info) = build_stream.next().await {
             match build_info {
                 Ok(info) => {
@@ -2989,6 +3046,9 @@ impl ImageBuilder for DockerRuntime {
                         if let Some(ref callback) = log_callback {
                             callback(stream.clone()).await;
                         }
+                    }
+                    if let Some(bollard::models::BuildInfoAux::BuildKit(ref res)) = info.aux {
+                        step_timer.observe_vertices(&res.vertexes);
                     }
                     if let Some(error_detail) = info.error_detail {
                         let error = error_detail
@@ -3011,9 +3071,11 @@ impl ImageBuilder for DockerRuntime {
                                 callback(line).await;
                             }
                         }
-                        return Err(err);
+                        build_error = Some(err);
+                        break;
                     }
                     if let Some(bollard::models::BuildInfoAux::BuildKit(res)) = info.aux {
+                        step_timer.observe_vertices(&res.vertexes);
                         // Emit vertex names (build step descriptions) when they
                         // start or complete.  This gives visibility into cached
                         // layers and overall build progress even when there is
@@ -3081,12 +3143,27 @@ impl ImageBuilder for DockerRuntime {
                             callback(line).await;
                         }
                     }
-                    return Err(err);
+                    build_error = Some(err);
+                    break;
                 }
             }
         }
 
+        if let Some(summary) = step_timer.summary(start_time.elapsed()) {
+            info!(image = %request.image_name, "Build step timings\n{}", summary.trim_end());
+            let _ = log_file.write_all(summary.as_bytes()).await;
+            if let Some(ref callback) = log_callback {
+                // One deployment log entry per line, like the build output.
+                for line in summary.lines() {
+                    callback(format!("{line}\n")).await;
+                }
+            }
+        }
         let _ = log_file.flush().await;
+
+        if let Some(error) = build_error {
+            return Err(error);
+        }
 
         let build_duration = start_time.elapsed().as_millis() as u64;
 
@@ -4478,6 +4555,112 @@ mod docker_tests {
     use tempfile::TempDir;
     use tokio::fs;
     use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn local_context_stream_filters_ignored_files_and_preserves_exceptions() {
+        let dir = tempfile::tempdir().unwrap();
+        for (path, contents) in [
+            ("Dockerfile", "FROM scratch"),
+            (
+                ".dockerignore",
+                "Dockerfile\nnode_modules\ndocs\n!docs/keep.txt\n.git\n",
+            ),
+            ("node_modules/huge.bin", "excluded"),
+            ("docs/keep.txt", "keep"),
+            ("docs/drop.txt", "drop"),
+            (".git/config", "private"),
+            ("src/main.ts", "source"),
+        ] {
+            let path = dir.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+        let rt = runtime_for_diagnosis(true);
+        let mut stream = rt
+            .create_tar_context_body(dir.path().to_path_buf(), None)
+            .await
+            .unwrap();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            bytes.extend_from_slice(&chunk.unwrap());
+        }
+        let mut archive = tar::Archive::new(bytes.as_slice());
+        let paths: Vec<_> = archive
+            .entries()
+            .unwrap()
+            .map(|entry| entry.unwrap().path().unwrap().into_owned())
+            .collect();
+        assert!(paths.contains(&PathBuf::from("Dockerfile")));
+        assert!(paths.contains(&PathBuf::from("docs/keep.txt")));
+        assert!(paths.contains(&PathBuf::from("src/main.ts")));
+        assert!(!paths.contains(&PathBuf::from("node_modules/huge.bin")));
+        assert!(!paths.contains(&PathBuf::from("docs/drop.txt")));
+        assert!(!paths.contains(&PathBuf::from(".git/config")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_context_preserves_symlinks_and_dockerfile_specific_ignore() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("docker")).unwrap();
+        std::fs::write(dir.path().join("docker/Buildfile"), "FROM scratch").unwrap();
+        std::fs::write(dir.path().join(".dockerignore"), "keep.txt").unwrap();
+        std::fs::write(dir.path().join("docker/Buildfile.dockerignore"), "drop.txt").unwrap();
+        std::fs::write(dir.path().join("keep.txt"), "keep").unwrap();
+        std::fs::write(dir.path().join("drop.txt"), "drop").unwrap();
+        std::os::unix::fs::symlink("keep.txt", dir.path().join("link")).unwrap();
+        let rt = runtime_for_diagnosis(true);
+        let mut stream = rt
+            .create_tar_context_body(
+                dir.path().to_path_buf(),
+                Some(dir.path().join("docker/Buildfile")),
+            )
+            .await
+            .unwrap();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            bytes.extend_from_slice(&chunk.unwrap());
+        }
+        let mut archive = tar::Archive::new(bytes.as_slice());
+        let mut paths = Vec::new();
+        for entry in archive.entries().unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path().unwrap().into_owned();
+            if path == Path::new("link") {
+                assert!(entry.header().entry_type().is_symlink());
+            }
+            paths.push(path);
+        }
+        assert!(paths.contains(&PathBuf::from("keep.txt")));
+        assert!(paths.contains(&PathBuf::from("link")));
+        assert!(!paths.contains(&PathBuf::from("drop.txt")));
+    }
+
+    #[test]
+    fn buildkit_arguments_extend_user_arguments() {
+        let request = BuildRequest {
+            cache_from: Vec::new(),
+            image_name: "test".into(),
+            context_path: PathBuf::new(),
+            dockerfile_path: None,
+            platform: None,
+            log_path: PathBuf::new(),
+            build_args: HashMap::from([
+                ("NEXT_PUBLIC_URL".into(), "https://example.test".into()),
+                ("OVERRIDE".into(), "user".into()),
+            ]),
+            build_args_buildkit: HashMap::from([
+                ("BUILDKIT_CACHE_MOUNT_NS".into(), "isolated".into()),
+                ("OVERRIDE".into(), "builder".into()),
+            ]),
+        };
+        let args = docker_build_args(&request, true);
+        assert_eq!(args["NEXT_PUBLIC_URL"], "https://example.test");
+        assert_eq!(args["BUILDKIT_CACHE_MOUNT_NS"], "isolated");
+        assert_eq!(args["OVERRIDE"], "builder");
+        assert_eq!(args["BUILDKIT_INLINE_CACHE"], "1");
+        assert_eq!(docker_build_args(&request, false), request.build_args);
+    }
 
     #[test]
     fn inspected_ports_preserve_every_interface_binding() {
@@ -6188,6 +6371,7 @@ CMD ["cat", "/hello.txt"]
         match create_test_docker_runtime().await {
             Ok(runtime) => {
                 let request = BuildRequest {
+                    cache_from: Vec::new(),
                     image_name: "docker-test:latest".to_string(),
                     context_path,
                     dockerfile_path: None,
@@ -7363,12 +7547,15 @@ CMD ["cat", "/hello.txt"]
         assert!(!runtime.docker.is_available());
     }
 
-    /// Archive `root` with [`append_build_context`] and return every entry's
-    /// path, header and contents.
+    /// Archive `root` with [`append_local_build_context`] and return every
+    /// entry's path, header and contents.
     fn archive_build_context(root: &std::path::Path) -> Vec<(String, tar::Header, Vec<u8>)> {
         use std::io::Read;
         let mut archive = tar::Builder::new(Vec::new());
-        append_build_context(&mut archive, root).expect("archive the build context");
+        let filter = crate::remote::load_context_filter(root, std::path::Path::new("Dockerfile"))
+            .expect("load the context filter");
+        append_local_build_context(&mut archive, root, std::path::Path::new(""), &filter)
+            .expect("archive the build context");
         let bytes = archive.into_inner().expect("finish the archive");
         let mut reader = tar::Archive::new(bytes.as_slice());
         reader
@@ -7447,18 +7634,23 @@ CMD ["cat", "/hello.txt"]
     }
 
     #[test]
-    fn build_context_follows_symlinks_like_before() {
+    fn build_context_archives_symlinks_as_root_owned_links() {
         let checkout = checkout_fixture();
         std::os::unix::fs::symlink("cmd/app/main.go", checkout.path().join("main.go")).unwrap();
 
         let entries = archive_build_context(checkout.path());
-        let (_, header, contents) = entries
+        let (_, header, _) = entries
             .iter()
             .find(|(path, _, _)| path == "main.go")
-            .expect("symlinked file archived");
+            .expect("symlink archived");
 
-        assert_eq!(header.entry_type(), tar::EntryType::Regular);
-        assert_eq!(contents, b"package main\n");
+        assert_eq!(header.entry_type(), tar::EntryType::Symlink);
+        assert_eq!(
+            header.link_name().unwrap().unwrap(),
+            std::path::Path::new("cmd/app/main.go")
+        );
+        assert_eq!(header.uid().unwrap(), 0);
+        assert_eq!(header.gid().unwrap(), 0);
     }
 
     #[test]
@@ -7478,15 +7670,33 @@ CMD ["cat", "/hello.txt"]
     }
 
     #[test]
-    fn build_context_reports_a_dangling_symlink() {
+    fn build_context_keeps_a_dangling_symlink_without_reading_through_it() {
         let checkout = checkout_fixture();
         std::os::unix::fs::symlink("does-not-exist", checkout.path().join("broken")).unwrap();
 
-        let mut archive = tar::Builder::new(Vec::new());
-        let error = append_build_context(&mut archive, checkout.path())
-            .expect_err("a dangling symlink cannot be followed");
+        let entries = archive_build_context(checkout.path());
+        let (_, header, _) = entries
+            .iter()
+            .find(|(path, _, _)| path == "broken")
+            .expect("dangling symlink archived as a link");
 
-        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(header.entry_type(), tar::EntryType::Symlink);
+    }
+
+    #[test]
+    fn build_context_omits_git_metadata_only_when_ignored() {
+        let checkout = checkout_fixture();
+        std::fs::write(checkout.path().join(".dockerignore"), ".git\n").unwrap();
+
+        let entries = archive_build_context(checkout.path());
+
+        assert!(
+            entries
+                .iter()
+                .all(|(path, _, _)| !path.starts_with(".git/")
+                    && path.trim_end_matches('/') != ".git")
+        );
+        assert!(entries.iter().any(|(path, _, _)| path == "cmd/app/main.go"));
     }
 
     #[test]
@@ -7548,6 +7758,7 @@ CMD ["cat", "/hello.txt"]
         let runtime = DockerRuntime::new(Arc::new(docker.clone()), true, network.clone());
         let log_dir = TempDir::new().unwrap();
         let request = BuildRequest {
+            cache_from: Vec::new(),
             image_name: image.clone(),
             context_path: checkout.path().to_path_buf(),
             dockerfile_path: None,

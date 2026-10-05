@@ -22,6 +22,39 @@ use temps_logs::{LogLevel, LogService};
 use temps_presets;
 use tokio::time::{sleep, Duration};
 
+// Widen only generated Next.js builds in a recognized workspace. Custom
+// Dockerfiles and other presets retain their explicitly selected context.
+fn nextjs_build_root(
+    preset: &str,
+    source_root: &Path,
+    app: &Path,
+) -> Result<PathBuf, WorkflowError> {
+    if preset != "nextjs" || source_root == app {
+        return Ok(app.to_path_buf());
+    }
+    for marker in ["turbo.json", "nx.json", "lerna.json", "pnpm-workspace.yaml"] {
+        if read_confined_control_file(source_root, &source_root.join(marker), 1024 * 1024)?
+            .is_some()
+        {
+            return Ok(source_root.to_path_buf());
+        }
+    }
+    if let Some(package) = read_confined_control_file(
+        source_root,
+        &source_root.join("package.json"),
+        5 * 1024 * 1024,
+    )? {
+        if serde_json::from_str::<serde_json::Value>(&package)
+            .ok()
+            .and_then(|manifest| manifest.get("workspaces").cloned())
+            .is_some_and(|workspaces| workspaces.is_array() || workspaces.is_object())
+        {
+            return Ok(source_root.to_path_buf());
+        }
+    }
+    Ok(app.to_path_buf())
+}
+
 fn validate_relative_build_path(path: &Path, label: &str) -> Result<(), WorkflowError> {
     if path.as_os_str().is_empty()
         || path.is_absolute()
@@ -568,10 +601,11 @@ impl BuildImageJob {
         context: &WorkflowContext,
         build_context_dir: &PathBuf,
         dockerfile_path: &PathBuf,
-    ) -> Result<std::collections::HashMap<String, String>, WorkflowError> {
+        source_root: &Path,
+    ) -> Result<(std::collections::HashMap<String, String>, PathBuf), WorkflowError> {
         // If Dockerfile exists, we're done (no preset build args)
         if fs::symlink_metadata(dockerfile_path).is_ok() {
-            return Ok(std::collections::HashMap::new());
+            return Ok((std::collections::HashMap::new(), build_context_dir.clone()));
         }
 
         // Resolve the canonical stored preset and typed config, or auto-detect
@@ -668,6 +702,7 @@ impl BuildImageJob {
         };
 
         let preset_slug = preset.slug();
+        let preset_root = nextjs_build_root(&preset_slug, source_root, build_context_dir)?;
 
         // Convert build args to build_vars format (Vec<String> of "KEY" for ARG directives)
         let build_vars: Vec<String> = self
@@ -703,10 +738,10 @@ impl BuildImageJob {
         }
 
         // Generate Dockerfile content with build args and .temps.yaml overrides
-        // Use build_context_dir as both root and local path so preset detection works correctly
+        // Workspace installs need the root lockfile and sibling packages.
         let mut dockerfile_with_args = preset
             .dockerfile(temps_presets::DockerfileConfig {
-                root_local_path: build_context_dir,
+                root_local_path: &preset_root,
                 local_path: build_context_dir,
                 install_command: install_cmd_owned.as_deref(),
                 build_command: build_cmd_owned.as_deref(),
@@ -756,7 +791,7 @@ impl BuildImageJob {
         }
 
         // Return the preset build args so the caller can merge them
-        Ok(dockerfile_with_args.build_args)
+        Ok((dockerfile_with_args.build_args, preset_root))
     }
 
     /// Write a `.npmrc` file into the build context when the user provides
@@ -869,6 +904,8 @@ impl BuildImageJob {
             )));
         }
 
+        let mut build_context = canonical_context.clone();
+
         // Determine dockerfile path relative to build context
         let dockerfile_relative = self
             .build_config
@@ -903,9 +940,10 @@ impl BuildImageJob {
 
         // Ensure Dockerfile exists (generate from preset if needed)
         // This returns build args from the preset
-        let preset_build_args = self
-            .ensure_dockerfile(context, &build_context, &dockerfile_path)
+        let (preset_build_args, preset_root) = self
+            .ensure_dockerfile(context, &build_context, &dockerfile_path, &canonical_root)
             .await?;
+        build_context = preset_root;
 
         // Write .npmrc into the build context when NPM_RC / NPM_TOKEN env vars
         // are provided (Vercel-compatible behavior). No-op otherwise.
@@ -940,10 +978,7 @@ impl BuildImageJob {
         self.log(context, "Building container image...".to_string())
             .await?;
 
-        let mut build_args = HashMap::new();
-        for (key, value) in &self.build_config.build_args {
-            build_args.insert(key.clone(), value.clone());
-        }
+        let build_args: HashMap<String, String> = build_args.into_iter().collect();
 
         let mut build_args_buildkit = HashMap::new();
         for (key, value) in &self.build_config.build_args_buildkit {
@@ -1007,6 +1042,7 @@ impl BuildImageJob {
             }
 
             let build_request = BuildRequest {
+                cache_from: self.build_config.cache_from.clone(),
                 image_name: tag.clone(),
                 context_path: build_context.clone(),
                 dockerfile_path: Some(dockerfile_path.clone()),
@@ -1685,6 +1721,44 @@ mod tests {
         BuildRequest, BuildRequestWithCallback, BuildResult, BuilderError, ImageBuilder,
     };
 
+    #[test]
+    fn nextjs_workspace_context_is_limited_to_generated_workspace_builds() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let app = root.join("apps/web");
+        std::fs::create_dir_all(&app).unwrap();
+        assert_eq!(nextjs_build_root("nextjs", root, &app).unwrap(), app);
+        std::fs::write(root.join("turbo.json"), "{}").unwrap();
+        assert_eq!(nextjs_build_root("nextjs", root, &app).unwrap(), root);
+        assert_eq!(nextjs_build_root("autopack", root, &app).unwrap(), app);
+        assert_eq!(nextjs_build_root("nextjs", root, root).unwrap(), root);
+    }
+
+    #[test]
+    fn nextjs_plain_workspace_context_uses_root_lockfiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let app = root.join("apps/web");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(root.join("pnpm-workspace.yaml"), "packages: [apps/*]").unwrap();
+        assert_eq!(nextjs_build_root("nextjs", root, &app).unwrap(), root);
+        std::fs::remove_file(root.join("pnpm-workspace.yaml")).unwrap();
+        std::fs::write(root.join("package.json"), r#"{"workspaces":["apps/*"]}"#).unwrap();
+        assert_eq!(nextjs_build_root("nextjs", root, &app).unwrap(), root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nextjs_workspace_context_rejects_symlink_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let app = root.join("apps/web");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(root.join("outside.json"), "{}").unwrap();
+        std::os::unix::fs::symlink(root.join("outside.json"), root.join("turbo.json")).unwrap();
+        assert!(nextjs_build_root("nextjs", root, &app).is_err());
+    }
+
     // Mock ImageBuilder for testing
     struct MockImageBuilder;
 
@@ -1923,6 +1997,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingImageBuilder {
         builds: std::sync::Mutex<Vec<(String, Option<String>)>>,
+        requests: std::sync::Mutex<Vec<BuildRequest>>,
         /// Platforms whose build should fail, with this error text.
         fail_platform: Option<(String, String)>,
     }
@@ -1936,6 +2011,7 @@ mod tests {
     #[async_trait]
     impl ImageBuilder for RecordingImageBuilder {
         async fn build_image(&self, request: BuildRequest) -> Result<BuildResult, BuilderError> {
+            self.requests.lock().unwrap().push(request.clone());
             self.builds
                 .lock()
                 .unwrap()
@@ -2021,6 +2097,74 @@ mod tests {
             repo_name: "repo".to_string(),
         };
         (dir, repo)
+    }
+
+    #[tokio::test]
+    async fn generated_nextjs_subfolder_build_uses_workspace_context() {
+        for custom_dockerfile in [false, true] {
+            let builder = Arc::new(RecordingImageBuilder::default());
+            let job = BuildImageJobBuilder::new()
+                .job_id("build".into())
+                .download_job_id("download_repo".into())
+                .image_tag("app:latest".into())
+                .build_context("apps/web".into())
+                .preset(StoredPreset::NextJs)
+                .cache_from(vec!["app:previous".into()])
+                .build(builder.clone())
+                .unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let app = root.join("apps/web");
+            std::fs::create_dir_all(&app).unwrap();
+            std::fs::write(root.join("package.json"), "{}").unwrap();
+            std::fs::write(root.join("turbo.json"), "{}").unwrap();
+            std::fs::write(root.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'").unwrap();
+            std::fs::write(
+                app.join("package.json"),
+                r#"{"scripts":{"build":"next build"}}"#,
+            )
+            .unwrap();
+            if custom_dockerfile {
+                std::fs::write(app.join("Dockerfile"), "FROM scratch\n").unwrap();
+            }
+            let repo = RepositoryOutput {
+                repo_dir: root.into(),
+                checkout_ref: "main".into(),
+                repo_owner: "owner".into(),
+                repo_name: "repo".into(),
+            };
+            let mut context = crate::test_utils::create_test_context("wf".into(), 1, 1, 1);
+            context
+                .set_output(
+                    "download_repo",
+                    "repo_dir",
+                    root.to_string_lossy().to_string(),
+                )
+                .unwrap();
+            context
+                .set_output("download_repo", "checkout_ref", "main")
+                .unwrap();
+            context
+                .set_output("download_repo", "repo_owner", "owner")
+                .unwrap();
+            context
+                .set_output("download_repo", "repo_name", "repo")
+                .unwrap();
+            job.build_image(&repo, &context).await.unwrap();
+            let requests = builder.requests.lock().unwrap();
+            let request = &requests[0];
+            let expected = if custom_dockerfile { &app } else { root };
+            assert_eq!(request.context_path, expected.canonicalize().unwrap());
+            assert_eq!(request.cache_from, vec!["app:previous"]);
+            if !custom_dockerfile {
+                let dockerfile = std::fs::read_to_string(app.join("Dockerfile")).unwrap();
+                assert!(dockerfile.contains("pnpm-lock.yaml"));
+                assert!(
+                    dockerfile.find("pnpm install").unwrap()
+                        < dockerfile.find("WORKDIR /repo/apps/web").unwrap()
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -2223,6 +2367,7 @@ mod tests {
     async fn test_secondary_platform_failure_degrades_instead_of_aborting() {
         let builder = Arc::new(RecordingImageBuilder {
             builds: Default::default(),
+            requests: Default::default(),
             fail_platform: Some(("linux/arm64".to_string(), "exec format error".to_string())),
         });
         let job = BuildImageJobBuilder::new()
@@ -2262,6 +2407,7 @@ mod tests {
     async fn test_primary_platform_failure_still_fails_the_job() {
         let builder = Arc::new(RecordingImageBuilder {
             builds: Default::default(),
+            requests: Default::default(),
             fail_platform: Some(("linux/amd64".to_string(), "boom".to_string())),
         });
         let job = BuildImageJobBuilder::new()

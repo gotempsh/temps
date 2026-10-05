@@ -85,7 +85,7 @@ async fn agent_error_detail(response: reqwest::Response) -> String {
 }
 
 /// What to archive from a build context, decided before anything is read.
-struct ContextFilter {
+pub(crate) struct ContextFilter {
     ignore: DockerIgnore,
     /// Paths the Docker CLI always sends even when ignored: the Dockerfile
     /// and the ignore file itself.
@@ -93,12 +93,12 @@ struct ContextFilter {
 }
 
 impl ContextFilter {
-    fn includes(&self, path: &Path) -> bool {
+    pub(crate) fn includes(&self, path: &Path) -> bool {
         self.always_include.iter().any(|kept| kept == path) || !self.ignore.is_excluded(path)
     }
 
     /// Whether an excluded directory may still contain something to send.
-    fn must_descend(&self, directory: &Path) -> bool {
+    pub(crate) fn must_descend(&self, directory: &Path) -> bool {
         self.ignore.has_exceptions()
             || self
                 .always_include
@@ -181,7 +181,10 @@ fn append_build_context(
 /// Load the ignore rules Docker would apply for `dockerfile`: a
 /// `<Dockerfile>.dockerignore` beside it takes precedence over the context
 /// root's `.dockerignore`, as with BuildKit.
-fn load_context_filter(root: &Path, dockerfile: &Path) -> Result<ContextFilter, BuilderError> {
+pub(crate) fn load_context_filter(
+    root: &Path,
+    dockerfile: &Path,
+) -> Result<ContextFilter, BuilderError> {
     let mut specific = dockerfile.as_os_str().to_owned();
     specific.push(".dockerignore");
     let candidates = [PathBuf::from(specific), PathBuf::from(".dockerignore")];
@@ -219,6 +222,11 @@ fn load_context_filter(root: &Path, dockerfile: &Path) -> Result<ContextFilter, 
 fn prepare_build_context(
     request: &BuildRequest,
 ) -> Result<(tempfile::NamedTempFile, BuildSpec), BuilderError> {
+    if !request.cache_from.is_empty() {
+        return Err(BuilderError::InvalidContext(
+            "Worker builds do not support cache_from image imports; use a local builder or remove cache_from".to_string(),
+        ));
+    }
     // These inputs materialise as a generated .npmrc before archiving. Never
     // rely on application-owned ignore rules to enforce the credential boundary.
     if request
@@ -1417,6 +1425,7 @@ mod tests {
         )
         .expect("git config");
         let request = BuildRequest {
+            cache_from: Vec::new(),
             image_name: "app:latest".to_string(),
             context_path: source.path().to_path_buf(),
             dockerfile_path: None,
@@ -1496,6 +1505,7 @@ mod tests {
         std::fs::write(source.path().join("Dockerfile"), "FROM scratch\n").expect("Dockerfile");
         std::os::unix::fs::symlink("/etc/passwd", source.path().join("linked")).expect("symlink");
         let request = BuildRequest {
+            cache_from: Vec::new(),
             image_name: "app:latest".to_string(),
             context_path: source.path().to_path_buf(),
             dockerfile_path: None,
@@ -1529,6 +1539,7 @@ mod tests {
 
     fn context_request(root: &Path, dockerfile: Option<PathBuf>) -> BuildRequest {
         BuildRequest {
+            cache_from: Vec::new(),
             image_name: "app:latest".to_string(),
             context_path: root.to_path_buf(),
             dockerfile_path: dockerfile,
@@ -1541,6 +1552,16 @@ mod tests {
 
     /// Files the project keeps out of its image must not leave the control
     /// plane at all — `.env` files are the canonical case.
+    #[test]
+    fn worker_context_refuses_unsupported_image_cache_import() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Dockerfile"), "FROM scratch").unwrap();
+        let mut request = context_request(dir.path(), None);
+        request.cache_from.push("app:previous".into());
+        let error = prepare_build_context(&request).err().unwrap();
+        assert!(error.to_string().contains("cache_from"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn worker_context_archive_applies_dockerignore() {
@@ -2071,6 +2092,7 @@ mod tests {
         .unwrap();
         let result = deployer
             .build_image(BuildRequest {
+                cache_from: Vec::new(),
                 image_name: "test:latest".to_string(),
                 context_path: source.path().to_path_buf(),
                 dockerfile_path: None,

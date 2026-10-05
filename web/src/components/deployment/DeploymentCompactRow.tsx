@@ -27,6 +27,7 @@ import {
   X,
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo } from 'react'
+import { failureStageLabel } from '@/lib/deployment-failure-guidance'
 import { deploymentSourceSummary } from '@/lib/deployment-source-summary'
 import { TimeAgo } from '../utils/TimeAgo'
 import { DeploymentStatusBadge } from './DeploymentStatusBadge'
@@ -115,6 +116,15 @@ export default function DeploymentCompactRow({
             </Badge>
           )}
         </div>
+        {deployment.status === 'failed' && deployment.failure && (
+          <p
+            className="mt-1 truncate text-xs text-destructive"
+            title={deployment.failure.remediation}
+          >
+            {failureStageLabel(deployment.failure.stage)} ·{' '}
+            {deployment.failure.title}
+          </p>
+        )}
       </div>
 
       {/* Meta line: source info — takes remaining space, truncates */}

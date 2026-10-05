@@ -1,149 +1,119 @@
 export const metadata = {
-  title: 'Deploy a Vue App',
-  description: 'Deploy a Vue.js or Nuxt application on Temps with Vite builds, server-side rendering support, automatic HTTPS, and zero-config CI/CD.',
+  title: "Deploy Vue.js and Nuxt SSR Applications",
+  description: "How Temps builds and serves Vue apps: static Vite builds are served from dist/, while Nuxt SSR apps run as Node.js containers with automatic HTTPS and scaling.",
   alternates: {
-    canonical: '/docs/deploy-vue',
+    canonical: "/docs/deploy-vue",
   },
-}
-
-# Deploy a Vue App
-
-This tutorial walks you through deploying a Vue.js application on Temps. Whether you are using a static Vite build or Nuxt for server-side rendering, Temps handles both. {{ className: 'lead' }}
-
----
-
-## What you will build {{ anchor: true, id: 'what-you-will-build' }}
-
-- A Vue app deployed from a Git repository
-- Static or SSR deployment depending on your setup
-- Automatic HTTPS and deployment on every push
-
-**Time required:** 10 minutes.
-
-**Prerequisites:**
-- A running Temps instance ([install guide](/docs/your-first-deployment))
-- A Vue app in a Git repository (Vite or Nuxt)
-- (Optional) A custom domain
-
----
-
-## Option A: Static Vue + Vite {{ anchor: true, id: 'static-vue' }}
-
-### Step 1: Prepare your app
-
-Verify your `package.json` has the build script:
-
-```json {{ title: 'package.json' }}
-{
-  "name": "my-vue-app",
-  "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "preview": "vite preview"
+  openGraph: {
+    title: "Deploy Vue.js and Nuxt SSR Applications",
+    description: "How Temps builds and serves Vue apps: static Vite builds are served from dist/, while Nuxt SSR apps run as Node.js containers with automatic HTTPS and scaling.",
+    images: [{ url: "/og/docs/deploy-vue.png", width: 1200, height: 630, alt: "Deploy Vue.js" }],
   },
-  "dependencies": {
-    "vue": "^3.5"
+  twitter: {
+    card: "summary_large_image",
+    title: "Deploy Vue.js and Nuxt SSR Applications",
+    description: "How Temps builds and serves Vue apps: static Vite builds are served from dist/, while Nuxt SSR apps run as Node.js containers with automatic HTTPS and scaling.",
+    images: ["/og/docs/deploy-vue.png"],
   }
-}
-```
+};
 
-Vite outputs static files to `dist/` by default. Temps detects this and serves them with a lightweight web server.
+export const sections = [
+  { title: "Quickstart", id: "quickstart" },
+  { title: "Static Vue (Vite)", id: "static-vue-vite" },
+  { title: "Nuxt SSR", id: "nuxt-ssr" },
+  { title: "Environment variables", id: "environment-variables" },
+  { title: "SPA routing", id: "spa-routing" },
+  { title: "Caching", id: "compression-caching" },
+];
 
-### Step 2: Create a project and deploy
+# Deploy Vue.js on Your Own Server
 
-1. Open the Temps dashboard
-2. Click **New Project** and connect your repository
-3. Temps detects Vue + Vite and configures the build automatically
-4. Push to deploy
-
-Or via CLI:
-
-```bash
-bunx @temps-sdk/cli projects create -n "my-vue-app" -d "Vue application"
-bunx @temps-sdk/cli projects git -p my-vue-app --owner yourorg --repo my-vue-app --branch main --preset static -y
-bunx @temps-sdk/cli deploy my-vue-app -b main -e production -y
-```
+**Push to your branch and Temps takes it from there** — static Vue apps built with Vite are served from the `dist/` directory with long-lived cache headers, while Nuxt SSR apps run as Node.js containers with automatic HTTPS. No Dockerfile needed. {{ className: 'lead' }}
 
 ---
 
-## Option B: Nuxt (SSR) {{ anchor: true, id: 'nuxt-ssr' }}
+## Quickstart {{ anchor: true, id: 'quickstart' }}
 
-### Step 1: Prepare your Nuxt app
+From your project root, deploy with your preferred package manager:
 
-Verify your `package.json`:
+<CliCommands commands={[
+  { args: "up" },
+]} />
 
-```json {{ title: 'package.json' }}
-{
-  "name": "my-nuxt-app",
-  "scripts": {
-    "dev": "nuxt dev",
-    "build": "nuxt build",
-    "start": "node .output/server/index.mjs"
-  },
-  "dependencies": {
-    "nuxt": "^3.15"
-  }
-}
-```
-
-Nuxt builds a standalone server in `.output/` that includes everything needed to run.
-
-### Step 2: Create a Dockerfile (optional)
-
-Temps auto-detects Nuxt, but you can customize with a Dockerfile:
-
-```dockerfile {{ title: 'Dockerfile' }}
-FROM node:22-alpine AS builder
-WORKDIR /app
-COPY package*.json ./
-RUN npm ci
-COPY . .
-RUN npm run build
-
-FROM node:22-alpine
-WORKDIR /app
-COPY --from=builder /app/.output ./.output
-EXPOSE 3000
-CMD ["node", ".output/server/index.mjs"]
-```
-
-### Step 3: Deploy
-
-1. Create a project in the Temps dashboard
-2. Connect your repository
-3. Add environment variables if needed
-4. Push to deploy
-
-```bash
-bunx @temps-sdk/cli deploy my-nuxt-app -b main -e production -y
-```
+Temps detects a Vite project from its `vite.config.js` or `vite.config.ts`, runs its `build` script, and serves the output. Static apps are live in a few minutes. Nuxt isn't detected; see [Nuxt SSR](#nuxt-ssr) below.
 
 ---
 
-## Environment variables {{ anchor: true, id: 'env-vars' }}
+## Static Vue (Vite) {{ anchor: true, id: 'static-vue-vite' }}
 
-For Nuxt, runtime configuration uses `NUXT_` prefixed variables:
+With the **Vite** preset, Temps installs dependencies with the package manager your lockfile points to, runs its `build` script (for example `npm run build`), and serves the `dist/` output from the Temps proxy, with long-lived cache headers for hashed assets. No container runs for a static app.
 
-```bash
-# Available at runtime via useRuntimeConfig()
-NUXT_PUBLIC_API_URL=https://api.example.com
-NUXT_SECRET_KEY=your-secret
-```
+Vue CLI projects aren't detected. Choose the **Vite** preset for them as well, under **Project → Settings → Build & deploy → Build → Framework**: it runs your `build` script and serves `dist/`, which is where Vue CLI writes its output.
 
-For static Vue apps, Vite uses `VITE_` prefixed variables that are embedded at build time:
-
-```bash
-VITE_API_URL=https://api.example.com
-```
-
-<Note>
-  Variables with the `VITE_` prefix are baked into the JavaScript bundle during the build step. If you change them, you must trigger a new deployment.
-</Note>
+| Feature | How Temps handles it |
+| ------- | -------------------- |
+| Build | Your package manager's `build` script |
+| Output | Serves `dist/`, or the `build.output_dir` set in `.temps.yaml` |
+| SPA routing | 404 → index.html fallback |
+| Cache | Hashed assets get 1-year cache headers |
+| HTTPS | Let's Encrypt, auto-renewed |
 
 ---
 
-## What to do next {{ anchor: true, id: 'next-steps' }}
+## Nuxt SSR {{ anchor: true, id: 'nuxt-ssr' }}
 
-- [Add a custom domain](/docs/add-a-custom-domain) — point your domain to this deployment
-- [Set up preview deployments](/docs/set-up-preview-deployments) — get a preview URL for every pull request
-- [Add monitoring](/docs/monitoring) — uptime checks and alerts
+Nuxt applications using server-side rendering run as Node.js containers. Choose the **Autopack (Node.js)** preset (`nixpacks-node`), with `up --preset nixpacks-node` or under **Project → Settings → Build & deploy → Build → Framework**.
+
+Temps runs your `build` script (`nuxt build`), but a new Nuxt project has no `start` script, so tell Temps how to start the server. Add a `Procfile` to the repository root:
+
+```text {{ title: 'Procfile' }}
+web: node .output/server/index.mjs
+```
+
+A `start` script with the same command works too.
+
+| Feature | How Temps handles it |
+| ------- | -------------------- |
+| Build | Your `build` script (`nuxt build`) |
+| Start | The `Procfile` `web:` line or your `start` script |
+| Port | The Nuxt server reads the `PORT` Temps sets |
+| Runtime config | `NUXT_` env vars supported |
+
+---
+
+## Environment variables {{ anchor: true, id: 'environment-variables' }}
+
+<CliCommands commands={[
+  { comment: "Runtime config (Nuxt)", args: "environments vars set NUXT_PUBLIC_API_URL \"https://api.example.com\" -e production" },
+  { comment: "Build-time (Vite)", args: "environments vars set VITE_API_URL \"https://api.example.com\" -e production" },
+]} />
+
+---
+
+## SPA routing {{ anchor: true, id: 'spa-routing' }}
+
+Static Vue apps (Vite) use client-side routing, handled automatically by the proxy.
+
+<SpaRouting />
+
+---
+
+## Caching {{ anchor: true, id: 'compression-caching' }}
+
+<StaticAssets />
+
+---
+
+## Next Steps
+
+<div className="not-prose">
+  <Button href="/docs/environment-variables" variant="text" arrow="right">
+    Environment variables
+  </Button>
+  <Button href="/docs/set-up-preview-deployments" variant="text" arrow="right">
+    Preview deployments
+  </Button>
+  <Button href="/docs/analytics" variant="text" arrow="right">
+    Built-in analytics
+  </Button>
+</div>

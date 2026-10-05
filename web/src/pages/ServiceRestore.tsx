@@ -357,16 +357,38 @@ export function ServiceRestore() {
     }
   }
 
-  // Re-plan whenever the inputs that affect the plan change. Throttled
-  // naturally by React Query's mutate serialization — a rapid change in
-  // mode/backup still produces the latest plan shown.
+  const planRequestKey = JSON.stringify({
+    id: serviceId,
+    body: buildRequestBody(),
+  })
+  const [plannedRestore, setPlannedRestore] = useState<{
+    key: string
+    plan: RestorePlan
+  } | null>(null)
+
+  // Ignore responses for inputs the user has already changed.
   useEffect(() => {
     const body = buildRequestBody()
     if (!body) return
-    planMutation.mutate({
-      path: { id: serviceId },
-      body: body as never,
-    })
+    let active = true
+    planMutation.mutate(
+      {
+        path: { id: serviceId },
+        body: body as never,
+      },
+      {
+        onSuccess: (data) => {
+          if (active)
+            setPlannedRestore({
+              key: planRequestKey,
+              plan: data as RestorePlan,
+            })
+        },
+      }
+    )
+    return () => {
+      active = false
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     selectedBackup?.id,
@@ -379,12 +401,23 @@ export function ServiceRestore() {
     serviceId,
   ])
 
-  const plan = planMutation.data as RestorePlan | undefined
+  const plan =
+    plannedRestore?.key === planRequestKey ? plannedRestore.plan : undefined
   const planError = planMutation.error as Error | null
   const planHasBlockingErrors = !!plan && plan.errors.length > 0
+  // The server decides cross-service by service identity (the backup's
+  // recorded producer ids). Only a completed plan for these exact inputs
+  // can authorize the confirmation and start action.
+  const crossServiceRestore = plan?.cross_service ?? false
 
   const canSubmit = (() => {
-    if (!selectedBackup) return false
+    if (
+      !selectedBackup ||
+      !plan ||
+      planMutation.isPending ||
+      planMutation.isError
+    )
+      return false
     if (mode === 'new_service' && effectiveNewServiceName.trim().length === 0)
       return false
     if (mode === 'pitr') {
@@ -402,7 +435,7 @@ export function ServiceRestore() {
   })()
 
   const doStart = () => {
-    if (!selectedBackup) return
+    if (!selectedBackup || !canSubmit) return
     const base: Record<string, unknown> = isOrphan
       ? {
           backup_location: selectedBackup.location,
@@ -410,6 +443,13 @@ export function ServiceRestore() {
           s3_source_id: effectiveSourceId,
         }
       : { backup_id: selectedBackup.id }
+
+    // Destructive restores only reach doStart() through the confirmation
+    // dialog, which names the cross-service overwrite explicitly; send that
+    // confirmation so the server can bind and audit it.
+    if (needsTypedConfirm && crossServiceRestore) {
+      base.confirm_cross_service = true
+    }
 
     let body: Record<string, unknown>
     if (mode === 'in_place') {
@@ -1071,6 +1111,17 @@ export function ServiceRestore() {
               entire dataset with the selected backup. All data written since
               the backup was taken will be permanently lost. This action cannot
               be undone.
+              {crossServiceRestore ? (
+                <>
+                  {' '}
+                  The backup was produced by{' '}
+                  <strong>
+                    {selectedBackup?.origin_service_name ?? 'another service'}
+                  </strong>
+                  , not this service: confirming records an explicit
+                  cross-service restore in the audit log.
+                </>
+              ) : null}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

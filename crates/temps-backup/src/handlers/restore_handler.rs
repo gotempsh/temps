@@ -45,6 +45,12 @@ impl From<RestoreError> for Problem {
             RestoreError::BackupDeleting { .. } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Backup deletion in progress")
                 .with_detail(error.to_string()),
+            RestoreError::CrossServiceRestoreNotConfirmed { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_type("https://temps.sh/probs/cross-service-restore-not-confirmed")
+                    .with_title("Cross-Service Restore Not Confirmed")
+                    .with_detail(error.to_string())
+            }
             RestoreError::BackupHasNoService { .. }
             | RestoreError::Validation { .. }
             | RestoreError::UnsupportedMode { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
@@ -118,6 +124,16 @@ pub struct StartRestoreRequest {
     /// is used.
     #[serde(default)]
     pub s3_source_id: Option<i32>,
+    /// Explicit confirmation for a destructive cross-service restore.
+    ///
+    /// Restoring in place (or PITR in place) onto a service that did not
+    /// produce the backup — or from a raw backup location whose origin is
+    /// unknown — overwrites the target with another service's data. Such a
+    /// request is rejected with `409 Conflict` unless this is `true`. The
+    /// confirmation is recorded in the audit log. Ignored for modes that
+    /// provision a new service and for same-service restores.
+    #[serde(default)]
+    pub confirm_cross_service: bool,
     /// Requested restore mode. See `RestoreRequestMode`.
     #[serde(flatten)]
     pub mode: RestoreRequestMode,
@@ -323,6 +339,7 @@ use crate::handlers::authz::{
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "Backup or service not found", body = ProblemDetails),
+        (status = 409, description = "Destructive cross-service restore requires explicit confirmation", body = ProblemDetails),
     ),
     security(("bearer_auth" = []))
 )]
@@ -350,9 +367,10 @@ async fn start_restore(
     // Resolve which backup the caller is pointing at. The URL's `{id}`
     // is the TARGET service — where the data will land. The backup
     // itself may have been produced by a completely different (or no
-    // longer existing) service, so we do NOT validate source/target
-    // linkage here — cross-service restore is a supported disaster-recovery
-    // path. We *do* require the caller to be entitled to the source as well,
+    // longer existing) service — cross-service restore is a supported
+    // disaster-recovery path, but a destructive one must be confirmed
+    // explicitly (see the origin binding below). We also require the caller
+    // to be entitled to the source as well,
     // otherwise a restore is an arbitrary read of another project's data into
     // a service the caller controls. The orchestrator enforces engine
     // compatibility.
@@ -409,6 +427,21 @@ async fn start_restore(
     )
     .await?;
     require_restore_source_access(&app_state, &auth, &selector, Permission::BackupsWrite).await?;
+
+    // Bind the restore to the backup's source service identity: a
+    // destructive restore onto a service that did not produce the backup must
+    // be confirmed explicitly. Checked after authorization (so the origin
+    // linkage is only disclosed to callers entitled to both ends) and before
+    // step-up verification (so the caller is not asked for MFA for a request
+    // that will be refused anyway).
+    let origin_binding = app_state
+        .restore_service
+        .resolve_origin_binding(id, &selector)
+        .await
+        .map_err(Problem::from)?;
+    origin_binding
+        .require_confirmation(id, &selector, &request.mode, request.confirm_cross_service)
+        .map_err(Problem::from)?;
 
     // Destructive restore modes overwrite the live service — require step-up
     // verification only after project authorization, but before any service
@@ -485,6 +518,9 @@ async fn start_restore(
         source_backup_id: request.backup_id.unwrap_or(0),
         mode: mode_str,
         target_service_name: target_name,
+        backup_origin_service_ids: origin_binding.origin_service_ids.clone(),
+        cross_service: origin_binding.cross_service,
+        cross_service_confirmed: origin_binding.cross_service && request.confirm_cross_service,
     };
 
     if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
@@ -767,6 +803,37 @@ mod tests {
     fn status_for(err: RestoreError) -> StatusCode {
         let p: Problem = err.into();
         p.status_code
+    }
+
+    #[test]
+    fn unconfirmed_cross_service_restore_maps_to_409() {
+        let problem: Problem = RestoreError::CrossServiceRestoreNotConfirmed {
+            target_service_id: 7,
+            backup: "backup 42".to_string(),
+            origin: "produced by service(s) 3".to_string(),
+        }
+        .into();
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|d| d.as_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(detail.contains("confirm_cross_service"), "{detail}");
+    }
+
+    #[test]
+    fn confirm_cross_service_defaults_to_false_and_parses() {
+        let req: StartRestoreRequest =
+            serde_json::from_str(r#"{"backup_id": 42, "mode": "in_place"}"#).unwrap();
+        assert!(!req.confirm_cross_service);
+        let req: StartRestoreRequest = serde_json::from_str(
+            r#"{"backup_id": 42, "mode": "in_place", "confirm_cross_service": true}"#,
+        )
+        .unwrap();
+        assert!(req.confirm_cross_service);
+        assert!(matches!(req.mode, RestoreRequestMode::InPlace));
     }
 
     #[test]

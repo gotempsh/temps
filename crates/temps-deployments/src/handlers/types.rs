@@ -279,6 +279,13 @@ pub struct DeploymentResponse {
     pub commit_date: Option<i64>,
     pub is_current: bool,
     pub cancelled_reason: Option<String>,
+    /// Classified cause of a failed deployment: the stage it failed in, a
+    /// stable failure code, and a concrete fix. Present only when `status` is
+    /// `failed` and a failure reason was recorded. Derived from
+    /// `cancelled_reason` at read time, so older deployments are classified
+    /// by the current classifier too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<crate::services::DeploymentFailureInfo>,
     /// Deployment configuration snapshot (CPU, memory, replicas, environment variables, etc.)
     pub deployment_config: Option<temps_entities::deployment_config::DeploymentConfigSnapshot>,
     /// Deployment metadata (build info, git event, etc.)
@@ -300,6 +307,11 @@ pub struct DeploymentEnvironmentResponse {
 
 impl DeploymentResponse {
     pub fn from_service_deployment(deployment: Deployment) -> Self {
+        let failure = if deployment.status == "failed" {
+            crate::services::describe_failure(deployment.cancelled_reason.as_deref())
+        } else {
+            None
+        };
         Self {
             id: deployment.id,
             project_id: deployment.project_id,
@@ -325,6 +337,7 @@ impl DeploymentResponse {
             commit_date: deployment.commit_date.map(|d| d.timestamp_millis()),
             is_current: deployment.is_current,
             cancelled_reason: deployment.cancelled_reason,
+            failure,
             deployment_config: deployment.deployment_config,
             metadata: deployment.metadata,
         }
