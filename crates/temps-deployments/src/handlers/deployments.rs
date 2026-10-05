@@ -1711,6 +1711,18 @@ pub async fn get_deployment_jobs(
     }))
 }
 
+/// Largest `tail` a job-log read may request.
+const MAX_JOB_LOG_TAIL_LINES: usize = 100_000;
+
+/// Query parameters for reading a deployment job's log.
+#[derive(Debug, Default, serde::Deserialize, utoipa::IntoParams)]
+pub struct JobLogsQuery {
+    /// Return the most recent complete lines (1-100000), reading at most
+    /// 8 MiB from local or archived storage. Omit to read the whole log.
+    #[param(minimum = 1, maximum = 100000)]
+    pub tail: Option<usize>,
+}
+
 /// Get logs for a specific deployment job
 #[utoipa::path(
     get,
@@ -1719,10 +1731,12 @@ pub async fn get_deployment_jobs(
     params(
         ("project_id" = i32, Path, description = "Project ID"),
         ("deployment_id" = i32, Path, description = "Deployment ID"),
-        ("job_id" = String, Path, description = "Job ID")
+        ("job_id" = String, Path, description = "Job ID"),
+        JobLogsQuery
     ),
     responses(
         (status = 200, description = "Job logs retrieved successfully", body = String),
+        (status = 400, description = "Invalid tail parameter"),
         (status = 404, description = "Job or logs not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -1734,10 +1748,12 @@ pub async fn get_deployment_job_logs(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path((project_id, deployment_id, job_id)): Path<(i32, i32, String)>,
+    Query(query): Query<JobLogsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
+    let tail = validate_job_log_tail(query.tail, &job_id, deployment_id)?;
 
     // Get the job to verify it exists and get its log_id
     let jobs = state
@@ -1751,12 +1767,33 @@ pub async fn get_deployment_job_logs(
         .ok_or_else(|| problemdetails::new(StatusCode::NOT_FOUND).with_detail("Job not found"))?;
 
     // Get logs using the log_id
-    let log_content = match state.log_service.get_log_content(&job.log_id).await {
+    let read = match tail {
+        Some(max_lines) => state.log_service.get_log_tail(&job.log_id, max_lines).await,
+        None => state.log_service.get_log_content(&job.log_id).await,
+    };
+    let log_content = match read {
         Ok(content) => content,
         Err(error) => job_logs_read_failure(&job_id, deployment_id, &job.status, &error)?,
     };
 
     Ok((StatusCode::OK, log_content))
+}
+
+/// Validate the optional `tail` of a job-log read.
+fn validate_job_log_tail(
+    tail: Option<usize>,
+    job_id: &str,
+    deployment_id: i32,
+) -> Result<Option<usize>, Problem> {
+    match tail {
+        None => Ok(None),
+        Some(lines) if (1..=MAX_JOB_LOG_TAIL_LINES).contains(&lines) => Ok(Some(lines)),
+        Some(lines) => Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Parameters")
+            .with_detail(format!(
+                "tail={lines} for job '{job_id}' of deployment {deployment_id} must be between 1 and {MAX_JOB_LOG_TAIL_LINES}"
+            ))),
+    }
 }
 
 /// Map a failed job-log read to a response.
@@ -2857,6 +2894,40 @@ pub async fn purge_environment_asset_cache(
 
 #[cfg(test)]
 mod tests {
+
+    mod job_log_tail_tests {
+        use super::super::{validate_job_log_tail, MAX_JOB_LOG_TAIL_LINES};
+        use axum::http::StatusCode;
+
+        #[test]
+        fn omitted_tail_reads_the_whole_log() {
+            assert_eq!(
+                validate_job_log_tail(None, "build_image", 7).ok(),
+                Some(None)
+            );
+        }
+
+        #[test]
+        fn tail_within_range_is_accepted() {
+            for lines in [1, 10_000, MAX_JOB_LOG_TAIL_LINES] {
+                assert_eq!(
+                    validate_job_log_tail(Some(lines), "build_image", 7).ok(),
+                    Some(Some(lines))
+                );
+            }
+        }
+
+        #[test]
+        fn tail_out_of_range_is_a_400_with_context() {
+            for lines in [0, MAX_JOB_LOG_TAIL_LINES + 1] {
+                let problem = validate_job_log_tail(Some(lines), "build_image", 7).unwrap_err();
+                assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+                let body = serde_json::to_string(&problem.body).unwrap();
+                assert!(body.contains("build_image"), "{body}");
+                assert!(body.contains("deployment 7"), "{body}");
+            }
+        }
+    }
 
     mod job_logs_read_failure_tests {
         use super::super::job_logs_read_failure;

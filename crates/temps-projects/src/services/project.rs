@@ -16,8 +16,8 @@ use temps_core::{
     ForceRouteReloadJob, Job, ProjectCreatedJob, ProjectDeletedJob, ProjectUpdatedJob,
 };
 use temps_entities::{
-    delivery_profiles, dns_providers, domain_delivery_bindings, env_var_environments, env_vars,
-    environments, external_services, git_provider_connections, git_providers,
+    delivery_profiles, deployments, dns_providers, domain_delivery_bindings, env_var_environments,
+    env_vars, environments, external_services, git_provider_connections, git_providers,
     project_delivery_settings, project_services, projects, settings, types::ProjectType,
 };
 use temps_git::services::public_repo::{PublicRepoError, PublicRepoProviderFactory};
@@ -33,6 +33,44 @@ use super::{EnvVarService, EnvVarWithEnvironments};
 use crate::handlers::{UpdateDeploymentConfigRequest, UpdateServiceTemplateRuntimeRequest};
 use temps_core::docker_socket_grant::DeployCaller;
 // Placeholder functions - these should be implemented properly or imported from other services
+
+async fn has_ready_deployment(
+    db: &temps_database::DbConnection,
+    hidden: &[i32],
+) -> Result<bool, ProjectError> {
+    // last_deployment is stamped when a Git deployment starts, so it is
+    // not proof of activation. New completions preserve ready_at; older
+    // deployments can still be identified by their successful lifecycle state.
+    // Fetch one id, rather than counting or loading deployment history.
+    let completed = deployments::Entity::find().filter(
+        Condition::any()
+            .add(deployments::Column::ReadyAt.is_not_null())
+            .add(deployments::Column::State.is_in([
+                "completed",
+                "deployed",
+                "superseded",
+                "paused",
+            ])),
+    );
+    let completed = if hidden.is_empty() {
+        completed
+    } else {
+        completed.filter(deployments::Column::ProjectId.is_not_in(hidden.iter().copied()))
+    };
+    let completed = completed
+        .select_only()
+        .column(deployments::Column::Id)
+        .into_tuple::<i32>()
+        .one(db)
+        .await
+        .map_err(|e| {
+            ProjectError::DatabaseConnectionError(format!(
+                "Failed to check for a completed deployment in project statistics: {e}"
+            ))
+        })?
+        .is_some();
+    Ok(completed)
+}
 
 /// The delivery provider a new project starts with, and whether the caller
 /// asked for it or it was inherited from the instance-wide default.
@@ -4670,7 +4708,12 @@ impl ProjectService {
             .map_err(|e| ProjectError::DatabaseConnectionError(e.to_string()))?
             as i64;
 
-        Ok(ProjectStatistics { total_count })
+        let has_completed_deployment = has_ready_deployment(self.db.as_ref(), hidden).await?;
+
+        Ok(ProjectStatistics {
+            total_count,
+            has_completed_deployment,
+        })
     }
 
     /// Reject `deployment_config` if it violates `app_settings`'s tenant
@@ -6131,6 +6174,35 @@ fn base_project_slug(name: &str) -> String {
 mod tests {
     use super::*;
     use sea_orm::{ActiveModelTrait, Set};
+
+    #[tokio::test]
+    async fn first_deploy_signal_requires_ready_and_excludes_hidden_projects() {
+        use sea_orm::{DatabaseBackend, MockDatabase, Value};
+        let row = std::collections::BTreeMap::from([("id", Value::Int(Some(42)))]);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row]])
+            .into_connection();
+        assert!(has_ready_deployment(&db, &[7, 9]).await.unwrap());
+        let log = db.into_transaction_log();
+        let statements = &log[0].statements()[0].sql;
+        assert!(
+            statements.contains("ready_at\" IS NOT NULL"),
+            "{statements}"
+        );
+        assert!(statements.contains("project_id\" NOT IN"), "{statements}");
+        assert!(statements.contains("state\" IN"), "{statements}");
+        assert!(statements.contains("LIMIT"), "{statements}");
+        assert!(!statements.contains("last_deployment"), "{statements}");
+    }
+
+    #[tokio::test]
+    async fn first_deploy_signal_is_false_without_a_ready_deployment() {
+        use sea_orm::{DatabaseBackend, MockDatabase, Value};
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<std::collections::BTreeMap<&str, Value>>::new()])
+            .into_connection();
+        assert!(!has_ready_deployment(&db, &[]).await.unwrap());
+    }
 
     #[test]
     fn resolved_framework_and_nixpacks_presets_get_their_runtime_project_type() {

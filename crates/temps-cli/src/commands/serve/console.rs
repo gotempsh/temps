@@ -726,7 +726,7 @@ enum InitialAdminBootstrapError {
 }
 
 #[derive(Debug, thiserror::Error)]
-enum InitialAdminConfigError {
+pub(crate) enum InitialAdminConfigError {
     #[error("TEMPS_ADMIN_EMAIL must be a valid email address")]
     InvalidEmail,
     #[error("TEMPS_ADMIN_EMAIL and TEMPS_ADMIN_PASSWORD_FILE must be configured together")]
@@ -1674,8 +1674,12 @@ async fn validate_geolite2_database(
     );
     match download_geolite2_database_on_startup(default_db_path, license_key).await {
         Ok(()) => Ok(()),
-        Err(e) => Err(anyhow::anyhow!(
-            "❌ GeoLite2-City.mmdb not found and automatic download failed\n\n\
+        Err(e) => Err(anyhow::Error::new(
+            super::startup_failure::ConsoleStartupError::GeoDatabase {
+                checked: search_paths.clone(),
+                reason: e.to_string(),
+                message: format!(
+                    "❌ GeoLite2-City.mmdb not found and automatic download failed\n\n\
             The MaxMind GeoLite2 database is required for geolocation features.\n\n\
             📍 Checked locations (in order):\n\
             1. {}\n\
@@ -1700,10 +1704,12 @@ async fn validate_geolite2_database(
             interval configured there (default every 24 hours).\n\n\
             🐳 For Docker users:\n\
             See Dockerfile in the repository for embedding the database",
-            search_paths[0].display(),
-            search_paths[1].display(),
-            e,
-            search_paths[1].display()
+                    search_paths[0].display(),
+                    search_paths[1].display(),
+                    e,
+                    search_paths[1].display()
+                ),
+            },
         )),
     }
 }
@@ -1818,6 +1824,10 @@ pub struct ConsoleApiParams {
     /// constructed at all — see `register_local_workload_plugins` — and is
     /// published to clients through `GET /api/platform/features`.
     pub profile: super::ServeProfile,
+    /// Shared with the in-process proxy. Marked running here when the
+    /// listeners start; the caller records the failure if this function
+    /// returns an error, so the proxy can explain it on the console URL.
+    pub startup_state: Arc<temps_core::console_startup::ConsoleStartupState>,
 }
 
 /// How long the `control-plane` profile waits for a Docker ping before
@@ -1825,28 +1835,29 @@ pub struct ConsoleApiParams {
 /// startup path, and "no daemon" is an expected, supported answer here.
 const DOCKER_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The operator-facing message for "this profile needs Docker and it isn't
+/// The operator-facing error for "this profile needs Docker and it isn't
 /// there". Shared by both failure points so the remediation steps can't drift
-/// apart.
+/// apart; names the endpoint that was tried and where it came from.
 fn docker_unavailable_error(reason: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        "❌ Docker dependency check FAILED\n\n\
-        The system requires Docker to be running and accessible.\n\n\
-        Error details: {}\n\n\
-        Solutions:\n\
-        1. Ensure Docker daemon is running\n\
-           - macOS: Check Docker Desktop application\n\
-           - Linux: Run 'sudo systemctl start docker'\n\n\
-        2. Verify Docker socket permissions\n\
-           - Linux: Run 'sudo usermod -aG docker $USER'\n\n\
-        3. Check Docker environment variables\n\
-           - DOCKER_HOST may need to be set\n\n\
-        4. Run this control plane without local workloads\n\
-           - `temps serve --profile control-plane` needs no Docker daemon; \
-             applications then run on worker nodes joined with `temps join`\n\n\
-        Deployment features will not be available until Docker is accessible.",
-        reason
+    anyhow::Error::new(
+        super::startup_failure::ConsoleStartupError::DockerUnavailable {
+            endpoint: crate::docker_context::docker_endpoint().describe(),
+            reason: reason.to_string(),
+        },
     )
+}
+
+/// Bind a console listener, naming the address in the error so the startup
+/// status page can tell the operator which address is taken.
+async fn bind_console_listener(
+    address: &str,
+) -> Result<TcpListener, super::startup_failure::ConsoleStartupError> {
+    TcpListener::bind(address).await.map_err(|source| {
+        super::startup_failure::ConsoleStartupError::ListenerBind {
+            address: address.to_string(),
+            source,
+        }
+    })
 }
 
 /// Storage backend selection for the log aggregator.
@@ -2850,6 +2861,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         traefik_discovery,
         external_plugin_registry,
         profile,
+        startup_state,
     } = params;
 
     // Count panics for the anonymous `error_summary` telemetry event. Only
@@ -2956,23 +2968,12 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     debug!("Checking logs directory...");
     let logs_dir = config.data_dir.join("logs");
     if let Err(e) = std::fs::create_dir_all(&logs_dir) {
-        return Err(anyhow::anyhow!(
-            "❌ Logs directory creation FAILED\n\n\
-            Cannot create or access the logs directory.\n\n\
-            Path: {}\n\
-            Error: {}\n\n\
-            Solutions:\n\
-            1. Check directory permissions\n\
-               - Ensure write permissions to parent directory: {}\n\n\
-            2. Verify disk space\n\
-               - Run: df -h\n\n\
-            3. Check file ownership\n\
-               - Run: ls -la {}\n\n\
-            Logs are required for system diagnostics and operation tracking.",
-            logs_dir.display(),
-            e,
-            config.data_dir.display(),
-            config.data_dir.display()
+        return Err(anyhow::Error::new(
+            super::startup_failure::ConsoleStartupError::LogsDirectory {
+                path: logs_dir.clone(),
+                data_dir: config.data_dir.clone(),
+                reason: e.to_string(),
+            },
         ));
     }
     debug!("✓ Logs directory is accessible");
@@ -3139,7 +3140,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let stateless_instance_id = temps_config::stateless_instance_id(db.as_ref()).await?;
     let shared_log_storage_config =
         log_aggregator_storage_config(&config.data_dir, stateless_instance_id.as_deref())
-            .map_err(|e| anyhow::anyhow!("❌ Log storage configuration is invalid\n\n{e}"))?;
+            .map_err(|source| super::startup_failure::ConsoleStartupError::LogStorage { source })?;
     let logs_plugin = Box::new(LogsPlugin::new(logs_dir, shared_log_storage_config.clone()));
     plugin_manager.register_plugin(logs_plugin);
 
@@ -3527,10 +3528,10 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         tracing::error!("  • Service initialization error");
         tracing::error!("");
         tracing::error!("Check the error message above for details.");
-        return Err(anyhow::anyhow!(
-            "Plugin initialization failed: {}",
-            error_msg
-        ));
+        return Err(
+            super::startup_failure::ConsoleStartupError::PluginInitialization { reason: error_msg }
+                .into(),
+        );
     }
     debug!("All plugins initialized successfully");
 
@@ -3616,7 +3617,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
             } else if let Some(admin_email) = prompt_for_admin_email()? {
                 create_initial_admin_user(db.as_ref(), &admin_email, None).await?;
             } else {
-                return Err(anyhow::anyhow!("Valid admin email is required to continue"));
+                return Err(super::startup_failure::ConsoleStartupError::AdminEmailRequired.into());
             }
         }
     } else {
@@ -4619,7 +4620,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                 admin_gate_handle.clone(),
                 super::admin_gate::admin_gate,
             ));
-        let listener = TcpListener::bind(addr).await?;
+        let listener = bind_console_listener(addr).await?;
         info!("Platform console (original temps UI) listening on {addr}");
         tokio::spawn(async move {
             if let Err(e) = axum::serve(
@@ -4714,12 +4715,12 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     match config.console_admin_address.as_deref() {
         Some(admin_addr) if !admin_addr.is_empty() => {
             // Two-listener mode: public + admin on separate addresses.
-            let public_listener = TcpListener::bind(&config.console_address).await?;
+            let public_listener = bind_console_listener(&config.console_address).await?;
             info!(
                 "Console PUBLIC API server listening on {}",
                 config.console_address
             );
-            let admin_listener = TcpListener::bind(admin_addr).await?;
+            let admin_listener = bind_console_listener(admin_addr).await?;
             info!("Console ADMIN API server listening on {}", admin_addr);
 
             // Routers, middleware, and both listeners are ready; flip
@@ -4727,6 +4728,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
             // after plugin init -- see that call site for why the two are
             // deliberately decoupled.
             ready_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            startup_state.mark_running();
             super::upgrade_telemetry::complete_startup(
                 upgrade_probe.as_ref(),
                 startup_reporter.as_ref(),
@@ -4754,7 +4756,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
             // want network-layer isolation should set TEMPS_CONSOLE_ADMIN_ADDRESS.
             let merged = Router::new().merge(public_app).merge(admin_app);
 
-            let listener = TcpListener::bind(&config.console_address).await?;
+            let listener = bind_console_listener(&config.console_address).await?;
             info!("Console API server listening on {}", config.console_address);
 
             // Routers, middleware, and the listener are ready; flip `/readyz`
@@ -4762,6 +4764,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
             // plugin init -- see that call site for why the two are
             // deliberately decoupled.
             ready_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            startup_state.mark_running();
             super::upgrade_telemetry::complete_startup(
                 upgrade_probe.as_ref(),
                 startup_reporter.as_ref(),

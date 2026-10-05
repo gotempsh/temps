@@ -17724,6 +17724,10 @@ export type ProjectServiceInfo = {
 };
 
 export type ProjectStatisticsResponse = {
+    /**
+     * Whether an accessible project's deployment has reached the ready state.
+     */
+    has_completed_deployment: boolean;
     total_count: number;
 };
 
@@ -53485,11 +53489,21 @@ export type GetDeploymentJobLogsData = {
          */
         job_id: string;
     };
-    query?: never;
+    query?: {
+        /**
+         * Return the most recent complete lines (1-100000), reading at most
+         * 8 MiB from local or archived storage. Omit to read the whole log.
+         */
+        tail?: number | null;
+    };
     url: '/projects/{project_id}/deployments/{deployment_id}/jobs/{job_id}/logs';
 };
 
 export type GetDeploymentJobLogsErrors = {
+    /**
+     * Invalid tail parameter
+     */
+    400: unknown;
     /**
      * Job or logs not found
      */

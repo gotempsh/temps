@@ -24,7 +24,7 @@
     "start": "rsbuild preview",
     "preview": "rsbuild preview",
     "_comment:test": "Scoped to src/ so bun's runner does not pick up the Playwright specs under e2e/ -- it matches *.spec.ts too, and those only run under `bun run e2e`.",
-    "test": "bun test src",
+    "test": "bun test src rsbuild.config.test.ts",
     "check:react-versions": "node scripts/check-react-versions.mjs",
     "e2e": "playwright test",
     "e2e:ui": "playwright test --ui",

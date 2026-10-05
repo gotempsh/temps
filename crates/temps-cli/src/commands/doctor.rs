@@ -16,6 +16,12 @@ pub use mesh::MeshDoctorArgs;
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// What to do when the daemon is unreachable; `temps serve` refuses to start
+/// the console in that state (the `full` profile).
+const DOCKER_REMEDIATION: &str = "Start the Docker daemon, or point DOCKER_HOST (or `docker \
+     context use`) at the socket it listens on; `temps serve --profile control-plane` runs \
+     without a local daemon";
+
 /// Diagnose the temps installation and check system health
 #[derive(Args)]
 pub struct DoctorCommand {
@@ -179,6 +185,12 @@ impl DoctorCommand {
         report.checks.clear();
 
         // -- Application Settings (requires DB) --
+        println!();
+        println!("{}", "  Initial admin".bright_yellow().bold());
+        self.check_initial_admin(db.as_ref(), &mut report).await;
+        report.print();
+        report.checks.clear();
+
         if let Some(ref db) = db {
             println!();
             println!("{}", "  Application".bright_yellow().bold());
@@ -417,12 +429,22 @@ impl DoctorCommand {
     // ── Docker checks ───────────────────────────────────────────────
 
     async fn check_docker(&self, report: &mut DiagnosticReport) {
-        let docker = match bollard::Docker::connect_with_local_defaults() {
+        // Same endpoint resolution as `temps serve`: DOCKER_HOST (including
+        // tcp:// and ssh:// endpoints), else the active Docker context adopted
+        // at startup, else the default socket. A doctor that probed a
+        // different endpoint than the server would report the wrong answer.
+        let endpoint = crate::docker_context::docker_endpoint();
+        report.add("Endpoint", CheckResult::Info(endpoint.describe()));
+
+        let docker = match bollard::Docker::connect_with_defaults() {
             Ok(d) => d,
             Err(e) => {
                 report.add(
                     "Daemon",
-                    CheckResult::Fail(format!("Cannot connect: {}", e)),
+                    CheckResult::Fail(format!(
+                        "Cannot connect to {}: {}. {}",
+                        endpoint.host, e, DOCKER_REMEDIATION
+                    )),
                 );
                 return;
             }
@@ -439,13 +461,24 @@ impl DoctorCommand {
                 );
             }
             Ok(Err(e)) => {
-                report.add("Daemon", CheckResult::Fail(format!("Error: {}", e)));
+                report.add(
+                    "Daemon",
+                    CheckResult::Fail(format!(
+                        "Not reachable at {}: {}. {}",
+                        endpoint.host, e, DOCKER_REMEDIATION
+                    )),
+                );
                 return;
             }
             Err(_) => {
                 report.add(
                     "Daemon",
-                    CheckResult::Fail("Connection timed out".to_string()),
+                    CheckResult::Fail(format!(
+                        "No answer from {} within {}s. {}",
+                        endpoint.host,
+                        CHECK_TIMEOUT.as_secs(),
+                        DOCKER_REMEDIATION
+                    )),
                 );
                 return;
             }
@@ -741,6 +774,35 @@ impl DoctorCommand {
         }
 
         Some(db)
+    }
+
+    // ── Initial admin bootstrap ─────────────────────────────────────
+
+    /// `temps serve` creates the first admin from TEMPS_ADMIN_EMAIL and
+    /// TEMPS_ADMIN_PASSWORD_FILE when no users exist. Doctor checks persisted
+    /// bootstrap state without rereading these one-shot input secrets.
+    async fn check_initial_admin(
+        &self,
+        db: Option<&sea_orm::DatabaseConnection>,
+        report: &mut DiagnosticReport,
+    ) {
+        let users: Option<i64> = if let Some(db) = db {
+            db.query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT COUNT(*) AS count FROM users WHERE deleted_at IS NULL AND id <> 0"
+                    .to_string(),
+            ))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|row| {
+                use sea_orm::TryGetable;
+                i64::try_get_by(&row, "count").ok()
+            })
+        } else {
+            None
+        };
+        report.add("Initial admin", initial_admin_result(users));
     }
 
     // ── App settings checks ─────────────────────────────────────────
@@ -1156,6 +1218,22 @@ impl DoctorCommand {
     }
 }
 
+/// Assess persisted bootstrap state without reading first-boot inputs.
+fn initial_admin_result(users: Option<i64>) -> CheckResult {
+    match users {
+        Some(count) if count > 0 => CheckResult::Pass(format!(
+            "{count} user(s) exist; initial user bootstrap has completed"
+        )),
+        Some(0) => CheckResult::Warn(
+            "No users exist yet. Run `temps serve` to complete initial admin setup; \
+             unattended first boot requires TEMPS_ADMIN_EMAIL and TEMPS_ADMIN_PASSWORD_FILE".to_string()
+        ),
+        _ => CheckResult::Warn(
+            "Could not determine whether users exist. Restore database connectivity to check persisted initial admin setup".to_string()
+        ),
+    }
+}
+
 /// Resolve the default installation layout without overriding an explicit
 /// `--data-dir` or `TEMPS_DATA_DIR`. Current installs use `~/.temps`, while
 /// older deployment scripts placed runtime secrets in `~/.temps/data`.
@@ -1375,6 +1453,30 @@ mod tests {
     fn test_parse_pg_url_invalid_scheme() {
         let result = parse_pg_url("mysql://u:p@localhost:3306/db");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn initial_admin_does_not_treat_a_failed_query_as_an_empty_database() {
+        assert!(
+            matches!(initial_admin_result(None), CheckResult::Warn(message)
+            if message.contains("Could not determine") && message.contains("database connectivity"))
+        );
+    }
+
+    #[test]
+    fn initial_admin_reports_completed_bootstrap_from_persisted_users() {
+        assert!(
+            matches!(initial_admin_result(Some(2)), CheckResult::Pass(message)
+            if message.contains("bootstrap has completed"))
+        );
+    }
+
+    #[test]
+    fn initial_admin_reports_the_required_first_boot_step() {
+        assert!(
+            matches!(initial_admin_result(Some(0)), CheckResult::Warn(message)
+            if message.contains("temps serve") && message.contains("unattended first boot"))
+        );
     }
 
     #[test]

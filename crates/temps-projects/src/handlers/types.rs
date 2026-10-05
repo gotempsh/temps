@@ -1087,6 +1087,8 @@ pub struct ProjectStats {
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct ProjectStatisticsResponse {
     pub total_count: i64,
+    /// Whether an accessible project's deployment has reached the ready state.
+    pub has_completed_deployment: bool,
 }
 
 // Add this struct with the other response types
