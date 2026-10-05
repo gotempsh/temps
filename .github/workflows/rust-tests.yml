@@ -360,6 +360,16 @@ jobs:
     with:
       binary-artifact: temps-binary-musl-fast
 
+  # Seeds an installation with the newest published release, upgrades it with
+  # this build, and checks data, the pre-migration backup, the schema guard
+  # and a backup-based rollback. Also runs nightly from its own file.
+  upgrade-test:
+    name: Upgrade
+    needs: build-binary
+    uses: ./.github/workflows/upgrade-tests.yml
+    with:
+      binary-artifact: temps-binary-musl-fast
+
   compose-security:
     name: Compose Security
     runs-on: ubuntu-latest

@@ -43,24 +43,23 @@ fn store_platform(platform: &SharedPlatform, value: String) {
     }
 }
 
+/// Network state the sync loop keeps current and request handlers read.
+#[derive(Clone)]
+pub struct SharedNetwork {
+    pub overlay_bridge_address: Arc<std::sync::RwLock<Option<std::net::IpAddr>>>,
+    pub overlay_peers: crate::network_sync::SharedPeers,
+    pub host_bind_address: crate::network_sync::SharedBindAddress,
+}
+
 /// Build the agent Axum router with authentication middleware.
 pub fn build_router(
     container_deployer: Arc<dyn ContainerDeployer>,
     image_builder: Arc<dyn ImageBuilder>,
     docker: Option<bollard::Docker>,
     config: &AgentConfig,
-    overlay_bridge_address: Arc<std::sync::RwLock<Option<std::net::IpAddr>>>,
-    overlay_peers: crate::network_sync::SharedPeers,
+    network: SharedNetwork,
     platform: SharedPlatform,
 ) -> Router {
-    // Same address app-container deploys bind to (never "0.0.0.0" — see
-    // AgentConfig::private_address). Falls back to loopback only for the
-    // legacy-config test-fixture case; `temps agent`'s CLI entrypoint
-    // already hard-errors before reaching here if this is genuinely unset.
-    let host_bind_address = config
-        .private_address
-        .clone()
-        .unwrap_or_else(|| "127.0.0.1".to_string());
     // ADR-048: the worker hosts sandboxes with the same Docker provider the
     // control plane uses for local ones.
     let sandbox_host = docker.clone().map(|docker| {
@@ -89,10 +88,10 @@ pub fn build_router(
         container_deployer,
         image_builder,
         docker,
-        overlay_bridge_address,
-        overlay_peers,
+        overlay_bridge_address: network.overlay_bridge_address,
+        overlay_peers: network.overlay_peers,
         platform,
-        host_bind_address,
+        host_bind_address: network.host_bind_address,
     });
     let resource_limits = Arc::new(handlers::AgentResourceLimits::new());
 
@@ -344,6 +343,7 @@ fn spawn_heartbeat_loop(
     docker_socket_grant: DockerSocketGrant,
 ) {
     let control_plane_url = config.control_plane_url.clone();
+    let heartbeat_client = crate::control_plane_client_builder(config);
     let node_id = config.node_id;
     let token = config.token.clone();
     let labels = config.labels.clone();
@@ -359,10 +359,7 @@ fn spawn_heartbeat_loop(
         // node's auth token. A MitM with a self-signed cert here would
         // capture the token and impersonate this worker. There is no
         // opt-in: `AppSettings.insecure_tls` is server-side only.
-        let client = match reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-        {
+        let client = match heartbeat_client.timeout(Duration::from_secs(10)).build() {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!("Failed to build heartbeat HTTP client: {}", e);
@@ -711,8 +708,7 @@ pub async fn start_agent_server(
     image_builder: Arc<dyn ImageBuilder>,
     docker: Option<bollard::Docker>,
     config: AgentConfig,
-    overlay_peers: crate::network_sync::SharedPeers,
-    overlay_bridge_address: Arc<std::sync::RwLock<Option<std::net::IpAddr>>>,
+    network: SharedNetwork,
     docker_socket_grant: DockerSocketGrant,
 ) -> Result<(), crate::AgentError> {
     validate_agent_transport(&config)?;
@@ -736,13 +732,17 @@ pub async fn start_agent_server(
         ),
     }
 
+    // `network.host_bind_address` is the same slot `container_deployer`
+    // publishes app-container ports on (never "0.0.0.0" — see
+    // AgentConfig::private_address); the network-sync loop moves it to the
+    // mesh address for a node that joined with a public one, and both app
+    // deploys and agent-API services follow it.
     let router = build_router(
         container_deployer.clone(),
         image_builder,
         docker.clone(),
         &config,
-        overlay_bridge_address.clone(),
-        overlay_peers.clone(),
+        network.clone(),
         platform.clone(),
     );
 
@@ -755,7 +755,7 @@ pub async fn start_agent_server(
     // Start heartbeat background loop (with deployer for container inventory on first beat)
     spawn_heartbeat_loop(
         &config,
-        container_deployer,
+        container_deployer.clone(),
         platform,
         docker,
         dns_health.clone(),
@@ -769,9 +769,11 @@ pub async fn start_agent_server(
     // peers reconciled. `temps join` semantics are unchanged either way.
     crate::network_sync::spawn(
         &config,
-        overlay_bridge_address.clone(),
-        overlay_peers,
+        network.overlay_bridge_address,
+        network.overlay_peers,
         dns_health,
+        network.host_bind_address,
+        container_deployer,
     );
 
     let listener = tokio::net::TcpListener::bind(&config.listen_address)
@@ -963,6 +965,9 @@ mod tests {
             public_ingress_http_port: 80,
             public_ingress_https_port: 443,
             public_ingress_private_key: None,
+            mesh_key_dir: std::path::PathBuf::from("/tmp/temps-wireguard"),
+            wg_endpoint: None,
+            control_plane_trust: Some(crate::ControlPlaneTrust::PublicRoots),
         }
     }
 

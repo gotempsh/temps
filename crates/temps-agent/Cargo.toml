@@ -37,6 +37,7 @@ temps-core = { path = "../temps-core" }
 temps-auth = { path = "../temps-auth" }
 temps-deployer = { path = "../temps-deployer" }
 temps-network = { path = "../temps-network" }
+temps-wireguard = { path = "../temps-wireguard" }
 temps-dns-resolver = { path = "../temps-dns-resolver" }
 chrono = { workspace = true }
 temps-providers = { path = "../temps-providers" }

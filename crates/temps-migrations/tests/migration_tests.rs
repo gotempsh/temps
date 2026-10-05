@@ -5372,3 +5372,118 @@ async fn test_trace_summary_create_and_upgrade_reconciliation() -> anyhow::Resul
     assert!(!state.try_get::<bool>("", "completed")?);
     Ok(())
 }
+
+/// ADR 048's migrations (mesh, pairings, SSH enrollments, hubs) roll back to
+/// the schema before them and apply again, and the hub tables keep the
+/// constraints the control plane relies on.
+#[tokio::test]
+async fn test_node_mesh_migrations_down_and_reup() -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!("Skipping node mesh migration test: external database configured");
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("Skipping node mesh migration test: Docker unavailable: {error}");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    Migrator::up(&db, None).await?;
+
+    let tables = [
+        "node_pairings",
+        "node_ssh_enrollments",
+        "node_mesh_reports",
+        "mesh_links",
+    ];
+    let exists = |table: &'static str| {
+        let db = &db;
+        async move {
+            let row = db
+                .query_one(sea_orm::Statement::from_string(
+                    sea_orm::DatabaseBackend::Postgres,
+                    format!("SELECT to_regclass('public.{table}') IS NOT NULL AS present"),
+                ))
+                .await?
+                .expect("one row");
+            anyhow::Ok(row.try_get::<bool>("", "present")?)
+        }
+    };
+    for table in tables {
+        assert!(exists(table).await?, "{table} after up");
+    }
+
+    // The routing table orders keys by bytes, not by the database locale.
+    let collation = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT collation_name FROM information_schema.columns \
+             WHERE table_name = 'mesh_links' AND column_name = 'key_a'"
+                .to_string(),
+        ))
+        .await?
+        .expect("key_a column");
+    assert_eq!(
+        collation
+            .try_get::<Option<String>>("", "collation_name")?
+            .as_deref(),
+        Some("C")
+    );
+    // At most one hub.
+    let both = db
+        .execute_unprepared(
+            "UPDATE network_config SET mesh_hub_control_plane = TRUE, \
+             mesh_hub_node_id = (SELECT id FROM nodes LIMIT 1)",
+        )
+        .await;
+    assert!(
+        both.is_ok(),
+        "no node exists, so the node id is NULL and the update is allowed"
+    );
+    db.execute_unprepared(
+        "INSERT INTO nodes (name, token_hash, address, private_address, role, status, labels, \
+         capacity, created_at, updated_at) VALUES ('hub-check', 'h', 'https://127.0.0.1:3100', \
+         '10.0.0.1', 'worker', 'active', '{}', '{}', NOW(), NOW())",
+    )
+    .await?;
+    assert!(
+        db.execute_unprepared(
+            "UPDATE network_config SET mesh_hub_control_plane = TRUE, \
+             mesh_hub_node_id = (SELECT id FROM nodes WHERE name = 'hub-check')",
+        )
+        .await
+        .is_err(),
+        "the control plane and a node cannot both be the hub"
+    );
+
+    Migrator::down(&db, Some(steps_back_to("m20260928_000001_wireguard_mesh"))).await?;
+    for table in tables {
+        assert!(!exists(table).await?, "{table} after down");
+    }
+    Migrator::up(&db, None).await?;
+    for table in tables {
+        assert!(exists(table).await?, "{table} after re-up");
+    }
+    Ok(())
+}

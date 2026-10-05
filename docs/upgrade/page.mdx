@@ -1,7 +1,7 @@
 export const metadata = {
   title: "Upgrading Temps",
   description:
-    "How to upgrade your Temps installation to the latest version. Includes backup procedures, migration steps, and rollback instructions.",
+    "Upgrade a self-hosted Temps installation: back up, replace the binary, apply database migrations, verify, and roll back if needed. Covers the automatic pre-migration backup and the schema guard.",
   alternates: {
     canonical: "/docs/upgrade",
   },
@@ -9,98 +9,84 @@ export const metadata = {
 
 # Upgrading Temps
 
-This guide covers how to upgrade your self-hosted Temps instance to the latest version. Temps is designed for zero-downtime upgrades — database migrations run automatically on startup. {{ className: 'lead' }}
+An upgrade replaces the `temps` binary and then applies the new release's database migrations. Migrations run automatically the next time `temps serve` starts (or explicitly with `temps migrate`). Before they run, Temps backs up the database so the upgrade can be rolled back, and it refuses to run an older binary against a database that a newer release has already migrated. {{ className: 'lead' }}
 
 ---
 
-## Before You Upgrade
+## Before you upgrade
 
-### Back Up Your Data
-
-While Temps handles migrations automatically, it's good practice to back up before upgrading:
-
-```bash
-# 1. Back up the database
-docker exec temps-timescaledb pg_dump -U temps temps > temps-backup-$(date +%Y%m%d).sql
-
-# 2. Back up the data directory
-cp -r ~/.temps/data ~/.temps/data-backup-$(date +%Y%m%d)
-
-# 3. Back up encryption keys (critical — these cannot be regenerated)
-cp ~/.temps/data/encryption_key ~/encryption_key.backup
-```
-
-### Check the Current Version
+Check what you are running:
 
 ```bash
 temps --version
+temps upgrade --check   # is a newer release available on your channel?
 ```
+
+Read the [release notes](https://github.com/gotempsh/temps/releases) for every version between yours and the target.
+
+### What Temps backs up for you
+
+When the new binary finds pending migrations on an existing database, it dumps the database **before applying any of them** to `<data dir>/backups/pre-migration/`. See [Automatic pre-migration backup](#automatic-pre-migration-backup) for what the dump contains. Nothing is backed up on a fresh install or on a normal restart with nothing to migrate.
+
+### Stateless installations
+
+The same backup requirement applies to a stateless control plane. Its local data directory may be temporary: copy the pre-migration dump to durable storage before replacing the container. If your database provider supplies backups, verify that you can restore one taken immediately before the upgrade, then explicitly use `--skip-pre-migration-backup` for that run. Temps does not infer that provider backups exist.
+
+### What you still back up yourself
+
+The pre-migration backup is the database only. Keep a copy of the data directory too — above all the encryption key, which decrypts every stored credential and cannot be regenerated:
+
+```bash
+# Installs made with deploy.sh keep their data in ~/.temps/data
+cp -a ~/.temps/data ~/temps-data-backup-$(date +%Y%m%d)
+```
+
+If you configured S3 backup storage, also run a control-plane backup from **Settings > Backups** before a major upgrade: it is stored off the machine.
 
 ---
 
-## Upgrade Methods
+## Upgrade the binary
 
-### Upgrade Script (Recommended)
+Use whichever method matches how you installed Temps.
 
-If you installed Temps using `deploy.sh`, this is the fastest way to upgrade. It handles everything in a single command — backs up your encryption key, downloads the latest binary, upgrades Localup if you use tunnel mode, and restarts all services automatically.
-
-```bash
-curl -fsSL https://temps.sh/upgrade.sh | bash
-```
-
-To upgrade to a specific version:
+### `temps upgrade` (self-upgrade)
 
 ```bash
-curl -fsSL https://temps.sh/upgrade.sh | bash -s vX.Y.Z
+temps upgrade            # newest release on your channel (stable by default)
+sudo temps upgrade       # if the binary lives in a root-owned directory
 ```
 
-The upgrade script will:
-
-1. **Back up your encryption key** to `~/.temps/backups/pre-upgrade-<timestamp>/`
-2. **Download and install** the latest Temps binary for your platform
-3. **Upgrade Localup** if tunnel mode is detected
-4. **Restart all services** (Temps and tunnel if applicable)
-5. **Wait for a health check** to confirm the upgrade succeeded
-
-### Quick Upgrade
-
-If you prefer to upgrade the binary only and restart services yourself:
+It downloads the release for your platform, verifies its SHA-256 checksum, and atomically replaces the binary. It does **not** restart the running server — see [Restart Temps](#restart-temps).
 
 ```bash
-curl -fsSL https://temps.sh/install.sh | bash
+temps upgrade --channel beta      # include beta pre-releases
+temps upgrade --version v1.1.0    # a specific release (also how you go back to an older one)
+temps upgrade --yes               # no confirmation prompt
+temps upgrade --check             # only report whether an update is available
+temps upgrade --path /opt/temps/bin/temps
 ```
 
-This will:
+`--stable` is a deprecated alias for `--channel stable`, which is already the default.
 
-- Download the latest Temps binary for your platform
-- Replace the existing binary at `~/.temps/bin/temps`
-- Preserve all configuration, data, and certificates
+### From the console
 
-Then restart the service:
+When an update is available, the console shows a banner with an **Update now** action. It downloads the new binary, runs `temps migrate` with it (including the pre-migration backup), and restarts. Start the server with `--disable-self-update` to forbid this path.
 
-<CodeGroup>
-
-```bash {{ title: 'Linux (systemd)' }}
-sudo systemctl restart temps
-```
-
-```bash {{ title: 'macOS (launchd)' }}
-launchctl kickstart -k gui/$(id -u)/dev.temps.temps
-```
-
-</CodeGroup>
-
-### Homebrew (macOS)
+### Upgrade script (`deploy.sh` installs)
 
 ```bash
-brew update
-brew upgrade temps
-
-# Restart the service
-launchctl kickstart -k gui/$(id -u)/dev.temps.temps
+curl -fsSL https://temps.sh/upgrade.sh | bash           # latest
+curl -fsSL https://temps.sh/upgrade.sh | bash -s vX.Y.Z # a specific version
 ```
 
-### Manual Upgrade
+The script backs up the encryption key to `~/.temps/backups/pre-upgrade-<timestamp>/`, installs the new binary, upgrades Localup when tunnel mode is in use, restarts the services, and waits for a health check.
+
+### Install script, Homebrew, or manual download
+
+```bash
+curl -fsSL https://temps.sh/install.sh | bash   # replaces ~/.temps/bin/temps
+brew update && brew upgrade temps               # Homebrew (macOS)
+```
 
 <CodeGroup>
 
@@ -108,39 +94,25 @@ launchctl kickstart -k gui/$(id -u)/dev.temps.temps
 curl -LO https://github.com/gotempsh/temps/releases/latest/download/temps-linux-amd64.tar.gz
 tar -xzf temps-linux-amd64.tar.gz
 sudo mv temps /usr/local/bin/temps
-sudo systemctl restart temps
 ```
 
 ```bash {{ title: 'Linux ARM64' }}
 curl -LO https://github.com/gotempsh/temps/releases/latest/download/temps-linux-arm64.tar.gz
 tar -xzf temps-linux-arm64.tar.gz
 sudo mv temps /usr/local/bin/temps
-sudo systemctl restart temps
 ```
 
 ```bash {{ title: 'macOS Apple Silicon' }}
 curl -LO https://github.com/gotempsh/temps/releases/latest/download/temps-darwin-arm64.tar.gz
 tar -xzf temps-darwin-arm64.tar.gz
 sudo mv temps /usr/local/bin/temps
-launchctl kickstart -k gui/$(id -u)/dev.temps.temps
 ```
 
 </CodeGroup>
 
----
+Then [restart Temps](#restart-temps).
 
-## What Happens During an Upgrade
-
-When Temps starts after a binary upgrade:
-
-1. **Detects the new version** and logs the upgrade
-2. **Runs database migrations** automatically — any new tables, columns, or indexes are applied
-3. **Reloads configuration** from the existing data directory
-4. **Resumes serving** with zero manual intervention
-
-Database migrations are **idempotent** — re-running a version that's already migrated is safe and has no effect.
-
-### Upgrading an Existing Docker Compose Stack
+### Docker Compose stack
 
 Before changing any files, check where the running stack keeps its database:
 
@@ -258,37 +230,155 @@ docker compose run --rm postgres-credential-sync
 
 ---
 
-## Verify the Upgrade
+---
 
-After restarting, confirm the new version is running:
+## Apply database migrations
+
+Pick one of the two:
+
+- **Automatically on start (default).** `temps serve` applies pending migrations before it starts serving. Simple, and right for most single-node installs.
+- **Explicitly with `temps migrate` (recommended for large databases).** Run the *new* binary's `migrate` command, watch it finish, then restart the server. A slow migration can then never hold the server in a restart loop.
 
 ```bash
-# Check the running version
-temps --version
-
-# Verify the service is healthy
-curl -sf http://localhost:8081/health
-
-# Check service status
-sudo systemctl status temps    # Linux
-launchctl list dev.temps.temps # macOS
+TEMPS_DATABASE_URL=postgresql://... temps migrate --dry-run   # show the plan, change nothing
+TEMPS_DATABASE_URL=postgresql://... temps migrate             # back up, then apply (asks first on a terminal)
+TEMPS_DATABASE_URL=postgresql://... temps migrate --yes       # no prompt
 ```
+
+Pass `--data-dir` (or set `TEMPS_DATA_DIR`) if your data directory is not `~/.temps`; that is where the pre-migration backup goes.
+
+Each startup, in order:
+
+1. **Schema guard.** Temps compares the migrations recorded in the database with the ones it knows. If the database has migrations this binary does not know — it was migrated by a newer release — Temps refuses to start and changes nothing. See [Database schema is newer than this binary](#database-schema-is-newer-than-this-binary).
+2. **Pre-migration backup**, only if there are pending migrations on an existing database. See below.
+3. **Migrations.** Each runs in its own transaction; a statement waiting more than 15 seconds for a lock fails fast, and the whole step is bounded at 10 minutes. If a migration fails, the server does not start and the database stays at the last migration that succeeded.
+4. **Maintenance** that does not block startup (large concurrent index builds, analytics backfills) runs in the background once the server is up.
+
+Migrations are idempotent: starting the same version again is a no-op.
+
+### Automatic pre-migration backup {{ anchor: true, id: 'automatic-pre-migration-backup' }}
+
+| | |
+|---|---|
+| **When** | Pending migrations on a database that already has applied ones. Never on a fresh install or a restart with nothing to migrate. |
+| **Where** | `<data dir>/backups/pre-migration/` — `~/.temps/data/backups/pre-migration/` for `deploy.sh` installs. The directory is readable only by the Temps user. |
+| **Files** | `temps-pre-migration-<UTC time>-<new version>.dump` (a `pg_dump` custom-format archive, compressed) and a `.json` manifest with the release it came from (`previous_version`), the migrations about to run and the tables dumped without data. |
+| **Retention** | The newest 3 backups; older ones are deleted. |
+| **Contents** | Every table's schema, and the data of everything except high-volume telemetry (proxy logs, traces, metrics, log events, analytics, session replays, error events, uptime samples, AI usage logs), which is dumped schema-only. This is the same scope as the control-plane backup, and it keeps an upgrade of a busy instance from waiting on gigabytes of telemetry. |
+| **How** | A `pg_dump` on the `PATH` that is at least as new as the PostgreSQL server; otherwise a one-shot `postgres:<server major>` container on the host network, the same way control-plane backups run. |
+
+The log line `Pre-migration database backup written to …` gives the exact path.
+
+**If the backup fails, nothing is migrated** and Temps exits with the reason (for example, no suitable `pg_dump` and no reachable Docker daemon). Fix the cause and start again. If you cannot, take your own backup and start **once** with the opt-out flag:
+
+```bash
+temps serve --skip-pre-migration-backup ...     # or: temps migrate --skip-pre-migration-backup
+```
+
+The opt-out is a command-line flag on purpose — not an environment variable — so it cannot stay switched on for later upgrades. Remove it after that start.
+
+Stateless control planes have the same backup requirement. Their data directory may be temporary, so retain the dump in durable storage or explicitly skip it only after verifying a database-provider backup. See [Stateless installations](#stateless-installations).
+
+<Note>
+Rolling back with this backup restores the configuration as it was at upgrade time. Telemetry recorded before the upgrade (logs, traces, analytics) is not in it. If you need to keep telemetry across a rollback, take a full `pg_dump` or a volume snapshot before upgrading.
+</Note>
 
 ---
 
-## Upgrading the Database
+## Restart Temps {{ anchor: true, id: 'restart-temps' }}
+
+<CodeGroup>
+
+```bash {{ title: 'Linux (systemd)' }}
+sudo systemctl restart temps
+```
+
+```bash {{ title: 'macOS (launchd)' }}
+launchctl kickstart -k gui/$(id -u)/dev.temps.temps
+```
+
+</CodeGroup>
+
+In a split topology, restart the console (`temps serve --role=console`) and then the separate proxy service (`sudo systemctl restart temps-proxy`). Run `temps upgrade --split` to print these steps for your install. In a terminal, stop `temps serve` with Ctrl+C and start it again.
+
+
+---
+
+## Verify the upgrade
+
+```bash
+temps --version
+curl -fsS http://127.0.0.1:<console port>/healthz   # liveness
+curl -fsS http://127.0.0.1:<console port>/readyz    # ready to serve
+temps doctor                                        # data dir, encryption key, database, migrations, Docker, connectivity
+sudo systemctl status temps                         # Linux
+launchctl list dev.temps.temps                      # macOS
+```
+
+Open the console and check that your projects, environments and services are listed.
+
+---
+
+## Roll back an upgrade {{ anchor: true, id: 'roll-back-an-upgrade' }}
+
+Migrations only go forward. To return to the previous release you need **both** the previous binary **and** the database as it was before the upgrade. Starting only the old binary on the upgraded database does not work: the schema guard (and, in older releases, the migrator) refuses it, so that an older binary cannot write to a schema it does not understand.
+
+The example below is for a `deploy.sh` install (database container `temps-timescaledb`, user and database `temps`, data in `~/.temps/data`). Adjust names to your setup.
+
+1. **Stop every Temps process connected to this database**, including standalone proxies and other console nodes. Keep them stopped until restore completes.
+
+   ```bash
+   sudo systemctl stop temps
+   # Split deploy.sh installations also have this service:
+   sudo systemctl stop temps-proxy
+   # On macOS, stop the corresponding launchctl jobs.
+   ```
+
+2. **Pick the backup and the version to return to.** The newest backup was taken by the upgrade you are undoing; its manifest names the release that ran before it.
+
+   ```bash
+   BACKUP=$(ls -1t ~/.temps/data/backups/pre-migration/temps-pre-migration-*.dump | head -n1)
+   echo "$BACKUP"
+   jq -r .previous_version "${BACKUP%.dump}.json"
+   ```
+
+3. **Install that release's binary.**
+
+   ```bash
+   temps upgrade --version vX.Y.Z --yes
+   ```
+
+4. **Restore the database into a fresh one**, keeping the upgraded database aside in case you need it:
+
+   ```bash
+   docker exec temps-timescaledb psql -v ON_ERROR_STOP=1 -U temps -d postgres \
+     -c 'ALTER DATABASE temps WITH ALLOW_CONNECTIONS false' \
+     -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'temps' AND pid <> pg_backend_pid()" \
+     -c 'ALTER DATABASE temps RENAME TO temps_before_rollback' \
+     -c 'CREATE DATABASE temps OWNER temps'
+   docker exec temps-timescaledb psql -v ON_ERROR_STOP=1 -U temps -d temps \
+     -c 'CREATE EXTENSION IF NOT EXISTS timescaledb' \
+     -c 'SELECT timescaledb_pre_restore()'
+   docker exec -i temps-timescaledb pg_restore --no-owner --exit-on-error \
+     -U temps -d temps < "$BACKUP"
+   docker exec temps-timescaledb psql -v ON_ERROR_STOP=1 -U temps -d temps -c 'SELECT timescaledb_post_restore()'
+   ```
+
+5. **Start Temps** and [verify](#verify-the-upgrade). Once you are satisfied, drop the set-aside database: `docker exec temps-timescaledb psql -U temps -d postgres -c 'DROP DATABASE temps_before_rollback'`.
+
+If you upgraded with `--skip-pre-migration-backup`, restore the backup you took yourself in step 4 instead.
+
+---
+
+## Upgrading the database
 
 TimescaleDB runs as a Docker container and is upgraded independently of Temps:
 
 ```bash
-# Pull the latest image
 docker pull timescale/timescaledb-ha:pg18
-
-# Stop and remove the old container (data persists in the volume)
 docker stop temps-timescaledb
 docker rm temps-timescaledb
 
-# Start with the new image
 docker run -d \
   --name temps-timescaledb \
   --restart unless-stopped \
@@ -299,91 +389,73 @@ docker run -d \
   -v temps-db-data:/home/postgres/pgdata/data \
   timescale/timescaledb-ha:pg18
 
-# Restart Temps to reconnect
 sudo systemctl restart temps
 ```
 
-Your database password is stored in `~/.temps/.wizard-state/db_password` if you used the deploy script.
+The data persists in the `temps-db-data` volume. If you used the deploy script, the database password is in `~/.temps/.wizard-state/db_password`.
 
 ---
 
-## Upgrading Localup (Tunnel)
+## Upgrading Localup (tunnel)
 
-If you use tunnel mode and are not using the upgrade script, upgrade the localup binary separately:
+The upgrade script does this for you. Otherwise:
 
 ```bash
 curl -fsSL https://localup.dev/install.sh | bash
-
-# Restart the tunnel service
-sudo systemctl restart localup-tunnel    # Linux
-launchctl kickstart -k gui/$(id -u)/dev.temps.localup-tunnel # macOS
+sudo systemctl restart localup-tunnel                          # Linux
+launchctl kickstart -k gui/$(id -u)/dev.temps.localup-tunnel   # macOS
 ```
-
-Note: The `upgrade.sh` script handles this automatically when tunnel mode is detected.
 
 ---
 
 ## Troubleshooting
 
-### Service Fails to Start After Upgrade
+### Database schema is newer than this binary {{ anchor: true, id: 'database-schema-is-newer-than-this-binary' }}
 
-```bash
-# Check logs for errors
-sudo journalctl -u temps -n 50 --no-pager   # Linux
-tail -50 ~/.temps/logs/temps.log             # macOS
-
-# Common fix: ensure data directory permissions are correct
-chmod 700 ~/.temps/data
-chmod 600 ~/.temps/data/encryption_key
+```text
+The database schema is newer than this Temps binary (v…): N applied migration(s) are unknown to it: m2026…
 ```
 
-### Database Migration Errors
+A newer release migrated this database, then an older binary was started on it — usually after rolling back only the binary. Nothing was changed. Either start the newer release again (`temps upgrade --version <that release>`), or [roll back](#roll-back-an-upgrade) properly by restoring the pre-migration backup.
 
-If migrations fail on startup:
+### Pre-migration backup failed
+
+```text
+Refusing to apply N pending database migration(s) because the automatic pre-migration backup failed: …
+```
+
+Nothing was changed. Common causes:
+
+- **No usable `pg_dump`.** Install the client tools for your PostgreSQL major version (`postgresql-client-18`), or make the Docker daemon reachable so Temps can use a `postgres:18` container.
+- **The data directory is not writable** by the Temps user, or the disk is full.
+
+If you cannot fix it now, back up the database yourself and start once with `--skip-pre-migration-backup`.
+
+### Migration errors
+
+The log names the migration that failed and why; the database stays at the last migration that succeeded. Check that the database is reachable and healthy, fix the cause, and start again (or run `temps migrate` to watch each step):
 
 ```bash
-# Check that the database is reachable
 docker exec temps-timescaledb pg_isready -U temps
-
-# Check database logs
 docker logs temps-timescaledb --tail 50
 ```
 
-If the database container isn't running, start it first:
+A migration that times out on a large database is safest applied with `temps migrate` while the server is stopped.
+
+### Service fails to start
 
 ```bash
-docker start temps-timescaledb
+sudo journalctl -u temps -n 100 --no-pager   # Linux
+tail -100 ~/.temps/logs/temps.log            # macOS
 ```
 
-### Rolling Back
-
-If you need to revert to a previous version, use the upgrade script with an explicit version tag:
-
-```bash
-curl -fsSL https://temps.sh/upgrade.sh | bash -s vX.Y.Z
-```
-
-Or manually:
-
-```bash
-# 1. Download the specific version
-curl -LO https://github.com/gotempsh/temps/releases/download/vX.Y.Z/temps-linux-amd64.tar.gz
-tar -xzf temps-linux-amd64.tar.gz
-sudo mv temps /usr/local/bin/temps
-
-# 2. Restore the database backup if needed
-docker exec -i temps-timescaledb psql -U temps temps < temps-backup-YYYYMMDD.sql
-
-# 3. Restart
-sudo systemctl restart temps
-```
-
-Note: Rolling back database migrations is not automatically supported. If a new version added migrations, restoring the database from a pre-upgrade backup is the safest way to roll back.
+Check that the data directory and encryption key are readable only by the Temps user (`chmod 700 ~/.temps/data`, `chmod 600 ~/.temps/data/encryption_key`).
 
 ---
 
-## Next Steps
+## Next steps
 
-- Check the [Release Notes](https://github.com/gotempsh/temps/releases) for what's new in each version
-- Review the [Troubleshooting](/docs/troubleshooting) guide if you encounter issues
-- Set up [Backups](/docs/backups) to automate pre-upgrade snapshots
+- [Release notes](https://github.com/gotempsh/temps/releases)
+- [Backups](/docs/backups) — scheduled, off-machine backups of the control plane and your services
+- [Restore a Temps instance from S3](/docs/howto/restore-instance-from-s3)
+- [Troubleshooting](/docs/troubleshooting)

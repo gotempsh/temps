@@ -113,6 +113,31 @@ pub enum NodeError {
         reason: String,
     },
 
+    #[error(
+        "Identity '{claimed}' is the control plane's {role}; a node cannot register under it, \
+         or the cluster CA would sign the node a certificate valid for the control plane"
+    )]
+    ControlPlaneIdentity { claimed: String, role: String },
+
+    #[error(
+        "Node '{node_name}' could not complete the pairing of enrollment token {token_id}: {source}"
+    )]
+    Pairing {
+        node_name: String,
+        token_id: i32,
+        #[source]
+        source: temps_network::mesh::MeshError,
+    },
+
+    #[error(
+        "Failed to read the WireGuard mesh settings while registering node '{node_name}': {source}"
+    )]
+    MeshSettings {
+        node_name: String,
+        #[source]
+        source: temps_network::mesh::MeshError,
+    },
+
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
 
@@ -400,6 +425,86 @@ fn truncate_dns_error(reason: &str) -> String {
     format!("{}... (truncated)", &reason[..end])
 }
 
+/// Extract the host from a validated node agent URL or private address for use
+/// as a server-authoritative certificate SAN, or from the control plane's
+/// external URL.
+pub fn node_address_host(address: &str) -> String {
+    let address = address.trim();
+    let authority = address
+        .strip_prefix("https://")
+        .or_else(|| address.strip_prefix("http://"))
+        .unwrap_or(address)
+        .split('/')
+        .next()
+        .unwrap_or(address);
+    if let Some(bracketed) = authority.strip_prefix('[') {
+        if let Some(end) = bracketed.find(']') {
+            return bracketed[..end].to_string();
+        }
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+            host.to_string()
+        }
+        _ => authority.to_string(),
+    }
+}
+
+/// Field checks every registration passes before any database work.
+fn validate_registration(request: &RegisterNodeRequest) -> Result<(), NodeError> {
+    if request.name.is_empty() {
+        return Err(NodeError::Validation {
+            message: "Node name cannot be empty".into(),
+        });
+    }
+    // Restrict to a DNS-label-style charset. The name is surfaced in logs
+    // and injected into every container's `TEMPS_NODE_NAME` env var, so
+    // reject shell metacharacters / newlines / control chars defensively.
+    if request.name.len() > 63
+        || !request
+            .name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_')
+    {
+        return Err(NodeError::Validation {
+            message: "Node name must be <=63 chars of letters, digits, '-', '.', or '_'".into(),
+        });
+    }
+
+    if request.address.is_empty() {
+        return Err(NodeError::Validation {
+            message: "Node address cannot be empty".into(),
+        });
+    }
+    Ok(())
+}
+
+/// What a registration needs from its caller beyond the node's own claims.
+#[derive(Debug, Clone, Default)]
+pub struct RegistrationContext {
+    /// The enrollment token the node registered with, when it was minted for
+    /// a node pairing (ADR 048 D2b): the node is linked to that pairing.
+    pub pairing_token_id: Option<i32>,
+    /// Hosts the control plane is reached at (its external URL's host). A
+    /// node may not register under them, or the cluster CA would sign it a
+    /// certificate valid for the control plane.
+    pub control_plane_hosts: Vec<String>,
+}
+
+/// The first of `claimed` that is one of `reserved`, compared
+/// case-insensitively, with the reason it is reserved.
+fn reserved_identity_claimed<'a>(
+    claimed: &[String],
+    reserved: &'a [(String, &'static str)],
+) -> Option<(String, &'a str)> {
+    claimed.iter().find_map(|value| {
+        reserved
+            .iter()
+            .find(|(identity, _)| identity.eq_ignore_ascii_case(value))
+            .map(|(_, role)| (value.clone(), *role))
+    })
+}
+
 pub struct NodeService {
     db: Arc<DatabaseConnection>,
 }
@@ -498,32 +603,130 @@ impl NodeService {
         Ok(())
     }
 
+    /// Refuse a node that claims one of the control plane's own identities:
+    /// a host it is reached at, or its mesh address. Every name and address a
+    /// node registers becomes a SAN on the leaf the cluster CA signs it, and
+    /// nodes paired over the mesh verify the control plane against that CA.
+    async fn assert_not_control_plane_identity(
+        &self,
+        request: &RegisterNodeRequest,
+        control_plane_hosts: &[String],
+    ) -> Result<(), NodeError> {
+        let claimed: Vec<String> = [
+            request.name.trim().to_string(),
+            node_address_host(&request.address),
+            node_address_host(&request.private_address),
+        ]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect();
+        let hosts: Vec<(String, &'static str)> = control_plane_hosts
+            .iter()
+            .map(|host| host.trim().to_string())
+            .filter(|host| !host.is_empty())
+            .map(|host| (host, "host"))
+            .collect();
+        let mut conflict = reserved_identity_claimed(&claimed, &hosts)
+            .map(|(claimed, role)| (claimed, role.to_string()));
+        if conflict.is_none() {
+            let mesh = temps_network::mesh::load_settings(self.db.as_ref())
+                .await
+                .map_err(|source| NodeError::MeshSettings {
+                    node_name: request.name.clone(),
+                    source,
+                })?;
+            if let Some(mesh) = mesh {
+                let address = [(mesh.control_plane_address().to_string(), "mesh address")];
+                conflict = reserved_identity_claimed(&claimed, &address)
+                    .map(|(claimed, role)| (claimed, role.to_string()));
+            }
+        }
+        if let Some((claimed, role)) = conflict {
+            tracing::warn!(
+                node_name = %request.name,
+                claimed = %claimed,
+                role = %role,
+                "Rejected node registration: it claims the control plane's own identity"
+            );
+            return Err(NodeError::ControlPlaneIdentity { claimed, role });
+        }
+        Ok(())
+    }
+
+    /// Register a node with the checks that need the caller's context: it
+    /// must not claim the control plane's identity, and a node enrolling
+    /// through a pairing (ADR 048 D2b) is linked to it. Linking is one
+    /// transaction; when it fails, a registration that created the node is
+    /// undone so the node can run `temps join --pair` again with the same
+    /// code. On [`NodeError::Pairing`] the caller gives the enrollment token
+    /// its use back.
+    pub async fn register_with_context(
+        &self,
+        request: RegisterNodeRequest,
+        context: &RegistrationContext,
+    ) -> Result<nodes::Model, NodeError> {
+        validate_registration(&request)?;
+        self.assert_not_control_plane_identity(&request, &context.control_plane_hosts)
+            .await?;
+        let Some(token_id) = context.pairing_token_id else {
+            return self.register(request).await;
+        };
+
+        // Refuse before creating the node, so a pairing that cannot complete
+        // never leaves a half-registered node behind.
+        let node_name = request.name.clone();
+        temps_network::pairing::check_linkable(self.db.as_ref(), token_id)
+            .await
+            .map_err(|source| NodeError::Pairing {
+                node_name: node_name.clone(),
+                token_id,
+                source,
+            })?;
+        let existed = nodes::Entity::find()
+            .filter(nodes::Column::Name.eq(node_name.as_str()))
+            .one(self.db.as_ref())
+            .await?
+            .is_some();
+
+        let node = self.register(request).await?;
+        match temps_network::pairing::link_node(&self.db, token_id, node.id).await {
+            Ok(Some(pairing)) => {
+                tracing::info!(
+                    node_id = node.id,
+                    pairing = pairing.id,
+                    "node registered through a pairing"
+                );
+                Ok(node)
+            }
+            Ok(None) => Ok(node),
+            Err(source) => {
+                tracing::error!(
+                    node_id = node.id,
+                    token_id,
+                    error = %source,
+                    "could not link the node to its pairing; undoing its registration"
+                );
+                if !existed {
+                    if let Err(remove_error) = self.remove(node.id).await {
+                        tracing::error!(
+                            node_id = node.id,
+                            error = %remove_error,
+                            "could not undo the node registration"
+                        );
+                    }
+                }
+                Err(NodeError::Pairing {
+                    node_name,
+                    token_id,
+                    source,
+                })
+            }
+        }
+    }
+
     /// Register a new node in the cluster.
     pub async fn register(&self, request: RegisterNodeRequest) -> Result<nodes::Model, NodeError> {
-        if request.name.is_empty() {
-            return Err(NodeError::Validation {
-                message: "Node name cannot be empty".into(),
-            });
-        }
-        // Restrict to a DNS-label-style charset. The name is surfaced in logs
-        // and injected into every container's `TEMPS_NODE_NAME` env var, so
-        // reject shell metacharacters / newlines / control chars defensively.
-        if request.name.len() > 63
-            || !request
-                .name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_')
-        {
-            return Err(NodeError::Validation {
-                message: "Node name must be <=63 chars of letters, digits, '-', '.', or '_'".into(),
-            });
-        }
-
-        if request.address.is_empty() {
-            return Err(NodeError::Validation {
-                message: "Node address cannot be empty".into(),
-            });
-        }
+        validate_registration(&request)?;
 
         // Check for existing node with the same name
         let existing = nodes::Entity::find()
@@ -1649,6 +1852,32 @@ mod tests {
     use sea_orm::{DatabaseBackend, MockDatabase};
     use temps_entities::deployments;
 
+    #[test]
+    fn reserved_identity_claimed_matches_case_insensitively() {
+        let reserved = vec![
+            ("temps.example.com".to_string(), "host"),
+            ("10.201.0.1".to_string(), "mesh address"),
+        ];
+        let claimed = vec!["worker-1".to_string(), "TEMPS.example.COM".to_string()];
+        assert_eq!(
+            reserved_identity_claimed(&claimed, &reserved),
+            Some(("TEMPS.example.COM".to_string(), "host"))
+        );
+        let claimed = vec!["worker-1".to_string(), "10.100.0.2".to_string()];
+        assert_eq!(reserved_identity_claimed(&claimed, &reserved), None);
+    }
+
+    #[test]
+    fn node_address_host_reads_the_external_url_host() {
+        assert_eq!(
+            node_address_host("https://temps.example.com/"),
+            "temps.example.com"
+        );
+        assert_eq!(node_address_host("https://10.201.0.1:51820"), "10.201.0.1");
+        assert_eq!(node_address_host("https://[fd00::1]:3100"), "fd00::1");
+        assert_eq!(node_address_host("10.100.0.2"), "10.100.0.2");
+    }
+
     fn sample_node() -> nodes::Model {
         nodes::Model {
             architecture: None,
@@ -1668,6 +1897,9 @@ mod tests {
             edge_public_key: None,
             compute_cidr: None,
             underlay_address: None,
+            mesh_wg_public_key: None,
+            mesh_wg_endpoint: None,
+            mesh_wg_address: None,
             failover_at: None,
             dns_resolver_running: None,
             dns_resolver_tasks_alive: None,

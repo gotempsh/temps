@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 pub mod agent;
+pub mod agent_service;
 pub mod api_key;
 mod api_url;
 pub mod backfill;
@@ -21,6 +22,7 @@ pub mod node;
 pub mod proxy;
 pub mod reset_password;
 pub mod sandbox;
+pub mod schema_upgrade;
 pub mod serve;
 pub mod services;
 pub mod setup;

@@ -42,25 +42,41 @@ const MAX_STATIC_ARCHIVE_STREAM_BYTES: u64 =
 const MAX_CONTAINER_LOG_BYTES: usize = 8 * 1024 * 1024;
 const LOG_TRUNCATION_NOTICE: &str = "[… earlier container logs truncated by worker …]\n";
 
-fn append_local_build_context(
-    archive: &mut tar::Builder<std::fs::File>,
+/// Write the build context under `root` into `archive` the way the Docker
+/// CLI sends it: paths the Dockerfile's ignore rules exclude are left out,
+/// symlinks are archived as links, and every entry is owned by root.
+///
+/// The CLI rewrites every context entry to uid/gid 0 before uploading it.
+/// Without that, the archive carries whatever user owns the checkout on this
+/// host, and BuildKit keeps those ids when it unpacks a tarball context, so a
+/// `COPY . .` lands files owned by an unrelated uid in the build stage. Git
+/// then refuses to touch the copied `.git` ("detected dubious ownership"):
+/// `go build` fails with `error obtaining VCS status: exit status 128`, and a
+/// `git describe` / `git rev-parse` in a Makefile fails the same way.
+///
+/// `.git` follows the ignore rules like any other path, as it does with the
+/// CLI: builds that read VCS metadata need it, and a `.dockerignore` entry
+/// keeps it out of builds that don't. File modes and modification times are
+/// kept, and entries are written in name order so the archive does not
+/// depend on directory iteration order.
+fn append_local_build_context<W: Write>(
+    archive: &mut tar::Builder<W>,
     root: &Path,
     relative: &Path,
     filter: &crate::remote::ContextFilter,
 ) -> Result<(), BuilderError> {
-    for entry in std::fs::read_dir(root.join(relative)).map_err(BuilderError::IoError)? {
-        let entry = entry.map_err(BuilderError::IoError)?;
+    let mut entries = std::fs::read_dir(root.join(relative))
+        .map_err(BuilderError::IoError)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(BuilderError::IoError)?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
         let path = relative.join(entry.file_name());
-        if path.components().any(|part| part.as_os_str() == ".git") {
-            continue;
-        }
         let file_type = entry.file_type().map_err(BuilderError::IoError)?;
         let included = filter.includes(&path);
         if file_type.is_dir() {
             if included {
-                archive
-                    .append_dir(&path, entry.path())
-                    .map_err(BuilderError::IoError)?;
+                append_root_owned_entry(archive, &entry.path(), &path)?;
             }
             if included || filter.must_descend(&path) {
                 append_local_build_context(archive, root, &path, filter)?;
@@ -72,13 +88,40 @@ fn append_local_build_context(
                     path.display()
                 )));
             }
-            // Preserve links without reading data outside the checkout.
-            archive
-                .append_path_with_name(entry.path(), &path)
-                .map_err(BuilderError::IoError)?;
+            append_root_owned_entry(archive, &entry.path(), &path)?;
         }
     }
     Ok(())
+}
+
+/// Append one context entry as `name`, owned by uid/gid 0. A symlink is
+/// archived as a link, so nothing outside the checkout is read through it.
+fn append_root_owned_entry<W: Write>(
+    archive: &mut tar::Builder<W>,
+    source: &Path,
+    name: &Path,
+) -> Result<(), BuilderError> {
+    let metadata = std::fs::symlink_metadata(source).map_err(BuilderError::IoError)?;
+    let mut header = tar::Header::new_gnu();
+    header.set_metadata_in_mode(&metadata, tar::HeaderMode::Complete);
+    header.set_uid(0);
+    header.set_gid(0);
+    if metadata.file_type().is_symlink() {
+        let target = std::fs::read_link(source).map_err(BuilderError::IoError)?;
+        header.set_size(0);
+        archive
+            .append_link(&mut header, name, target)
+            .map_err(BuilderError::IoError)
+    } else if metadata.is_dir() {
+        archive
+            .append_data(&mut header, name, std::io::empty())
+            .map_err(BuilderError::IoError)
+    } else {
+        let file = std::fs::File::open(source).map_err(BuilderError::IoError)?;
+        archive
+            .append_data(&mut header, name, file)
+            .map_err(BuilderError::IoError)
+    }
 }
 
 fn docker_build_args(request: &BuildRequest, use_buildkit: bool) -> HashMap<String, String> {
@@ -821,6 +864,16 @@ pub fn hardened_host_config(
     }
 }
 
+/// Host address published container ports bind to, shared with whoever may
+/// move it at runtime (the agent's `network_sync` loop moves a node that
+/// joined with a public address onto its WireGuard mesh address). Read at
+/// container-creation time, so every container created after a move
+/// publishes on the new address.
+pub type SharedHostBindAddress = Arc<std::sync::RwLock<String>>;
+
+/// Where published ports go when the configured bind address is unusable.
+const FALLBACK_HOST_BIND_ADDRESS: &str = "127.0.0.1";
+
 pub struct DockerRuntime {
     /// The process-wide Docker client, which may be unavailable on a
     /// control-plane node that has no local daemon. All operations that
@@ -831,8 +884,10 @@ pub struct DockerRuntime {
     network_name: String,
     /// Address to bind host ports to: "127.0.0.1" for the control plane's
     /// own local containers, or a worker agent's private/overlay address
-    /// (never "0.0.0.0" — see [`Self::with_host_bind_address`]).
-    host_bind_address: String,
+    /// (never "0.0.0.0" — see [`Self::with_host_bind_address`]). Shared via
+    /// [`Self::with_host_bind_slot`] when the address can move at runtime;
+    /// always read through [`Self::current_host_bind_address`].
+    host_bind_address: SharedHostBindAddress,
     /// Optional secondary network for multi-host overlay (e.g. "temps-overlay").
     /// When set, every container is additionally connected to this network
     /// after creation. Skipped silently when the network doesn't exist —
@@ -1086,6 +1141,55 @@ fn clamp_build_memory(requested_bytes: i64) -> (i32, bool) {
     }
 }
 
+/// Explain why a per-build memory cap was lowered before it was sent.
+///
+/// `requested_bytes` is what Settings > Build Limits (or, when no memory cap
+/// is set there, the half-of-host-RAM default) asked for; `sent_bytes` is
+/// the value actually sent. The message names both, where the requested value
+/// came from, and what the builder does with the sent value, so it never reads
+/// as if the larger number were still being requested.
+fn describe_clamped_build_memory(
+    image_name: &str,
+    requested_bytes: i64,
+    sent_bytes: i32,
+    from_settings: bool,
+    use_buildkit: bool,
+) -> String {
+    let requested_mb = requested_bytes / (1024 * 1024);
+    let sent_mb = i64::from(sent_bytes) / (1024 * 1024);
+    let source = if from_settings {
+        "set in Settings > Build Limits"
+    } else {
+        "the default of half this host's RAM, since Settings > Build Limits sets no memory cap"
+    };
+    let effect = if use_buildkit {
+        "BuildKit ignores this value, so the build is not memory-capped".to_string()
+    } else {
+        format!(
+            "the build is capped at {sent_mb} MB. To choose the cap explicitly, set a memory \
+             cap of at most {sent_mb} MB in Settings > Build Limits"
+        )
+    };
+    format!(
+        "Build {image_name}: the per-build memory cap of {requested_mb} MB ({source}) is larger \
+         than the {sent_mb} MB maximum the Docker build API client can send, so {sent_mb} MB \
+         was sent instead; {effect}."
+    )
+}
+
+/// The one-line build log summary of the memory cap sent with a build.
+fn describe_build_memory_request(image_name: &str, sent_bytes: i32, use_buildkit: bool) -> String {
+    let sent_mb = i64::from(sent_bytes) / (1024 * 1024);
+    if use_buildkit {
+        format!(
+            "Build {image_name}: sending a per-build memory cap of {sent_mb} MB; this host builds \
+             with BuildKit, which does not enforce it"
+        )
+    } else {
+        format!("Build {image_name}: per-build memory cap of {sent_mb} MB")
+    }
+}
+
 /// Whether a `DOCKER_HOST` value points at the daemon on this machine.
 /// Unset means the default local socket, as it does for bollard.
 fn docker_host_is_local(docker_host: Option<&str>) -> bool {
@@ -1208,6 +1312,15 @@ fn read_kernel_log() -> Option<String> {
 #[cfg(not(target_os = "linux"))]
 fn read_kernel_log() -> Option<String> {
     None
+}
+
+/// The message a failed build stream carries, without bollard's
+/// `Docker stream error:` wrapper, which tells the user nothing.
+fn build_stream_error_text(error: &bollard::errors::Error) -> String {
+    match error {
+        bollard::errors::Error::DockerStreamError { error } => error.clone(),
+        other => other.to_string(),
+    }
 }
 
 /// The exit status a builder error reports for a failed step. BuildKit
@@ -1460,7 +1573,9 @@ impl DockerRuntime {
             docker: handle,
             use_buildkit,
             network_name,
-            host_bind_address: "127.0.0.1".to_string(),
+            host_bind_address: Arc::new(std::sync::RwLock::new(
+                FALLBACK_HOST_BIND_ADDRESS.to_string(),
+            )),
             overlay_network: None,
             extra_networks: Vec::new(),
             dns_servers: Vec::new(),
@@ -1655,9 +1770,71 @@ impl DockerRuntime {
     /// reachable from the control-plane proxy over the private network but
     /// never on the node's public interface. Never pass "0.0.0.0" — Docker
     /// treats it as "bind every interface", including any public one.
+    ///
+    /// The address is fixed for this runtime's lifetime; use
+    /// [`Self::with_host_bind_slot`] when it can move.
     pub fn with_host_bind_address(mut self, address: String) -> Self {
-        self.host_bind_address = address;
+        self.host_bind_address = Arc::new(std::sync::RwLock::new(address));
         self
+    }
+
+    /// Share the host bind address with the code that may move it at runtime.
+    ///
+    /// The agent passes the same slot its own service handlers read and its
+    /// `network_sync` loop updates when a node that joined with a public
+    /// address moves onto its WireGuard mesh address, so application
+    /// containers created after the move publish on the mesh address the
+    /// control plane now dials (`nodes::Model::data_address`) instead of the
+    /// public address captured at startup.
+    pub fn with_host_bind_slot(mut self, slot: SharedHostBindAddress) -> Self {
+        self.host_bind_address = slot;
+        self
+    }
+
+    /// The address to publish a port on right now, for port mappings that do
+    /// not name their own `host_ip`.
+    ///
+    /// Never returns an all-interfaces address: an empty or unspecified value
+    /// (`0.0.0.0`, `::`) in the slot falls back to loopback, because binding it
+    /// would expose the container on every interface, public ones included.
+    /// A poisoned lock still holds a complete `String`, so its value is used.
+    fn current_host_bind_address(&self) -> String {
+        let address = match self.host_bind_address.read() {
+            Ok(guard) => guard.trim().to_string(),
+            Err(poisoned) => poisoned.into_inner().trim().to_string(),
+        };
+        let all_interfaces = address
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_unspecified());
+        if address.is_empty() || all_interfaces {
+            warn!(
+                configured = %address,
+                fallback = FALLBACK_HOST_BIND_ADDRESS,
+                "refusing to publish container ports on all interfaces; the configured host \
+                 bind address is empty or unspecified, binding to loopback instead"
+            );
+            return FALLBACK_HOST_BIND_ADDRESS.to_string();
+        }
+        address
+    }
+
+    /// Docker port binding for one requested mapping: the mapping's own
+    /// `host_ip` when set, otherwise this runtime's current bind address.
+    fn host_port_binding(&self, port_mapping: &PortMapping) -> bollard::models::PortBinding {
+        bollard::models::PortBinding {
+            host_ip: Some(
+                port_mapping
+                    .host_ip
+                    .clone()
+                    .unwrap_or_else(|| self.current_host_bind_address()),
+            ),
+            // When host_port is 0, let Docker pick an available port
+            host_port: if port_mapping.host_port == 0 {
+                None
+            } else {
+                Some(port_mapping.host_port.to_string())
+            },
+        }
     }
 
     /// Declare which projects this host grants `/var/run/docker.sock` to
@@ -2080,7 +2257,6 @@ impl DockerRuntime {
             let filter = crate::remote::load_context_filter(&context_path, dockerfile)?;
             let file = tmp.reopen().map_err(BuilderError::IoError)?;
             let mut archive = tar::Builder::new(file);
-            archive.follow_symlinks(false);
             append_local_build_context(&mut archive, &context_path, Path::new(""), &filter)?;
             archive.finish().map_err(BuilderError::IoError)?;
             Ok::<_, BuilderError>(tmp)
@@ -2107,18 +2283,26 @@ impl DockerRuntime {
     }
 
     /// The `memory` value to put on `BuildImageOptions` for a requested cap.
-    /// Warns when the request had to be reduced to what the API accepts.
+    ///
+    /// Logs the reduction when the request had to be lowered to what the API
+    /// accepts: as a warning on the legacy builder, which enforces the value,
+    /// and only at debug level on BuildKit, which ignores it (the build runs
+    /// uncapped either way, so a warning there would be noise on every build).
     fn effective_build_memory(&self, requested_bytes: i64, image_name: &str) -> i32 {
         let (memory, clamped) = clamp_build_memory(requested_bytes);
         if clamped {
-            warn!(
-                "Build {}: per-build memory cap of {} MB exceeds the {} MB the Docker build API \
-                 accepts through this client; requesting {} MB instead",
+            let message = describe_clamped_build_memory(
                 image_name,
-                requested_bytes / (1024 * 1024),
-                MAX_REQUESTABLE_BUILD_MEMORY_BYTES / (1024 * 1024),
-                i64::from(memory) / (1024 * 1024)
+                requested_bytes,
+                memory,
+                self.build_resource_override.is_some(),
+                self.use_buildkit,
             );
+            if self.use_buildkit {
+                debug!("{}", message);
+            } else {
+                warn!("{}", message);
+            }
         }
         memory
     }
@@ -2564,14 +2748,8 @@ impl ImageBuilder for DockerRuntime {
         let (memory_bytes, cpu_quota_us, cpu_period_us) = self.resolve_build_resource_caps();
         let memory_i32 = self.effective_build_memory(memory_bytes, &request.image_name);
         info!(
-            "Build {}: requesting a per-build memory cap of {} MB from the daemon{}",
-            request.image_name,
-            i64::from(memory_i32) / (1024 * 1024),
-            if self.use_buildkit {
-                ", which BuildKit does not enforce"
-            } else {
-                ""
-            }
+            "{}",
+            describe_build_memory_request(&request.image_name, memory_i32, self.use_buildkit)
         );
 
         let mut labels = HashMap::new();
@@ -2662,13 +2840,18 @@ impl ImageBuilder for DockerRuntime {
                     }
                 }
                 Err(e) => {
-                    let error_msg = format!("Build failed: {}", e);
-                    error!("{}", error_msg);
+                    // `BuilderError::BuildFailed` adds the "Build failed:"
+                    // prefix itself; passing it in too doubled it.
+                    let error_text = build_stream_error_text(&e);
+                    error!("Build failed: {}", error_text);
                     let _ = log_file
-                        .write_all(format!("ERROR: {}\n", error_msg).as_bytes())
+                        .write_all(format!("ERROR: Build failed: {}\n", error_text).as_bytes())
                         .await;
-                    let (err, memory_line) =
-                        self.classify_build_failure(error_msg, &build_start, i64::from(memory_i32));
+                    let (err, memory_line) = self.classify_build_failure(
+                        error_text,
+                        &build_start,
+                        i64::from(memory_i32),
+                    );
                     if let Some(line) = memory_line {
                         let _ = log_file.write_all(line.as_bytes()).await;
                     }
@@ -2785,14 +2968,8 @@ impl ImageBuilder for DockerRuntime {
         let (memory_bytes, cpu_quota_us, cpu_period_us) = self.resolve_build_resource_caps();
         let memory_i32 = self.effective_build_memory(memory_bytes, &request.image_name);
         info!(
-            "Build {}: requesting a per-build memory cap of {} MB from the daemon{}",
-            request.image_name,
-            i64::from(memory_i32) / (1024 * 1024),
-            if self.use_buildkit {
-                ", which BuildKit does not enforce"
-            } else {
-                ""
-            }
+            "{}",
+            describe_build_memory_request(&request.image_name, memory_i32, self.use_buildkit)
         );
 
         let mut labels = HashMap::new();
@@ -2943,9 +3120,11 @@ impl ImageBuilder for DockerRuntime {
                     }
                 }
                 Err(e) => {
-                    let error_msg = format!("Build failed: {}", e);
-                    error!("{}", error_msg);
-                    let error_line = format!("ERROR: {}\n", error_msg);
+                    // `BuilderError::BuildFailed` adds the "Build failed:"
+                    // prefix itself; passing it in too doubled it.
+                    let error_text = build_stream_error_text(&e);
+                    error!("Build failed: {}", error_text);
+                    let error_line = format!("ERROR: Build failed: {}\n", error_text);
                     let _ = log_file.write_all(error_line.as_bytes()).await;
 
                     // Call log callback with error
@@ -2953,8 +3132,11 @@ impl ImageBuilder for DockerRuntime {
                         callback(error_line).await;
                     }
 
-                    let (err, memory_line) =
-                        self.classify_build_failure(error_msg, &build_start, i64::from(memory_i32));
+                    let (err, memory_line) = self.classify_build_failure(
+                        error_text,
+                        &build_start,
+                        i64::from(memory_i32),
+                    );
                     if let Some(line) = memory_line {
                         let _ = log_file.write_all(line.as_bytes()).await;
                         if let Some(ref callback) = log_callback {
@@ -3452,20 +3634,7 @@ impl ContainerDeployer for DockerRuntime {
         for port_mapping in &request.port_mappings {
             let container_port_key =
                 format!("{}/{}", port_mapping.container_port, port_mapping.protocol);
-            let host_port_binding = bollard::models::PortBinding {
-                host_ip: Some(
-                    port_mapping
-                        .host_ip
-                        .clone()
-                        .unwrap_or_else(|| self.host_bind_address.clone()),
-                ),
-                // When host_port is 0, let Docker pick an available port
-                host_port: if port_mapping.host_port == 0 {
-                    None
-                } else {
-                    Some(port_mapping.host_port.to_string())
-                },
-            };
+            let host_port_binding = self.host_port_binding(port_mapping);
 
             port_bindings.insert(container_port_key.clone(), Some(vec![host_port_binding]));
             exposed_ports.push(container_port_key);
@@ -4394,7 +4563,7 @@ mod docker_tests {
             ("Dockerfile", "FROM scratch"),
             (
                 ".dockerignore",
-                "Dockerfile\nnode_modules\ndocs\n!docs/keep.txt\n",
+                "Dockerfile\nnode_modules\ndocs\n!docs/keep.txt\n.git\n",
             ),
             ("node_modules/huge.bin", "excluded"),
             ("docs/keep.txt", "keep"),
@@ -5095,6 +5264,95 @@ mod docker_tests {
 
         assert_eq!(dns[0], "172.18.0.1", "Hickory resolver must stay primary");
         assert!(dns.len() <= 3, "glibc/musl ignore nameservers past the 3rd");
+    }
+
+    fn unpinned_port(host_port: u16) -> PortMapping {
+        PortMapping {
+            host_port,
+            container_port: 8080,
+            protocol: Protocol::Tcp,
+            host_ip: None,
+        }
+    }
+
+    #[test]
+    fn test_host_port_binding_follows_a_moved_bind_slot() {
+        // A worker that joined with a public address starts publishing there,
+        // then network_sync moves the shared slot onto its mesh address. Ports
+        // created afterwards must land on the mesh address, not the public
+        // one captured at startup.
+        let slot: SharedHostBindAddress =
+            Arc::new(std::sync::RwLock::new("203.0.113.10".to_string()));
+        let runtime = test_runtime().with_host_bind_slot(slot.clone());
+        assert_eq!(
+            runtime
+                .host_port_binding(&unpinned_port(0))
+                .host_ip
+                .as_deref(),
+            Some("203.0.113.10")
+        );
+
+        *slot.write().expect("test slot lock") = "10.99.0.4".to_string();
+
+        let binding = runtime.host_port_binding(&unpinned_port(31000));
+        assert_eq!(binding.host_ip.as_deref(), Some("10.99.0.4"));
+        assert_eq!(binding.host_port.as_deref(), Some("31000"));
+    }
+
+    #[test]
+    fn test_host_port_binding_keeps_an_explicit_host_ip() {
+        // The control plane pins app deploys to the node's data address; that
+        // request-level choice wins over the runtime's own bind address.
+        let runtime = test_runtime().with_host_bind_address("10.99.0.4".to_string());
+        let mapping = PortMapping {
+            host_ip: Some("10.0.0.8".to_string()),
+            ..unpinned_port(0)
+        };
+
+        let binding = runtime.host_port_binding(&mapping);
+
+        assert_eq!(binding.host_ip.as_deref(), Some("10.0.0.8"));
+        assert_eq!(binding.host_port, None, "port 0 lets Docker pick");
+    }
+
+    #[test]
+    fn test_host_port_binding_defaults_to_loopback() {
+        let binding = test_runtime().host_port_binding(&unpinned_port(0));
+        assert_eq!(binding.host_ip.as_deref(), Some("127.0.0.1"));
+    }
+
+    #[test]
+    fn test_host_port_binding_never_binds_all_interfaces() {
+        for unusable in ["0.0.0.0", "::", "", "   "] {
+            let slot: SharedHostBindAddress =
+                Arc::new(std::sync::RwLock::new(unusable.to_string()));
+            let runtime = test_runtime().with_host_bind_slot(slot);
+
+            let binding = runtime.host_port_binding(&unpinned_port(0));
+
+            assert_eq!(
+                binding.host_ip.as_deref(),
+                Some("127.0.0.1"),
+                "bind address {unusable:?} must fall back to loopback"
+            );
+        }
+    }
+
+    #[test]
+    fn test_host_port_binding_reads_a_poisoned_slot() {
+        let slot: SharedHostBindAddress = Arc::new(std::sync::RwLock::new("10.99.0.4".to_string()));
+        let poisoner = slot.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.write().expect("test slot lock");
+            panic!("poison the bind slot");
+        })
+        .join();
+        assert!(slot.is_poisoned());
+        let runtime = test_runtime().with_host_bind_slot(slot);
+
+        let binding = runtime.host_port_binding(&unpinned_port(0));
+
+        assert_eq!(binding.host_ip.as_deref(), Some("10.99.0.4"));
     }
 
     #[test]
@@ -6747,6 +7005,49 @@ CMD ["cat", "/hello.txt"]
     }
 
     #[test]
+    fn clamped_build_memory_message_names_the_sent_value_not_the_requested_one() {
+        let requested = 262_144_i64 * 1024 * 1024;
+        let (sent, clamped) = clamp_build_memory(requested);
+        assert!(clamped);
+
+        let legacy = describe_clamped_build_memory("app:1", requested, sent, false, false);
+        assert!(legacy.contains("cap of 262144 MB"), "{legacy}");
+        assert!(legacy.contains("half this host's RAM"), "{legacy}");
+        assert!(legacy.contains("so 2047 MB was sent instead"), "{legacy}");
+        assert!(
+            legacy.contains("the build is capped at 2047 MB"),
+            "{legacy}"
+        );
+        // The old wording ended "requesting <requested> MB instead", which
+        // contradicted the reduction it was reporting.
+        assert!(!legacy.contains("requesting 262144 MB"), "{legacy}");
+
+        let configured = describe_clamped_build_memory("app:1", requested, sent, true, false);
+        assert!(
+            configured.contains("set in Settings > Build Limits"),
+            "{configured}"
+        );
+
+        let buildkit = describe_clamped_build_memory("app:1", requested, sent, false, true);
+        assert!(
+            buildkit.contains("BuildKit ignores this value, so the build is not memory-capped"),
+            "{buildkit}"
+        );
+        assert!(!buildkit.contains("capped at 2047 MB"), "{buildkit}");
+    }
+
+    #[test]
+    fn build_memory_request_summary_says_whether_the_cap_is_enforced() {
+        let sent = i32::MAX;
+        assert_eq!(
+            describe_build_memory_request("app:1", sent, false),
+            "Build app:1: per-build memory cap of 2047 MB"
+        );
+        assert!(describe_build_memory_request("app:1", sent, true)
+            .ends_with("BuildKit, which does not enforce it"));
+    }
+
+    #[test]
     fn docker_host_is_local_only_for_unset_or_socket_hosts() {
         assert!(docker_host_is_local(None));
         assert!(docker_host_is_local(Some("")));
@@ -7244,5 +7545,236 @@ CMD ["cat", "/hello.txt"]
         let runtime = disabled_runtime();
         // We can't .await in a sync test, but we can verify the handle state.
         assert!(!runtime.docker.is_available());
+    }
+
+    /// Archive `root` with [`append_local_build_context`] and return every
+    /// entry's path, header and contents.
+    fn archive_build_context(root: &std::path::Path) -> Vec<(String, tar::Header, Vec<u8>)> {
+        use std::io::Read;
+        let mut archive = tar::Builder::new(Vec::new());
+        let filter = crate::remote::load_context_filter(root, std::path::Path::new("Dockerfile"))
+            .expect("load the context filter");
+        append_local_build_context(&mut archive, root, std::path::Path::new(""), &filter)
+            .expect("archive the build context");
+        let bytes = archive.into_inner().expect("finish the archive");
+        let mut reader = tar::Archive::new(bytes.as_slice());
+        reader
+            .entries()
+            .expect("read the archive")
+            .map(|entry| {
+                let mut entry = entry.expect("archive entry");
+                let path = entry.path().expect("entry path").display().to_string();
+                let header = entry.header().clone();
+                let mut contents = Vec::new();
+                entry.read_to_end(&mut contents).expect("entry contents");
+                (path, header, contents)
+            })
+            .collect()
+    }
+
+    /// A git checkout in the shape Temps clones it: sources plus `.git`.
+    fn checkout_fixture() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".git/refs/heads")).unwrap();
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir_all(root.join("cmd/app")).unwrap();
+        std::fs::write(root.join("cmd/app/main.go"), "package main\n").unwrap();
+        std::fs::write(root.join("Dockerfile"), "FROM scratch\n").unwrap();
+        let script = root.join("build.sh");
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn build_context_entries_are_owned_by_root() {
+        let checkout = checkout_fixture();
+
+        let entries = archive_build_context(checkout.path());
+
+        assert!(!entries.is_empty());
+        for (path, header, _) in &entries {
+            assert_eq!(header.uid().unwrap(), 0, "{path} must be owned by uid 0");
+            assert_eq!(header.gid().unwrap(), 0, "{path} must be owned by gid 0");
+        }
+    }
+
+    #[test]
+    fn build_context_keeps_git_metadata_sources_and_modes() {
+        let checkout = checkout_fixture();
+
+        let entries = archive_build_context(checkout.path());
+        let find = |wanted: &str| {
+            entries
+                .iter()
+                .find(|(path, _, _)| path.trim_end_matches('/') == wanted)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{wanted} missing from {entries:?}",
+                        entries = entries.iter().map(|e| &e.0).collect::<Vec<_>>()
+                    )
+                })
+        };
+
+        let (_, head, contents) = find(".git/HEAD");
+        assert_eq!(contents, b"ref: refs/heads/main\n");
+        assert_eq!(head.entry_type(), tar::EntryType::Regular);
+        assert_eq!(
+            find(".git/refs/heads").1.entry_type(),
+            tar::EntryType::Directory
+        );
+        assert_eq!(find("cmd/app/main.go").2, b"package main\n");
+        assert_eq!(find("build.sh").1.mode().unwrap() & 0o777, 0o755);
+        // Paths are relative to the context root, never absolute.
+        assert!(entries.iter().all(|(path, _, _)| !path.starts_with('/')));
+    }
+
+    #[test]
+    fn build_context_archives_symlinks_as_root_owned_links() {
+        let checkout = checkout_fixture();
+        std::os::unix::fs::symlink("cmd/app/main.go", checkout.path().join("main.go")).unwrap();
+
+        let entries = archive_build_context(checkout.path());
+        let (_, header, _) = entries
+            .iter()
+            .find(|(path, _, _)| path == "main.go")
+            .expect("symlink archived");
+
+        assert_eq!(header.entry_type(), tar::EntryType::Symlink);
+        assert_eq!(
+            header.link_name().unwrap().unwrap(),
+            std::path::Path::new("cmd/app/main.go")
+        );
+        assert_eq!(header.uid().unwrap(), 0);
+        assert_eq!(header.gid().unwrap(), 0);
+    }
+
+    #[test]
+    fn build_context_order_is_independent_of_directory_iteration() {
+        let checkout = checkout_fixture();
+
+        let first: Vec<String> = archive_build_context(checkout.path())
+            .into_iter()
+            .map(|(path, _, _)| path)
+            .collect();
+        let second: Vec<String> = archive_build_context(checkout.path())
+            .into_iter()
+            .map(|(path, _, _)| path)
+            .collect();
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn build_context_keeps_a_dangling_symlink_without_reading_through_it() {
+        let checkout = checkout_fixture();
+        std::os::unix::fs::symlink("does-not-exist", checkout.path().join("broken")).unwrap();
+
+        let entries = archive_build_context(checkout.path());
+        let (_, header, _) = entries
+            .iter()
+            .find(|(path, _, _)| path == "broken")
+            .expect("dangling symlink archived as a link");
+
+        assert_eq!(header.entry_type(), tar::EntryType::Symlink);
+    }
+
+    #[test]
+    fn build_context_omits_git_metadata_only_when_ignored() {
+        let checkout = checkout_fixture();
+        std::fs::write(checkout.path().join(".dockerignore"), ".git\n").unwrap();
+
+        let entries = archive_build_context(checkout.path());
+
+        assert!(entries.iter().all(|(path, _, _)| !path.starts_with(".git/")
+            && path.trim_end_matches('/') != ".git"));
+        assert!(entries.iter().any(|(path, _, _)| path == "cmd/app/main.go"));
+    }
+
+    #[test]
+    fn build_stream_error_text_drops_the_stream_wrapper() {
+        let stream = bollard::errors::Error::DockerStreamError {
+            error: "process \"/bin/sh -c make build\" did not complete successfully: exit code: 2"
+                .to_string(),
+        };
+        let text = build_stream_error_text(&stream);
+        assert_eq!(
+            text,
+            "process \"/bin/sh -c make build\" did not complete successfully: exit code: 2"
+        );
+
+        // The builder error adds the prefix exactly once.
+        let error = BuilderError::BuildFailed(text);
+        assert_eq!(
+            error.to_string(),
+            "Build failed: process \"/bin/sh -c make build\" did not complete successfully: \
+             exit code: 2"
+        );
+        assert_eq!(build_step_exit_code(&error.to_string()), Some(2));
+
+        let other = bollard::errors::Error::RequestTimeoutError;
+        assert_eq!(build_stream_error_text(&other), other.to_string());
+    }
+
+    /// End to end against a real BuildKit daemon: a `COPY` of the context
+    /// must land root-owned in the build stage, which is what lets git (and
+    /// `go build`'s VCS stamping) use a copied `.git`. Before the fix the
+    /// files kept the checkout owner's uid and git exited 128.
+    #[tokio::test]
+    #[serial]
+    async fn buildkit_build_stage_sees_root_owned_context() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(docker) => docker,
+            Err(e) => {
+                println!("Docker not available, skipping: {}", e);
+                return;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker ping failed, skipping");
+            return;
+        }
+
+        let checkout = checkout_fixture();
+        std::fs::write(
+            checkout.path().join("Dockerfile"),
+            "FROM alpine:3.20\nCOPY . /src\n\
+             RUN test \"$(stat -c %u:%g /src/.git/HEAD)\" = 0:0 \\\n \
+             && test \"$(stat -c %u:%g /src/cmd/app/main.go)\" = 0:0\n",
+        )
+        .unwrap();
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let network = format!("temps-test-ctx-owner-{suffix}");
+        let image = format!("temps-test-ctx-owner:{suffix}");
+        let runtime = DockerRuntime::new(Arc::new(docker.clone()), true, network.clone());
+        let log_dir = TempDir::new().unwrap();
+        let request = BuildRequest {
+            image_name: image.clone(),
+            context_path: checkout.path().to_path_buf(),
+            dockerfile_path: None,
+            build_args: HashMap::new(),
+            build_args_buildkit: HashMap::new(),
+            platform: None,
+            log_path: log_dir.path().join("build.log"),
+        };
+
+        let result = timeout(Duration::from_secs(300), runtime.build_image(request)).await;
+
+        let _ = runtime.remove_image(&image).await;
+        let _ = docker.remove_network(&network).await;
+        match result {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                let log =
+                    std::fs::read_to_string(log_dir.path().join("build.log")).unwrap_or_default();
+                panic!("build with a root-owned context failed: {e}\n{log}");
+            }
+            Err(_) => panic!("BuildKit build timed out"),
+        }
     }
 }

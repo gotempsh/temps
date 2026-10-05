@@ -353,10 +353,10 @@ pub async fn verify_mfa_challenge(
 
     match auth_state
         .auth_service
-        .verify_mfa_challenge(&mfa_session, &verification.code)
+        .verify_mfa_challenge_with_origin(&mfa_session, &verification.code)
         .await
     {
-        Ok(user) => {
+        Ok((user, origin)) => {
             let audit_context = AuditContext {
                 user_id: user.id,
                 ip_address: Some(metadata.ip_address.to_string()),
@@ -389,8 +389,17 @@ pub async fn verify_mfa_challenge(
                     }
                 };
 
-            let session_token = match auth_state.auth_service.create_session(user.id).await {
+            let session_token = match auth_state
+                .auth_service
+                .create_session_after_mfa(&user, origin.as_deref())
+                .await
+            {
                 Ok(session_token) => session_token,
+                Err(crate::auth_service::AuthError::Unauthorized(detail)) => {
+                    return Err(problem_new(StatusCode::UNAUTHORIZED)
+                        .with_title("OIDC Provider Revoked")
+                        .with_detail(detail));
+                }
                 Err(error) => {
                     error!("Failed to create session after MFA verification: {}", error);
                     record_login_failure(

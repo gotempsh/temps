@@ -29,6 +29,22 @@ describe('generateDocs', () => {
     expect(commands.some((command) => command.name === 'otel-forward')).toBe(true)
     expect(commands.some((command) => command.name === 'projects')).toBe(true)
     expect(commands.some((command) => command.name === 'cloud')).toBe(true)
+    // Registered but not implemented: neither help nor docs advertise them.
+    for (const unavailable of ['kv', 'blob', 'exec', 'dev']) {
+      expect(commands.some((command) => command.name === unavailable)).toBe(false)
+    }
+  })
+
+  test('hides unimplemented commands from help but keeps them runnable', async () => {
+    const { createProgram } = await import('../cli.js')
+    const program = createProgram()
+    const help = program.helpInformation()
+    for (const unavailable of ['kv', 'blob', 'exec', 'dev']) {
+      expect(help).not.toMatch(new RegExp(`^\\s+${unavailable}\\b`, 'm'))
+      expect(program.commands.some((command) => command.name() === unavailable)).toBe(
+        true,
+      )
+    }
   })
 
   test('keeps the skill command appendix synchronized with the CLI', async () => {

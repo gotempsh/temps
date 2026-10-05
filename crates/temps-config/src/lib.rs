@@ -24,7 +24,7 @@ pub use installation_secrets::{
 pub use plugin::ConfigPlugin;
 pub use retention::{settings_retention_resolver, RETENTION_REFRESH_INTERVAL};
 pub use service::{
-    installation_mode, stateless_instance_id, stateless_telemetry_anonymous_id,
-    ClusterCaRotationResult, ClusterNetworkState, ConfigService, ConfigServiceError,
-    EffectiveTelemetryPolicies, InstallationMode, ServerConfig,
+    anonymous_telemetry_preference, installation_mode, stateless_instance_id,
+    stateless_telemetry_anonymous_id, ClusterCaRotationResult, ClusterNetworkState, ConfigService,
+    ConfigServiceError, EffectiveTelemetryPolicies, InstallationMode, ServerConfig,
 };

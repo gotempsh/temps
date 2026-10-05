@@ -674,7 +674,7 @@ async fn handle_api_call(
         return Err(ChannelError::new(
             ChannelErrorCode::PermissionDenied,
             format!(
-                "Plugin '{plugin_name}' called {} {} but does not declare the '{}' capability;                  add it to the plugin manifest",
+                "Plugin '{plugin_name}' called {} {} but does not declare the '{}' capability; add it to the plugin manifest",
                 call.method.as_str(),
                 call.path,
                 required.as_str()

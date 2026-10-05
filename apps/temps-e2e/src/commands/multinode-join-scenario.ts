@@ -525,6 +525,28 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
     client = makeClient(cfg)
     log(`  cfg: ${cfg.url}`)
 
+    // The container reports healthy once the proxy completes a TLS handshake,
+    // which can be seconds before the API behind it is listening; until then
+    // the proxy answers 503. Wait for the API itself before the first write.
+    await step('wait for the control-plane API to answer through the proxy', () =>
+      pollUntil(
+        async () => {
+          try {
+            return (await adminListNodes({ client: client! })).response?.status ?? 0
+          } catch {
+            return 0
+          }
+        },
+        (status) => status === 200,
+        {
+          timeoutMs: 120_000,
+          intervalMs: 1000,
+          onPoll: (status) => log(`    ...control-plane API status=${status || '(no response)'}`),
+          label: 'control-plane API to answer an authenticated request',
+        },
+      ),
+    )
+
     managedPostgres = await step('create managed Postgres before enabling the control-plane overlay', () =>
       createE2eService(client!, {
         name: `${runId}-postgres`,

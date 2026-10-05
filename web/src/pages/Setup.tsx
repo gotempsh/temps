@@ -14,6 +14,7 @@ import {
   Globe,
   Lightbulb,
   PartyPopper,
+  Rocket,
   ShieldCheck,
   Sparkles,
   Bot,
@@ -36,6 +37,7 @@ import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 
 // Per-step icon so the checklist reads visually, not just as text rows.
 const STEP_ICONS: Record<string, LucideIcon> = {
+  deploy: Rocket,
   ai: Bot,
   git: GitBranch,
   domain: Globe,

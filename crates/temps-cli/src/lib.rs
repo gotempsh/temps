@@ -24,8 +24,13 @@ use tracing_subscriber::{layer::SubscriberExt, Layer};
 #[command(
     author,
     version = env!("TEMPS_VERSION"),
-    about,
-    long_about = None
+    about = "Temps: a self-hosted platform for deploying and operating web applications",
+    long_about = "Temps: a self-hosted platform for deploying and operating web applications.\n\n\
+                  This binary runs the Temps server (`temps serve`), sets up a new installation \
+                  (`temps setup`), and administers it: migrations, backups, domains, API keys, \
+                  worker nodes and upgrades.\n\n\
+                  To manage projects and deployments from your workstation, use the `temps` CLI \
+                  published on npm (`npx @temps-sdk/cli`)."
 )]
 pub struct Cli {
     /// Log level (trace, debug, info, warn, error)
@@ -563,7 +568,9 @@ mod command_tree_tests {
 
     fn expected_leaf_paths() -> BTreeSet<String> {
         [
-            "agent",
+            "agent service install",
+            "agent service status",
+            "agent service uninstall",
             "api-key",
             "backfill clickhouse",
             "backfill cloud-telemetry",
@@ -574,7 +581,7 @@ mod command_tree_tests {
             "deploy git",
             "deploy image",
             "deploy static",
-            "doctor",
+            "doctor mesh",
             "domain add",
             "domain cert-status",
             "domain delete",

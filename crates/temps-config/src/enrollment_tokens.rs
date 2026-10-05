@@ -172,6 +172,21 @@ impl EnrollmentTokenService {
         Ok(updated)
     }
 
+    /// Give back one use consumed by [`Self::validate_and_consume`] when the
+    /// registration it authorized was rolled back, so the node can retry with
+    /// the same token instead of needing a new one.
+    pub async fn release_use(&self, id: i32) -> Result<(), EnrollmentError> {
+        let stmt = Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "UPDATE node_enrollment_tokens \
+             SET used_count = used_count - 1, updated_at = now() \
+             WHERE id = $1 AND used_count > 0",
+            [id.into()],
+        );
+        self.db.execute(stmt).await?;
+        Ok(())
+    }
+
     /// List currently-valid (non-revoked, non-expired) tokens, newest first.
     pub async fn list_active(&self) -> Result<Vec<node_enrollment_tokens::Model>, EnrollmentError> {
         let now = chrono::Utc::now();

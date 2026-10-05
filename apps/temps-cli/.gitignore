@@ -4,6 +4,8 @@ node_modules
 # output
 out
 dist
+# standalone binary produced by `bun run build:bin`
+/bin
 *.tgz
 
 # code coverage

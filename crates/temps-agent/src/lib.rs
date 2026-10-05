@@ -91,6 +91,80 @@ pub struct NodeHealthReport {
     pub platform: String,
 }
 
+/// How this node verifies the control plane's TLS certificate.
+///
+/// The cluster CA also signs every worker's own leaf, for the names the
+/// worker registered under, so trusting it for a URL lets any enrolled worker
+/// present a certificate for that URL. It is therefore trusted only by nodes
+/// whose join pinned it to the control plane, and for those it replaces the
+/// public roots rather than adding to them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlPlaneTrust {
+    /// Public roots only: every node joined over a public control-plane URL,
+    /// and every `agent.json` written before this field existed.
+    #[default]
+    PublicRoots,
+    /// The cluster CA only: a node paired over the mesh (ADR 048 D3), which
+    /// reaches the control plane at `https://<mesh address>`, or a relay join
+    /// pinned with `--ca-fingerprint`.
+    ClusterCa,
+}
+
+/// The cluster CA as the trust root for calls to the control plane, when this
+/// node's join pinned it ([`ControlPlaneTrust::ClusterCa`]) and it holds it.
+/// `None` for every other node, which verifies the control plane against the
+/// public roots only.
+///
+/// A client given this certificate must also drop the public roots, as
+/// [`with_control_plane_trust`] does.
+pub fn control_plane_ca(config: &AgentConfig) -> Option<reqwest::Certificate> {
+    if config.effective_control_plane_trust() != ControlPlaneTrust::ClusterCa {
+        return None;
+    }
+    let Some(path) = config.cluster_ca_path.as_ref() else {
+        tracing::warn!(
+            node = %config.node_name,
+            "agent.json pins the control plane to the cluster CA but names no cluster_ca_path; \
+             control-plane calls trust only public roots until `temps join` is run again"
+        );
+        return None;
+    };
+    match std::fs::read(path)
+        .map_err(|error| error.to_string())
+        .and_then(|pem| reqwest::Certificate::from_pem(&pem).map_err(|error| error.to_string()))
+    {
+        Ok(certificate) => Some(certificate),
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "the cluster CA is unreadable; control-plane calls trust only public roots"
+            );
+            None
+        }
+    }
+}
+
+/// A client builder for calls to the control plane: see [`control_plane_ca`].
+pub fn control_plane_client_builder(config: &AgentConfig) -> reqwest::ClientBuilder {
+    with_control_plane_trust(reqwest::Client::builder(), control_plane_ca(config))
+}
+
+/// Apply the trust from [`control_plane_ca`] to `builder`: the cluster CA
+/// *instead of* the public roots when given, the public roots otherwise.
+pub fn with_control_plane_trust(
+    builder: reqwest::ClientBuilder,
+    cluster_ca: Option<reqwest::Certificate>,
+) -> reqwest::ClientBuilder {
+    match cluster_ca {
+        Some(certificate) => builder
+            .tls_built_in_root_certs(false)
+            .add_root_certificate(certificate),
+        None => builder,
+    }
+}
+
 /// Configuration for the agent server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
@@ -177,6 +251,21 @@ pub struct AgentConfig {
     pub public_ingress_http_port: u16,
     #[serde(default = "default_public_https_port")]
     pub public_ingress_https_port: u16,
+    /// Directory holding this node's WireGuard mesh private key (`0600`).
+    #[serde(default = "default_mesh_key_dir")]
+    pub mesh_key_dir: std::path::PathBuf,
+    /// `ip:port` other nodes dial to reach this node's WireGuard socket.
+    /// `None` uses the registered `private_address` on the mesh port; set it
+    /// when that address is not what other nodes can reach (NAT with a
+    /// forwarded port, a different public IP).
+    #[serde(default)]
+    pub wg_endpoint: Option<String>,
+    /// How control-plane calls verify its certificate; see
+    /// [`ControlPlaneTrust`]. Written by `temps join`; `None` in an
+    /// `agent.json` written before it existed, see
+    /// [`AgentConfig::effective_control_plane_trust`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_plane_trust: Option<ControlPlaneTrust>,
     /// X25519 private key used only to decrypt this node's certificate bundles.
     #[serde(default)]
     pub public_ingress_private_key: Option<String>,
@@ -191,6 +280,10 @@ fn default_public_https_port() -> u16 {
 
 fn default_dns_data_dir() -> std::path::PathBuf {
     std::path::PathBuf::from("/var/lib/temps/dns")
+}
+
+fn default_mesh_key_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from("/var/lib/temps/wireguard")
 }
 
 /// Sandbox work root (ADR-048) for a given `dns_data_dir`:
@@ -236,6 +329,32 @@ fn absolute_dns_data_dir(dns_data_dir: &std::path::Path) -> Result<std::path::Pa
 }
 
 impl AgentConfig {
+    /// The trust this node's control-plane calls use. An `agent.json`
+    /// written before `control_plane_trust` existed has none recorded, so it
+    /// is read from what only a mesh pairing (`temps join --pair`) writes: a
+    /// WireGuard endpoint, the cluster CA, and a control-plane URL that is an
+    /// IP literal (the control plane's mesh address). Every other legacy
+    /// config is a direct or relay join and keeps the public roots, as it
+    /// did before.
+    pub fn effective_control_plane_trust(&self) -> ControlPlaneTrust {
+        if let Some(trust) = self.control_plane_trust {
+            return trust;
+        }
+        let url_is_ip = reqwest::Url::parse(&self.control_plane_url).is_ok_and(|url| {
+            url.host_str().is_some_and(|host| {
+                host.trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .parse::<std::net::IpAddr>()
+                    .is_ok()
+            })
+        });
+        if self.wg_endpoint.is_some() && self.cluster_ca_path.is_some() && url_is_ip {
+            ControlPlaneTrust::ClusterCa
+        } else {
+            ControlPlaneTrust::PublicRoots
+        }
+    }
+
     /// Resolve this config's on-disk paths once at startup, before the agent
     /// serves any request: `dns_data_dir` is made absolute in place and the
     /// sandbox work root derived from it is validated. Fails with
@@ -638,6 +757,9 @@ mod tests {
             public_ingress_http_port: 80,
             public_ingress_https_port: 443,
             public_ingress_private_key: None,
+            mesh_key_dir: default_mesh_key_dir(),
+            wg_endpoint: None,
+            control_plane_trust: Some(ControlPlaneTrust::PublicRoots),
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -795,5 +917,96 @@ mod tests {
             "unexpected error: {error}"
         );
         assert!(config.sandbox_work_root().is_absolute());
+    }
+
+    /// A config holding a readable cluster CA, with the given trust.
+    fn config_with_cluster_ca(trust: ControlPlaneTrust) -> (AgentConfig, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = temps_core::node_pki::generate_cluster_ca().unwrap();
+        let path = dir.path().join("cluster-ca.pem");
+        std::fs::write(&path, &ca.cert_pem).unwrap();
+        let mut config = config_with_dns_data_dir("/var/lib/temps/dns");
+        config.cluster_ca_path = Some(path);
+        config.control_plane_trust = Some(trust);
+        (config, dir)
+    }
+
+    #[test]
+    fn agent_json_without_control_plane_trust_trusts_public_roots_only() {
+        // Every agent.json written before the field existed, including every
+        // node that joined directly and holds the cluster CA only for mTLS.
+        let config = config_with_dns_data_dir("/var/lib/temps/dns");
+        assert_eq!(config.control_plane_trust, None);
+        assert_eq!(
+            config.effective_control_plane_trust(),
+            ControlPlaneTrust::PublicRoots
+        );
+    }
+
+    #[test]
+    fn control_plane_trust_round_trips_through_agent_json() {
+        let (config, _dir) = config_with_cluster_ca(ControlPlaneTrust::ClusterCa);
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json["control_plane_trust"], "cluster_ca");
+        let back: AgentConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(back.control_plane_trust, Some(ControlPlaneTrust::ClusterCa));
+    }
+
+    #[test]
+    fn cluster_ca_is_not_trusted_for_the_control_plane_unless_the_join_pinned_it() {
+        // A directly joined node holds the cluster CA for its agent's mTLS.
+        // Any enrolled worker can get a leaf from that CA, so it must not
+        // also vouch for the control plane.
+        let (config, _dir) = config_with_cluster_ca(ControlPlaneTrust::PublicRoots);
+        assert!(control_plane_ca(&config).is_none());
+    }
+
+    #[test]
+    fn a_pinned_node_trusts_the_cluster_ca_for_the_control_plane() {
+        let (config, _dir) = config_with_cluster_ca(ControlPlaneTrust::ClusterCa);
+        assert!(control_plane_ca(&config).is_some());
+        assert!(control_plane_client_builder(&config).build().is_ok());
+    }
+
+    #[test]
+    fn a_pinned_node_without_a_cluster_ca_path_gets_no_extra_root() {
+        let mut config = config_with_dns_data_dir("/var/lib/temps/dns");
+        config.control_plane_trust = Some(ControlPlaneTrust::ClusterCa);
+        assert!(control_plane_ca(&config).is_none());
+    }
+
+    #[test]
+    fn a_node_paired_before_the_field_existed_keeps_trusting_the_cluster_ca() {
+        // `temps join --pair` wrote the control plane's mesh URL, a WireGuard
+        // endpoint and the cluster CA, but no `control_plane_trust`.
+        let (mut config, _dir) = config_with_cluster_ca(ControlPlaneTrust::ClusterCa);
+        config.control_plane_trust = None;
+        config.control_plane_url = "https://10.201.0.1:51820".to_string();
+        config.wg_endpoint = Some("203.0.113.7:51820".to_string());
+        assert_eq!(
+            config.effective_control_plane_trust(),
+            ControlPlaneTrust::ClusterCa
+        );
+        assert!(control_plane_ca(&config).is_some());
+    }
+
+    #[test]
+    fn a_legacy_direct_join_keeps_public_roots() {
+        // Holds the cluster CA for its agent's mTLS, but joined a public URL.
+        let (mut config, _dir) = config_with_cluster_ca(ControlPlaneTrust::PublicRoots);
+        config.control_plane_trust = None;
+        config.control_plane_url = "https://temps.example.com".to_string();
+        assert_eq!(
+            config.effective_control_plane_trust(),
+            ControlPlaneTrust::PublicRoots
+        );
+        // A WireGuard endpoint alone (e.g. set with `--wg-endpoint`) does not
+        // make a public URL a mesh one.
+        config.wg_endpoint = Some("203.0.113.7:51820".to_string());
+        assert_eq!(
+            config.effective_control_plane_trust(),
+            ControlPlaneTrust::PublicRoots
+        );
+        assert!(control_plane_ca(&config).is_none());
     }
 }

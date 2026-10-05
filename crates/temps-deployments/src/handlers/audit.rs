@@ -220,6 +220,85 @@ pub struct NodePublicIngressChangedAudit {
     pub enabled: bool,
 }
 
+/// An operator turned on the cluster's WireGuard mesh from the API.
+#[derive(Debug, Clone, Serialize)]
+pub struct WireguardMeshEnabledAudit {
+    pub context: AuditContext,
+    pub cidr: String,
+    pub listen_port: u16,
+}
+
+/// An operator started pairing a node the control plane will dial (ADR 048
+/// D2b): whoever runs the returned command at that address joins the mesh.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodePairingCreatedAudit {
+    pub context: AuditContext,
+    pub pairing_id: i32,
+    pub name: String,
+    pub node_endpoint: String,
+}
+
+/// An operator cancelled a pending node pairing.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodePairingCancelledAudit {
+    pub context: AuditContext,
+    pub pairing_id: i32,
+    pub name: String,
+}
+
+/// An operator made a mesh member the hub, or removed it (ADR 048 D4).
+#[derive(Debug, Clone, Serialize)]
+pub struct WireguardMeshHubChangedAudit {
+    pub context: AuditContext,
+    /// `none`, `control-plane` or `node <id>`.
+    pub hub: String,
+}
+
+/// An operator started adding a server over SSH (ADR 048 D2c). The
+/// credentials are not recorded; the host key they confirmed is.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeSshEnrollmentStartedAudit {
+    pub context: AuditContext,
+    pub enrollment_id: i32,
+    pub pairing_id: i32,
+    pub name: String,
+    pub ssh_address: String,
+    pub ssh_user: String,
+    pub auth_method: String,
+    pub host_key_fingerprint: String,
+}
+
+/// A server added over SSH joined and its agent runs. Recorded when the
+/// background enrollment ends, with the context (user, IP, user agent) of
+/// the operator who started it.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeSshEnrollmentSucceededAudit {
+    pub context: AuditContext,
+    pub enrollment_id: i32,
+    pub pairing_id: i32,
+    pub name: String,
+    pub ssh_address: String,
+    /// The node the server registered as.
+    pub node_id: Option<i32>,
+    /// `service` or `detached`.
+    pub agent_mode: String,
+}
+
+/// Adding a server over SSH failed. Recorded when the background enrollment
+/// ends, with the context of the operator who started it.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeSshEnrollmentFailedAudit {
+    pub context: AuditContext,
+    pub enrollment_id: i32,
+    pub pairing_id: i32,
+    pub name: String,
+    pub ssh_address: String,
+    /// The step it was on when it failed.
+    pub step: String,
+    /// Why it failed, as the enrollment shows it (secrets already masked).
+    pub error: String,
+}
+
 // ── Traefik discovery audits ────────────────────────────────────────────────
 
 /// An operator suppressed or restored a single Traefik-discovered route.
@@ -335,6 +414,16 @@ impl_audit_operation!(StaticBundleDeletedAudit, "STATIC_BUNDLE_DELETED");
 impl_audit_operation!(DeploymentTokenRotatedAudit, "DEPLOYMENT_TOKEN_ROTATED");
 impl_audit_operation!(NodeArchitectureChangedAudit, "NODE_ARCHITECTURE_CHANGED");
 impl_audit_operation!(NodePublicIngressChangedAudit, "NODE_PUBLIC_INGRESS_CHANGED");
+impl_audit_operation!(WireguardMeshEnabledAudit, "WIREGUARD_MESH_ENABLED");
+impl_audit_operation!(WireguardMeshHubChangedAudit, "WIREGUARD_MESH_HUB_CHANGED");
+impl_audit_operation!(NodePairingCreatedAudit, "NODE_PAIRING_CREATED");
+impl_audit_operation!(NodePairingCancelledAudit, "NODE_PAIRING_CANCELLED");
+impl_audit_operation!(NodeSshEnrollmentStartedAudit, "NODE_SSH_ENROLLMENT_STARTED");
+impl_audit_operation!(
+    NodeSshEnrollmentSucceededAudit,
+    "NODE_SSH_ENROLLMENT_SUCCEEDED"
+);
+impl_audit_operation!(NodeSshEnrollmentFailedAudit, "NODE_SSH_ENROLLMENT_FAILED");
 impl_audit_operation!(
     TraefikDiscoveredRouteToggledAudit,
     "TRAEFIK_DISCOVERED_ROUTE_TOGGLED"

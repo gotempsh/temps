@@ -22,6 +22,12 @@ pub struct ProxyConfig {
     /// settings), the TLS callback asks this manager to provision a cert in the
     /// background for allowlisted, stable, in-zone hostnames.
     pub on_demand_cert_manager: Option<Arc<crate::on_demand_cert::OnDemandCertManager>>,
+    /// Startup state of the console running in this same process
+    /// (`temps serve`). When set, requests forwarded to `console_address`
+    /// while the console failed to start (or is still starting) get a status
+    /// page explaining why instead of a generic 503. `None` for the split
+    /// `temps proxy` process, which cannot observe a separate console.
+    pub console_startup: Option<Arc<temps_core::console_startup::ConsoleStartupState>>,
 }
 
 impl Default for ProxyConfig {
@@ -34,6 +40,7 @@ impl Default for ProxyConfig {
             preview_domain: Some("localhost".to_string()), // Default for local development
             disable_https_redirect: false,
             on_demand_cert_manager: None,
+            console_startup: None,
         }
     }
 }

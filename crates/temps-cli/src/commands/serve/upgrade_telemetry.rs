@@ -167,7 +167,7 @@ pub fn record_started_version(data_dir: &Path) {
 /// The recorded version, or `None` when absent or not a plausible release
 /// string. The file is local and writable, so its content is validated before
 /// it can reach an event.
-fn read_last_started_version(data_dir: &Path) -> Option<String> {
+pub(crate) fn read_last_started_version(data_dir: &Path) -> Option<String> {
     let raw = std::fs::read_to_string(data_dir.join(LAST_STARTED_VERSION_FILE)).ok()?;
     version_label(raw.trim())
 }
@@ -201,6 +201,12 @@ async fn send_before_exit(db: &DatabaseConnection, data_dir: &Path, event: Telem
         ) else {
             return;
         };
+        // Honour an admin's opt-out from Settings > Telemetry. If the
+        // preference cannot be read, send nothing: it may be an opt-out.
+        let Ok(preference) = temps_telemetry::stored_preference(db).await else {
+            return;
+        };
+        reporter.apply_admin_preference(preference);
         reporter.send_now(event).await;
     };
     if tokio::time::timeout(SEND_BEFORE_EXIT_TIMEOUT, send)

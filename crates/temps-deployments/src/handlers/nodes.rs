@@ -14,7 +14,7 @@ use axum::{
     extract::{ConnectInfo, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::{get, post},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use sea_orm::{DatabaseConnection, EntityTrait};
@@ -28,7 +28,8 @@ use utoipa::{OpenApi, ToSchema};
 use crate::handlers::audit::{NodeArchitectureChangedAudit, NodePublicIngressChangedAudit};
 use crate::handlers::types::AppState;
 use crate::services::node_service::{
-    HeartbeatRequest, NodeError, NodeService, RegisterNodeRequest,
+    node_address_host, HeartbeatRequest, NodeError, NodeService, RegisterNodeRequest,
+    RegistrationContext,
 };
 use crate::services::CONTROL_PLANE_NODE_ID;
 use crate::services::{DockerDiskUsage, DockerDiskUsageCategory, DockerDiskUsageError};
@@ -478,6 +479,8 @@ pub struct ClusterDnsStatusResponse {
         node_heartbeat,
         get_s3_credentials,
         crate::handlers::network::list_peers,
+        crate::handlers::network::register_mesh,
+        crate::handlers::network::report_mesh_handshakes,
         admin_list_nodes,
         admin_get_node,
         admin_list_node_containers,
@@ -489,6 +492,16 @@ pub struct ClusterDnsStatusResponse {
         cluster_dns_status,
         node_docker_disk_usage,
         node_capability,
+        crate::handlers::wireguard_mesh::wireguard_mesh_status,
+        crate::handlers::wireguard_mesh::enable_wireguard_mesh,
+        crate::handlers::wireguard_mesh::set_wireguard_mesh_hub,
+        crate::handlers::node_pairings::create_node_pairing,
+        crate::handlers::node_pairings::list_node_pairings,
+        crate::handlers::node_pairings::cancel_node_pairing,
+        crate::handlers::node_ssh::node_ssh_host_key,
+        crate::handlers::node_ssh::create_node_ssh_enrollment,
+        crate::handlers::node_ssh::list_node_ssh_enrollments,
+        crate::handlers::node_ssh::get_node_ssh_enrollment,
     ),
     components(schemas(
         RegisterNodeApiRequest,
@@ -500,6 +513,13 @@ pub struct ClusterDnsStatusResponse {
         crate::handlers::network::PeerEntry,
         crate::handlers::network::AllocEntry,
         crate::handlers::network::PeerListResponse,
+        crate::handlers::network::WireguardMeshEntry,
+        crate::handlers::network::WireguardMeshSelfEntry,
+        crate::handlers::network::WireguardMeshPeerEntry,
+        crate::handlers::network::RegisterWireguardMeshRequest,
+        crate::handlers::network::RegisterWireguardMeshResponse,
+        crate::handlers::network::ReportWireguardHandshakesRequest,
+        crate::handlers::network::WireguardHandshakeReport,
         NodeInfoResponse,
         NodeListResponse,
         NodeContainerResponse,
@@ -513,6 +533,29 @@ pub struct ClusterDnsStatusResponse {
         DockerDiskUsage,
         DockerDiskUsageCategory,
         NodeCapabilityResponse,
+        crate::handlers::wireguard_mesh::WireguardMeshState,
+        crate::handlers::wireguard_mesh::WireguardMeshNodeConnection,
+        crate::handlers::wireguard_mesh::WireguardMeshControlPlaneEntry,
+        crate::handlers::wireguard_mesh::WireguardMeshNodeStatus,
+        crate::handlers::wireguard_mesh::WireguardMeshCheck,
+        crate::handlers::wireguard_mesh::WireguardMeshCheckStatus,
+        crate::handlers::wireguard_mesh::WireguardMeshStatusResponse,
+        crate::handlers::wireguard_mesh::EnableWireguardMeshRequest,
+        crate::handlers::wireguard_mesh::SetWireguardMeshHubRequest,
+        crate::handlers::wireguard_mesh::WireguardMeshHubTarget,
+        crate::handlers::wireguard_mesh::WireguardMeshHub,
+        crate::handlers::wireguard_mesh::WireguardMeshLink,
+        crate::handlers::wireguard_mesh::WireguardMeshLinkState,
+        crate::handlers::node_pairings::CreateNodePairingRequest,
+        crate::handlers::node_pairings::CreateNodePairingResponse,
+        crate::handlers::node_pairings::NodePairingResponse,
+        crate::handlers::node_pairings::NodePairingListResponse,
+        crate::handlers::node_ssh::SshHostKeyRequest,
+        crate::handlers::node_ssh::SshHostKeyResponse,
+        crate::handlers::node_ssh::SshCredentials,
+        crate::handlers::node_ssh::CreateSshEnrollmentRequest,
+        crate::handlers::node_ssh::NodeSshEnrollmentResponse,
+        crate::handlers::node_ssh::NodeSshEnrollmentListResponse,
         SetNodePublicIngressRequest,
         SetNodePublicIngressResponse,
     )),
@@ -537,6 +580,14 @@ pub fn configure_routes() -> Router<Arc<NodeAppState>> {
         .route(
             "/internal/nodes/{node_id}/network/peers",
             get(crate::handlers::network::list_peers),
+        )
+        .route(
+            "/internal/nodes/{node_id}/network/wireguard",
+            put(crate::handlers::network::register_mesh),
+        )
+        .route(
+            "/internal/nodes/{node_id}/network/wireguard/handshakes",
+            put(crate::handlers::network::report_mesh_handshakes),
         )
         .route("/internal/edge/routes", get(edge_routes))
 }
@@ -586,6 +637,37 @@ pub fn configure_admin_routes() -> Router<Arc<AppState>> {
         // Literal segment, so it can never be shadowed by the `{node_id}`
         // routes below it.
         .route("/nodes/capability", get(node_capability))
+        .route(
+            "/nodes/wireguard",
+            get(crate::handlers::wireguard_mesh::wireguard_mesh_status)
+                .post(crate::handlers::wireguard_mesh::enable_wireguard_mesh),
+        )
+        .route(
+            "/nodes/wireguard/hub",
+            put(crate::handlers::wireguard_mesh::set_wireguard_mesh_hub),
+        )
+        .route(
+            "/nodes/pairings",
+            get(crate::handlers::node_pairings::list_node_pairings)
+                .post(crate::handlers::node_pairings::create_node_pairing),
+        )
+        .route(
+            "/nodes/pairings/{pairing_id}",
+            delete(crate::handlers::node_pairings::cancel_node_pairing),
+        )
+        .route(
+            "/nodes/ssh/host-key",
+            post(crate::handlers::node_ssh::node_ssh_host_key),
+        )
+        .route(
+            "/nodes/ssh/enrollments",
+            get(crate::handlers::node_ssh::list_node_ssh_enrollments)
+                .post(crate::handlers::node_ssh::create_node_ssh_enrollment),
+        )
+        .route(
+            "/nodes/ssh/enrollments/{enrollment_id}",
+            get(crate::handlers::node_ssh::get_node_ssh_enrollment),
+        )
         .route(
             "/nodes/{node_id}/docker-disk-usage",
             get(node_docker_disk_usage),
@@ -827,30 +909,6 @@ pub fn validate_node_private_address(addr: &str) -> Result<std::net::IpAddr, Nod
     Ok(ip)
 }
 
-/// Extract the host from a validated node agent URL or private address for use
-/// as a server-authoritative certificate SAN.
-fn node_address_host(address: &str) -> String {
-    let address = address.trim();
-    let authority = address
-        .strip_prefix("https://")
-        .or_else(|| address.strip_prefix("http://"))
-        .unwrap_or(address)
-        .split('/')
-        .next()
-        .unwrap_or(address);
-    if let Some(bracketed) = authority.strip_prefix('[') {
-        if let Some(end) = bracketed.find(']') {
-            return bracketed[..end].to_string();
-        }
-    }
-    match authority.rsplit_once(':') {
-        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
-            host.to_string()
-        }
-        _ => authority.to_string(),
-    }
-}
-
 fn mtls_agent_address(address: &str) -> String {
     let address = address.trim();
     if address.starts_with("https://") {
@@ -1018,6 +1076,52 @@ fn node_join_failure_code(
     }
 }
 
+/// Give the enrollment token back the use a registration that was refused
+/// or undone consumed. Best effort: a failure only means the operator needs a
+/// new pairing.
+async fn release_token_use(app_state: &NodeAppState, token_id: i32) {
+    if let Err(error) = app_state
+        .enrollment_token_service
+        .release_use(token_id)
+        .await
+    {
+        error!(token_id, %error, "could not give the enrollment token its use back");
+    }
+}
+
+/// Why a paired node could not complete its registration, and what to do.
+fn pairing_problem(error: &temps_network::mesh::MeshError) -> Problem {
+    use temps_network::mesh::MeshError;
+    match error {
+        MeshError::PairingClosed => problemdetails::new(StatusCode::CONFLICT)
+            .with_title("Pairing Closed")
+            .with_detail(
+                "This pairing is no longer waiting for this node (it was cancelled, expired or \
+                 already used). Create a new pairing: bunx @temps-sdk/cli nodes pair create \
+                 --address <node-ip>",
+            ),
+        MeshError::PublicKeyInUse => problemdetails::new(StatusCode::CONFLICT)
+            .with_title("WireGuard Key In Use")
+            .with_detail(
+                "Another cluster member already uses this node's WireGuard key, usually because \
+                 the key file was copied from another machine. Delete the node's mesh key, \
+                 then create a new pairing.",
+            ),
+        MeshError::Disabled => problemdetails::new(StatusCode::CONFLICT)
+            .with_title("WireGuard Mesh Off")
+            .with_detail("The WireGuard mesh was turned off while this node was pairing."),
+        other => {
+            error!(error = %other, "could not complete a node pairing");
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Internal Server Error")
+                .with_detail(
+                    "Failed to complete the node's pairing; nothing was registered, so running \
+                     `temps join --pair` again retries it. See the server logs.",
+                )
+        }
+    }
+}
+
 async fn register_node_inner(
     State(app_state): State<Arc<NodeAppState>>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
@@ -1062,12 +1166,16 @@ async fn register_node_inner(
             .with_detail("A token is required to register a node. Generate an enrollment token in Settings > Worker Nodes.")
     })?;
 
+    // The enrollment token this node registered with, when it was one: a
+    // token minted for a node pairing links the pairing to the node.
+    let mut enrollment_token_id = None;
     match app_state
         .enrollment_token_service
         .validate_and_consume(provided_token)
         .await
     {
         Ok(token_row) => {
+            enrollment_token_id = Some(token_row.id);
             // Enforce a node-name pin if the token was scoped to one node.
             if let Some(ref bound) = token_row.bound_node_name {
                 if bound != request.name.trim() {
@@ -1290,11 +1398,31 @@ async fn register_node_inner(
         prior_token_hash: request.prior_token.as_deref().map(sha256_hash),
     };
 
-    let node = app_state
+    // The service refuses a node claiming the control plane's own identity
+    // and links a paired node (ADR 048 D2b) to its pairing, undoing the
+    // registration if that fails.
+    let context = RegistrationContext {
+        pairing_token_id: enrollment_token_id,
+        control_plane_hosts: settings
+            .external_url
+            .as_deref()
+            .map(node_address_host)
+            .into_iter()
+            .collect(),
+    };
+    let node = match app_state
         .node_service
-        .register(register_request)
+        .register_with_context(register_request, &context)
         .await
-        .map_err(Problem::from)?;
+    {
+        Ok(node) => node,
+        Err(error) => {
+            if let (NodeError::Pairing { token_id, .. }, Some(_)) = (&error, enrollment_token_id) {
+                release_token_use(&app_state, *token_id).await;
+            }
+            return Err(Problem::from(error));
+        }
+    };
 
     info!(node_id = node.id, name = %node.name, "Node registered successfully");
 
@@ -1345,10 +1473,14 @@ async fn persist_underlay_address(db: &sea_orm::DatabaseConnection, node_id: i32
     use sea_orm::{sea_query::Expr, ColumnTrait, EntityTrait, QueryFilter};
     use temps_entities::nodes;
 
+    // A node on the WireGuard mesh keeps its mesh address as underlay across
+    // re-registration; the address it joined with is only its endpoint.
+    // Decided in the UPDATE itself so a concurrent mesh registration can't be
+    // overwritten from a stale read.
     let result = nodes::Entity::update_many()
         .col_expr(
             nodes::Column::UnderlayAddress,
-            Expr::value(Some(underlay.to_string())),
+            Expr::cust_with_values("COALESCE(mesh_wg_address, $1)", [underlay.to_string()]),
         )
         .filter(nodes::Column::Id.eq(node_id))
         .exec(db)
@@ -3331,6 +3463,16 @@ impl From<NodeError> for Problem {
             NodeError::DockerSocketNotSchedulable { .. } => {
                 temps_core::worker_node_required_problem(error.to_string())
             }
+            NodeError::ControlPlaneIdentity { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Control Plane Identity")
+                .with_detail(error.to_string()),
+            NodeError::Pairing { ref source, .. } => pairing_problem(source),
+            NodeError::MeshSettings { ref source, .. } => {
+                error!("Failed to read mesh settings in node operation: {}", source);
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Internal Server Error")
+                    .with_detail(error.to_string())
+            }
             NodeError::Database(ref e) => {
                 error!("Database error in node operation: {}", e);
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
@@ -3566,6 +3708,9 @@ mod tests {
             edge_public_key: None,
             compute_cidr: None,
             underlay_address: None,
+            mesh_wg_public_key: None,
+            mesh_wg_endpoint: None,
+            mesh_wg_address: None,
             failover_at: None,
             dns_resolver_running: None,
             dns_resolver_tasks_alive: None,
@@ -3896,10 +4041,85 @@ mod tests {
         assert!(rl.check(ip2).is_ok());
     }
 
+    /// A registration request body for `name` at `private_address`.
+    fn register_body(name: &str, private_address: &str) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "token": "test-token",
+            "join_token": "test-join-token",
+            "address": format!("https://{private_address}:3100"),
+            "private_address": private_address,
+        })
+    }
+
+    async fn post_register(app: Router, body: &serde_json::Value) -> axum::response::Response {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/internal/nodes/register")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_register_node_rejects_the_control_plane_external_host_as_name() {
+        // A worker named after the control plane's host would get a cluster-CA
+        // leaf valid for it. Refused before any database work.
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let mut settings = settings_with_join_token();
+        settings.external_url = Some("https://Temps.Example.com/".to_string());
+        let app = make_app_with_settings(db, settings);
+
+        let response = post_register(app, &register_body("temps.example.com", "10.100.0.2")).await;
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(problem["title"], "Control Plane Identity");
+        assert!(problem["detail"]
+            .as_str()
+            .unwrap()
+            .contains("'temps.example.com' is the control plane's host"));
+    }
+
+    #[tokio::test]
+    async fn test_register_node_rejects_the_control_plane_mesh_address() {
+        // Mesh-paired nodes verify the control plane at its mesh address
+        // against the cluster CA, so no worker may hold that address as a SAN.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![
+                crate::handlers::wireguard_mesh::admin_test_support::network_config(true, true),
+            ]])
+            .into_connection();
+        let app = make_app_with_settings(db, settings_with_join_token());
+
+        let response = post_register(app, &register_body("worker-9", "10.201.0.1")).await;
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(problem["detail"]
+            .as_str()
+            .unwrap()
+            .contains("'10.201.0.1' is the control plane's mesh address"));
+    }
+
     #[tokio::test]
     async fn test_register_node_success() {
         let node = sample_node();
         let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // Control-plane identity guard: the mesh is off
+            .append_query_results(vec![vec![
+                crate::handlers::wireguard_mesh::admin_test_support::network_config(false, false),
+            ]])
             // Check for duplicate name (returns empty)
             .append_query_results(vec![Vec::<nodes::Model>::new()])
             // Identity guard: name/address not claimed by another node
@@ -4139,6 +4359,10 @@ mod tests {
     async fn test_register_node_with_valid_join_token_succeeds() {
         let node = sample_node();
         let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // control-plane identity guard: the mesh is off
+            .append_query_results(vec![vec![
+                crate::handlers::wireguard_mesh::admin_test_support::network_config(false, false),
+            ]])
             .append_query_results(vec![Vec::<nodes::Model>::new()]) // duplicate name
             .append_query_results(vec![Vec::<nodes::Model>::new()]) // identity guard
             .append_query_results(vec![vec![node.clone()]])

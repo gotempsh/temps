@@ -4,11 +4,13 @@
 import type { DeploymentResponse, ProjectResponse } from '@/api/client'
 import { getEnvironmentsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { useQuery } from '@tanstack/react-query'
+import { useEffect, useRef } from 'react'
 import {
   describeDockerSocket,
   HOST_DOCKER_ACCESS_SHORT_LABEL,
 } from '@/lib/docker-socket'
 import { projectDeploymentStatus } from '@/lib/project-deployment-status'
+import { isActiveDeploymentStatus } from '@/lib/recent-deployments'
 import { ProjectAvatar } from '@/components/project/ProjectAvatar'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -24,7 +26,14 @@ import {
   repositoryWebUrl,
   type GitProviderKind,
 } from '@/lib/project-header-actions'
-import { ExternalLink, GitFork, Plug, Rocket, Users } from 'lucide-react'
+import {
+  ExternalLink,
+  GitFork,
+  Loader2,
+  Plug,
+  Rocket,
+  Users,
+} from 'lucide-react'
 import BitbucketIcon from '@/icons/Bitbucket'
 import GiteaIcon from '@/icons/Gitea'
 import GithubIcon from '@/icons/Github'
@@ -105,7 +114,27 @@ export function ProjectDetailHeader({
   })
   // Latest build and currently deployed version can be different, including
   // during builds, after failures, and following a rollback.
-  const deploymentStatus = projectDeploymentStatus(environmentsQuery.data)
+  const deploymentStatus = projectDeploymentStatus(
+    environmentsQuery.data,
+    lastDeployment
+  )
+  // When a build finishes, its environment pointer is already set; refetch at
+  // once so "Deploying" turns into "Deployed" instead of briefly reading
+  // "Not deployed" until the next poll.
+  const lastDeploymentStatus = lastDeployment?.status
+  const previousDeploymentStatus = useRef(lastDeploymentStatus)
+  const refetchEnvironments = environmentsQuery.refetch
+  useEffect(() => {
+    const previous = previousDeploymentStatus.current
+    previousDeploymentStatus.current = lastDeploymentStatus
+    if (
+      previous !== undefined &&
+      isActiveDeploymentStatus(previous) &&
+      !(lastDeploymentStatus && isActiveDeploymentStatus(lastDeploymentStatus))
+    ) {
+      void refetchEnvironments()
+    }
+  }, [lastDeploymentStatus, refetchEnvironments])
   const repositoryUrl = repositoryCloneUrl
     ? repositoryWebUrl(repositoryCloneUrl)
     : null
@@ -144,8 +173,11 @@ export function ProjectDetailHeader({
             </h1>
             <Badge
               variant={deploymentStatus === 'Deployed' ? 'default' : 'outline'}
-              className="hidden sm:inline-flex shrink-0"
+              className="hidden sm:inline-flex shrink-0 gap-1"
             >
+              {deploymentStatus === 'Deploying' && (
+                <Loader2 aria-hidden="true" className="size-3 animate-spin" />
+              )}
               {deploymentStatus ??
                 (environmentsQuery.isError
                   ? 'Deployment status unavailable'

@@ -69,6 +69,9 @@ pub struct ResolverConfig {
     /// own `service_endpoints` database). `node_token` / `control_plane_url`
     /// are unused in this mode. Defaults to `false` (worker behaviour).
     pub disable_sync: bool,
+    /// Trust root (PEM) for the control plane: the cluster CA, for a node
+    /// whose join pinned it. When set it replaces the public roots.
+    pub control_plane_ca_pem: Option<Vec<u8>>,
 }
 
 impl ResolverConfig {
@@ -99,6 +102,7 @@ impl ResolverConfig {
                 SocketAddr::new("8.8.8.8".parse().expect("static ipv4"), 53),
             ],
             disable_sync: false,
+            control_plane_ca_pem: None,
         }
     }
 
@@ -124,6 +128,7 @@ impl ResolverConfig {
                 SocketAddr::new("8.8.8.8".parse().expect("static ipv4"), 53),
             ],
             disable_sync: true,
+            control_plane_ca_pem: None,
         }
     }
 

@@ -217,6 +217,23 @@ pub struct AppSettings {
     #[serde(default)]
     pub plugin_installation_reporting_enabled: bool,
 
+    /// Admin preference for anonymous product telemetry (the events sent to
+    /// the Temps maintainers by `temps-telemetry`; unrelated to Temps Cloud
+    /// mirroring in `cloud.telemetry_enabled` and to OpenTelemetry ingest).
+    ///
+    /// - `None` (default) — the operator has not chosen; the built-in default
+    ///   applies (see `temps_telemetry::DEFAULT_TELEMETRY_ENABLED`).
+    /// - `Some(true)` / `Some(false)` — an admin turned it on/off from
+    ///   Settings › Telemetry. Applied at runtime without a restart.
+    ///
+    /// The `TEMPS_TELEMETRY=0` environment variable is a host-level kill
+    /// switch that wins over this value unconditionally. The dedicated
+    /// `PATCH /settings/telemetry` endpoint is the only write path: the
+    /// generic settings save restores the stored value under the row lock, so
+    /// an older client round-tripping the whole document cannot flip it.
+    #[serde(default)]
+    pub anonymous_telemetry_enabled: Option<bool>,
+
     /// One-click "Update now" from the console. Enabled by default; an admin
     /// can turn it off here to keep upgrades on the CLI/config-management path.
     ///
@@ -270,6 +287,14 @@ pub struct CloudSettings {
     pub backups_enabled: bool,
     /// Explicit consent to send notifications through managed providers.
     pub notifications_enabled: bool,
+
+    /// Explicit operator consent to let Temps Cloud open this instance's
+    /// console over the outbound relay, using managed OIDC authentication.
+    /// Default off for every enrollment path. Linking, including unattended
+    /// bootstrap, never enables console access; enable it explicitly in
+    /// Settings > Temps Cloud or with `temps cloud console-access enable`.
+    #[serde(default)]
+    pub console_access_enabled: bool,
 
     /// ADR-041 §3d: hard ceiling, in bytes, on the durable span outbox that
     /// backs Cloud-primary telemetry writes.
@@ -435,6 +460,8 @@ impl Default for CloudSettings {
             telemetry_enabled: false,
             backups_enabled: false,
             notifications_enabled: false,
+            // Linking never changes this explicit operator consent.
+            console_access_enabled: false,
             telemetry_outbox_max_bytes: DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES,
             // ADR-042 §3: unthrottled by default. "Activate now" is what the
             // customer paid for, and a throttle nobody asked for makes a long
@@ -1010,7 +1037,7 @@ pub struct ProviderConfig {
     /// Auth flavor for this provider. Valid values depend on the provider:
     ///   - `claude_cli`: "subscription" (OAuth token) | "api_key"
     ///   - `codex_cli`: "api_key"
-    ///   - `opencode`:  "config_file"
+    ///   - `opencode`:  "config_file" | "openai_compatible"
     pub auth_type: String,
     /// Encrypted credential payload. The decrypted bytes are interpreted
     /// according to the catalog entry's `credential_format`:
@@ -2001,6 +2028,7 @@ impl Default for AppSettings {
             setup_complete: false,
             require_mfa_for_admins: false,
             plugin_installation_reporting_enabled: false,
+            anonymous_telemetry_enabled: None,
             self_update: None,
             console_version: None,
         }
@@ -2203,7 +2231,19 @@ impl SecurityHeadersSettings {
 impl AppSettings {
     /// Create settings from JSON value, using defaults for missing fields
     pub fn from_json(value: serde_json::Value) -> Self {
-        serde_json::from_value(value).unwrap_or_default()
+        serde_json::from_value(value.clone()).unwrap_or_else(|_| {
+            // Unrelated malformed sections must never turn a saved opt-out
+            // into the opt-in default during an unrelated settings write.
+            let anonymous_telemetry_enabled = match value.get("anonymous_telemetry_enabled") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::Bool(enabled)) => Some(*enabled),
+                Some(_) => Some(false),
+            };
+            Self {
+                anonymous_telemetry_enabled,
+                ..Self::default()
+            }
+        })
     }
 
     /// Convert settings to JSON value
@@ -3082,6 +3122,10 @@ mod tests {
         assert!(!defaults.telemetry_enabled);
         assert!(!defaults.backups_enabled);
         assert!(!defaults.notifications_enabled);
+        // ADR-045 §5: console access defaults off just like the other three
+        // consent flags -- an instance never gets it merely by loading
+        // settings. Every enrollment path preserves explicit operator consent.
+        assert!(!defaults.console_access_enabled);
 
         let parsed = AppSettings::from_json(serde_json::json!({
             "cloud": {"backend_url": "https://cloud.example.com"}
@@ -3089,6 +3133,21 @@ mod tests {
         assert!(!parsed.cloud.telemetry_enabled);
         assert!(!parsed.cloud.backups_enabled);
         assert!(!parsed.cloud.notifications_enabled);
+        assert!(!parsed.cloud.console_access_enabled);
+
+        // A settings row written before this field existed (no `cloud.
+        // console_access_enabled` key at all) must deserialize as off
+        // rather than failing the whole settings read.
+        let legacy = AppSettings::from_json(serde_json::json!({
+            "cloud": {
+                "backend_url": "https://cloud.example.com",
+                "telemetry_enabled": true,
+                "backups_enabled": false,
+                "notifications_enabled": false
+            }
+        }));
+        assert!(!legacy.cloud.console_access_enabled);
+        assert!(legacy.cloud.telemetry_enabled);
     }
 
     #[test]

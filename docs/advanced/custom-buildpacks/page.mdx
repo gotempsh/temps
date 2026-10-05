@@ -8,8 +8,13 @@ export const metadata = {
 
 
 # Custom Buildpacks
-## Page Goal
-Enable advanced users to customize build process for complex requirements.
-## Target Persona
-**Advanced Adam** - Complex app requirements, needs build customization, comfortable with Docker/buildpacks.
-## Key Content: Nixpacks, custom Dockerfiles, build configuration, multi-stage builds, caching strategies
+
+<Note>
+This guide is not written yet. It is planned for a future update of the documentation.
+</Note>
+
+Temps does not use Cloud Native Buildpacks (Heroku or Paketo). Until this guide is published:
+
+- [Supported platforms](/docs/supported-platforms) explains how Temps picks a build preset and which build settings you can override.
+- A `Dockerfile` in your repository takes precedence over framework and language detection, so you control the build completely. Only a Docker Compose file ranks higher. See [Deploy Docker containers](/docs/docker-containers).
+- To build somewhere else, build the image in CI and deploy it as an image. See [Set up a CI/CD pipeline](/docs/set-up-ci-cd-pipeline).

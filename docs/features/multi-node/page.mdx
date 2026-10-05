@@ -12,6 +12,7 @@ export const sections = [
   { title: 'Architecture', id: 'architecture' },
   { title: 'Prerequisites', id: 'prerequisites' },
   { title: 'Adding a worker node (direct mode)', id: 'direct-mode' },
+  { title: 'Joining over the internet (WireGuard mesh)', id: 'wireguard-mesh' },
   { title: 'Adding a worker node (WireGuard mode)', id: 'wireguard-mode' },
   { title: 'Running the agent directly', id: 'agent-command' },
   { title: 'Verifying nodes', id: 'verifying-nodes' },
@@ -138,7 +139,107 @@ The agent reads its config from `~/.temps/agent.json` and begins sending heartbe
 
 ---
 
+## Joining over the internet (WireGuard mesh) {{ anchor: true, id: 'wireguard-mesh' }}
+
+Direct mode needs a private network the worker shares with the control plane. When a worker only shares the internet with it — another provider, another region, a box at home — turn on the managed WireGuard mesh. Every node gets a private address on an encrypted WireGuard tunnel, the container overlay runs over it, and the control plane reaches the worker's agent and published ports on that address.
+
+Turn it on from **Settings → Worker Nodes → Over the internet → Enable WireGuard mesh**, or with the CLI:
+
+```bash
+bunx @temps-sdk/cli nodes mesh enable
+```
+
+The running `temps serve` and every agent move onto the mesh within a minute, with no restart. Cross-node traffic pauses while nodes switch over. Once on, the mesh stays on; workers on your private network keep using it.
+
+Requirements:
+
+- Nodes run Linux with kernel WireGuard (5.6 or newer).
+- Every link needs one end the other can dial on the mesh port (UDP `51820` by default): open it inbound on that end in your provider's firewall. WireGuard is symmetric, so a control plane behind NAT (a laptop, a home server) works as long as the workers accept UDP `51820`.
+- Workers reach the control plane over the mesh on TCP `51820` too (the node API, on the control plane's mesh address only). Pick another port with `bunx @temps-sdk/cli nodes mesh enable --node-api-port <port>`.
+
+There are two ways to join a worker, depending on which side can reach the other.
+
+**The worker reaches the control plane** (the control plane has a public URL). Join the worker with its **public** IP:
+
+```bash
+temps join https://temps.example.com <join-token> --private-address <worker-public-ip>
+temps agent
+```
+
+Behind NAT, or reachable on a different public IP? Start the agent with `temps agent --wg-endpoint <public-ip>:51820`.
+
+**The control plane reaches the worker** (the control plane has no address workers can reach). On **Settings → Worker Nodes → Over the internet → This server reaches the worker**, enter the worker's public IP, or run:
+
+```bash
+bunx @temps-sdk/cli nodes pair create --address <worker-public-ip> --name worker-1
+```
+
+It prints one command. Run it on the worker as root, then start the agent:
+
+```bash
+temps join --pair tpair1.…
+temps agent service install
+```
+
+`temps join --pair -` reads the code from stdin instead, which keeps it out of the process list and shell history.
+
+The worker waits on UDP `51820` until the control plane reaches it (the command expires after 30 minutes). The two exchange WireGuard **public** keys over a message authenticated with a one-time secret in the command; no private key leaves either machine. The worker then registers over the mesh, trusting only the cluster CA whose fingerprint the command carries. Pairings in progress, with why a worker has not been reached yet, show on the same page and with `bunx @temps-sdk/cli nodes pair`.
+
+### Adding a server over SSH
+
+When the control plane can log in to the server, it can do the whole setup itself. Open **Settings → Worker Nodes → Over the internet → Add it over SSH**, or run:
+
+```bash
+bunx @temps-sdk/cli nodes ssh add --host 203.0.113.10 --user root
+```
+
+1. The control plane connects and shows the server's SSH host key. Compare it with the server's own before continuing, from its console or a session you trust: `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`. The CLI asks you to confirm it; pass `--host-key SHA256:…` for automation. If the server presents another key during the setup, the setup stops.
+2. It logs in with a password, a private key (`--identity-file`, `--ask-passphrase`) or the SSH agent of the `temps serve` process (`--agent`). A user other than root needs sudo. If sudo asks for a password, log in with that user's password and it is used for sudo too.
+3. It checks the server runs Linux and Docker, installs Temps if missing, runs `temps join --pair -` with a pairing code on stdin, and installs the agent as `temps-agent.service`. Without systemd it starts the agent in the background and says so: that agent does not come back after a reboot.
+4. It waits for the node's first heartbeat. Progress and the server's output show on the page, and with `bunx @temps-sdk/cli nodes ssh show <id>`.
+
+The credentials are used for this setup only and are never stored. The server must accept UDP `51820` from the control plane, as for any pairing. `--node-address` gives the server's public IP for WireGuard when it differs from the address SSH connects to. Loopback, link-local and cloud metadata addresses are refused; private addresses are allowed, for servers on the same LAN or VPC.
+
+### Checking the mesh
+
+Check each node's connection on the Worker Nodes page (the **Mesh** column; **What to fix** lists anything the control plane sees wrong), or with:
+
+```bash
+bunx @temps-sdk/cli nodes mesh doctor
+```
+
+It checks the control plane's end, every node's link and every pairing in progress, and says what fixes each failure. On a node (or the control plane host), check that machine's own end: its key, the `temps-wg0` interface, each peer's handshake, the path MTU, the mesh firewall and the control plane's node API:
+
+```bash
+temps doctor mesh
+```
+
+A node that stays **Not connected** almost always has the mesh UDP port blocked on the end that is dialed; both doctors name the port and the side to open.
+
+### Nodes that cannot reach each other: mesh hubs
+
+Two nodes that both sit behind NAT (a home lab and an office box, say) can each reach the control plane but cannot dial each other. The mesh finds this by itself: every agent reports when it last completed a WireGuard handshake with each peer, and a pair that has not connected after a couple of minutes shows as **Cannot connect** under **Settings → Worker Nodes → Mesh hub**, with the fix.
+
+The fix is a **hub**: a member that both sides reach and that relays between them. Choose it on the same card, or run:
+
+```bash
+bunx @temps-sdk/cli nodes mesh hub set control-plane   # or a node name
+bunx @temps-sdk/cli nodes mesh hub                     # the hub and every pair it carries
+bunx @temps-sdk/cli nodes mesh hub unset
+```
+
+- The control plane moves a pair onto the hub only when the direct path never came up, both nodes are reporting, and the hub reaches both. Pairs that connect directly are left alone.
+- A pair goes back to trying the direct path when one of its nodes gets a new endpoint, when the hub is removed or changed to one of the two nodes, or when the hub stops reaching one of them. It is never switched on a timer, so a working relayed path is not broken to probe a direct one.
+- The hub decrypts what it relays and encrypts it again for the other node, so it can read that traffic. Pick a machine you control; setting the hub is recorded in the audit log.
+- The hub needs a public address both nodes can dial. If no member has one, the Mesh hub card says so.
+
+---
+
 ## Adding a worker node (WireGuard mode) {{ anchor: true, id: 'wireguard-mode' }}
+
+<Note>
+For nodes on different networks, prefer the [WireGuard mesh](#wireguard-mesh) above: Temps creates and manages the tunnels itself. The steps below are for running your own WireGuard network instead.
+</Note>
 
 Use WireGuard when nodes are on different networks without direct connectivity: behind NAT, in another cloud, or in another region. Run a WireGuard network yourself, then join each worker in **direct mode** with its WireGuard address as `--private-address`. Temps then sends everything between nodes (agent API, heartbeats, proxied requests and the container overlay) through the tunnel.
 
@@ -217,6 +318,18 @@ The agent loads its configuration from `~/.temps/agent.json` (saved by `temps jo
 | `TEMPS_NODE_ID` / `--node-id` | — | Node ID assigned during registration |
 
 If no `~/.temps/agent.json` exists and required fields are missing, the agent exits with an error suggesting you run `temps join` first.
+
+### Run the agent as a service
+
+On a server with systemd, install the agent as `temps-agent.service` so it restarts on failure and comes back after a reboot:
+
+```bash
+sudo temps agent service install     # writes the unit, enables and starts it
+temps agent service status
+sudo temps agent service uninstall
+```
+
+The unit runs this `temps` binary with the data directory `temps join` wrote (`--binary` and `--data-dir` override them; `--dry-run` prints the unit without installing it). The enrollment token and TLS key stay in that owner-only directory: the unit only points at it. It refuses to replace a `temps-agent.service` that Temps did not write. Without systemd, run `temps agent` under your own supervisor.
 
 The agent sends a **heartbeat** to the control plane every 30 seconds. If heartbeats stop (e.g., the agent is stopped or the machine goes down), the control plane marks the node as **offline** after 90 seconds and excludes it from scheduling.
 

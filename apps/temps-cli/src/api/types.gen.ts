@@ -1630,6 +1630,23 @@ export type AppSettings = {
      */
     ai_workspace_file_limits?: AiWorkspaceFileLimitsSettings;
     /**
+     * Admin preference for anonymous product telemetry (the events sent to
+     * the Temps maintainers by `temps-telemetry`; unrelated to Temps Cloud
+     * mirroring in `cloud.telemetry_enabled` and to OpenTelemetry ingest).
+     *
+     * - `None` (default) — the operator has not chosen; the built-in default
+     * applies (see `temps_telemetry::DEFAULT_TELEMETRY_ENABLED`).
+     * - `Some(true)` / `Some(false)` — an admin turned it on/off from
+     * Settings › Telemetry. Applied at runtime without a restart.
+     *
+     * The `TEMPS_TELEMETRY=0` environment variable is a host-level kill
+     * switch that wins over this value unconditionally. The dedicated
+     * `PATCH /settings/telemetry` endpoint is the only write path: the
+     * generic settings save restores the stored value under the row lock, so
+     * an older client round-tripping the whole document cannot flip it.
+     */
+    anonymous_telemetry_enabled?: boolean | null;
+    /**
      * Build-time resource limits applied on the control plane to prevent
      * `docker build` from saturating host CPU/RAM. Worker nodes are
      * intentionally NOT subject to these limits (each worker is dedicated
@@ -3600,9 +3617,13 @@ export type CloudDeliveryGapResponse = {
 };
 
 export type CloudFeatureSwitchesRequest = {
-    backups_enabled: boolean;
-    notifications_enabled: boolean;
-    telemetry_enabled: boolean;
+    backups_enabled?: boolean | null;
+    /**
+     * Omitted switches retain their current value under the settings row lock.
+     */
+    console_access_enabled?: boolean | null;
+    notifications_enabled?: boolean | null;
+    telemetry_enabled?: boolean | null;
 };
 
 /**
@@ -3627,6 +3648,14 @@ export type CloudSettings = {
      * Explicit consent to export completed backup objects.
      */
     backups_enabled?: boolean;
+    /**
+     * Explicit operator consent to let Temps Cloud open this instance's
+     * console over the outbound relay, using managed OIDC authentication.
+     * Default off for every enrollment path. Linking, including unattended
+     * bootstrap, never enables console access; enable it explicitly in
+     * Settings > Temps Cloud or with `temps cloud console-access enable`.
+     */
+    console_access_enabled?: boolean;
     /**
      * Explicit consent to send notifications through managed providers.
      */
@@ -3711,6 +3740,11 @@ export type CloudStatus = {
     account_email?: string | null;
     backend_url: string;
     backups_enabled: boolean;
+    /**
+     * ADR-045 §5: whether this instance currently permits Temps Cloud to
+     * open its console over the console-proxy tunnel.
+     */
+    console_access_enabled: boolean;
     health: string;
     health_message: string;
     instance_id?: string | null;
@@ -5708,6 +5742,33 @@ export type CreateMonitorRequest = {
     environment_id: number;
     monitor_type: string;
     name: string;
+};
+
+/**
+ * Start pairing a node.
+ */
+export type CreateNodePairingRequest = {
+    /**
+     * The node's public address, `ip` or `ip:port`. The control plane dials
+     * it on the mesh UDP port (or the port given).
+     */
+    address: string;
+    /**
+     * Name the node registers under. Defaults to `worker-<random>`.
+     */
+    name?: string | null;
+};
+
+/**
+ * A new pairing and the one command to run on the node. The command holds
+ * a secret and is returned only here.
+ */
+export type CreateNodePairingResponse = {
+    /**
+     * Run this on the node, as root: `temps join --pair <code>`.
+     */
+    join_command: string;
+    pairing: NodePairingResponse;
 };
 
 export type CreateNotificationEmailProviderRequest = {
@@ -8739,6 +8800,26 @@ export type EnablePgStatStatementsResponse = {
      * Human-readable message confirming the action.
      */
     message: string;
+};
+
+/**
+ * Body of `POST /nodes/wireguard`. Both fields keep their current value
+ * when omitted; neither can change once a node is on the mesh.
+ */
+export type EnableWireguardMeshRequest = {
+    /**
+     * Mesh address pool (private IPv4, clear of the compute pool).
+     */
+    cidr?: string | null;
+    /**
+     * UDP port the mesh listens on.
+     */
+    listen_port?: number | null;
+    /**
+     * TCP port nodes reach the control plane's API on over the mesh.
+     * Defaults to the mesh port number.
+     */
+    node_api_port?: number | null;
 };
 
 /**
@@ -14845,6 +14926,48 @@ export type NodeListResponse = {
     total: number;
 };
 
+export type NodePairingListResponse = {
+    pairings: Array<NodePairingResponse>;
+};
+
+/**
+ * A pairing as the Worker Nodes page shows it.
+ */
+export type NodePairingResponse = {
+    created_at: string;
+    expires_at: string;
+    id: number;
+    last_attempt_at?: string | null;
+    /**
+     * Why the last attempt to reach the node failed.
+     */
+    last_error?: string | null;
+    /**
+     * Why the control plane last refused the node's key (e.g. it belongs to
+     * another node). Kept until a key is accepted, so it outlives the
+     * "no answer" attempts after the refused node stopped.
+     */
+    last_rejection?: string | null;
+    /**
+     * Mesh address reserved for the node.
+     */
+    mesh_address: string;
+    name: string;
+    /**
+     * `ip:port` the control plane dials.
+     */
+    node_endpoint: string;
+    /**
+     * The node that registered with this pairing.
+     */
+    node_id?: number | null;
+    /**
+     * `waiting` (dialing the node), `key_received` (the node answered; it is
+     * registering over the mesh), `completed`, `expired` or `cancelled`.
+     */
+    status: string;
+};
+
 /**
  * A live sandbox on a node, with its owner. For sandboxes the caller does
  * not own, owner-only details (preview password hint, source repository
@@ -14875,6 +14998,186 @@ export type NodeSandboxesResponse = {
      * Every live sandbox on the node, across all pages.
      */
     total: number;
+};
+
+/**
+ * How to log in to the server. Used for this enrollment only, never stored.
+ * Its `Debug` never prints the credentials.
+ */
+export type NodeSshCredentials = {
+    method: 'password';
+    password: string;
+} | {
+    method: 'private_key';
+    passphrase?: string | null;
+    private_key: string;
+} | {
+    method: 'agent';
+};
+
+/**
+ * Add a server over SSH.
+ */
+export type NodeSshEnrollmentCreateRequest = {
+    credentials: NodeSshCredentials;
+    /**
+     * Hostname or IP address.
+     */
+    host: string;
+    /**
+     * The host-key fingerprint the operator confirmed (from
+     * `POST /nodes/ssh/host-key`). The enrollment stops if the server
+     * presents another key.
+     */
+    host_key_fingerprint: string;
+    /**
+     * Name the node registers under. Defaults to `worker-<random>`.
+     */
+    name?: string | null;
+    /**
+     * The server's public address for WireGuard, `ip` or `ip:port`, when it
+     * is not the address SSH connects to.
+     */
+    node_address?: string | null;
+    /**
+     * SSH port (default 22).
+     */
+    port?: number | null;
+    /**
+     * User to log in as: root, or a user with sudo.
+     */
+    user: string;
+};
+
+/**
+ * A page of servers added over SSH, newest first.
+ */
+export type NodeSshEnrollmentListResponse = {
+    enrollments: Array<NodeSshEnrollmentSummary>;
+    page: number;
+    per_page: number;
+    /**
+     * Enrollments on every page.
+     */
+    total: number;
+};
+
+/**
+ * An "add server over SSH" as the Worker Nodes page shows it.
+ */
+export type NodeSshEnrollmentResponse = {
+    /**
+     * `service` (systemd unit) or `detached` (started without a service
+     * manager: it does not come back after a reboot).
+     */
+    agent_mode?: string | null;
+    /**
+     * `password`, `private_key` or `agent`.
+     */
+    auth_method: string;
+    created_at: string;
+    /**
+     * Why it failed, and what to do.
+     */
+    error?: string | null;
+    finished_at?: string | null;
+    host: string;
+    host_key_fingerprint: string;
+    id: number;
+    /**
+     * What it did, with the server's output (its last 64 KiB).
+     */
+    log: string;
+    name: string;
+    node_id?: number | null;
+    /**
+     * The pairing it runs on the server.
+     */
+    pairing_id?: number | null;
+    ssh_address: string;
+    ssh_user: string;
+    /**
+     * `running`, `succeeded` or `failed`.
+     */
+    status: string;
+    /**
+     * What it is doing, or was doing when it stopped.
+     */
+    step: string;
+};
+
+/**
+ * An "add server over SSH" in a list: everything but its log, which
+ * `GET /nodes/ssh/enrollments/{enrollment_id}` returns.
+ */
+export type NodeSshEnrollmentSummary = {
+    /**
+     * `service` or `detached`.
+     */
+    agent_mode?: string | null;
+    /**
+     * `password`, `private_key` or `agent`.
+     */
+    auth_method: string;
+    created_at: string;
+    /**
+     * Why it failed, and what to do.
+     */
+    error?: string | null;
+    finished_at?: string | null;
+    host: string;
+    host_key_fingerprint: string;
+    id: number;
+    name: string;
+    node_id?: number | null;
+    /**
+     * The pairing it runs on the server.
+     */
+    pairing_id?: number | null;
+    ssh_address: string;
+    ssh_user: string;
+    /**
+     * `running`, `succeeded` or `failed`.
+     */
+    status: string;
+    /**
+     * What it is doing, or was doing when it stopped.
+     */
+    step: string;
+};
+
+/**
+ * A server to read the SSH host key of.
+ */
+export type NodeSshHostKeyRequest = {
+    /**
+     * Hostname or IP address.
+     */
+    host: string;
+    /**
+     * SSH port (default 22).
+     */
+    port?: number | null;
+};
+
+/**
+ * The server's SSH host key. Compare the fingerprint with the server's
+ * (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on it) before
+ * enrolling it.
+ */
+export type NodeSshHostKeyResponse = {
+    /**
+     * `ip:port` the control plane connected to.
+     */
+    address: string;
+    /**
+     * e.g. `ssh-ed25519`.
+     */
+    algorithm: string;
+    /**
+     * `SHA256:…`, as `ssh-keygen -l` prints it.
+     */
+    fingerprint: string;
 };
 
 export type NotificationPreferencesResponse = {
@@ -16096,6 +16399,7 @@ export type PeerListResponse = {
      * All other nodes with a `compute_cidr` set, excluding the caller.
      */
     peers: Array<PeerEntry>;
+    wireguard?: WireguardMeshEntry | null;
 };
 
 /**
@@ -17228,7 +17532,9 @@ export type ProjectInfo = {
 export type ProjectMonitorHealth = {
     project_id: number;
     /**
-     * Overall status: "operational", "degraded", "down", or "no_monitors"
+     * Overall status: "operational", "degraded", "down", "not_deployed"
+     * (monitors exist but the environment has no deployment to check yet),
+     * or "no_monitors"
      */
     status: string;
 };
@@ -17454,6 +17760,10 @@ export type ProjectServiceInfo = {
 };
 
 export type ProjectStatisticsResponse = {
+    /**
+     * Whether an accessible project's deployment has reached the ready state.
+     */
+    has_completed_deployment: boolean;
     total_count: number;
 };
 
@@ -18775,6 +19085,32 @@ export type RegisterRequest = {
 };
 
 /**
+ * Body of `PUT /internal/nodes/{node_id}/network/wireguard`.
+ */
+export type RegisterWireguardMeshRequest = {
+    /**
+     * `ip:port` other nodes dial to reach this node's WireGuard socket.
+     */
+    endpoint: string;
+    /**
+     * Base64 WireGuard public key. The private key never leaves the node.
+     */
+    public_key: string;
+};
+
+/**
+ * Response of `PUT /internal/nodes/{node_id}/network/wireguard`.
+ */
+export type RegisterWireguardMeshResponse = {
+    /**
+     * Mesh address assigned to this node; also its overlay underlay.
+     */
+    address: string;
+    listen_port: number;
+    prefix_len: number;
+};
+
+/**
  * The outer envelope signs the decoded bytes in `payload`. Encoding the
  * payload instead of reserializing a JSON object avoids ambiguous map order,
  * whitespace, and number representations.
@@ -18897,6 +19233,15 @@ export type RepointContinuousArchiveSourceRequest = {
      * The S3 source continuous archiving should point at from now on.
      */
     new_s3_source_id: number;
+};
+
+/**
+ * Body of `PUT /internal/nodes/{node_id}/network/wireguard/handshakes`: when
+ * this node last completed a WireGuard handshake with each peer. Peers it
+ * never handshook with are left out.
+ */
+export type ReportWireguardHandshakesRequest = {
+    peers: Array<WireguardHandshakeReport>;
 };
 
 export type RepositoryComposeServicesResponse = {
@@ -21529,6 +21874,13 @@ export type SetResponse = {
 };
 
 /**
+ * Body of `PUT /nodes/wireguard/hub`.
+ */
+export type SetWireguardMeshHubRequest = {
+    hub: WireguardMeshHubTarget;
+};
+
+/**
  * Response for successful settings update
  */
 export type SettingsUpdateResponse = {
@@ -22929,6 +23281,23 @@ export type TeamResponse = {
 export type TeamRole = 'owner' | 'admin' | 'deployer' | 'viewer';
 
 /**
+ * Area an event belongs to, for operator-facing disclosure (see
+ * [`TelemetryEventKind::category`]). Serialized as snake_case.
+ */
+export type TelemetryEventCategory = 'instance' | 'deployments' | 'projects' | 'git' | 'domains' | 'services' | 'feature_activation' | 'ai' | 'configuration' | 'health';
+
+/**
+ * One event this binary can send.
+ */
+export type TelemetryEventInfo = {
+    category: TelemetryEventCategory;
+    /**
+     * Wire name, e.g. `deploy_succeeded`.
+     */
+    name: string;
+};
+
+/**
  * A gap window as the client renders it.
  */
 export type TelemetryGapWindowResponse = {
@@ -22944,6 +23313,67 @@ export type TelemetryGapWindowResponse = {
     reason: TelemetryWriteIntervalReason;
     started_at: string;
 };
+
+/**
+ * Current anonymous telemetry state and disclosure.
+ */
+export type TelemetryStatusResponse = {
+    /**
+     * The admin's stored choice; `null` when nobody has chosen yet.
+     */
+    admin_preference?: boolean | null;
+    /**
+     * Random identifier events are reported under. Not derived from the
+     * host, domain or any account. `null` if the reporter could not start.
+     */
+    anonymous_id?: string | null;
+    /**
+     * Whether the caller may change the setting (instance admins only).
+     */
+    can_manage: boolean;
+    /**
+     * The built-in default that applies when nobody has chosen.
+     */
+    default_enabled: boolean;
+    /**
+     * Whether this server is sending anonymous telemetry right now.
+     */
+    enabled: boolean;
+    /**
+     * Host events are sent to.
+     */
+    endpoint_host?: string | null;
+    /**
+     * `TEMPS_TELEMETRY` forces telemetry off on this server. The console
+     * cannot override it; remove the variable and restart to change.
+     */
+    env_opted_out: boolean;
+    /**
+     * Name of the environment variable that forces telemetry off.
+     */
+    env_var: string;
+    /**
+     * Every event this binary can send.
+     */
+    events: Array<TelemetryEventInfo>;
+    /**
+     * Documentation of what is collected and what is never collected.
+     */
+    privacy_doc_url: string;
+    /**
+     * What decided `enabled`.
+     */
+    source: TelemetryStatusSource;
+    /**
+     * Version string stamped on every event.
+     */
+    temps_version?: string | null;
+};
+
+/**
+ * What decided the current telemetry state.
+ */
+export type TelemetryStatusSource = 'environment' | 'admin_setting' | 'default' | 'unavailable';
 
 /**
  * Why an interval opened.
@@ -25193,6 +25623,13 @@ export type UpdateTeamRequest = {
     name?: string | null;
 };
 
+/**
+ * Turn anonymous telemetry on or off.
+ */
+export type UpdateTelemetrySettingsRequest = {
+    enabled: boolean;
+};
+
 export type UpdateTokenRequest = {
     access_token: string;
     refresh_token?: string | null;
@@ -26155,6 +26592,256 @@ export type WebhookTriggerRequest = unknown;
 export type WebhookTriggerResponse = {
     run_id: number;
     status: string;
+};
+
+export type WireguardHandshakeReport = {
+    public_key: string;
+    /**
+     * Seconds since the last completed handshake, on the node's clock.
+     */
+    seconds_since_handshake: number;
+};
+
+/**
+ * One thing the control plane can tell about a node's mesh link (ADR 048
+ * D9), with the action that fixes it when it fails.
+ */
+export type WireguardMeshCheck = {
+    /**
+     * Rendered verbatim.
+     */
+    detail: string;
+    /**
+     * What fixes it; rendered verbatim.
+     */
+    fix?: string | null;
+    label: string;
+    status: WireguardMeshCheckStatus;
+};
+
+/**
+ * Outcome of one mesh check.
+ */
+export type WireguardMeshCheckStatus = 'pass' | 'warn' | 'fail' | 'info';
+
+/**
+ * The control plane's end of the mesh.
+ */
+export type WireguardMeshControlPlaneEntry = {
+    /**
+     * Its mesh address.
+     */
+    address: string;
+    /**
+     * `ip:port` nodes dial. `None` when the control plane has no address
+     * nodes can reach (e.g. it runs on a laptop): it dials the nodes that
+     * publish an endpoint instead.
+     */
+    endpoint?: string | null;
+    /**
+     * Whether `endpoint` is a private address, which nodes joining over the
+     * internet cannot reach.
+     */
+    endpoint_is_private: boolean;
+};
+
+/**
+ * Managed WireGuard mesh state for the calling node. Absent when the mesh
+ * is off; the node then keeps its registered address as underlay.
+ */
+export type WireguardMeshEntry = {
+    cidr: string;
+    /**
+     * This node is the mesh hub (ADR 048 D4): it forwards traffic between
+     * members that cannot reach each other.
+     */
+    hub?: boolean;
+    listen_port: number;
+    peers: Array<WireguardMeshPeerEntry>;
+    self?: WireguardMeshSelfEntry | null;
+};
+
+/**
+ * The current hub.
+ */
+export type WireguardMeshHub = {
+    /**
+     * `control-plane` or the node's name.
+     */
+    name: string;
+    target: WireguardMeshHubTarget;
+};
+
+/**
+ * The member relaying for pairs that cannot reach each other (ADR 048 D4).
+ */
+export type WireguardMeshHubTarget = {
+    kind: 'none';
+} | {
+    kind: 'control_plane';
+} | {
+    kind: 'node';
+    node_id: number;
+};
+
+/**
+ * One pair of mesh members.
+ */
+export type WireguardMeshLink = {
+    /**
+     * `control-plane` or a node name.
+     */
+    a: string;
+    /**
+     * `None` for the control plane.
+     */
+    a_node_id?: number | null;
+    b: string;
+    b_node_id?: number | null;
+    /**
+     * What connects them when `state` is not `direct`, or what to do.
+     * Rendered verbatim.
+     */
+    detail?: string | null;
+    /**
+     * Most recent direct handshake either side reported (RFC 3339).
+     */
+    last_handshake_at?: string | null;
+    state: WireguardMeshLinkState;
+};
+
+/**
+ * How one pair of mesh members is connected.
+ */
+export type WireguardMeshLinkState = 'direct' | 'via_hub' | 'connecting' | 'unreachable';
+
+/**
+ * One node's standing on the mesh, as the control plane sees it.
+ */
+export type WireguardMeshNodeConnection = 'mesh_off' | 'not_registered' | 'waiting_for_control_plane' | 'connected' | 'stale' | 'never_connected' | 'unknown';
+
+export type WireguardMeshNodeStatus = {
+    /**
+     * What the control plane can check about this node's link (empty while
+     * the mesh is off). The node's own view: `temps doctor mesh` on it.
+     */
+    checks: Array<WireguardMeshCheck>;
+    connection: WireguardMeshNodeConnection;
+    /**
+     * Where the control plane reaches this node's agent and published
+     * ports: the mesh address for a node joined over the internet.
+     */
+    data_address: string;
+    /**
+     * `ip:port` other nodes dial for this node's WireGuard socket.
+     */
+    endpoint?: string | null;
+    /**
+     * RFC 3339.
+     */
+    last_handshake_at?: string | null;
+    mesh_address?: string | null;
+    name: string;
+    node_id: number;
+    node_status: string;
+    /**
+     * The address the node joined with (`temps join --private-address`).
+     */
+    registered_address: string;
+    /**
+     * Whether that address is private: the node shares a private network
+     * with the control plane rather than only the internet.
+     */
+    registered_on_private_network: boolean;
+    rx_bytes?: number | null;
+    tx_bytes?: number | null;
+};
+
+/**
+ * A WireGuard mesh peer on the wire.
+ */
+export type WireguardMeshPeerEntry = {
+    /**
+     * Peer's mesh address (its overlay underlay).
+     */
+    address: string;
+    /**
+     * `ip:port` to dial, or `null` when the peer has none (it dials us).
+     */
+    endpoint?: string | null;
+    /**
+     * Node name, or `control-plane`. For status output only.
+     */
+    name: string;
+    public_key: string;
+    /**
+     * On the hub's entry only (ADR 048 D4): the mesh addresses of the
+     * members this node reaches through the hub.
+     */
+    relayed?: Array<string>;
+};
+
+/**
+ * This node's registered mesh identity, as the control plane stored it.
+ */
+export type WireguardMeshSelfEntry = {
+    address: string;
+    endpoint: string;
+    public_key: string;
+};
+
+/**
+ * Whether the cluster's mesh is carrying traffic.
+ */
+export type WireguardMeshState = 'disabled' | 'starting' | 'ready';
+
+/**
+ * Response of `GET /nodes/wireguard`.
+ */
+export type WireguardMeshStatusResponse = {
+    /**
+     * Whether `POST /nodes/wireguard` can turn the mesh on here.
+     */
+    can_enable: boolean;
+    /**
+     * Mesh address pool, when enabled.
+     */
+    cidr?: string | null;
+    control_plane?: WireguardMeshControlPlaneEntry | null;
+    /**
+     * What prevents enabling it, when `can_enable` is false and the mesh is
+     * off. Rendered verbatim.
+     */
+    enable_blocker?: string | null;
+    /**
+     * CLI equivalent of enabling, for the control-plane host.
+     */
+    enable_command: string;
+    /**
+     * Why handshake data is missing, when it is.
+     */
+    handshake_error?: string | null;
+    hub?: WireguardMeshHub | null;
+    /**
+     * The configured external URL: what `temps join` should point at.
+     * `null` when none is configured.
+     */
+    join_url?: string | null;
+    /**
+     * Every pair of members that are both on the mesh.
+     */
+    links: Array<WireguardMeshLink>;
+    /**
+     * UDP port every node must accept from the others — the configured
+     * one even while the mesh is off, so it can be opened in advance.
+     */
+    listen_port: number;
+    nodes: Array<WireguardMeshNodeStatus>;
+    /**
+     * Why the mesh is not ready, when it is not. Rendered verbatim.
+     */
+    reason?: string | null;
+    state: WireguardMeshState;
 };
 
 export type WorkflowDryRunRequest = {
@@ -42409,6 +43096,86 @@ export type ListPeersResponses = {
 
 export type ListPeersResponse = ListPeersResponses[keyof ListPeersResponses];
 
+export type WireguardMeshRegisterData = {
+    body: RegisterWireguardMeshRequest;
+    path: {
+        /**
+         * Node id, must match the bearer token's node
+         */
+        node_id: number;
+    };
+    query?: never;
+    url: '/internal/nodes/{node_id}/network/wireguard';
+};
+
+export type WireguardMeshRegisterErrors = {
+    /**
+     * Invalid public key or endpoint
+     */
+    400: unknown;
+    /**
+     * Missing or invalid bearer token
+     */
+    401: unknown;
+    /**
+     * Node not found
+     */
+    404: unknown;
+    /**
+     * Mesh disabled, key already in use, or pool exhausted
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type WireguardMeshRegisterResponses = {
+    /**
+     * Mesh address and port for this node
+     */
+    200: RegisterWireguardMeshResponse;
+};
+
+export type WireguardMeshRegisterResponse = WireguardMeshRegisterResponses[keyof WireguardMeshRegisterResponses];
+
+export type WireguardMeshHandshakesReportData = {
+    body: ReportWireguardHandshakesRequest;
+    path: {
+        /**
+         * Node id, must match the bearer token's node
+         */
+        node_id: number;
+    };
+    query?: never;
+    url: '/internal/nodes/{node_id}/network/wireguard/handshakes';
+};
+
+export type WireguardMeshHandshakesReportErrors = {
+    /**
+     * Too many peers
+     */
+    400: unknown;
+    /**
+     * Missing or invalid bearer token
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type WireguardMeshHandshakesReportResponses = {
+    /**
+     * Report recorded
+     */
+    204: void;
+};
+
+export type WireguardMeshHandshakesReportResponse = WireguardMeshHandshakesReportResponses[keyof WireguardMeshHandshakesReportResponses];
+
 export type AdminSetNodePublicIngressData = {
     body: SetNodePublicIngressRequest;
     path: {
@@ -44052,6 +44819,403 @@ export type NodeCapabilityGetResponses = {
 };
 
 export type NodeCapabilityGetResponse = NodeCapabilityGetResponses[keyof NodeCapabilityGetResponses];
+
+export type NodePairingListData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/nodes/pairings';
+};
+
+export type NodePairingListErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type NodePairingListResponses = {
+    /**
+     * Node pairings
+     */
+    200: NodePairingListResponse;
+};
+
+export type NodePairingListResponse2 = NodePairingListResponses[keyof NodePairingListResponses];
+
+export type NodePairingCreateData = {
+    body: CreateNodePairingRequest;
+    path?: never;
+    query?: never;
+    url: '/nodes/pairings';
+};
+
+export type NodePairingCreateErrors = {
+    /**
+     * Invalid address or name
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * The mesh is off or its control-plane end is not up
+     */
+    409: unknown;
+    /**
+     * Re-authentication required
+     */
+    428: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type NodePairingCreateResponses = {
+    /**
+     * Pairing created
+     */
+    201: CreateNodePairingResponse;
+};
+
+export type NodePairingCreateResponse = NodePairingCreateResponses[keyof NodePairingCreateResponses];
+
+export type NodePairingCancelData = {
+    body?: never;
+    path: {
+        /**
+         * Pairing ID
+         */
+        pairing_id: number;
+    };
+    query?: never;
+    url: '/nodes/pairings/{pairing_id}';
+};
+
+export type NodePairingCancelErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No such pairing
+     */
+    404: unknown;
+    /**
+     * The pairing already finished
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type NodePairingCancelResponses = {
+    /**
+     * Pairing cancelled
+     */
+    204: void;
+};
+
+export type NodePairingCancelResponse = NodePairingCancelResponses[keyof NodePairingCancelResponses];
+
+export type NodeSshEnrollmentListData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Page, from 1 (default 1).
+         */
+        page?: number;
+        /**
+         * Enrollments per page (default 20, at most 100).
+         */
+        per_page?: number;
+    };
+    url: '/nodes/ssh/enrollments';
+};
+
+export type NodeSshEnrollmentListErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type NodeSshEnrollmentListResponses = {
+    /**
+     * SSH enrollments
+     */
+    200: NodeSshEnrollmentListResponse;
+};
+
+export type NodeSshEnrollmentListResponse2 = NodeSshEnrollmentListResponses[keyof NodeSshEnrollmentListResponses];
+
+export type NodeSshEnrollmentCreateData = {
+    body: NodeSshEnrollmentCreateRequest;
+    path?: never;
+    query?: never;
+    url: '/nodes/ssh/enrollments';
+};
+
+export type NodeSshEnrollmentCreateErrors = {
+    /**
+     * Invalid host, user, fingerprint or name
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * The mesh is off or not ready, or too many enrollments are running
+     */
+    409: unknown;
+    /**
+     * Re-authentication required
+     */
+    428: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type NodeSshEnrollmentCreateResponses = {
+    /**
+     * Enrollment started
+     */
+    202: NodeSshEnrollmentResponse;
+};
+
+export type NodeSshEnrollmentCreateResponse = NodeSshEnrollmentCreateResponses[keyof NodeSshEnrollmentCreateResponses];
+
+export type NodeSshEnrollmentGetData = {
+    body?: never;
+    path: {
+        /**
+         * Enrollment ID
+         */
+        enrollment_id: number;
+    };
+    query?: never;
+    url: '/nodes/ssh/enrollments/{enrollment_id}';
+};
+
+export type NodeSshEnrollmentGetErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No such enrollment
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type NodeSshEnrollmentGetResponses = {
+    /**
+     * The enrollment
+     */
+    200: NodeSshEnrollmentResponse;
+};
+
+export type NodeSshEnrollmentGetResponse = NodeSshEnrollmentGetResponses[keyof NodeSshEnrollmentGetResponses];
+
+export type NodeSshHostKeyData = {
+    body: NodeSshHostKeyRequest;
+    path?: never;
+    query?: never;
+    url: '/nodes/ssh/host-key';
+};
+
+export type NodeSshHostKeyErrors = {
+    /**
+     * Invalid or unusable host
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Re-authentication required
+     */
+    428: unknown;
+    /**
+     * The server could not be reached over SSH
+     */
+    502: unknown;
+};
+
+export type NodeSshHostKeyResponses = {
+    /**
+     * The server's host key
+     */
+    200: NodeSshHostKeyResponse;
+};
+
+export type NodeSshHostKeyResponse2 = NodeSshHostKeyResponses[keyof NodeSshHostKeyResponses];
+
+export type WireguardMeshStatusGetData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/nodes/wireguard';
+};
+
+export type WireguardMeshStatusGetErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type WireguardMeshStatusGetResponses = {
+    /**
+     * WireGuard mesh state
+     */
+    200: WireguardMeshStatusResponse;
+};
+
+export type WireguardMeshStatusGetResponse = WireguardMeshStatusGetResponses[keyof WireguardMeshStatusGetResponses];
+
+export type WireguardMeshEnableData = {
+    body: EnableWireguardMeshRequest;
+    path?: never;
+    query?: never;
+    url: '/nodes/wireguard';
+};
+
+export type WireguardMeshEnableErrors = {
+    /**
+     * Invalid pool or port
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * This server cannot bring up the mesh, or the pool/port is in use
+     */
+    409: unknown;
+    /**
+     * Re-authentication required
+     */
+    428: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type WireguardMeshEnableResponses = {
+    /**
+     * Mesh enabled; current state
+     */
+    200: WireguardMeshStatusResponse;
+};
+
+export type WireguardMeshEnableResponse = WireguardMeshEnableResponses[keyof WireguardMeshEnableResponses];
+
+export type WireguardMeshHubSetData = {
+    body: SetWireguardMeshHubRequest;
+    path?: never;
+    query?: never;
+    url: '/nodes/wireguard/hub';
+};
+
+export type WireguardMeshHubSetErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No such node
+     */
+    404: unknown;
+    /**
+     * The mesh is off, or the member is not on it
+     */
+    409: unknown;
+    /**
+     * Re-authentication required
+     */
+    428: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type WireguardMeshHubSetResponses = {
+    /**
+     * Hub set; current state
+     */
+    200: WireguardMeshStatusResponse;
+};
+
+export type WireguardMeshHubSetResponse = WireguardMeshHubSetResponses[keyof WireguardMeshHubSetResponses];
 
 export type NodeMetricsGetRangeData = {
     body?: never;
@@ -52446,11 +53610,21 @@ export type GetDeploymentJobLogsData = {
          */
         job_id: string;
     };
-    query?: never;
+    query?: {
+        /**
+         * Return the most recent complete lines (1-100000), reading at most
+         * 8 MiB from local or archived storage. Omit to read the whole log.
+         */
+        tail?: number | null;
+    };
     url: '/projects/{project_id}/deployments/{deployment_id}/jobs/{job_id}/logs';
 };
 
 export type GetDeploymentJobLogsErrors = {
+    /**
+     * Invalid tail parameter
+     */
+    400: unknown;
     /**
      * Job or logs not found
      */
@@ -63003,6 +64177,76 @@ export type DownloadGlobalSkillArchiveResponses = {
 };
 
 export type DownloadGlobalSkillArchiveResponse = DownloadGlobalSkillArchiveResponses[keyof DownloadGlobalSkillArchiveResponses];
+
+export type GetTelemetrySettingsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/settings/telemetry';
+};
+
+export type GetTelemetrySettingsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Stored preference could not be read
+     */
+    500: ProblemDetails;
+};
+
+export type GetTelemetrySettingsError = GetTelemetrySettingsErrors[keyof GetTelemetrySettingsErrors];
+
+export type GetTelemetrySettingsResponses = {
+    /**
+     * Current telemetry state
+     */
+    200: TelemetryStatusResponse;
+};
+
+export type GetTelemetrySettingsResponse = GetTelemetrySettingsResponses[keyof GetTelemetrySettingsResponses];
+
+export type UpdateTelemetrySettingsData = {
+    body: UpdateTelemetrySettingsRequest;
+    path?: never;
+    query?: never;
+    url: '/settings/telemetry';
+};
+
+export type UpdateTelemetrySettingsErrors = {
+    /**
+     * Invalid request body
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Instance admin required
+     */
+    403: ProblemDetails;
+    /**
+     * Setting could not be saved
+     */
+    500: ProblemDetails;
+};
+
+export type UpdateTelemetrySettingsError = UpdateTelemetrySettingsErrors[keyof UpdateTelemetrySettingsErrors];
+
+export type UpdateTelemetrySettingsResponses = {
+    /**
+     * Setting saved; returns the new state
+     */
+    200: TelemetryStatusResponse;
+};
+
+export type UpdateTelemetrySettingsResponse = UpdateTelemetrySettingsResponses[keyof UpdateTelemetrySettingsResponses];
 
 export type GetUpdateCapabilityData = {
     body?: never;

@@ -228,6 +228,26 @@ impl TempsPlugin for DeploymentsPlugin {
                 scheduler_service.start_cron_scheduler().await;
             });
 
+            // One-paste node pairing (ADR 048 D2b): dial the nodes operators
+            // are pairing until they answer with their WireGuard key. Only
+            // UDP out, so it runs whether or not this process has workloads.
+            crate::services::node_pairing::spawn_pairing_initiator(
+                db.clone(),
+                encryption_service.clone(),
+            );
+            // Servers being added over SSH (ADR 048 D2c) lost their sessions
+            // with the previous process.
+            match crate::services::node_ssh_enrollment::fail_interrupted(&db).await {
+                Ok(0) => {}
+                Ok(count) => tracing::warn!(
+                    count,
+                    "marked SSH enrollments interrupted by the restart as failed"
+                ),
+                Err(error) => {
+                    tracing::warn!(%error, "could not mark interrupted SSH enrollments as failed")
+                }
+            }
+
             // Resolve the CAS asset store backend once and share it across every
             // write-side consumer in this plugin (the cleanup service below, and
             // the workflow execution service further down). `TEMPS_STATIC_STORAGE_BACKEND`
@@ -812,6 +832,37 @@ impl TempsPlugin for DeploymentsPlugin {
             .expect("Failed to build FailureReportService HTTP client"),
         );
 
+        // WireGuard mesh and node pairing admin (ADR 048). Their handlers are
+        // mounted with the admin node routes and read these as request
+        // extensions (layered onto those routes below).
+        // Enrollment tokens are the ones `temps join` redeems; use the
+        // registered service when a plugin provides one.
+        let enrollment_token_service = context
+            .get_service::<temps_config::EnrollmentTokenService>()
+            .unwrap_or_else(|| Arc::new(temps_config::EnrollmentTokenService::new(db.clone())));
+        let wireguard_mesh_state = handlers::wireguard_mesh::WireguardMeshAdminState {
+            mesh_service: Arc::new(crate::services::wireguard_mesh::WireguardMeshService::new(
+                db.clone(),
+                node_service.clone(),
+                config_service.clone(),
+            )),
+            audit_service: audit_service.clone(),
+            sensitive_action_authorizer: sensitive_action_authorizer.clone(),
+        };
+        let node_pairing_admin = Arc::new(
+            crate::services::node_pairing_admin::NodePairingAdminService::new(
+                db.clone(),
+                config_service.clone(),
+                encryption_service.clone(),
+                enrollment_token_service.clone(),
+            ),
+        );
+        let node_pairing_state = handlers::node_pairings::NodePairingAdminState {
+            pairing_service: node_pairing_admin.clone(),
+            audit_service: audit_service.clone(),
+            sensitive_action_authorizer: sensitive_action_authorizer.clone(),
+        };
+
         let app_state = Arc::new(handlers::types::AppState {
             deployment_service,
             log_service,
@@ -837,6 +888,8 @@ impl TempsPlugin for DeploymentsPlugin {
             hostname_resolver,
             metrics_store,
             failure_report_service,
+            enrollment_token_service,
+            node_pairing_admin,
             sensitive_action_authorizer,
         });
 
@@ -881,7 +934,9 @@ impl TempsPlugin for DeploymentsPlugin {
         let cron_routes = handlers::crons::configure_routes();
         let external_images_routes = handlers::external_images::configure_routes();
         let remote_deployments_routes = handlers::remote_deployments::configure_routes();
-        let admin_node_routes = handlers::nodes::configure_admin_routes();
+        let admin_node_routes = handlers::nodes::configure_admin_routes()
+            .layer(axum::Extension(wireguard_mesh_state))
+            .layer(axum::Extension(node_pairing_state));
 
         // Token routes use their own state; apply it before merging so the
         // combined router resolves to a single `Router<()>`.

@@ -5197,6 +5197,7 @@ mod tests {
             telemetry: false,
             backups: true,
             notifications: false,
+            console_access: false,
         })
         .expect("enable backup mirroring");
         let mut resources =
@@ -5324,6 +5325,7 @@ mod tests {
             telemetry: false,
             backups: true,
             notifications: false,
+            console_access: false,
         })
         .expect("enable backup mirroring");
         let mut resources =
@@ -5514,6 +5516,7 @@ mod tests {
             telemetry: false,
             backups: true,
             notifications: false,
+            console_access: false,
         })
         .expect("enable backup mirroring");
         let mut resources =
@@ -5799,6 +5802,7 @@ mod tests {
             telemetry: false,
             backups: true,
             notifications: false,
+            console_access: false,
         })
         .expect("enable backup mirroring");
         let mut resources =
@@ -6462,6 +6466,7 @@ mod tests {
             telemetry: false,
             backups: true,
             notifications: false,
+            console_access: false,
         })
         .expect("enable backup mirroring");
         link.enroll("TEST-CODE").await.expect("enroll Cloud link");
@@ -6612,6 +6617,7 @@ mod tests {
             telemetry: false,
             backups: true,
             notifications: false,
+            console_access: false,
         })
         .expect("enable backup mirroring");
         link.enroll("TEST-CODE").await.expect("enroll Cloud link");

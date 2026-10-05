@@ -99,8 +99,15 @@ impl SyncClient {
         shutdown: Arc<Notify>,
         status: Arc<RwLock<SyncStatus>>,
     ) -> Result<Self, ResolverError> {
-        let http = reqwest::Client::builder()
-            .timeout(config.http_timeout)
+        let mut builder = reqwest::Client::builder().timeout(config.http_timeout);
+        if let Some(pem) = &config.control_plane_ca_pem {
+            let certificate = reqwest::Certificate::from_pem(pem)
+                .map_err(|e| ResolverError::Internal(format!("control-plane CA: {e}")))?;
+            builder = builder
+                .tls_built_in_root_certs(false)
+                .add_root_certificate(certificate);
+        }
+        let http = builder
             .build()
             .map_err(|e| ResolverError::Internal(format!("build reqwest client: {e}")))?;
         Ok(Self {
@@ -298,6 +305,7 @@ mod tests {
             http_timeout: Duration::from_secs(2),
             upstream_resolvers: vec![],
             disable_sync: false,
+            control_plane_ca_pem: None,
         }
     }
 

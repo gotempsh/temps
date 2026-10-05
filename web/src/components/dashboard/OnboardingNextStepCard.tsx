@@ -14,6 +14,7 @@ import {
   DatabaseBackup,
   GitBranch,
   Globe,
+  Rocket,
   ShieldCheck,
   Sparkles,
   Users,
@@ -28,6 +29,7 @@ import {
 } from './onboarding-next-step'
 
 const STEP_ICONS: Record<string, LucideIcon> = {
+  deploy: Rocket,
   ai: Bot,
   git: GitBranch,
   domain: Globe,

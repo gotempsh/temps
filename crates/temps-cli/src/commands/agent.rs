@@ -69,6 +69,13 @@ pub struct AgentCommand {
     #[arg(long, env = "TEMPS_AGENT_UNDERLAY_MTU")]
     pub underlay_mtu: Option<u32>,
 
+    /// `ip:port` other nodes dial to reach this node's WireGuard mesh socket.
+    /// Only used when the cluster runs the managed WireGuard mesh. Defaults
+    /// to the registered private address on the mesh port; set it when other
+    /// nodes reach this one through a different IP or a forwarded port.
+    #[arg(long, env = "TEMPS_WG_ENDPOINT")]
+    pub wg_endpoint: Option<String>,
+
     /// This node's private/underlay address, as registered with the control
     /// plane during `temps join` (`nodes.private_address`) — the WireGuard
     /// tunnel IP in relay mode, or the user-managed address in direct mode.
@@ -93,10 +100,23 @@ pub struct AgentCommand {
 
     #[arg(long, default_value_t = 443)]
     pub public_ingress_https_port: u16,
+
+    #[command(subcommand)]
+    pub service: Option<AgentSubcommand>,
+}
+
+#[derive(clap::Subcommand)]
+pub enum AgentSubcommand {
+    /// Run the agent as a systemd service (install, uninstall, status)
+    #[command(subcommand)]
+    Service(super::agent_service::AgentServiceCommand),
 }
 
 impl AgentCommand {
     pub fn execute(self) -> anyhow::Result<()> {
+        if let Some(AgentSubcommand::Service(command)) = &self.service {
+            return command.execute();
+        }
         let available_parallelism = std::thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(1);
@@ -184,8 +204,10 @@ impl AgentCommand {
                         address = %host_bind_address,
                         "this node's private_address is not an RFC 1918 private IP; \
                          deployed container ports will be reachable on this address from \
-                         any network that can route to it. If this node has no WireGuard \
-                         underlay, restrict access with a host firewall."
+                         any network that can route to it until the node is on the cluster's \
+                         WireGuard mesh (they then move to its mesh address). Enable the mesh \
+                         on the control plane with `temps network setup-multi-node --wireguard`, \
+                         or restrict access with a host firewall."
                     );
                 }
             }
@@ -196,12 +218,22 @@ impl AgentCommand {
             let docker_socket_grant = temps_deployer::docker_socket_grant::process_grant().clone();
             docker_socket_grant.log_startup("temps agent");
 
+            // One bind slot for the whole agent: app deploys (this runtime),
+            // agent-API services and the network-sync loop share it, so when
+            // a node that joined with a public address moves onto its
+            // WireGuard mesh address, containers created afterwards publish
+            // there instead of on the address captured here at startup.
+            let host_bind_slot: temps_agent::network_sync::SharedBindAddress =
+                Arc::new(std::sync::RwLock::new(
+                    temps_agent::network_sync::initial_bind_address(Some(&host_bind_address)),
+                ));
+
             let mut runtime_builder = temps_deployer::docker::DockerRuntime::new(
                 Arc::new(docker.clone()),
                 true,
                 network_name,
             )
-            .with_host_bind_address(host_bind_address)
+            .with_host_bind_slot(host_bind_slot.clone())
             .with_docker_socket_grant(docker_socket_grant.clone())
             .with_overlay_dns_slot(overlay_bridge_address.clone());
             if !overlay_network.is_empty() {
@@ -252,12 +284,13 @@ impl AgentCommand {
             // global notifier passed below; if the agent server exits,
             // the client stops on the next round.
             let route_sync_shutdown = Arc::new(tokio::sync::Notify::new());
-            match temps_agent::route_sync_client::RouteSyncClient::new(
+            match temps_agent::route_sync_client::RouteSyncClient::new_with_ca(
                 config.control_plane_url.clone(),
                 config.node_id,
                 config.token.clone(),
                 route_store.clone(),
                 route_sync_shutdown.clone(),
+                temps_agent::control_plane_ca(&config),
             ) {
                 Ok(client) => {
                     tokio::spawn(async move {
@@ -288,6 +321,7 @@ impl AgentCommand {
                     ),
                     private_key_b64,
                     control_plane_url: config.control_plane_url.clone(),
+                    control_plane_ca: temps_agent::control_plane_ca(&config),
                     node_id: config.node_id,
                     node_token: config.token.clone(),
                 };
@@ -371,8 +405,11 @@ impl AgentCommand {
                 builder,
                 Some(docker),
                 config,
-                overlay_peers,
-                overlay_bridge_address,
+                temps_agent::server::SharedNetwork {
+                    overlay_bridge_address,
+                    overlay_peers,
+                    host_bind_address: host_bind_slot,
+                },
                 docker_socket_grant,
             )
             .await
@@ -557,6 +594,18 @@ impl AgentCommand {
             public_ingress_private_key: saved
                 .as_ref()
                 .and_then(|config| config.public_ingress_private_key.clone()),
+            mesh_key_dir: agent_data_dir().join("wireguard"),
+            wg_endpoint: self
+                .wg_endpoint
+                .clone()
+                .or_else(|| saved.as_ref().and_then(|config| config.wg_endpoint.clone())),
+            // Decided by `temps join` and never widened here: read from the
+            // saved agent.json alone (a legacy one is resolved from what its
+            // join wrote, before any CLI override), and a node without a
+            // saved config verifies the control plane against public roots.
+            control_plane_trust: saved
+                .as_ref()
+                .map(|config| config.effective_control_plane_trust()),
         };
         // Make the data paths absolute once, here, before anything uses them.
         // Sandbox work dirs (ADR-048) are Docker bind-mount sources and must

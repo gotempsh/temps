@@ -35,6 +35,41 @@ fn monitor_url(public_url: &str, monitor_type: &str, check_path: Option<&str>) -
     }
 }
 
+/// Roll a project's production monitors up into one status.
+///
+/// Counts come from `get_projects_monitor_health`; `operational_count` and
+/// `major_outage_count` only cover monitors whose environment has a current
+/// deployment, and `undeployed_count` covers the rest.
+///
+/// - `no_monitors`: the project has no active production monitor.
+/// - `not_deployed`: every monitor is on an environment that has never been
+///   (or is no longer) deployed, so there is nothing to check yet. This is a
+///   neutral state, not an outage.
+/// - `down` is reserved for every *checked* monitor being hard-down
+///   (major_outage, or no check within a day); a monitor merely returning a
+///   soft client error (degraded/partial_outage) does not paint the project
+///   red -- see health_check_service.rs for the per-monitor statuses.
+/// - `degraded`: anything in between.
+fn project_monitor_status(
+    monitor_count: i64,
+    undeployed_count: i64,
+    operational_count: i64,
+    major_outage_count: i64,
+) -> &'static str {
+    let checked = monitor_count - undeployed_count;
+    if monitor_count == 0 {
+        "no_monitors"
+    } else if checked <= 0 {
+        "not_deployed"
+    } else if operational_count == checked {
+        "operational"
+    } else if major_outage_count == checked {
+        "down"
+    } else {
+        "degraded"
+    }
+}
+
 fn is_managed_monitor_unique_violation(error: &DbErr) -> bool {
     let rendered = error.to_string();
     rendered.contains("idx_status_monitors_managed_environment")
@@ -552,7 +587,8 @@ impl MonitorService {
 
     /// Get production health for multiple projects in one query.
     /// Checks only monitors linked to the "production" environment.
-    /// Returns a simple status per project: operational, degraded, down, or no_monitors.
+    /// Returns a simple status per project: operational, degraded, down,
+    /// not_deployed, or no_monitors (see [`project_monitor_status`]).
     pub async fn get_projects_monitor_health(
         &self,
         project_ids: &[i32],
@@ -589,6 +625,7 @@ impl MonitorService {
         struct ProjectHealth {
             project_id: i32,
             monitor_count: i64,
+            undeployed_count: i64,
             operational_count: i64,
             major_outage_count: i64,
         }
@@ -606,13 +643,24 @@ impl MonitorService {
         // (minutes), so a 1-day bound prunes to the newest chunks while a
         // monitor whose checker has been dead for over a day correctly counts
         // as not operational.
+        //
+        // A monitor on an environment with no current deployment is never
+        // probed (the checker skips it), so its missing check is "nothing to
+        // check yet", not an outage: it is counted separately and kept out of
+        // the operational/outage tallies.
         let sql = format!(
             r#"
             SELECT
                 sm.project_id,
                 COUNT(sm.id) as monitor_count,
-                COUNT(lc.status) FILTER (WHERE lc.status = 'operational') as operational_count,
-                COUNT(*) FILTER (WHERE lc.status = 'major_outage' OR lc.status IS NULL) as major_outage_count
+                COUNT(sm.id) FILTER (WHERE e.current_deployment_id IS NULL) as undeployed_count,
+                COUNT(lc.status) FILTER (
+                    WHERE e.current_deployment_id IS NOT NULL AND lc.status = 'operational'
+                ) as operational_count,
+                COUNT(*) FILTER (
+                    WHERE e.current_deployment_id IS NOT NULL
+                      AND (lc.status = 'major_outage' OR lc.status IS NULL)
+                ) as major_outage_count
             FROM status_monitors sm
             JOIN environments e ON e.id = sm.environment_id
                 AND e.name = 'production'
@@ -646,25 +694,18 @@ impl MonitorService {
             std::collections::HashMap::new();
 
         for r in results {
-            // "down" is reserved for monitors that are hard-down (major_outage or no
-            // recent check at all) across the board; a monitor merely returning a
-            // soft client error (degraded/partial_outage) should not paint the whole
-            // project red -- see health_check_service.rs for the per-monitor statuses.
-            let status = if r.monitor_count == 0 {
-                "no_monitors".to_string()
-            } else if r.operational_count == r.monitor_count {
-                "operational".to_string()
-            } else if r.major_outage_count == r.monitor_count {
-                "down".to_string()
-            } else {
-                "degraded".to_string()
-            };
+            let status = project_monitor_status(
+                r.monitor_count,
+                r.undeployed_count,
+                r.operational_count,
+                r.major_outage_count,
+            );
 
             health_map.insert(
                 r.project_id,
                 super::types::ProjectMonitorHealth {
                     project_id: r.project_id,
-                    status,
+                    status: status.to_string(),
                 },
             );
         }
@@ -2254,20 +2295,17 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_project_health_degraded_monitor_is_not_reported_as_down() {
-        let test_db = TestDatabase::with_migrations().await.unwrap();
-        let db = test_db.connection_arc();
-        let config_service = create_mock_config_service(&db);
-        let service = MonitorService::new(db.clone(), config_service);
-
-        let project = create_test_project(&db).await;
-
-        // get_projects_monitor_health only looks at "production" environments.
+    /// A "production" environment (the only one project health reads),
+    /// optionally with a current deployment like a project that has shipped.
+    async fn create_production_environment(
+        db: &Arc<DatabaseConnection>,
+        project_id: i32,
+        deployed: bool,
+    ) -> environments::Model {
         let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let subdomain = format!("test-prod-{}", nanos);
         let environment = environments::ActiveModel {
-            project_id: Set(project.id),
+            project_id: Set(project_id),
             name: Set("production".to_string()),
             slug: Set(subdomain.clone()),
             subdomain: Set(subdomain.clone()),
@@ -2278,6 +2316,67 @@ mod tests {
         .insert(db.as_ref())
         .await
         .unwrap();
+        if !deployed {
+            return environment;
+        }
+        let deployment = temps_entities::deployments::ActiveModel {
+            project_id: Set(project_id),
+            environment_id: Set(environment.id),
+            slug: Set(format!("{subdomain}-deployment")),
+            state: Set("completed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let mut active: environments::ActiveModel = environment.into();
+        active.current_deployment_id = Set(Some(deployment.id));
+        active.update(db.as_ref()).await.unwrap()
+    }
+
+    /// A project that has never been deployed has a managed production
+    /// monitor but no check rows (the checker skips undeployed environments).
+    /// That is "nothing to check yet", not an outage.
+    #[tokio::test]
+    async fn test_project_health_never_deployed_is_not_deployed() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+        let config_service = create_mock_config_service(&db);
+        let service = MonitorService::new(db.clone(), config_service);
+
+        let project = create_test_project(&db).await;
+        let environment = create_production_environment(&db, project.id, false).await;
+        let request = CreateMonitorRequest {
+            name: "Production Monitor".to_string(),
+            monitor_type: "web".to_string(),
+            environment_id: environment.id,
+            check_interval_seconds: Some(60),
+            ..Default::default()
+        };
+        service.create_monitor(project.id, request).await.unwrap();
+
+        let health = service
+            .get_projects_monitor_health(&[project.id])
+            .await
+            .unwrap();
+
+        assert_eq!(health.len(), 1);
+        assert_eq!(health[0].status, "not_deployed");
+    }
+
+    #[tokio::test]
+    async fn test_project_health_degraded_monitor_is_not_reported_as_down() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+        let config_service = create_mock_config_service(&db);
+        let service = MonitorService::new(db.clone(), config_service);
+
+        let project = create_test_project(&db).await;
+
+        let environment = create_production_environment(&db, project.id, true).await;
 
         let request = CreateMonitorRequest {
             name: "Production Monitor".to_string(),
@@ -2314,20 +2413,7 @@ mod tests {
 
         let project = create_test_project(&db).await;
 
-        let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        let subdomain = format!("test-prod-{}", nanos);
-        let environment = environments::ActiveModel {
-            project_id: Set(project.id),
-            name: Set("production".to_string()),
-            slug: Set(subdomain.clone()),
-            subdomain: Set(subdomain.clone()),
-            host: Set(format!("{}.local", subdomain)),
-            upstreams: Set(UpstreamList::default()),
-            ..Default::default()
-        }
-        .insert(db.as_ref())
-        .await
-        .unwrap();
+        let environment = create_production_environment(&db, project.id, true).await;
 
         let request = CreateMonitorRequest {
             name: "Production Monitor".to_string(),
@@ -2355,5 +2441,42 @@ mod tests {
 
         assert_eq!(health.len(), 1);
         assert_eq!(health[0].status, "down");
+    }
+
+    // ── project_monitor_status ──────────────────────────────────────────────
+
+    #[test]
+    fn never_deployed_project_is_not_deployed_rather_than_down() {
+        // One managed production monitor, environment never deployed: the
+        // checker skips it, so there is no check row at all.
+        assert_eq!(project_monitor_status(1, 1, 0, 0), "not_deployed");
+    }
+
+    #[test]
+    fn project_without_monitors_is_no_monitors() {
+        assert_eq!(project_monitor_status(0, 0, 0, 0), "no_monitors");
+    }
+
+    #[test]
+    fn deployed_project_with_all_checks_passing_is_operational() {
+        assert_eq!(project_monitor_status(1, 0, 1, 0), "operational");
+    }
+
+    #[test]
+    fn deployed_project_with_all_checks_failing_is_down() {
+        assert_eq!(project_monitor_status(2, 0, 0, 2), "down");
+    }
+
+    /// An undeployed monitor alongside a healthy deployed one must not drag
+    /// the project to "degraded".
+    #[test]
+    fn undeployed_monitors_do_not_count_against_deployed_ones() {
+        assert_eq!(project_monitor_status(2, 1, 1, 0), "operational");
+        assert_eq!(project_monitor_status(2, 1, 0, 1), "down");
+    }
+
+    #[test]
+    fn mixed_results_are_degraded() {
+        assert_eq!(project_monitor_status(3, 0, 1, 1), "degraded");
     }
 }

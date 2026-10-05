@@ -124,9 +124,32 @@ impl RouteSyncClient {
         store: SharedRouteStore,
         shutdown: Arc<Notify>,
     ) -> Result<Self, reqwest::Error> {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(60))
-            .build()?;
+        Self::new_with_ca(
+            control_plane_url,
+            node_id,
+            node_token,
+            store,
+            shutdown,
+            None,
+        )
+    }
+
+    /// [`Self::new`], verifying the control plane against `control_plane_ca`
+    /// (the cluster CA, for a node whose join pinned it) instead of the public
+    /// roots when given. See [`crate::control_plane_ca`].
+    pub fn new_with_ca(
+        control_plane_url: String,
+        node_id: i32,
+        node_token: String,
+        store: SharedRouteStore,
+        shutdown: Arc<Notify>,
+        control_plane_ca: Option<reqwest::Certificate>,
+    ) -> Result<Self, reqwest::Error> {
+        let http = crate::with_control_plane_trust(
+            reqwest::Client::builder().timeout(Duration::from_secs(60)),
+            control_plane_ca,
+        )
+        .build()?;
         Ok(Self {
             control_plane_url,
             node_id,

@@ -4,6 +4,7 @@
 import { useState } from 'react'
 import { useActivationSignals } from './useActivationSignals'
 import { useManualHarnessCompletion } from './useManualHarnessCompletion'
+import { FIRST_DEPLOY_PATH } from '@/lib/first-deploy'
 
 const DISMISSED_KEY = 'temps_getting_started_dismissed'
 
@@ -25,6 +26,18 @@ export function useGettingStarted() {
   const manualHarness = useManualHarnessCompletion()
 
   const items: GettingStartedItem[] = [
+    // First because nothing else on this list matters until something runs:
+    // it proves Docker, image pulls and routing work on this host, and the
+    // guide it opens offers a one-click sample when there is no code yet.
+    {
+      key: 'deploy',
+      label: 'Deploy your first app',
+      description:
+        'Launch a sample app in one click, or deploy your own from Git or a Docker image, and get a live URL.',
+      done: signals.firstDeploySucceeded,
+      href: FIRST_DEPLOY_PATH,
+      cta: 'Deploy an app',
+    },
     {
       key: 'ai',
       label: 'Connect your AI harness',
@@ -45,11 +58,6 @@ export function useGettingStarted() {
       href: '/git-providers/add',
       cta: 'Connect Git',
     },
-    // NOTE: "Deploy your first project" is intentionally omitted — this
-    // checklist only renders once at least one project exists (the empty-
-    // state onboarding owns the no-projects moment), so that step would
-    // always be complete and add nothing.
-    //
     // Ordered by importance: foundational platform setup that affects every
     // deployment (HTTPS routing, failure alerts, the DNS automation that backs
     // them) comes before per-app extras (databases and their backups), with

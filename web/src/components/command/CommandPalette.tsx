@@ -81,6 +81,7 @@ import {
   Monitor,
   Network,
   Puzzle,
+  Rocket,
   ScrollText,
   Search,
   Server,
@@ -252,6 +253,20 @@ const mainNavItems: NavigationItem[] = [
     url: '/workspaces',
     icon: Folder,
     keywords: ['workspace', 'context', 'persistent'],
+  },
+  {
+    title: 'Deploy your first app',
+    url: '/get-started',
+    icon: Rocket,
+    keywords: [
+      'get started',
+      'getting started',
+      'sample',
+      'demo',
+      'first deploy',
+      'onboarding',
+      'hello',
+    ],
   },
   {
     title: 'Create New Project',

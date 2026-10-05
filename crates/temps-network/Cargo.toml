@@ -23,6 +23,7 @@ uuid = { workspace = true, features = ["serde"] }
 
 # CIDR math — small, dependency-free, ubiquitous in the Rust networking ecosystem.
 ipnet = { version = "2.10", features = ["serde"] }
+temps-wireguard = { path = "../temps-wireguard" }
 
 # Control-plane feature dependencies. Gated so workers / single-host installs
 # don't pull sea-orm into temps-network unnecessarily.
@@ -40,6 +41,7 @@ nix = { version = "0.31", features = ["net", "sched", "fs"] }
 libc = "0.2"
 
 [dev-dependencies]
+base64 = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 mockall = "0.15"
 tempfile = "3"

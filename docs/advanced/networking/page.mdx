@@ -9,15 +9,19 @@ export const metadata = {
 
 # Networking
 
-## Page Goal
+How traffic reaches your applications, how applications reach their databases, and the advanced options for generated hostnames, DNS record sync and proxy timeouts. {{ className: 'lead' }}
 
-Cover advanced networking for complex deployments.
+## Listeners and ports
 
-## Target Persona
+Every request to an application goes through the Temps proxy. It listens on `--address` / `TEMPS_ADDRESS` for HTTP (default `127.0.0.1:3000`) and, when set, on `--tls-address` / `TEMPS_TLS_ADDRESS` for HTTPS. On a server that receives traffic directly, bind them to `0.0.0.0:80` and `0.0.0.0:443`. The proxy routes each request by its `Host` header to the matching environment's containers, and passes requests for any other hostname to the Temps console.
 
-**Network Nick** - Needs VPNs, private networks, firewall config, advanced networking.
+The console listens separately on `TEMPS_CONSOLE_ADDRESS`, and optionally on a private admin address. See the [Production hardening checklist](/docs/production-hardening#network) for a table of every listener and the ports to open in your firewall, and [Admin Listener](/docs/admin-listener) for keeping the management API private.
 
-## Key Content: Port configuration, internal networking, VPC, firewall rules, proxy configuration, load balancing
+## Private networking between applications and services
+
+Application containers and managed services (PostgreSQL, Redis, MongoDB, S3 storage) share a Docker network, `temps-app-network` by default (`TEMPS_NETWORK_NAME`). Applications reach a linked service by its container name, which is what the injected connection variables such as `POSTGRES_URL` contain. Managed service ports are published on the host only on `127.0.0.1`, so they are not reachable from the internet. To attach application containers to additional existing Docker networks, list them in `TEMPS_DOCKER_EXTRA_NETWORKS` (see [Environment variables](/docs/environment-variables)).
+
+With worker nodes, containers on different hosts communicate over a WireGuard mesh. See [Multi-node](/docs/multi-node).
 
 ## Flat Hostnames for Wildcard-TLS Providers
 
