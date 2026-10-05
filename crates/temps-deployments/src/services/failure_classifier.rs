@@ -924,10 +924,9 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
         return make(S::Configuration, C::ComposeFileInvalid);
     }
 
-    // ── Architecture mismatch (log evidence counts: exec format error is
-    //    what a mismatched binary prints) ────────────────────────────────
+    // ── Architecture mismatch from trusted platform diagnostics ─────────
     let platform_mismatch = contains_any(
-        &full,
+        r,
         &[
             "exec format error",
             "no matching manifest for",
