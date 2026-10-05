@@ -186,8 +186,12 @@ impl TempsPlugin for ErrorTrackingPlugin {
                             .with_metadata("last_seen", alert.last_seen.clone());
 
                         // Identify the project by slug, matching the alarm
-                        // notifications and the console URLs.
-                        if let Some(ref project) = alert.project_slug {
+                        // notifications and the console URLs. Enrichment has no
+                        // slug when the project row can't be loaded; its name
+                        // fallback (`Project <id>`) still beats no project at all.
+                        if let Some(project) =
+                            alert.project_slug.as_ref().or(alert.project_name.as_ref())
+                        {
                             notification = notification.with_metadata("project", project.clone());
                         }
                         if let Some(ref env) = alert.environment_name {
