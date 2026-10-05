@@ -5841,9 +5841,19 @@ echo "[restore] Pre-seed complete"
                     .map_err(|e| ExternalServiceError::InternalError {
                         reason: format!("Failed to decrypt service config: {e}"),
                     })?;
-                serde_json::from_str(&json).map_err(|e| ExternalServiceError::InternalError {
-                    reason: format!("Failed to parse service config: {e}"),
-                })
+                let value: serde_json::Value = serde_json::from_str(&json).map_err(|e| {
+                    ExternalServiceError::InternalError {
+                        reason: format!(
+                            "Failed to parse service config for service {service_id}: {e}"
+                        ),
+                    }
+                })?;
+                // Older services can store valid non-object JSON. It has no
+                // cluster credentials to preserve and may be replaced safely.
+                Ok(value
+                    .as_object()
+                    .map(|map| map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                    .unwrap_or_default())
             };
         if let Some(encrypted) = current.config.as_deref() {
             let stored = parse(encrypted)?;
@@ -5866,6 +5876,16 @@ echo "[restore] Pre-seed complete"
                 };
                 let mut parameters = parse(proposed)?;
                 auth.insert_into(&mut parameters);
+                if stored
+                    .get("_cluster_scram_auth_version")
+                    .and_then(|v| v.as_u64())
+                    .is_some_and(|v| v >= 1)
+                {
+                    parameters.insert(
+                        "_cluster_scram_auth_version".to_string(),
+                        stored["_cluster_scram_auth_version"].clone(),
+                    );
+                }
                 let json = serde_json::to_string(&parameters).map_err(|e| {
                     ExternalServiceError::InternalError {
                         reason: e.to_string(),
@@ -5980,6 +6000,104 @@ echo "[restore] Pre-seed complete"
     /// the rewritten rules alone (its patchers only add rules when no
     /// `0.0.0.0/0` rule for the role exists).
     pub async fn upgrade_cluster_auth(&self, service_id: i32) -> Result<(), ExternalServiceError> {
+        use sea_orm::ConnectionTrait;
+        // Only a completed, versioned upgrade proves convergence. Serialize
+        // across processes, then let SCRAM-native concurrent additions proceed.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        let txn = loop {
+            let candidate = self.db.begin().await?;
+            let acquired = candidate
+                .query_one(sea_orm::Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "SELECT pg_try_advisory_xact_lock($1, $2) AS acquired",
+                    [0x54454d50_i32.into(), service_id.into()],
+                ))
+                .await?
+                .ok_or_else(|| ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Cluster authentication lock returned no result for service {service_id}"
+                    ),
+                })?
+                .try_get::<bool>("", "acquired")?;
+            if acquired {
+                break candidate;
+            }
+            // Waiting callers must release their pooled connection so the
+            // lock owner can load members and persist the completed upgrade.
+            candidate.rollback().await?;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ExternalServiceError::InternalError {
+                    reason: format!("Timed out waiting for cluster authentication upgrade for service {service_id}; retry the operation"),
+                });
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        };
+        // Read through the held transaction: even a one-connection pool must
+        // be able to recognize an already completed upgrade.
+        let service = external_services::Entity::find_by_id(service_id)
+            .one(&txn)
+            .await?
+            .ok_or(ExternalServiceError::ServiceNotFound { id: service_id })?;
+        let mut parameters: HashMap<String, serde_json::Value> = match service.config.as_deref() {
+            Some(encrypted) => {
+                let json = self
+                    .encryption_service
+                    .decrypt_string(encrypted)
+                    .map_err(|e| ExternalServiceError::InternalError {
+                        reason: format!(
+                            "Failed to decrypt authentication config for service {service_id}: {e}"
+                        ),
+                    })?;
+                serde_json::from_str(&json).map_err(|e| ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Failed to parse authentication config for service {service_id}: {e}"
+                    ),
+                })?
+            }
+            None => HashMap::new(),
+        };
+        if parameters
+            .get("_cluster_scram_auth_version")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|v| v >= 1)
+        {
+            txn.commit().await?;
+            return Ok(());
+        }
+        if let Err(error) = self.apply_cluster_auth_upgrade(service_id).await {
+            txn.rollback().await?;
+            return Err(error);
+        }
+        parameters = self.get_service_parameters(service_id).await?;
+        parameters.insert(
+            "_cluster_scram_auth_version".to_string(),
+            serde_json::json!(1),
+        );
+        let config = serde_json::to_string(&parameters).map_err(|e| {
+            ExternalServiceError::InternalError {
+                reason: e.to_string(),
+            }
+        })?;
+        let encrypted = self
+            .encryption_service
+            .encrypt_string(&config)
+            .map_err(|e| ExternalServiceError::InternalError {
+                reason: e.to_string(),
+            })?;
+        let active = external_services::ActiveModel {
+            id: Set(service_id),
+            config: Set(Some(encrypted)),
+            ..Default::default()
+        };
+        self.persist_service_config(service_id, active).await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    async fn apply_cluster_auth_upgrade(
+        &self,
+        service_id: i32,
+    ) -> Result<(), ExternalServiceError> {
         use crate::externalsvc::postgres_cluster::{AuthUpgradeStep, PostgresClusterService};
 
         let (_, auth, _) = self.ensure_cluster_auth_secrets(service_id).await?;
@@ -16714,6 +16832,33 @@ mod tests {
             assert!(result.1 == results[0].1);
             assert_eq!(result.0.get("database"), Some(&serde_json::json!("kept")));
         }
+        let mut stored = manager.get_service_parameters(service.id).await.unwrap();
+        stored.insert(
+            "_cluster_scram_auth_version".to_string(),
+            serde_json::json!(1),
+        );
+        let config = manager
+            .encryption_service
+            .encrypt_string(&serde_json::to_string(&stored).unwrap())
+            .unwrap();
+        manager
+            .persist_service_config(
+                service.id,
+                external_services::ActiveModel {
+                    id: Set(service.id),
+                    config: Set(Some(config)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        // A completed upgrade can be checked concurrently without touching fake containers.
+        let (first, second) = tokio::join!(
+            manager.upgrade_cluster_auth(service.id),
+            manager.upgrade_cluster_auth(service.id)
+        );
+        first.unwrap();
+        second.unwrap();
         // A settings writer that read before generation must not erase passwords.
         let stale = manager
             .encryption_service
@@ -16726,6 +16871,36 @@ mod tests {
             .await
             .unwrap();
         let persisted = manager.get_service_parameters(service.id).await.unwrap();
+        assert_eq!(
+            persisted.get("_cluster_scram_auth_version"),
+            Some(&serde_json::json!(1))
+        );
+        let old_null = manager.encryption_service.encrypt_string("null").unwrap();
+        let legacy = external_services::ActiveModel {
+            name: Set("legacy-null".to_string()),
+            service_type: Set("postgres".to_string()),
+            status: Set("running".to_string()),
+            config: Set(Some(old_null)),
+            ..Default::default()
+        }
+        .insert(manager.db.as_ref())
+        .await
+        .unwrap();
+        let config = manager
+            .encryption_service
+            .encrypt_string(r#"{"resources":{"cpu_cores":1}}"#)
+            .unwrap();
+        manager
+            .persist_service_config(
+                legacy.id,
+                external_services::ActiveModel {
+                    id: Set(legacy.id),
+                    config: Set(Some(config)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         assert!(
             crate::externalsvc::postgres_cluster::ClusterAuthSecrets::from_parameters(&persisted)
                 .unwrap()
