@@ -2,14 +2,17 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 pub mod gateway;
+pub mod native;
 pub mod pricing;
 pub mod provider_status;
 pub mod providers;
+mod sse_usage;
 pub mod structured_output;
 pub mod types;
 pub mod usage;
 
 pub use gateway::configure_gateway_routes;
+pub use native::configure_native_routes;
 pub use pricing::configure_pricing_routes;
 pub use provider_status::configure_provider_status_routes;
 pub use providers::configure_admin_routes;

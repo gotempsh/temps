@@ -77,6 +77,22 @@ impl From<AiGatewayError> for Problem {
                     .with_title("Invalid Provider URL")
                     .with_detail(error.to_string())
             }
+            AiGatewayError::UnsupportedEndpoint { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Endpoint Not Supported For Model")
+                    .with_detail(error.to_string())
+            }
+            AiGatewayError::UploadTooLarge { .. } => {
+                problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
+                    .with_title("Batch input file too large")
+                    .with_detail(error.to_string())
+            }
+            AiGatewayError::UploadCapacity => problemdetails::new(StatusCode::TOO_MANY_REQUESTS)
+                .with_title("Batch upload capacity reached")
+                .with_detail(error.to_string()),
+            AiGatewayError::ObjectNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Object Not Found")
+                .with_detail(error.to_string()),
         }
     }
 }

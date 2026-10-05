@@ -14,7 +14,7 @@ export interface DeploymentFailureSummary {
 // Rust-Debug-formatted (`Some("...")` with escaped quotes) and with the same
 // prefixes repeated by every layer that wrapped it. Those rows are permanent,
 // so normalise them here; reasons stored since then pass through unchanged.
-const DEBUG_OPTION_WRAPPER = /Some\("([\s\S]*)"\)/
+const DEBUG_OPTION_WRAPPER = /Some\("((?:\\.|[^"\\])*)"\)/
 const REPEATED_PREFIXES = /Job execution failed: |Docker stream error: /g
 const DOUBLED_BUILD_FAILED = /(Build failed: )+/g
 
@@ -23,13 +23,13 @@ function unescapeDebugString(value: string): string {
 }
 
 export function normalizeFailureReason(rawReason: string): string {
-  const unwrapped = rawReason.replace(
+  const logsStart = rawReason.indexOf(CONTAINER_LOGS_MARKER)
+  const rawHeader = logsStart >= 0 ? rawReason.slice(0, logsStart) : rawReason
+  const logs = logsStart >= 0 ? rawReason.slice(logsStart) : ''
+  const reason = rawHeader.replace(
     DEBUG_OPTION_WRAPPER,
     (_match, inner: string) => unescapeDebugString(inner)
   )
-  const logsStart = unwrapped.indexOf(CONTAINER_LOGS_MARKER)
-  const reason = logsStart >= 0 ? unwrapped.slice(0, logsStart) : unwrapped
-  const logs = logsStart >= 0 ? unwrapped.slice(logsStart) : ''
   return (
     reason
       .replace(REPEATED_PREFIXES, '')

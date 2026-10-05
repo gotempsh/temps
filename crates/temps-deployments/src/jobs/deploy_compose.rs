@@ -162,6 +162,8 @@ pub struct DeployComposeJob {
     relaxed_capability_services: Vec<String>,
     /// Compose services explicitly exempted from Temps' runtime sandbox.
     unsandboxed_services: Vec<String>,
+    /// Readiness budget for the stack; `None` keeps the executor default.
+    ready_timeout_secs: Option<u64>,
     /// Explicit public service/target selections. These disambiguate services
     /// that publish multiple ports (for example GitLab HTTP and SSH).
     public_ports: Vec<ComposePublicPort>,
@@ -192,6 +194,7 @@ pub struct DeployComposeJobBuilder {
     excluded_services: Vec<String>,
     relaxed_capability_services: Vec<String>,
     unsandboxed_services: Vec<String>,
+    ready_timeout_secs: Option<u64>,
     public_ports: Vec<ComposePublicPort>,
     environment_vars: HashMap<String, String>,
     secrets: HashMap<String, String>,
@@ -224,6 +227,7 @@ impl DeployComposeJobBuilder {
             excluded_services: Vec::new(),
             relaxed_capability_services: Vec::new(),
             unsandboxed_services: Vec::new(),
+            ready_timeout_secs: None,
             public_ports: Vec::new(),
             environment_vars: HashMap::new(),
             secrets: HashMap::new(),
@@ -283,6 +287,13 @@ impl DeployComposeJobBuilder {
         self.relaxed_capability_services = services;
         self
     }
+    /// Readiness budget for the whole stack, in seconds (the project's
+    /// startup-timeout setting).
+    pub fn ready_timeout_secs(mut self, secs: u64) -> Self {
+        self.ready_timeout_secs = Some(secs);
+        self
+    }
+
     pub fn unsandboxed_services(mut self, services: Vec<String>) -> Self {
         self.unsandboxed_services = services;
         self
@@ -351,6 +362,7 @@ impl DeployComposeJobBuilder {
             excluded_services: self.excluded_services,
             relaxed_capability_services: self.relaxed_capability_services,
             unsandboxed_services: self.unsandboxed_services,
+            ready_timeout_secs: self.ready_timeout_secs,
             public_ports: self.public_ports,
             environment_vars: self.environment_vars,
             secrets: self.secrets,
@@ -1046,6 +1058,7 @@ impl DeployComposeJob {
             compose_override: compose_override.clone(),
             relaxed_capability_services: self.relaxed_capability_services.clone(),
             unsandboxed_services: self.unsandboxed_services.clone(),
+            ready_timeout: self.ready_timeout_secs.map(std::time::Duration::from_secs),
         };
 
         // Prepare compose files, build (if needed), and pull images BEFORE

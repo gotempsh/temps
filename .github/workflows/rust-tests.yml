@@ -83,6 +83,9 @@ jobs:
       - name: Verify release image runtime contract
         run: scripts/test-release-dockerfile.sh
 
+      - name: Verify runtime image signing fails closed
+        run: python3 .github/scripts/test_runtime_image_signing.py
+
       - name: Verify workflow caches are save-if guarded
         # An unguarded Swatinem/rust-cache step in a pull_request-triggered
         # workflow duplicates that cache once per open PR ref, evicting the
@@ -110,6 +113,12 @@ jobs:
 
       - name: Test stateless file migration safety
         run: python3 scripts/test_migrate_stateless_files.py
+
+      - name: Test release test gate
+        run: python3 .github/scripts/test_release_test_gate.py
+
+      - name: Test installer release lookup errors
+        run: python3 .github/scripts/test_install_release_lookup.py
 
       - name: Test docs-only CI classification
         run: python3 .github/scripts/test-classify-ci-changes.py

@@ -2686,6 +2686,58 @@ export type BackupScheduleResponse = {
     updated_at: number;
 };
 
+/**
+ * A batch object as returned by the provider.
+ */
+export type BatchObject = {
+    [key: string]: unknown;
+} & {
+    completion_window?: string;
+    created_at?: number;
+    endpoint?: string;
+    /**
+     * Results of the failed requests.
+     */
+    error_file_id?: string | null;
+    id: string;
+    input_file_id?: string;
+    model?: string | null;
+    /**
+     * Always `batch`
+     */
+    object: string;
+    /**
+     * Results of the successful requests; download with
+     * `GET /ai/v1/files/{file_id}/content`.
+     */
+    output_file_id?: string | null;
+    request_counts?: BatchRequestCounts | null;
+    /**
+     * `validating`, `in_progress`, `finalizing`, `completed`, `failed`,
+     * `expired`, `cancelling` or `cancelled`
+     */
+    status: string;
+    usage?: BatchUsage | null;
+};
+
+/**
+ * Progress counters of a batch.
+ */
+export type BatchRequestCounts = {
+    completed?: number;
+    failed?: number;
+    total?: number;
+};
+
+/**
+ * Token usage of a finished batch, summed over its requests.
+ */
+export type BatchUsage = {
+    input_tokens?: number;
+    output_tokens?: number;
+    total_tokens?: number;
+};
+
 export type BindApplicationGitConnectionRequest = {
     connectionId: number;
     projectId: number;
@@ -5280,6 +5332,30 @@ export type CreateBackupScheduleRequest = {
     target_all_services?: boolean | null;
 };
 
+/**
+ * Request body of `POST /ai/v1/batches`.
+ */
+export type CreateBatchRequest = {
+    [key: string]: unknown;
+} & {
+    /**
+     * Currently only `24h`.
+     */
+    completion_window: string;
+    /**
+     * Endpoint every request in the input file targets: `/v1/responses`,
+     * `/v1/chat/completions` or `/v1/embeddings`.
+     */
+    endpoint: string;
+    /**
+     * A file uploaded through `POST /ai/v1/files` by the same caller.
+     */
+    input_file_id: string;
+    metadata?: {
+        [key: string]: string;
+    } | null;
+};
+
 export type CreateBitbucketRequest = {
     /**
      * Authentication credentials — either an access token or an app password.
@@ -6922,6 +6998,16 @@ export type DeploymentConfig = {
      */
     exposedPort?: number | null;
     /**
+     * How long, in seconds, a new container may take to start and pass its
+     * readiness check before the deployment fails. Covers apps that boot
+     * slowly (migrations, JIT warm-up, large model loads). `None` = the
+     * platform default ([`DEFAULT_HEALTH_CHECK_TIMEOUT_SECONDS`]); valid
+     * overrides are [`MIN_HEALTH_CHECK_TIMEOUT_SECONDS`]..=
+     * [`MAX_HEALTH_CHECK_TIMEOUT_SECONDS`]. Environments inherit the project
+     * value and may override it.
+     */
+    healthCheckTimeoutSeconds?: number | null;
+    /**
      * Seconds of inactivity before containers are stopped in on-demand mode.
      * Only used when `on_demand` is true. Min: 60, Max: 86400 (24h).
      * Default: 300 (5 minutes).
@@ -7190,6 +7276,57 @@ export type DeploymentEnvironmentResponse = {
     slug: string;
 };
 
+/**
+ * Allowlisted failure codes. Wire values are `snake_case` and stable; add new
+ * variants rather than renaming existing ones.
+ */
+export type DeploymentFailureCode = 'out_of_memory' | 'disk_exhausted' | 'timeout' | 'health_check_failed' | 'repository_authentication' | 'repository_not_found' | 'repository_clone' | 'dns_resolution' | 'network_connection' | 'dependency_lockfile_out_of_sync' | 'dependency_resolution' | 'dependency_download' | 'runtime_version_unsupported' | 'missing_build_script' | 'compile_error' | 'dockerfile_invalid' | 'base_image_pull' | 'image_missing' | 'static_output_missing' | 'port_unavailable' | 'permission_denied' | 'invalid_configuration' | 'container_start' | 'build_error' | 'platform_internal' | 'cancelled' | 'build_timeout' | 'source_timeout' | 'image_pull_timeout' | 'health_check_timeout' | 'app_not_listening' | 'container_exited' | 'image_not_found' | 'registry_authentication' | 'registry_rate_limited' | 'image_platform_mismatch' | 'compose_file_invalid' | 'compose_variable_missing' | 'compose_policy_rejected' | 'compose_build_failed' | 'compose_up_failed' | 'compose_unavailable' | 'volume_mount' | 'route_activation' | 'unknown';
+
+/**
+ * API view of a failed deployment's classification.
+ */
+export type DeploymentFailureInfo = {
+    /**
+     * Version of the classifier that produced this view.
+     */
+    classifier_version: number;
+    /**
+     * Allowlisted failure code.
+     */
+    code: DeploymentFailureCode;
+    /**
+     * Pipeline job that failed (e.g. `build_image`, `deploy_compose`).
+     */
+    failed_job?: string | null;
+    /**
+     * Concrete, actionable fix.
+     */
+    remediation: string;
+    settings_section?: FailureSettingsSection | null;
+    /**
+     * Pipeline stage the deployment failed in.
+     */
+    stage: DeploymentFailureStage;
+    /**
+     * How long the timed-out step ran, in seconds, when the reason states it.
+     */
+    timeout_elapsed_seconds?: number | null;
+    /**
+     * Time limit that was hit, in seconds, when the failure is a timeout and
+     * the reason states it.
+     */
+    timeout_limit_seconds?: number | null;
+    /**
+     * Short human title, e.g. "Image tag not found".
+     */
+    title: string;
+};
+
+/**
+ * The pipeline stage a deployment failed in.
+ */
+export type DeploymentFailureStage = 'source' | 'configuration' | 'dependency_install' | 'build' | 'image' | 'deploy' | 'runtime' | 'health_check' | 'resource' | 'platform' | 'unknown';
+
 export type DeploymentJobResponse = {
     created_at: number;
     dependencies?: unknown;
@@ -7338,6 +7475,7 @@ export type DeploymentResponse = {
     deployment_config?: DeploymentConfigSnapshot | null;
     environment: DeploymentEnvironmentResponse;
     environment_id: number;
+    failure?: DeploymentFailureInfo | null;
     finished_at?: number | null;
     id: number;
     is_current: boolean;
@@ -10342,6 +10480,12 @@ export type FailureReportPreviewResponse = {
     reporting_enabled: boolean;
 };
 
+/**
+ * Settings surface that fixes a given failure. The console maps each value to
+ * a deep link; the API stays independent of console routes.
+ */
+export type FailureSettingsSection = 'source' | 'build' | 'deploy' | 'environment_variables' | 'git' | 'docker_registry' | 'build_limits';
+
 export type FeatureMaturity = {
     docs_path: string;
     key: string;
@@ -10362,6 +10506,38 @@ export type FieldResponse = {
      * Whether the field is nullable
      */
     nullable: boolean;
+};
+
+/**
+ * Reply of `DELETE /ai/v1/files/{file_id}`.
+ */
+export type FileDeletedResponse = {
+    deleted: boolean;
+    id: string;
+    /**
+     * Always `file`
+     */
+    object: string;
+};
+
+/**
+ * A file object as returned by the provider.
+ */
+export type FileObject = {
+    [key: string]: unknown;
+} & {
+    bytes?: number;
+    created_at?: number;
+    filename?: string;
+    id: string;
+    /**
+     * Always `file`
+     */
+    object: string;
+    /**
+     * `batch` for uploads, `batch_output` for batch results
+     */
+    purpose?: string;
 };
 
 export type Finding = {
@@ -19998,6 +20174,77 @@ export type ResponseField = {
 };
 
 /**
+ * A response object as returned by the provider.
+ */
+export type ResponseObject = {
+    [key: string]: unknown;
+} & {
+    id: string;
+    model: string;
+    /**
+     * Always `response`
+     */
+    object: string;
+    /**
+     * `completed`, `incomplete`, `failed`, `in_progress`, …
+     */
+    status?: string | null;
+    usage?: ResponseUsage | null;
+};
+
+/**
+ * One JSON payload in the Responses SSE stream. Event-specific fields are retained.
+ */
+export type ResponseStreamEvent = {
+    [key: string]: unknown;
+} & {
+    type: string;
+};
+
+/**
+ * Token usage of a response.
+ */
+export type ResponseUsage = {
+    input_tokens?: number;
+    output_tokens?: number;
+    total_tokens?: number;
+};
+
+/**
+ * Request body of `POST /ai/v1/responses`, OpenAI's Responses API.
+ */
+export type ResponsesRequest = {
+    [key: string]: unknown;
+} & {
+    /**
+     * Run asynchronously and poll for the result. Requires your own
+     * provider key: the result is fetched from the provider account.
+     */
+    background?: boolean | null;
+    /**
+     * Attach the response to a stored conversation. Requires your own
+     * provider key, for the same reason as `previous_response_id`.
+     */
+    conversation?: {
+        [key: string]: unknown;
+    } | null;
+    /**
+     * Model to run, e.g. `gpt-6-luna`. Must be served by OpenAI.
+     */
+    model: string;
+    /**
+     * Continue from a stored response. Requires your own provider key
+     * (`X-Provider-Api-Key`), because stored responses live in the
+     * provider account that created them.
+     */
+    previous_response_id?: string | null;
+    /**
+     * Stream the reply as server-sent events.
+     */
+    stream?: boolean;
+};
+
+/**
  * Capabilities a service exposes for the generic restore framework.
  *
  * Each engine overrides `ExternalService::restore_capabilities` to declare
@@ -25161,6 +25408,13 @@ export type UpdateDeploymentConfigRequest = {
     crossArchitectureBuilds?: boolean | null;
     exposedPort?: number | null;
     /**
+     * How long, in seconds (30-3600), a new deployment's containers may take
+     * to start and pass their readiness check before the deployment fails.
+     * Absent leaves the current value unchanged; the platform default is
+     * 300 seconds.
+     */
+    healthCheckTimeoutSeconds?: number | null;
+    /**
      * Project-level default cap on concurrent in-flight requests to a
      * single environment's upstream (0 = unlimited). Environments may
      * override this. Absent leaves the current value unchanged. See
@@ -26111,6 +26365,21 @@ export type UpgradeServiceTemplateRequest = {
      * target if the catalog changes between preview and apply.
      */
     target_version: string;
+};
+
+/**
+ * `multipart/form-data` body of `POST /ai/v1/files`.
+ */
+export type UploadFileForm = {
+    /**
+     * A JSONL batch input file: one request per line, every line targeting
+     * the same model and endpoint. At most 200 MB and 50,000 requests.
+     */
+    file: Blob | File;
+    /**
+     * Must be `batch`.
+     */
+    purpose: string;
 };
 
 export type UpsertAgentRequest = {
@@ -30145,6 +30414,107 @@ export type GetUsageTopModelsResponses = {
 
 export type GetUsageTopModelsResponse = GetUsageTopModelsResponses[keyof GetUsageTopModelsResponses];
 
+export type CreateBatchData = {
+    body: CreateBatchRequest;
+    path?: never;
+    query?: never;
+    url: '/ai/v1/batches';
+};
+
+export type CreateBatchErrors = {
+    /**
+     * Invalid request
+     */
+    400: OpenAiErrorResponse;
+    /**
+     * Unauthorized
+     */
+    401: OpenAiErrorResponse;
+    /**
+     * Input file not found for the caller
+     */
+    404: OpenAiErrorResponse;
+};
+
+export type CreateBatchError = CreateBatchErrors[keyof CreateBatchErrors];
+
+export type CreateBatchResponses = {
+    /**
+     * Batch created
+     */
+    200: BatchObject;
+};
+
+export type CreateBatchResponse = CreateBatchResponses[keyof CreateBatchResponses];
+
+export type RetrieveBatchData = {
+    body?: never;
+    path: {
+        /**
+         * Provider batch id, e.g. batch_abc123
+         */
+        batch_id: string;
+    };
+    query?: never;
+    url: '/ai/v1/batches/{batch_id}';
+};
+
+export type RetrieveBatchErrors = {
+    /**
+     * Unauthorized
+     */
+    401: OpenAiErrorResponse;
+    /**
+     * No such batch created by the caller
+     */
+    404: OpenAiErrorResponse;
+};
+
+export type RetrieveBatchError = RetrieveBatchErrors[keyof RetrieveBatchErrors];
+
+export type RetrieveBatchResponses = {
+    /**
+     * Batch object
+     */
+    200: BatchObject;
+};
+
+export type RetrieveBatchResponse = RetrieveBatchResponses[keyof RetrieveBatchResponses];
+
+export type CancelBatchData = {
+    body?: never;
+    path: {
+        /**
+         * Provider batch id, e.g. batch_abc123
+         */
+        batch_id: string;
+    };
+    query?: never;
+    url: '/ai/v1/batches/{batch_id}/cancel';
+};
+
+export type CancelBatchErrors = {
+    /**
+     * Unauthorized
+     */
+    401: OpenAiErrorResponse;
+    /**
+     * No such batch created by the caller
+     */
+    404: OpenAiErrorResponse;
+};
+
+export type CancelBatchError = CancelBatchErrors[keyof CancelBatchErrors];
+
+export type CancelBatchResponses = {
+    /**
+     * Batch is cancelling
+     */
+    200: BatchObject;
+};
+
+export type CancelBatchResponse = CancelBatchResponses[keyof CancelBatchResponses];
+
 export type ChatCompletionsData = {
     body: ChatCompletionRequest;
     path?: never;
@@ -30215,6 +30585,153 @@ export type EmbeddingsResponses = {
 
 export type EmbeddingsResponse = EmbeddingsResponses[keyof EmbeddingsResponses];
 
+export type UploadFileData = {
+    body: UploadFileForm;
+    path?: never;
+    query?: never;
+    url: '/ai/v1/files';
+};
+
+export type UploadFileErrors = {
+    /**
+     * Invalid batch input file
+     */
+    400: OpenAiErrorResponse;
+    /**
+     * Unauthorized
+     */
+    401: OpenAiErrorResponse;
+    /**
+     * Model not allowed
+     */
+    403: OpenAiErrorResponse;
+    /**
+     * Model or provider not configured
+     */
+    404: OpenAiErrorResponse;
+    /**
+     * File larger than 200 MB
+     */
+    413: OpenAiErrorResponse;
+    /**
+     * Concurrent upload capacity reached; retry later
+     */
+    429: OpenAiErrorResponse;
+};
+
+export type UploadFileError = UploadFileErrors[keyof UploadFileErrors];
+
+export type UploadFileResponses = {
+    /**
+     * Uploaded file
+     */
+    200: FileObject;
+};
+
+export type UploadFileResponse = UploadFileResponses[keyof UploadFileResponses];
+
+export type DeleteFileData = {
+    body?: never;
+    path: {
+        /**
+         * Provider file id, e.g. file-abc123
+         */
+        file_id: string;
+    };
+    query?: never;
+    url: '/ai/v1/files/{file_id}';
+};
+
+export type DeleteFileErrors = {
+    /**
+     * Unauthorized
+     */
+    401: OpenAiErrorResponse;
+    /**
+     * No such file created by the caller
+     */
+    404: OpenAiErrorResponse;
+};
+
+export type DeleteFileError = DeleteFileErrors[keyof DeleteFileErrors];
+
+export type DeleteFileResponses = {
+    /**
+     * File deleted
+     */
+    200: FileDeletedResponse;
+};
+
+export type DeleteFileResponse = DeleteFileResponses[keyof DeleteFileResponses];
+
+export type RetrieveFileData = {
+    body?: never;
+    path: {
+        /**
+         * Provider file id, e.g. file-abc123
+         */
+        file_id: string;
+    };
+    query?: never;
+    url: '/ai/v1/files/{file_id}';
+};
+
+export type RetrieveFileErrors = {
+    /**
+     * Unauthorized
+     */
+    401: OpenAiErrorResponse;
+    /**
+     * No such file created by the caller
+     */
+    404: OpenAiErrorResponse;
+};
+
+export type RetrieveFileError = RetrieveFileErrors[keyof RetrieveFileErrors];
+
+export type RetrieveFileResponses = {
+    /**
+     * File object
+     */
+    200: FileObject;
+};
+
+export type RetrieveFileResponse = RetrieveFileResponses[keyof RetrieveFileResponses];
+
+export type FileContentData = {
+    body?: never;
+    path: {
+        /**
+         * Provider file id, e.g. a batch's output_file_id
+         */
+        file_id: string;
+    };
+    query?: never;
+    url: '/ai/v1/files/{file_id}/content';
+};
+
+export type FileContentErrors = {
+    /**
+     * Unauthorized
+     */
+    401: OpenAiErrorResponse;
+    /**
+     * No such file created by the caller
+     */
+    404: OpenAiErrorResponse;
+};
+
+export type FileContentError = FileContentErrors[keyof FileContentErrors];
+
+export type FileContentResponses = {
+    /**
+     * File content (JSONL for batch files), streamed
+     */
+    200: Blob | File;
+};
+
+export type FileContentResponse = FileContentResponses[keyof FileContentResponses];
+
 export type ListModelsData = {
     body?: never;
     path?: never;
@@ -30239,6 +30756,56 @@ export type ListModelsResponses = {
 };
 
 export type ListModelsResponse = ListModelsResponses[keyof ListModelsResponses];
+
+export type CreateResponseJsonData = {
+    body: ResponsesRequest;
+    path?: never;
+    query?: never;
+    url: '/ai/v1/responses/json';
+};
+
+export type CreateResponseJsonErrors = {
+    /**
+     * Invalid request
+     */
+    400: OpenAiErrorResponse;
+};
+
+export type CreateResponseJsonError = CreateResponseJsonErrors[keyof CreateResponseJsonErrors];
+
+export type CreateResponseJsonResponses = {
+    /**
+     * Complete response object; forces stream=false
+     */
+    200: ResponseObject;
+};
+
+export type CreateResponseJsonResponse = CreateResponseJsonResponses[keyof CreateResponseJsonResponses];
+
+export type CreateResponseStreamData = {
+    body: ResponsesRequest;
+    path?: never;
+    query?: never;
+    url: '/ai/v1/responses/stream';
+};
+
+export type CreateResponseStreamErrors = {
+    /**
+     * Invalid request
+     */
+    400: OpenAiErrorResponse;
+};
+
+export type CreateResponseStreamError = CreateResponseStreamErrors[keyof CreateResponseStreamErrors];
+
+export type CreateResponseStreamResponses = {
+    /**
+     * Incremental Responses events; forces stream=true
+     */
+    200: ResponseStreamEvent;
+};
+
+export type CreateResponseStreamResponse = CreateResponseStreamResponses[keyof CreateResponseStreamResponses];
 
 export type GetGlobalAiWorkspaceData = {
     body?: never;

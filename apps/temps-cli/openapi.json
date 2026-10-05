@@ -5808,6 +5808,124 @@
         ],
         "type": "object"
       },
+      "BatchObject": {
+        "allOf": [
+          {
+            "type": "object"
+          },
+          {
+            "properties": {
+              "completion_window": {
+                "type": "string"
+              },
+              "created_at": {
+                "format": "int64",
+                "type": "integer"
+              },
+              "endpoint": {
+                "type": "string"
+              },
+              "error_file_id": {
+                "description": "Results of the failed requests.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "id": {
+                "type": "string"
+              },
+              "input_file_id": {
+                "type": "string"
+              },
+              "model": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "object": {
+                "description": "Always `batch`",
+                "type": "string"
+              },
+              "output_file_id": {
+                "description": "Results of the successful requests; download with\n`GET /ai/v1/files/{file_id}/content`.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "request_counts": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/BatchRequestCounts"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "status": {
+                "description": "`validating`, `in_progress`, `finalizing`, `completed`, `failed`,\n`expired`, `cancelling` or `cancelled`",
+                "type": "string"
+              },
+              "usage": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/BatchUsage"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "object",
+              "status"
+            ],
+            "type": "object"
+          }
+        ],
+        "description": "A batch object as returned by the provider."
+      },
+      "BatchRequestCounts": {
+        "description": "Progress counters of a batch.",
+        "properties": {
+          "completed": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "failed": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "BatchUsage": {
+        "description": "Token usage of a finished batch, summed over its requests.",
+        "properties": {
+          "input_tokens": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "output_tokens": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "total_tokens": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
       "BindApplicationGitConnectionRequest": {
         "properties": {
           "connectionId": {
@@ -11261,6 +11379,49 @@
         ],
         "type": "object"
       },
+      "CreateBatchRequest": {
+        "allOf": [
+          {
+            "description": "`output_expires_after` and any other field, forwarded unchanged.",
+            "type": "object"
+          },
+          {
+            "properties": {
+              "completion_window": {
+                "description": "Currently only `24h`.",
+                "type": "string"
+              },
+              "endpoint": {
+                "description": "Endpoint every request in the input file targets: `/v1/responses`,\n`/v1/chat/completions` or `/v1/embeddings`.",
+                "type": "string"
+              },
+              "input_file_id": {
+                "description": "A file uploaded through `POST /ai/v1/files` by the same caller.",
+                "type": "string"
+              },
+              "metadata": {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "propertyNames": {
+                  "type": "string"
+                },
+                "type": [
+                  "object",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "input_file_id",
+              "endpoint",
+              "completion_window"
+            ],
+            "type": "object"
+          }
+        ],
+        "description": "Request body of `POST /ai/v1/batches`."
+      },
       "CreateBitbucketRequest": {
         "properties": {
           "auth": {
@@ -14570,6 +14731,14 @@
               "null"
             ]
           },
+          "healthCheckTimeoutSeconds": {
+            "description": "How long, in seconds, a new container may take to start and pass its\nreadiness check before the deployment fails. Covers apps that boot\nslowly (migrations, JIT warm-up, large model loads). `None` = the\nplatform default ([`DEFAULT_HEALTH_CHECK_TIMEOUT_SECONDS`]); valid\noverrides are [`MIN_HEALTH_CHECK_TIMEOUT_SECONDS`]..=\n[`MAX_HEALTH_CHECK_TIMEOUT_SECONDS`]. Environments inherit the project\nvalue and may override it.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "idleTimeoutSeconds": {
             "description": "Seconds of inactivity before containers are stopped in on-demand mode.\nOnly used when `on_demand` is true. Min: 60, Max: 86400 (24h).\nDefault: 300 (5 minutes).",
             "format": "int32",
@@ -15007,6 +15176,145 @@
         ],
         "type": "object"
       },
+      "DeploymentFailureCode": {
+        "description": "Allowlisted failure codes. Wire values are `snake_case` and stable; add new\nvariants rather than renaming existing ones.",
+        "enum": [
+          "out_of_memory",
+          "disk_exhausted",
+          "timeout",
+          "health_check_failed",
+          "repository_authentication",
+          "repository_not_found",
+          "repository_clone",
+          "dns_resolution",
+          "network_connection",
+          "dependency_lockfile_out_of_sync",
+          "dependency_resolution",
+          "dependency_download",
+          "runtime_version_unsupported",
+          "missing_build_script",
+          "compile_error",
+          "dockerfile_invalid",
+          "base_image_pull",
+          "image_missing",
+          "static_output_missing",
+          "port_unavailable",
+          "permission_denied",
+          "invalid_configuration",
+          "container_start",
+          "build_error",
+          "platform_internal",
+          "cancelled",
+          "build_timeout",
+          "source_timeout",
+          "image_pull_timeout",
+          "health_check_timeout",
+          "app_not_listening",
+          "container_exited",
+          "image_not_found",
+          "registry_authentication",
+          "registry_rate_limited",
+          "image_platform_mismatch",
+          "compose_file_invalid",
+          "compose_variable_missing",
+          "compose_policy_rejected",
+          "compose_build_failed",
+          "compose_up_failed",
+          "compose_unavailable",
+          "volume_mount",
+          "route_activation",
+          "unknown"
+        ],
+        "type": "string"
+      },
+      "DeploymentFailureInfo": {
+        "description": "API view of a failed deployment's classification.",
+        "properties": {
+          "classifier_version": {
+            "description": "Version of the classifier that produced this view.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "code": {
+            "$ref": "#/components/schemas/DeploymentFailureCode",
+            "description": "Allowlisted failure code."
+          },
+          "failed_job": {
+            "description": "Pipeline job that failed (e.g. `build_image`, `deploy_compose`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "remediation": {
+            "description": "Concrete, actionable fix.",
+            "type": "string"
+          },
+          "settings_section": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/FailureSettingsSection",
+                "description": "Settings surface that fixes it, when one exists."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "stage": {
+            "$ref": "#/components/schemas/DeploymentFailureStage",
+            "description": "Pipeline stage the deployment failed in."
+          },
+          "timeout_elapsed_seconds": {
+            "description": "How long the timed-out step ran, in seconds, when the reason states it.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "timeout_limit_seconds": {
+            "description": "Time limit that was hit, in seconds, when the failure is a timeout and\nthe reason states it.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "title": {
+            "description": "Short human title, e.g. \"Image tag not found\".",
+            "type": "string"
+          }
+        },
+        "required": [
+          "stage",
+          "code",
+          "title",
+          "remediation",
+          "classifier_version"
+        ],
+        "type": "object"
+      },
+      "DeploymentFailureStage": {
+        "description": "The pipeline stage a deployment failed in.",
+        "enum": [
+          "source",
+          "configuration",
+          "dependency_install",
+          "build",
+          "image",
+          "deploy",
+          "runtime",
+          "health_check",
+          "resource",
+          "platform",
+          "unknown"
+        ],
+        "type": "string"
+      },
       "DeploymentJobResponse": {
         "properties": {
           "created_at": {
@@ -15380,6 +15688,17 @@
           "environment_id": {
             "format": "int32",
             "type": "integer"
+          },
+          "failure": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DeploymentFailureInfo",
+                "description": "Classified cause of a failed deployment: the stage it failed in, a\nstable failure code, and a concrete fix. Present only when `status` is\n`failed` and a failure reason was recorded. Derived from\n`cancelled_reason` at read time, so older deployments are classified\nby the current classifier too."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "finished_at": {
             "format": "int64",
@@ -22102,6 +22421,19 @@
         ],
         "type": "object"
       },
+      "FailureSettingsSection": {
+        "description": "Settings surface that fixes a given failure. The console maps each value to\na deep link; the API stays independent of console routes.",
+        "enum": [
+          "source",
+          "build",
+          "deploy",
+          "environment_variables",
+          "git",
+          "docker_registry",
+          "build_limits"
+        ],
+        "type": "string"
+      },
       "FeatureMaturity": {
         "properties": {
           "docs_path": {
@@ -22149,6 +22481,66 @@
           "nullable"
         ],
         "type": "object"
+      },
+      "FileDeletedResponse": {
+        "description": "Reply of `DELETE /ai/v1/files/{file_id}`.",
+        "properties": {
+          "deleted": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          },
+          "object": {
+            "description": "Always `file`",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "object",
+          "deleted"
+        ],
+        "type": "object"
+      },
+      "FileObject": {
+        "allOf": [
+          {
+            "type": "object"
+          },
+          {
+            "properties": {
+              "bytes": {
+                "format": "int64",
+                "type": "integer"
+              },
+              "created_at": {
+                "format": "int64",
+                "type": "integer"
+              },
+              "filename": {
+                "type": "string"
+              },
+              "id": {
+                "type": "string"
+              },
+              "object": {
+                "description": "Always `file`",
+                "type": "string"
+              },
+              "purpose": {
+                "description": "`batch` for uploads, `batch_output` for batch results",
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "object"
+            ],
+            "type": "object"
+          }
+        ],
+        "description": "A file object as returned by the provider."
       },
       "Finding": {
         "properties": {
@@ -42564,6 +42956,135 @@
           }
         ]
       },
+      "ResponseObject": {
+        "allOf": [
+          {
+            "description": "`output`, `error`, `incomplete_details` and every other field.",
+            "type": "object"
+          },
+          {
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "model": {
+                "type": "string"
+              },
+              "object": {
+                "description": "Always `response`",
+                "type": "string"
+              },
+              "status": {
+                "description": "`completed`, `incomplete`, `failed`, `in_progress`, …",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "usage": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/ResponseUsage"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "object",
+              "model"
+            ],
+            "type": "object"
+          }
+        ],
+        "description": "A response object as returned by the provider."
+      },
+      "ResponseStreamEvent": {
+        "allOf": [
+          {
+            "type": "object"
+          },
+          {
+            "properties": {
+              "type": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          }
+        ],
+        "description": "One JSON payload in the Responses SSE stream. Event-specific fields are retained."
+      },
+      "ResponseUsage": {
+        "description": "Token usage of a response.",
+        "properties": {
+          "input_tokens": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "output_tokens": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "total_tokens": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "ResponsesRequest": {
+        "allOf": [
+          {
+            "description": "Every other Responses API field (`input`, `instructions`, `tools`,\n`text`, `reasoning`, …), forwarded unchanged.",
+            "type": "object"
+          },
+          {
+            "properties": {
+              "background": {
+                "description": "Run asynchronously and poll for the result. Requires your own\nprovider key: the result is fetched from the provider account.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "conversation": {
+                "description": "Attach the response to a stored conversation. Requires your own\nprovider key, for the same reason as `previous_response_id`.",
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "model": {
+                "description": "Model to run, e.g. `gpt-6-luna`. Must be served by OpenAI.",
+                "type": "string"
+              },
+              "previous_response_id": {
+                "description": "Continue from a stored response. Requires your own provider key\n(`X-Provider-Api-Key`), because stored responses live in the\nprovider account that created them.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "stream": {
+                "description": "Stream the reply as server-sent events.",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "model"
+            ],
+            "type": "object"
+          }
+        ],
+        "description": "Request body of `POST /ai/v1/responses`, OpenAI's Responses API."
+      },
       "RestoreCapabilities": {
         "description": "Capabilities a service exposes for the generic restore framework.\n\nEach engine overrides `ExternalService::restore_capabilities` to declare\nwhat it supports. The handler layer uses this to validate requests and\nthe UI uses it to conditionally show options (e.g., PITR picker).",
         "properties": {
@@ -53677,6 +54198,14 @@
               "null"
             ]
           },
+          "healthCheckTimeoutSeconds": {
+            "description": "How long, in seconds (30-3600), a new deployment's containers may take\nto start and pass their readiness check before the deployment fails.\nAbsent leaves the current value unchanged; the platform default is\n300 seconds.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "maxConcurrentConnections": {
             "description": "Project-level default cap on concurrent in-flight requests to a\nsingle environment's upstream (0 = unlimited). Environments may\noverride this. Absent leaves the current value unchanged. See\nissue #646.",
             "format": "int32",
@@ -55645,6 +56174,25 @@
         },
         "required": [
           "target_version"
+        ],
+        "type": "object"
+      },
+      "UploadFileForm": {
+        "description": "`multipart/form-data` body of `POST /ai/v1/files`.",
+        "properties": {
+          "file": {
+            "description": "A JSONL batch input file: one request per line, every line targeting\nthe same model and endpoint. At most 200 MB and 50,000 requests.",
+            "format": "binary",
+            "type": "string"
+          },
+          "purpose": {
+            "description": "Must be `batch`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "file",
+          "purpose"
         ],
         "type": "object"
       },
@@ -64127,6 +64675,186 @@
         "x-maturity": "experimental"
       }
     },
+    "/ai/v1/batches": {
+      "post": {
+        "operationId": "create_batch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateBatchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchObject"
+                }
+              }
+            },
+            "description": "Batch created"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiErrorResponse"
+                }
+              }
+            },
+            "description": "Input file not found for the caller"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Gateway"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/v1/batches/{batch_id}": {
+      "get": {
+        "operationId": "retrieve_batch",
+        "parameters": [
+          {
+            "description": "Provider batch id, e.g. batch_abc123",
+            "in": "path",
+            "name": "batch_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchObject"
+                }
+              }
+            },
+            "description": "Batch object"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiErrorResponse"
+                }
+              }
+            },
+            "description": "No such batch created by the caller"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Gateway"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/v1/batches/{batch_id}/cancel": {
+      "post": {
+        "operationId": "cancel_batch",
+        "parameters": [
+          {
+            "description": "Provider batch id, e.g. batch_abc123",
+            "in": "path",
+            "name": "batch_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchObject"
+                }
+              }
+            },
+            "description": "Batch is cancelling"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiErrorResponse"
+                }
+              }
+            },
+            "description": "No such batch created by the caller"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Gateway"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
     "/ai/v1/chat/completions": {
       "post": {
         "operationId": "chat_completions",
@@ -64269,6 +64997,267 @@
         "x-maturity": "experimental"
       }
     },
+    "/ai/v1/files": {
+      "post": {
+        "operationId": "upload_file",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/UploadFileForm"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FileObject"
+                }
+              }
+            },
+            "description": "Uploaded file"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid batch input file"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiErrorResponse"
+                }
+              }
+            },
+            "description": "Model not allowed"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiErrorResponse"
+                }
+              }
+            },
+            "description": "Model or provider not configured"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiErrorResponse"
+                }
+              }
+            },
+            "description": "File larger than 200 MB"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiErrorResponse"
+                }
+              }
+            },
+            "description": "Concurrent upload capacity reached; retry later"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Gateway"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/v1/files/{file_id}": {
+      "delete": {
+        "operationId": "delete_file",
+        "parameters": [
+          {
+            "description": "Provider file id, e.g. file-abc123",
+            "in": "path",
+            "name": "file_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FileDeletedResponse"
+                }
+              }
+            },
+            "description": "File deleted"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiErrorResponse"
+                }
+              }
+            },
+            "description": "No such file created by the caller"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Gateway"
+        ],
+        "x-maturity": "experimental"
+      },
+      "get": {
+        "operationId": "retrieve_file",
+        "parameters": [
+          {
+            "description": "Provider file id, e.g. file-abc123",
+            "in": "path",
+            "name": "file_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FileObject"
+                }
+              }
+            },
+            "description": "File object"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiErrorResponse"
+                }
+              }
+            },
+            "description": "No such file created by the caller"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Gateway"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/v1/files/{file_id}/content": {
+      "get": {
+        "operationId": "file_content",
+        "parameters": [
+          {
+            "description": "Provider file id, e.g. a batch's output_file_id",
+            "in": "path",
+            "name": "file_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/octet-stream": {}
+            },
+            "description": "File content (JSONL for batch files), streamed"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiErrorResponse"
+                }
+              }
+            },
+            "description": "No such file created by the caller"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Gateway"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
     "/ai/v1/models": {
       "get": {
         "operationId": "list_models",
@@ -64299,6 +65288,191 @@
             "bearer_auth": []
           }
         ],
+        "tags": [
+          "AI Gateway"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/v1/responses": {
+      "post": {
+        "operationId": "create_response",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResponsesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResponseObject"
+                }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResponseStreamEvent"
+                }
+              }
+            },
+            "description": "JSON when stream=false, SSE when stream=true. Generated SDKs use the explicit /json and /stream operations."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request, or the model is not served by OpenAI"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiErrorResponse"
+                }
+              }
+            },
+            "description": "Model not allowed"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiErrorResponse"
+                }
+              }
+            },
+            "description": "Model or provider not configured"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Gateway"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/v1/responses/json": {
+      "post": {
+        "operationId": "create_response_json",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResponsesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResponseObject"
+                }
+              }
+            },
+            "description": "Complete response object; forces stream=false"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Explicit JSON contract for generated clients; the standard OpenAI route remains polymorphic.",
+        "tags": [
+          "AI Gateway"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/v1/responses/stream": {
+      "post": {
+        "operationId": "create_response_stream",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResponsesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResponseStreamEvent"
+                }
+              }
+            },
+            "description": "Incremental Responses events; forces stream=true"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Explicit SSE contract for generated clients; never buffers a successful event stream.",
         "tags": [
           "AI Gateway"
         ],

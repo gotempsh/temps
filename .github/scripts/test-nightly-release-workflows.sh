@@ -44,7 +44,7 @@ tag_aware_dispatch_count="$(
   # shellcheck disable=SC2016
   grep -Fc 'if [[ "$DRY_RUN" == "true" ]]; then' "$release_workflow"
 )"
-if [[ "$tag_aware_dispatch_count" -ne 6 ]]; then
+if [[ "$tag_aware_dispatch_count" -ne 7 ]]; then
   fail "expected release channel and version logic to distinguish dry-runs from tag dispatches"
 fi
 
@@ -78,12 +78,25 @@ abort "release builds can bypass ref validation" unless
 publish = release.dig("jobs", "create-release")
 abort "standalone runtime manifest is not a published release asset" unless
   publish.fetch("steps").any? { |step| step.fetch("run", "").match?(/release_assets=\([^)]*release\/runtime-images\.json/m) }
+abort "the release does not publish a git-cliff generated CHANGELOG.md" unless
+  publish.fetch("steps").any? { |step| step.fetch("uses", "").start_with?("orhun/git-cliff-action@") && step.dig("env", "OUTPUT") == "release/CHANGELOG.md" } &&
+  publish.fetch("steps").any? { |step| step.fetch("run", "").match?(/release_assets=\([^)]*release\/CHANGELOG\.md/m) }
+attest_steps = publish.fetch("steps").select { |step| step.fetch("uses", "").start_with?("actions/attest@") }
+abort "release tarballs must get provenance and SBOM attestations before publication" unless
+  attest_steps.length == 2 &&
+  attest_steps.all? { |step| step.dig("with", "subject-path").include?("release/temps-*.tar.gz") } &&
+  attest_steps.any? { |step| step.dig("with", "sbom-path") == "release/temps-sbom.spdx.json" } &&
+  publish.fetch("steps").index { |step| step["name"] == "Create GitHub Release" } >
+    publish.fetch("steps").rindex { |step| step.fetch("uses", "").start_with?("actions/attest@") }
 abort "public release can precede required daemon images" unless
   publish.fetch("needs").include?("runtime-image-manifest") &&
   publish.fetch("needs").include?("promote-runtime-images") && !publish.key?("if")
+%w[daemon-images build-and-push-sandbox-images build-and-push-preview-gateway].each do |name|
+  abort "#{name} publishes before tests" unless Array(release.dig("jobs", name, "needs")).include?("require-tests")
+end
 daemon_call = release.dig("jobs", "daemon-images")
 abort "daemon staging must follow ref validation without moving channel tags" unless
-  daemon_call["needs"] == "validate-release-ref" &&
+  daemon_call["needs"].sort == %w[validate-release-ref require-tests].sort &&
   daemon_call.dig("with", "revision_only") == true && !daemon_call.key?("continue-on-error")
 manifest = release.dig("jobs", "runtime-image-manifest")
 abort "manifest can precede one of the required image sets" unless
@@ -101,6 +114,23 @@ abort "manifest can precede one of the required image sets" unless
   abort "#{platform} tarball omits runtime manifest" unless
     job.fetch("steps").any? { |step| step.fetch("run", "").include?("-C release-inputs runtime-images.json") }
 end
+# Nothing public may happen before rust-tests.yml has passed for the commit.
+gate = release.dig("jobs", "require-tests")
+abort "release test gate is missing or can be skipped" unless
+  gate && gate["needs"] == "validate-release-ref" && !gate.key?("if") && !gate.key?("continue-on-error")
+gate_run = gate.fetch("steps").map { |step| step.fetch("run", "") }.join("\n")
+abort "release test gate does not wait for rust-tests.yml on the released SHA" unless
+  gate_run.include?("release_test_gate.py") && gate_run.include?("--workflow rust-tests.yml") &&
+  gate.fetch("steps").any? { |step| step.dig("env", "RELEASE_SHA") == "${{ github.sha }}" }
+abort "the test gate bypass must be an explicit, default-off dispatch input" unless
+  # Psych reads the bare `on:` key as YAML 1.1 boolean true.
+  (release["on"] || release[true]).dig("workflow_dispatch", "inputs", "skip_test_gate", "default") == false
+%w[promote-runtime-images create-release].each do |name|
+  abort "#{name} can publish before the test gate passes" unless
+    Array(release.dig("jobs", name, "needs")).include?("require-tests")
+end
+abort "the server image can be pushed before the test gate passes" unless
+  Array(release.dig("jobs", "build-and-push-docker", "needs")).include?("create-release")
 promotion = release.dig("jobs", "promote-runtime-images")
 abort "runtime aliases can move before binaries pass" unless
   (%w[build-linux-amd64 build-linux-arm64 build-darwin-amd64 build-darwin-arm64] - promotion["needs"]).empty? &&
@@ -230,8 +260,9 @@ abort "release workflow must deny token permissions by default" unless
 read_contents = {"contents" => "read"}
 publish_packages = {"contents" => "read", "packages" => "write"}
 expected_release_permissions = {
-  "daemon-images" => publish_packages,
+  "daemon-images" => publish_packages.merge("id-token" => "write"),
   "validate-release-ref" => read_contents,
+  "require-tests" => {"actions" => "read", "contents" => "read"},
   "runtime-image-manifest" => {"contents" => "read", "packages" => "read"},
   "promote-runtime-images" => publish_packages,
   "build-web-assets" => read_contents,
@@ -239,12 +270,12 @@ expected_release_permissions = {
   "build-linux-arm64" => read_contents,
   "build-darwin-amd64" => read_contents,
   "build-darwin-arm64" => read_contents,
-  "create-release" => {"contents" => "write"},
+  "create-release" => {"contents" => "write", "id-token" => "write", "attestations" => "write"},
   "build-and-push-docker" => publish_packages,
-  "create-docker-manifest" => publish_packages,
+  "create-docker-manifest" => publish_packages.merge("id-token" => "write"),
   "prepare-sandbox-context" => read_contents,
-  "build-and-push-sandbox-images" => publish_packages,
-  "build-and-push-preview-gateway" => publish_packages,
+  "build-and-push-sandbox-images" => publish_packages.merge("id-token" => "write"),
+  "build-and-push-preview-gateway" => publish_packages.merge("id-token" => "write"),
 }
 actual_release_permissions = release.fetch("jobs").map do |name, job|
   [name, job["permissions"]]
@@ -276,10 +307,10 @@ abort "release workflow uses an unpinned wasm-pack version" unless
   wasm_pack_installs == ["cargo install wasm-pack --version 0.15.0 --locked"]
 
 expected_sandbox_permissions = {
-  "daemon-images" => publish_packages,
+  "daemon-images" => publish_packages.merge("id-token" => "write"),
   "prepare-context" => read_contents,
-  "build-and-push-sandbox-images" => publish_packages,
-  "build-and-push-preview-gateway" => publish_packages,
+  "build-and-push-sandbox-images" => publish_packages.merge("id-token" => "write"),
+  "build-and-push-preview-gateway" => publish_packages.merge("id-token" => "write"),
 }
 actual_sandbox_permissions = sandbox.fetch("jobs").map do |name, job|
   [name, job["permissions"]]
@@ -310,19 +341,58 @@ expect_decision() {
 }
 
 expect_decision $'should_release=true\nshould_create_tag=true\nexisting_tag=' \
-  new-sha "" "" false missing
+  new-sha "" "" false missing success
 expect_decision $'should_release=true\nshould_create_tag=true\nexisting_tag=' \
-  new-sha old-tag old-sha true success
+  new-sha old-tag old-sha true success success
 expect_decision $'should_release=false\nshould_create_tag=false\nexisting_tag=nightly-tag' \
-  same-sha nightly-tag same-sha true success
+  same-sha nightly-tag same-sha true success success
 expect_decision $'should_release=false\nshould_create_tag=false\nexisting_tag=nightly-tag' \
-  same-sha nightly-tag same-sha false active
+  same-sha nightly-tag same-sha false active success
 expect_decision $'should_release=true\nshould_create_tag=false\nexisting_tag=nightly-tag' \
-  same-sha nightly-tag same-sha false missing
+  same-sha nightly-tag same-sha false missing success
 expect_decision $'should_release=true\nshould_create_tag=false\nexisting_tag=nightly-tag' \
-  same-sha nightly-tag same-sha true failed
+  same-sha nightly-tag same-sha true failed success
 expect_decision $'should_release=true\nshould_create_tag=false\nexisting_tag=nightly-tag' \
-  same-sha nightly-tag same-sha false success
+  same-sha nightly-tag same-sha false success success
+# A commit that failed rust-tests.yml is never tagged or re-dispatched...
+expect_decision $'should_release=false\nshould_create_tag=false\nexisting_tag=' \
+  new-sha old-tag old-sha true success failed
+expect_decision $'should_release=false\nshould_create_tag=false\nexisting_tag=nightly-tag' \
+  same-sha nightly-tag same-sha false failed failed
+# ...but a pending, missing or unknown test state still proceeds: release.yml's
+# own gate waits for it or rejects it.
+for tests_state in pending missing unknown; do
+  expect_decision $'should_release=true\nshould_create_tag=true\nexisting_tag=' \
+    new-sha old-tag old-sha true success "$tests_state"
+done
+if "$decision_script" new-sha old-tag old-sha true success bogus >/dev/null 2>&1; then
+  fail "the nightly decision accepted an unknown tests state"
+fi
+
+channel_script="$repository_root/.github/scripts/release-channel.sh"
+expect_channel() {
+  local expected="$1" actual
+  shift
+  actual="$("$channel_script" "$@")"
+  if [[ "$actual" != "$expected" ]]; then
+    fail "unexpected release channel for '$*': expected '$expected', got '$actual'"
+  fi
+}
+# Docker channels: nightlies must never move :beta, ad-hoc prereleases move
+# nothing, and dry-runs never look stable.
+expect_channel $'is_prerelease=false\nchannel_tag=latest' false v1.2.3
+expect_channel $'is_prerelease=true\nchannel_tag=beta' false v0.1.0-beta.56
+expect_channel $'is_prerelease=true\nchannel_tag=beta' false v1.0.0-rc.1
+expect_channel $'is_prerelease=true\nchannel_tag=nightly' false v0.1.0-nightly.20261004.32a8e9c1
+expect_channel $'is_prerelease=true\nchannel_tag=' false v0.1.0-test
+expect_channel $'is_prerelease=true\nchannel_tag=' false v0.1.0-beta
+expect_channel $'is_prerelease=true\nchannel_tag=beta' true main
+if "$channel_script" false latest >/dev/null 2>&1; then
+  fail "a malformed tag was assigned a release channel"
+fi
+# shellcheck disable=SC2016
+grep -Fq '.github/scripts/release-channel.sh "$DRY_RUN" "$RELEASE_TAG"' "$release_workflow" ||
+  fail "create-release does not use the tested channel script"
 
 "$validation_script" true branch main >/dev/null
 "$validation_script" false tag v0.1.0 >/dev/null
@@ -339,3 +409,5 @@ fi
 
 echo "nightly release workflow wiring and publishing workflow security are valid"
 python3 "$repository_root/.github/scripts/test_release_image_manifest.py"
+
+python3 "$repository_root/.github/scripts/test_sign_release_image.py"

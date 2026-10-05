@@ -48,6 +48,11 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
+import {
+  failureSettingsLink,
+  failureStageLabel,
+  failureTimeoutSummary,
+} from '@/lib/deployment-failure-guidance'
 import { deploymentFailureSummary } from '@/lib/deployment-failure-summary'
 import {
   deploymentRedeployPlan,
@@ -465,34 +470,103 @@ function SecondaryActions({
 }
 
 // Top-level failure/cancellation banner shown directly under the header for
-// deployments that didn't succeed.
-function CancelledReason({ deployment }: { deployment: DeploymentResponse }) {
+// deployments that didn't succeed. Failed deployments also carry a server-side
+// classification (stage, code, concrete fix and the settings page that fixes
+// it), which leads the banner; the raw error stays one click away.
+function CancelledReason({
+  deployment,
+  projectSlug,
+}: {
+  deployment: DeploymentResponse
+  projectSlug: string
+}) {
   const [isExpanded, setIsExpanded] = useState(false)
   if (!deployment.cancelled_reason) return null
   const isCancelled = deployment.status === 'cancelled'
   const failureReason = deploymentFailureSummary(deployment.cancelled_reason)
+  const failure = isCancelled ? null : deployment.failure
+  const settingsLink = failure
+    ? failureSettingsLink(failure.settings_section, projectSlug)
+    : null
+  const timeoutSummary = failure ? failureTimeoutSummary(failure) : null
   return (
-    <div className="flex items-start gap-2.5 rounded-lg border border-destructive/30 bg-destructive/5 p-4">
+    <div
+      className="flex items-start gap-2.5 rounded-lg border border-destructive/30 bg-destructive/5 p-4"
+      data-testid="deployment-failure-banner"
+    >
       <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
-      <div className="min-w-0">
-        <p className="text-sm font-medium text-destructive">
-          {isCancelled ? 'Deployment cancelled' : 'Deployment failed'}
-        </p>
-        <p className="mt-0.5 whitespace-pre-wrap break-words text-sm text-destructive/80">
-          {isExpanded ? failureReason.fullReason : failureReason.summary}
-        </p>
-        {failureReason.hasMore && (
-          <Button
-            type="button"
-            variant="link"
-            size="sm"
-            className="mt-1 h-auto p-0 text-xs text-destructive underline-offset-4"
-            aria-expanded={isExpanded}
-            onClick={() => setIsExpanded((expanded) => !expanded)}
-          >
-            {isExpanded ? 'Collapse error' : 'Show full error'}
-          </Button>
+      <div className="min-w-0 flex-1 space-y-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <p className="text-sm font-medium text-destructive">
+            {isCancelled
+              ? 'Deployment cancelled'
+              : failure
+                ? `Deployment failed: ${failure.title}`
+                : 'Deployment failed'}
+          </p>
+          {failure && (
+            <Badge
+              variant="outline"
+              className="border-destructive/30 text-destructive"
+              data-testid="deployment-failure-stage"
+            >
+              {failureStageLabel(failure.stage)}
+            </Badge>
+          )}
+          {failure && failure.code !== 'unknown' && (
+            <code className="rounded bg-destructive/10 px-1.5 py-0.5 text-xs text-destructive/80">
+              {failure.code}
+            </code>
+          )}
+        </div>
+        {failure && (
+          <div className="space-y-1.5" data-testid="deployment-failure-fix">
+            <p className="text-sm text-foreground">
+              <span className="font-medium">How to fix: </span>
+              {failure.remediation}
+            </p>
+            {(timeoutSummary || failure.failed_job) && (
+              <p className="text-xs text-muted-foreground">
+                {[
+                  failure.failed_job
+                    ? `Failed step: ${failure.failed_job}`
+                    : null,
+                  timeoutSummary,
+                ]
+                  .filter(Boolean)
+                  .join(' · ')}
+              </p>
+            )}
+            {settingsLink && (
+              <Button asChild variant="outline" size="sm" className="h-7">
+                <Link to={settingsLink.href}>
+                  Open {settingsLink.label}
+                  <ExternalLink className="ml-1.5 h-3 w-3" />
+                </Link>
+              </Button>
+            )}
+          </div>
         )}
+        <div>
+          {failure && (
+            <p className="text-xs font-medium text-muted-foreground">Error</p>
+          )}
+          <p className="whitespace-pre-wrap break-words text-sm text-destructive/80">
+            {isExpanded ? failureReason.fullReason : failureReason.summary}
+          </p>
+          {failureReason.hasMore && (
+            <Button
+              type="button"
+              variant="link"
+              size="sm"
+              className="mt-1 h-auto p-0 text-xs text-destructive underline-offset-4"
+              aria-expanded={isExpanded}
+              onClick={() => setIsExpanded((expanded) => !expanded)}
+            >
+              {isExpanded ? 'Collapse error' : 'Show full error'}
+            </Button>
+          )}
+        </div>
       </div>
     </div>
   )
@@ -1220,6 +1294,9 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
         deployment.cancelled_reason
           ? `Failure reason: ${deployment.cancelled_reason}.`
           : '',
+        deployment.failure
+          ? `Classified as ${deployment.failure.code} in the ${deployment.failure.stage} stage. Suggested fix: ${deployment.failure.remediation}`
+          : '',
         'Fetch details via the temps CLI: `deployments get_deployment`, `get_deployment_jobs`, `get_deployment_job_logs`.',
       ]
         .filter(Boolean)
@@ -1411,7 +1488,7 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
         />
 
         {/* Failure/cancellation reason — prominent, directly under the header. */}
-        <CancelledReason deployment={deployment} />
+        <CancelledReason deployment={deployment} projectSlug={project.slug} />
 
         {/* Failed Compose candidates are the primary debugging surface, so
             keep their live logs beside the concise failure summary instead

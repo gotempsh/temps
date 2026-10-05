@@ -230,6 +230,10 @@ async fn deployment_response_with_service_urls(
     components(schemas(
         DeploymentListResponse,
         DeploymentResponse,
+        crate::services::DeploymentFailureInfo,
+        crate::services::DeploymentFailureStage,
+        crate::services::DeploymentFailureCode,
+        crate::services::FailureSettingsSection,
         LatestDeploymentMediaResponse,
         LatestDeploymentMediaResponseItem,
         DeploymentStateResponse,

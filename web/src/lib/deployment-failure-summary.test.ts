@@ -6,6 +6,15 @@ import { describe, expect, test } from 'bun:test'
 import { deploymentFailureSummary } from './deployment-failure-summary'
 
 describe('deployment failure summary', () => {
+  test('preserves literal Rust option strings in application logs', () => {
+    const logs =
+      'Container logs for unhealthy/stopped services:\nSome("first") then Some("second")'
+    expect(
+      deploymentFailureSummary(`Job execution failed: crash\n${logs}`)
+        .fullReason
+    ).toBe(`crash\n${logs}`)
+  })
+
   test('keeps a short failure unchanged', () => {
     expect(deploymentFailureSummary('Image pull failed')).toEqual({
       fullReason: 'Image pull failed',

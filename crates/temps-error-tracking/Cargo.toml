@@ -66,3 +66,4 @@ temps-migrations = { path = "../temps-migrations" }
 tokio-test = "0.4"
 axum-test = "21.0.0"
 serial_test = "4.0"
+semver = { workspace = true }

@@ -266,7 +266,12 @@ WORKDIR /{project_slug}
         // cache mount, so when the lockfile changes only new or changed
         // packages are downloaded. `node_modules` itself stays in the layer:
         // the runtime stage copies it.
-        let install_cmd_line = if config.use_buildkit {
+        // Yarn environment variables override repository configuration. A
+        // configured local/offline cache must remain at its declared path.
+        let configured_yarn = matches!(package_manager, PackageManager::Yarn)
+            && (workspace_manifests::has_yarn_install_config(config.root_local_path)
+                || workspace_manifests::has_yarn_install_config(config.local_path));
+        let install_cmd_line = if config.use_buildkit && !configured_yarn {
             let (store_dir, store_env) = package_manager.store_cache();
             let env_lines: String = store_env
                 .iter()
@@ -513,7 +518,11 @@ mod tests {
             std::fs::write(root.join("package.json"), "{}").unwrap();
             std::fs::create_dir_all(root.join(".git/refs")).unwrap();
             std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
-            std::fs::write(root.join(".npmrc"), "//registry.example.test/:_authToken=test-only").unwrap();
+            std::fs::write(
+                root.join(".npmrc"),
+                "//registry.example.test/:_authToken=test-only",
+            )
+            .unwrap();
             std::fs::write(root.join("node_modules/shared/index.js"), "shared").unwrap();
             std::fs::write(app.join(".next/static/chunk.js"), "chunk").unwrap();
             std::fs::write(app.join("public/asset.txt"), "asset").unwrap();
@@ -583,9 +592,21 @@ mod tests {
                 assert!(start.contains("require.resolve('next/dist/bin/next')"));
                 let next = runtime.join("node_modules/next/dist/bin");
                 std::fs::create_dir_all(&next).unwrap();
-                std::fs::write(next.join("next.js"), "if (process.argv[2] !== 'start') process.exit(1); console.log('started');").unwrap();
-                let output = std::process::Command::new("sh").arg(dir.path().join("start.sh")).current_dir(&packaged_app).output().unwrap();
-                assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+                std::fs::write(
+                    next.join("next.js"),
+                    "if (process.argv[2] !== 'start') process.exit(1); console.log('started');",
+                )
+                .unwrap();
+                let output = std::process::Command::new("sh")
+                    .arg(dir.path().join("start.sh"))
+                    .current_dir(&packaged_app)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
                 assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "started");
                 assert!(runtime.join("node_modules/shared/index.js").is_file());
             }
@@ -1138,6 +1159,74 @@ mod tests {
         assert!(manifests < web && web < install, "{dockerfile}");
         assert!(install < sources && sources < build, "{dockerfile}");
         assert_eq!(dockerfile.matches("COPY . .\n").count(), 1, "{dockerfile}");
+    }
+
+    #[tokio::test]
+    async fn deeply_nested_workspace_inputs_are_copied_before_install() {
+        let repo = turbo_workspace();
+        write(
+            repo.path(),
+            "pnpm-workspace.yaml",
+            "packages:\n  - apps/*\n  - packages/**\n",
+        );
+        write(
+            repo.path(),
+            "packages/a/b/c/d/library/package.json",
+            r#"{"name":"deep","scripts":{"postinstall":"node prepare.js"}}"#,
+        );
+        let dockerfile = generate(repo.path(), true).await;
+        let copy = dockerfile
+            .find("COPY . .\n")
+            .expect("complete install context");
+        let install = dockerfile.find("pnpm install").expect("install step");
+        assert!(copy < install, "{dockerfile}");
+        assert!(
+            dockerfile.contains("workspace search reached"),
+            "{dockerfile}"
+        );
+        assert!(
+            !dockerfile.contains("COPY [\"apps/web/package.json\""),
+            "{dockerfile}"
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_yarn_install_preserves_repository_cache_and_inputs() {
+        for berry in [false, true] {
+            let repo = tempfile::tempdir().unwrap();
+            write(
+                repo.path(),
+                "package.json",
+                r#"{"private":true,"workspaces":["apps/*"]}"#,
+            );
+            write(repo.path(), "yarn.lock", "");
+            write(repo.path(), "apps/web/package.json", r#"{"name":"web"}"#);
+            if berry {
+                write(repo.path(), ".yarnrc.yml", "enableGlobalCache: false\nenableNetwork: false\nyarnPath: .yarn/releases/yarn.cjs\n");
+                write(repo.path(), ".yarn/releases/yarn.cjs", "fixture");
+                write(repo.path(), ".yarn/cache/package.zip", "fixture");
+                write(repo.path(), ".pnp.cjs", "fixture");
+            } else {
+                write(
+                    repo.path(),
+                    ".yarnrc",
+                    "yarn-offline-mirror ./offline-packages\n",
+                );
+                write(repo.path(), "offline-packages/package.tgz", "fixture");
+            }
+            let dockerfile = generate(repo.path(), true).await;
+            let copy = dockerfile
+                .find("COPY . .\n")
+                .expect("complete offline inputs");
+            let install = dockerfile
+                .find("RUN yarn install --frozen-lockfile")
+                .expect("configured Yarn install");
+            assert!(copy < install, "{dockerfile}");
+            assert_eq!(dockerfile.matches("COPY . .\n").count(), 1, "{dockerfile}");
+            assert!(!dockerfile.contains("YARN_CACHE_FOLDER"), "{dockerfile}");
+            assert!(!dockerfile.contains("YARN_GLOBAL_FOLDER"), "{dockerfile}");
+            assert!(!dockerfile.contains("id=yarn_store"), "{dockerfile}");
+        }
     }
 
     #[tokio::test]

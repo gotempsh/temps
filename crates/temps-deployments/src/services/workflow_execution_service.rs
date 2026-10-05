@@ -34,9 +34,7 @@ use crate::jobs::{
 use crate::services::DeploymentJobTracker;
 use temps_screenshots::ScreenshotService;
 
-/// Version of the allowlisted failure taxonomy emitted in deployment telemetry.
-/// Increment this when matching semantics or wire labels change.
-const FAILURE_CLASSIFIER_VERSION: u8 = 1;
+use crate::services::failure_classifier::{classify_failure_reason, FAILURE_CLASSIFIER_VERSION};
 
 /// A lexically-last retained status used after a cleanup attempt fails.
 ///
@@ -77,21 +75,6 @@ fn cleanup_snapshot_condition(
         .add(deleted_condition)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeploymentFailureStage {
-    Source,
-    Configuration,
-    DependencyInstall,
-    Build,
-    Image,
-    Deploy,
-    Runtime,
-    HealthCheck,
-    Resource,
-    Platform,
-    Unknown,
-}
-
 /// Read all per-service Compose runtime selections together so a new setting
 /// cannot be persisted successfully and then be silently omitted by the
 /// deployment workflow.
@@ -108,112 +91,6 @@ fn compose_service_security_settings(
     }
 }
 
-impl DeploymentFailureStage {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Source => "source",
-            Self::Configuration => "configuration",
-            Self::DependencyInstall => "dependency_install",
-            Self::Build => "build",
-            Self::Image => "image",
-            Self::Deploy => "deploy",
-            Self::Runtime => "runtime",
-            Self::HealthCheck => "health_check",
-            Self::Resource => "resource",
-            Self::Platform => "platform",
-            Self::Unknown => "unknown",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeploymentFailureCode {
-    OutOfMemory,
-    DiskExhausted,
-    Timeout,
-    HealthCheckFailed,
-    RepositoryAuthentication,
-    RepositoryNotFound,
-    RepositoryClone,
-    DnsResolution,
-    NetworkConnection,
-    DependencyLockfileOutOfSync,
-    DependencyResolution,
-    DependencyDownload,
-    RuntimeVersionUnsupported,
-    MissingBuildScript,
-    CompileError,
-    DockerfileInvalid,
-    BaseImagePull,
-    ImageMissing,
-    StaticOutputMissing,
-    PortUnavailable,
-    PermissionDenied,
-    InvalidConfiguration,
-    ContainerStart,
-    BuildError,
-    PlatformInternal,
-    Cancelled,
-    Unknown,
-}
-
-impl DeploymentFailureCode {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::OutOfMemory => "out_of_memory",
-            Self::DiskExhausted => "disk_exhausted",
-            Self::Timeout => "timeout",
-            Self::HealthCheckFailed => "health_check_failed",
-            Self::RepositoryAuthentication => "repository_authentication",
-            Self::RepositoryNotFound => "repository_not_found",
-            Self::RepositoryClone => "repository_clone",
-            Self::DnsResolution => "dns_resolution",
-            Self::NetworkConnection => "network_connection",
-            Self::DependencyLockfileOutOfSync => "dependency_lockfile_out_of_sync",
-            Self::DependencyResolution => "dependency_resolution",
-            Self::DependencyDownload => "dependency_download",
-            Self::RuntimeVersionUnsupported => "runtime_version_unsupported",
-            Self::MissingBuildScript => "missing_build_script",
-            Self::CompileError => "compile_error",
-            Self::DockerfileInvalid => "dockerfile_invalid",
-            Self::BaseImagePull => "base_image_pull",
-            Self::ImageMissing => "image_missing",
-            Self::StaticOutputMissing => "static_output_missing",
-            Self::PortUnavailable => "port_unavailable",
-            Self::PermissionDenied => "permission_denied",
-            Self::InvalidConfiguration => "invalid_configuration",
-            Self::ContainerStart => "container_start",
-            Self::BuildError => "build_error",
-            Self::PlatformInternal => "platform_internal",
-            Self::Cancelled => "cancelled",
-            Self::Unknown => "unknown",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DeploymentFailureClassification {
-    stage: DeploymentFailureStage,
-    code: DeploymentFailureCode,
-    /// Coarse pre-taxonomy value retained for telemetry consumers that already
-    /// group by `reason`.
-    legacy_reason: &'static str,
-}
-
-impl DeploymentFailureClassification {
-    const fn new(
-        stage: DeploymentFailureStage,
-        code: DeploymentFailureCode,
-        legacy_reason: &'static str,
-    ) -> Self {
-        Self {
-            stage,
-            code,
-            legacy_reason,
-        }
-    }
-}
-
 /// Whether a deployment's stored commit names something to check out.
 ///
 /// An empty string is "no commit" (older manual triggers stored ''), and the
@@ -225,10 +102,6 @@ fn is_concrete_commit_ref(commit: &str) -> bool {
     !commit.is_empty() && !commit.eq_ignore_ascii_case("HEAD")
 }
 
-fn contains_any(reason: &str, signals: &[&str]) -> bool {
-    signals.iter().any(|signal| reason.contains(signal))
-}
-
 /// Add bounded template context without allowing operator-defined template
 /// slugs to become identifying or high-cardinality outbound telemetry.
 fn with_template_telemetry(
@@ -238,364 +111,13 @@ fn with_template_telemetry(
     event.with_template_provenance(template_slug)
 }
 
-/// Preserve the pre-taxonomy `reason` wire value exactly for existing
-/// telemetry consumers. New stage/code matching may be more specific, but it
-/// must not silently change this compatibility dimension.
-fn legacy_failure_reason(reason: Option<&str>) -> &'static str {
-    let Some(reason) = reason else {
-        return "unknown";
-    };
-    let reason = reason.to_lowercase();
-
-    if reason.contains("out of memory")
-        || reason.contains("oom")
-        || reason.contains("exit code 137")
-    {
-        "oom"
-    } else if reason.contains("timeout")
-        || reason.contains("timed out")
-        || reason.contains("deadline")
-    {
-        "timeout"
-    } else if reason.contains("health check")
-        || reason.contains("healthcheck")
-        || reason.contains("unhealthy")
-    {
-        "health_check"
-    } else if reason.contains("build") || reason.contains("compile") || reason.contains("nixpacks")
-    {
-        "build_error"
-    } else if reason.contains("clone")
-        || reason.contains("network")
-        || reason.contains("connection")
-        || reason.contains("download")
-        || reason.contains("dns")
-    {
-        "network"
-    } else if reason.contains("image")
-        && (reason.contains("not found")
-            || reason.contains("missing")
-            || reason.contains("no such"))
-    {
-        "image_missing"
-    } else if reason.contains("cancel") {
-        "cancelled"
-    } else {
-        "unknown"
-    }
-}
-
-/// Classify a deployment's free-form failure reason locally into fixed,
-/// NON-identifying labels. The raw reason can contain secrets, source code,
-/// paths, repository names, and dependency names, so it must never leave the
-/// instance. Matching order is deliberately most-specific-first.
-fn classify_failure_reason(reason: Option<&str>) -> DeploymentFailureClassification {
-    let Some(reason) = reason else {
-        return DeploymentFailureClassification::new(
-            DeploymentFailureStage::Unknown,
-            DeploymentFailureCode::Unknown,
-            "unknown",
-        );
-    };
-    let r = reason.to_lowercase();
-
-    let classification =
-        if contains_any(&r, &["out of memory", "oom", "oomkilled", "exit code 137"]) {
-            DeploymentFailureClassification::new(
-                DeploymentFailureStage::Resource,
-                DeploymentFailureCode::OutOfMemory,
-                "oom",
-            )
-        } else if contains_any(
-            &r,
-            &["no space left on device", "disk quota exceeded", "enospc"],
-        ) {
-            DeploymentFailureClassification::new(
-                DeploymentFailureStage::Resource,
-                DeploymentFailureCode::DiskExhausted,
-                "unknown",
-            )
-        } else if contains_any(&r, &["health check", "healthcheck", "unhealthy"]) {
-            DeploymentFailureClassification::new(
-                DeploymentFailureStage::HealthCheck,
-                DeploymentFailureCode::HealthCheckFailed,
-                "health_check",
-            )
-        } else if contains_any(&r, &["timeout", "timed out", "deadline"]) {
-            DeploymentFailureClassification::new(
-                DeploymentFailureStage::Platform,
-                DeploymentFailureCode::Timeout,
-                "timeout",
-            )
-        } else if contains_any(
-            &r,
-            &[
-                "authentication failed",
-                "could not read username",
-                "permission denied (publickey)",
-                "invalid credentials",
-            ],
-        ) {
-            DeploymentFailureClassification::new(
-                DeploymentFailureStage::Source,
-                DeploymentFailureCode::RepositoryAuthentication,
-                "network",
-            )
-        } else if contains_any(&r, &["repository not found", "remote ref does not exist"]) {
-            DeploymentFailureClassification::new(
-                DeploymentFailureStage::Source,
-                DeploymentFailureCode::RepositoryNotFound,
-                "network",
-            )
-        } else if contains_any(&r, &["failed to clone", "git clone", "clone task failed"]) {
-            DeploymentFailureClassification::new(
-                DeploymentFailureStage::Source,
-                DeploymentFailureCode::RepositoryClone,
-                "network",
-            )
-        } else if contains_any(
-            &r,
-            &[
-                "could not resolve host",
-                "name or service not known",
-                "dns lookup failed",
-                "dns resolution",
-            ],
-        ) {
-            DeploymentFailureClassification::new(
-                DeploymentFailureStage::Source,
-                DeploymentFailureCode::DnsResolution,
-                "network",
-            )
-        } else if contains_any(
-            &r,
-            &[
-                "err_pnpm_outdated_lockfile",
-                "frozen lockfile",
-                "lockfile is out of date",
-                "package-lock.json is not in sync",
-                "yarn.lock needs to be updated",
-            ],
-        ) {
-            DeploymentFailureClassification::new(
-                DeploymentFailureStage::DependencyInstall,
-                DeploymentFailureCode::DependencyLockfileOutOfSync,
-                "build_error",
-            )
-        } else if contains_any(
-            &r,
-            &[
-                "eresolve",
-                "could not resolve dependency",
-                "unable to resolve dependency tree",
-                "version solving failed",
-            ],
-        ) {
-            DeploymentFailureClassification::new(
-                DeploymentFailureStage::DependencyInstall,
-                DeploymentFailureCode::DependencyResolution,
-                "build_error",
-            )
-        } else if contains_any(
-            &r,
-            &[
-                "failed to download",
-                "error fetching packages",
-                "package download failed",
-                "registry request failed",
-            ],
-        ) {
-            DeploymentFailureClassification::new(
-                DeploymentFailureStage::DependencyInstall,
-                DeploymentFailureCode::DependencyDownload,
-                "network",
-            )
-        } else if contains_any(
-            &r,
-            &[
-                "ebadengine",
-                "unsupported engine",
-                "unsupported runtime",
-                "runtime version not found",
-                "no matching version found",
-            ],
-        ) {
-            DeploymentFailureClassification::new(
-                DeploymentFailureStage::Configuration,
-                DeploymentFailureCode::RuntimeVersionUnsupported,
-                "build_error",
-            )
-        } else if contains_any(
-            &r,
-            &[
-                "missing script: build",
-                "command \"build\" not found",
-                "couldn't find a script named \"build\"",
-            ],
-        ) {
-            DeploymentFailureClassification::new(
-                DeploymentFailureStage::Build,
-                DeploymentFailureCode::MissingBuildScript,
-                "build_error",
-            )
-        } else if contains_any(
-            &r,
-            &[
-                "compilation failed",
-                "failed to compile",
-                "syntax error",
-                "type error",
-                "typescript error",
-            ],
-        ) {
-            DeploymentFailureClassification::new(
-                DeploymentFailureStage::Build,
-                DeploymentFailureCode::CompileError,
-                "build_error",
-            )
-        } else if r.contains("dockerfile")
-            && contains_any(
-                &r,
-                &["parse error", "invalid", "failed to read", "not found"],
-            )
-        {
-            DeploymentFailureClassification::new(
-                DeploymentFailureStage::Configuration,
-                DeploymentFailureCode::DockerfileInvalid,
-                "build_error",
-            )
-        } else if contains_any(
-            &r,
-            &[
-                "failed to pull image",
-                "pull access denied",
-                "manifest unknown",
-                "failed to resolve source metadata",
-            ],
-        ) {
-            DeploymentFailureClassification::new(
-                DeploymentFailureStage::Image,
-                DeploymentFailureCode::BaseImagePull,
-                "network",
-            )
-        } else if r.contains("image")
-            && contains_any(&r, &["not found", "missing", "no such image"])
-        {
-            DeploymentFailureClassification::new(
-                DeploymentFailureStage::Image,
-                DeploymentFailureCode::ImageMissing,
-                "image_missing",
-            )
-        } else if contains_any(
-            &r,
-            &[
-                "static output directory not found",
-                "index.html not found",
-                "build output not found",
-            ],
-        ) {
-            DeploymentFailureClassification::new(
-                DeploymentFailureStage::Build,
-                DeploymentFailureCode::StaticOutputMissing,
-                "build_error",
-            )
-        } else if contains_any(
-            &r,
-            &[
-                "address already in use",
-                "failed to find available port",
-                "no available port",
-            ],
-        ) {
-            DeploymentFailureClassification::new(
-                DeploymentFailureStage::Deploy,
-                DeploymentFailureCode::PortUnavailable,
-                "unknown",
-            )
-        } else if contains_any(&r, &["permission denied", "operation not permitted"]) {
-            DeploymentFailureClassification::new(
-                DeploymentFailureStage::Platform,
-                DeploymentFailureCode::PermissionDenied,
-                "unknown",
-            )
-        } else if contains_any(
-            &r,
-            &[
-                "failed to parse .temps.yaml",
-                "invalid configuration",
-                "configuration validation failed",
-            ],
-        ) {
-            DeploymentFailureClassification::new(
-                DeploymentFailureStage::Configuration,
-                DeploymentFailureCode::InvalidConfiguration,
-                "unknown",
-            )
-        } else if contains_any(
-            &r,
-            &[
-                "failed to start container",
-                "container failed to start",
-                "container exited before",
-            ],
-        ) {
-            DeploymentFailureClassification::new(
-                DeploymentFailureStage::Runtime,
-                DeploymentFailureCode::ContainerStart,
-                "unknown",
-            )
-        } else if contains_any(
-            &r,
-            &["connection refused", "connection reset", "network error"],
-        ) {
-            DeploymentFailureClassification::new(
-                DeploymentFailureStage::Platform,
-                DeploymentFailureCode::NetworkConnection,
-                "network",
-            )
-        } else if contains_any(&r, &["build", "compile", "nixpacks"]) {
-            DeploymentFailureClassification::new(
-                DeploymentFailureStage::Build,
-                DeploymentFailureCode::BuildError,
-                "build_error",
-            )
-        } else if contains_any(&r, &["clone", "network", "connection", "download", "dns"]) {
-            DeploymentFailureClassification::new(
-                DeploymentFailureStage::Platform,
-                DeploymentFailureCode::NetworkConnection,
-                "network",
-            )
-        } else if r.contains("cancel") {
-            DeploymentFailureClassification::new(
-                DeploymentFailureStage::Platform,
-                DeploymentFailureCode::Cancelled,
-                "cancelled",
-            )
-        } else if contains_any(
-            &r,
-            &[
-                "workflow execution failed",
-                "internal error",
-                "job validation failed",
-            ],
-        ) {
-            DeploymentFailureClassification::new(
-                DeploymentFailureStage::Platform,
-                DeploymentFailureCode::PlatformInternal,
-                "unknown",
-            )
-        } else {
-            DeploymentFailureClassification::new(
-                DeploymentFailureStage::Unknown,
-                DeploymentFailureCode::Unknown,
-                "unknown",
-            )
-        };
-
-    DeploymentFailureClassification {
-        legacy_reason: legacy_failure_reason(Some(reason)),
-        ..classification
-    }
+/// Cancellation is a typed control-flow outcome, never a substring of
+/// user-controlled build output or runtime logs.
+fn is_workflow_cancellation(error: &WorkflowError, _message: &str) -> bool {
+    matches!(
+        error,
+        WorkflowError::WorkflowCancelled | WorkflowError::BuildCancelled
+    )
 }
 
 fn deploy_failed_telemetry_event(
@@ -964,9 +486,7 @@ impl WorkflowExecutionService {
                 // the console, and the "Job execution failed:" prefix only
                 // repeats what the "Deployment failed" banner already says.
                 let error_message = e.detail();
-                let lower_error_message = error_message.to_lowercase();
-                let is_cancellation = lower_error_message.contains("cancelled")
-                    || lower_error_message.contains("canceled");
+                let is_cancellation = is_workflow_cancellation(&e, &error_message);
 
                 if is_cancellation {
                     info!(
@@ -1737,6 +1257,13 @@ impl WorkflowExecutionService {
                 let memory_limit_mb = resolve_i32(|c| c.memory_limit);
                 let cpu_request_micro = resolve_i32(|c| c.cpu_request);
                 let memory_request_mb = resolve_i32(|c| c.memory_request);
+                // Readiness budget: environment override, then project, then
+                // the platform default. A slow-booting app gets more time by
+                // raising this, instead of failing as a generic timeout.
+                let health_check_timeout_secs =
+                    temps_entities::deployment_config::resolve_health_check_timeout_seconds(
+                        resolve_i32(|c| c.health_check_timeout_seconds),
+                    );
                 let resources = ResourceUsage {
                     cpu_limit: cpu_limit_micro.map(|u| format!("{}u", u)),
                     memory_limit: memory_limit_mb.map(|mb| format!("{}Mi", mb)),
@@ -1767,6 +1294,7 @@ impl WorkflowExecutionService {
                 .audit_logger(self.audit_logger.get().cloned())
                 .port(port as u32)
                 .configured_port(configured_port)
+                .health_check_timeout_secs(health_check_timeout_secs)
                 .replicas(replicas)
                 .environment_variables(env_variables)
                 .remote_environment_variables(remote_env_variables)
@@ -2879,6 +2407,22 @@ impl WorkflowExecutionService {
                     .with_security_policy(compose_policy),
                 );
 
+                // Same startup-timeout setting as single-container deploys:
+                // environment override, then project, then the default.
+                let compose_ready_timeout_secs =
+                    temps_entities::deployment_config::resolve_health_check_timeout_seconds(
+                        environment
+                            .deployment_config
+                            .as_ref()
+                            .and_then(|c| c.health_check_timeout_seconds)
+                            .or_else(|| {
+                                project
+                                    .deployment_config
+                                    .as_ref()
+                                    .and_then(|c| c.health_check_timeout_seconds)
+                            }),
+                    );
+
                 let job = crate::jobs::DeployComposeJobBuilder::new()
                     .job_id(db_job.job_id.clone())
                     .deployment_id(deployment.id)
@@ -2893,6 +2437,7 @@ impl WorkflowExecutionService {
                     .excluded_services(excluded_services)
                     .relaxed_capability_services(relaxed_capability_services)
                     .unsandboxed_services(unsandboxed_services)
+                    .ready_timeout_secs(compose_ready_timeout_secs)
                     .public_ports(public_ports)
                     .download_job_id(download_job_id)
                     .environment_vars(env_vars)
@@ -3941,6 +3486,9 @@ mod tests {
         assert!(error.to_string().contains("artifact extraction"));
     }
     use super::*;
+    use crate::services::failure_classifier::{
+        legacy_failure_reason, DeploymentFailureCode, DeploymentFailureStage,
+    };
     use async_trait::async_trait;
     use chrono::Utc;
     use sea_orm::{ActiveModelTrait, DatabaseBackend, MockDatabase, Set};
@@ -4031,7 +3579,7 @@ mod tests {
             (
                 "application health check timed out",
                 DeploymentFailureStage::HealthCheck,
-                DeploymentFailureCode::HealthCheckFailed,
+                DeploymentFailureCode::HealthCheckTimeout,
             ),
             (
                 "authentication failed while fetching repository",
@@ -4166,7 +3714,10 @@ mod tests {
         assert_eq!(event.event_type, "deploy_failed");
         assert_eq!(event.properties["failure_stage"], "build");
         assert_eq!(event.properties["failure_code"], "build_error");
-        assert_eq!(event.properties["classifier_version"], 1);
+        assert_eq!(
+            event.properties["classifier_version"],
+            FAILURE_CLASSIFIER_VERSION
+        );
         assert_eq!(event.properties["is_template"], true);
         assert_eq!(event.properties["template_source"], "bundled");
         assert_eq!(event.properties["template_slug"], "observability-starter");
@@ -4254,6 +3805,26 @@ mod tests {
             "7f05d217867b2af52b0a28c6d1c91df97e1b5b39"
         ));
         assert!(is_concrete_commit_ref("7f05d21"));
+    }
+
+    #[test]
+    fn go_context_canceled_is_a_failure_not_a_cancellation() {
+        let docker_abort = WorkflowError::JobExecutionFailed(
+            "Required job 'deploy_container' failed: Failed to start container: context canceled"
+                .to_string(),
+        );
+        assert!(!is_workflow_cancellation(
+            &docker_abort,
+            &docker_abort.to_string()
+        ));
+
+        let typed = WorkflowError::WorkflowCancelled;
+        assert!(is_workflow_cancellation(&typed, &typed.to_string()));
+
+        let compose = WorkflowError::JobExecutionFailed(
+            "Compose deployment was cancelled after teardown".to_string(),
+        );
+        assert!(!is_workflow_cancellation(&compose, &compose.to_string()));
     }
 
     #[test]

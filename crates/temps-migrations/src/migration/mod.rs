@@ -309,6 +309,8 @@ mod m20260929_000002_node_pairing_rejection;
 mod m20260929_000003_node_ssh_enrollments;
 mod m20260929_000004_mesh_hub;
 mod m20261002_000001_add_bunny_hostname_owned;
+mod m20261005_000001_ai_gateway_objects;
+mod m20261005_000002_ai_batch_reconciliation;
 
 pub struct Migrator;
 
@@ -689,6 +691,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260929_000002_node_pairing_rejection::Migration),
             Box::new(m20260929_000003_node_ssh_enrollments::Migration),
             Box::new(m20260929_000004_mesh_hub::Migration),
+            Box::new(m20261005_000001_ai_gateway_objects::Migration),
+            Box::new(m20261005_000002_ai_batch_reconciliation::Migration),
         ]
     }
 }

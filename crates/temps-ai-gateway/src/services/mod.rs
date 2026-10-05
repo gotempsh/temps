@@ -3,6 +3,7 @@
 
 pub mod ai_service;
 pub mod gateway_service;
+pub mod native_api_service;
 pub mod provider_capabilities;
 pub mod provider_key_service;
 pub mod provider_model_service;
@@ -11,7 +12,8 @@ pub mod structured_output;
 pub mod usage_service;
 
 pub use ai_service::GatewayAiService;
-pub use gateway_service::{ByokOverride, CredentialType, GatewayService};
+pub use gateway_service::{ByokOverride, CredentialType, GatewayService, ResolvedCredentials};
+pub use native_api_service::{NativeApiService, Owner};
 pub use provider_capabilities::gateway_provider_capabilities;
 pub use provider_key_service::ProviderKeyService;
 pub use provider_model_service::ProviderModelService;

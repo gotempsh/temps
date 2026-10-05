@@ -4923,6 +4923,9 @@ impl ProjectService {
         if let Some(max_concurrent_connections) = config.max_concurrent_connections {
             deployment_config.max_concurrent_connections = Some(max_concurrent_connections);
         }
+        if let Some(health_check_timeout_seconds) = config.health_check_timeout_seconds {
+            deployment_config.health_check_timeout_seconds = Some(health_check_timeout_seconds);
+        }
 
         // Validate the deployment config
         deployment_config
