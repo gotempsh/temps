@@ -613,12 +613,14 @@ async fn idle_watchdog(clock: &ActivityClock, timeout: Duration) {
 // ---------------------------------------------------------------------------
 
 struct StreamEntry {
+    /// Upgrade requests have no HTTP body channel. Their request EOF must
+    /// never close the sender later installed for WebSocket relay bytes.
+    upgrade_requested: bool,
     /// Where the next inbound data frame's payload goes: the request body
     /// channel before a response is sent, or the WebSocket relay-write
     /// channel afterward (swapped exactly once, on a successful upgrade).
-    /// `None` means "no body expected" (a GET with no declared
-    /// `Content-Length`) — an inbound data frame arriving in that state is a
-    /// protocol violation from Cloud and is logged, not delivered anywhere.
+    /// `None` means an explicitly empty or completed request body. A body
+    /// without `Content-Length` stays open until Cloud sends `ConsoleStreamEnd`.
     inbound: Arc<StdMutex<Option<mpsc::Sender<Bytes>>>>,
     /// Bytes still expected on `inbound` before it is closed (dropped) to
     /// signal end-of-body to the router. `< 0` means "unbounded / not
@@ -884,6 +886,57 @@ async fn handle_envelope(
         handle_stream_open(shared.clone(), open, enabled).await;
         return;
     }
+    if let Some(end) = envelope.decode::<ConsoleStreamEnd>(ConsoleStreamEnd::KIND) {
+        if end.reason == ConsoleStreamEndReason::Complete {
+            // This closes only the request side: the router can now finish
+            // reading an unknown-length body and send its response normally.
+            let truncated = {
+                let table = shared.streams.lock().unwrap_or_else(|p| p.into_inner());
+                table.get(&end.stream_id).and_then(|entry| {
+                    if entry.upgrade_requested {
+                        entry.activity.touch();
+                        return None;
+                    }
+                    let remaining = entry.remaining_inbound_bytes.load(Ordering::Acquire);
+                    if remaining > 0 {
+                        entry.abort.abort();
+                        Some(remaining)
+                    } else {
+                        entry
+                            .inbound
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .take();
+                        entry.activity.touch();
+                        None
+                    }
+                })
+            };
+            if let Some(remaining) = truncated {
+                end_stream(
+                    shared,
+                    end.stream_id,
+                    ConsoleStreamEndReason::Error {
+                        detail: format!(
+                            "request body ended with {remaining} declared bytes missing"
+                        ),
+                    },
+                )
+                .await;
+            }
+        } else {
+            // An aborted body must never reach a handler as a successful EOF.
+            let entry = shared
+                .streams
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&end.stream_id);
+            if let Some(entry) = entry {
+                entry.abort.abort();
+            }
+        }
+        return;
+    }
     if let Some(cancel) = envelope.decode::<ConsoleStreamCancel>(ConsoleStreamCancel::KIND) {
         let entry = shared
             .streams
@@ -1054,9 +1107,9 @@ async fn handle_stream_open(shared: Arc<ConnectionShared>, open: ConsoleStreamOp
 
     let content_length = header_value(&open.headers, "content-length").and_then(|value| {
         let parsed: u64 = value.trim().parse().ok()?;
-        (parsed > 0).then_some(parsed)
+        i64::try_from(parsed).ok()
     });
-    let (inbound_tx, inbound_rx) = if content_length.is_some() && !open.upgrade_requested {
+    let (inbound_tx, inbound_rx) = if content_length != Some(0) && !open.upgrade_requested {
         let (tx, rx) = mpsc::channel(STREAM_BODY_CHANNEL_CAPACITY);
         (Some(tx), Some(rx))
     } else {
@@ -1064,14 +1117,13 @@ async fn handle_stream_open(shared: Arc<ConnectionShared>, open: ConsoleStreamOp
     };
 
     let inbound = Arc::new(StdMutex::new(inbound_tx));
-    let remaining_inbound_bytes = Arc::new(AtomicI64::new(
-        content_length.map(|n| n as i64).unwrap_or(-1),
-    ));
+    let remaining_inbound_bytes = Arc::new(AtomicI64::new(content_length.unwrap_or(-1)));
     let outbound_credit = Arc::new(tokio::sync::Semaphore::new(
         CONSOLE_STREAM_WINDOW_BYTES as usize,
     ));
     let activity = Arc::new(ActivityClock::new());
 
+    let upgrade_requested = open.upgrade_requested;
     let stream_shared = shared.clone();
     let inbound_for_task = inbound.clone();
     let remaining_for_task = remaining_inbound_bytes.clone();
@@ -1103,6 +1155,7 @@ async fn handle_stream_open(shared: Arc<ConnectionShared>, open: ConsoleStreamOp
         .insert(
             stream_id,
             StreamEntry {
+                upgrade_requested,
                 inbound,
                 remaining_inbound_bytes,
                 outbound_credit,
@@ -2766,6 +2819,7 @@ mod tests {
             shared.streams.lock().unwrap().insert(
                 Uuid::new_v4(),
                 StreamEntry {
+                    upgrade_requested: false,
                     inbound: Arc::new(StdMutex::new(None)),
                     remaining_inbound_bytes: Arc::new(AtomicI64::new(-1)),
                     outbound_credit: Arc::new(tokio::sync::Semaphore::new(0)),
@@ -2918,6 +2972,139 @@ mod tests {
             .unwrap();
         assert_eq!(end.stream_id, open.stream_id);
         assert_eq!(end.reason, ConsoleStreamEndReason::Complete);
+        harness.cancel_tx.send(true).unwrap();
+        harness.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unknown_length_request_bodies_finish_on_cloud_end() {
+        let Some((url, mut server_rx)) = fake_cloud_server().await else {
+            return;
+        };
+        let harness = Harness::start(&url).await;
+        harness
+            .set_router(Router::new().route(
+                "/echo",
+                axum::routing::any(|body: Bytes| async move { body }),
+            ))
+            .await;
+        let mut cloud = server_rx.recv().await.unwrap();
+        cloud_handshake(&mut cloud).await;
+        send_oidc_config(&mut cloud).await;
+        // HTTP/1 chunked, HTTP/2 with no length, GET with a body, and empty
+        // requests all use the same explicit request-side EOF contract.
+        for (method, framing, payload) in [
+            (
+                "POST",
+                Some(("transfer-encoding", "chunked")),
+                b"chunked body".as_slice(),
+            ),
+            ("POST", None, b"http2 body".as_slice()),
+            ("GET", None, b"get body".as_slice()),
+            ("POST", None, b"".as_slice()),
+            ("POST", Some(("content-length", "0")), b"".as_slice()),
+        ] {
+            let id = Uuid::new_v4();
+            let mut open = open_request(id, method, "/echo");
+            if let Some((name, value)) = framing {
+                open.headers.push((name.into(), value.into()));
+            }
+            send_control(&mut cloud, ConsoleStreamOpen::KIND, &open).await;
+            for chunk in payload.chunks(4) {
+                send_data(
+                    &mut cloud,
+                    ConsoleFrameKind::RequestBodyChunk,
+                    id,
+                    Bytes::copy_from_slice(chunk),
+                )
+                .await;
+                let envelope =
+                    tokio::time::timeout(Duration::from_secs(3), recv_control(&mut cloud))
+                        .await
+                        .unwrap();
+                let update: ConsoleWindowUpdate = envelope
+                    .decode(ConsoleWindowUpdate::KIND)
+                    .expect("request chunks must replenish credit before EOF");
+                assert_eq!(update.additional_bytes as usize, chunk.len());
+            }
+            send_control(
+                &mut cloud,
+                ConsoleStreamEnd::KIND,
+                &ConsoleStreamEnd {
+                    stream_id: id,
+                    reason: ConsoleStreamEndReason::Complete,
+                },
+            )
+            .await;
+            let (head, body) =
+                tokio::time::timeout(Duration::from_secs(3), expect_response(&mut cloud, id))
+                    .await
+                    .unwrap();
+            assert_eq!(head.status, 200);
+            assert_eq!(body, payload);
+        }
+        harness.cancel_tx.send(true).unwrap();
+        harness.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn premature_request_end_rejects_a_truncated_declared_body() {
+        let Some((url, mut server_rx)) = fake_cloud_server().await else {
+            return;
+        };
+        let harness = Harness::start(&url).await;
+        let (called_tx, mut called_rx) = mpsc::channel(1);
+        harness
+            .set_router(Router::new().route(
+                "/echo",
+                axum::routing::post(move |body: Bytes| {
+                    let called_tx = called_tx.clone();
+                    async move {
+                        called_tx.send(()).await.unwrap();
+                        body
+                    }
+                }),
+            ))
+            .await;
+        let mut cloud = server_rx.recv().await.unwrap();
+        cloud_handshake(&mut cloud).await;
+        send_oidc_config(&mut cloud).await;
+        let id = Uuid::new_v4();
+        let mut open = open_request(id, "POST", "/echo");
+        open.headers.push(("content-length".into(), "10".into()));
+        send_control(&mut cloud, ConsoleStreamOpen::KIND, &open).await;
+        send_data(
+            &mut cloud,
+            ConsoleFrameKind::RequestBodyChunk,
+            id,
+            Bytes::from_static(b"short"),
+        )
+        .await;
+        assert_eq!(
+            recv_control(&mut cloud).await.kind,
+            ConsoleWindowUpdate::KIND
+        );
+        send_control(
+            &mut cloud,
+            ConsoleStreamEnd::KIND,
+            &ConsoleStreamEnd {
+                stream_id: id,
+                reason: ConsoleStreamEndReason::Complete,
+            },
+        )
+        .await;
+        let envelope = tokio::time::timeout(Duration::from_secs(3), recv_control(&mut cloud))
+            .await
+            .unwrap();
+        let end: ConsoleStreamEnd = envelope.decode(ConsoleStreamEnd::KIND).unwrap();
+        assert!(matches!(end.reason, ConsoleStreamEndReason::Error { .. }));
+        assert!(
+            !matches!(
+                tokio::time::timeout(Duration::from_millis(200), called_rx.recv()).await,
+                Ok(Some(()))
+            ),
+            "partial body must never execute the handler"
+        );
         harness.cancel_tx.send(true).unwrap();
         harness.join.await.unwrap();
     }
@@ -3436,6 +3623,16 @@ mod tests {
             .push(("sec-websocket-version".into(), "13".into()));
         send_control(&mut cloud, ConsoleStreamOpen::KIND, &open).await;
 
+        send_control(
+            &mut cloud,
+            ConsoleStreamEnd::KIND,
+            &ConsoleStreamEnd {
+                stream_id,
+                reason: ConsoleStreamEndReason::Complete,
+            },
+        )
+        .await;
+
         let envelope = recv_control(&mut cloud).await;
         assert_eq!(envelope.kind, ConsoleResponseHead::KIND);
         let head: ConsoleResponseHead = envelope
@@ -3450,10 +3647,16 @@ mod tests {
         // genuine RFC 6455 framing over the relay.
         let (to_instance_tx, mut to_instance_rx) = mpsc::channel::<bytes::Bytes>(64);
         let (from_instance_tx, from_instance_rx) = mpsc::channel::<bytes::Bytes>(64);
+        let (eof_tx, mut eof_rx) = mpsc::channel::<tokio::sync::oneshot::Sender<()>>(1);
         let pump = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     biased;
+                    Some(ack) = eof_rx.recv() => {
+                        send_control(&mut cloud, ConsoleStreamEnd::KIND,
+                            &ConsoleStreamEnd { stream_id, reason: ConsoleStreamEndReason::Complete }).await;
+                        let _ = ack.send(());
+                    }
                     outgoing = to_instance_rx.recv() => {
                         match outgoing {
                             Some(bytes) => {
@@ -3505,6 +3708,15 @@ mod tests {
             .expect("echo arrives")
             .expect("echo readable");
         assert_eq!(large_echo.into_data(), large_message);
+
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        eof_tx
+            .send(ack_tx)
+            .await
+            .expect("request EOF must reach pump");
+        ack_rx
+            .await
+            .expect("request EOF must be sent before the next WebSocket frame");
 
         ws.send(Message::Text("hello over the tunnel".into()))
             .await

@@ -275,10 +275,11 @@ fn is_valid_cluster_secret(value: &str) -> bool {
 // SCRAM authentication for pg_auto_failover's infrastructure roles
 // ---------------------------------------------------------------------------
 //
-// Each fragment is idempotent and used twice: by the member entrypoints (so a
-// new or restarted container converges) and by the in-place upgrade the
-// control plane runs against already-running clusters
-// (`PostgresClusterService::auth_upgrade_command`). The upgrade runs them in
+// Each fragment is idempotent and shared by SCRAM-native member creation
+// and the in-place upgrade the control plane runs against existing clusters.
+// The upgrade uses `PostgresClusterService::auth_upgrade_command`; a restarted
+// monitor preserves its volume's authentication until every peer is prepared.
+// The upgrade runs them in
 // the order of `AuthUpgradeStep::ORDER`: every password is distributed while
 // the legacy `trust` rules still admit everyone, and only then are the rules
 // switched to SCRAM, so no connection that is needed for replication or
@@ -293,6 +294,7 @@ const MONITOR_PREPARE_SNIPPET: &str = r#"gosu postgres pg_autoctl config set --p
   for _ in $(seq 1 120); do
     if printf '%s\n' "ALTER ROLE autoctl_node PASSWORD :'pw';" \
       | gosu postgres psql -X -q -p "$MONITOR_PORT" -d pg_auto_failover -v ON_ERROR_STOP=1 -v pw="$AUTOCTL_NODE_PASSWORD" >/dev/null 2>&1; then
+      rm -f "${PGDATA%/*}/.temps-monitor-scram-initializing" || exit 1
       exit 0
     fi
     sleep 1
@@ -579,9 +581,11 @@ fi"#
     fn monitor_command(&self) -> Vec<String> {
         // The entrypoint script handles:
         // 1. pg_autoctl create monitor (if not initialized), with SCRAM auth
-        // 2. SCRAM-only HBA for autoctl_node + its password (see
-        //    MONITOR_ENFORCE_SNIPPET / MONITOR_PREPARE_SNIPPET); also
-        //    upgrades volumes created with `trust`
+        // 2. Install SCRAM HBA + the role password on first creation, or
+        //    resume an interrupted creation marked on the persistent volume.
+        //    Existing volumes retain their authentication on restart: legacy
+        //    peers must receive credentials through the staged cluster-wide
+        //    upgrade before the monitor can stop accepting trust connections.
         // 3. Remove stale pidfile (prevents "already running with PID 1" on restart)
         // 4. pg_autoctl run
         //
@@ -590,9 +594,12 @@ fi"#
             "bash".to_string(),
             "-c".to_string(),
             [
+                "set -e",
                 "PGDATA=/var/lib/postgresql/monitor",
+                r#"AUTH_PENDING="${PGDATA%/*}/.temps-monitor-scram-initializing""#,
                 "chown -R postgres:postgres /var/lib/postgresql",
                 "if ! gosu postgres pg_autoctl config get --pgdata \"$PGDATA\" postgresql.pgdata >/dev/null 2>&1; then",
+                "  touch \"$AUTH_PENDING\"",
                 "  gosu postgres pg_autoctl create monitor \\",
                 "    --pgdata \"$PGDATA\" \\",
                 "    --pgport \"$MONITOR_PORT\" \\",
@@ -600,8 +607,10 @@ fi"#
                 "    --auth scram-sha-256 \\",
                 "    --ssl-self-signed;",
                 "fi",
+                "if [ -f \"$AUTH_PENDING\" ]; then",
                 MONITOR_ENFORCE_SNIPPET,
                 MONITOR_PREPARE_SNIPPET,
+                "fi",
                 "rm -f /tmp/pg_autoctl/*.pid /tmp/pg_autoctl/*/*.pid",
                 "exec gosu postgres pg_autoctl run --pgdata \"$PGDATA\"",
             ]
@@ -1470,6 +1479,74 @@ rm -f "$HBA""#
         assert!(conn_str.starts_with("postgresql://admin:secret@"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn restarting_an_initialized_monitor_preserves_existing_authentication() {
+        use std::os::unix::fs::PermissionsExt;
+        // Execute the actual entrypoint with isolated command stubs and a
+        // temporary volume. No Docker daemon or operator resources are touched.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        for command in ["chown", "rm"] {
+            let path = bin.join(command);
+            std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let gosu = bin.join("gosu");
+        std::fs::write(
+            &gosu,
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "$COMMAND_LOG"
+exit 0
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(gosu, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The command generator never contacts Docker; use an HTTP client
+        // constructor that does not require a local socket to exist.
+        let docker =
+            Docker::connect_with_http("http://127.0.0.1:1", 120, bollard::API_DEFAULT_VERSION)
+                .unwrap();
+        let service = PostgresClusterService::new("test".into(), Arc::new(docker));
+        let script = service.monitor_command()[2].replace(
+            "/var/lib/postgresql/monitor",
+            dir.path().join("monitor").to_str().unwrap(),
+        );
+        let pgdata = dir.path().join("monitor");
+        std::fs::create_dir(&pgdata).unwrap();
+        // Include a partially prepared legacy volume: setting auth_method
+        // earlier in an interrupted upgrade does not prove peers are ready.
+        for auth_method in ["trust", "scram-sha-256"] {
+            let hba = format!("hostssl all autoctl_node 0.0.0.0/0 {auth_method}\n");
+            std::fs::write(pgdata.join("pg_hba.conf"), &hba).unwrap();
+            let log = dir.path().join("commands");
+            std::fs::write(&log, "").unwrap();
+            let output = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(&script)
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .env("COMMAND_LOG", &log)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "monitor restart failed: {output:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(pgdata.join("pg_hba.conf")).unwrap(),
+                hba
+            );
+            let calls = std::fs::read_to_string(log).unwrap();
+            assert!(calls.contains("pg_autoctl run"));
+            assert!(!calls.contains("config set"));
+            assert!(
+                !calls.contains("psql"),
+                "restart must not change credentials independently"
+            );
+        }
+    }
+
     #[test]
     fn test_monitor_command_contains_ssl() {
         let docker = Docker::connect_with_defaults()
@@ -1635,7 +1712,8 @@ mod scram_docker_tests {
     use bollard::exec::{CreateExecOptions, StartExecResults};
     use bollard::models::{ContainerCreateBody, HostConfig, NetworkCreateRequest};
     use bollard::query_parameters::{
-        CreateContainerOptionsBuilder, RemoveContainerOptions, StartContainerOptions,
+        CreateContainerOptionsBuilder, RemoveContainerOptions, RenameContainerOptions,
+        StartContainerOptions, StopContainerOptions,
     };
     use futures::{FutureExt, StreamExt};
     use std::time::{Duration, Instant};
@@ -1697,6 +1775,16 @@ mod scram_docker_tests {
         }
 
         async fn run(&mut self, name: &str, env: &HashMap<String, String>, cmd: Vec<String>) {
+            self.run_with_volume(name, env, cmd, None).await;
+        }
+
+        async fn run_with_volume(
+            &mut self,
+            name: &str,
+            env: &HashMap<String, String>,
+            cmd: Vec<String>,
+            volume_from: Option<&str>,
+        ) {
             let body = ContainerCreateBody {
                 image: Some(DEFAULT_CLUSTER_IMAGE.to_string()),
                 cmd: Some(cmd),
@@ -1704,6 +1792,7 @@ mod scram_docker_tests {
                 hostname: Some(name.to_string()),
                 host_config: Some(HostConfig {
                     network_mode: Some(self.network.clone()),
+                    volumes_from: volume_from.map(|name| vec![format!("{name}:rw")]),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -1720,6 +1809,49 @@ mod scram_docker_tests {
                 .start_container(name, None::<StartContainerOptions>)
                 .await
                 .unwrap_or_else(|e| panic!("start {name}: {e}"));
+        }
+
+        async fn recreate_with_volume(
+            &mut self,
+            name: &str,
+            env: &HashMap<String, String>,
+            cmd: Vec<String>,
+        ) {
+            let retired = format!("{name}-retired");
+            let state = self
+                .docker
+                .inspect_container(name, None)
+                .await
+                .unwrap()
+                .state
+                .unwrap();
+            if state.running == Some(true) {
+                self.docker
+                    .stop_container(
+                        name,
+                        Some(StopContainerOptions {
+                            t: Some(10),
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .unwrap();
+            }
+            self.docker
+                .rename_container(
+                    name,
+                    RenameContainerOptions {
+                        name: retired.clone(),
+                    },
+                )
+                .await
+                .unwrap();
+            *self
+                .containers
+                .iter_mut()
+                .find(|entry| entry.as_str() == name)
+                .unwrap() = retired.clone();
+            self.run_with_volume(name, env, cmd, Some(&retired)).await;
         }
 
         async fn exec(
@@ -1982,12 +2114,46 @@ mod scram_docker_tests {
                     crate::externalsvc::ServiceResourceLimits::default(),
                     &auth,
                 );
-                fx.run(
-                    &params.container_name,
-                    &params.environment,
-                    params.command.clone().expect("member command"),
-                )
-                .await;
+                let command = params.command.clone().expect("member command");
+                if spec.ordinal == 0 {
+                    // Crash after pg_autoctl has persisted its configuration,
+                    // before authentication initialization completes. The
+                    // pending marker must survive on this test's volume.
+                    let mut interrupted = command.clone();
+                    interrupted[2] = interrupted[2].replace(
+                        MONITOR_ENFORCE_SNIPPET,
+                        "test -f \"$AUTH_PENDING\" || exit 76\nexit 75",
+                    );
+                    fx.run(&params.container_name, &params.environment, interrupted)
+                        .await;
+                    tokio::time::timeout(Duration::from_secs(120), async {
+                        loop {
+                            let state = fx
+                                .docker
+                                .inspect_container(&params.container_name, None)
+                                .await
+                                .unwrap()
+                                .state
+                                .unwrap();
+                            if state.running != Some(true) {
+                                assert_eq!(
+                                    state.exit_code,
+                                    Some(75),
+                                    "must interrupt after config and marker persist"
+                                );
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                        }
+                    })
+                    .await
+                    .expect("interrupted monitor must exit");
+                    fx.recreate_with_volume(&params.container_name, &params.environment, command)
+                        .await;
+                } else {
+                    fx.run(&params.container_name, &params.environment, command)
+                        .await;
+                }
                 if spec.ordinal == 1 {
                     fx.wait_for(
                         &monitor,
@@ -2004,6 +2170,17 @@ mod scram_docker_tests {
                 .await;
             fx.wait_for(&monitor, &n2, "secondary", Duration::from_secs(240))
                 .await;
+
+            let (code, out) = fx
+                .sh(
+                    &monitor,
+                    "test ! -f /var/lib/postgresql/.temps-monitor-scram-initializing",
+                )
+                .await;
+            assert_eq!(
+                code, 0,
+                "successful recovery must clear the pending marker: {out}"
+            );
 
             assert_infrastructure_roles_require_passwords(&fx, &n2, &monitor, &[&n1, &n2], &auth)
                 .await;
@@ -2083,6 +2260,19 @@ mod scram_docker_tests {
                 "legacy cluster admits the replicator without a password"
             );
 
+            // Recreate only this test's monitor with the current entrypoint
+            // and the legacy volume, before any peer has received passwords.
+            // Restarting one member must not perform a cluster-wide upgrade.
+            let mut env = auth.env();
+            env.insert("MONITOR_HOSTNAME".into(), monitor.clone());
+            env.insert("MONITOR_PORT".into(), "5432".into());
+            let svc = PostgresClusterService::new("test".into(), fx.docker.clone());
+            fx.recreate_with_volume(&monitor, &env, svc.monitor_command()).await;
+            fx.wait_for(&monitor, &n1, "primary", Duration::from_secs(120)).await;
+            fx.wait_for(&monitor, &n2, "secondary", Duration::from_secs(120)).await;
+            let (code, out) = fx.sh(&n1, &psql_probe(&monitor, "autoctl_node", "pg_auto_failover", "")).await;
+            assert_eq!(code, 0, "legacy peers must still reach the recreated monitor without a password: {out}");
+
             // In-place upgrade, in the order the control plane runs it.
             for step in AuthUpgradeStep::ORDER {
                 let targets: Vec<&String> = if step.targets_monitor() {
@@ -2138,8 +2328,8 @@ mod scram_docker_tests {
             fx.wait_for(&monitor, &n1, "secondary", Duration::from_secs(180))
                 .await;
 
-            // A restart runs the legacy entrypoint again; it must neither
-            // re-open trust nor lose the member.
+            // Restart the legacy node and the recreated monitor; neither
+            // entrypoint may reopen trust or lose the member.
             fx.docker
                 .restart_container(
                     &n1,
