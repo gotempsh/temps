@@ -329,6 +329,9 @@ WORKDIR /{project_slug}
         // Normalize the runtime tree after the build. Standalone mode is
         // selected from actual output, so functional/TypeScript configs work
         // without parsing or changing the user's Next.js configuration.
+        // `.git` stays in the build stage for builds that read VCS metadata,
+        // but never reaches the runtime image: the `next start` fallback
+        // copies the whole tree, and repository history must not ship.
         let app_relative = if matches!(build_system.monorepo_tool, MonorepoTool::None) {
             ""
         } else {
@@ -362,7 +365,8 @@ RUN mkdir -p public {runtime_app} && \
         cp -a /{project_slug}/. /temps-runtime/ && \
         printf '%s\n' '#!/bin/sh' "exec node \"\$(node -p \"require.resolve('next/dist/bin/next')\")\" start" > /temps-start.sh; \
     fi && \
-    find /temps-runtime -name .npmrc -type f -delete
+    find /temps-runtime -name .npmrc -type f -delete && \
+    find /temps-runtime -name .git -prune -exec rm -rf {{}} +
 
 # Stage 2: Production
 FROM {run_image} AS runner
@@ -507,6 +511,8 @@ mod tests {
             std::fs::create_dir_all(app.join("public")).unwrap();
             std::fs::create_dir_all(root.join("node_modules/shared")).unwrap();
             std::fs::write(root.join("package.json"), "{}").unwrap();
+            std::fs::create_dir_all(root.join(".git/refs")).unwrap();
+            std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
             std::fs::write(root.join(".npmrc"), "//registry.example.test/:_authToken=test-only").unwrap();
             std::fs::write(root.join("node_modules/shared/index.js"), "shared").unwrap();
             std::fs::write(app.join(".next/static/chunk.js"), "chunk").unwrap();
@@ -560,6 +566,7 @@ mod tests {
             let runtime = dir.path().join("runtime");
             let packaged_app = runtime.join(app_relative);
             assert!(!runtime.join(".npmrc").exists());
+            assert!(!runtime.join(".git").exists());
             assert_eq!(
                 std::fs::read_to_string(packaged_app.join("public/asset.txt")).unwrap(),
                 "asset"
