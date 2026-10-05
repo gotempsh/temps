@@ -132,6 +132,40 @@ pub enum WorkflowError {
     },
 }
 
+impl WorkflowError {
+    /// Whether this error is an *outcome of the workload being deployed*
+    /// rather than a fault in Temps itself.
+    ///
+    /// A build that fails on the user's code, an app that never passes its
+    /// health check, a rejected archive, a cancelled run or a placement the
+    /// operator has to fix are all recorded on the deployment (state, error
+    /// message, job logs) where the user acts on them. Logging those at ERROR
+    /// as well made every failed user deploy look like a server fault, so
+    /// callers log them at WARN and keep ERROR for the remaining variants:
+    /// a broken workflow definition, I/O or serialization failures inside
+    /// the executor, and uncategorised internal errors.
+    pub fn is_workload_outcome(&self) -> bool {
+        match self {
+            Self::JobExecutionFailed(_)
+            | Self::JobValidationFailed(_)
+            | Self::WorkflowCancelled
+            | Self::BuildCancelled
+            | Self::InvalidArchiveEntry { .. }
+            | Self::ArchiveTooLarge { .. }
+            | Self::InvalidBundlePath { .. }
+            | Self::CrossNodeServiceUnreachable { .. }
+            | Self::LocalWorkloadsDisabled(_)
+            | Self::DockerSocketNotMounted { .. }
+            | Self::DockerSocketDeployRequiresAdmin { .. } => true,
+            Self::DependencyCycleDetected(_)
+            | Self::JobNotFound(_)
+            | Self::IoError(_)
+            | Self::SerializationError(_)
+            | Self::Other(_) => false,
+        }
+    }
+}
+
 /// Trait for writing logs in real-time during workflow execution
 /// Each LogWriter is associated with a specific deployment stage and writes to its log file
 #[async_trait]
@@ -849,5 +883,30 @@ mod tests {
         );
         let artifact = context.get_artifact("job1", "build_artifact");
         assert_eq!(artifact, Some(&PathBuf::from("/tmp/artifact.tar.gz")));
+    }
+
+    #[test]
+    fn workload_outcomes_are_distinguished_from_internal_faults() {
+        let outcomes = [
+            WorkflowError::JobExecutionFailed("build exited with code 1".into()),
+            WorkflowError::JobValidationFailed("no Dockerfile".into()),
+            WorkflowError::WorkflowCancelled,
+            WorkflowError::BuildCancelled,
+            WorkflowError::ArchiveTooLarge { limit_bytes: 1 },
+            WorkflowError::LocalWorkloadsDisabled("control-plane profile".into()),
+        ];
+        for error in outcomes {
+            assert!(error.is_workload_outcome(), "{error} is a workload outcome");
+        }
+
+        let faults = [
+            WorkflowError::DependencyCycleDetected("a -> b -> a".into()),
+            WorkflowError::JobNotFound("deploy".into()),
+            WorkflowError::IoError(std::io::Error::other("disk full")),
+            WorkflowError::Other("tracker unavailable".into()),
+        ];
+        for error in faults {
+            assert!(!error.is_workload_outcome(), "{error} is an internal fault");
+        }
     }
 }

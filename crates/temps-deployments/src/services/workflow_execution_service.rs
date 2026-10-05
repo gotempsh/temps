@@ -977,6 +977,14 @@ impl WorkflowExecutionService {
                         "Deployment {} cancellation completed - workflow stopped gracefully",
                         deployment_id
                     );
+                } else if e.is_workload_outcome() {
+                    // The user's build/app failed: the outcome is recorded on
+                    // the deployment (state, reason, job logs) below. Not a
+                    // Temps fault, so not an ERROR.
+                    warn!(
+                        "Workflow execution failed for deployment {}: {}",
+                        deployment_id, e
+                    );
                 } else {
                     error!(
                         "Workflow execution failed for deployment {}: {}",
@@ -3841,6 +3849,31 @@ pub enum WorkflowExecutionError {
     Validation(String),
 }
 
+impl WorkflowExecutionError {
+    /// Whether this failure is an outcome of the deployment itself (the
+    /// user's build or app failed, the run was cancelled, a resource it
+    /// targeted was deleted mid-flight) rather than a fault in Temps.
+    ///
+    /// Outcomes are recorded on the deployment where the user acts on them,
+    /// so callers log them at WARN and keep ERROR for database failures and
+    /// a workflow Temps itself could not assemble.
+    pub fn is_workload_outcome(&self) -> bool {
+        match self {
+            Self::WorkflowFailed(error) => error.is_workload_outcome(),
+            Self::DeploymentNotFound(_)
+            | Self::ProjectNotFound(_)
+            | Self::EnvironmentNotFound(_)
+            | Self::Validation(_) => true,
+            Self::DatabaseError(_)
+            | Self::NoJobsFound(_)
+            | Self::MissingJobConfig(_)
+            | Self::InvalidJobConfig(_)
+            | Self::UnsupportedJobType(_)
+            | Self::JobCreationFailed(_) => false,
+        }
+    }
+}
+
 impl From<anyhow::Error> for WorkflowExecutionError {
     fn from(e: anyhow::Error) -> Self {
         WorkflowExecutionError::JobCreationFailed(e.to_string())
@@ -3849,6 +3882,34 @@ impl From<anyhow::Error> for WorkflowExecutionError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn user_caused_failures_are_workload_outcomes() {
+        use super::WorkflowExecutionError;
+        use temps_core::WorkflowError;
+
+        let outcomes = [
+            WorkflowExecutionError::WorkflowFailed(WorkflowError::JobExecutionFailed(
+                "Required job 'build' failed: exit code 1".into(),
+            )),
+            WorkflowExecutionError::WorkflowFailed(WorkflowError::WorkflowCancelled),
+            WorkflowExecutionError::DeploymentNotFound(3),
+            WorkflowExecutionError::Validation("bad port".into()),
+        ];
+        for error in outcomes {
+            assert!(error.is_workload_outcome(), "{error}");
+        }
+
+        let faults = [
+            WorkflowExecutionError::DatabaseError(sea_orm::DbErr::Custom("down".into())),
+            WorkflowExecutionError::WorkflowFailed(WorkflowError::Other("tracker".into())),
+            WorkflowExecutionError::NoJobsFound(3),
+            WorkflowExecutionError::UnsupportedJobType("X".into()),
+        ];
+        for error in faults {
+            assert!(!error.is_workload_outcome(), "{error}");
+        }
+    }
+
     #[test]
     fn worker_build_scope_rejects_mixed_architectures_and_static_before_building() {
         use super::validate_worker_build_scope;

@@ -7,8 +7,9 @@ use async_trait::async_trait;
 use headless_chrome::{Browser, LaunchOptions};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
+use temps_core::log_transitions::{FailureLatch, FailureLog, DEFAULT_REMINDER_INTERVAL};
 use tokio::sync::Mutex as AsyncMutex;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::error::{ScreenshotError, ScreenshotResult};
 use crate::provider::ScreenshotProvider;
@@ -29,6 +30,46 @@ use crate::provider::ScreenshotProvider;
 /// running -- see `check_availability`'s use of `lock_owned()`.
 static CHROME_LAUNCH_LOCK: LazyLock<Arc<AsyncMutex<()>>> =
     LazyLock::new(|| Arc::new(AsyncMutex::new(())));
+
+/// Whether headless Chrome is currently failing to launch on this host.
+///
+/// Chrome is an optional dependency: hosts without it simply don't get local
+/// deployment screenshots (or switch to a remote provider in Settings). It is
+/// reported once at WARN when first observed, with the fix, plus an hourly
+/// reminder — not as an ERROR on every availability probe and every
+/// deployment's screenshot attempt.
+static CHROME_UNAVAILABLE: FailureLatch = FailureLatch::new(DEFAULT_REMINDER_INTERVAL);
+
+/// Report that Chrome could not be launched. `reason` should name the fix.
+fn report_chrome_unavailable(latch: &FailureLatch, reason: &str) -> FailureLog {
+    let outcome = latch.record_failure();
+    match outcome {
+        FailureLog::Started => warn!(
+            "Local screenshots are unavailable: headless Chrome could not be launched: {}",
+            reason
+        ),
+        FailureLog::Reminder { consecutive } => warn!(
+            consecutive_failures = consecutive,
+            "Local screenshots are still unavailable: headless Chrome could not be launched: {}",
+            reason
+        ),
+        FailureLog::Suppressed { consecutive } => debug!(
+            consecutive_failures = consecutive,
+            "Headless Chrome is still unavailable: {}", reason
+        ),
+    }
+    outcome
+}
+
+/// Report that Chrome launched, logging the recovery if it had been failing.
+fn report_chrome_available(latch: &FailureLatch) {
+    if let Some(failures) = latch.record_success() {
+        info!(
+            previous_failures = failures,
+            "Headless Chrome is available again; local screenshots are enabled"
+        );
+    }
+}
 
 /// Local screenshot provider using headless Chrome
 pub struct LocalScreenshotProvider {
@@ -100,20 +141,29 @@ impl ScreenshotProvider for LocalScreenshotProvider {
                     .window_size(Some((width, height))) // Set window size
                     .build()
                     .map_err(|e| {
-                        error!("Failed to build launch options: {}", e);
+                        report_chrome_unavailable(
+                            &CHROME_UNAVAILABLE,
+                            &format!("failed to build launch options: {}", e),
+                        );
                         ScreenshotError::ChromeError(format!("Failed to build options: {}", e))
                     })?;
 
-                // Launch browser
+                // Launch browser. Failing here means Chrome (an optional
+                // dependency) is missing or broken on this host — reported
+                // once by the latch, and returned to the caller.
                 let browser = Browser::new(options).map_err(|e| {
-                    error!("Failed to launch Chrome browser: {}", e);
+                    report_chrome_unavailable(
+                        &CHROME_UNAVAILABLE,
+                        &format!("failed to launch browser: {}", e),
+                    );
                     ScreenshotError::ChromeError(format!("Failed to launch browser: {}", e))
                 })?;
 
+                report_chrome_available(&CHROME_UNAVAILABLE);
                 debug!("Browser launched successfully");
 
                 let tab = browser.new_tab().map_err(|e| {
-                    error!("Failed to create new tab: {}", e);
+                    warn!("Failed to create new Chrome tab for screenshot of {}: {}", url, e);
                     ScreenshotError::ChromeError(format!("Failed to create tab: {}", e))
                 })?;
 
@@ -129,8 +179,10 @@ impl ScreenshotProvider for LocalScreenshotProvider {
                 // Inject into every new document via Page.addScriptToEvaluateOnNewDocument
                 tab.evaluate(disable_animations_css, false).ok();
 
+                // The target is the user's deployed app; it being unreachable
+                // is the app's state, not a Temps fault.
                 tab.navigate_to(&url).map_err(|e| {
-                    error!("Failed to navigate to {}: {}", url, e);
+                    warn!("Failed to navigate to {} for screenshot: {}", url, e);
                     ScreenshotError::ChromeError(format!("Failed to navigate: {}", e))
                 })?;
 
@@ -177,7 +229,7 @@ impl ScreenshotProvider for LocalScreenshotProvider {
                         true, // Capture beyond viewport (full page)
                     )
                     .map_err(|e| {
-                        error!("Failed to capture screenshot: {}", e);
+                        warn!("Failed to capture screenshot of {}: {}", url, e);
                         ScreenshotError::ChromeError(format!("Screenshot capture failed: {}", e))
                     })?;
 
@@ -247,6 +299,7 @@ impl ScreenshotProvider for LocalScreenshotProvider {
         let reason = match check_result {
             Ok(Ok(Ok(Ok(())))) => {
                 debug!("Chrome browser is available");
+                report_chrome_available(&CHROME_UNAVAILABLE);
                 return Ok(());
             }
             Ok(Ok(Ok(Err(e)))) => e,
@@ -270,7 +323,7 @@ impl ScreenshotProvider for LocalScreenshotProvider {
              to a remote screenshot provider in Settings.",
             reason
         );
-        error!("Chrome browser is NOT available: {}", message);
+        report_chrome_unavailable(&CHROME_UNAVAILABLE, &message);
         Err(ScreenshotError::ChromeError(message))
     }
 }
@@ -278,6 +331,27 @@ impl ScreenshotProvider for LocalScreenshotProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_chrome_is_reported_once_until_it_becomes_available() {
+        let latch = FailureLatch::new(DEFAULT_REMINDER_INTERVAL);
+
+        assert_eq!(
+            report_chrome_unavailable(&latch, "no chrome binary"),
+            FailureLog::Started
+        );
+        // Every later probe or deployment screenshot stays quiet.
+        for _ in 0..10 {
+            assert!(!report_chrome_unavailable(&latch, "no chrome binary").should_log());
+        }
+        report_chrome_available(&latch);
+        assert!(!latch.is_failing());
+        // Breaking again (e.g. a package removed) is a new transition.
+        assert_eq!(
+            report_chrome_unavailable(&latch, "no chrome binary"),
+            FailureLog::Started
+        );
+    }
 
     // Concurrent real-Chrome-launch tests used to race on headless_chrome's
     // shared cached `fetch` binary and need their own lock. That's now

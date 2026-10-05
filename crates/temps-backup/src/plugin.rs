@@ -6,10 +6,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use temps_backup_core::BackupExecutorBuilder;
+use temps_core::log_transitions::{FailureLatch, FailureLog, KeyedFailureLatch};
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
@@ -462,18 +463,25 @@ impl TempsPlugin for BackupPlugin {
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(5 * 60));
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let failures = FailureLatch::default();
                 loop {
                     tick.tick().await;
                     match sweep_backup_alerts(alert_db.as_ref()).await {
-                        Ok(stats) if stats.has_changes() => info!(
-                            opened_overdue = stats.opened_overdue,
-                            opened_stalled = stats.opened_stalled,
-                            resolved_overdue = stats.resolved_overdue,
-                            resolved_stalled = stats.resolved_stalled,
-                            "backup alert sweep: state changes detected"
-                        ),
-                        Ok(_) => {}
-                        Err(e) => error!("backup alert sweep failed: {}", e),
+                        Ok(stats) => {
+                            report_periodic_success(&failures, "backup alert sweep");
+                            if stats.has_changes() {
+                                info!(
+                                    opened_overdue = stats.opened_overdue,
+                                    opened_stalled = stats.opened_stalled,
+                                    resolved_overdue = stats.resolved_overdue,
+                                    resolved_stalled = stats.resolved_stalled,
+                                    "backup alert sweep: state changes detected"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            report_periodic_failure(&failures, "backup alert sweep", &e);
+                        }
                     }
                 }
             });
@@ -501,21 +509,25 @@ impl TempsPlugin for BackupPlugin {
             let sweeper = pg_upgrade_service.clone();
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+                let failures = FailureLatch::new(HOURLY_SWEEP_REMINDER);
                 loop {
                     tick.tick().await;
                     match sweeper.sweep_expired_rollback_volumes().await {
-                        Ok(0) => {}
-                        Ok(n) => info!(
-                            removed = n,
-                            "swept expired Postgres-upgrade rollback volumes"
-                        ),
+                        Ok(0) => report_periodic_success(&failures, "Rollback-volume sweep"),
+                        Ok(n) => {
+                            report_periodic_success(&failures, "Rollback-volume sweep");
+                            info!(
+                                removed = n,
+                                "swept expired Postgres-upgrade rollback volumes"
+                            )
+                        }
                         Err(temps_providers::externalsvc::postgres_upgrade::PostgresUpgradeError::DockerUnavailable(e)) => {
                             // Expected on every tick of a profile with no
                             // local Docker daemon — nothing to sweep here.
                             info!("Rollback-volume sweep skipped: {}", e);
                         }
                         Err(e) => {
-                            error!("Rollback-volume sweep failed (will retry next tick): {}", e)
+                            report_periodic_failure(&failures, "Rollback-volume sweep", &e);
                         }
                     }
                 }
@@ -550,27 +562,40 @@ impl TempsPlugin for BackupPlugin {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
                 tick.tick().await;
                 let svc = S3LifecycleService::new(lifecycle_db, lifecycle_enc);
+                let list_failures = FailureLatch::new(HOURLY_SWEEP_REMINDER);
+                let source_failures = KeyedFailureLatch::new(HOURLY_SWEEP_REMINDER);
                 loop {
                     tick.tick().await;
                     let sources = match svc.sources_in_scope().await {
-                        Ok(s) => s,
+                        Ok(s) => {
+                            report_periodic_success(&list_failures, "S3 lifecycle sweep");
+                            s
+                        }
                         Err(e) => {
-                            error!(
-                                error = %e,
-                                "S3 lifecycle sweep: failed to list S3 sources",
+                            report_periodic_failure(
+                                &list_failures,
+                                "S3 lifecycle sweep (listing S3 sources)",
+                                &e,
                             );
                             continue;
                         }
                     };
+                    let in_scope: std::collections::HashSet<i32> =
+                        sources.iter().map(|source| source.id).collect();
+                    source_failures.retain(|id| in_scope.contains(id));
                     for source in sources {
                         match svc.reconcile_bucket(source.id).await {
-                            Ok(_) => {}
+                            Ok(_) => {
+                                if let Some(failures) = source_failures.record_success(&source.id) {
+                                    info!(
+                                        s3_source_id = source.id,
+                                        previous_failures = failures,
+                                        "S3 lifecycle reconcile recovered",
+                                    );
+                                }
+                            }
                             Err(e) => {
-                                error!(
-                                    s3_source_id = source.id,
-                                    error = %e,
-                                    "S3 lifecycle reconcile failed during sweep",
-                                );
+                                report_lifecycle_reconcile_failure(&source_failures, source.id, &e);
                             }
                         }
                     }
@@ -607,17 +632,24 @@ impl TempsPlugin for BackupPlugin {
                     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                     // First tick fires immediately so newly-created MariaDB
                     // services get a schedule shortly after startup.
+                    let failures = FailureLatch::default();
                     loop {
                         tick.tick().await;
-                        if let Err(e) = backup_service
+                        match backup_service
                             .reconcile_default_external_service_schedules()
                             .await
                         {
-                            error!(
-                                error = %e,
-                                "default-backup auto-provision reconcile failed \
-                                 (will retry next tick)"
-                            );
+                            Ok(()) => report_periodic_success(
+                                &failures,
+                                "default-backup auto-provision reconcile",
+                            ),
+                            Err(e) => {
+                                report_periodic_failure(
+                                    &failures,
+                                    "default-backup auto-provision reconcile",
+                                    &e,
+                                );
+                            }
                         }
                     }
                 }
@@ -659,9 +691,115 @@ impl TempsPlugin for BackupPlugin {
     }
 }
 
+/// How often a still-failing *hourly* sweep is re-reported. The default
+/// one-hour reminder would re-log every tick of an hourly loop.
+const HOURLY_SWEEP_REMINDER: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Log a failed run of a periodic backup task on state transitions only.
+///
+/// These loops (alert sweep, default-schedule reconcile, rollback-volume
+/// sweep) fail when the database or Docker is unreachable — Temps faults, so
+/// ERROR — but they re-run every few minutes, and logging every run turned
+/// one outage into a steady stream of identical ERROR lines.
+fn report_periodic_failure(
+    latch: &FailureLatch,
+    task: &str,
+    error: &dyn std::fmt::Display,
+) -> FailureLog {
+    let outcome = latch.record_failure();
+    match outcome {
+        FailureLog::Started => error!("{task} failed (will retry next tick): {error}"),
+        FailureLog::Reminder { consecutive } => error!(
+            consecutive_failures = consecutive,
+            "{task} is still failing: {error}"
+        ),
+        FailureLog::Suppressed { consecutive } => debug!(
+            consecutive_failures = consecutive,
+            "{task} failed (will retry next tick): {error}"
+        ),
+    }
+    outcome
+}
+
+/// Log the recovery of a periodic backup task that had been failing.
+fn report_periodic_success(latch: &FailureLatch, task: &str) {
+    if let Some(failures) = latch.record_success() {
+        info!(previous_failures = failures, "{task} recovered");
+    }
+}
+
+/// Log a failed S3 lifecycle reconcile for one source on transitions only.
+///
+/// A provider rejecting `PutBucketLifecycleConfiguration` (missing
+/// permission, a provider without lifecycle support, bad credentials) is the
+/// operator's bucket configuration, so WARN; a database failure is ERROR.
+/// The source stays in scope and is retried every hour either way.
+fn report_lifecycle_reconcile_failure(
+    latch: &KeyedFailureLatch<i32>,
+    s3_source_id: i32,
+    error: &crate::services::BackupError,
+) -> FailureLog {
+    let outcome = latch.record_failure(s3_source_id);
+    let is_fault = matches!(error, crate::services::BackupError::Database(_));
+    match (outcome.should_log(), is_fault) {
+        (true, true) => error!(
+            s3_source_id,
+            consecutive_failures = outcome.consecutive(),
+            error = %error,
+            "S3 lifecycle reconcile failed during sweep",
+        ),
+        (true, false) => warn!(
+            s3_source_id,
+            consecutive_failures = outcome.consecutive(),
+            error = %error,
+            "S3 lifecycle reconcile failed during sweep; the bucket's lifecycle rules may be stale \
+             until it succeeds (retried hourly)",
+        ),
+        (false, _) => debug!(
+            s3_source_id,
+            consecutive_failures = outcome.consecutive(),
+            error = %error,
+            "S3 lifecycle reconcile still failing",
+        ),
+    }
+    outcome
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn periodic_failures_are_logged_once_per_outage() {
+        let latch = FailureLatch::default();
+        assert_eq!(
+            report_periodic_failure(&latch, "backup alert sweep", &"db down"),
+            FailureLog::Started
+        );
+        for _ in 0..12 {
+            assert!(
+                !report_periodic_failure(&latch, "backup alert sweep", &"db down").should_log()
+            );
+        }
+        report_periodic_success(&latch, "backup alert sweep");
+        assert!(!latch.is_failing());
+    }
+
+    #[test]
+    fn lifecycle_failures_are_tracked_per_source() {
+        let latch = KeyedFailureLatch::new(HOURLY_SWEEP_REMINDER);
+        let rejected = crate::services::BackupError::S3("AccessDenied".into());
+
+        assert_eq!(
+            report_lifecycle_reconcile_failure(&latch, 1, &rejected),
+            FailureLog::Started
+        );
+        assert!(!report_lifecycle_reconcile_failure(&latch, 1, &rejected).should_log());
+        assert_eq!(
+            report_lifecycle_reconcile_failure(&latch, 2, &rejected),
+            FailureLog::Started
+        );
+    }
 
     #[tokio::test]
     async fn test_backup_plugin_name() {

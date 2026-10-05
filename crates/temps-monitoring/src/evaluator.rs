@@ -49,13 +49,16 @@ use sea_orm::sea_query::Expr;
 #[cfg(test)]
 use sea_orm::Set;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use temps_core::log_transitions::{FailureLatch, FailureLog, KeyedFailureLatch};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 use temps_entities::monitoring_alert_rules;
 use temps_metrics::{LatestQuery, MetricsStore, SourceKind};
 
-use crate::alarm_service::{AlarmService, AlarmSeverity, AlarmStatus, AlarmType, FireAlarmRequest};
+use crate::alarm_service::{
+    AlarmError, AlarmService, AlarmSeverity, AlarmStatus, AlarmType, FireAlarmRequest,
+};
 
 /// Interval between evaluation cycles.
 const EVAL_INTERVAL_SECS: u64 = 30;
@@ -105,6 +108,92 @@ pub struct AlertEvaluator {
     /// Tracks which alarm ID was fired for each rule so it can be resolved.
     /// Key: `rule_id`, Value: `alarm_id` returned by [`AlarmService::fire_alarm`].
     firing_alarms: Arc<RwLock<HashMap<i32, i32>>>,
+    /// Log-on-transition state for the conditions this loop re-observes every
+    /// [`EVAL_INTERVAL_SECS`]. Without it a single misconfigured rule, an
+    /// unreachable metrics store or a failing alarm write logged the same line
+    /// every 30 seconds, forever. See [`temps_core::log_transitions`].
+    log_state: EvaluatorLogState,
+}
+
+/// Failure latches for [`AlertEvaluator`]'s recurring conditions.
+#[derive(Default)]
+struct EvaluatorLogState {
+    /// Loading the rule set failed (database unreachable).
+    cycle: FailureLatch,
+    /// Rules that cannot be evaluated as stored (no single target, unknown
+    /// comparator). A rule configuration problem, reported at WARN once per
+    /// rule until the rule is fixed or deleted.
+    invalid_rules: KeyedFailureLatch<i32>,
+    /// `query_latest` failures, keyed by `(source_kind, source_id)`.
+    metric_sources: KeyedFailureLatch<(String, i32)>,
+    /// Firing or resolving a rule's alarm failed, keyed by rule ID.
+    alarm_writes: KeyedFailureLatch<i32>,
+}
+
+impl EvaluatorLogState {
+    /// Forget every rule that is no longer evaluated (deleted, disabled or
+    /// silenced) so the latches stay bounded by the live rule set.
+    fn retain_rules(&self, active_ids: &HashSet<i32>) {
+        self.invalid_rules.retain(|id| active_ids.contains(id));
+        self.alarm_writes.retain(|id| active_ids.contains(id));
+    }
+
+    /// Report a rule whose stored definition cannot be evaluated.
+    fn report_invalid_rule(&self, rule_id: i32, problem: &str) -> FailureLog {
+        let outcome = self.invalid_rules.record_failure(rule_id);
+        if outcome.should_log() {
+            warn!(
+                rule_id,
+                "AlertEvaluator: rule cannot be evaluated ({problem}); skipping it until it is \
+                 fixed (repeats are logged at debug)"
+            );
+        } else {
+            debug!(
+                rule_id,
+                "AlertEvaluator: rule still cannot be evaluated ({problem})"
+            );
+        }
+        outcome
+    }
+
+    /// Report a rule that evaluated cleanly, logging if it used to be invalid.
+    fn report_valid_rule(&self, rule_id: i32) {
+        if self.invalid_rules.record_success(&rule_id).is_some() {
+            info!(rule_id, "AlertEvaluator: rule is evaluable again");
+        }
+    }
+
+    /// Report a failed alarm write (fire or resolve) for `rule_id`.
+    fn report_alarm_write_failure(&self, rule_id: i32, operation: &str, error: &str) -> FailureLog {
+        let outcome = self.alarm_writes.record_failure(rule_id);
+        match outcome {
+            FailureLog::Started => {
+                error!(rule_id, "AlertEvaluator: {operation} failed: {error}")
+            }
+            FailureLog::Reminder { consecutive } => error!(
+                rule_id,
+                consecutive_failures = consecutive,
+                "AlertEvaluator: {operation} is still failing: {error}"
+            ),
+            FailureLog::Suppressed { consecutive } => debug!(
+                rule_id,
+                consecutive_failures = consecutive,
+                "AlertEvaluator: {operation} failed: {error}"
+            ),
+        }
+        outcome
+    }
+
+    /// Report a successful alarm write for `rule_id`.
+    fn report_alarm_write_success(&self, rule_id: i32) {
+        if let Some(failures) = self.alarm_writes.record_success(&rule_id) {
+            info!(
+                rule_id,
+                previous_failures = failures,
+                "AlertEvaluator: alarm writes for rule recovered"
+            );
+        }
+    }
 }
 
 /// Cached alarm context `(project_id, environment_id, deployment_id, service_id)`
@@ -130,6 +219,7 @@ impl AlertEvaluator {
             alarm_service,
             breach_start: Arc::new(RwLock::new(HashMap::new())),
             firing_alarms: Arc::new(RwLock::new(HashMap::new())),
+            log_state: EvaluatorLogState::default(),
         }
     }
 
@@ -188,8 +278,29 @@ impl AlertEvaluator {
         }
 
         loop {
-            if let Err(e) = self.run_cycle().await {
-                error!("AlertEvaluator: cycle failed: {e}");
+            match self.run_cycle().await {
+                Ok(()) => {
+                    if let Some(failures) = self.log_state.cycle.record_success() {
+                        info!(
+                            previous_failures = failures,
+                            "AlertEvaluator: evaluation cycles recovered"
+                        );
+                    }
+                }
+                // Only `run_cycle`'s rule load can fail (the database is
+                // unreachable): a real fault, so ERROR — once per outage plus
+                // an hourly reminder, not every 30 seconds.
+                Err(e) => match self.log_state.cycle.record_failure() {
+                    FailureLog::Started => error!("AlertEvaluator: cycle failed: {e}"),
+                    FailureLog::Reminder { consecutive } => error!(
+                        consecutive_failures = consecutive,
+                        "AlertEvaluator: cycles are still failing: {e}"
+                    ),
+                    FailureLog::Suppressed { consecutive } => debug!(
+                        consecutive_failures = consecutive,
+                        "AlertEvaluator: cycle failed: {e}"
+                    ),
+                },
             }
 
             tokio::time::sleep(Duration::from_secs(EVAL_INTERVAL_SECS)).await;
@@ -528,6 +639,7 @@ impl AlertEvaluator {
             .map_err(|e| format!("AlertEvaluator: failed to load rules: {e}"))?;
 
         if rules.is_empty() {
+            self.log_state.retain_rules(&HashSet::new());
             debug!("AlertEvaluator: no enabled rules to evaluate");
             return Ok(());
         }
@@ -559,6 +671,7 @@ impl AlertEvaluator {
             let mut fa = self.firing_alarms.write().await;
             fa.retain(|k, _| active_ids.contains(k));
         }
+        self.log_state.retain_rules(&active_ids);
 
         // Resolve alarm context (project/env/deployment IDs) for all rules
         // upfront so `handle_breach` and `handle_recovery` don't need to query
@@ -602,9 +715,9 @@ impl AlertEvaluator {
         }
 
         for rule_id in invalid_rules {
-            warn!(
+            self.log_state.report_invalid_rule(
                 rule_id,
-                "AlertEvaluator: rule has invalid target (exactly one of service_id/deployment_id/node_id must be set); skipping"
+                "invalid target: exactly one of service_id/deployment_id/node_id must be set",
             );
         }
 
@@ -632,6 +745,7 @@ impl AlertEvaluator {
                 .into_iter()
                 .collect();
 
+            let source_key = (source_kind_str.clone(), *source_id);
             let latest = match self
                 .store
                 .query_latest(LatestQuery {
@@ -641,12 +755,36 @@ impl AlertEvaluator {
                 })
                 .await
             {
-                Ok(v) => v,
+                Ok(v) => {
+                    if let Some(failures) =
+                        self.log_state.metric_sources.record_success(&source_key)
+                    {
+                        info!(
+                            source_kind = source_kind_str,
+                            source_id,
+                            previous_failures = failures,
+                            "AlertEvaluator: metric queries for source group recovered"
+                        );
+                    }
+                    v
+                }
                 Err(e) => {
-                    warn!(
-                        source_kind = source_kind_str,
-                        source_id, "AlertEvaluator: query_latest failed for source group: {e}"
-                    );
+                    let outcome = self.log_state.metric_sources.record_failure(source_key);
+                    if outcome.should_log() {
+                        warn!(
+                            source_kind = source_kind_str,
+                            source_id,
+                            consecutive_failures = outcome.consecutive(),
+                            "AlertEvaluator: query_latest failed for source group: {e}"
+                        );
+                    } else {
+                        debug!(
+                            source_kind = source_kind_str,
+                            source_id,
+                            consecutive_failures = outcome.consecutive(),
+                            "AlertEvaluator: query_latest failed for source group: {e}"
+                        );
+                    }
                     continue;
                 }
             };
@@ -686,6 +824,16 @@ impl AlertEvaluator {
             }
         };
 
+        if !is_known_comparator(&rule.comparator) {
+            // Treated as "not breaching", as before, but reported once per
+            // rule instead of on every cycle.
+            self.log_state.report_invalid_rule(
+                rule.id,
+                &format!("unknown comparator '{}'", rule.comparator),
+            );
+        } else {
+            self.log_state.report_valid_rule(rule.id);
+        }
         let is_breaching = compare(value, rule.threshold, &rule.comparator);
 
         if is_breaching {
@@ -821,6 +969,7 @@ impl AlertEvaluator {
 
         match self.alarm_service.fire_alarm(request).await {
             Ok(Some(alarm_id)) => {
+                self.log_state.report_alarm_write_success(rule_id);
                 info!(
                     rule_id,
                     alarm_id,
@@ -831,10 +980,13 @@ impl AlertEvaluator {
                 self.firing_alarms.write().await.insert(rule_id, alarm_id);
             }
             Ok(None) => {
+                self.log_state.report_alarm_write_success(rule_id);
                 debug!(rule_id, "AlertEvaluator: alarm suppressed by cooldown");
             }
             Err(e) => {
-                error!(rule_id, "AlertEvaluator: fire_alarm failed: {e}");
+                // Retried on the next cycle while the rule keeps breaching.
+                self.log_state
+                    .report_alarm_write_failure(rule_id, "fire_alarm", &e.to_string());
             }
         }
     }
@@ -855,6 +1007,7 @@ impl AlertEvaluator {
 
             match self.alarm_service.resolve_alarm(alarm_id, project_id).await {
                 Ok(()) => {
+                    self.log_state.report_alarm_write_success(rule_id);
                     info!(
                         rule_id,
                         alarm_id,
@@ -862,10 +1015,25 @@ impl AlertEvaluator {
                         "AlertEvaluator: alarm resolved (metric recovered)"
                     );
                 }
-                Err(e) => {
-                    error!(
+                Err(AlarmError::NotFound { .. }) => {
+                    // The alarm row is gone (deleted by a user or retention)
+                    // or no longer in this rule's scope. Retrying can never
+                    // succeed, and re-inserting it used to fail — and log an
+                    // ERROR — on every cycle forever. Stop tracking it.
+                    self.log_state.report_alarm_write_success(rule_id);
+                    info!(
                         rule_id,
-                        alarm_id, "AlertEvaluator: resolve_alarm failed: {e}"
+                        alarm_id,
+                        project_id = ?project_id,
+                        "AlertEvaluator: alarm to resolve no longer exists in the rule's scope; \
+                         no longer tracking it"
+                    );
+                }
+                Err(e) => {
+                    self.log_state.report_alarm_write_failure(
+                        rule_id,
+                        "resolve_alarm",
+                        &format!("alarm {alarm_id}: {e}"),
                     );
                     // Re-insert so we attempt resolution again next cycle.
                     self.firing_alarms.write().await.insert(rule_id, alarm_id);
@@ -986,20 +1154,20 @@ impl AlertEvaluator {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Evaluate `lhs <comparator> rhs`.
+/// Whether `comparator` is one [`compare`] understands.
+fn is_known_comparator(comparator: &str) -> bool {
+    matches!(comparator, ">" | "<" | ">=" | "<=")
+}
+
+/// Evaluate `lhs <comparator> rhs`. An unknown comparator is never breaching;
+/// the caller reports it (once per rule) via [`is_known_comparator`].
 fn compare(lhs: f64, rhs: f64, comparator: &str) -> bool {
     match comparator {
         ">" => lhs > rhs,
         "<" => lhs < rhs,
         ">=" => lhs >= rhs,
         "<=" => lhs <= rhs,
-        _ => {
-            warn!(
-                "AlertEvaluator: unknown comparator '{}', treating as false",
-                comparator
-            );
-            false
-        }
+        _ => false,
     }
 }
 
@@ -1728,6 +1896,74 @@ mod tests {
     #[test]
     fn compare_unknown_comparator_returns_false() {
         assert!(!compare(100.0, 1.0, "!="));
+    }
+
+    #[test]
+    fn known_comparators() {
+        for c in [">", "<", ">=", "<="] {
+            assert!(is_known_comparator(c), "{c} is supported");
+        }
+        for c in ["!=", "==", "", "gt"] {
+            assert!(!is_known_comparator(c), "{c:?} is not supported");
+        }
+    }
+
+    // ── EvaluatorLogState ───────────────────────────────────────────────────────
+
+    #[test]
+    fn invalid_rule_is_reported_once_until_fixed() {
+        let state = EvaluatorLogState::default();
+
+        assert_eq!(
+            state.report_invalid_rule(7, "unknown comparator '!='"),
+            FailureLog::Started
+        );
+        // Subsequent 30-second cycles stay quiet.
+        for _ in 0..20 {
+            assert!(!state
+                .report_invalid_rule(7, "unknown comparator '!='")
+                .should_log());
+        }
+        // Another broken rule is its own transition.
+        assert_eq!(
+            state.report_invalid_rule(8, "invalid target"),
+            FailureLog::Started
+        );
+
+        // Fixing rule 7 re-arms it: breaking it again is logged again.
+        state.report_valid_rule(7);
+        assert_eq!(
+            state.report_invalid_rule(7, "unknown comparator '!='"),
+            FailureLog::Started
+        );
+    }
+
+    #[test]
+    fn deleted_rules_are_forgotten() {
+        let state = EvaluatorLogState::default();
+        state.report_invalid_rule(1, "invalid target");
+        state.report_alarm_write_failure(2, "fire_alarm", "db down");
+        state.report_alarm_write_failure(3, "fire_alarm", "db down");
+
+        state.retain_rules(&HashSet::from([3]));
+
+        assert!(!state.invalid_rules.is_failing(&1));
+        assert!(!state.alarm_writes.is_failing(&2));
+        assert!(state.alarm_writes.is_failing(&3));
+    }
+
+    #[test]
+    fn alarm_write_failures_log_once_per_outage() {
+        let state = EvaluatorLogState::default();
+        assert_eq!(
+            state.report_alarm_write_failure(4, "fire_alarm", "db down"),
+            FailureLog::Started
+        );
+        assert!(!state
+            .report_alarm_write_failure(4, "fire_alarm", "db down")
+            .should_log());
+        state.report_alarm_write_success(4);
+        assert!(!state.alarm_writes.is_failing(&4));
     }
 
     // ── alarm_type_for_rule() ───────────────────────────────────────────────────
