@@ -36,10 +36,16 @@ fixture() {
 
 # shellcheck disable=SC2317,SC2329 # invoked by the EXIT trap
 teardown() {
+  local result=$?
+  trap - EXIT
   if [[ "${SOAK_KEEP:-0}" != "1" && -f "$STATE" ]]; then
     echo "== removing the soak workload =="
-    fixture --teardown || echo "warning: soak workload teardown reported errors" >&2
+    if ! fixture --teardown; then
+      echo "error: soak workload teardown failed" >&2
+      [[ "$result" -ne 0 ]] || result=1
+    fi
   fi
+  exit "$result"
 }
 trap teardown EXIT
 

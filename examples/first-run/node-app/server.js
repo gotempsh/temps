@@ -3,45 +3,53 @@
 
 'use strict'
 
-// Zero-dependency Node app for the first-run scenario suite
+// Managed-service authentication probe app for the first-run scenario suite
 // (apps/temps-e2e `first-run-scenario`). It is deployed by uploading this
 // directory as source, so Temps has to detect a Node preset and build it.
 //
 //   GET /        -> {"app":"first-run-node"}
 //   GET /health  -> {"status":"ok"}
 //   GET /env     -> which managed-service variables are present and whether
-//                   the host:port each one points at accepts a TCP connection.
+//                   each connection URL authenticates and can execute a command.
 //                   Values are never echoed back: they carry credentials.
 
 const http = require('http')
-const net = require('net')
+const { Client } = require('pg')
+const { createClient } = require('redis')
 
 const PORT = parseInt(process.env.PORT || '3000', 10)
 const SERVICE_VARIABLES = ['POSTGRES_URL', 'REDIS_URL']
 
-function probe(value) {
-  return new Promise((resolve) => {
-    let target
-    try {
-      target = new URL(value)
-    } catch {
-      resolve({ present: true, parsed: false, reachable: false })
-      return
+async function probe(value) {
+  let target
+  try { target = new URL(value) } catch {
+    return { present: true, parsed: false, reachable: false }
+  }
+  let client
+  try {
+    if (['postgres:', 'postgresql:'].includes(target.protocol)) {
+      client = new Client({ connectionString: value, connectionTimeoutMillis: 3000, query_timeout: 3000 })
+      await client.connect()
+      await client.query('SELECT 1')
+    } else if (['redis:', 'rediss:'].includes(target.protocol)) {
+      client = createClient({ url: value, socket: { connectTimeout: 3000, reconnectStrategy: false } })
+      // Avoid uncaught EventEmitter errors, and never log credential-bearing URLs.
+      client.on('error', () => {})
+      await client.connect()
+      await client.ping()
+    } else {
+      return { present: true, parsed: false, reachable: false }
     }
-    const defaultPort = target.protocol.startsWith('redis') ? 6379 : 5432
-    const socket = net.connect({
-      host: target.hostname,
-      port: parseInt(target.port || String(defaultPort), 10),
-    })
-    const finish = (reachable) => {
-      socket.destroy()
-      resolve({ present: true, parsed: true, reachable })
-    }
-    socket.setTimeout(3000, () => finish(false))
-    socket.once('connect', () => finish(true))
-    socket.once('error', () => finish(false))
-  })
+    return { present: true, parsed: true, reachable: true }
+  } catch {
+    return { present: true, parsed: true, reachable: false }
+  } finally {
+    if (client instanceof Client) await client.end().catch(() => {})
+    else if (client?.isOpen) client.destroy()
+  }
 }
+
+module.exports = { probe }
 
 async function environmentReport() {
   const report = {}
@@ -57,7 +65,7 @@ function send(res, status, body) {
   res.end(JSON.stringify(body))
 }
 
-http
+if (require.main === module) http
   .createServer(async (req, res) => {
     const path = new URL(req.url, 'http://localhost').pathname
     if (path === '/health') return send(res, 200, { status: 'ok' })

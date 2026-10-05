@@ -130,8 +130,10 @@ def parse_log(lines: list[str]) -> list[LogLine]:
                     text=text,
                 )
             )
-        elif PANIC.search(text):
+        elif PANIC.search(text) or re.search(r"\b(?:ERROR|FATAL)\b", text, re.IGNORECASE):
             parsed.append(LogLine(number=number, timestamp=None, level="ERROR", target="panic", text=text))
+    if any(line.strip() for line in lines) and not parsed:
+        raise InputError("nonempty server log contains no recognizable structured entries")
     return parsed
 
 

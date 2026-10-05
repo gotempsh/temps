@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import io
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -24,7 +25,25 @@ def line(ts: str, level: str, rest: str) -> str:
     return f"2026-10-04T{ts}.123456Z {level:>5} {rest}"
 
 
+class TeardownTests(unittest.TestCase):
+    def test_teardown_failure_fails_successful_soak_and_preserves_original_failure(self):
+        source = (Path(__file__).parent / "quiet-logs-soak.sh").read_text()
+        cleanup = source[source.index("teardown() {"):source.index("trap teardown EXIT")]
+        with tempfile.NamedTemporaryFile() as state:
+            for original, teardown, expected in [(0, 0, 0), (0, 1, 1), (7, 1, 7)]:
+                script = f'STATE="{state.name}"\nfixture() {{ return {teardown}; }}\n' + cleanup
+                script += f"trap teardown EXIT\nexit {original}\n"
+                result = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+                self.assertEqual(result.returncode, expected, result.stderr)
+
+
 class ParseTests(unittest.TestCase):
+    def test_unstructured_error_and_unrecognized_logs_fail_closed(self):
+        [entry] = cql.parse_log(["dependency: ERROR database unavailable"])
+        self.assertEqual(entry.level, "ERROR")
+        with self.assertRaises(cql.InputError):
+            cql.parse_log(["unrecognized server output"])
+
     def test_extracts_target_after_spans_and_strips_ansi(self) -> None:
         raw = "\x1b[2m2026-10-04T10:00:00.123456Z\x1b[0m \x1b[33m WARN\x1b[0m request{id=7 path=/a}: temps_proxy::proxy: upstream slow: retrying"
         [parsed] = cql.parse_log([raw])
@@ -41,7 +60,8 @@ class ParseTests(unittest.TestCase):
         self.assertEqual([(p.level, p.target) for p in parsed], [("ERROR", "panic")])
 
     def test_unstructured_lines_are_ignored(self) -> None:
-        self.assertEqual(cql.parse_log(["   continuation of a multi-line message", ""]), [])
+        with self.assertRaises(cql.InputError):
+            cql.parse_log(["   continuation of a multi-line message", ""])
 
     def test_nanosecond_timestamps_parse(self) -> None:
         [parsed] = cql.parse_log(["2026-10-04T10:00:00.123456789Z  INFO temps_cli: ready"])

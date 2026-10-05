@@ -125,7 +125,7 @@ jobs:
             --volume "$PWD":/build --workdir /build/crates/temps-captcha-wasm \
             --env CARGO_TARGET_DIR=/tmp/captcha-target \
             temps-toolchain:ci \
-            sh -ec 'git config --global --add safe.directory /build; npm run build'
+            sh -ec 'git config --global --add safe.directory /build; bun run build'
 
       - name: Build temps binary in toolchain container
         run: |
