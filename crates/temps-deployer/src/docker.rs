@@ -7754,6 +7754,7 @@ CMD ["cat", "/hello.txt"]
         let runtime = DockerRuntime::new(Arc::new(docker.clone()), true, network.clone());
         let log_dir = TempDir::new().unwrap();
         let request = BuildRequest {
+            cache_from: Vec::new(),
             image_name: image.clone(),
             context_path: checkout.path().to_path_buf(),
             dockerfile_path: None,
