@@ -1319,17 +1319,8 @@ impl ProjectService {
         // Insert the project. The slug column has a UNIQUE index — if a
         // concurrent request raced us to the same slug, surface a typed
         // SlugConflict (HTTP 409) instead of a generic 500.
-        let project_found_db = match project.insert(self.db.as_ref()).await {
-            Ok(model) => model,
-            Err(e) if super::types::is_unique_violation(&e) => {
-                return Err(ProjectError::SlugConflict { slug: project_slug });
-            }
-            Err(e) => {
-                return Err(ProjectError::DatabaseError {
-                    reason: e.to_string(),
-                })
-            }
-        };
+        let project_found_db = self.persist_named_project(project, true).await?;
+
         info!(
             "Created project id={} slug={} preset={}",
             project_found_db.id, project_found_db.slug, project_found_db.preset
@@ -2246,7 +2237,7 @@ impl ProjectService {
         apply_resolved_preset(&mut active_project, resolved)?;
         active_project.updated_at = Set(chrono::Utc::now());
 
-        let project_found = active_project.update(self.db.as_ref()).await?;
+        let project_found = self.persist_named_project(active_project, false).await?;
 
         // Emit ProjectUpdated before reading anything else. Everything after
         // the commit is a fresh await point, and a cancelled request (client
@@ -3214,7 +3205,13 @@ impl ProjectService {
             // itself rides `active_project` below rather than a separate update.
             let mut rename = None;
             if let Some(ref name_value) = new_name {
-                rename = self.locked_rename(&txn, project_id, name_value).await?;
+                rename = match self.locked_rename(&txn, project_id, name_value).await {
+                    Ok(rename) => rename,
+                    Err(error) => {
+                        txn.rollback().await?;
+                        return Err(error);
+                    }
+                };
                 active_project.name = Set(name_value.clone());
             }
 
@@ -3278,7 +3275,13 @@ impl ProjectService {
         let mut rename = None;
         let final_project = if let Some(name_value) = new_name {
             let txn = self.db.begin().await?;
-            rename = self.locked_rename(&txn, project_id, &name_value).await?;
+            rename = match self.locked_rename(&txn, project_id, &name_value).await {
+                Ok(rename) => rename,
+                Err(error) => {
+                    txn.rollback().await?;
+                    return Err(error);
+                }
+            };
             if rename.is_some() {
                 let mut active_project = projects::ActiveModel {
                     id: Set(project_id),
@@ -3823,6 +3826,8 @@ impl ProjectService {
                 project_id
             )))?;
 
+        self.lock_project_name_available(txn, new_name, Some(project_id))
+            .await?;
         Ok(if locked.name == new_name {
             None
         } else {
@@ -5495,6 +5500,82 @@ impl ProjectService {
     /// Deleted projects are ignored: their slug stays reserved (handled by
     /// [`Self::generate_unique_project_slug`]), but their name is free to reuse.
     /// `exclude_project_id` lets a project keep -- or re-case -- its own name.
+    /// Serialize create/rename writes by normalized display name. Existing
+    /// installations need no data-changing uniqueness migration.
+    async fn persist_named_project(
+        &self,
+        active: projects::ActiveModel,
+        inserting: bool,
+    ) -> Result<projects::Model, ProjectError> {
+        let name =
+            active.name.clone().take().ok_or_else(|| {
+                ProjectError::InvalidInput("Project name is required".to_string())
+            })?;
+        let id = active.id.clone().take();
+        let slug = active.slug.clone().take().unwrap_or_default();
+        let txn = self.db.begin().await?;
+        if !inserting {
+            if let Some(id) = id {
+                projects::Entity::find_by_id(id)
+                    .lock_exclusive()
+                    .one(&txn)
+                    .await?;
+            }
+        }
+        if let Err(error) = self
+            .lock_project_name_available(&txn, &name, if inserting { None } else { id })
+            .await
+        {
+            txn.rollback().await?;
+            return Err(error);
+        }
+        let result = if inserting {
+            active.insert(&txn).await
+        } else {
+            active.update(&txn).await
+        };
+        let result = result.map_err(|e| {
+            if super::types::is_unique_violation(&e) {
+                ProjectError::SlugConflict { slug }
+            } else {
+                ProjectError::DatabaseError {
+                    reason: e.to_string(),
+                }
+            }
+        })?;
+        txn.commit().await?;
+        Ok(result)
+    }
+
+    async fn lock_project_name_available(
+        &self,
+        txn: &DatabaseTransaction,
+        name: &str,
+        exclude: Option<i32>,
+    ) -> Result<(), ProjectError> {
+        use sea_orm::sea_query::{Expr, Func};
+        txn.query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            [format!("temps-project-name:{}", name.to_lowercase()).into()],
+        ))
+        .await?;
+        let mut query = projects::Entity::find()
+            .filter(projects::Column::IsDeleted.eq(false))
+            .filter(
+                Expr::expr(Func::lower(Expr::col(projects::Column::Name))).eq(name.to_lowercase()),
+            );
+        if let Some(id) = exclude {
+            query = query.filter(projects::Column::Id.ne(id));
+        }
+        if query.one(txn).await?.is_some() {
+            return Err(ProjectError::NameAlreadyExists {
+                name: name.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     async fn ensure_project_name_available(
         &self,
         name: &str,
@@ -10489,6 +10570,43 @@ mod tests {
         // The deleted project's slug stays reserved.
         assert_ne!(project.slug, "whoami");
         assert!(project.slug.starts_with("whoami-"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_project_renames_keep_names_unique() {
+        if !docker_available().await {
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let service = create_test_services(test_db.db.clone(), Arc::new(MockJobQueue::new())).await;
+        let a = service
+            .create_project(create_request("first"))
+            .await
+            .unwrap();
+        let b = service
+            .create_project(create_request("second"))
+            .await
+            .unwrap();
+        // Both callers already loaded and validated their original rows.
+        let mut a = projects::ActiveModel {
+            id: Set(a.id),
+            ..Default::default()
+        };
+        let mut b = projects::ActiveModel {
+            id: Set(b.id),
+            ..Default::default()
+        };
+        a.name = Set("Shared".to_string());
+        b.name = Set("shared".to_string());
+        let (a, b) = tokio::join!(
+            service.persist_named_project(a, false),
+            service.persist_named_project(b, false)
+        );
+        assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
+        assert!(
+            matches!(a, Err(ProjectError::NameAlreadyExists { .. }))
+                || matches!(b, Err(ProjectError::NameAlreadyExists { .. }))
+        );
     }
 
     #[tokio::test]

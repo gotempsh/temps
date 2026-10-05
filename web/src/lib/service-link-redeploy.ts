@@ -70,6 +70,7 @@ export function serviceLinkRedeployMessage(
 
 export type RedeployOutcome = {
   environment: string
+  failed?: string
   /** Why this environment was not redeployed, when it was not. */
   skipped?: string
 }
@@ -145,32 +146,47 @@ async function redeployDeployment(
 /**
  * Redeploy the current deployment of every environment returned by
  * {@link environmentsToRedeploy}, each from its own source (commit, image or
- * static bundle), so only the environment variables change. Throws on the
- * first API failure; environments that cannot be redeployed are reported as
+ * static bundle), so only the environment variables change. Reports each API failure without losing successful outcomes; environments that cannot be redeployed are reported as
  * skipped rather than failing the rest.
  */
 export async function redeployCurrentDeployments(
   projectId: number,
   projectSourceType: SourceType,
   environments: EnvironmentResponse[],
-  api: RedeployApi = sdkRedeployApi
+  api: RedeployApi = sdkRedeployApi,
+  completed: Set<number> = new Set()
 ): Promise<RedeployOutcome[]> {
   const outcomes: RedeployOutcome[] = []
   for (const environment of environmentsToRedeploy(environments)) {
-    const { data: deployment } = await api.getDeployment({
-      path: {
-        project_id: projectId,
-        deployment_id: environment.current_deployment_id as number,
-      },
-      throwOnError: true,
-    })
-    const skipped = await redeployDeployment(
-      api,
-      projectId,
-      projectSourceType,
-      deployment
-    )
-    outcomes.push({ environment: environment.name, skipped })
+    if (completed.has(environment.id)) continue
+    try {
+      const { data: deployment } = await api.getDeployment({
+        path: {
+          project_id: projectId,
+          deployment_id: environment.current_deployment_id as number,
+        },
+        throwOnError: true,
+      })
+      const skipped = await redeployDeployment(
+        api,
+        projectId,
+        projectSourceType,
+        deployment
+      )
+      outcomes.push({
+        environment: environment.name,
+        skipped,
+      })
+      if (!skipped) completed.add(environment.id)
+    } catch (error) {
+      const failed =
+        (error as { detail?: string })?.detail ??
+        (error instanceof Error ? error.message : 'Request failed')
+      outcomes.push({
+        environment: environment.name,
+        failed,
+      })
+    }
   }
   return outcomes
 }
@@ -191,9 +207,13 @@ export function redeploySummary(outcomes: RedeployOutcome[]): {
   started: number
   message: string
 } {
-  const started = outcomes.filter((outcome) => !outcome.skipped)
+  const started = outcomes.filter(
+    (outcome) => !outcome.skipped && !outcome.failed
+  )
   const skipped = outcomes.filter((outcome) => outcome.skipped)
-  const parts: string[] = []
+  const parts: string[] = outcomes
+    .filter((o) => o.failed)
+    .map((o) => `${o.environment} redeploy failed: ${o.failed}`)
   if (started.length > 0) {
     parts.push(
       started.length === 1
@@ -232,12 +252,19 @@ export async function toastRedeployAfterLinkChange(
     error: (message: string) => void
   }
 ): Promise<void> {
-  const environments = await fetchProjectEnvironments(project.id).catch(
-    () => []
-  )
+  let environments: EnvironmentResponse[]
+  try {
+    environments = await fetchProjectEnvironments(project.id)
+  } catch {
+    notify.warning(
+      `${project.name}: the service was ${change.kind}. Running apps retain their old connection variables until redeployed. Open the project's deployments to apply the change.`
+    )
+    return
+  }
   const targets = environmentsToRedeploy(environments)
   if (targets.length === 0) return
   const { description } = serviceLinkRedeployMessage(change, targets)
+  const completed = new Set<number>()
   notify.info(`${project.name}: redeploy to apply`, {
     description,
     duration: 20_000,
@@ -247,7 +274,9 @@ export async function toastRedeployAfterLinkChange(
         redeployCurrentDeployments(
           project.id,
           project.source_type,
-          environments
+          environments,
+          sdkRedeployApi,
+          completed
         )
           .then((outcomes) => {
             const summary = redeploySummary(outcomes)

@@ -89,6 +89,37 @@ describe('redeployCurrentDeployments', () => {
     return { api, calls }
   }
 
+  test('retries only failed environments after partial success', async () => {
+    const { api, calls } = fakeApi({
+      10: deployment(10, 1, { branch: 'main' }),
+      20: deployment(20, 2, { branch: 'main' }),
+    })
+    const trigger = api.triggerProjectPipeline
+    let fail = true
+    api.triggerProjectPipeline = (async (
+      options: Parameters<typeof trigger>[0]
+    ) => {
+      if (options?.body?.environment_id === 2 && fail)
+        throw new Error('unavailable')
+      return trigger(options)
+    }) as typeof trigger
+    const completed = new Set<number>()
+    const environments = [env(1, 'production', 10), env(2, 'staging', 20)]
+    const first = await redeployCurrentDeployments(
+      1,
+      'git',
+      environments,
+      api,
+      completed
+    )
+    expect(first[1].failed).toBe('unavailable')
+    expect(completed.has(1)).toBe(true)
+    fail = false
+    await redeployCurrentDeployments(1, 'git', environments, api, completed)
+    expect(calls).toHaveLength(2)
+    expect(completed.size).toBe(2)
+  })
+
   test('rebuilds each environment from the source it is running', async () => {
     const { api, calls } = fakeApi({
       10: deployment(10, 1, { branch: 'main', commit_hash: 'abc123' }),

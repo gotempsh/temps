@@ -18,6 +18,7 @@ import {
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Info, Loader2, RefreshCw, X } from 'lucide-react'
 import { Link } from 'react-router'
+import { useEffect, useRef } from 'react'
 import { toast } from 'sonner'
 
 /**
@@ -37,6 +38,7 @@ export function ServiceLinkRedeployPrompt({
   onDismiss: () => void
 }) {
   const queryClient = useQueryClient()
+  const completed = useRef(new Set<number>())
   const environments = useQuery({
     ...getEnvironmentsOptions({ path: { project_id: project.id } }),
     enabled: change != null,
@@ -46,7 +48,9 @@ export function ServiceLinkRedeployPrompt({
       redeployCurrentDeployments(
         project.id,
         project.source_type,
-        environments.data ?? []
+        environments.data ?? [],
+        undefined,
+        completed.current
       ),
     meta: { errorTitle: 'Failed to start the redeploy' },
     onSuccess: (outcomes) => {
@@ -56,12 +60,17 @@ export function ServiceLinkRedeployPrompt({
       queryClient.invalidateQueries({
         queryKey: getProjectDeploymentsQueryKey({ path: { id: project.id } }),
       })
-      onDismiss()
+      if (!outcomes.some((o) => o.failed)) onDismiss()
     },
   })
 
+  useEffect(() => {
+    completed.current.clear()
+    redeploy.reset()
+  }, [change, project.id, redeploy.reset])
+
   const targets = environmentsToRedeploy(environments.data)
-  if (!change || targets.length === 0) return null
+  if (!change || (environments.isSuccess && targets.length === 0)) return null
 
   const { title, description } = serviceLinkRedeployMessage(change, targets)
 
@@ -71,11 +80,33 @@ export function ServiceLinkRedeployPrompt({
       <AlertTitle>{title}</AlertTitle>
       <AlertDescription>
         <p>{description}</p>
+        {environments.isError && (
+          <p>
+            Could not load environments. Running apps keep their old connection
+            variables until redeployed.
+          </p>
+        )}
+        {environments.isError && (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => environments.refetch()}
+          >
+            Retry loading environments
+          </Button>
+        )}
+        {redeploy.data
+          ?.filter((o) => o.failed)
+          .map((o) => (
+            <p key={o.environment}>
+              {o.environment}: {o.failed}
+            </p>
+          ))}
         <div className="mt-3 flex flex-wrap items-center gap-2">
           <Button
             size="sm"
             onClick={() => redeploy.mutate()}
-            disabled={redeploy.isPending}
+            disabled={redeploy.isPending || !environments.isSuccess}
           >
             {redeploy.isPending ? (
               <Loader2 className="size-3.5 animate-spin" />
