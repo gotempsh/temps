@@ -48,7 +48,9 @@ the browser part with `FIRST_RUN_SKIP_UI=1`. The scenario itself is
 (one deployed app, one managed Postgres linked to it, one error alert rule,
 one uptime monitor), waits a minute for it to settle, leaves the server idle
 for `SOAK_MINUTES` (default 20) and then runs `check_quiet_logs.py` on the
-server log. It fails when:
+server log. Before accepting the report, it verifies that the recorded app still responds successfully and its managed Postgres service is running. A disappeared or unhealthy workload fails the soak even when the log budget passes.
+
+It fails when:
 
 - the log contains **any** `ERROR` line or Rust panic (anywhere in the log,
   including startup), or
