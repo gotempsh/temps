@@ -32,9 +32,8 @@ use crate::TelemetryService;
 /// How often each process re-reads the stored preference. The process that
 /// served the admin's change applies it immediately; this bounds how long
 /// other processes sharing the database (split proxy/console roles, stateless
-/// replicas) keep the old value. The read goes through the settings cache,
-/// which the `settings_change` NOTIFY listener invalidates, so it is one cheap
-/// lookup per interval.
+/// replicas) keep the old value. Consent is read directly from its own JSON key so unrelated settings
+/// decoding and cache snapshots cannot undo an opt-out.
 pub const PREFERENCE_SYNC_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Errors reading or writing the stored telemetry preference.
@@ -74,9 +73,8 @@ impl ConfigTelemetryPreferenceStore {
 impl TelemetryPreferenceStore for ConfigTelemetryPreferenceStore {
     async fn load(&self) -> Result<Option<bool>, TelemetrySettingsError> {
         self.config_service
-            .get_settings()
+            .anonymous_telemetry_preference()
             .await
-            .map(|settings| settings.anonymous_telemetry_enabled)
             .map_err(|error| TelemetrySettingsError::PreferenceRead {
                 reason: error.to_string(),
             })
@@ -100,27 +98,11 @@ impl TelemetryPreferenceStore for ConfigTelemetryPreferenceStore {
 pub async fn stored_preference(
     db: &sea_orm::DatabaseConnection,
 ) -> Result<Option<bool>, TelemetrySettingsError> {
-    use sea_orm::{ConnectionTrait, Statement};
-
-    let statement = Statement::from_string(
-        db.get_database_backend(),
-        "SELECT (data::jsonb ->> 'anonymous_telemetry_enabled')::boolean AS enabled \
-         FROM settings WHERE id = 1",
-    );
-    let row =
-        db.query_one(statement)
-            .await
-            .map_err(|error| TelemetrySettingsError::PreferenceRead {
-                reason: error.to_string(),
-            })?;
-    match row {
-        Some(row) => row.try_get::<Option<bool>>("", "enabled").map_err(|error| {
-            TelemetrySettingsError::PreferenceRead {
-                reason: error.to_string(),
-            }
-        }),
-        None => Ok(None),
-    }
+    temps_config::anonymous_telemetry_preference(db)
+        .await
+        .map_err(|error| TelemetrySettingsError::PreferenceRead {
+            reason: error.to_string(),
+        })
 }
 
 /// What decided the current telemetry state.
@@ -181,6 +163,7 @@ pub struct TelemetrySettingsService {
     /// Environment opt-out, kept separately so it is reported even when the
     /// reporter is unavailable.
     env_opted_out: bool,
+    preference_lock: tokio::sync::Mutex<()>,
 }
 
 impl TelemetrySettingsService {
@@ -196,6 +179,7 @@ impl TelemetrySettingsService {
             reporter,
             store,
             env_opted_out,
+            preference_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -206,6 +190,7 @@ impl TelemetrySettingsService {
 
     /// Re-read the stored preference and apply it to this process's reporter.
     pub async fn refresh(&self) -> Result<Option<bool>, TelemetrySettingsError> {
+        let _guard = self.preference_lock.lock().await;
         let preference = self.store.load().await?;
         if let Some(reporter) = &self.reporter {
             reporter.apply_admin_preference(preference);
@@ -226,6 +211,7 @@ impl TelemetrySettingsService {
         &self,
         enabled: bool,
     ) -> Result<TelemetryStatus, TelemetrySettingsError> {
+        let _guard = self.preference_lock.lock().await;
         let stored = self.store.save(enabled).await?;
         if let Some(reporter) = &self.reporter {
             reporter.apply_admin_preference(stored);
@@ -286,6 +272,7 @@ impl TelemetrySettingsService {
 pub(crate) mod tests {
     use super::*;
     use std::sync::Mutex;
+    use temps_core::TelemetryReporter;
 
     /// In-memory store for tests.
     #[derive(Default)]
@@ -310,6 +297,59 @@ pub(crate) mod tests {
             *self.value.lock().expect("store lock") = Some(enabled);
             Ok(Some(enabled))
         }
+    }
+
+    #[tokio::test]
+    async fn stale_refresh_cannot_apply_after_a_saved_opt_out() {
+        struct PausedStore {
+            value: Mutex<Option<bool>>,
+            loaded: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+        }
+        #[async_trait]
+        impl TelemetryPreferenceStore for PausedStore {
+            async fn load(&self) -> Result<Option<bool>, TelemetrySettingsError> {
+                let snapshot = *self.value.lock().unwrap();
+                self.loaded.notify_one();
+                self.release.notified().await;
+                Ok(snapshot)
+            }
+            async fn save(&self, enabled: bool) -> Result<Option<bool>, TelemetrySettingsError> {
+                *self.value.lock().unwrap() = Some(enabled);
+                Ok(Some(enabled))
+            }
+        }
+        let store = Arc::new(PausedStore {
+            value: Mutex::new(Some(true)),
+            loaded: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let dir = std::env::temp_dir().join(format!("temps-consent-race-{}", uuid::Uuid::new_v4()));
+        let reporter = TelemetryService::new(&dir, "0.0.0-test").unwrap();
+        let service = Arc::new(TelemetrySettingsService::new(
+            Some(reporter.clone()),
+            store.clone(),
+        ));
+        let refresh = tokio::spawn({
+            let service = service.clone();
+            async move { service.refresh().await }
+        });
+        store.loaded.notified().await;
+        let save = tokio::spawn({
+            let service = service.clone();
+            async move { service.set_enabled(false).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !save.is_finished(),
+            "save must wait for the older read/apply operation"
+        );
+        store.release.notify_one();
+        refresh.await.unwrap().unwrap();
+        save.await.unwrap().unwrap();
+        assert!(!reporter.is_enabled());
+        assert_eq!(*store.value.lock().unwrap(), Some(false));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

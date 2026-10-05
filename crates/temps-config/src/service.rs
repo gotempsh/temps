@@ -22,6 +22,23 @@ pub const ENCRYPTION_KEY_FILE: &str = "encryption_key";
 pub const AUTH_SECRET_FILE: &str = "auth_secret";
 pub const SQLITE_DB_NAME: &str = "temps.db";
 
+/// Read only telemetry consent, independently of unrelated settings sections.
+pub async fn anonymous_telemetry_preference(
+    db: &DbConnection,
+) -> Result<Option<bool>, ConfigServiceError> {
+    let model = settings::Entity::find_by_id(1).one(db).await?;
+    match model
+        .as_ref()
+        .and_then(|row| row.data.get("anonymous_telemetry_enabled"))
+    {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Bool(enabled)) => Ok(Some(*enabled)),
+        Some(_) => Err(ConfigServiceError::MalformedSettingsSection {
+            section: "anonymous_telemetry_enabled",
+        }),
+    }
+}
+
 /// Key of the geolocation section inside the singleton `settings.data`
 /// document. Named once so the surgical, geo-only writer below cannot drift
 /// from `AppSettings`' serde field name.
@@ -1931,6 +1948,11 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         Ok(current)
     }
 
+    /// Read the consent key without decoding or caching unrelated settings.
+    pub async fn anonymous_telemetry_preference(&self) -> Result<Option<bool>, ConfigServiceError> {
+        anonymous_telemetry_preference(self.db.as_ref()).await
+    }
+
     /// Persist the admin's anonymous product telemetry preference
     /// (`anonymous_telemetry_enabled`) and return the stored value.
     ///
@@ -2835,6 +2857,38 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    #[tokio::test]
+    async fn telemetry_consent_read_ignores_malformed_unrelated_sections_on_each_backend() {
+        for backend in [
+            DatabaseBackend::Postgres,
+            DatabaseBackend::Sqlite,
+            DatabaseBackend::MySql,
+        ] {
+            let mut row = settings_row("kept.example.com");
+            row.data["rate_limiting"] = serde_json::json!("invalid");
+            row.data["anonymous_telemetry_enabled"] = serde_json::json!(false);
+            let db = MockDatabase::new(backend)
+                .append_query_results(vec![vec![row]])
+                .into_connection();
+            assert_eq!(
+                anonymous_telemetry_preference(&db).await.unwrap(),
+                Some(false)
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_settings_fallback_and_reserialization_keep_opt_out() {
+        let raw =
+            serde_json::json!({"rate_limiting":"invalid", "anonymous_telemetry_enabled":false});
+        let decoded = AppSettings::from_json(raw.clone());
+        assert_eq!(decoded.anonymous_telemetry_enabled, Some(false));
+        assert_eq!(
+            decoded.to_json_merged(&raw)["anonymous_telemetry_enabled"],
+            false
+        );
     }
 
     #[tokio::test]

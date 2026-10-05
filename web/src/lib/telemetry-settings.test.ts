@@ -14,6 +14,7 @@ const base = {
   env_var: 'TEMPS_TELEMETRY',
   default_enabled: true,
   can_manage: true,
+  admin_preference: null,
 }
 
 describe('summarizeTelemetryState', () => {
@@ -73,16 +74,18 @@ describe('telemetryToggleState', () => {
     expect(telemetryToggleState(base, true).disabled).toBe(true)
   })
 
-  it('is locked off with instructions when the environment forces it', () => {
-    // Even an admin cannot override the host-level kill switch, and the
-    // switch must not claim telemetry is on.
+  it('can save an opt-out while the host override keeps reporting off', () => {
     const toggle = telemetryToggleState(
-      { ...base, enabled: false, source: 'environment' },
+      {
+        ...base,
+        enabled: false,
+        source: 'environment',
+        admin_preference: false,
+      },
       false
     )
     expect(toggle.checked).toBe(false)
-    expect(toggle.disabled).toBe(true)
-    expect(toggle.disabledReason).toContain('Remove TEMPS_TELEMETRY')
+    expect(toggle.disabled).toBe(false)
   })
 
   it('is read-only for users who cannot manage it', () => {
@@ -92,13 +95,13 @@ describe('telemetryToggleState', () => {
     expect(toggle.disabledReason).toContain('instance admins')
   })
 
-  it('is disabled when the reporter is unavailable', () => {
-    const toggle = telemetryToggleState(
-      { ...base, enabled: false, source: 'unavailable' },
-      false
-    )
-    expect(toggle.disabled).toBe(true)
-    expect(toggle.checked).toBe(false)
+  it('can save a preference while the reporter is unavailable', () => {
+    expect(
+      telemetryToggleState(
+        { ...base, enabled: false, source: 'unavailable' },
+        false
+      ).disabled
+    ).toBe(false)
   })
 })
 

@@ -100,11 +100,13 @@ function StatusSection({
       <div className="flex items-start justify-between gap-4 rounded-lg border p-3">
         <div className="min-w-0 space-y-0.5">
           <Label htmlFor="telemetry-enabled" className="text-sm">
-            Send anonymous usage data
+            Saved preference for anonymous usage
           </Label>
           <p className="max-w-prose text-xs text-muted-foreground">
             {toggle.disabledReason ??
-              'Takes effect immediately, without a restart. Every change is recorded in the audit log.'}
+              (status.source === 'environment'
+                ? 'Saved for when the host opt-out is removed. Nothing is sent while the override is set.'
+                : 'Takes effect immediately. Every change is recorded in the audit log.')}
           </p>
         </div>
         <Switch
@@ -284,6 +286,8 @@ export function TelemetrySettingsPage() {
   const statusQuery = useQuery({
     ...getTelemetrySettingsOptions(),
     retry: false,
+    refetchInterval: 30_000,
+    refetchOnWindowFocus: true,
   })
 
   const update = useMutation({

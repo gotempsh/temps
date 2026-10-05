@@ -115,31 +115,25 @@ export interface TelemetryToggleState {
 export function telemetryToggleState(
   status: Pick<
     TelemetryStatusResponse,
-    'enabled' | 'source' | 'env_var' | 'can_manage'
+    | 'enabled'
+    | 'source'
+    | 'env_var'
+    | 'can_manage'
+    | 'admin_preference'
+    | 'default_enabled'
   >,
   isSaving: boolean
 ): TelemetryToggleState {
-  if (status.source === 'environment') {
-    return {
-      checked: false,
-      disabled: true,
-      disabledReason: `Remove ${status.env_var} from the server environment and restart to manage this here.`,
-    }
-  }
-  if (status.source === 'unavailable') {
-    return {
-      checked: false,
-      disabled: true,
-      disabledReason:
-        'Unavailable until the telemetry reporter starts. See the server log.',
-    }
-  }
   if (!status.can_manage) {
     return {
-      checked: status.enabled,
+      checked: status.admin_preference ?? status.default_enabled,
       disabled: true,
       disabledReason: 'Only instance admins can change this setting.',
     }
   }
-  return { checked: status.enabled, disabled: isSaving, disabledReason: null }
+  return {
+    checked: status.admin_preference ?? status.default_enabled,
+    disabled: isSaving,
+    disabledReason: null,
+  }
 }

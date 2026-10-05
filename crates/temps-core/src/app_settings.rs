@@ -2221,7 +2221,19 @@ impl SecurityHeadersSettings {
 impl AppSettings {
     /// Create settings from JSON value, using defaults for missing fields
     pub fn from_json(value: serde_json::Value) -> Self {
-        serde_json::from_value(value).unwrap_or_default()
+        serde_json::from_value(value.clone()).unwrap_or_else(|_| {
+            // Unrelated malformed sections must never turn a saved opt-out
+            // into the opt-in default during an unrelated settings write.
+            let anonymous_telemetry_enabled = match value.get("anonymous_telemetry_enabled") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::Bool(enabled)) => Some(*enabled),
+                Some(_) => Some(false),
+            };
+            Self {
+                anonymous_telemetry_enabled,
+                ..Self::default()
+            }
+        })
     }
 
     /// Convert settings to JSON value
