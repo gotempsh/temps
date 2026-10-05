@@ -60,6 +60,9 @@ while (( SECONDS < end )); do
 done
 window_end="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
+# A quiet log is insufficient if the workload disappeared or stopped serving.
+fixture --verify
+
 # Snapshot the log before teardown so deleting the workload is not judged.
 cp "$TEMPS_LOG" "$FIRST_RUN_DIR/quiet-logs-window.log"
 

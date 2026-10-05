@@ -607,6 +607,7 @@ program
   )
   .requiredOption('--state <file>', 'file recording the created resource ids')
   .option('--teardown', 'delete the resources recorded in --state')
+  .option('--verify', 'verify the recorded workload is still healthy')
   .option('--image <ref>', 'public image to deploy', 'traefik/whoami:v1.10')
   .option('--image-port <port>', 'container port of --image', '80')
   .option('--deploy-timeout <ms>', 'max wait for the deployment / service', '300000')

@@ -33,6 +33,7 @@ import { awaitDeployment, awaitServedBody, awaitServiceRunning } from '../lib/fi
 export interface QuietLogsFixtureOptions {
   state: string
   teardown?: boolean
+  verify?: boolean
   image?: string
   imagePort?: string
   deployTimeout?: string
@@ -57,6 +58,24 @@ export async function quietLogsFixtureCommand(opts: QuietLogsFixtureOptions): Pr
   const client = makeClient(cfg)
   const log = (msg: string) => {
     if (!opts.json) process.stderr.write(msg + '\n')
+  }
+
+  if (opts.verify) {
+    const state = JSON.parse(await readFile(opts.state, 'utf8')) as QuietLogsFixtureState
+    if (!state.projectId || !state.deploymentId || !state.serviceId || !state.appUrl) {
+      throw new Error('Soak fixture state is incomplete; cannot verify workload health')
+    }
+    await awaitServiceRunning(client, state.serviceId, 15_000)
+    await awaitDeployment(client, {
+      projectId: state.projectId, deploymentId: state.deploymentId, timeoutMs: 15_000,
+    })
+    await awaitServedBody({
+      instanceUrl: cfg.url, appUrl: state.appUrl, timeoutMs: 15_000,
+      description: 'soak workload after the idle window',
+      accept: (status) => status >= 200 && status < 400,
+    })
+    log('soak workload still healthy')
+    return
   }
 
   if (opts.teardown) {
