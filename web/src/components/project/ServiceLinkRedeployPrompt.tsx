@@ -64,10 +64,11 @@ export function ServiceLinkRedeployPrompt({
     },
   })
 
+  const resetRedeploy = redeploy.reset
   useEffect(() => {
     completed.current.clear()
-    redeploy.reset()
-  }, [change, project.id, redeploy.reset])
+    resetRedeploy()
+  }, [change, project.id, resetRedeploy])
 
   const targets = environmentsToRedeploy(environments.data)
   if (!change || (environments.isSuccess && targets.length === 0)) return null
