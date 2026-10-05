@@ -61,9 +61,27 @@ pub(crate) fn render(
     // user's application builds.
     let mut env = Environment::new();
 
-    for pair in config.build_vars.into_iter().flatten() {
-        if let Some((key, value)) = pair.split_once('=') {
-            env.set(key, value);
+    // `KEY=VALUE` entries configure autopack itself (`AUTOPACK_*`). A bare
+    // name is a project variable whose value the build receives as a
+    // `--build-arg`: autopack declares it as an `ARG` in its build step, after
+    // dependencies are installed, which is where a framework inlines
+    // `VITE_*`/`NEXT_PUBLIC_*`/`PUBLIC_*` values into its output.
+    for entry in config.build_vars.into_iter().flatten() {
+        match entry.split_once('=') {
+            Some((key, value)) => {
+                env.set(key, value);
+            }
+            None if is_build_arg_name(entry) => {
+                env.add_build_arg(entry.as_str());
+            }
+            // Autopack rejects a plan whose `ARG` name could break out of the
+            // line, so a variable named e.g. `my-var` would otherwise fail the
+            // whole build. It still reaches the running container.
+            None => warn!(
+                variable = %entry.escape_debug(),
+                "autopack: not passing variable to the build step: build arguments must be \
+                 letters, digits and underscores, not starting with a digit"
+            ),
         }
     }
 
@@ -104,6 +122,15 @@ pub(crate) fn render(
 
     let dockerfile = to_dockerfile(&analysis.plan).map_err(|e| e.to_string())?;
     Ok(DockerfileWithArgs::new(dockerfile))
+}
+
+/// True when `name` can be declared as a Dockerfile `ARG` by autopack.
+fn is_build_arg_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Render, or fall back to a Dockerfile that fails loudly with the reason.
@@ -325,6 +352,58 @@ mod tests {
         let missing_key = vec!["AUTOPACK_CACHE_SCOPE=app".to_string()];
         let config = buildkit_config(dir.path()).with_build_vars(&missing_key);
         assert!(render(&config, None).unwrap_err().contains("AUTOPACK_CACHE_KEY"));
+    }
+
+    /// The lines of the stage declared `FROM ... AS {stage}`.
+    fn stage<'a>(dockerfile: &'a str, stage: &str) -> Vec<&'a str> {
+        let header = format!(" AS {stage}");
+        dockerfile
+            .lines()
+            .skip_while(|line| !(line.starts_with("FROM ") && line.ends_with(&header)))
+            .take_while(|line| !line.starts_with("# ----"))
+            .collect()
+    }
+
+    #[test]
+    fn project_variables_are_declared_in_the_build_step() {
+        // `build_image.rs` passes names only; the values arrive as
+        // `--build-arg`s, which a stage only sees for the `ARG`s it declares.
+        let dir = fixture(&[
+            ("package.json", r#"{"scripts":{"build":"node build.js","start":"node server.js"}}"#),
+            ("package-lock.json", "{}"),
+        ]);
+        let vars = vec!["VITE_API_URL".to_string(), "PUBLIC_SITE_NAME".to_string()];
+        let config = buildkit_config(dir.path()).with_build_vars(&vars);
+        let result = render(&config, None).expect("Node plan");
+
+        let build = stage(&result.content, "autopack-build");
+        for name in ["VITE_API_URL", "PUBLIC_SITE_NAME"] {
+            let declaration = format!("ARG {name}");
+            assert!(build.contains(&declaration.as_str()), "{}", result.content);
+            // Declared once, so a changed value never re-runs `npm ci`.
+            assert_eq!(result.content.matches(&declaration).count(), 1, "{}", result.content);
+        }
+    }
+
+    #[test]
+    fn variables_an_arg_cannot_declare_do_not_fail_the_build() {
+        let dir = fixture(&[
+            ("package.json", r#"{"scripts":{"build":"node build.js","start":"node server.js"}}"#),
+            ("package-lock.json", "{}"),
+        ]);
+        let vars = vec![
+            "my-var".to_string(),
+            "1ST".to_string(),
+            "BAD\nRUN id".to_string(),
+            "GOOD".to_string(),
+        ];
+        let config = buildkit_config(dir.path()).with_build_vars(&vars);
+        let result = render(&config, None).expect("invalid names are skipped, not fatal");
+
+        assert!(result.content.contains("ARG GOOD"), "{}", result.content);
+        assert!(!result.content.contains("my-var"), "{}", result.content);
+        assert!(!result.content.contains("ARG 1ST"), "{}", result.content);
+        assert!(!result.content.contains("RUN id"), "{}", result.content);
     }
 
     #[tokio::test]
