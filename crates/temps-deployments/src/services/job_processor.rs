@@ -82,6 +82,7 @@ struct CommitInfo {
 }
 
 enum DeploymentDuplicateKey {
+    Manual,
     Commit(String),
     Image(String),
     DurableCommand(uuid::Uuid),
@@ -326,6 +327,9 @@ impl JobProcessorService {
                 duplicate_query
             };
             let duplicate_query = match &duplicate_key {
+                DeploymentDuplicateKey::Manual => {
+                    unreachable!("manual requests bypass deduplication")
+                }
                 DeploymentDuplicateKey::Commit(commit) => duplicate_query
                     .filter(deployments::Column::State.is_in(vec![
                         "pending",
@@ -2263,7 +2267,11 @@ async fn process_git_push_event(
                 project.id,
                 environment.id,
                 job.recovery_of_deployment_id,
-                DeploymentDuplicateKey::Commit(job.commit.clone()),
+                if job.manual_trigger && job.recovery_of_deployment_id.is_none() {
+                    DeploymentDuplicateKey::Manual
+                } else {
+                    DeploymentDuplicateKey::Commit(job.commit.clone())
+                },
                 new_deployment,
             )
             .await
@@ -3071,6 +3079,62 @@ mod tests {
             .expect("reload routed deployment")
             .expect("routed deployment exists");
         assert_eq!(routed.state, "running");
+    }
+
+    #[tokio::test]
+    async fn test_manual_git_same_commit_creates_new_generation() {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping manual Git redeployment regression test");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("create test database");
+        let db = test_db.connection_arc();
+        let (project_id, environment_id) = setup_git_push_test_data(db.as_ref())
+            .await
+            .expect("seed project and environment");
+        let now = Utc::now();
+        let existing = generation_model(
+            project_id,
+            environment_id,
+            "existing",
+            "running",
+            "same-commit",
+            now,
+        )
+        .insert(db.as_ref())
+        .await
+        .expect("insert existing deployment");
+        let outcome = JobProcessorService::create_deployment_with_generation_fence(
+            db.as_ref(),
+            project_id,
+            environment_id,
+            None,
+            DeploymentDuplicateKey::Manual,
+            generation_model(
+                project_id,
+                environment_id,
+                "manual",
+                "pending",
+                "same-commit",
+                now + chrono::Duration::seconds(1),
+            ),
+        )
+        .await
+        .expect("create explicit redeployment");
+        match outcome {
+            DeploymentCreationOutcome::Created { deployment, .. } => {
+                assert_ne!(deployment.id, existing.id)
+            }
+            _ => panic!("explicit redeploy must create a new generation"),
+        }
+        let obsolete = deployments::Entity::find_by_id(existing.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(obsolete.state, "cancelled");
     }
 
     #[tokio::test]
