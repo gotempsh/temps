@@ -11,15 +11,20 @@
 #   1. OLD_BIN starts on an empty database; an admin, an API key, a project,
 #      a second environment, environment variables, an imported external
 #      service and a completed static deployment are created through the API.
-#   2. NEW_BIN starts on the same database and data directory. It must take a
-#      pre-migration backup, migrate, come up healthy, and serve all of the
-#      seeded data (including the deployed site through the proxy).
-#   3. A plain restart of NEW_BIN must not take another backup.
+#   2. NEW_BIN starts on the same database and data directory with
+#      --pre-migration-backup. It must refuse to migrate when the backup
+#      cannot be written; otherwise it must take the backup, migrate, come up
+#      healthy, and serve all of the seeded data (including the deployed site
+#      through the proxy).
+#   3. A plain restart of NEW_BIN, still with the flag, must not take another
+#      backup.
 #   4. With an unknown "future" migration recorded, NEW_BIN must refuse to
 #      start (schema guard) and leave the database untouched.
 #   5. OLD_BIN must refuse the upgraded database.
 #   6. The pre-migration backup is restored into a fresh database, and OLD_BIN
 #      must start on it and serve the seeded data again (rollback).
+#   7. NEW_BIN without the flag (the default) upgrades that rolled-back
+#      database without taking a backup and serves the seeded data.
 #
 # Required environment:
 #   OLD_BIN, NEW_BIN    previous release and candidate `temps` binaries
@@ -165,10 +170,11 @@ wait_ready() {
 }
 
 # Run `temps serve` expecting it to exit non-zero without becoming ready.
-# Usage: expect_start_refused BIN DB_URL LOG [grep pattern]
+# Usage: expect_start_refused BIN DB_URL LOG [grep pattern [extra args]]
 expect_start_refused() {
   local bin=$1 db_url=$2 logfile=$3 pattern=${4:-}
-  start_server "$bin" "$db_url" "$logfile"
+  shift $(($# < 4 ? $# : 4))
+  start_server "$bin" "$db_url" "$logfile" "$@"
   local pid=$SERVER_PID exited=""
   for _ in $(seq 1 90); do
     if ! kill -0 "$pid" 2>/dev/null; then
@@ -351,17 +357,18 @@ if grep -q '"event":"up_to_date"' "$LOG_DIR/2-migration-plan.log"; then
 fi
 
 if [ "$HAS_PENDING" = 1 ]; then
-log "2. Refuse an upgrade if the automatic backup cannot be written"
+log "2. Refuse an upgrade if the requested backup cannot be written"
 LEDGER_BEFORE=$(psql_db "$DB_NAME" -tA -c "SELECT count(*) FROM seaql_migrations")
 printf 'intentional backup directory obstruction\n' >"$DATA_DIR/backups"
-expect_start_refused "$NEW_BIN" "$DATABASE_URL" "$LOG_DIR/2-backup-refused.log" "pre-migration backup failed"
+expect_start_refused "$NEW_BIN" "$DATABASE_URL" "$LOG_DIR/2-backup-refused.log" \
+  "pre-migration backup failed" --pre-migration-backup
 LEDGER_AFTER=$(psql_db "$DB_NAME" -tA -c "SELECT count(*) FROM seaql_migrations")
 [ "$LEDGER_BEFORE" = "$LEDGER_AFTER" ] || fail "failed backup changed the migration ledger"
 rm "$DATA_DIR/backups"
 fi
 
 log "2. Upgrade in place with the candidate binary"
-start_server "$NEW_BIN" "$DATABASE_URL" "$LOG_DIR/2-new-upgrade.log"
+start_server "$NEW_BIN" "$DATABASE_URL" "$LOG_DIR/2-new-upgrade.log" --pre-migration-backup
 wait_ready "$LOG_DIR/2-new-upgrade.log"
 if [ "$HAS_PENDING" = 1 ]; then
 grep -q "Pre-migration database backup written" "$LOG_DIR/2-new-upgrade.log" ||
@@ -382,8 +389,8 @@ verify_data "candidate, after upgrade"
 stop_server
 
 # ---------------------------------------------------------------------------
-log "3. Plain restart takes no backup"
-start_server "$NEW_BIN" "$DATABASE_URL" "$LOG_DIR/3-new-restart.log"
+log "3. Plain restart takes no backup, even with --pre-migration-backup"
+start_server "$NEW_BIN" "$DATABASE_URL" "$LOG_DIR/3-new-restart.log" --pre-migration-backup
 wait_ready "$LOG_DIR/3-new-restart.log"
 if grep -q "Pre-migration database backup written" "$LOG_DIR/3-new-restart.log"; then
   fail "a restart with no pending migrations took a backup"
@@ -396,7 +403,8 @@ log "4. Schema guard refuses a database migrated by a newer release"
 FUTURE_MIGRATION="m29991231_000001_upgrade_test_future_release"
 psql_db "$DB_NAME" -c "INSERT INTO seaql_migrations (version, applied_at) VALUES ('$FUTURE_MIGRATION', 0)"
 LEDGER_BEFORE=$(psql_db "$DB_NAME" -tA -c "SELECT count(*) FROM seaql_migrations")
-expect_start_refused "$NEW_BIN" "$DATABASE_URL" "$LOG_DIR/4-new-guard.log" "newer than this Temps binary"
+expect_start_refused "$NEW_BIN" "$DATABASE_URL" "$LOG_DIR/4-new-guard.log" \
+  "newer than this Temps binary" --pre-migration-backup
 grep -q "$FUTURE_MIGRATION" "$LOG_DIR/4-new-guard.log" || fail "the guard error does not name the unknown migration"
 LEDGER_AFTER=$(psql_db "$DB_NAME" -tA -c "SELECT count(*) FROM seaql_migrations")
 [ "$LEDGER_BEFORE" = "$LEDGER_AFTER" ] || fail "the refused start changed the migration ledger"
@@ -431,5 +439,21 @@ start_server "$OLD_BIN" "$ROLLBACK_DATABASE_URL" "$LOG_DIR/6-old-rollback.log"
 wait_ready "$LOG_DIR/6-old-rollback.log"
 verify_data "previous release, after rollback"
 stop_server
+
+# ---------------------------------------------------------------------------
+if [ "$HAS_PENDING" = 1 ]; then
+log "7. Without --pre-migration-backup, an upgrade migrates and takes no backup"
+BACKUPS_BEFORE=$(count_backups)
+start_server "$NEW_BIN" "$ROLLBACK_DATABASE_URL" "$LOG_DIR/7-new-default-upgrade.log"
+wait_ready "$LOG_DIR/7-new-default-upgrade.log"
+grep -q "without a pre-migration backup" "$LOG_DIR/7-new-default-upgrade.log" ||
+  fail "the default upgrade did not log that it skipped the backup"
+if grep -q "Pre-migration database backup written" "$LOG_DIR/7-new-default-upgrade.log"; then
+  fail "an upgrade without --pre-migration-backup took a backup"
+fi
+[ "$(count_backups)" = "$BACKUPS_BEFORE" ] || fail "an upgrade without --pre-migration-backup changed the number of backups"
+verify_data "candidate, default upgrade of the rolled-back database"
+stop_server
+fi
 
 log "Upgrade test passed"
