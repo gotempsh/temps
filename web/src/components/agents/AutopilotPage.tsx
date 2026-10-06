@@ -60,6 +60,20 @@ interface AutopilotPageProps {
   project: ProjectResponse
 }
 
+/**
+ * Absolute URLs for the agent pages. AutopilotPage is mounted both at
+ * /projects/:slug/agents and inside Settings → Automation, so relative paths
+ * would resolve against whichever mount rendered it.
+ */
+export function autopilotPaths(projectSlug: string) {
+  const base = `/projects/${projectSlug}/agents`
+  return {
+    agent: (agentSlug: string) => `${base}/detail/${agentSlug}`,
+    editAgent: (agentSlug: string) => `${base}/detail/${agentSlug}/edit`,
+    run: (runId: number) => `${base}/${runId}`,
+  }
+}
+
 function formatTimeAgo(dateStr: string): string {
   const now = Date.now()
   const then = new Date(dateStr).getTime()
@@ -377,6 +391,7 @@ function AgentCard({
 
 export function AutopilotPage({ project }: AutopilotPageProps) {
   const navigate = useNavigate()
+  const paths = autopilotPaths(project.slug)
   const queryClient = useQueryClient()
 
   const { data: agentsData, isLoading: isLoadingAgents } = useQuery({
@@ -584,8 +599,8 @@ prompt: |
               agent={agent}
               projectId={project.id}
               queryClient={queryClient}
-              onEdit={(a) => navigate(`detail/${a.slug}/edit`)}
-              onNavigate={(slug) => navigate(`detail/${slug}`)}
+              onEdit={(a) => navigate(paths.editAgent(a.slug))}
+              onNavigate={(slug) => navigate(paths.agent(slug))}
             />
           ))}
         </div>
@@ -637,7 +652,7 @@ prompt: |
                           `/projects/${project.slug}/errors/${run.trigger_source_id}/autofix`
                         )
                       } else {
-                        navigate(`${run.id}`)
+                        navigate(paths.run(run.id))
                       }
                     }}
                   >

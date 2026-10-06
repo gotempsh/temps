@@ -480,12 +480,32 @@ export function ProjectDetail() {
                 element={<ProjectAnalytics project={project} />}
               />
               <Route
+                path="speed"
+                element={<ProjectSpeedInsights project={project} />}
+              />
+              <Route
+                path="revenue"
+                element={<ProjectRevenue project={project} />}
+              />
+              <Route
                 path="errors"
                 element={<ErrorTracking project={project} />}
               />
               <Route
                 path="errors/setup"
                 element={<ErrorTrackingSetup project={project} />}
+              />
+              <Route
+                path="errors/alert-rules"
+                element={<AlertRulesManagement projectId={project.id} />}
+              />
+              <Route
+                path="errors/alert-rules/new"
+                element={<AlertRuleForm projectId={project.id} />}
+              />
+              <Route
+                path="errors/alert-rules/:ruleId/edit"
+                element={<AlertRuleForm projectId={project.id} />}
               />
               <Route
                 path="errors/:errorGroupId"
@@ -496,6 +516,15 @@ export function ProjectDetail() {
                 element={<ErrorEventDetail project={project} />}
               />
               <Route path="traces/*" element={<Traces project={project} />} />
+              <Route
+                path="ai-gateway"
+                element={
+                  <ProjectAgentActivity
+                    projectId={project.id}
+                    projectSlug={project.slug}
+                  />
+                }
+              />
               <Route
                 path="telemetry-logs"
                 element={<LogsList project={project} />}

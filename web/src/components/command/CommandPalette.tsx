@@ -762,7 +762,7 @@ const accountNavItems: NavigationItem[] = [
 ]
 
 // Project-specific navigation items (will be prefixed with project slug)
-const projectNavItems: NavigationItem[] = [
+export const projectNavItems: NavigationItem[] = [
   {
     title: 'Project Overview',
     url: 'project',
@@ -947,7 +947,7 @@ const projectNavItems: NavigationItem[] = [
   },
   {
     title: 'Build & Deploy',
-    url: 'build',
+    url: 'settings/delivery',
     icon: Settings,
     keywords: ['build', 'framework', 'compose', 'docker', 'root directory'],
   },
@@ -1074,12 +1074,6 @@ const projectNavItems: NavigationItem[] = [
     url: 'autofixer',
     icon: Wand2,
     keywords: ['autofix', 'autofixer', 'ai', 'errors', 'repair'],
-  },
-  {
-    title: 'Workspace',
-    url: 'workspace',
-    icon: SquareTerminal,
-    keywords: ['workspace', 'shell', 'terminal', 'exec'],
   },
   {
     title: 'Error Alert Rules',
