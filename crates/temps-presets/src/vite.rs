@@ -223,6 +223,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn extglob_vite_members_receive_root_install_and_dependency_builds() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(
+            repo.path().join("pnpm-workspace.yaml"),
+            "packages: ['apps/@(web|api|private)', '!apps/@(private|internal)']",
+        )
+        .unwrap();
+        for (name, member) in [
+            ("web", true),
+            ("api", true),
+            ("private", false),
+            ("mobile", false),
+        ] {
+            let app = repo.path().join("apps").join(name);
+            std::fs::create_dir_all(&app).unwrap();
+            std::fs::write(app.join("package.json"), "{}").unwrap();
+            let result = Vite
+                .dockerfile(DockerfileConfig::new(repo.path(), &app, "fixture"))
+                .await
+                .content;
+            assert_eq!(
+                result.contains("pnpm install --frozen-lockfile"),
+                member,
+                "{name}: {result}"
+            );
+            assert_eq!(result.contains("--filter"), member, "{name}: {result}");
+        }
+    }
+
+    #[tokio::test]
     async fn nonmember_vite_apps_never_receive_workspace_filters() {
         let repo = tempfile::tempdir().unwrap();
         let app = repo.path().join("apps/web");

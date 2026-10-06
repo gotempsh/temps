@@ -754,6 +754,43 @@ mod tests {
     }
 
     #[test]
+    fn extglob_node_members_use_workspace_install_and_selected_entrypoint() {
+        let repo = fixture(&[
+            (
+                "pnpm-workspace.yaml",
+                "packages: ['apps/@(web|api|private)', '!apps/@(private|internal)']",
+            ),
+            (
+                "package.json",
+                r#"{"name":"root","packageManager":"pnpm@9.15.9"}"#,
+            ),
+            ("pnpm-lock.yaml", "lockfileVersion: '9.0'"),
+        ]);
+        for (name, member) in [
+            ("web", true),
+            ("api", true),
+            ("private", false),
+            ("mobile", false),
+        ] {
+            let app = repo.path().join("apps").join(name);
+            std::fs::create_dir_all(&app).unwrap();
+            std::fs::write(
+                app.join("package.json"),
+                r#"{"scripts":{"build":"node build.js","start":"node server.js"}}"#,
+            )
+            .unwrap();
+            let config = DockerfileConfig::new(repo.path(), &app, "fixture").with_buildkit(true);
+            let result = render(&config, Some("node")).unwrap().content;
+            assert_eq!(result.contains("--filter"), member, "{name}: {result}");
+            assert_eq!(
+                result.contains(&format!("cd /app/apps/{name}")),
+                member,
+                "{name}: {result}"
+            );
+        }
+    }
+
+    #[test]
     fn nonmember_node_apps_are_analyzed_locally_without_workspace_filters() {
         let repo = fixture(&[
             (

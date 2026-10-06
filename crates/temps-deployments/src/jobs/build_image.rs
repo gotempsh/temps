@@ -1870,6 +1870,37 @@ mod tests {
     }
 
     #[test]
+    fn pnpm_extglob_members_select_root_context_and_exclusions_keep_app_context() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(
+            repo.path().join("pnpm-workspace.yaml"),
+            "packages: ['apps/@(web|api|private)', '!apps/@(private|internal)']",
+        )
+        .unwrap();
+        for (name, member) in [
+            ("web", true),
+            ("api", true),
+            ("private", false),
+            ("mobile", false),
+        ] {
+            let app = repo.path().join("apps").join(name);
+            std::fs::create_dir_all(&app).unwrap();
+            std::fs::write(app.join("package.json"), "{}").unwrap();
+            for preset in ["nextjs", "vite", "nixpacks-node", "autopack"] {
+                assert_eq!(
+                    preset_build_root(preset, repo.path(), &app).unwrap(),
+                    if member {
+                        repo.path().to_path_buf()
+                    } else {
+                        app.clone()
+                    },
+                    "{preset}: {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn pnpm_nonmembers_and_excluded_apps_keep_their_selected_context() {
         let repo = tempfile::tempdir().unwrap();
         std::fs::write(repo.path().join("turbo.json"), "{}").unwrap();
