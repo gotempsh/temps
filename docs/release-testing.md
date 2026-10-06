@@ -48,10 +48,15 @@ candidate results unless the reviewer explicitly documents why evidence applies.
 
 Use the existing `scripts/first-run/run-first-run.sh` and
 `scripts/test-upgrade-from-release.sh` as executable starting points; inspect their
-prerequisites before running. For the upgrade harness set `OLD_BIN` to a verified
-v0.0.8 binary and `NEW_BIN` to the candidate. Use a dedicated test database
-container and unused database names. Never stop, remove or mutate operator-owned
-Docker resources. Additional feature-specific scenarios below remain required
+prerequisites before running. The upgrade harness expects the previous binary
+to expose `migrate`; the checksum-verified macOS arm64 v0.0.8 binary does **not**
+(`temps migrate --help` rejects the subcommand). Therefore this harness cannot
+qualify v0.0.8 unchanged. Adapt its old-version bootstrap/seeding path, or define
+and verify an explicit supported intermediate upgrade route, before using it as
+evidence for #1195. Set `OLD_BIN` to the verified previous binary and `NEW_BIN`
+to the candidate only after establishing command/API compatibility. Use a
+dedicated test database container/engine and unused database names. Never stop,
+remove or mutate operator-owned Docker resources. Additional feature-specific scenarios below remain required
 for shipped scope; automation definitions alone do not count as successful runs.
 
 The published [v0.0.8 assets](https://github.com/gotempsh/temps/releases/tag/v0.0.8)
