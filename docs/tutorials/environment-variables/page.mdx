@@ -78,6 +78,10 @@ All environment variables are available at both build time and runtime. However,
 | Create React App | `REACT_APP_` | Yes | Yes |
 | Node.js / Python / Go | (any) | No | No |
 
+<Note>
+  With an Autopack preset (`autopack`, `nixpacks-*`, and the Python, Go, Rust and Java presets), variables reach the build command but not the dependency install, so changing a value does not reinstall dependencies. Build-time variable names must start with a letter or underscore and contain only letters, digits and underscores; other names (for example `my-var` or `1ST`) are only available at runtime. Builds that run on a worker node do not receive project variables yet, so there they are only available at runtime too.
+</Note>
+
 ### Server-side variables
 
 Variables without the framework prefix are only available on the server. They are injected at runtime and can be changed by redeploying — no rebuild needed.

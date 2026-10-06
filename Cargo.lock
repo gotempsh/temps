@@ -419,8 +419,8 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "autopack-core"
-version = "0.1.4"
-source = "git+https://github.com/gotempsh/autopack?tag=v0.1.4#23677873132ff8e93bca99cfb295dbbed0756cdd"
+version = "0.1.5"
+source = "git+https://github.com/gotempsh/autopack?tag=v0.1.5#b41738ffff7c2246efa21a599fb13bf20ccc16b7"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
@@ -435,16 +435,16 @@ dependencies = [
 
 [[package]]
 name = "autopack-dockerfile"
-version = "0.1.4"
-source = "git+https://github.com/gotempsh/autopack?tag=v0.1.4#23677873132ff8e93bca99cfb295dbbed0756cdd"
+version = "0.1.5"
+source = "git+https://github.com/gotempsh/autopack?tag=v0.1.5#b41738ffff7c2246efa21a599fb13bf20ccc16b7"
 dependencies = [
  "autopack-core",
 ]
 
 [[package]]
 name = "autopack-providers"
-version = "0.1.4"
-source = "git+https://github.com/gotempsh/autopack?tag=v0.1.4#23677873132ff8e93bca99cfb295dbbed0756cdd"
+version = "0.1.5"
+source = "git+https://github.com/gotempsh/autopack?tag=v0.1.5#b41738ffff7c2246efa21a599fb13bf20ccc16b7"
 dependencies = [
  "autopack-core",
  "indexmap 2.14.0",

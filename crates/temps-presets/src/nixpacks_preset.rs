@@ -359,6 +359,10 @@ impl Drop for StagedConfig {
 
 #[async_trait]
 impl Preset for NixpacksPreset {
+    fn uses_autopack(&self) -> bool {
+        true
+    }
+
     fn project_type(&self) -> ProjectType {
         // The static provider serves a directory of pre-built files with no
         // language runtime (see `autopack_provider`'s "static" mapping) — it

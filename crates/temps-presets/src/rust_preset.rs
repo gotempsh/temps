@@ -29,6 +29,10 @@ impl Default for RustPreset {
 
 #[async_trait]
 impl Preset for RustPreset {
+    fn uses_autopack(&self) -> bool {
+        true
+    }
+
     fn project_type(&self) -> ProjectType {
         ProjectType::Server
     }
