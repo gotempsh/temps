@@ -6,16 +6,19 @@
 pub use sea_orm;
 pub mod approx_count;
 mod connection;
+pub mod schema_guard;
 
 pub use approx_count::{approximate_row_count, count_for_pagination, CountKind};
 pub use connection::{
     cancel_migration_backend, connect_for_migrate, connect_options, connect_without_migrations,
-    defined_migration_count, establish_connection, get_pending_migration_names,
-    reconcile_otel_trace_summaries, run_migrations, run_migrations_reported,
-    run_migrations_streaming, run_post_migration_backfill, run_post_migration_backfill_streaming,
-    run_post_migration_indexes, run_post_migration_indexes_streaming, DbConnection,
-    MaintenanceProgress, MigrationProgress, MigrationRunReport, MigrationStepResult,
+    defined_migration_count, ensure_no_unprotected_upgrade, establish_connection,
+    get_pending_migration_names, reconcile_otel_trace_summaries, run_migrations,
+    run_migrations_reported, run_migrations_streaming, run_post_migration_backfill,
+    run_post_migration_backfill_streaming, run_post_migration_indexes,
+    run_post_migration_indexes_streaming, DbConnection, MaintenanceProgress, MigrationProgress,
+    MigrationRunReport, MigrationStepResult,
 };
+pub use schema_guard::{check_schema_compatibility, SchemaGuardError, SchemaStatus};
 
 // Export test utilities for use by other crates in their tests
 pub mod test_utils;

@@ -36,6 +36,15 @@ export function registerDocsCommand(program: Command): void {
     .action(generateDocs)
 }
 
+/**
+ * Hidden commands (registered but not implemented yet) are left out of the
+ * docs for the same reason they are left out of `--help`: a reference must
+ * not advertise a command that only prints "coming soon".
+ */
+function isDocumented(cmd: Command): boolean {
+  return !(cmd as Command & { _hidden?: boolean })._hidden
+}
+
 function extractCommandInfo(cmd: Command, parentName = ''): CommandInfo {
   const name = parentName ? `${parentName} ${cmd.name()}` : cmd.name()
   const aliases = cmd.aliases()
@@ -52,6 +61,7 @@ function extractCommandInfo(cmd: Command, parentName = ''): CommandInfo {
 
   const subcommands: CommandInfo[] = cmd.commands
     .filter((sub: Command) => sub.name() !== 'docs') // Exclude docs command from docs
+    .filter(isDocumented)
     .map((sub: Command) => extractCommandInfo(sub, name))
 
   return {
@@ -276,6 +286,7 @@ export async function generateDocs(options: DocsOptions): Promise<void> {
   // Extract command information (excluding docs command itself)
   const commands: CommandInfo[] = program.commands
     .filter((cmd: Command) => cmd.name() !== 'docs')
+    .filter(isDocumented)
     .map((cmd: Command) => extractCommandInfo(cmd))
 
   let output: string

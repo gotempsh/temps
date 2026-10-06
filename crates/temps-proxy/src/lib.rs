@@ -18,6 +18,7 @@ mod client_ip;
 pub mod cloudflare_ips;
 pub mod config;
 mod connection_limiter;
+pub mod console_unavailable;
 pub mod crawler_detector;
 pub mod handler;
 pub mod metrics;

@@ -10,7 +10,8 @@ use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, Quer
 use serde::Serialize;
 use std::sync::OnceLock;
 use temps_cloud_client::{
-    BackendUrl, CloudError, CloudFeatureSwitches, CloudLink, EnrollmentKind, FirstLinkEnrollment,
+    BackendUrl, CloudError, CloudFeatureSwitches, CloudLink, ConsoleDispatchSlot,
+    ConsoleProxyWorker, EnrollmentKind, FirstLinkEnrollment,
 };
 use temps_cloud_protocol::{
     ManagedBackupCapability, ManagedNotificationAccepted, ManagedNotificationRequest,
@@ -50,6 +51,8 @@ pub enum CloudServiceError {
     ManagedBackupSchedule(#[from] temps_core::ManagedBackupScheduleError),
     #[error("Could not provision the managed console-access OIDC provider: {0}")]
     ConsoleOidcProvisioning(#[from] temps_auth::oidc_errors::OidcError),
+    #[error("Managed console-access OIDC provisioning is not configured on this instance")]
+    ConsoleOidcUnavailable,
 }
 
 /// Outcome of attempting to provision a Cloud-managed backup source as part
@@ -181,6 +184,9 @@ pub struct CloudStatus {
     pub telemetry_enabled: bool,
     pub backups_enabled: bool,
     pub notifications_enabled: bool,
+    /// ADR-045 §5: whether this instance currently permits Temps Cloud to
+    /// open its console over the console-proxy tunnel.
+    pub console_access_enabled: bool,
     pub managed_backup_setup: ManagedBackupSetup,
 }
 
@@ -195,6 +201,11 @@ pub struct CloudService {
     backup_credential_rotation_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     heartbeat_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     lifecycle_notify_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// ADR-045 §3: the console-proxy connection task and its own stop
+    /// switch. Separate from `cancel` because the worker owns a dedicated
+    /// `watch` channel (`ConsoleProxyWorker::spawn` returns it) rather than
+    /// subscribing to the service-wide one.
+    console_proxy_task: Mutex<Option<(tokio::task::JoinHandle<()>, watch::Sender<bool>)>>,
     /// Lets [`Self::wake_backup_mirror`] pull the next sweep tick forward the
     /// moment a local backup finishes, instead of it waiting behind whatever
     /// backoff `backup_mirror::run` is currently sitting on. See the comment
@@ -239,8 +250,19 @@ pub struct CloudService {
     /// `CloudPlugin::initialize_plugin_services`), the same pattern
     /// `schedule_provisioner` above already uses for `temps-backup`. `None`
     /// on a build with no auth plugin registered (never happens in practice,
-    /// but this degrades to "no managed provider" rather than panicking).
+    /// but the console-proxy path degrades to "no managed provider" rather
+    /// than panicking).
     oidc_provisioner: OnceLock<Arc<temps_auth::oidc_service::OidcService>>,
+    /// ADR-045 §1/§5: tracks `cloud.console_access_enabled` for
+    /// `ConsoleProxyWorker::spawn`'s `enabled` parameter. Updated from
+    /// settings at `initialize()`/enrollment time and by
+    /// [`Self::update_feature_switches`]; flipped to `false` on
+    /// [`Self::disconnect`]. A `watch` channel (not the plain atomics
+    /// `CloudLink` uses for the other three switches) because the
+    /// console-proxy connection task needs to `.changed()` on it to open or
+    /// close the tunnel without polling.
+    console_access_tx: watch::Sender<bool>,
+    feature_update_lock: AsyncMutex<()>,
 }
 
 impl CloudService {
@@ -252,6 +274,7 @@ impl CloudService {
         allow_loopback_development: bool,
     ) -> Self {
         let (cancel, _) = watch::channel(false);
+        let (console_access_tx, _) = watch::channel(false);
         Self {
             link,
             config,
@@ -263,6 +286,7 @@ impl CloudService {
             backup_credential_rotation_task: Mutex::new(None),
             heartbeat_task: Mutex::new(None),
             lifecycle_notify_task: Mutex::new(None),
+            console_proxy_task: Mutex::new(None),
             backup_mirror_wake: Arc::new(Notify::new()),
             allow_loopback_development,
             configuration_issue: RwLock::new(None),
@@ -272,6 +296,8 @@ impl CloudService {
             schedule_provisioner: OnceLock::new(),
             managed_backup_retention_days: RwLock::new(None),
             oidc_provisioner: OnceLock::new(),
+            console_access_tx,
+            feature_update_lock: AsyncMutex::new(()),
         }
     }
 
@@ -281,36 +307,31 @@ impl CloudService {
         let _ = self.oidc_provisioner.set(oidc_service);
     }
 
-    /// Upsert the managed console-access `oidc_providers` row from a
-    /// `ConsoleOidcConfig` frame (ADR-045 §4), delivered at enrollment or
-    /// provisioning time by a later change. A `None` [`Self::oidc_provisioner`]
-    /// (no auth plugin registered) degrades to a logged no-op rather than an
-    /// error — there is no console to authenticate into on such a build.
-    pub async fn apply_console_oidc_config(
-        &self,
-        config: temps_auth::oidc_service::ManagedCloudOidcConfig,
-    ) -> Result<(), CloudServiceError> {
-        let Some(oidc) = self.oidc_provisioner.get() else {
-            tracing::error!(
-                "received a managed console-access OIDC configuration but no OidcService is \
-                 registered on this build; console access cannot be authenticated"
-            );
-            return Ok(());
-        };
-        oidc.upsert_managed_cloud_provider(config).await?;
-        Ok(())
+    /// Tracks `cloud.console_access_enabled` for
+    /// `ConsoleProxyWorker::spawn`'s `enabled: watch::Receiver<bool>`
+    /// parameter (ADR-045 §1); see [`Self::start_console_proxy_worker`].
+    pub fn console_access_enabled_rx(&self) -> watch::Receiver<bool> {
+        self.console_access_tx.subscribe()
     }
 
-    /// Delete the managed console-access `oidc_providers` row and invalidate
-    /// every session it issued (ADR-045 §4). Idempotent: a build with no
-    /// managed row, or no `OidcService` registered, returns `Ok(false)`
-    /// rather than erroring, since "there was nothing to revoke" is a normal
-    /// outcome.
-    pub async fn revoke_console_oidc_provider(&self) -> Result<bool, CloudServiceError> {
-        let Some(oidc) = self.oidc_provisioner.get() else {
-            return Ok(false);
-        };
-        Ok(oidc.revoke_managed_cloud_provider().await?)
+    /// Read-only snapshot, for status/tests.
+    pub fn console_access_enabled(&self) -> bool {
+        *self.console_access_tx.borrow()
+    }
+
+    /// Publish `settings.cloud.console_access_enabled` to
+    /// [`Self::console_access_enabled_rx`]. A no-op send when the value has
+    /// not changed, so subscribers only wake on a real transition.
+    fn apply_console_access_from_settings(&self, settings: &temps_core::AppSettings) {
+        let enabled = settings.cloud.console_access_enabled;
+        self.console_access_tx.send_if_modified(|current| {
+            if *current == enabled {
+                false
+            } else {
+                *current = enabled;
+                true
+            }
+        });
     }
 
     /// Consume the `<TEMPS_DATA_DIR>/cloud-oidc.json` first-boot bootstrap
@@ -636,6 +657,32 @@ impl CloudService {
         }
     }
 
+    /// ADR-045 §3: launch the console-proxy worker that lets Temps Cloud
+    /// reach this instance's console through the outbound tunnel. Safe to
+    /// spawn unconditionally at startup: it does nothing until the link is
+    /// established *and* `cloud.console_access_enabled` is on (both are
+    /// re-checked before every connection attempt), and a mid-connection
+    /// flip to off closes the tunnel. `dispatch` is the slot the host
+    /// process fills with the console router once that router exists.
+    pub fn start_console_proxy_worker(self: &Arc<Self>, dispatch: ConsoleDispatchSlot) {
+        let mut task = self
+            .console_proxy_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if task.is_none() {
+            tracing::info!("Cloud service launching console-proxy worker task");
+            let sink = Arc::new(crate::console_oidc::ConsoleOidcAdapter::new(self.clone()));
+            *task = Some(ConsoleProxyWorker::spawn(
+                self.link.clone(),
+                self.console_access_enabled_rx(),
+                dispatch,
+                sink,
+            ));
+        } else {
+            tracing::debug!("Cloud console-proxy worker task is already registered");
+        }
+    }
+
     pub fn link(&self) -> Arc<CloudLink> {
         self.link.clone()
     }
@@ -698,10 +745,12 @@ impl CloudService {
                 return Ok(());
             }
         };
+        self.apply_console_access_from_settings(&settings);
         if let Err(state_error) = self.link.set_feature_switches(CloudFeatureSwitches {
             telemetry: settings.cloud.telemetry_enabled,
             backups: settings.cloud.backups_enabled,
             notifications: settings.cloud.notifications_enabled,
+            console_access: settings.cloud.console_access_enabled,
         }) {
             tracing::error!(%state_error, "Cloud consent state could not be applied; outbound operations blocked");
             self.link.block_outbound(
@@ -840,6 +889,7 @@ impl CloudService {
             telemetry_enabled: switches.telemetry,
             backups_enabled: switches.backups,
             notifications_enabled: switches.notifications,
+            console_access_enabled: switches.console_access,
             managed_backup_setup,
         })
     }
@@ -866,21 +916,104 @@ impl CloudService {
         &self,
         switches: CloudFeatureSwitches,
     ) -> Result<CloudStatus, CloudServiceError> {
-        self.config
-            .update_cloud_features(switches.telemetry, switches.backups, switches.notifications)
+        self.patch_feature_switches(
+            Some(switches.telemetry),
+            Some(switches.backups),
+            Some(switches.notifications),
+            Some(switches.console_access),
+        )
+        .await
+    }
+
+    pub async fn patch_feature_switches(
+        &self,
+        telemetry: Option<bool>,
+        backups: Option<bool>,
+        notifications: Option<bool>,
+        console_access: Option<bool>,
+    ) -> Result<CloudStatus, CloudServiceError> {
+        let _update = self.feature_update_lock.lock().await;
+        let updated = self
+            .config
+            .update_cloud_features(telemetry, backups, notifications, console_access)
             .await?;
+        let switches = CloudFeatureSwitches {
+            telemetry: updated.cloud.telemetry_enabled,
+            backups: updated.cloud.backups_enabled,
+            notifications: updated.cloud.notifications_enabled,
+            console_access: updated.cloud.console_access_enabled,
+        };
         if let Err(error) = self.link.set_feature_switches(switches) {
             self.link.block_outbound(
                 "telemetry consent state could not be persisted; repair the Cloud link state",
             );
             return Err(CloudServiceError::State(error));
         }
+        self.console_access_tx.send_if_modified(|current| {
+            if *current == switches.console_access {
+                false
+            } else {
+                *current = switches.console_access;
+                true
+            }
+        });
         if switches.backups {
             self.reconcile_managed_backup_source().await?;
         } else {
             self.set_managed_backup_setup(default_managed_backup_setup(false));
         }
+        // ADR-045 §5: "Toggling off does the reverse [of toggling on]:
+        // symmetric with disconnect" -- the managed OIDC provider row (and
+        // its sessions) must not survive an operator turning console access
+        // back off, even though the console-proxy connection itself is torn
+        // down asynchronously by the worker observing `console_access_tx`.
+        if console_access == Some(false) {
+            // Explicit retries must re-attempt revocation even after the
+            // persisted switch and relay have already been disabled.
+            self.revoke_console_oidc_provider().await?;
+        }
         self.status().await
+    }
+
+    /// Upsert the managed console-access `oidc_providers` row from a
+    /// `ConsoleOidcConfig` frame (ADR-045 §4). Called by the
+    /// `ConsoleOidcSink` adapter (`crate::console_oidc`) on every
+    /// console-proxy connect/reconnect. A `None` [`Self::oidc_provisioner`]
+    /// (no auth plugin registered) fails closed so the relay never enables
+    /// routing without an authentication provider.
+    pub async fn apply_console_oidc_config(
+        &self,
+        config: temps_auth::oidc_service::ManagedCloudOidcConfig,
+    ) -> Result<(), CloudServiceError> {
+        // Serialize provisioning with consent updates and disconnect. A delayed
+        // configuration must never recreate the provider after revocation.
+        let _update = self.feature_update_lock.lock().await;
+        let Some(oidc) = self.oidc_provisioner.get() else {
+            tracing::error!(
+                "received a managed console-access OIDC configuration but no OidcService is \
+                 registered on this build; console access cannot be authenticated"
+            );
+            return Err(CloudServiceError::ConsoleOidcUnavailable);
+        };
+        if !self.console_access_enabled() || !self.link.is_linked() {
+            return Err(CloudServiceError::Client(CloudError::FeatureDisabled {
+                feature: "console_access",
+            }));
+        }
+        oidc.upsert_managed_cloud_provider(config).await?;
+        Ok(())
+    }
+
+    /// Delete the managed console-access `oidc_providers` row and invalidate
+    /// every session it issued (ADR-045 §4). Idempotent: a build with no
+    /// managed row, or no `OidcService` registered, returns `Ok(false)`
+    /// rather than erroring, since "there was nothing to revoke" is a normal
+    /// outcome on the local-toggle and Cloud-revoke paths alike.
+    pub async fn revoke_console_oidc_provider(&self) -> Result<bool, CloudServiceError> {
+        let Some(oidc) = self.oidc_provisioner.get() else {
+            return Ok(false);
+        };
+        Ok(oidc.revoke_managed_cloud_provider().await?)
     }
 
     /// Enroll this instance and, if the tenant's plan includes it, provision
@@ -1017,11 +1150,13 @@ impl CloudService {
             .configure(backend)
             .map_err(CloudServiceError::State)?;
         self.set_configuration_issue(None);
+        self.apply_console_access_from_settings(&settings);
         self.link
             .set_feature_switches(CloudFeatureSwitches {
                 telemetry: settings.cloud.telemetry_enabled,
                 backups: settings.cloud.backups_enabled,
                 notifications: settings.cloud.notifications_enabled,
+                console_access: settings.cloud.console_access_enabled,
             })
             .map_err(CloudServiceError::State)
     }
@@ -1185,6 +1320,7 @@ impl CloudService {
     /// Returns `(status, backup_credential_revoked, console_oidc_revoked)` so
     /// the caller can audit each independently.
     pub async fn disconnect(&self) -> Result<(CloudStatus, bool, bool), CloudServiceError> {
+        let _update = self.feature_update_lock.lock().await;
         if !self.link.is_linked() {
             // Nothing to revoke, so nothing to release either: the answer
             // `revoke` would give, before any schedule is touched.
@@ -1208,6 +1344,14 @@ impl CloudService {
         // intact instead means the operator sees the error and can retry the
         // disconnect once the database is reachable again.
         let console_oidc_revoked = self.revoke_console_oidc_provider().await?;
+        self.console_access_tx.send_if_modified(|current| {
+            if *current {
+                *current = false;
+                true
+            } else {
+                false
+            }
+        });
         match self.link.revoke().await {
             Ok(()) | Err(CloudError::CredentialRejected) => {}
             Err(error) => return Err(CloudServiceError::Client(error)),
@@ -1337,6 +1481,17 @@ impl CloudService {
             .take();
         if let Some(task) = heartbeat_task {
             await_task_shutdown(task, "Cloud heartbeat sender", SHUTDOWN_TASK_TIMEOUT).await;
+        }
+        let console_proxy_task = self
+            .console_proxy_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some((task, stop)) = console_proxy_task {
+            // The worker answers this with `GoingAway` on its open streams so
+            // Cloud can tell browsers to retry (ADR-045 §3).
+            let _ = stop.send(true);
+            await_task_shutdown(task, "Cloud console-proxy worker", SHUTDOWN_TASK_TIMEOUT).await;
         }
     }
 }
@@ -1871,6 +2026,135 @@ mod tests {
         ));
         let encryption = Arc::new(EncryptionService::new_from_password("cloud-service-test"));
         (temp, CloudService::new(link, config, db, encryption, true))
+    }
+
+    #[tokio::test]
+    async fn delayed_console_config_rechecks_consent_under_lifecycle_lock() {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        );
+        let (_temp, service) = linked_cloud_service(db.clone());
+        service.set_oidc_service(Arc::new(temps_auth::oidc_service::OidcService::new(
+            db.clone(),
+            Arc::new(EncryptionService::new_from_password("consent-race-test")),
+            Arc::new(temps_auth::UserService::new(db)),
+        )));
+        service.console_access_tx.send_replace(true);
+        let guard = service.feature_update_lock.lock().await;
+        let mut delayed = Box::pin(service.apply_console_oidc_config(
+            temps_auth::oidc_service::ManagedCloudOidcConfig {
+                issuer: "https://cloud.example.com".into(),
+                client_id: "client".into(),
+                client_secret: "test-secret".into(),
+            },
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut delayed)
+                .await
+                .is_err(),
+            "provisioning must wait for an ongoing lifecycle operation"
+        );
+        // The disable path publishes this value while holding the same lock.
+        service.console_access_tx.send_replace(false);
+        drop(guard);
+        assert!(matches!(
+            delayed.await,
+            Err(CloudServiceError::Client(CloudError::FeatureDisabled {
+                feature: "console_access"
+            }))
+        ));
+        // Even stale enabled consent cannot provision a disconnected link.
+        service.console_access_tx.send_replace(true);
+        service.link.disconnect().unwrap();
+        assert!(matches!(
+            service
+                .apply_console_oidc_config(temps_auth::oidc_service::ManagedCloudOidcConfig {
+                    issuer: "https://cloud.example.com".into(),
+                    client_id: "client".into(),
+                    client_secret: "test-secret".into(),
+                },)
+                .await,
+            Err(CloudServiceError::Client(
+                CloudError::FeatureDisabled { .. }
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn console_provisioning_without_auth_fails_closed() {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        );
+        let (_temp, service) = linked_cloud_service(db);
+        let result = service
+            .apply_console_oidc_config(temps_auth::oidc_service::ManagedCloudOidcConfig {
+                issuer: "https://cloud.example.com".into(),
+                client_id: "client".into(),
+                client_secret: "test-secret".into(),
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(CloudServiceError::ConsoleOidcUnavailable)
+        ));
+    }
+
+    #[tokio::test]
+    async fn explicit_disable_retries_failed_provider_revocation() {
+        let row = temps_entities::settings::Model {
+            id: 1,
+            data: temps_core::AppSettings::default().to_json(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results(vec![
+                    // Each update reads, returns the updated row, and reloads
+                    // the invalidated settings cache before revocation.
+                    vec![row.clone()],
+                    vec![row.clone()],
+                    vec![row.clone()],
+                    vec![row.clone()],
+                    vec![row.clone()],
+                    vec![row],
+                ])
+                .append_exec_results(vec![
+                    sea_orm::MockExecResult {
+                        last_insert_id: 1,
+                        rows_affected: 1,
+                    };
+                    2
+                ])
+                .into_connection(),
+        );
+        let (_temp, service) = linked_cloud_service(db);
+        let oidc_db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_errors(vec![
+                    sea_orm::DbErr::Custom("revocation unavailable".into()),
+                    sea_orm::DbErr::Custom("revocation still unavailable".into()),
+                ])
+                .into_connection(),
+        );
+        service.set_oidc_service(Arc::new(temps_auth::oidc_service::OidcService::new(
+            oidc_db.clone(),
+            Arc::new(EncryptionService::new_from_password("oidc-retry-test")),
+            Arc::new(temps_auth::UserService::new(oidc_db)),
+        )));
+        for _ in 0..2 {
+            let result = service
+                .patch_feature_switches(None, None, None, Some(false))
+                .await;
+            assert!(
+                matches!(result, Err(CloudServiceError::ConsoleOidcProvisioning(_))),
+                "unexpected disable result: {result:?}"
+            );
+            assert!(
+                !service.console_access_enabled(),
+                "the relay stays disabled while revocation is retried"
+            );
+        }
     }
 
     /// SECURITY: disconnecting must not report success while the managed

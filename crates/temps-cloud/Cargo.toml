@@ -17,6 +17,7 @@ temps-core = { path = "../temps-core" }
 temps-entities = { path = "../temps-entities" }
 
 anyhow.workspace = true
+async-trait.workspace = true
 aws-sdk-s3.workspace = true
 axum.workspace = true
 chrono.workspace = true

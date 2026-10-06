@@ -4,6 +4,7 @@
 import { Link } from 'react-router'
 import { ConnectedRepository } from './ConnectedRepository'
 import { StarterLocalFiles } from './StarterLocalFiles'
+import { SampleDeployCard } from '@/components/first-deploy/SampleDeployCard'
 import {
   Dialog,
   DialogContent,
@@ -20,6 +21,8 @@ import {
 import {
   Activity,
   ArrowRight,
+  Container,
+  LayoutTemplate,
   Terminal,
   Sparkles,
   UploadCloud,
@@ -52,17 +55,32 @@ export function FirstProjectOnboarding() {
           </Link>
         </Button>
       </div>
+      {/* The do-this-first path: something live in one click, before any
+          credentials. The same card lives on /get-started, which the Platform
+          setup checklist links to once this empty state is gone. */}
+      <SampleDeployCard />
       <div className="grid min-w-0 gap-4 lg:grid-cols-2">
         <ConnectedRepository />
         <div className="min-w-0 self-start rounded-lg border p-5">
           <StarterLocalFiles />
         </div>
       </div>
-      <Button asChild variant="ghost">
-        <Link to="/projects/new?source=templates&template=observability-starter">
-          Try a demo app <ArrowRight className="size-4" />
-        </Link>
-      </Button>
+      <nav
+        aria-label="More ways to deploy"
+        className="flex flex-wrap items-center gap-2"
+      >
+        <span className="text-sm text-muted-foreground">Or start from</span>
+        <Button asChild variant="ghost" size="sm">
+          <Link to="/projects/new?source=manual">
+            <Container className="mr-2 size-4" /> A Docker image
+          </Link>
+        </Button>
+        <Button asChild variant="ghost" size="sm">
+          <Link to="/projects/new?source=templates">
+            <LayoutTemplate className="mr-2 size-4" /> A template
+          </Link>
+        </Button>
+      </nav>
       {choosingSource && (
         <div className="flex flex-col gap-3 border-t pt-5 sm:flex-row sm:items-center sm:justify-between">
           <div className="min-w-0">

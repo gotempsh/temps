@@ -2726,6 +2726,7 @@ pub async fn get_project_statistics(
 
     let response = ProjectStatisticsResponse {
         total_count: statistics.total_count,
+        has_completed_deployment: statistics.has_completed_deployment,
     };
 
     Ok(Json(response))

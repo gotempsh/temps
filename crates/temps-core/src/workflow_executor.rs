@@ -15,6 +15,19 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
+/// The error a workflow stops with when a required job fails.
+///
+/// `message` is the job's own failure text and is embedded as-is: it ends up
+/// as the deployment's failure reason in the console, so it must read as a
+/// sentence rather than as `Some("...")` with escaped quotes.
+fn required_job_failed(job_id: &str, message: Option<&str>) -> WorkflowError {
+    WorkflowError::JobExecutionFailed(format!(
+        "Required job '{}' failed: {}",
+        job_id,
+        message.unwrap_or("Unknown error")
+    ))
+}
+
 /// Workflow executor that handles job dependencies and parallel execution
 pub struct WorkflowExecutor {
     /// Optional job tracker for persistence
@@ -322,10 +335,7 @@ impl WorkflowExecutor {
                             self.cleanup_terminal_resources(&config.jobs, &context)
                                 .await;
 
-                            return Err(WorkflowError::JobExecutionFailed(format!(
-                                "Required job '{}' failed: {:?}",
-                                job_id, result.message
-                            )));
+                            return Err(required_job_failed(&job_id, result.message.as_deref()));
                         } else {
                             warn!("⚠️ Required job '{}' failed, but continuing due to continue_on_failure=true", job_id);
                         }
@@ -740,7 +750,7 @@ impl WorkflowExecutor {
                                 if is_cancellation {
                                     JobResult::cancelled(error_context)
                                 } else {
-                                    JobResult::failure(error_context, e.to_string())
+                                    JobResult::failure(error_context, e.detail())
                                 },
                             )
                         }
@@ -778,6 +788,30 @@ impl WorkflowExecutor {
 mod tests {
     use super::*;
     use crate::workflow::WorkflowBuilder;
+
+    #[test]
+    fn required_job_failure_embeds_the_job_message_verbatim() {
+        let error = required_job_failed(
+            "build_image",
+            Some("Failed to build image: process \"/bin/sh -c make build\" exited 2"),
+        );
+
+        assert_eq!(
+            error.detail(),
+            "Required job 'build_image' failed: Failed to build image: \
+             process \"/bin/sh -c make build\" exited 2"
+        );
+        assert!(!error.to_string().contains("Some("));
+        assert!(!error.to_string().contains("\\\""));
+    }
+
+    #[test]
+    fn required_job_failure_without_a_message_says_so() {
+        assert_eq!(
+            required_job_failed("deploy", None).detail(),
+            "Required job 'deploy' failed: Unknown error"
+        );
+    }
     use crate::workflow::WorkflowTask;
     use crate::LogWriter;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1362,6 +1396,57 @@ mod tests {
             "an intentional skip is not an error and the executor doesn't know the \
              job's reason — it must not fabricate one, got: {:?}",
             message
+        );
+    }
+
+    #[derive(Debug)]
+    struct BuildFailureJob;
+
+    #[async_trait::async_trait]
+    impl WorkflowTask for BuildFailureJob {
+        fn job_id(&self) -> &str {
+            "build_image"
+        }
+        fn name(&self) -> &str {
+            "Build image"
+        }
+        fn description(&self) -> &str {
+            "Fails the way an image build step does"
+        }
+        async fn execute(&self, _context: WorkflowContext) -> Result<JobResult, WorkflowError> {
+            Err(WorkflowError::JobExecutionFailed(
+                "Failed to build image: Build failed: process \"/bin/sh -c make build\" did \
+                 not complete successfully: exit code: 2"
+                    .to_string(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn required_job_failure_reason_is_readable() {
+        let config = WorkflowBuilder::new()
+            .with_workflow_run_id("failing-build".to_string())
+            .with_deployment_context(1, 1, 1)
+            .with_log_writer(Arc::new(MockLogWriter))
+            .with_job(Arc::new(BuildFailureJob))
+            .continue_on_failure(false)
+            .build()
+            .expect("workflow config should build");
+
+        let error = WorkflowExecutor::new(None)
+            .execute_workflow(
+                config,
+                Arc::new(TestCancellationProvider { cancelled: false }),
+            )
+            .await
+            .expect_err("a failing required job fails the workflow");
+
+        // This is the deployment failure reason the console shows: one
+        // prefix per layer, the build's own quotes intact, no Debug output.
+        assert_eq!(
+            error.detail(),
+            "Required job 'build_image' failed: Failed to build image: Build failed: process \
+             \"/bin/sh -c make build\" did not complete successfully: exit code: 2"
         );
     }
 

@@ -11,6 +11,7 @@ pub mod client_ip;
 /// (ADR-042 P3).
 pub mod cloud_telemetry_activation;
 pub mod config;
+pub mod console_startup;
 pub mod deployment;
 pub mod dns_automation;
 pub mod env_vars_provider;

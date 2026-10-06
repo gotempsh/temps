@@ -292,6 +292,41 @@ mod tests {
         assert!(result.content.contains("build:prod"), "{}", result.content);
     }
 
+    #[test]
+    fn upgraded_autopack_preserves_next_and_pnpm_caches() {
+        let dir = fixture(&[
+            ("package.json", r#"{"packageManager":"pnpm@11.0.0","scripts":{"build":"next build","start":"next start"},"dependencies":{"next":"16.0.0"}}"#),
+            ("pnpm-lock.yaml", "lockfileVersion: '9.0'\n"),
+        ]);
+        let result = render(&buildkit_config(dir.path()), None).expect("Next.js plan");
+        assert!(result.content.contains("pnpm_config_store_dir"), "{}", result.content);
+        assert!(result.content.contains("target=/cache/pnpm"), "{}", result.content);
+        assert!(result.content.contains("target=/app/.next/cache,sharing=locked"), "{}", result.content);
+    }
+
+    #[test]
+    fn upgraded_autopack_prepares_caddy_despite_user_step_overrides() {
+        let dir = fixture(&[
+            ("index.html", "<h1>static site</h1>"),
+            ("autopack.json", r#"{"steps":{"caddy":{"commands":["echo custom step"]}}}"#),
+        ]);
+        let result = render(&buildkit_config(dir.path()), None).expect("static plan");
+        assert!(result.content.contains("RUN cp /usr/bin/caddy /tmp/caddy && mv /tmp/caddy /usr/bin/caddy"), "{}", result.content);
+        assert!(result.content.contains("--from=autopack-caddy-1 /usr/bin/caddy /usr/bin/caddy"), "{}", result.content);
+    }
+
+    #[test]
+    fn app_cache_scope_build_variables_reach_autopack() {
+        let dir = node_app();
+        let vars = vec!["AUTOPACK_CACHE_SCOPE=app".to_string(), "AUTOPACK_CACHE_KEY=project-a".to_string()];
+        let config = buildkit_config(dir.path()).with_build_vars(&vars);
+        let result = render(&config, None).expect("scoped plan");
+        assert!(result.content.contains("id=autopack-70726f6a6563742d61-"), "{}", result.content);
+        let missing_key = vec!["AUTOPACK_CACHE_SCOPE=app".to_string()];
+        let config = buildkit_config(dir.path()).with_build_vars(&missing_key);
+        assert!(render(&config, None).unwrap_err().contains("AUTOPACK_CACHE_KEY"));
+    }
+
     #[tokio::test]
     async fn a_build_without_buildkit_is_refused_by_name() {
         // The classic builder cannot parse `--mount`, and the error it gives

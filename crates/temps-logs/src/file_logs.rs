@@ -77,6 +77,40 @@ pub const DEFAULT_TAIL_REPLAY_LINES: usize = 100_000;
 /// how long individual lines are.
 const TAIL_SCAN_CHUNK: usize = 64 * 1024;
 
+/// Maximum bytes fetched for one HTTP log-tail snapshot.
+pub const MAX_LOG_TAIL_BYTES: usize = 8 * 1024 * 1024;
+
+/// The suffix of `content` holding its last `max_lines` lines, with the same
+/// line counting as [`find_tail_offset`]: a trailing '\n' ends the last line
+/// rather than starting an empty one.
+fn last_lines(content: &str, max_lines: usize) -> &str {
+    if max_lines == 0 {
+        return "";
+    }
+    let body = content.strip_suffix('\n').unwrap_or(content);
+    match body.rmatch_indices('\n').nth(max_lines - 1) {
+        Some((index, _)) => &content[index + 1..],
+        None => content,
+    }
+}
+
+fn tail_content(
+    bytes: &[u8],
+    starts_inside: bool,
+    max_lines: usize,
+) -> Result<String, std::io::Error> {
+    let bytes = if starts_inside {
+        let Some(boundary) = bytes.iter().position(|byte| *byte == b'\n') else {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                "The latest log entry exceeds the 8 MiB viewer limit; read the full log without tail"));
+        };
+        &bytes[boundary + 1..]
+    } else {
+        bytes
+    };
+    Ok(last_lines(&String::from_utf8_lossy(bytes), max_lines).to_string())
+}
+
 /// Byte offset of the first of the last `replay_lines` lines of `file_size`
 /// bytes, found by scanning backwards in fixed blocks.
 ///
@@ -490,6 +524,90 @@ impl LogService {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Read the last `max_lines` lines, fetching at most 8 MiB. A suffix
+    /// that starts within an entry drops that partial entry, retaining valid
+    /// JSONL. Local and archived reads obey the same byte bound.
+    pub async fn get_log_tail(
+        &self,
+        log_id: &str,
+        max_lines: usize,
+    ) -> Result<String, std::io::Error> {
+        validate_log_id(log_id)?;
+        if max_lines == 0 {
+            return Ok(String::new());
+        }
+        if self.durable_chunks {
+            // Finished durable logs have a compacted object. Read that in
+            // one bounded Range request before scanning immutable chunks.
+            match self.read_archived_tail(log_id, max_lines).await {
+                Ok(content) => return Ok(content),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            if let Some(archive) = &self.archive {
+                let chunks = archive
+                    .download_recent_log_chunks_bounded(log_id, max_lines, MAX_LOG_TAIL_BYTES)
+                    .await
+                    .map_err(|error| {
+                        std::io::Error::other(format!(
+                            "failed to read recent durable chunks for log '{log_id}': {error}"
+                        ))
+                    })?;
+                if !chunks.is_empty() {
+                    let mut content = String::new();
+                    for chunk in &chunks {
+                        content.push_str(&String::from_utf8_lossy(&chunk.data));
+                    }
+                    return Ok(last_lines(&content, max_lines).to_string());
+                }
+            }
+            return self.read_archived_tail(log_id, max_lines).await;
+        }
+        let log_path = self.get_log_path(log_id);
+        match File::open(&log_path).await {
+            Ok(mut file) => {
+                let file_size = file.metadata().await?.len();
+                let start = file_size.saturating_sub(MAX_LOG_TAIL_BYTES as u64);
+                file.seek(SeekFrom::Start(start)).await?;
+                let mut bytes = Vec::new();
+                file.take(MAX_LOG_TAIL_BYTES as u64)
+                    .read_to_end(&mut bytes)
+                    .await?;
+                tail_content(&bytes, start > 0, max_lines)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.read_archived_tail(log_id, max_lines).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn read_archived_tail(
+        &self,
+        log_id: &str,
+        max_lines: usize,
+    ) -> Result<String, std::io::Error> {
+        let Some(archive) = &self.archive else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("log '{log_id}' not found"),
+            ));
+        };
+        let (bytes, starts_inside) = archive
+            .download_log_suffix(&self.archive_key(log_id), MAX_LOG_TAIL_BYTES)
+            .await
+            .map_err(|error| match error {
+                LogArchiveStorageError::NotFound { .. } => std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("log '{log_id}' not found"),
+                ),
+                other => std::io::Error::other(format!(
+                    "failed to read archived tail for log '{log_id}': {other}"
+                )),
+            })?;
+        tail_content(&bytes, starts_inside, max_lines)
     }
 
     async fn read_durable_chunks(&self, log_id: &str) -> Result<String, std::io::Error> {
@@ -970,6 +1088,129 @@ mod tests {
         // We can't easily test the streaming behavior in a unit test
     }
 
+    #[test]
+    fn last_lines_keeps_only_the_requested_suffix() {
+        assert_eq!(last_lines("a\nb\nc\n", 2), "b\nc\n");
+        assert_eq!(last_lines("a\nb\nc", 2), "b\nc");
+        assert_eq!(last_lines("a\nb\n", 5), "a\nb\n");
+        assert_eq!(last_lines("a\nb\n", 2), "a\nb\n");
+        assert_eq!(last_lines("", 3), "");
+        assert_eq!(last_lines("a\n", 0), "");
+    }
+
+    #[tokio::test]
+    async fn get_log_tail_bounds_the_read_to_the_last_lines() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_service = LogService::new(temp_dir.path().to_path_buf());
+        let log_id = "tail-tests/test-log-tail.log";
+        for index in 1..=5 {
+            log_service
+                .log_info(log_id, format!("message {index}"))
+                .await
+                .unwrap();
+        }
+
+        let tail = log_service.get_log_tail(log_id, 2).await.unwrap();
+        let entries: Vec<LogEntry> = tail
+            .lines()
+            .map(|line| LogEntry::from_jsonl(line).unwrap())
+            .collect();
+        assert_eq!(
+            entries.iter().map(|entry| entry.line).collect::<Vec<_>>(),
+            vec![4, 5]
+        );
+        assert_eq!(entries[1].message, "message 5");
+
+        // Asking for more lines than exist returns the whole log.
+        assert_eq!(
+            log_service.get_log_tail(log_id, 100).await.unwrap(),
+            log_service.get_log_content(log_id).await.unwrap()
+        );
+        assert_eq!(log_service.get_log_tail(log_id, 0).await.unwrap(), "");
+    }
+
+    #[tokio::test]
+    async fn get_log_tail_bounds_bytes_and_discards_partial_entries() {
+        let dir = TempDir::new().unwrap();
+        let service = LogService::new(dir.path().to_path_buf());
+        let log_id = "large-tail";
+        let content = format!(
+            "{}\nlast complete entry\n",
+            "x".repeat(MAX_LOG_TAIL_BYTES + 32)
+        );
+        tokio::fs::write(service.get_log_path(log_id), content)
+            .await
+            .unwrap();
+        assert_eq!(
+            service.get_log_tail(log_id, 100).await.unwrap(),
+            "last complete entry\n"
+        );
+        tokio::fs::write(
+            service.get_log_path(log_id),
+            vec![b'x'; MAX_LOG_TAIL_BYTES + 1],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            service.get_log_tail(log_id, 100).await.unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[tokio::test]
+    async fn get_log_tail_reads_a_bounded_archived_suffix() {
+        let dir = TempDir::new().unwrap();
+        let archive = Arc::new(MockArchive::default());
+        let service = LogService::with_archive(dir.path().to_path_buf(), Some(archive.clone()));
+        let id = "large-archive";
+        let content = format!(
+            "{}\nlast complete archived entry\n",
+            "x".repeat(MAX_LOG_TAIL_BYTES + 32)
+        );
+        archive
+            .upload_log(&service.archive_key(id), content.into_bytes())
+            .await
+            .unwrap();
+        assert_eq!(
+            service.get_log_tail(id, 100).await.unwrap(),
+            "last complete archived entry\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_log_tail_reads_recent_durable_chunks() {
+        let dir = TempDir::new().unwrap();
+        let archive = Arc::new(MockArchive::default());
+        let service = LogService::with_archive_mode(dir.path().to_path_buf(), Some(archive), true);
+        let id = "durable-tail";
+        for n in 1..=4 {
+            service.log_info(id, format!("entry {n}")).await.unwrap();
+        }
+        let content = service.get_log_tail(id, 2).await.unwrap();
+        let lines: Vec<_> = content
+            .lines()
+            .map(|s| LogEntry::from_jsonl(s).unwrap().line)
+            .collect();
+        assert_eq!(lines, vec![3, 4]);
+    }
+
+    #[tokio::test]
+    async fn get_log_tail_keeps_the_not_found_shape_of_get_log_content() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_service = LogService::new(temp_dir.path().to_path_buf());
+
+        let error = log_service.get_log_tail("missing", 10).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(
+            log_service
+                .get_log_tail("../outside", 10)
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
     #[tokio::test]
     async fn test_get_log_content_nonexistent_file() {
         let temp_dir = TempDir::new().unwrap();
@@ -1414,6 +1655,51 @@ mod tests {
                 chunks.drain(..chunks.len() - limit);
             }
             Ok(chunks)
+        }
+
+        async fn download_recent_log_chunks_bounded(
+            &self,
+            log_id: &str,
+            limit: usize,
+            max_bytes: usize,
+        ) -> Result<Vec<DurableLogChunk>, LogArchiveStorageError> {
+            let entries = self.chunks.lock().expect("mock chunk lock poisoned");
+            let mut remaining = max_bytes;
+            let mut chunks = Vec::new();
+            for ((stored_id, line), data) in entries
+                .iter()
+                .rev()
+                .filter(|((stored_id, _), _)| stored_id == log_id)
+                .take(limit)
+            {
+                let _ = stored_id;
+                if data.len() > remaining {
+                    break;
+                }
+                remaining -= data.len();
+                chunks.push(DurableLogChunk {
+                    line: *line,
+                    data: data.clone(),
+                });
+            }
+            chunks.reverse();
+            Ok(chunks)
+        }
+
+        async fn download_log_suffix(
+            &self,
+            key: &str,
+            max_bytes: usize,
+        ) -> Result<(Vec<u8>, bool), LogArchiveStorageError> {
+            let objects = self.objects.lock().expect("mock archive lock poisoned");
+            let data = objects
+                .get(key)
+                .ok_or_else(|| LogArchiveStorageError::NotFound {
+                    bucket: "mock".to_string(),
+                    key: key.to_string(),
+                })?;
+            let start = data.len().saturating_sub(max_bytes);
+            Ok((data[start..].to_vec(), start > 0))
         }
 
         async fn upload_log(&self, key: &str, data: Vec<u8>) -> Result<(), LogArchiveStorageError> {

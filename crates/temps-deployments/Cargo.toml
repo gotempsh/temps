@@ -100,7 +100,7 @@ rcgen = { version = "0.14.8", features = ["x509-parser"] }
 # Key re-encoding for SEC1 (EC) and PKCS#1 (RSA) coverage (ADR-041 verification table).
 # All three crates are already vendored as transitive dependencies; adding them here
 # only exposes their encoding APIs to the test binary, without new network downloads.
-p256 = { version = "0.13", features = ["pkcs8", "pem"] }
+p256 = { version = "0.14", features = ["pkcs8", "pem"] }
 rsa = { version = "0.9", features = ["pem"] }
 
 [features]

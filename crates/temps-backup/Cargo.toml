@@ -55,6 +55,7 @@ utoipa = { workspace = true }
 axum = { workspace = true }
 bollard = { workspace = true }
 futures = { workspace = true }
+tar = { workspace = true }
 async-trait = { workspace = true }
 async-stream = { workspace = true }
 urlencoding = { workspace = true }

@@ -624,10 +624,16 @@ impl AlertEvaluator {
                 }
             };
 
-            // Deduplicate metric names for this source.
+            // Deduplicate metric names for this source. A rule whose metric
+            // has a volume gate also needs the gating metric, fetched in the
+            // same query so gating costs no extra round trip.
             let names: Vec<String> = group
                 .iter()
-                .map(|r| r.metric_name.clone())
+                .flat_map(|r| {
+                    std::iter::once(r.metric_name.as_str())
+                        .chain(default_volume_gate(r).map(|g| g.metric_name))
+                })
+                .map(str::to_string)
                 .collect::<HashSet<_>>()
                 .into_iter()
                 .collect();
@@ -685,6 +691,21 @@ impl AlertEvaluator {
                 return Ok(());
             }
         };
+
+        // A ratio over too little volume is noise, not a signal (e.g. the
+        // fragmentation ratio of an empty Redis is routinely > 10). Treat it
+        // as healthy rather than as missing data so a breach window opened
+        // before the gate existed is reset and an alarm it fired resolves.
+        if default_volume_gate(rule).is_some_and(|gate| !latest.contains_key(gate.metric_name)) {
+            // Missing collector data does not establish that an existing
+            // alarm has recovered. Wait for a complete sample.
+            self.clear_breach(rule.id).await;
+            return Ok(());
+        }
+        if default_volume_gate(rule).is_some() && !meets_volume_gate(&rule.metric_name, latest) {
+            self.handle_recovery(rule, ctx).await;
+            return Ok(());
+        }
 
         let is_breaching = compare(value, rule.threshold, &rule.comparator);
 
@@ -986,6 +1007,89 @@ impl AlertEvaluator {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// Minimum Redis dataset size for interpreting the fragmentation ratio.
+/// Fixed allocator overhead dominates small datasets. This is an alert policy
+/// threshold on used memory, not Redis's active-defrag-ignore-bytes setting
+/// (which measures wasted bytes).
+pub const REDIS_FRAGMENTATION_MIN_USED_BYTES: f64 = 100.0 * 1024.0 * 1024.0;
+
+/// Lifetime keyspace lookups (hits + misses) before the Redis hit ratio is
+/// evaluated. One `GET` of a missing key on a new instance is a 0% hit ratio.
+pub const REDIS_HIT_RATIO_MIN_LOOKUPS: f64 = 10_000.0;
+
+/// Lifetime shared-buffer block accesses (hits + reads) before the Postgres
+/// cache hit ratio is evaluated. A new server's first reads all come from
+/// disk, so its ratio starts low and only becomes meaningful with volume.
+pub const PG_CACHE_HIT_RATIO_MIN_BLOCKS: f64 = 100_000.0;
+
+/// Requests in one proxy sample interval before error-rate and latency
+/// percentiles are evaluated. On an idle host a single 502 is a 100% error
+/// rate and a single slow request is the p99.
+pub const PROXY_MIN_REQUESTS_PER_SAMPLE: f64 = 20.0;
+
+/// A precondition on another metric of the same source that must hold before
+/// a rule over a ratio/percentile metric is evaluated.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VolumeGate {
+    /// Metric (same source kind and id) carrying the volume.
+    pub metric_name: &'static str,
+    /// Minimum latest value of `metric_name` for the rule to be evaluated.
+    pub min_value: f64,
+}
+
+/// The volume gate for `metric_name`, if it needs one.
+///
+/// Used for unmodified seeded rules; custom alert rules retain their
+/// explicitly configured thresholds.
+pub fn volume_gate(metric_name: &str) -> Option<VolumeGate> {
+    let (gate_metric, min_value) = match metric_name {
+        "redis.memory_fragmentation_ratio" => (
+            "redis.memory_used_bytes",
+            REDIS_FRAGMENTATION_MIN_USED_BYTES,
+        ),
+        "redis.keyspace_hit_ratio" => ("redis.keyspace_lookups", REDIS_HIT_RATIO_MIN_LOOKUPS),
+        "pg.cache_hit_ratio" => ("pg.cache_blocks_accessed", PG_CACHE_HIT_RATIO_MIN_BLOCKS),
+        "proxy.error_rate_percent" | "proxy.request_duration_p99_ms" => {
+            ("proxy.requests", PROXY_MIN_REQUESTS_PER_SAMPLE)
+        }
+        _ => return None,
+    };
+    Some(VolumeGate {
+        metric_name: gate_metric,
+        min_value,
+    })
+}
+
+/// Apply the volume policy only while a rule retains its seeded definition.
+/// There is no persisted "default" flag, so compare the identifying fields;
+/// editing the name, threshold or comparator opts out of the default policy.
+fn default_volume_gate(rule: &monitoring_alert_rules::Model) -> Option<VolumeGate> {
+    let gate = volume_gate(&rule.metric_name)?;
+    postgres_default_seeds()
+        .into_iter()
+        .chain(redis_default_seeds())
+        .chain(proxy_default_seeds())
+        .any(|seed| {
+            seed.name == rule.name
+                && seed.metric_name == rule.metric_name
+                && seed.threshold == rule.threshold
+                && seed.comparator == rule.comparator
+        })
+        .then_some(gate)
+}
+
+/// Whether `latest` carries enough volume for a rule over `metric_name` to be
+/// evaluated. Ungated metrics always pass; a gated metric whose volume metric
+/// is missing (not collected yet, or an older collector) does not.
+fn meets_volume_gate(metric_name: &str, latest: &HashMap<String, f64>) -> bool {
+    match volume_gate(metric_name) {
+        None => true,
+        Some(gate) => latest
+            .get(gate.metric_name)
+            .is_some_and(|v| *v >= gate.min_value),
+    }
+}
+
 /// Evaluate `lhs <comparator> rhs`.
 fn compare(lhs: f64, rhs: f64, comparator: &str) -> bool {
     match comparator {
@@ -1042,7 +1146,9 @@ pub use temps_metrics::MetricsError;
 /// - `"postgres"` — 6 default rules covering connections, cache hit ratio,
 ///   replication lag and deadlocks.
 /// - `"redis"` — 4 default rules covering memory fragmentation, eviction,
-///   client count and keyspace hit ratio.
+///   client count and keyspace hit ratio. The two ratio rules are only
+///   evaluated once the instance has real volume (see [`volume_gate`]), so an
+///   empty instance does not alert.
 /// - `"mongodb"` — 6 default rules covering connections, queued operations,
 ///   WiredTiger cache pressure, replication buffer pressure, and asserts.
 /// - `"rustfs"` — 3 default rules covering offline nodes and free-capacity
@@ -2578,5 +2684,283 @@ mod tests {
         assert_eq!(environment_id, None);
         assert_eq!(deployment_id, None);
         assert_eq!(service_id, None);
+    }
+
+    // ── volume gates ───────────────────────────────────────────────────────────
+
+    fn latest(pairs: &[(&str, f64)]) -> HashMap<String, f64> {
+        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    /// The value a freshly started, empty Redis reports: ~1 MiB used and a
+    /// fragmentation ratio far above the default 1.5 threshold.
+    fn empty_redis() -> HashMap<String, f64> {
+        latest(&[
+            ("redis.memory_fragmentation_ratio", 17.0),
+            ("redis.memory_used_bytes", 1_100_000.0),
+            ("redis.keyspace_hit_ratio", 0.0),
+            ("redis.keyspace_lookups", 3.0),
+        ])
+    }
+
+    #[test]
+    fn empty_redis_fragmentation_and_hit_ratio_are_not_evaluated() {
+        let values = empty_redis();
+        assert!(!meets_volume_gate(
+            "redis.memory_fragmentation_ratio",
+            &values
+        ));
+        assert!(!meets_volume_gate("redis.keyspace_hit_ratio", &values));
+    }
+
+    #[test]
+    fn loaded_redis_fragmentation_and_hit_ratio_are_evaluated() {
+        let values = latest(&[
+            ("redis.memory_used_bytes", 512.0 * 1024.0 * 1024.0),
+            ("redis.keyspace_lookups", 50_000.0),
+        ]);
+        assert!(meets_volume_gate(
+            "redis.memory_fragmentation_ratio",
+            &values
+        ));
+        assert!(meets_volume_gate("redis.keyspace_hit_ratio", &values));
+    }
+
+    #[test]
+    fn volume_gate_threshold_is_inclusive() {
+        let values = latest(&[(
+            "redis.memory_used_bytes",
+            REDIS_FRAGMENTATION_MIN_USED_BYTES,
+        )]);
+        assert!(meets_volume_gate(
+            "redis.memory_fragmentation_ratio",
+            &values
+        ));
+    }
+
+    /// A collector that predates the volume metric (or has not scraped yet)
+    /// must not be treated as having volume.
+    #[test]
+    fn missing_volume_metric_fails_the_gate() {
+        let values = latest(&[("pg.cache_hit_ratio", 0.4)]);
+        assert!(!meets_volume_gate("pg.cache_hit_ratio", &values));
+    }
+
+    #[test]
+    fn proxy_ratio_rules_need_traffic_in_the_current_sample() {
+        let idle = latest(&[
+            ("proxy.error_rate_percent", 100.0),
+            ("proxy.request_duration_p99_ms", 9000.0),
+            ("proxy.requests", 1.0),
+        ]);
+        assert!(!meets_volume_gate("proxy.error_rate_percent", &idle));
+        assert!(!meets_volume_gate("proxy.request_duration_p99_ms", &idle));
+
+        let busy = latest(&[("proxy.requests", 500.0)]);
+        assert!(meets_volume_gate("proxy.error_rate_percent", &busy));
+        assert!(meets_volume_gate("proxy.request_duration_p99_ms", &busy));
+    }
+
+    #[test]
+    fn ungated_metrics_always_pass() {
+        let none = HashMap::new();
+        for metric in [
+            "pg.connections_active",
+            "redis.evicted_keys_total",
+            "redis.connected_clients",
+            "container.memory_percent",
+            "node.fd_percent",
+        ] {
+            assert_eq!(volume_gate(metric), None, "{metric} must not be gated");
+            assert!(meets_volume_gate(metric, &none));
+        }
+    }
+
+    /// Every seeded ratio/percentile rule must have a gate, so a new service
+    /// or an idle host cannot raise one of these on day one.
+    #[test]
+    fn default_ratio_rules_are_volume_gated() {
+        let seeded: Vec<&str> = postgres_default_seeds()
+            .iter()
+            .chain(redis_default_seeds().iter())
+            .chain(proxy_default_seeds().iter())
+            .map(|s| s.metric_name)
+            .collect();
+        for metric in [
+            "redis.memory_fragmentation_ratio",
+            "redis.keyspace_hit_ratio",
+            "pg.cache_hit_ratio",
+            "proxy.error_rate_percent",
+            "proxy.request_duration_p99_ms",
+        ] {
+            assert!(seeded.contains(&metric), "{metric} is no longer seeded");
+            assert!(volume_gate(metric).is_some(), "{metric} must be gated");
+        }
+    }
+
+    /// End to end through `evaluate_rule`: the default fragmentation rule on
+    /// an empty Redis is treated as healthy. An in-progress window (e.g. one
+    /// opened before this gate existed) is cleared, and nothing is fired.
+    #[tokio::test]
+    async fn empty_redis_fragmentation_rule_clears_breach_and_never_fires() {
+        let rule = monitoring_alert_rules::Model {
+            name: "High memory fragmentation ratio".into(),
+            metric_name: "redis.memory_fragmentation_ratio".into(),
+            threshold: 1.5,
+            for_duration_secs: 300,
+            ..make_rule(Some(1), None)
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results(vec![sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let evaluator = evaluator_with_shared_db(db.clone());
+        evaluator
+            .breach_start
+            .write()
+            .await
+            .insert(rule.id, Utc::now() - chrono::Duration::minutes(10));
+
+        evaluator
+            .evaluate_rule(&rule, &empty_redis(), (Some(1), None, None, Some(1)))
+            .await
+            .expect("evaluation succeeds");
+
+        assert!(
+            !evaluator.breach_start.read().await.contains_key(&rule.id),
+            "a ratio below its volume gate must reset the breach window"
+        );
+        assert!(evaluator.firing_alarms.read().await.is_empty());
+
+        let log = transaction_log(evaluator, db);
+        assert_eq!(log.len(), 1, "only the breach clear may run: {log:?}");
+        let sql = format!("{:?}", log[0]);
+        assert!(
+            sql.contains("breach_started_at") && !sql.contains("INSERT"),
+            "no alarm may be inserted: {sql}"
+        );
+    }
+
+    #[test]
+    fn custom_ratio_rules_keep_their_explicit_threshold() {
+        let mut rule = monitoring_alert_rules::Model {
+            name: "High memory fragmentation ratio".into(),
+            metric_name: "redis.memory_fragmentation_ratio".into(),
+            threshold: 1.5,
+            ..make_rule(Some(1), None)
+        };
+        assert!(default_volume_gate(&rule).is_some());
+        rule.threshold = 1.2;
+        assert!(default_volume_gate(&rule).is_none());
+        rule.threshold = 1.5;
+        rule.name = "My fragmentation alert".into();
+        assert!(default_volume_gate(&rule).is_none());
+    }
+
+    #[tokio::test]
+    async fn custom_ratio_rule_breaches_without_default_volume_metric() {
+        let rule = monitoring_alert_rules::Model {
+            name: "Custom fragmentation alert".into(),
+            metric_name: "redis.memory_fragmentation_ratio".into(),
+            threshold: 1.5,
+            for_duration_secs: 300,
+            ..make_rule(Some(1), None)
+        };
+        let started_at = Utc::now();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results(vec![sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .append_query_results(vec![vec![monitoring_alert_rules::Model {
+                    breach_started_at: Some(started_at),
+                    ..rule.clone()
+                }]])
+                .into_connection(),
+        );
+        let evaluator = evaluator_with_shared_db(db.clone());
+        let values = latest(&[("redis.memory_fragmentation_ratio", 2.4)]);
+
+        evaluator
+            .evaluate_rule(&rule, &values, (Some(1), None, None, Some(1)))
+            .await
+            .expect("evaluation succeeds");
+
+        assert_eq!(
+            evaluator.breach_start.read().await.get(&rule.id).copied(),
+            Some(started_at),
+            "custom ratio rules must not depend on the default volume metric"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_volume_metric_does_not_resolve_an_existing_alarm() {
+        let rule = monitoring_alert_rules::Model {
+            name: "High memory fragmentation ratio".into(),
+            metric_name: "redis.memory_fragmentation_ratio".into(),
+            threshold: 1.5,
+            ..make_rule(Some(1), None)
+        };
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let evaluator = evaluator_with_shared_db(db);
+        evaluator.firing_alarms.write().await.insert(rule.id, 99);
+        evaluator
+            .evaluate_rule(
+                &rule,
+                &latest(&[("redis.memory_fragmentation_ratio", 2.4)]),
+                (Some(1), None, None, Some(1)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            evaluator.firing_alarms.read().await.get(&rule.id),
+            Some(&99)
+        );
+    }
+
+    /// The same ratio on an instance with real volume still opens a breach.
+    #[tokio::test]
+    async fn loaded_redis_fragmentation_rule_still_breaches() {
+        let rule = monitoring_alert_rules::Model {
+            name: "High memory fragmentation ratio".into(),
+            metric_name: "redis.memory_fragmentation_ratio".into(),
+            threshold: 1.5,
+            for_duration_secs: 300,
+            ..make_rule(Some(1), None)
+        };
+        let started_at = Utc::now();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results(vec![sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .append_query_results(vec![vec![monitoring_alert_rules::Model {
+                    breach_started_at: Some(started_at),
+                    ..rule.clone()
+                }]])
+                .into_connection(),
+        );
+        let evaluator = evaluator_with_shared_db(db.clone());
+        let values = latest(&[
+            ("redis.memory_fragmentation_ratio", 2.4),
+            ("redis.memory_used_bytes", 2.0 * 1024.0 * 1024.0 * 1024.0),
+        ]);
+
+        evaluator
+            .evaluate_rule(&rule, &values, (Some(1), None, None, Some(1)))
+            .await
+            .expect("evaluation succeeds");
+
+        assert_eq!(
+            evaluator.breach_start.read().await.get(&rule.id).copied(),
+            Some(started_at),
+            "a fragmented, loaded instance must start the breach window"
+        );
     }
 }
