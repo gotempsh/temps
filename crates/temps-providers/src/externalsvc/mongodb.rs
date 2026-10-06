@@ -8,7 +8,7 @@ use bollard::query_parameters::{
     AttachContainerOptionsBuilder, InspectContainerOptions, RemoveContainerOptionsBuilder,
     StopContainerOptions, WaitContainerOptionsBuilder,
 };
-use bollard::{body_full, Docker};
+use bollard::Docker;
 use futures::StreamExt;
 use mongodb::bson::doc;
 use mongodb::options::ClientOptions;
@@ -1380,47 +1380,36 @@ impl MongodbService {
             backup_location
         );
 
-        // Download backup from S3
-        let response = s3_client
-            .get_object()
-            .bucket(&s3_source.bucket_name)
-            .key(backup_location)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to download MongoDB backup from S3: {}", e))?;
-
-        let backup_data = response
-            .body
-            .collect()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to read backup data: {}", e))?
-            .into_bytes();
-
-        info!("Downloaded backup, size: {} bytes", backup_data.len());
-
-        // Create a temporary file for the backup
-        let temp_file = tempfile::NamedTempFile::new()?;
-        let temp_path = temp_file.path().to_str().unwrap();
-        std::fs::write(temp_path, &backup_data)?;
-
-        // Copy backup file to container
-        let tar_data = {
-            let mut ar = tar::Builder::new(Vec::new());
-            ar.append_path_with_name(temp_path, "backup.gz")?;
-            ar.finish()?;
-            ar.into_inner()?
-        };
-
-        self.docker
-            .upload_to_container(
-                &container_name,
-                Some(bollard::query_parameters::UploadToContainerOptions {
-                    path: "/tmp".to_string(),
-                    ..Default::default()
-                }),
-                body_full(tar_data.into()),
+        // Stage the archive on disk and stream it into the container, so
+        // memory stays constant however large the backup is.
+        let staging = tempfile::tempdir().map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to create a temp dir to stage MongoDB backup {}: {}",
+                backup_location,
+                e
             )
-            .await?;
+        })?;
+        let staged = staging.path().join("backup.gz");
+        let size = super::restore_staging::download_s3_object_to_file(
+            s3_client,
+            &s3_source.bucket_name,
+            backup_location,
+            &staged,
+        )
+        .await?;
+        info!("Downloaded backup, size: {} bytes", size);
+
+        super::container_upload::upload_file_to_container(
+            &self.docker,
+            &container_name,
+            &staged,
+            "/tmp",
+            "backup.gz",
+            0o644,
+            MONGORESTORE_UPLOAD_TIMEOUT,
+        )
+        .await?;
+        drop(staging);
 
         // Execute mongorestore inside the container
         let exec_config = CreateExecOptions {
@@ -3109,41 +3098,18 @@ impl ExternalService for MongodbService {
             .to_string();
         let host_archive_path = restore_dir.join(&archive_filename);
 
-        let response = ctx
-            .s3_client
-            .get_object()
-            .bucket(&ctx.s3_source.bucket_name)
-            .key(ctx.backup_location)
-            .send()
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to download MongoDB archive '{}' from S3: {}",
-                    ctx.backup_location,
-                    e
-                )
-            })?;
-
-        let archive_bytes = response
-            .body
-            .collect()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to read archive body from S3: {}", e))?
-            .into_bytes();
-
-        tokio::fs::write(&host_archive_path, &archive_bytes)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to write archive to {}: {}",
-                    host_archive_path.display(),
-                    e
-                )
-            })?;
+        // Streamed to disk: memory does not grow with the archive's size.
+        let archive_size = super::restore_staging::download_s3_object_to_file(
+            ctx.s3_client,
+            &ctx.s3_source.bucket_name,
+            ctx.backup_location,
+            &host_archive_path,
+        )
+        .await?;
 
         info!(
             "MongoDB restore_in_place: downloaded {} bytes to {}",
-            archive_bytes.len(),
+            archive_size,
             host_archive_path.display()
         );
 
@@ -3271,37 +3237,19 @@ impl ExternalService for MongodbService {
             .to_string();
         let host_archive_path = restore_dir.join(&archive_filename);
 
-        let response = ctx
-            .s3_client
-            .get_object()
-            .bucket(&ctx.s3_source.bucket_name)
-            .key(ctx.backup_location)
-            .send()
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to download MongoDB archive '{}' from S3: {}",
-                    ctx.backup_location,
-                    e
-                )
-            })?;
-
-        let archive_bytes = response
-            .body
-            .collect()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to read archive body from S3: {}", e))?
-            .into_bytes();
-
-        tokio::fs::write(&host_archive_path, &archive_bytes)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to write archive to {}: {}",
-                    host_archive_path.display(),
-                    e
-                )
-            })?;
+        // Streamed to disk: memory does not grow with the archive's size.
+        let archive_size = super::restore_staging::download_s3_object_to_file(
+            ctx.s3_client,
+            &ctx.s3_source.bucket_name,
+            ctx.backup_location,
+            &host_archive_path,
+        )
+        .await?;
+        info!(
+            "MongoDB restore_to_new_service: downloaded {} bytes to {}",
+            archive_size,
+            host_archive_path.display()
+        );
 
         let restore_result = new_service
             .run_mongorestore_sidecar(
@@ -4779,6 +4727,7 @@ mod tests {
 
         // Step 7: Restore from S3
         println!("Step 7: Restoring MongoDB from S3...");
+        let legacy_service_config = service_config.clone();
         service
             .restore_from_s3(
                 &minio.s3_client,
@@ -4829,6 +4778,87 @@ mod tests {
             "✓ Data verified: {} documents restored correctly",
             count_after_restore
         );
+
+        // Step 8b: Legacy (non-WAL-G) archive restore. The archive is staged
+        // through the default temp dir and streamed into the container, so
+        // this also proves it works when that dir is not shared with Docker.
+        println!("Step 8b: Restoring a legacy mongodump archive...");
+        let mongo_container = service.get_container_name();
+        crate::externalsvc::exec_util::run_exec(
+            &docker,
+            &mongo_container,
+            vec![
+                "mongodump".to_string(),
+                format!("--username={}", username),
+                format!("--password={}", password),
+                "--authenticationDatabase=admin".to_string(),
+                "--archive=/tmp/legacy.archive.gz".to_string(),
+                "--gzip".to_string(),
+            ],
+            None,
+            std::time::Duration::from_secs(120),
+        )
+        .await
+        .expect("mongodump for the legacy archive");
+        let mut legacy_tar = Vec::new();
+        let mut download = docker.download_from_container(
+            &mongo_container,
+            Some(
+                bollard::query_parameters::DownloadFromContainerOptionsBuilder::new()
+                    .path("/tmp/legacy.archive.gz")
+                    .build(),
+            ),
+        );
+        while let Some(chunk) = futures::StreamExt::next(&mut download).await {
+            legacy_tar.extend_from_slice(&chunk.expect("download legacy archive"));
+        }
+        let mut legacy_archive = Vec::new();
+        {
+            use std::io::Read;
+            let mut tar = tar::Archive::new(legacy_tar.as_slice());
+            let mut entry = tar
+                .entries()
+                .expect("tar entries")
+                .next()
+                .expect("one entry")
+                .expect("entry");
+            entry
+                .read_to_end(&mut legacy_archive)
+                .expect("read legacy archive");
+        }
+        let legacy_key = "legacy/backup.archive.gz";
+        minio
+            .s3_client
+            .put_object()
+            .bucket(&minio.s3_source.bucket_name)
+            .key(legacy_key)
+            .body(legacy_archive.into())
+            .send()
+            .await
+            .expect("upload legacy archive");
+        collection_after_restore
+            .drop()
+            .await
+            .expect("drop collection before legacy restore");
+        service
+            .restore_from_s3(
+                &minio.s3_client,
+                &s3_creds,
+                legacy_key,
+                &minio.s3_source,
+                legacy_service_config,
+            )
+            .await
+            .expect("legacy archive restore");
+        let legacy_count = collection_after_restore
+            .count_documents(doc! {})
+            .await
+            .expect("count after legacy restore");
+        assert_eq!(
+            legacy_count, 3,
+            "legacy restore must bring back 3 documents"
+        );
+        println!("✓ Legacy archive restore verified");
 
         // Step 9: Cleanup
         println!("Step 9: Cleaning up...");

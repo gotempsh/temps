@@ -12,7 +12,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use bollard::exec::CreateExecOptions;
 use bollard::query_parameters::{InspectContainerOptions, StopContainerOptions};
-use bollard::{body_full, Docker};
+use bollard::Docker;
 use futures::StreamExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -606,6 +606,9 @@ fn generate_password() -> String {
         .map(char::from)
         .collect()
 }
+
+/// Upper bound for streaming a staged logical dump into the container.
+const RESTORE_UPLOAD_TIMEOUT: Duration = Duration::from_secs(3600);
 
 pub struct MariaDbService {
     name: String,
@@ -2319,24 +2322,18 @@ impl MariaDbService {
         let container_name = self.get_live_container_name(config);
         let restore_filename = "temps_mariadb_restore.sql";
 
-        let tar_data = {
-            let mut archive = tar::Builder::new(Vec::new());
-            archive.append_path_with_name(sql_path, restore_filename)?;
-            archive.finish()?;
-            archive.into_inner()?
-        };
-
-        self.docker
-            .upload_to_container(
-                &container_name,
-                Some(bollard::query_parameters::UploadToContainerOptions {
-                    path: "/tmp".to_string(),
-                    ..Default::default()
-                }),
-                body_full(bytes::Bytes::from(tar_data)),
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to upload MariaDB restore SQL: {}", e))?;
+        // Streamed, so memory does not grow with the dump's size.
+        super::container_upload::upload_file_to_container(
+            &self.docker,
+            &container_name,
+            sql_path,
+            "/tmp",
+            restore_filename,
+            0o644,
+            RESTORE_UPLOAD_TIMEOUT,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to upload MariaDB restore SQL: {}", e))?;
 
         let restore_path = format!("/tmp/{}", restore_filename);
         let restore_cmd = format!(
@@ -3110,42 +3107,18 @@ impl MariaDbService {
         dest_name: &str,
         timeout: Duration,
     ) -> Result<()> {
-        let tar_data = {
-            let mut archive = tar::Builder::new(Vec::new());
-            archive
-                .append_path_with_name(host_path, dest_name)
-                .map_err(|e| {
-                    anyhow::anyhow!("Failed to tar {} for upload: {}", host_path.display(), e)
-                })?;
-            archive.finish()?;
-            archive
-                .into_inner()
-                .map_err(|e| anyhow::anyhow!("Failed to finalize upload tar: {}", e))?
-        };
-
-        tokio::time::timeout(timeout, async {
-            self.docker
-                .upload_to_container(
-                    container_id,
-                    Some(bollard::query_parameters::UploadToContainerOptions {
-                        path: dest_dir.to_string(),
-                        ..Default::default()
-                    }),
-                    body_full(bytes::Bytes::from(tar_data)),
-                )
-                .await
-        })
+        // Streamed from disk, so memory does not grow with the backup's size.
+        super::container_upload::upload_file_to_container(
+            &self.docker,
+            container_id,
+            host_path,
+            dest_dir,
+            dest_name,
+            0o644,
+            timeout,
+        )
         .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "Timed out uploading {} to container {} after {}s",
-                dest_name,
-                container_id,
-                timeout.as_secs()
-            )
-        })?
-        .map_err(|e| anyhow::anyhow!("Failed to upload {} to container: {}", dest_name, e))?;
-        Ok(())
+        .map_err(|e| anyhow::anyhow!("Failed to upload {} to container: {}", dest_name, e))
     }
 
     /// Best-effort collection of a container's combined stdout/stderr logs,

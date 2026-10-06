@@ -10,7 +10,6 @@ use anyhow::Result;
 use async_trait::async_trait;
 use bollard::query_parameters::{InspectContainerOptions, StopContainerOptions};
 use bollard::Docker;
-use flate2::read::GzDecoder;
 use redis::{aio::ConnectionManager, AsyncCommands, Client};
 use schemars::JsonSchema;
 use sea_orm::prelude::*;
@@ -1547,14 +1546,19 @@ impl RedisService {
         })?;
         let gz_host_path = temp_dir.path().join("restore.rdb.gz");
         let rdb_host_path = temp_dir.path().join(RDB_RESTORE_FILE_NAME);
-        download_s3_object_to_file(
+        super::restore_staging::download_s3_object_to_file(
             s3_client,
             &s3_source.bucket_name,
             backup_location,
             &gz_host_path,
         )
         .await?;
-        gunzip_file(&gz_host_path, &rdb_host_path, backup_location).await?;
+        super::restore_staging::gunzip_file(
+            &gz_host_path,
+            &rdb_host_path,
+            &format!("Redis backup {}", backup_location),
+        )
+        .await?;
         let _ = tokio::fs::remove_file(&gz_host_path).await;
 
         // ── 3. Resolve the target container name ─────────────────────────────
@@ -2084,87 +2088,6 @@ const RDB_RESTORE_DIR: &str = "/tmp";
 /// File name of the uploaded snapshot inside [`RDB_RESTORE_DIR`] (and of the
 /// staged copy in the host temp dir).
 const RDB_RESTORE_FILE_NAME: &str = "temps-restore.rdb";
-
-/// Stream an S3 object into a new file at `dest`, chunk by chunk.
-async fn download_s3_object_to_file(
-    s3_client: &aws_sdk_s3::Client,
-    bucket: &str,
-    key: &str,
-    dest: &std::path::Path,
-) -> Result<u64> {
-    use tokio::io::AsyncWriteExt;
-
-    let object = s3_client
-        .get_object()
-        .bucket(bucket)
-        .key(key)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("S3 GetObject failed for s3://{}/{}: {}", bucket, key, e))?;
-    let mut body = object.body;
-    let mut file = tokio::fs::File::create(dest).await.map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to create {} to stage s3://{}/{}: {}",
-            dest.display(),
-            bucket,
-            key,
-            e
-        )
-    })?;
-    let mut written = 0_u64;
-    while let Some(chunk) = body.try_next().await.map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to read s3://{}/{} after {} bytes: {}",
-            bucket,
-            key,
-            written,
-            e
-        )
-    })? {
-        file.write_all(&chunk).await.map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to write s3://{}/{} into {}: {}",
-                bucket,
-                key,
-                dest.display(),
-                e
-            )
-        })?;
-        written += chunk.len() as u64;
-    }
-    file.flush()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to flush {}: {}", dest.display(), e))?;
-    Ok(written)
-}
-
-/// Gunzip `src` into a new file at `dest` on a blocking thread, streaming.
-async fn gunzip_file(
-    src: &std::path::Path,
-    dest: &std::path::Path,
-    backup_location: &str,
-) -> Result<u64> {
-    let src = src.to_path_buf();
-    let dest = dest.to_path_buf();
-    let location = backup_location.to_string();
-    tokio::task::spawn_blocking(move || -> Result<u64> {
-        let input = std::fs::File::open(&src)
-            .map_err(|e| anyhow::anyhow!("Failed to open {}: {}", src.display(), e))?;
-        let mut decoder = GzDecoder::new(std::io::BufReader::new(input));
-        let mut output = std::fs::File::create(&dest)
-            .map_err(|e| anyhow::anyhow!("Failed to create {}: {}", dest.display(), e))?;
-        std::io::copy(&mut decoder, &mut output)
-            .map_err(|e| anyhow::anyhow!("Failed to gunzip Redis backup {}: {}", location, e))
-    })
-    .await
-    .map_err(|e| {
-        anyhow::anyhow!(
-            "Gunzip task for Redis backup {} failed: {}",
-            backup_location,
-            e
-        )
-    })?
-}
 
 /// Docker-free, static metadata about this engine.
 ///

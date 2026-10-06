@@ -4,7 +4,7 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bollard::query_parameters::{InspectContainerOptions, StopContainerOptions};
-use bollard::{body_full, Docker};
+use bollard::Docker;
 use futures::StreamExt;
 use schemars::JsonSchema;
 use sea_orm::{prelude::*, *};
@@ -532,6 +532,9 @@ fn example_docker_image() -> &'static str {
 }
 
 use super::port_util::{find_available_port, find_available_port_async, is_port_conflict_error};
+
+/// Upper bound for streaming a staged pg_dump file into the container.
+const LEGACY_RESTORE_UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
 
 pub struct PostgresService {
     name: String,
@@ -1751,33 +1754,29 @@ impl PostgresService {
         &self,
         docker: &Docker,
         container_name: &str,
-        backup_data: Vec<u8>,
+        backup_path: &std::path::Path,
         username: &str,
         password: &str,
     ) -> Result<()> {
-        // Create a temporary file with the backup data
-        // Create a temporary file for the backup data
-        let temp_file = tempfile::NamedTempFile::new()?;
-        tokio::fs::write(temp_file.path(), backup_data).await?;
-
-        // Create a tar archive containing the backup file
-        let mut tar = tar::Builder::new(Vec::new());
-        tar.append_path_with_name(temp_file.path(), "backup.sql")?;
-        let tar_data = tar.into_inner()?;
-        // Copy the tar archive into the container
-        docker
-            .upload_to_container(
+        // Stream the staged dump into the container: constant memory, and no
+        // host path has to be shared with the Docker daemon.
+        super::container_upload::upload_file_to_container(
+            docker,
+            container_name,
+            backup_path,
+            "/",
+            "backup.sql",
+            0o644,
+            LEGACY_RESTORE_UPLOAD_TIMEOUT,
+        )
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to upload backup file to container {}: {}",
                 container_name,
-                Some(bollard::query_parameters::UploadToContainerOptions {
-                    path: "/".to_string(),
-                    ..Default::default()
-                }),
-                body_full(bytes::Bytes::from(tar_data)),
+                e
             )
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(format!("Failed to upload backup file to container: {}", e))
-            })?;
+        })?;
 
         // Execute psql to restore the backup with actual credentials
         let password_env = format!("PGPASSWORD={}", password);
@@ -1819,30 +1818,27 @@ impl PostgresService {
         &self,
         docker: &Docker,
         container_name: &str,
-        backup_data: Vec<u8>,
+        backup_path: &std::path::Path,
         username: &str,
         password: &str,
     ) -> Result<()> {
-        let temp_file = tempfile::NamedTempFile::new()?;
-        tokio::fs::write(temp_file.path(), &backup_data).await?;
-
-        // Create a tar archive containing the backup file
-        let mut tar = tar::Builder::new(Vec::new());
-        tar.append_path_with_name(temp_file.path(), "backup.pgdump")?;
-        let tar_data = tar.into_inner()?;
-
-        // Copy the tar archive into the container
-        docker
-            .upload_to_container(
+        super::container_upload::upload_file_to_container(
+            docker,
+            container_name,
+            backup_path,
+            "/",
+            "backup.pgdump",
+            0o644,
+            LEGACY_RESTORE_UPLOAD_TIMEOUT,
+        )
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to upload backup file to container {}: {}",
                 container_name,
-                Some(bollard::query_parameters::UploadToContainerOptions {
-                    path: "/".to_string(),
-                    ..Default::default()
-                }),
-                body_full(bytes::Bytes::from(tar_data)),
+                e
             )
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to upload backup file to container: {}", e))?;
+        })?;
 
         // Execute pg_restore inside the container
         let password_env = format!("PGPASSWORD={}", password);
@@ -2316,21 +2312,32 @@ impl PostgresService {
 
         let postgres_config = self.get_postgres_config(service_config)?;
 
-        // Get the backup object from S3
-        let get_obj = s3_client
-            .get_object()
-            .bucket(&s3_source.bucket_name)
-            .key(backup_location)
-            .send()
-            .await?;
-
-        // Read the backup data
-        let backup_data = get_obj.body.collect().await?.to_vec();
-
-        // Decompress (assuming gzip compression)
-        let mut decoder = flate2::read::GzDecoder::new(&backup_data[..]);
-        let mut decompressed_data = Vec::new();
-        std::io::Read::read_to_end(&mut decoder, &mut decompressed_data)?;
+        // Stage the backup on disk, file to file, so memory stays constant
+        // however large the dump is. The temp dir is owned by this attempt
+        // and removed when it drops.
+        let staging = tempfile::tempdir().map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to create a temp dir to stage PostgreSQL backup {}: {}",
+                backup_location,
+                e
+            )
+        })?;
+        let compressed_path = staging.path().join("backup.gz");
+        let dump_path = staging.path().join("backup.dump");
+        super::restore_staging::download_s3_object_to_file(
+            s3_client,
+            &s3_source.bucket_name,
+            backup_location,
+            &compressed_path,
+        )
+        .await?;
+        super::restore_staging::gunzip_file(
+            &compressed_path,
+            &dump_path,
+            &format!("PostgreSQL backup {}", backup_location),
+        )
+        .await?;
+        let _ = tokio::fs::remove_file(&compressed_path).await;
 
         let container_name = self.get_live_container_name(&postgres_config);
 
@@ -2341,7 +2348,7 @@ impl PostgresService {
             self.restore_backup_file(
                 &self.docker,
                 &container_name,
-                decompressed_data,
+                &dump_path,
                 &postgres_config.username,
                 &postgres_config.password,
             )
@@ -2350,7 +2357,7 @@ impl PostgresService {
             self.restore_custom_backup_file(
                 &self.docker,
                 &container_name,
-                decompressed_data,
+                &dump_path,
                 &postgres_config.username,
                 &postgres_config.password,
             )
@@ -6706,5 +6713,158 @@ mod tests {
         );
         assert!(libs.contains("timescaledb"));
         assert!(libs.contains("pg_stat_statements"));
+    }
+
+    /// pg_dump restores (the in-place path for every non-WAL-G Postgres
+    /// backup) stream the staged dump into the container: constant memory,
+    /// and the staging file lives in the OS default temp dir, which a Docker
+    /// daemon in a VM (Colima, Docker Desktop) cannot see.
+    #[tokio::test]
+    #[cfg(feature = "docker-tests")]
+    async fn pg_dump_restores_stream_staged_files_into_the_container() {
+        use crate::externalsvc::exec_util::run_exec;
+        use futures::StreamExt;
+        use std::io::Read;
+
+        let Ok(docker) = Docker::connect_with_local_defaults() else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let image = "postgres:17-alpine";
+        if crate::utils::pull_image_with_retry(&docker, image, None)
+            .await
+            .is_err()
+        {
+            println!("Could not pull {image}, skipping");
+            return;
+        }
+        let suffix = &uuid::Uuid::new_v4().simple().to_string()[..10];
+        let container = format!("temps-pgdump-restore-test-{suffix}");
+        let password = "restore-test-pw";
+        if docker
+            .create_container(
+                Some(
+                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                        .name(&container)
+                        .build(),
+                ),
+                bollard::models::ContainerCreateBody {
+                    image: Some(image.to_string()),
+                    env: Some(vec![format!("POSTGRES_PASSWORD={password}")]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .is_err()
+        {
+            println!("Could not create the test Postgres, skipping");
+            return;
+        }
+        let _ = docker
+            .start_container(
+                &container,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await;
+
+        let timeout = Duration::from_secs(60);
+        let psql = |sql: &str| {
+            vec![
+                "psql".to_string(),
+                "-U".to_string(),
+                "postgres".to_string(),
+                "-tAc".to_string(),
+                sql.to_string(),
+            ]
+        };
+        let outcome: anyhow::Result<(String, String)> = async {
+            let mut ready = false;
+            for _ in 0..60 {
+                if let Ok(r) = run_exec(&docker, &container, psql("SELECT 1"), None, timeout).await {
+                    if r.output.trim().ends_with('1') {
+                        ready = true;
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            anyhow::ensure!(ready, "test Postgres never became ready");
+            let service = PostgresService::new(format!("pgdump-test-{suffix}"), Arc::new(docker.clone()));
+
+            // Plain SQL dump, staged in the default temp dir.
+            let staging = tempfile::tempdir()?;
+            let sql_path = staging.path().join("backup.dump");
+            std::fs::write(
+                &sql_path,
+                "CREATE TABLE plain_items (n int);\nINSERT INTO plain_items VALUES (1), (2), (3);\n",
+            )?;
+            service
+                .restore_backup_file(&docker, &container, &sql_path, "postgres", password)
+                .await?;
+            let plain = run_exec(&docker, &container, psql("SELECT count(*) FROM plain_items"), None, timeout)
+                .await?
+                .output;
+
+            // Custom-format dump: produce one, take it out, drop the table,
+            // then restore it from a host file.
+            run_exec(&docker, &container, psql("CREATE TABLE custom_items AS SELECT generate_series(1, 5) AS n"), None, timeout).await?;
+            run_exec(
+                &docker,
+                &container,
+                vec!["pg_dump".into(), "-U".into(), "postgres".into(), "-Fc".into(), "-t".into(), "custom_items".into(), "-f".into(), "/tmp/custom.pgdump".into()],
+                None,
+                timeout,
+            )
+            .await?;
+            let mut tar_bytes = Vec::new();
+            let mut stream = docker.download_from_container(
+                &container,
+                Some(
+                    bollard::query_parameters::DownloadFromContainerOptionsBuilder::new()
+                        .path("/tmp/custom.pgdump")
+                        .build(),
+                ),
+            );
+            while let Some(chunk) = stream.next().await {
+                tar_bytes.extend_from_slice(&chunk?);
+            }
+            let mut archive = tar::Archive::new(tar_bytes.as_slice());
+            let mut entry = archive
+                .entries()?
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("empty pg_dump download"))??;
+            let mut dump = Vec::new();
+            entry.read_to_end(&mut dump)?;
+            let custom_path = staging.path().join("custom.pgdump");
+            std::fs::write(&custom_path, &dump)?;
+            run_exec(&docker, &container, psql("DROP TABLE custom_items"), None, timeout).await?;
+            service
+                .restore_custom_backup_file(&docker, &container, &custom_path, "postgres", password)
+                .await?;
+            let custom = run_exec(&docker, &container, psql("SELECT count(*) FROM custom_items"), None, timeout)
+                .await?
+                .output;
+            Ok((plain, custom))
+        }
+        .await;
+
+        let _ = docker
+            .remove_container(
+                &container,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    v: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        let (plain, custom) = outcome.expect("pg_dump restore round trip");
+        assert_eq!(plain.trim(), "3", "plain-format restore");
+        assert_eq!(custom.trim(), "5", "custom-format restore");
     }
 }

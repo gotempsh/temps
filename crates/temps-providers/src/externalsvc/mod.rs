@@ -44,6 +44,7 @@ pub mod rc_client;
 pub mod redis;
 pub mod restore_helper;
 pub mod restore_image;
+pub(crate) mod restore_staging;
 pub mod rustfs;
 pub mod s3;
 pub mod s3_util;
