@@ -13111,6 +13111,7 @@ dependencies = [
  "autopack-core",
  "autopack-dockerfile",
  "autopack-providers",
+ "globset",
  "regex",
  "serde",
  "serde_json",

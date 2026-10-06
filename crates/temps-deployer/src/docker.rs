@@ -4636,6 +4636,71 @@ mod docker_tests {
         assert!(!paths.contains(&PathBuf::from("drop.txt")));
     }
 
+    #[tokio::test]
+    async fn local_workspace_archive_intersects_root_and_specific_rules() {
+        let source = tempfile::tempdir().unwrap();
+        let root = source.path();
+        for directory in ["apps/web", "private-data", "app-private", "src", "docs"] {
+            std::fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        for file in [
+            "apps/web/Dockerfile",
+            "private-data/secret",
+            "app-private/secret",
+            "src/keep.ts",
+            "src/drop.ts",
+            "docs/readme",
+        ] {
+            std::fs::write(root.join(file), "fixture").unwrap();
+        }
+        std::fs::write(
+            root.join(".dockerignore"),
+            "private-data\nsrc\n!src/keep.ts\n!app-private\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("apps/web/Dockerfile.dockerignore"),
+            format!(
+                "{}\napp-private\n!private-data\n!src\n",
+                crate::build_protocol::WORKSPACE_ROOT_IGNORE_MARKER
+            ),
+        )
+        .unwrap();
+        let rt = runtime_for_diagnosis(true);
+        let mut stream = rt
+            .create_tar_context_body(root.to_path_buf(), Some(root.join("apps/web/Dockerfile")))
+            .await
+            .unwrap();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            bytes.extend_from_slice(&chunk.unwrap());
+        }
+        let mut archive = tar::Archive::new(bytes.as_slice());
+        let paths: Vec<_> = archive
+            .entries()
+            .unwrap()
+            .map(|entry| entry.unwrap().path().unwrap().into_owned())
+            .collect();
+        for kept in [
+            "apps/web/Dockerfile",
+            "apps/web/Dockerfile.dockerignore",
+            ".dockerignore",
+            "src/keep.ts",
+            "docs/readme",
+        ] {
+            assert!(
+                paths.contains(&PathBuf::from(kept)),
+                "missing {kept}: {paths:?}"
+            );
+        }
+        for excluded in ["private-data/secret", "app-private/secret", "src/drop.ts"] {
+            assert!(
+                !paths.contains(&PathBuf::from(excluded)),
+                "exposed {excluded}"
+            );
+        }
+    }
+
     #[test]
     fn buildkit_arguments_extend_user_arguments() {
         let request = BuildRequest {

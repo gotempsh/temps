@@ -32,18 +32,31 @@ fn preset_build_root(
     if source_root == app {
         return Ok(app.to_path_buf());
     }
-    if preset != "nextjs" {
-        if matches!(preset, "vite" | "nixpacks-node" | "nixpacks" | "autopack")
-            && app.join("package.json").is_file()
-            && read_confined_control_file(
-                source_root,
-                &source_root.join("pnpm-workspace.yaml"),
-                1024 * 1024,
-            )?
-            .is_some()
-        {
-            return Ok(source_root.to_path_buf());
+    if matches!(
+        preset,
+        "nextjs" | "vite" | "nixpacks-node" | "nixpacks" | "autopack"
+    ) {
+        if let Some(workspace) = read_confined_control_file(
+            source_root,
+            &source_root.join("pnpm-workspace.yaml"),
+            1024 * 1024,
+        )? {
+            if !app.join("package.json").is_file() {
+                return Ok(app.to_path_buf());
+            }
+            let relative = app.strip_prefix(source_root).map_err(|_| {
+                WorkflowError::JobValidationFailed(format!(
+                    "Application '{}' escapes workspace '{}'",
+                    app.display(),
+                    source_root.display()
+                ))
+            })?;
+            let member = temps_presets::pnpm_workspace_contains(&workspace, relative)
+                .map_err(WorkflowError::JobValidationFailed)?;
+            return Ok(if member { source_root } else { app }.to_path_buf());
         }
+    }
+    if preset != "nextjs" {
         return Ok(app.to_path_buf());
     }
     for marker in ["turbo.json", "nx.json", "lerna.json", "pnpm-workspace.yaml"] {
@@ -70,18 +83,19 @@ fn preset_build_root(
 }
 
 fn write_workspace_ignore(root: &Path, dockerfile: &Path) -> Result<(), WorkflowError> {
-    // Dockerfile-specific rules take precedence for both local and worker builders.
-    // Retain existing rules, then exclude dependencies and secrets across siblings.
+    // Widening the context must not let app-local negations expose siblings.
+    // Builders recognize this internal marker and independently enforce both
+    // root and specific rule sets, retaining each file's own negations.
     let mut specific = dockerfile.as_os_str().to_os_string();
     specific.push(".dockerignore");
     let path = Path::new(&specific);
     let existing = read_confined_control_file(root, path, 1024 * 1024)?;
     let create_new = existing.is_none();
-    let mut ignore = match existing {
-        Some(ignore) => ignore,
-        None => read_confined_control_file(root, &root.join(".dockerignore"), 1024 * 1024)?
-            .unwrap_or_default(),
-    };
+    // Validate the root control file before handing either builder the context.
+    read_confined_control_file(root, &root.join(".dockerignore"), 1024 * 1024)?;
+    let mut ignore = existing.unwrap_or_else(|| "# SPDX-FileCopyrightText: 2024-2026 Temps Contributors\n# SPDX-License-Identifier: MIT OR Apache-2.0\n".to_string());
+    ignore.push('\n');
+    ignore.push_str(temps_deployer::build_protocol::WORKSPACE_ROOT_IGNORE_MARKER);
     ignore.push_str("\n**/node_modules\n**/.git\n**/.env\n**/.env.*\n");
     write_no_follow(path, ignore.as_bytes(), create_new)
 }
@@ -1811,6 +1825,7 @@ mod tests {
         let root = dir.path();
         let app = root.join("apps/web");
         std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("package.json"), "{}").unwrap();
         std::fs::write(root.join("pnpm-workspace.yaml"), "packages: [apps/*]").unwrap();
         assert_eq!(preset_build_root("nextjs", root, &app).unwrap(), root);
         std::fs::remove_file(root.join("pnpm-workspace.yaml")).unwrap();
@@ -1855,6 +1870,45 @@ mod tests {
     }
 
     #[test]
+    fn pnpm_nonmembers_and_excluded_apps_keep_their_selected_context() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("turbo.json"), "{}").unwrap();
+        let manifestless_app = repo.path().join("apps/empty");
+        std::fs::create_dir_all(&manifestless_app).unwrap();
+        std::fs::write(
+            repo.path().join("pnpm-workspace.yaml"),
+            "packages: [apps/*]",
+        )
+        .unwrap();
+        for preset in ["nextjs", "vite", "nixpacks-node", "autopack"] {
+            assert_eq!(
+                preset_build_root(preset, repo.path(), &manifestless_app).unwrap(),
+                manifestless_app
+            );
+        }
+        for (patterns, path) in [
+            ("packages: [packages/*]", "apps/web"),
+            ("packages: ['apps/*', '!apps/web']", "apps/web"),
+            ("packages: ['!apps/web', 'apps/*']", "apps/web"),
+            ("packages: ['apps/*']", "apps/nested/web"),
+            ("sharedWorkspaceLockfile: true", "apps/web"),
+            ("# empty config", "apps/web"),
+        ] {
+            let app = repo.path().join(path);
+            std::fs::create_dir_all(&app).unwrap();
+            std::fs::write(app.join("package.json"), "{}").unwrap();
+            std::fs::write(repo.path().join("pnpm-workspace.yaml"), patterns).unwrap();
+            for preset in ["nextjs", "vite", "nixpacks-node", "nixpacks", "autopack"] {
+                assert_eq!(
+                    preset_build_root(preset, repo.path(), &app).unwrap(),
+                    app,
+                    "{preset}: {patterns}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn widened_workspace_context_keeps_ignore_rules_and_excludes_sibling_secrets() {
         use temps_deployer::build_protocol::DockerIgnore;
         let repo = tempfile::tempdir().unwrap();
@@ -1869,6 +1923,13 @@ mod tests {
         write_workspace_ignore(repo.path(), &dockerfile).unwrap();
         let contents = std::fs::read_to_string(app.join("Dockerfile.dockerignore")).unwrap();
         let rules = DockerIgnore::parse(&contents, "Dockerfile.dockerignore").unwrap();
+        let root_rules = DockerIgnore::parse(
+            &std::fs::read_to_string(repo.path().join(".dockerignore")).unwrap(),
+            ".dockerignore",
+        )
+        .unwrap();
+        assert!(contents.contains(temps_deployer::build_protocol::WORKSPACE_ROOT_IGNORE_MARKER));
+        assert!(contents.contains("SPDX-License-Identifier: MIT OR Apache-2.0"));
         for path in [
             ".env",
             "apps/api/.env.production",
@@ -1877,7 +1938,10 @@ mod tests {
             ".git/config",
             "private-data/secret",
         ] {
-            assert!(rules.is_excluded(Path::new(path)), "included {path}");
+            assert!(
+                rules.is_excluded(Path::new(path)) || root_rules.is_excluded(Path::new(path)),
+                "included {path}"
+            );
         }
         for path in [
             "pnpm-lock.yaml",

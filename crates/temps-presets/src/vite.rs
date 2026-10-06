@@ -26,10 +26,15 @@ impl Preset for Vite {
     }
 
     async fn dockerfile(&self, config: super::DockerfileConfig<'_>) -> DockerfileWithArgs {
-        if config.root_local_path != config.local_path
-            && config.root_local_path.join("pnpm-workspace.yaml").is_file()
-        {
-            return workspace_dockerfile(&config);
+        match super::autopack_preset::pnpm_app_directory(&config) {
+            Ok(Some(relative)) => return workspace_dockerfile(&config, &relative),
+            Ok(None) => {}
+            Err(message) => {
+                return DockerfileWithArgs::new(format!(
+                "# {}\nFROM node:22\nRUN echo 'Invalid pnpm workspace configuration' >&2; exit 1\n",
+                message.replace('\n', "\n# ")
+            ))
+            }
         }
         let package_manager = PackageManager::detect(config.local_path);
         let install_cmd = config
@@ -149,14 +154,10 @@ impl std::fmt::Display for Vite {
     }
 }
 
-fn workspace_dockerfile(config: &super::DockerfileConfig<'_>) -> DockerfileWithArgs {
-    let relative = match super::autopack_preset::pnpm_app_directory(config) {
-        Ok(Some(relative)) => relative,
-        _ => return DockerfileWithArgs::new(
-            "FROM node:22\nRUN echo 'Invalid pnpm workspace application directory' >&2; exit 1\n"
-                .into(),
-        ),
-    };
+fn workspace_dockerfile(
+    config: &super::DockerfileConfig<'_>,
+    relative: &str,
+) -> DockerfileWithArgs {
     let install = config
         .install_command
         .unwrap_or("pnpm install --frozen-lockfile");
@@ -182,6 +183,7 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         let app = repo.path().join("apps/web");
         std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("package.json"), "{}").unwrap();
         std::fs::write(
             repo.path().join("pnpm-workspace.yaml"),
             "packages: [apps/*, packages/*]",
@@ -203,6 +205,7 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         let app = repo.path().join("apps/web");
         std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("package.json"), "{}").unwrap();
         std::fs::write(
             repo.path().join("pnpm-workspace.yaml"),
             "packages: [apps/*]",
@@ -217,6 +220,27 @@ mod tests {
             "RUN pnpm install && pnpm run prepare\nWORKDIR /app/apps/web\nRUN pnpm run release"
         ));
         assert!(result.contains("/app/apps/web/public /usr/share/nginx/html"));
+    }
+
+    #[tokio::test]
+    async fn nonmember_vite_apps_never_receive_workspace_filters() {
+        let repo = tempfile::tempdir().unwrap();
+        let app = repo.path().join("apps/web");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("package.json"), "{}").unwrap();
+        for packages in [
+            "packages: [packages/*]",
+            "packages: ['apps/*', '!apps/web']",
+        ] {
+            std::fs::write(repo.path().join("pnpm-workspace.yaml"), packages).unwrap();
+            let result = Vite
+                .dockerfile(DockerfileConfig::new(repo.path(), &app, "fixture"))
+                .await
+                .content;
+            assert!(!result.contains("--filter"), "{result}");
+            assert!(!result.contains("WORKDIR /app/apps/web"), "{result}");
+            assert!(result.contains("RUN npm install"), "{result}");
+        }
     }
 
     #[tokio::test]

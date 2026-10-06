@@ -30,14 +30,24 @@ struct Resources {
 
 impl Resources {
     fn new() -> Option<Self> {
-        if !Command::new("docker")
-            .arg("info")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
-        {
-            eprintln!("Docker unavailable; skipping generated-preset image scenarios");
+        let available = [&["info"][..], &["buildx", "version"][..]]
+            .iter()
+            .all(|args| {
+                Command::new("docker")
+                    .args(*args)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success())
+            });
+        if !available {
+            // CI must execute the scenarios; a missing daemon/plugin is a failure.
+            // Local contributors retain graceful skips without a new test knob.
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "Docker and Buildx are required for generated-preset image scenarios in CI"
+            );
+            eprintln!("Docker or Buildx unavailable; skipping generated-preset image scenarios");
             return None;
         }
         let id = SystemTime::now()

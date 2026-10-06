@@ -21,6 +21,7 @@ async-trait = { workspace = true }
 tokio = { workspace = true, features = ["fs"] }
 anyhow = { workspace = true }
 regex = "1.11"
+globset = "0.4"
 toml = "1.1"
 serde_yaml = "0.9"
 url = { workspace = true }

@@ -144,3 +144,59 @@ for (const method of ['dns-01', 'http-01', 'acme']) {
     client.clear()
   })
 }
+
+for (const status of ['active', 'active_renewal_failed']) {
+  for (const method of ['dns-01', 'http-01']) {
+    for (const cachedOrder of [false, true]) {
+      test(`retained ${cachedOrder ? 'cached' : 'uncached'} ${method} order error does not block renewal after becoming ${status}`, () => {
+        const client = createClient()
+        const pendingDomain = { ...domain, verification_method: method }
+        const orderError = new TypeError('Failed to fetch')
+        client.setQueryData(domainKey, pendingDomain)
+        if (cachedOrder) {
+          client.setQueryData(orderKey, {
+            id: 2,
+            domain_id: 1,
+            status: 'pending',
+            authorizations: { challenge_type: method },
+            identifiers: [],
+            order_url: 'https://acme.example.test/order/2',
+            email: 'operator@example.test',
+            created_at: domain.created_at,
+            updated_at: domain.updated_at,
+          })
+        }
+        fail(client, orderKey, orderError)
+
+        const pending = render(client)
+        expect(pending).toContain('Certificate order unavailable')
+        expect(pending).not.toContain('Create order')
+        expect(pending).not.toContain('Start renewal')
+        expect(pending).not.toContain('Renew certificate')
+
+        client.setQueryData(domainKey, { ...pendingDomain, status })
+        const serving = render(client)
+        expect(client.getQueryState(orderKey)?.error).toBe(orderError)
+        expect(serving).not.toContain('Certificate order unavailable')
+        expect(serving).toContain('Active TLS certificate')
+        const renewLabel =
+          method === 'dns-01' ? 'Start renewal' : 'Renew certificate'
+        const renewalButton = serving
+          .match(/<button\b[^>]*>[\s\S]*?<\/button>/g)
+          ?.find((button) => button.includes(renewLabel))
+        expect(renewalButton).toBeDefined()
+        expect(renewalButton).not.toContain('disabled=')
+        if (status === 'active_renewal_failed') {
+          expect(serving).toContain('Certificate renewal failed')
+        }
+
+        client.setQueryData(domainKey, pendingDomain)
+        const pendingAgain = render(client)
+        expect(pendingAgain).toContain('Certificate order unavailable')
+        expect(pendingAgain).not.toContain('Create order')
+        expect(pendingAgain).not.toContain(renewLabel)
+        client.clear()
+      })
+    }
+  }
+}

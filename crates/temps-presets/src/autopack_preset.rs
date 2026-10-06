@@ -197,7 +197,7 @@ pub(crate) fn render(
 }
 
 /// A pnpm workspace app directory safe to use in Dockerfile paths and shell filters.
-/// The build job confines the root and checks the workspace marker before calling us.
+/// Check membership here too: presets may also be invoked outside the build job.
 pub(crate) fn pnpm_app_directory(config: &DockerfileConfig<'_>) -> Result<Option<String>, String> {
     if config.root_local_path == config.local_path
         || !config.root_local_path.join("pnpm-workspace.yaml").is_file()
@@ -222,6 +222,9 @@ pub(crate) fn pnpm_app_directory(config: &DockerfileConfig<'_>) -> Result<Option
         return Err(format!(
             "Unsupported pnpm workspace application directory: {text}"
         ));
+    }
+    if !super::pnpm_workspace::app_is_member(config.root_local_path, config.local_path)? {
+        return Ok(None);
     }
     Ok(Some(text.to_string()))
 }
@@ -362,7 +365,11 @@ mod tests {
             .dockerfile_with_build_dir(dir.path())
             .await;
 
-        assert!(result.content.starts_with("# syntax="), "{}", result.content);
+        assert!(
+            result.content.starts_with("# syntax="),
+            "{}",
+            result.content
+        );
         assert!(result.content.contains("node server.js"));
     }
 
@@ -428,36 +435,77 @@ mod tests {
     #[test]
     fn upgraded_autopack_preserves_next_and_pnpm_caches() {
         let dir = fixture(&[
-            ("package.json", r#"{"packageManager":"pnpm@11.0.0","scripts":{"build":"next build","start":"next start"},"dependencies":{"next":"16.0.0"}}"#),
+            (
+                "package.json",
+                r#"{"packageManager":"pnpm@11.0.0","scripts":{"build":"next build","start":"next start"},"dependencies":{"next":"16.0.0"}}"#,
+            ),
             ("pnpm-lock.yaml", "lockfileVersion: '9.0'\n"),
         ]);
         let result = render(&buildkit_config(dir.path()), None).expect("Next.js plan");
-        assert!(result.content.contains("pnpm_config_store_dir"), "{}", result.content);
-        assert!(result.content.contains("target=/cache/pnpm"), "{}", result.content);
-        assert!(result.content.contains("target=/app/.next/cache,sharing=locked"), "{}", result.content);
+        assert!(
+            result.content.contains("pnpm_config_store_dir"),
+            "{}",
+            result.content
+        );
+        assert!(
+            result.content.contains("target=/cache/pnpm"),
+            "{}",
+            result.content
+        );
+        assert!(
+            result
+                .content
+                .contains("target=/app/.next/cache,sharing=locked"),
+            "{}",
+            result.content
+        );
     }
 
     #[test]
     fn upgraded_autopack_prepares_caddy_despite_user_step_overrides() {
         let dir = fixture(&[
             ("index.html", "<h1>static site</h1>"),
-            ("autopack.json", r#"{"steps":{"caddy":{"commands":["echo custom step"]}}}"#),
+            (
+                "autopack.json",
+                r#"{"steps":{"caddy":{"commands":["echo custom step"]}}}"#,
+            ),
         ]);
         let result = render(&buildkit_config(dir.path()), None).expect("static plan");
-        assert!(result.content.contains("RUN cp /usr/bin/caddy /tmp/caddy && mv /tmp/caddy /usr/bin/caddy"), "{}", result.content);
-        assert!(result.content.contains("--from=autopack-caddy-1 /usr/bin/caddy /usr/bin/caddy"), "{}", result.content);
+        assert!(
+            result
+                .content
+                .contains("RUN cp /usr/bin/caddy /tmp/caddy && mv /tmp/caddy /usr/bin/caddy"),
+            "{}",
+            result.content
+        );
+        assert!(
+            result
+                .content
+                .contains("--from=autopack-caddy-1 /usr/bin/caddy /usr/bin/caddy"),
+            "{}",
+            result.content
+        );
     }
 
     #[test]
     fn app_cache_scope_build_variables_reach_autopack() {
         let dir = node_app();
-        let vars = vec!["AUTOPACK_CACHE_SCOPE=app".to_string(), "AUTOPACK_CACHE_KEY=project-a".to_string()];
+        let vars = vec![
+            "AUTOPACK_CACHE_SCOPE=app".to_string(),
+            "AUTOPACK_CACHE_KEY=project-a".to_string(),
+        ];
         let config = buildkit_config(dir.path()).with_build_vars(&vars);
         let result = render(&config, None).expect("scoped plan");
-        assert!(result.content.contains("id=autopack-70726f6a6563742d61-"), "{}", result.content);
+        assert!(
+            result.content.contains("id=autopack-70726f6a6563742d61-"),
+            "{}",
+            result.content
+        );
         let missing_key = vec!["AUTOPACK_CACHE_SCOPE=app".to_string()];
         let config = buildkit_config(dir.path()).with_build_vars(&missing_key);
-        assert!(render(&config, None).unwrap_err().contains("AUTOPACK_CACHE_KEY"));
+        assert!(render(&config, None)
+            .unwrap_err()
+            .contains("AUTOPACK_CACHE_KEY"));
     }
 
     /// The lines of the stage declared `FROM ... AS {stage}`.
@@ -475,7 +523,10 @@ mod tests {
         // `build_image.rs` passes names only; the values arrive as
         // `--build-arg`s, which a stage only sees for the `ARG`s it declares.
         let dir = fixture(&[
-            ("package.json", r#"{"scripts":{"build":"node build.js","start":"node server.js"}}"#),
+            (
+                "package.json",
+                r#"{"scripts":{"build":"node build.js","start":"node server.js"}}"#,
+            ),
             ("package-lock.json", "{}"),
         ]);
         let vars = vec!["VITE_API_URL".to_string(), "PUBLIC_SITE_NAME".to_string()];
@@ -487,14 +538,22 @@ mod tests {
             let declaration = format!("ARG {name}");
             assert!(build.contains(&declaration.as_str()), "{}", result.content);
             // Declared once, so a changed value never re-runs `npm ci`.
-            assert_eq!(result.content.matches(&declaration).count(), 1, "{}", result.content);
+            assert_eq!(
+                result.content.matches(&declaration).count(),
+                1,
+                "{}",
+                result.content
+            );
         }
     }
 
     #[test]
     fn variables_an_arg_cannot_declare_do_not_fail_the_build() {
         let dir = fixture(&[
-            ("package.json", r#"{"scripts":{"build":"node build.js","start":"node server.js"}}"#),
+            (
+                "package.json",
+                r#"{"scripts":{"build":"node build.js","start":"node server.js"}}"#,
+            ),
             ("package-lock.json", "{}"),
         ]);
         let vars = vec![
@@ -526,16 +585,27 @@ mod tests {
         // never receives their values. That must leave no `ARG` behind, or
         // every Autopack build on a worker is refused.
         let dir = fixture(&[
-            ("package.json", r#"{"scripts":{"build":"node build.js","start":"node server.js"}}"#),
+            (
+                "package.json",
+                r#"{"scripts":{"build":"node build.js","start":"node server.js"}}"#,
+            ),
             ("package-lock.json", "{}"),
         ]);
         let result = render(&buildkit_config(dir.path()), None).expect("Node plan");
-        assert!(!worker_guard_finds_an_arg(&result.content), "{}", result.content);
+        assert!(
+            !worker_guard_finds_an_arg(&result.content),
+            "{}",
+            result.content
+        );
 
         let vars = vec!["VITE_API_URL".to_string()];
         let config = buildkit_config(dir.path()).with_build_vars(&vars);
         let result = render(&config, None).expect("Node plan");
-        assert!(worker_guard_finds_an_arg(&result.content), "{}", result.content);
+        assert!(
+            worker_guard_finds_an_arg(&result.content),
+            "{}",
+            result.content
+        );
     }
 
     #[tokio::test]
@@ -543,7 +613,10 @@ mod tests {
         // `uses_autopack` decides whether a worker build omits build
         // variables, so it has to match what the preset actually renders.
         let dir = fixture(&[
-            ("package.json", r#"{"scripts":{"build":"node build.js","start":"node server.js"}}"#),
+            (
+                "package.json",
+                r#"{"scripts":{"build":"node build.js","start":"node server.js"}}"#,
+            ),
             ("package-lock.json", "{}"),
         ]);
         let mut reported = Vec::new();
@@ -563,7 +636,10 @@ mod tests {
             );
         }
         for slug in ["autopack", "nixpacks", "python", "go", "rust", "java"] {
-            assert!(reported.iter().any(|s| s == slug), "{slug} must report Autopack");
+            assert!(
+                reported.iter().any(|s| s == slug),
+                "{slug} must report Autopack"
+            );
         }
     }
 
@@ -584,7 +660,10 @@ mod tests {
     fn forcing_a_provider_overrides_detection() {
         // A repository that looks like two things must build as the one the
         // user picked, not the one that happens to detect first.
-        let dir = fixture(&[("main.go", "package main\nfunc main() {}\n"), ("go.mod", "module x\n\ngo 1.22\n")]);
+        let dir = fixture(&[
+            ("main.go", "package main\nfunc main() {}\n"),
+            ("go.mod", "module x\n\ngo 1.22\n"),
+        ]);
         let config = buildkit_config(dir.path());
 
         let forced = render(&config, Some("go")).expect("go provider");
@@ -672,6 +751,39 @@ mod tests {
             "{result}"
         );
         assert!(!result.contains("node wrong.js"), "{result}");
+    }
+
+    #[test]
+    fn nonmember_node_apps_are_analyzed_locally_without_workspace_filters() {
+        let repo = fixture(&[
+            (
+                "pnpm-workspace.yaml",
+                "packages: ['apps/*', '!apps/private']",
+            ),
+            (
+                "package.json",
+                r#"{"name":"root","packageManager":"pnpm@9.15.9"}"#,
+            ),
+            (
+                "apps/private/package.json",
+                r#"{"scripts":{"build":"node build.js","start":"node server.js"}}"#,
+            ),
+            (
+                "tools/web/package.json",
+                r#"{"scripts":{"build":"node build.js","start":"node server.js"}}"#,
+            ),
+        ]);
+        for relative in ["apps/private", "tools/web"] {
+            let app = repo.path().join(relative);
+            let config = DockerfileConfig::new(repo.path(), &app, "fixture").with_buildkit(true);
+            assert_eq!(pnpm_app_directory(&config).unwrap(), None);
+            let dockerfile = render(&config, Some("node")).unwrap().content;
+            assert!(!dockerfile.contains("--filter"), "{dockerfile}");
+            assert!(
+                !dockerfile.contains(&format!("/app/{relative}")),
+                "{dockerfile}"
+            );
+        }
     }
 
     #[test]

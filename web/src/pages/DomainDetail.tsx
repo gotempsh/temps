@@ -234,11 +234,12 @@ export function DomainDetail() {
     })
   }
 
+  const orderRequired = !!domain && !isServingCert(domain.status)
   const orderQuery = useQuery({
     ...getDomainOrderOptions({ path: { domain_id: Number(id) } }),
     // Only fetch an in-progress ACME order when the domain isn't already serving a
     // cert. "active_renewal_failed" is still serving, so treat it like "active".
-    enabled: !!domain && !isServingCert(domain.status),
+    enabled: orderRequired,
     retry: false,
   })
 
@@ -281,10 +282,14 @@ export function DomainDetail() {
     canManageCertificates: platformCanManageCertificates,
     isUsingCloudflare,
   } = usePlatformCapabilities()
+  // Disabled queries retain their errors. Once a certificate is serving, an
+  // earlier pending-order failure must not block renewal or show an obsolete alert.
   const orderReadFailed =
-    orderQuery.isError && (!isVerifiedNotFound(orderQuery.error) || !!order)
+    orderRequired &&
+    orderQuery.isError &&
+    (!isVerifiedNotFound(orderQuery.error) || !!order)
   const orderKnown =
-    isServingCert(domain?.status) ||
+    !orderRequired ||
     orderQuery.isSuccess ||
     isVerifiedNotFound(orderQuery.error)
   const canManageCertificates =
