@@ -54,6 +54,12 @@ container and unused database names. Never stop, remove or mutate operator-owned
 Docker resources. Additional feature-specific scenarios below remain required
 for shipped scope; automation definitions alone do not count as successful runs.
 
+The published [v0.0.8 assets](https://github.com/gotempsh/temps/releases/tag/v0.0.8)
+include Linux amd64 and macOS amd64/arm64 archives, but no Linux arm64 archive.
+Record the architecture actually upgraded and rolled back. A Linux arm64
+migration route needs a separately reviewed strategy and execution evidence;
+other architecture results do not establish that route.
+
 The quiet-log harness (`SOAK_MINUTES=1440
 scripts/first-run/quiet-logs-soak.sh`) checks a small idle fixture and end-of-window
 health. It is **only part of** the healthy workload soak: collect periodic health,
