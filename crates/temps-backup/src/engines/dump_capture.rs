@@ -92,6 +92,20 @@ pub enum DumpCaptureError {
         source: Box<OneShotError>,
     },
 
+    /// A dump that runs through `docker exec` in the service's own container
+    /// (rather than in a one-shot sidecar) could not be run or streamed out:
+    /// the exec could not be created, started or inspected, the output stream
+    /// broke, or writing it to the attempt's host file failed.
+    #[error("{tool} dump could not be streamed out of container '{container}' through docker exec: {reason}")]
+    Exec {
+        tool: &'static str,
+        container: String,
+        reason: String,
+        /// Mirrors [`BackupError::is_permanent`] of the underlying failure,
+        /// so wrapping the error never changes the executor's retry policy.
+        permanent: bool,
+    },
+
     /// The dump tool itself failed (bad credentials, unreachable target,
     /// tool error). Retrying usually needs a configuration change.
     #[error("{tool} export failed in backup container '{container}' with exit code {exit_code}: {stderr}")]
@@ -162,6 +176,24 @@ impl DumpCaptureError {
             permanent,
         }
     }
+
+    /// Classify a failure from [`super::mariadb_exec::exec_stream_stdout_to_file`]
+    /// as an exec-stream failure, preserving cancellation and permanence.
+    pub fn exec(tool: &'static str, container: &str, error: BackupError) -> Self {
+        let permanent = error.is_permanent();
+        let reason = match error {
+            BackupError::Cancelled => return Self::Cancelled { tool },
+            BackupError::Failed { reason }
+            | BackupError::PermanentFailure { reason }
+            | BackupError::Timeout { reason } => reason,
+        };
+        Self::Exec {
+            tool,
+            container: container.to_string(),
+            reason,
+            permanent,
+        }
+    }
 }
 
 impl From<DumpCaptureError> for BackupError {
@@ -170,10 +202,16 @@ impl From<DumpCaptureError> for BackupError {
             DumpCaptureError::Cancelled { .. } => BackupError::Cancelled,
             DumpCaptureError::Upload {
                 permanent: true, ..
+            }
+            | DumpCaptureError::Exec {
+                permanent: true, ..
             } => BackupError::PermanentFailure {
                 reason: error.to_string(),
             },
             DumpCaptureError::Upload {
+                permanent: false, ..
+            }
+            | DumpCaptureError::Exec {
                 permanent: false, ..
             }
             | DumpCaptureError::HostWorkdir { .. }
