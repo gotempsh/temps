@@ -15,8 +15,9 @@ item and page title.
 
 ## Stable
 
-This works, it is verified end to end in CI on every commit, and we will not
-break it in a `0.1.x` release.
+Stable is the intended compatibility commitment within `0.1.x`. A label does
+not prove that all journeys passed CI or release qualification. Check the
+candidate release evidence before relying on a GA claim.
 
 - HTTP API shapes, CLI flags, and configuration keys remain compatible within
   `0.1.x`.
@@ -25,10 +26,10 @@ break it in a `0.1.x` release.
 
 ## Beta
 
-This works and we test it, but the data model or API may still change between
-releases.
+The data model or API may still change between releases. Coverage and known
+limitations vary by feature; consult its registry reason and release evidence.
 
-- The feature is functional and covered by tests.
+- A Beta label alone does not establish complete end-to-end coverage.
 - Upgrades preserve platform data, while feature-specific schemas may be
   reshaped or migrated lossily.
 - Breaking changes are documented in the changelog.
@@ -38,11 +39,42 @@ releases.
 This is under active development. It may change substantially or be removed,
 so do not build critical workflows on it yet.
 
-Experimental features are not hidden or disabled. The badge exists so you can
-make an informed decision while still trying the feature and giving feedback.
+Experimental features remain discoverable, but a maturity label does not
+control runtime enablement, configuration or authorization. Check the actual
+feature settings and required integrations before enabling one. Off-by-default
+behavior must be independently verified; the badge is not a security boundary.
 
 ## Where the label comes from
 
 Every release ships a build-time feature maturity registry. The console, the
 OpenAPI description, and the Temps CLI read the same registry so the promise is
 consistent across interfaces.
+
+## v0.1.0 scope decision remains pending
+
+The proposed GA target is **single-node core**: deployments, managed services,
+backups, proxy, domains, authentication and authorization, logs, uptime,
+transactional email, blob/KV, feature flags, audit, CLI and console core. This is
+proposed release scope, not a claim that each capability has qualified.
+
+Analytics, error tracking and status pages can graduate only if their reliability
+and privacy gates pass; they currently remain Beta. Multi-node, advanced
+observability, teams and curated service templates remain Beta candidates.
+Database HA/failover is currently **Experimental** in the registry; a proposal to
+label it Beta requires a separate evidence-backed decision. AI, agents,
+sandboxes, revenue, plugins and vulnerability scanning remain Experimental.
+MCP surfaces require an explicit scope/defaults audit rather than an assumed
+registry entry or implied GA promise.
+
+The source registry in `crates/temps-core/src/feature_maturity.rs` describes the
+labels this build actually exposes. It is discovery input, not release evidence.
+Do not promote registry tiers solely to match this proposal. Maintainers must
+approve the final list, supported topologies and known limitations after reviewing
+[release qualification](https://github.com/gotempsh/temps/blob/main/docs/release-testing.md)
+and [the scope decision](https://github.com/gotempsh/temps/issues/1214).
+
+The launch gate also requires an independent inventory of experimental
+capabilities: actual default state, configuration prerequisites, UI onboarding,
+API permission checks and explicit opt-in behavior. Any feature that is enabled
+by default must be fixed or called out as an unresolved release blocker; a badge
+or missing provider configuration does not establish that it is disabled.

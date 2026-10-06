@@ -8,12 +8,105 @@ forward or revert the offending PR.
 Conventions used below:
 
 - `temps` = the server binary; `cli` = `bunx @temps-sdk/cli`
-- "fresh staging" = clean control plane + 1 worker, no projects, no services
-- "sample app" = `https://github.com/dviejokfs/sandbox-test-nextjs` (PortBoard)
+- "fresh staging" = disposable single-node control plane, no projects or services;
+  add run-owned workers only for explicitly multi-node scenarios
+- "sample app" = a generic owned test repository with an HTTP health endpoint
 - All HTTP checks use the cookie auth set by the UI login — assert the JSON
   body, not just the status code
 
 ---
+
+## v0.1.0 qualification and promotion record
+
+Tracking: [#1195](https://github.com/gotempsh/temps/issues/1195),
+[#1214](https://github.com/gotempsh/temps/issues/1214), and
+[#1215](https://github.com/gotempsh/temps/issues/1215). This checklist is a runbook,
+not evidence of completion. **RC publication and stable promotion remain blocked
+until the gates below have actual, reviewed results.** Do not infer qualification
+from merged fixes, a green unit test, a maturity badge, or a short idle soak.
+
+Record the exact source commit, candidate tag, binary/image digests, platform,
+database version, fixture identities, test commands, UTC start/end times,
+expected/actual results, and reviewer for each run. Keep raw reports, credentials,
+logs and user feedback private; link sanitized evidence from the release record.
+Use `untested`, `passed`, `failed`, `blocked`, or `inconclusive`, and give every
+blocked/inconclusive result a reason and owner. A new candidate invalidates prior
+candidate results unless the reviewer explicitly documents why evidence applies.
+
+### Before publishing rc.1 (or a replacement RC)
+
+| Gate | Required evidence | Current qualification state |
+| --- | --- | --- |
+| Combined integration CI | Required Rust, console, CLI, generated SDK, attribution and security checks on the integrated commit; links to full results and runtime skip counts | Untested for the final combined candidate |
+| Fresh installation | Empty database and first-admin bootstrap; Docker image, Git/Dockerfile, Node, Compose and static deploy flows; UI/CLI feedback; actual proxy responses, service readback and restart persistence | Untested for the final combined candidate |
+| Seeded upgrade from v0.0.8 | Previous released binary and candidate digests; migrations, pre-migration backup, projects/environments/secrets/services/deployments preserved; app served through proxy | Untested |
+| Actual rollback to v0.0.8 | Restore pre-migration database and matching data directory with the old binary, read back seeded data and app response; verify schema-ahead refusal without data mutation | Untested |
+| Healthy 24-hour workload soak | Continuous workload health, deployed app requests, service checks, deploy/error/upgrade metrics, bounded memory/disk/log growth, no unexplained restart or stuck jobs; log report and UTC window | Untested; no 24-hour run claimed |
+| Security | GA-scope findings reviewed, external penetration test report and remediation/retest, authorization/SSRF/secret masking/defaults reviewed independently of labels | External assessment and sign-off pending (#1210, #1216) |
+| Release packaging | Required architecture binaries/images, checksums, signatures, SBOM and provenance verified for candidate artifacts; installer channel behavior and upgrade policy reviewed | Candidate artifact verification pending (#1207, #1208, #1213) |
+| Maturity and actual defaults | Maintainer approves scope; source registry, UI/API/CLI consistency and each experimental capability's actual enablement, prerequisites and authorization checked | Decision and defaults audit pending (#1214) |
+
+Use the existing `scripts/first-run/run-first-run.sh` and
+`scripts/test-upgrade-from-release.sh` as executable starting points; inspect their
+prerequisites before running. For the upgrade harness set `OLD_BIN` to a verified
+v0.0.8 binary and `NEW_BIN` to the candidate. Use a dedicated test database
+container and unused database names. Never stop, remove or mutate operator-owned
+Docker resources. Additional feature-specific scenarios below remain required
+for shipped scope; automation definitions alone do not count as successful runs.
+
+The quiet-log harness (`SOAK_MINUTES=1440
+scripts/first-run/quiet-logs-soak.sh`) checks a small idle fixture and end-of-window
+health. It is **only part of** the healthy workload soak: collect periodic health,
+request/deploy/error counts, resource usage and restart history throughout the
+window. Twenty minutes in CI cannot establish 24-hour reliability. The full run
+needs a supervised dedicated host; keep the workload and evidence isolated.
+
+### After RC publication, before stable promotion
+
+- Freeze the candidate scope and document exceptions. A maintainer publishes
+  the qualified RC; this checklist and its checker never publish anything.
+- Invite beta users to upgrade through the approved communication channel.
+  Observe **5–7 actual days** of tester feedback after publication, recording
+  upgraded versions, upgrade outcomes, deploy success, error summaries and
+  unresolved regressions. No responses is not affirmative compatibility evidence.
+- If a blocker requires rc.2, document the fix and repeat affected qualification;
+  the reviewer decides and records whether the feedback window must restart.
+- Reverify the published artifact digests, signatures/SBOM/provenance, supported
+  architecture downloads, and stable installer selection. Verify that stable
+  selection excludes prereleases and pinned upgrades select the requested version.
+- Publish reviewed release notes (generated changelog plus verified limitations),
+  final GA/Beta/Experimental list, and a link to the supported compatibility and
+  upgrade/rollback policy. Never hand-edit `CHANGELOG.md`.
+- Name the patch owner, security reporting route, and **30-day patch window**
+  starting at the actual stable publication time, with an explicit end date.
+  Regressions must have severity, reproduction, mitigation and patch/retest plan.
+- Require a named maintainer's promotion approval after reviewing all evidence.
+  Do not publish automatically, merge the qualification PR, or close operational
+  issues merely because the checklist is present. beta.57 is optional.
+
+### Private evidence ledger
+
+The repository includes a fail-closed completeness checker. Initialize outside
+the checkout so raw operational evidence cannot enter a commit:
+
+```bash
+python3 scripts/check-release-qualification.py /tmp/temps-v010-evidence/ledger.json --init
+python3 scripts/check-release-qualification.py /tmp/temps-v010-evidence/ledger.json \
+  --phase rc --commit "$(git rev-parse HEAD)"
+# After RC feedback and the remaining promotion gates:
+python3 scripts/check-release-qualification.py /tmp/temps-v010-evidence/ledger.json \
+  --phase stable --commit "$(git rev-parse HEAD)"
+```
+
+Initialization marks every gate untested. Fill `candidate_commit`,
+`candidate_version`, and each gate's `status`, `reviewer`, and `evidence` list.
+Each evidence item contains a path relative to the ledger directory and the
+file's lowercase SHA-256 (`sha256sum` or `shasum -a 256`). For `workload-soak` and
+`tester-feedback`, also record timezone-qualified `started_at` and `ended_at`.
+The checker rejects missing gates, missing/changed files, stale source commits,
+short windows and future end times. It cannot authenticate reports or determine
+whether a workload was healthy; a reviewer must inspect the evidence and verify
+candidate artifact identities. A zero exit code is not authorization to release.
 
 ## 1. Onboarding & auth
 
@@ -797,7 +890,7 @@ releases:
   security review is approved.
 ## How to use this document
 
-1. Open a `RELEASE_CHECKLIST_vX.Y.Z.md` for the release in flight.
+1. Create a private release evidence ledger for the release in flight (see above).
 2. **Run** every scenario above against staging. Tick the boxes as you go.
 3. Skip with a written reason any scenario that does not apply (e.g., "no
    migrations this release"). Never skip silently.
