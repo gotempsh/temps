@@ -173,6 +173,18 @@ docs: update installation instructions
 Use `!` after the type/scope for breaking changes (`feat(api)!: …`). Choose a
 meaningful **scope** — it becomes the bold prefix in the changelog.
 
+### Public interface compatibility
+
+Changes to documented API endpoints, CLI commands or flags, and configuration
+keys must follow the [compatibility and deprecation policy](docs/features/api/page.mdx#compatibility-and-deprecation).
+Identify the feature maturity before making a breaking change. For Stable
+features, retain deprecated interfaces through `0.1.x`; include the replacement,
+migration example, earliest removal release and date in the reference docs and
+release notes. Use a breaking-change Conventional Commit for removals or other
+incompatible changes so the generated changelog calls them out. Regenerate
+tracked OpenAPI clients when the API changes, and record the source server
+release and verified compatibility range when releasing an SDK.
+
 ### Developer Certificate of Origin (sign-off required)
 
 Every commit must be signed off under the [Developer Certificate of Origin](DCO)

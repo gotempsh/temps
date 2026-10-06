@@ -15,14 +15,20 @@ item and page title.
 
 ## Stable
 
-Stable is the intended compatibility commitment within `0.1.x`. A label does
+Stable is the intended compatibility commitment between stable `0.1.x`
+releases, starting at `0.1.0`. Prereleases are outside this promise. A label does
 not prove that all journeys passed CI or release qualification. Check the
 candidate release evidence before relying on a GA claim.
 
 - HTTP API shapes, CLI flags, and configuration keys remain compatible within
-  `0.1.x`.
+  stable `0.1.x` releases, subject to the documented security exception.
 - Database migrations preserve your data across upgrades.
 - Regressions are treated as release-blocking.
+
+See [Compatibility and deprecation](/docs/api-overview#compatibility) for the
+covered interfaces, additive changes, deprecation window, OpenAPI and SDK
+versioning, and how future `0.x` breaking changes are announced. There is no
+compatibility promise across `0.x` minor releases or for a future `1.x` series.
 
 ## Beta
 
@@ -32,12 +38,15 @@ limitations vary by feature; consult its registry reason and release evidence.
 - A Beta label alone does not establish complete end-to-end coverage.
 - Upgrades preserve platform data, while feature-specific schemas may be
   reshaped or migrated lossily.
-- Breaking changes are documented in the changelog.
+- Breaking changes are documented in the changelog and release notes using
+  the [compatibility notice process](/docs/api-overview#compatibility).
 
 ## Experimental
 
 This is under active development. It may change substantially or be removed,
 so do not build critical workflows on it yet.
+
+Changes and removals use the same notice process as Beta features.
 
 Experimental features remain discoverable, but a maturity label does not
 control runtime enablement, configuration or authorization. Check the actual

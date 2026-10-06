@@ -12,6 +12,7 @@ export const sections = [
   { title: "Create an API key", id: "api-keys" },
   { title: "Make a request", id: "requests" },
   { title: "Explore the API", id: "openapi" },
+  { title: "Compatibility and deprecation", id: "compatibility" },
   { title: "Deploy from CI", id: "ci" },
   { title: "Use the CLI", id: "cli" },
   { title: "Call the API from your application", id: "deployment-tokens" },
@@ -95,6 +96,107 @@ Every instance serves its own OpenAPI document and an interactive Swagger UI, so
 | Swagger UI | `/api/swagger-ui` |
 
 Both require you to be logged in (or to send an API key), and both are served on the admin surface. You can generate a client for any language from the OpenAPI document. Temps' own console and CLI are generated from it.
+
+---
+
+## Compatibility and deprecation {{ anchor: true, id: 'compatibility' }}
+
+### The 0.1.x promise
+
+For **Stable** features, upgrades from one stable `0.1.x` release to a later
+stable `0.1.x` release preserve the documented public interfaces below. This
+promise starts at `0.1.0`; it does not cover `0.1.0-beta.*`, release candidates,
+nightly builds, or undocumented internals. [Feature maturity](/docs/feature-maturity)
+identifies the features covered by this promise. Beta and Experimental features
+can change within `0.1.x`, with the notice process below.
+
+| Surface | Preserved during stable 0.1.x upgrades | Compatible additions and limits |
+|---------|--------------------------------------|---------------------------------|
+| HTTP API | Documented methods and paths, accepted request fields, response field types, status codes, and documented behavior | New endpoints, optional request fields with backward-compatible defaults, and response fields may be added. Clients must ignore unknown response fields. New required inputs, removed fields, changed types, and new values in a closed documented enum are breaking changes. |
+| CLI | Documented commands, flags, their meanings and defaults, exit-code behavior, and documented machine-readable output | New commands and optional flags may be added. Human-readable help, progress messages, and table formatting may change; use documented structured output for scripts. This applies to both the Rust `temps` binary and `@temps-sdk/cli`. |
+| Configuration | Documented configuration keys, environment variables, accepted values, and defaults | New optional settings may be added. Existing valid configurations continue to work without newly required settings. Internal database tables and on-disk implementation details are not public configuration interfaces. |
+
+Database migrations preserve platform data during supported forward upgrades.
+This is not a promise that an older binary can run against a newer schema or
+that a downgrade is safe. Back up before upgrading. Beta feature schemas may
+be reshaped as described on the maturity page.
+
+A security fix may need to reject previously accepted unsafe input or tighten
+access. Such an exception must be identified in the release notes with the
+impact and required operator action; it must not silently be presented as a
+compatible change. Other regressions in Stable interfaces block a release.
+
+### Deprecation and future 0.x changes
+
+Deprecation means an interface still works but has a named replacement. For a
+Stable interface, the first notice must ship in a stable release, in its
+reference documentation, and in that release's GitHub release notes and
+generated changelog. The notice must state the affected API path, CLI flag, or
+configuration key; why it is deprecated; the replacement with a migration
+example; and the earliest removal release and date.
+
+Keep the deprecated interface working for the rest of `0.1.x`. Removal must
+wait until a later `0.x` minor release, at least one stable patch release after
+the notice and at least 30 days after that notice. For example, a flag deprecated
+in `0.1.2` cannot be removed in `0.1.3`; it may be removed in `0.2.0` only after
+both notice conditions have been met. The security exception above can shorten
+this window when retaining the behavior would be unsafe.
+
+For Beta and Experimental interfaces, changes or removal may happen within
+`0.1.x`. Document the impact and migration in the changelog and release notes;
+announce planned breaking changes in the target release's prerelease notes
+before the stable release. Do not label these interfaces Stable merely to
+imply compatibility.
+
+Before any future `0.x` minor release with breaking changes, publish a migration
+guide in the existing reference documentation and link it from the prerelease
+and final GitHub release notes. List the old and new behavior, affected versions,
+configuration or data migration steps, and any rollback limitations. Mark the
+implementing commits as breaking changes so the generated changelog includes
+them. A version change by itself is not sufficient notice. This policy makes
+no compatibility promise across `0.x` minor releases or for a future `1.x`
+series; those releases must publish their own policy.
+
+### OpenAPI and SDK versions
+
+Management routes use the unversioned `/api/*` base path. There is no general
+`/api/v1` alias or API-version negotiation; individual protocol endpoints may
+have their own versioned paths. The compatibility promise applies to the
+interfaces themselves, regardless of the URL spelling.
+
+OpenAPI has three separate version concepts:
+
+- The top-level `openapi` field identifies the OpenAPI document format.
+- `info.version` identifies the management API schema family. Its current
+  `1.0.0` value is independent of the Temps binary version and does **not**
+  promise Temps product `1.x` compatibility. Keep this schema family for
+  compatible `0.1.x` changes; an incompatible management API revision in a
+  future `0.x` minor release must change `info.version` and document the
+  migration. It is not an exact schema fingerprint: additive changes and
+  changes to Beta or Experimental features can occur within the family.
+- The Temps release tag identifies the exact release's schema. Fetch
+  `/api/api-docs/openapi.json` from the instance you target and record its
+  Temps release alongside the saved spec. Do not infer the running server
+  release or client compatibility from `info.version` alone.
+
+The console client and the CLI's checked-in generated client are regenerated
+from the matching backend source when its API surface changes. The CLI's
+committed OpenAPI document is a release snapshot, not a spec for every server.
+Generate custom clients from the target instance's authenticated OpenAPI
+endpoint rather than from an unrelated checkout.
+
+Published `@temps-sdk/*` packages have independent package versions; their
+version numbers do not have to equal the Temps binary or OpenAPI version.
+Pin the package version and use its release notes to select a version that
+supports your server release. SDK releases that change the API client must
+identify the source Temps release and supported server range in their release
+notes; report compatibility only for combinations actually verified. During
+SDK `0.x`, incompatible public SDK changes require a minor version increase
+and migration notes, while compatible fixes and additions use patch versions.
+Prerelease SDKs carry no stable compatibility promise. A newer SDK's newly
+added method may require a newer server even when its older methods remain
+compatible; upgrade the server before adopting that method. Pin both server
+and SDK versions when depending on Beta or Experimental interfaces.
 
 ---
 
