@@ -128,10 +128,32 @@ def wait(args, fetch=fetch_runs, sleep=time.sleep, clock=time.monotonic):
     missing_deadline = started + args.missing_grace_minutes * 60
     runs = []
     state = "missing"
+    seen_qualifying_run = False
+    warned_run_dropped = False
     while True:
         try:
-            runs = fetch(args.repository, args.workflow, args.sha, token)
-            state = classify(runs)
+            fetched = fetch(args.repository, args.workflow, args.sha, token)
+            fetched_state = classify(fetched)
+            if fetched_state != "missing":
+                runs = fetched
+                state = fetched_state
+                seen_qualifying_run = True
+            elif seen_qualifying_run:
+                # The runs listing filtered by `head_sha` sometimes omits a
+                # queued run it returned a minute earlier. A run cannot be
+                # unregistered, so this is the API flapping, not a missing
+                # run: keep waiting on the last answer that listed it. Annotate
+                # once; a long gap would otherwise add one warning per poll.
+                message = (
+                    f"{args.workflow} runs for {args.sha} were listed earlier "
+                    "but are absent from this response; treating as pending"
+                )
+                print(message if warned_run_dropped else f"::warning::{message}")
+                warned_run_dropped = True
+                state = "pending"
+            else:
+                runs = fetched
+                state = fetched_state
         except (urllib.error.URLError, TimeoutError, ValueError) as error:
             # Transient API trouble must not publish, but should not fail the
             # gate on the first hiccup either: keep polling until the deadline.
@@ -194,6 +216,9 @@ def main(argv=None):
         help="query once, print `tests_state=<state>` and exit 0 (used by nightly-release.yml)",
     )
     args = parser.parse_args(argv)
+    # The gate polls for up to hours; without line buffering the job log shows
+    # nothing until it exits, and then every line carries the same timestamp.
+    sys.stdout.reconfigure(line_buffering=True)
     if args.print_state:
         return print_state(args)
     return wait(args)
