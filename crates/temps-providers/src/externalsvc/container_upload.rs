@@ -15,9 +15,11 @@
 //! be arbitrarily large and the link to the daemon arbitrarily slow, so the
 //! only signal that an upload is broken is that the daemon stops accepting
 //! data. The body is pulled under backpressure, so every chunk pulled is a
-//! chunk the daemon took.
+//! chunk the daemon took. Once the last byte is sent the daemon may still be
+//! writing the file out, so the wait for its answer gets its own window that
+//! grows with the file's size.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -34,8 +36,8 @@ pub enum ContainerUploadError {
     #[error("Invalid upload file name '{name}': {reason}")]
     InvalidName { name: String, reason: String },
 
-    /// The Docker daemon stopped accepting data (or never answered after the
-    /// last byte) for longer than the stall timeout.
+    /// The Docker daemon stopped accepting data for longer than the stall
+    /// timeout, before the whole archive was sent.
     #[error(
         "Upload of '{dest_name}' into container {container_id} stalled: the Docker daemon \
          accepted no data for {stall_secs}s after {sent} of {size} bytes"
@@ -46,6 +48,19 @@ pub enum ContainerUploadError {
         size: u64,
         sent: u64,
         stall_secs: u64,
+    },
+
+    /// The whole archive was sent, but the Docker daemon did not confirm the
+    /// upload within the window allowed for writing out a file this size.
+    #[error(
+        "Upload of '{dest_name}' into container {container_id} was not confirmed: the Docker \
+         daemon received all {size} bytes but did not answer within {waited_secs}s"
+    )]
+    Unconfirmed {
+        container_id: String,
+        dest_name: String,
+        size: u64,
+        waited_secs: u64,
     },
 
     /// The Docker daemon rejected or aborted the upload.
@@ -65,16 +80,39 @@ pub enum ContainerUploadError {
 const UPLOAD_CHUNK_BYTES: usize = 256 * 1024;
 
 /// How long the daemon may accept no data before an upload is abandoned.
-/// Covers the time from the last chunk to the daemon's response too.
 const UPLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
-/// When an upload last made progress, and how far it got.
+/// Slowest rate at which the daemon is assumed to write out an uploaded file
+/// once it has received all of it. Sizes the wait for its answer.
+const MIN_DAEMON_WRITE_BYTES_PER_SEC: u64 = 8 * 1024 * 1024;
+
+/// How long to wait for the daemon's answer after the last byte of a `size`
+/// byte upload: the stall timeout, plus the time to write the whole file out
+/// at [`MIN_DAEMON_WRITE_BYTES_PER_SEC`] (the daemon normally extracts while
+/// it receives, so this is a generous bound, not an expected duration).
+fn confirmation_timeout(size: u64) -> Duration {
+    UPLOAD_STALL_TIMEOUT + Duration::from_secs(size / MIN_DAEMON_WRITE_BYTES_PER_SEC)
+}
+
+/// Why an upload was abandoned by [`run_until_stalled`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Abandoned {
+    /// No chunk was taken for the stall timeout; `sent` bytes had gone out.
+    Stalled { sent: u64 },
+    /// Every byte was sent, but no answer came within the confirmation window.
+    Unconfirmed { waited: Duration },
+}
+
+/// When an upload last made progress, how far it got, and whether the whole
+/// body has been sent.
 #[derive(Clone)]
 struct UploadProgress {
     started: tokio::time::Instant,
-    /// Milliseconds after `started` at which the last chunk was taken.
+    /// Milliseconds after `started` at which the last chunk was taken (or the
+    /// body ended).
     last_progress_ms: Arc<AtomicU64>,
     sent: Arc<AtomicU64>,
+    body_sent: Arc<AtomicBool>,
 }
 
 impl UploadProgress {
@@ -83,13 +121,29 @@ impl UploadProgress {
             started: tokio::time::Instant::now(),
             last_progress_ms: Arc::new(AtomicU64::new(0)),
             sent: Arc::new(AtomicU64::new(0)),
+            body_sent: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    fn record(&self, bytes: usize) {
+    fn touch(&self) {
         let elapsed_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.last_progress_ms.store(elapsed_ms, Ordering::Relaxed);
+    }
+
+    fn record(&self, bytes: usize) {
+        self.touch();
         self.sent.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// The body is exhausted: from now on the upload is waiting for the
+    /// daemon's answer, not for it to take more data.
+    fn finish_body(&self) {
+        self.touch();
+        self.body_sent.store(true, Ordering::Relaxed);
+    }
+
+    fn body_sent(&self) -> bool {
+        self.body_sent.load(Ordering::Relaxed)
     }
 
     fn last_progress(&self) -> tokio::time::Instant {
@@ -101,7 +155,8 @@ impl UploadProgress {
     }
 }
 
-/// Wrap `stream` so every chunk taken from it is recorded in `progress`.
+/// Wrap `stream` so every chunk taken from it, and the end of the body, is
+/// recorded in `progress`.
 fn track_progress<S>(
     stream: S,
     progress: UploadProgress,
@@ -109,29 +164,50 @@ fn track_progress<S>(
 where
     S: futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static,
 {
-    use futures::TryStreamExt;
-    stream.inspect_ok(move |chunk| progress.record(chunk.len()))
+    use futures::{StreamExt, TryStreamExt};
+    let at_end = progress.clone();
+    stream
+        .inspect_ok(move |chunk| progress.record(chunk.len()))
+        .chain(futures::stream::poll_fn(move |_| {
+            at_end.finish_body();
+            std::task::Poll::Ready(None)
+        }))
 }
 
-/// Drive `upload` to completion unless `progress` shows no new chunk for
-/// `stall`. Returns the bytes sent when it gives up. A slow upload that keeps
-/// moving is never cut off, however long it takes in total.
+/// Drive `upload` to completion with two bounds instead of a total deadline:
+/// while the body is being sent, give up after `stall` without a chunk taken;
+/// once it is all sent, give up after `confirmation` without an answer. A slow
+/// upload that keeps moving is never cut off, however long it takes in total,
+/// and a daemon still writing out a large file gets time to finish.
 async fn run_until_stalled<F, T>(
     upload: F,
     progress: &UploadProgress,
     stall: Duration,
-) -> Result<T, u64>
+    confirmation: Duration,
+) -> Result<T, Abandoned>
 where
     F: std::future::Future<Output = T>,
 {
+    let window = |progress: &UploadProgress| {
+        if progress.body_sent() {
+            confirmation
+        } else {
+            stall
+        }
+    };
     tokio::pin!(upload);
     loop {
-        let deadline = progress.last_progress() + stall;
+        let deadline = progress.last_progress() + window(progress);
         tokio::select! {
             output = &mut upload => return Ok(output),
             _ = tokio::time::sleep_until(deadline) => {
-                if progress.last_progress() + stall <= tokio::time::Instant::now() {
-                    return Err(progress.sent());
+                let window = window(progress);
+                if progress.last_progress() + window <= tokio::time::Instant::now() {
+                    return Err(if progress.body_sent() {
+                        Abandoned::Unconfirmed { waited: window }
+                    } else {
+                        Abandoned::Stalled { sent: progress.sent() }
+                    });
                 }
             }
         }
@@ -195,6 +271,7 @@ where
     S: futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static,
 {
     let progress = UploadProgress::new();
+    let confirmation = confirmation_timeout(size);
     run_until_stalled(
         docker.upload_to_container(
             container_id,
@@ -206,14 +283,23 @@ where
         ),
         &progress,
         UPLOAD_STALL_TIMEOUT,
+        confirmation,
     )
     .await
-    .map_err(|sent| ContainerUploadError::Stalled {
-        container_id: container_id.to_string(),
-        dest_name: dest_name.to_string(),
-        size,
-        sent,
-        stall_secs: UPLOAD_STALL_TIMEOUT.as_secs(),
+    .map_err(|abandoned| match abandoned {
+        Abandoned::Stalled { sent } => ContainerUploadError::Stalled {
+            container_id: container_id.to_string(),
+            dest_name: dest_name.to_string(),
+            size,
+            sent,
+            stall_secs: UPLOAD_STALL_TIMEOUT.as_secs(),
+        },
+        Abandoned::Unconfirmed { waited } => ContainerUploadError::Unconfirmed {
+            container_id: container_id.to_string(),
+            dest_name: dest_name.to_string(),
+            size,
+            waited_secs: waited.as_secs(),
+        },
     })?
     .map_err(|e| ContainerUploadError::Upload {
         container_id: container_id.to_string(),
@@ -487,6 +573,7 @@ mod tests {
             ),
             &progress,
             stall,
+            stall,
         )
         .await;
 
@@ -517,12 +604,89 @@ mod tests {
                 ),
                 &progress,
                 stall,
+                Duration::from_secs(60),
             ),
         )
         .await
         .expect("a stalled upload must be abandoned, not hang");
 
-        assert_eq!(outcome, Err(128));
+        assert_eq!(outcome, Err(Abandoned::Stalled { sent: 128 }));
+    }
+
+    /// Send every chunk at once, then answer only after `answer_after`, like
+    /// a daemon that is still writing out a large file.
+    async fn send_then_answer<S>(stream: S, answer_after: Duration) -> u64
+    where
+        S: futures::Stream<Item = std::io::Result<bytes::Bytes>>,
+    {
+        let taken = drain_slowly(stream, Duration::ZERO).await;
+        tokio::time::sleep(answer_after).await;
+        taken
+    }
+
+    #[tokio::test]
+    async fn a_daemon_still_writing_out_the_file_is_given_time_to_answer() {
+        let stall = Duration::from_millis(100);
+        let progress = UploadProgress::new();
+        let chunks = futures::stream::iter(
+            (0..3).map(|_| Ok::<_, std::io::Error>(bytes::Bytes::from_static(&[2_u8; 10]))),
+        );
+
+        // The answer comes 4x the stall timeout after the last byte, inside
+        // the confirmation window.
+        let outcome = run_until_stalled(
+            send_then_answer(
+                track_progress(chunks, progress.clone()),
+                Duration::from_millis(400),
+            ),
+            &progress,
+            stall,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert_eq!(outcome, Ok(30));
+    }
+
+    #[tokio::test]
+    async fn a_daemon_that_never_answers_after_the_last_byte_is_unconfirmed() {
+        let progress = UploadProgress::new();
+        let chunks = futures::stream::iter(
+            (0..3).map(|_| Ok::<_, std::io::Error>(bytes::Bytes::from_static(&[3_u8; 10]))),
+        );
+        let confirmation = Duration::from_millis(300);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_until_stalled(
+                send_then_answer(
+                    track_progress(chunks, progress.clone()),
+                    Duration::from_secs(3600),
+                ),
+                &progress,
+                Duration::from_millis(100),
+                confirmation,
+            ),
+        )
+        .await
+        .expect("an unanswered upload must be abandoned, not hang");
+
+        assert_eq!(
+            outcome,
+            Err(Abandoned::Unconfirmed {
+                waited: confirmation
+            })
+        );
+    }
+
+    #[test]
+    fn the_confirmation_window_grows_with_the_file() {
+        assert_eq!(confirmation_timeout(0), UPLOAD_STALL_TIMEOUT);
+        // 80 GiB at 8 MiB/s is 10240s on top of the stall timeout.
+        assert_eq!(
+            confirmation_timeout(80 * 1024 * 1024 * 1024),
+            UPLOAD_STALL_TIMEOUT + Duration::from_secs(10_240)
+        );
     }
 
     /// Both upload paths land the file, with its mode, in a container that
