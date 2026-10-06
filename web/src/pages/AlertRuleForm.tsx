@@ -284,7 +284,12 @@ export function AlertRuleForm({ projectId, projectName }: AlertRuleFormProps) {
   return (
     <div className="w-full space-y-6">
       <div className="flex items-center gap-4">
-        <Button variant="ghost" size="icon" onClick={() => goBack()}>
+        <Button
+          variant="ghost"
+          size="icon"
+          aria-label="Back to alert rules"
+          onClick={() => goBack()}
+        >
           <ArrowLeft className="h-4 w-4" />
         </Button>
         <div>

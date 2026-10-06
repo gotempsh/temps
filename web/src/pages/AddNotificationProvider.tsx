@@ -210,7 +210,10 @@ export function AddNotificationProvider() {
 
   const testMutation = useMutation({
     ...testNotificationProviderMutation(),
-    meta: { errorTitle: 'Test notification failed' },
+    // A failed test answers with an error status and the provider's reason,
+    // which the result callout below shows in place. Replacing the global
+    // error toast avoids a second, generic "An error occurred".
+    onError: () => {},
   })
   const sendTest = () => {
     if (!createdProvider) return
