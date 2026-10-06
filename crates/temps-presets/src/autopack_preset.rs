@@ -54,7 +54,17 @@ pub(crate) fn render(
         );
     }
 
-    let app = App::new(config.local_path).map_err(|e| e.to_string())?;
+    let workspace_app = if provider.is_none() || provider == Some("node") {
+        pnpm_app_directory(config)?
+    } else {
+        None
+    };
+    let analysis_root = if workspace_app.is_some() {
+        config.root_local_path
+    } else {
+        config.local_path
+    };
+    let app = App::new(analysis_root).map_err(|e| e.to_string())?;
 
     // Build the environment explicitly. Inheriting the server's process
     // environment would let a variable on the control plane change how a
@@ -100,8 +110,70 @@ pub(crate) fn render(
         env.set("AUTOPACK_PROVIDER", provider);
     }
 
-    let analysis =
-        analyze(&app, &env, &autopack_providers::registry()).map_err(|e| e.to_string())?;
+    if let Some(relative) = &workspace_app {
+        // Plan the selected server separately to retain its entry point and framework
+        // defaults, but install and build against the complete root workspace.
+        let selected = App::new(config.local_path).map_err(|e| e.to_string())?;
+        let mut selected_env = env.clone();
+        selected_env.set("AUTOPACK_PROVIDER", "node");
+        let selected_analysis = analyze(&selected, &selected_env, &autopack_providers::registry())
+            .map_err(|e| e.to_string())?;
+        let start = selected_analysis
+            .plan
+            .deploy
+            .start_command
+            .as_deref()
+            .ok_or_else(|| {
+                format!("No start command found for workspace application {relative}")
+            })?;
+        env.set("AUTOPACK_PROVIDER", "node");
+        env.set(
+            "AUTOPACK_START_CMD",
+            format!("cd /app/{relative} && PATH=/app/{relative}/node_modules/.bin:$PATH {start}"),
+        );
+        if config.build_command.is_none() {
+            env.set(
+                "AUTOPACK_BUILD_CMD",
+                format!("pnpm --filter './{relative}...' --if-present run build"),
+            );
+        } else if let Some(command) = config.build_command {
+            env.set(
+                "AUTOPACK_BUILD_CMD",
+                format!("cd /app/{relative} && {command}"),
+            );
+        }
+    }
+    let registry = autopack_providers::registry();
+    // Validate the requested interpreter before planning can mask it with an
+    // unrelated missing-start-command error. Resolve the same effective provider
+    // as autopack so incidental Ruby files in a Node app do not affect it.
+    if app.has_file(".ruby-version") {
+        let effective_config =
+            autopack_core::Config::load(&app, &env).map_err(|e| e.to_string())?;
+        let effective_provider = registry
+            .resolve(&app, &env, &effective_config)
+            .map_err(|e| e.to_string())?;
+        if effective_provider.id() == "ruby" {
+            if let Some(requested) = app
+                .read_file_opt(".ruby-version")
+                .map_err(|e| e.to_string())?
+            {
+                let version = requested
+                    .trim()
+                    .strip_prefix("ruby-")
+                    .unwrap_or(requested.trim());
+                let parts: Vec<_> = version.split('.').collect();
+                if !(1..=3).contains(&parts.len())
+                    || parts
+                        .iter()
+                        .any(|part| part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()))
+                {
+                    return Err(format!("Unsupported .ruby-version pin '{}': use an MRI version such as 3.4.11 or ruby-3.4.11; refusing to silently choose a fallback interpreter", requested.trim()));
+                }
+            }
+        }
+    }
+    let analysis = analyze(&app, &env, &registry).map_err(|e| e.to_string())?;
 
     info!(
         provider = %analysis.provider,
@@ -122,6 +194,36 @@ pub(crate) fn render(
 
     let dockerfile = to_dockerfile(&analysis.plan).map_err(|e| e.to_string())?;
     Ok(DockerfileWithArgs::new(dockerfile))
+}
+
+/// A pnpm workspace app directory safe to use in Dockerfile paths and shell filters.
+/// The build job confines the root and checks the workspace marker before calling us.
+pub(crate) fn pnpm_app_directory(config: &DockerfileConfig<'_>) -> Result<Option<String>, String> {
+    if config.root_local_path == config.local_path
+        || !config.root_local_path.join("pnpm-workspace.yaml").is_file()
+    {
+        return Ok(None);
+    }
+    let relative = config
+        .local_path
+        .strip_prefix(config.root_local_path)
+        .map_err(|_| "Application directory escapes the pnpm workspace root".to_string())?;
+    let text = relative
+        .to_str()
+        .ok_or_else(|| "pnpm workspace application directory must be UTF-8".to_string())?;
+    if text.is_empty()
+        || !text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/_.-".contains(c))
+        || relative
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return Err(format!(
+            "Unsupported pnpm workspace application directory: {text}"
+        ));
+    }
+    Ok(Some(text.to_string()))
 }
 
 /// True when `name` can be declared as a Dockerfile `ARG` by autopack.
@@ -533,5 +635,121 @@ mod tests {
             "a project reachable only through symlinks must not be planned: {:?}",
             result.map(|dockerfile| dockerfile.content)
         );
+    }
+    #[test]
+    fn nested_pnpm_server_uses_root_version_lock_and_selected_entrypoint() {
+        let repo = fixture(&[
+            (
+                "package.json",
+                r#"{"private":true,"packageManager":"pnpm@10.15.1","scripts":{"start":"node wrong.js","build":"node wrong.js"}}"#,
+            ),
+            ("pnpm-workspace.yaml", "packages: [apps/*, packages/*]"),
+            ("pnpm-lock.yaml", "lockfileVersion: '9.0'"),
+            (
+                "apps/api/package.json",
+                r#"{"scripts":{"build":"node build.js","start":"node server.js"},"dependencies":{"@fixture/shared":"workspace:*"}}"#,
+            ),
+            ("apps/api/server.js", ""),
+            (
+                "packages/shared/package.json",
+                r#"{"name":"@fixture/shared"}"#,
+            ),
+        ]);
+        let app = repo.path().join("apps/api");
+        let mut config = DockerfileConfig::new(repo.path(), &app, "fixture");
+        config.use_buildkit = true;
+        let result = render(&config, Some("node")).unwrap().content;
+        assert!(result.contains("10.15.1"), "{result}");
+        assert!(result.contains("--frozen-lockfile"), "{result}");
+        assert!(
+            result.contains("pnpm --filter './apps/api...' --if-present run build"),
+            "{result}"
+        );
+        assert!(
+            result.contains(
+                "cd /app/apps/api && PATH=/app/apps/api/node_modules/.bin:$PATH node server.js"
+            ),
+            "{result}"
+        );
+        assert!(!result.contains("node wrong.js"), "{result}");
+    }
+
+    #[test]
+    fn workspace_directory_rejects_escape_and_shell_metacharacters() {
+        let repo = fixture(&[("pnpm-workspace.yaml", "packages: [apps/*]")]);
+        for path in [
+            repo.path().join("../other"),
+            repo.path().join("apps/web;echo"),
+        ] {
+            let config = DockerfileConfig::new(repo.path(), &path, "fixture");
+            assert!(pnpm_app_directory(&config).is_err());
+        }
+    }
+
+    #[test]
+    fn adopted_ruby_provider_preserves_version_and_online_locked_install() {
+        for version in ["3.3.6", "ruby-3.3.6", "3.4.11", "ruby-3.4.11"] {
+            let repo = fixture(&[
+                ("Gemfile", "source 'https://rubygems.org'\ngem 'rack'\n"),
+                ("Gemfile.lock", "GEM\n  remote: https://rubygems.org/\n  specs:\n    rack (3.1.8)\n\nPLATFORMS\n  ruby\n  x86_64-linux\n\nDEPENDENCIES\n  rack\n\nBUNDLED WITH\n   2.6.9\n"),
+                (".ruby-version", version),
+                ("config.ru", "run ->(_env) { [200, {}, ['ok']] }\n"),
+            ]);
+            let result = render(&buildkit_config(repo.path()), Some("ruby"))
+                .unwrap()
+                .content;
+            let expected = if version.contains("3.4") {
+                "ruby:3.4"
+            } else {
+                "ruby:3.3"
+            };
+            assert!(result.contains(expected), "{result}");
+            assert!(result.contains("BUNDLE_DEPLOYMENT=1"), "{result}");
+            assert!(result.contains("BUNDLE_USER_CACHE"), "{result}");
+            assert!(!result.contains("BUNDLE_CACHE_PATH"), "{result}");
+        }
+    }
+
+    #[test]
+    fn adopted_php_provider_removes_file_capability_and_inherited_admin_probe() {
+        let repo = fixture(&[
+            ("composer.json", r#"{"require":{"php":"^8.4"}}"#),
+            ("index.php", "<?php echo 'ok';"),
+        ]);
+        let result = render(&buildkit_config(repo.path()), Some("php"))
+            .unwrap()
+            .content;
+        assert!(
+            result.contains("cp /usr/local/bin/frankenphp /usr/local/bin/frankenphp.autopack"),
+            "{result}"
+        );
+        assert!(result.contains("HEALTHCHECK NONE"), "{result}");
+        assert!(result.contains("admin off"), "{result}");
+        assert!(result.contains("10001"), "{result}");
+    }
+
+    #[test]
+    fn malformed_ruby_pin_fails_with_requested_version_instead_of_defaulting() {
+        for pin in ["ruby-bad", "3..4", "jruby-9.4.0.0"] {
+            let repo = fixture(&[
+                ("Gemfile", "source 'https://rubygems.org'\n"),
+                (".ruby-version", pin),
+            ]);
+            let error = render(&buildkit_config(repo.path()), Some("ruby")).unwrap_err();
+            assert!(error.contains(pin), "{error}");
+            assert!(error.contains("refusing to silently choose"));
+        }
+    }
+
+    #[test]
+    fn ruby_gemfile_and_lockfile_version_conventions_are_preserved() {
+        for files in [
+            vec![("Gemfile", "source 'https://rubygems.org'\nruby '3.4.11'\n"), ("Procfile", "web: ruby server.rb"), ("server.rb", "")],
+            vec![("Gemfile", "source 'https://rubygems.org'\n"), ("Gemfile.lock", "GEM\n  specs:\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n\nRUBY VERSION\n   ruby 3.4.11p0\n\nBUNDLED WITH\n   2.6.9\n"), ("Procfile", "web: ruby server.rb"), ("server.rb", "")],
+        ] {
+            let repo = fixture(&files);
+            let result = render(&buildkit_config(repo.path()), Some("ruby")).unwrap().content;
+            assert!(result.contains("ruby:3.4"), "{result}");
+        }
     }
 }

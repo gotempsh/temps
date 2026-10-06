@@ -22,14 +22,28 @@ use temps_logs::{LogLevel, LogService};
 use temps_presets;
 use tokio::time::{sleep, Duration};
 
-// Widen only generated Next.js builds in a recognized workspace. Custom
-// Dockerfiles and other presets retain their explicitly selected context.
-fn nextjs_build_root(
+// Generated JavaScript workspace builds need root lockfiles and sibling packages.
+// Existing Dockerfiles return before this helper and keep their selected context.
+fn preset_build_root(
     preset: &str,
     source_root: &Path,
     app: &Path,
 ) -> Result<PathBuf, WorkflowError> {
-    if preset != "nextjs" || source_root == app {
+    if source_root == app {
+        return Ok(app.to_path_buf());
+    }
+    if preset != "nextjs" {
+        if matches!(preset, "vite" | "nixpacks-node" | "nixpacks" | "autopack")
+            && app.join("package.json").is_file()
+            && read_confined_control_file(
+                source_root,
+                &source_root.join("pnpm-workspace.yaml"),
+                1024 * 1024,
+            )?
+            .is_some()
+        {
+            return Ok(source_root.to_path_buf());
+        }
         return Ok(app.to_path_buf());
     }
     for marker in ["turbo.json", "nx.json", "lerna.json", "pnpm-workspace.yaml"] {
@@ -53,6 +67,23 @@ fn nextjs_build_root(
         }
     }
     Ok(app.to_path_buf())
+}
+
+fn write_workspace_ignore(root: &Path, dockerfile: &Path) -> Result<(), WorkflowError> {
+    // Dockerfile-specific rules take precedence for both local and worker builders.
+    // Retain existing rules, then exclude dependencies and secrets across siblings.
+    let mut specific = dockerfile.as_os_str().to_os_string();
+    specific.push(".dockerignore");
+    let path = Path::new(&specific);
+    let existing = read_confined_control_file(root, path, 1024 * 1024)?;
+    let create_new = existing.is_none();
+    let mut ignore = match existing {
+        Some(ignore) => ignore,
+        None => read_confined_control_file(root, &root.join(".dockerignore"), 1024 * 1024)?
+            .unwrap_or_default(),
+    };
+    ignore.push_str("\n**/node_modules\n**/.git\n**/.env\n**/.env.*\n");
+    write_no_follow(path, ignore.as_bytes(), create_new)
 }
 
 fn validate_relative_build_path(path: &Path, label: &str) -> Result<(), WorkflowError> {
@@ -711,7 +742,10 @@ impl BuildImageJob {
         };
 
         let preset_slug = preset.slug();
-        let preset_root = nextjs_build_root(&preset_slug, source_root, build_context_dir)?;
+        let preset_root = preset_build_root(&preset_slug, source_root, build_context_dir)?;
+        if preset_root != *build_context_dir {
+            self.log(context, format!("Workspace build context: {}; selected application: {}. Installing with the root lockfile and retaining sibling packages.", preset_root.display(), build_context_dir.display())).await?;
+        }
 
         // Convert build args to build_vars format (Vec<String> of "KEY" for ARG directives)
         let mut build_vars: Vec<String> = self
@@ -806,6 +840,10 @@ impl BuildImageJob {
             dockerfile_with_args.content.as_bytes(),
             true,
         )?;
+
+        if preset_root != *build_context_dir && preset_slug != "nextjs" {
+            write_workspace_ignore(&preset_root, dockerfile_path)?;
+        }
 
         self.log(
             context,
@@ -1760,11 +1798,11 @@ mod tests {
         let root = dir.path();
         let app = root.join("apps/web");
         std::fs::create_dir_all(&app).unwrap();
-        assert_eq!(nextjs_build_root("nextjs", root, &app).unwrap(), app);
+        assert_eq!(preset_build_root("nextjs", root, &app).unwrap(), app);
         std::fs::write(root.join("turbo.json"), "{}").unwrap();
-        assert_eq!(nextjs_build_root("nextjs", root, &app).unwrap(), root);
-        assert_eq!(nextjs_build_root("autopack", root, &app).unwrap(), app);
-        assert_eq!(nextjs_build_root("nextjs", root, root).unwrap(), root);
+        assert_eq!(preset_build_root("nextjs", root, &app).unwrap(), root);
+        assert_eq!(preset_build_root("autopack", root, &app).unwrap(), app);
+        assert_eq!(preset_build_root("nextjs", root, root).unwrap(), root);
     }
 
     #[test]
@@ -1774,10 +1812,10 @@ mod tests {
         let app = root.join("apps/web");
         std::fs::create_dir_all(&app).unwrap();
         std::fs::write(root.join("pnpm-workspace.yaml"), "packages: [apps/*]").unwrap();
-        assert_eq!(nextjs_build_root("nextjs", root, &app).unwrap(), root);
+        assert_eq!(preset_build_root("nextjs", root, &app).unwrap(), root);
         std::fs::remove_file(root.join("pnpm-workspace.yaml")).unwrap();
         std::fs::write(root.join("package.json"), r#"{"workspaces":["apps/*"]}"#).unwrap();
-        assert_eq!(nextjs_build_root("nextjs", root, &app).unwrap(), root);
+        assert_eq!(preset_build_root("nextjs", root, &app).unwrap(), root);
     }
 
     #[cfg(unix)]
@@ -1789,7 +1827,69 @@ mod tests {
         std::fs::create_dir_all(&app).unwrap();
         std::fs::write(root.join("outside.json"), "{}").unwrap();
         std::os::unix::fs::symlink(root.join("outside.json"), root.join("turbo.json")).unwrap();
-        assert!(nextjs_build_root("nextjs", root, &app).is_err());
+        assert!(preset_build_root("nextjs", root, &app).is_err());
+    }
+
+    #[test]
+    fn pnpm_nested_vite_and_node_use_workspace_context_only_for_generated_presets() {
+        let repo = tempfile::tempdir().unwrap();
+        let app = repo.path().join("apps/web");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("package.json"), "{}").unwrap();
+        std::fs::write(
+            repo.path().join("pnpm-workspace.yaml"),
+            "packages: [apps/*, packages/*]",
+        )
+        .unwrap();
+        for preset in ["vite", "nixpacks-node", "nixpacks", "autopack"] {
+            assert_eq!(
+                preset_build_root(preset, repo.path(), &app).unwrap(),
+                repo.path()
+            );
+        }
+        for preset in ["dockerfile", "nixpacks-ruby", "nixpacks-php"] {
+            assert_eq!(preset_build_root(preset, repo.path(), &app).unwrap(), app);
+        }
+        std::fs::remove_file(repo.path().join("pnpm-workspace.yaml")).unwrap();
+        assert_eq!(preset_build_root("vite", repo.path(), &app).unwrap(), app);
+    }
+
+    #[test]
+    fn widened_workspace_context_keeps_ignore_rules_and_excludes_sibling_secrets() {
+        use temps_deployer::build_protocol::DockerIgnore;
+        let repo = tempfile::tempdir().unwrap();
+        let app = repo.path().join("apps/web");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            repo.path().join(".dockerignore"),
+            "private-data\n!**/.env\n",
+        )
+        .unwrap();
+        let dockerfile = app.join("Dockerfile");
+        write_workspace_ignore(repo.path(), &dockerfile).unwrap();
+        let contents = std::fs::read_to_string(app.join("Dockerfile.dockerignore")).unwrap();
+        let rules = DockerIgnore::parse(&contents, "Dockerfile.dockerignore").unwrap();
+        for path in [
+            ".env",
+            "apps/api/.env.production",
+            "apps/web/.env.example",
+            "packages/shared/node_modules/x.js",
+            ".git/config",
+            "private-data/secret",
+        ] {
+            assert!(rules.is_excluded(Path::new(path)), "included {path}");
+        }
+        for path in [
+            "pnpm-lock.yaml",
+            "pnpm-workspace.yaml",
+            "packages/shared/index.js",
+        ] {
+            assert!(!rules.is_excluded(Path::new(path)), "excluded {path}");
+        }
+        std::fs::write(app.join("Dockerfile.dockerignore"), "specific-private\n").unwrap();
+        write_workspace_ignore(repo.path(), &dockerfile).unwrap();
+        let contents = std::fs::read_to_string(app.join("Dockerfile.dockerignore")).unwrap();
+        assert!(contents.starts_with("specific-private\n"));
     }
 
     // Mock ImageBuilder for testing
@@ -2133,69 +2233,92 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generated_nextjs_subfolder_build_uses_workspace_context() {
-        for custom_dockerfile in [false, true] {
-            let builder = Arc::new(RecordingImageBuilder::default());
-            let job = BuildImageJobBuilder::new()
-                .job_id("build".into())
-                .download_job_id("download_repo".into())
-                .image_tag("app:latest".into())
-                .build_context("apps/web".into())
-                .preset(StoredPreset::NextJs)
-                .cache_from(vec!["app:previous".into()])
-                .build(builder.clone())
-                .unwrap();
-            let dir = tempfile::tempdir().unwrap();
-            let root = dir.path();
-            let app = root.join("apps/web");
-            std::fs::create_dir_all(&app).unwrap();
-            std::fs::write(root.join("package.json"), "{}").unwrap();
-            std::fs::write(root.join("turbo.json"), "{}").unwrap();
-            std::fs::write(root.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'").unwrap();
-            std::fs::write(
-                app.join("package.json"),
-                r#"{"scripts":{"build":"next build"}}"#,
-            )
-            .unwrap();
-            if custom_dockerfile {
-                std::fs::write(app.join("Dockerfile"), "FROM scratch\n").unwrap();
-            }
-            let repo = RepositoryOutput {
-                repo_dir: root.into(),
-                checkout_ref: "main".into(),
-                repo_owner: "owner".into(),
-                repo_name: "repo".into(),
-            };
-            let mut context = crate::test_utils::create_test_context("wf".into(), 1, 1, 1);
-            context
-                .set_output(
-                    "download_repo",
-                    "repo_dir",
-                    root.to_string_lossy().to_string(),
+    async fn generated_javascript_subfolder_build_uses_workspace_context() {
+        for preset in [
+            StoredPreset::NextJs,
+            StoredPreset::Vite,
+            StoredPreset::Nixpacks,
+        ] {
+            for custom_dockerfile in [false, true] {
+                let builder = Arc::new(RecordingImageBuilder::default());
+                let job = BuildImageJobBuilder::new()
+                    .job_id("build".into())
+                    .download_job_id("download_repo".into())
+                    .image_tag("app:latest".into())
+                    .build_context("apps/web".into())
+                    .preset(preset)
+                    .preset_config(if preset == StoredPreset::Nixpacks {
+                        Some(StoredPresetConfig::Nixpacks(
+                            temps_entities::preset::NixpacksConfig {
+                                nixpacks_config: None,
+                                providers: vec![temps_entities::preset::NixpacksProvider::Node],
+                            },
+                        ))
+                    } else {
+                        None
+                    })
+                    .cache_from(vec!["app:previous".into()])
+                    .build(builder.clone())
+                    .unwrap();
+                let dir = tempfile::tempdir().unwrap();
+                let root = dir.path();
+                let app = root.join("apps/web");
+                std::fs::create_dir_all(&app).unwrap();
+                std::fs::write(root.join("package.json"), "{}").unwrap();
+                std::fs::write(root.join("turbo.json"), "{}").unwrap();
+                std::fs::write(root.join("pnpm-workspace.yaml"), "packages: [apps/*]").unwrap();
+                std::fs::write(root.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'").unwrap();
+                std::fs::write(
+                    app.join("package.json"),
+                    r#"{"scripts":{"build":"node build.js","start":"node server.js"}}"#,
                 )
                 .unwrap();
-            context
-                .set_output("download_repo", "checkout_ref", "main")
-                .unwrap();
-            context
-                .set_output("download_repo", "repo_owner", "owner")
-                .unwrap();
-            context
-                .set_output("download_repo", "repo_name", "repo")
-                .unwrap();
-            job.build_image(&repo, &context).await.unwrap();
-            let requests = builder.requests.lock().unwrap();
-            let request = &requests[0];
-            let expected = if custom_dockerfile { &app } else { root };
-            assert_eq!(request.context_path, expected.canonicalize().unwrap());
-            assert_eq!(request.cache_from, vec!["app:previous"]);
-            if !custom_dockerfile {
-                let dockerfile = std::fs::read_to_string(app.join("Dockerfile")).unwrap();
-                assert!(dockerfile.contains("pnpm-lock.yaml"));
-                assert!(
-                    dockerfile.find("pnpm install").unwrap()
-                        < dockerfile.find("WORKDIR /repo/apps/web").unwrap()
-                );
+                if custom_dockerfile {
+                    std::fs::write(app.join("Dockerfile"), "FROM scratch\n").unwrap();
+                }
+                let repo = RepositoryOutput {
+                    repo_dir: root.into(),
+                    checkout_ref: "main".into(),
+                    repo_owner: "owner".into(),
+                    repo_name: "repo".into(),
+                };
+                let mut context = crate::test_utils::create_test_context("wf".into(), 1, 1, 1);
+                context
+                    .set_output(
+                        "download_repo",
+                        "repo_dir",
+                        root.to_string_lossy().to_string(),
+                    )
+                    .unwrap();
+                context
+                    .set_output("download_repo", "checkout_ref", "main")
+                    .unwrap();
+                context
+                    .set_output("download_repo", "repo_owner", "owner")
+                    .unwrap();
+                context
+                    .set_output("download_repo", "repo_name", "repo")
+                    .unwrap();
+                job.build_image(&repo, &context).await.unwrap();
+                let requests = builder.requests.lock().unwrap();
+                let request = &requests[0];
+                let expected = if custom_dockerfile { &app } else { root };
+                assert_eq!(request.context_path, expected.canonicalize().unwrap());
+                assert_eq!(request.cache_from, vec!["app:previous"]);
+                if !custom_dockerfile {
+                    let dockerfile = std::fs::read_to_string(app.join("Dockerfile")).unwrap();
+                    if preset == StoredPreset::NextJs {
+                        assert!(dockerfile.contains("pnpm-lock.yaml"));
+                        assert!(
+                            dockerfile.find("pnpm install").unwrap()
+                                < dockerfile.find("WORKDIR /repo/apps/web").unwrap()
+                        );
+                    } else {
+                        assert!(dockerfile.contains("--frozen-lockfile"), "{dockerfile}");
+                        assert!(dockerfile.contains("./apps/web..."), "{dockerfile}");
+                        assert!(app.join("Dockerfile.dockerignore").is_file());
+                    }
+                }
             }
         }
     }
