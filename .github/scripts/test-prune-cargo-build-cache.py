@@ -75,7 +75,18 @@ def cargo_build(workspace: Path, target: Path) -> list[dict]:
             "--message-format=json-render-diagnostics",
         ],
         cwd=workspace,
-        env={**os.environ, "CARGO_TARGET_DIR": str(target)},
+        # The fixture needs incremental sessions to prune, as the real musl
+        # build has. CARGO_INCREMENTAL outranks build.incremental and the
+        # profile, so a runner that disables incremental compilation cannot
+        # leave incremental/ empty and fail the test before it prunes. The
+        # empty RUSTC_WRAPPER overrides a configured sccache, which refuses
+        # to run when CARGO_INCREMENTAL is set.
+        env={
+            **os.environ,
+            "CARGO_TARGET_DIR": str(target),
+            "CARGO_INCREMENTAL": "1",
+            "RUSTC_WRAPPER": "",
+        },
         check=True,
         capture_output=True,
         text=True,
