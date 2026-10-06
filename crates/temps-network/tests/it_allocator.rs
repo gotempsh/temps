@@ -1458,3 +1458,202 @@ async fn pairings_refuse_taken_keys_and_link_atomically() {
         Some(mesh_key(5).as_str())
     );
 }
+
+/// Enabling the mesh refuses a pool that holds an address a node registered
+/// as its own: the cluster CA signed that node a leaf for it, valid for the
+/// control plane's mesh address or whichever member gets the address.
+#[tokio::test]
+async fn enabling_the_mesh_refuses_a_pool_holding_a_registered_node_address() {
+    use temps_network::mesh::{self, MeshError};
+
+    let Some(fx) = fixture().await else { return };
+    let db = fx.db.clone();
+    let squatter = insert_node(db.as_ref(), "squatter", None).await;
+    let mut active: nodes::ActiveModel = nodes::Entity::find_by_id(squatter)
+        .one(db.as_ref())
+        .await
+        .unwrap()
+        .unwrap()
+        .into();
+    active.private_address = Set("10.201.0.1".into());
+    active.update(db.as_ref()).await.unwrap();
+
+    let error = mesh::enable(&db, None, None, None).await.unwrap_err();
+    let MeshError::InvalidCidr { value, reason } = &error else {
+        panic!("expected InvalidCidr, got {error:?}");
+    };
+    assert_eq!(value, "10.201.0.0/16");
+    assert!(
+        reason.contains(&format!("node 'squatter' (id {squatter})")),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("the control plane's mesh address"),
+        "{reason}"
+    );
+    assert!(
+        mesh::load_settings(&db).await.unwrap().is_none(),
+        "a refused enable leaves the mesh off"
+    );
+
+    // Anywhere inside the pool, and through the agent URL too.
+    let mut active: nodes::ActiveModel = nodes::Entity::find_by_id(squatter)
+        .one(db.as_ref())
+        .await
+        .unwrap()
+        .unwrap()
+        .into();
+    active.private_address = Set("10.0.0.1".into());
+    active.address = Set("https://10.201.3.3:3100".into());
+    active.update(db.as_ref()).await.unwrap();
+    let error = mesh::enable(&db, None, None, None).await.unwrap_err();
+    assert!(
+        matches!(&error, MeshError::InvalidCidr { reason, .. } if reason.contains("inside this pool")),
+        "{error:?}"
+    );
+
+    // A pool clear of every node's addresses is fine.
+    let settings = mesh::enable(&db, Some("10.202.0.0/24"), None, None)
+        .await
+        .unwrap();
+    assert_eq!(settings.cidr.to_string(), "10.202.0.0/24");
+}
+
+/// A pending pairing holds an address of the current pool and its code
+/// carries the pool and port, so neither can change until it finishes.
+#[tokio::test]
+async fn the_pool_and_port_stay_put_while_a_pairing_is_pending() {
+    use temps_network::{
+        mesh::{self, MeshError},
+        pairing,
+    };
+
+    let Some(fx) = fixture().await else { return };
+    let db = fx.db.clone();
+    mesh::enable(&db, Some("10.205.0.0/24"), Some(51820), None)
+        .await
+        .unwrap();
+    let token = enrollment_token("pending-a")
+        .insert(db.as_ref())
+        .await
+        .unwrap()
+        .id;
+    let pending = pairing::create(
+        &db,
+        new_pairing(
+            "pending-a",
+            token,
+            "198.51.100.30:51820",
+            chrono::Duration::minutes(30),
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        mesh::enable(&db, Some("10.206.0.0/24"), None, None).await,
+        Err(MeshError::InUse {
+            setting: "pool",
+            assigned: 1,
+            ..
+        })
+    ));
+    assert!(matches!(
+        mesh::enable(&db, None, Some(51821), None).await,
+        Err(MeshError::InUse {
+            setting: "port",
+            assigned: 1,
+            ..
+        })
+    ));
+    // Unchanged settings are still fine.
+    mesh::enable(&db, Some("10.205.0.0/24"), Some(51820), None)
+        .await
+        .unwrap();
+
+    // Once the pairing is no longer pending, the pool can move.
+    assert!(pairing::cancel(&db, pending.id).await.unwrap());
+    let moved = mesh::enable(&db, Some("10.206.0.0/24"), Some(51821), None)
+        .await
+        .unwrap();
+    assert_eq!(moved.cidr.to_string(), "10.206.0.0/24");
+    assert_eq!(moved.port, 51821);
+}
+
+/// Set up a CA whose complete issuance history starts with this test.
+async fn certificate_history_ca(db: &DatabaseConnection) {
+    db.execute_unprepared("INSERT INTO settings (id, data, created_at, updated_at) VALUES (1, '{\"multi_node\":{\"cluster_ca_cert_pem\":\"test-ca\"}}'::jsonb, NOW(), NOW()) ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data").await.unwrap();
+    db.execute_unprepared(&format!(
+        "INSERT INTO cluster_certificate_history (ca_key) VALUES ('{}')",
+        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b"test-ca"))
+    ))
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn certificate_history_blocks_deleted_nodes_and_unknown_old_cas() {
+    use temps_network::mesh;
+    let Some(f) = fixture().await else {
+        return;
+    };
+    certificate_history_ca(&f.db).await;
+    mesh::reserve_certificate_addresses(&f.db, "test-ca", &["10.202.0.1".into()])
+        .await
+        .unwrap();
+    let node_id = insert_node(&f.db, "historical-worker", None).await;
+    nodes::Entity::delete_by_id(node_id)
+        .exec(f.db.as_ref())
+        .await
+        .unwrap();
+    let error = mesh::enable(&f.db, Some("10.202.0.0/24"), None, None)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("issued a worker certificate"),
+        "{error}"
+    );
+    f.db.execute_unprepared("DELETE FROM cluster_certificate_history")
+        .await
+        .unwrap();
+    let error = mesh::enable(&f.db, None, None, None).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("predates certificate address history"),
+        "{error}"
+    );
+    // An unchanged, already active pool introduces no new identity. Ordinary
+    // port updates and idempotent enable calls must not force a CA rotation.
+    f.db.execute_unprepared("UPDATE network_config SET wireguard_enabled = TRUE")
+        .await
+        .unwrap();
+    mesh::enable(&f.db, None, None, None).await.unwrap();
+    let error = mesh::enable(&f.db, Some("10.202.0.0/24"), None, None)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("predates certificate address history"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn certificate_reservation_and_pool_changes_are_serialized() {
+    use temps_network::mesh;
+    let Some(f) = fixture().await else {
+        return;
+    };
+    certificate_history_ca(&f.db).await;
+    let identities = ["10.202.0.1".into()];
+    let (issued, enabled) = tokio::join!(
+        mesh::reserve_certificate_addresses(&f.db, "test-ca", &identities),
+        mesh::enable(&f.db, Some("10.202.0.0/24"), None, None),
+    );
+    assert!(
+        issued.is_ok() ^ enabled.is_ok(),
+        "issued={issued:?}, enabled={enabled:?}"
+    );
+}

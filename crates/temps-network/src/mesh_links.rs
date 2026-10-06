@@ -99,6 +99,19 @@ impl Member {
     }
 }
 
+/// When a handshake reported as `seconds_ago` before `now` happened, or
+/// `None` when the age cannot be placed on the clock.
+///
+/// The age comes from a node's report, so it is untrusted: chrono's
+/// `TimeDelta::seconds` and `DateTime - TimeDelta` panic on overflow, and
+/// a node reporting `u64::MAX` must not take the handler down. An age that
+/// does not fit is dropped, which reads the same as "never handshook": the
+/// pair is not live, exactly what a handshake that long ago would mean.
+pub fn handshake_at(now: DateTime<Utc>, seconds_ago: u64) -> Option<DateTime<Utc>> {
+    let seconds = i64::try_from(seconds_ago).ok()?;
+    now.checked_sub_signed(chrono::TimeDelta::try_seconds(seconds)?)
+}
+
 fn age(at: DateTime<Utc>, now: DateTime<Utc>) -> Duration {
     (now - at).to_std().unwrap_or_default()
 }
@@ -351,7 +364,7 @@ mod db {
             .iter()
             .filter(|(key, _)| known.contains(*key))
             .filter_map(|(key, seconds)| {
-                let at = now - chrono::Duration::seconds(i64::try_from(*seconds).ok()?);
+                let at = handshake_at(now, *seconds)?;
                 Some((key.clone(), serde_json::Value::from(at.timestamp())))
             })
             .collect();
@@ -626,6 +639,23 @@ mod tests {
                 .collect(),
         );
         hub
+    }
+
+    #[test]
+    fn a_handshake_age_is_placed_on_the_control_plane_clock() {
+        assert_eq!(handshake_at(at(100), 40), Some(at(60)));
+        assert_eq!(handshake_at(at(100), 0), Some(at(100)));
+    }
+
+    #[test]
+    fn an_absurd_handshake_age_is_dropped_instead_of_panicking() {
+        // Beyond i64.
+        assert_eq!(handshake_at(at(0), u64::MAX), None);
+        // Fits i64 but overflows TimeDelta (i64::MAX milliseconds).
+        assert_eq!(handshake_at(at(0), i64::MAX as u64), None);
+        // Fits TimeDelta but lands before chrono's earliest date.
+        assert_eq!(handshake_at(at(0), 10u64.pow(13)), None);
+        assert_eq!(handshake_at(at(0), 10u64.pow(15)), None);
     }
 
     fn direct_since(seconds: i64, a: &Member, b: &Member) -> Link {

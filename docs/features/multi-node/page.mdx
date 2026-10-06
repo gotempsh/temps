@@ -80,6 +80,24 @@ Traffic from the internet still enters through the control plane's reverse proxy
 - The `/api/internal/nodes/register` endpoint reachable from workers
 - A **join token** generated from **Settings > Worker Nodes** (required for secure node registration)
 
+### Upgrading a mesh cluster
+
+Upgrade and restart the **control plane before upgrading workers**. The hardened worker verifies the control plane's reserved TLS name; an older control plane only presents an IP identity and will be rejected. Existing workers can connect to an upgraded control plane because its certificate still includes the mesh IP. If a worker was upgraded first and stopped synchronizing, upgrade and restart the control plane, then restart that worker. Do not disable certificate verification to recover.
+
+If workers must be upgraded first, provision a temporary **exact certificate pin** before restarting them:
+
+1. Through an independently authenticated SSH session on the control plane, capture the leaf served by its local node API (substitute your mesh address and node API port):
+
+   ```bash
+   openssl s_client -connect 10.201.0.1:51820 -showcerts </dev/null 2>/dev/null | openssl x509 -outform PEM > control-plane-legacy.pem
+   ```
+
+2. Copy that PEM to each worker through authenticated SSH/SCP. In the worker's existing `agent.json`, set `"control_plane_legacy_cert_path": "/var/lib/temps/control-plane-legacy.pem"`. Keep the existing cluster CA and control-plane URL. Never capture the pin from an untrusted worker-to-server connection or copy a private key.
+3. Upgrade and restart the workers. Both agent calls and DNS synchronization accept the pinned leaf only when its CA chain, validity, IP identity, and TLS signatures verify. A missing or invalid optional pin retains strict cluster-CA reserved-name verification; an unusable cluster CA refuses connections. A different certificate for the same IP is rejected. Upgrade the control plane when ready; its reserved-name certificate is accepted even while the temporary pin remains configured.
+4. Remove `control_plane_legacy_cert_path` and the temporary PEM after the control plane is upgraded. An older control-plane restart regenerates its leaf; if that happens before its upgrade, independently provision the replacement pin again.
+
+A cluster CA created before certificate address history was introduced cannot safely enable a disabled mesh or change its pool: deleted nodes may still hold valid certificates for the requested pool. Rotate the CA in **Settings > Worker Nodes** and re-enroll every worker against the new root before enabling the mesh or changing its pool. Reapplying an already active pool or updating only its ports does not require rotation. Rotation invalidates existing worker identities and pairing codes; plan this as a maintenance operation. Deleting or renaming a node alone does not make its signed addresses safe to reuse.
+
 ---
 
 ## Adding a worker node (direct mode) {{ anchor: true, id: 'direct-mode' }}
@@ -177,11 +195,11 @@ bunx @temps-sdk/cli nodes pair create --address <worker-public-ip> --name worker
 It prints one command. Run it on the worker as root, then start the agent:
 
 ```bash
-temps join --pair tpair1.…
+ printf '%s\n' 'tpair1.…' | temps join --pair -
 temps agent service install
 ```
 
-`temps join --pair -` reads the code from stdin instead, which keeps it out of the process list and shell history.
+The command pipes the code to `temps join --pair -`, which reads it from stdin, so the code never appears in the process list; the leading space keeps the line out of the shell history in shells that honour it (bash with `HISTCONTROL=ignoreboth`, the Debian and Ubuntu default; zsh with `HIST_IGNORE_SPACE`). Not in a root shell? Put `sudo` right before `temps join`, after the `|`.
 
 The worker waits on UDP `51820` until the control plane reaches it (the command expires after 30 minutes). The two exchange WireGuard **public** keys over a message authenticated with a one-time secret in the command; no private key leaves either machine. The worker then registers over the mesh, trusting only the cluster CA whose fingerprint the command carries. Pairings in progress, with why a worker has not been reached yet, show on the same page and with `bunx @temps-sdk/cli nodes pair`.
 
@@ -194,7 +212,7 @@ bunx @temps-sdk/cli nodes ssh add --host 203.0.113.10 --user root
 ```
 
 1. The control plane connects and shows the server's SSH host key. Compare it with the server's own before continuing, from its console or a session you trust: `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`. The CLI asks you to confirm it; pass `--host-key SHA256:…` for automation. If the server presents another key during the setup, the setup stops.
-2. It logs in with a password, a private key (`--identity-file`, `--ask-passphrase`) or the SSH agent of the `temps serve` process (`--agent`). A user other than root needs sudo. If sudo asks for a password, log in with that user's password and it is used for sudo too.
+2. It logs in with a password or a private key (`--identity-file`, `--ask-passphrase`). From the console, an instance admin can also use the SSH agent of the `temps serve` process; API keys, CLI tokens and other roles cannot, since that agent holds the operator's own keys. A user other than root needs sudo. If sudo asks for a password, log in with that user's password and it is used for sudo too; it is only ever read by sudo, never by the command sudo runs.
 3. It checks the server runs Linux and Docker, installs Temps if missing, runs `temps join --pair -` with a pairing code on stdin, and installs the agent as `temps-agent.service`. Without systemd it starts the agent in the background and says so: that agent does not come back after a reboot.
 4. It waits for the node's first heartbeat. Progress and the server's output show on the page, and with `bunx @temps-sdk/cli nodes ssh show <id>`.
 
@@ -329,7 +347,7 @@ temps agent service status
 sudo temps agent service uninstall
 ```
 
-The unit runs this `temps` binary with the data directory `temps join` wrote (`--binary` and `--data-dir` override them; `--dry-run` prints the unit without installing it). The enrollment token and TLS key stay in that owner-only directory: the unit only points at it. It refuses to replace a `temps-agent.service` that Temps did not write. Without systemd, run `temps agent` under your own supervisor.
+The unit runs this `temps` binary with the data directory `temps join` wrote (`--binary` and `--data-dir` override them; `--dry-run` prints the unit without installing it). The enrollment token and TLS key stay in that owner-only directory: the unit only points at it. It refuses to replace a `temps-agent.service` that Temps did not write. Because the service runs as root, it also refuses a binary, data directory or `agent.json` that anyone but root could change, including through a directory above it; the error names the path and how to fix it (e.g. `sudo install -D -o root -g root -m 0755 ./temps /opt/temps/bin/temps`, then `--binary /opt/temps/bin/temps`). Without systemd, run `temps agent` under your own supervisor.
 
 The agent sends a **heartbeat** to the control plane every 30 seconds. If heartbeats stop (e.g., the agent is stopped or the machine goes down), the control plane marks the node as **offline** after 90 seconds and excludes it from scheduling.
 

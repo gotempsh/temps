@@ -2584,6 +2584,7 @@ Restore a service from a backup (in-place, new service, or PITR)
 | `--backup-id <id>` | Backup ID to restore from (see `list-backups`) | - | Yes |
 | `--new-service [name]` | Clone into a new service. Omit the value or pass "auto" to accept the auto-suggested name. | - | No |
 | `--pitr <iso>` | Point-in-time recovery target, ISO 8601 timestamp (requires a PITR-capable backup). Combine with --new-service to route PITR into a new service. | - | No |
+| `--confirm-cross-service` | Confirm an in-place (or PITR in-place) restore of a backup produced by a different service. Required by the server for such restores; recorded in the audit log. | - | No |
 | `-y, --yes` | Skip confirmation | - | No |
 | `--no-wait` | Return immediately without polling run status | - | No |
 | `--json` | Output in JSON format | - | No |
@@ -3597,7 +3598,6 @@ Add the server at --host. Shows its SSH host key to confirm first (or pass --hos
 | `--identity-file <path>` | Log in with this private key | - | No |
 | `--ask-passphrase` | Prompt for the private key passphrase | - | No |
 | `--passphrase-stdin` | Read the private key passphrase from stdin (not with --password-stdin) | - | No |
-| `--agent` | Log in with the SSH agent of the control plane's temps serve process | - | No |
 | `--password-stdin` | Read the password from stdin (default: prompt for it) | - | No |
 | `--host-key <fingerprint>` | The SHA256:… host key fingerprint you verified (see `nodes ssh host-key`) | - | No |
 | `--name <name>` | Name the node registers under (default: worker-<random>) | - | No |
@@ -8068,6 +8068,7 @@ Temps Cloud
 - `backup-schedule` - The backup schedule that writes to the Temps Cloud destination
 - `vps` - Manage cloud VPS instances
 - `billing` - Manage Temps Cloud billing and subscription
+- `console-access` - Console access through Temps Cloud (ADR-045) -- Cloud members with the owner/admin role can open this console with no inbound port
 - `telemetry` - Where a project’s spans are written — this instance, or Temps Cloud (ADR-041)
 
 ### `cloud login`
@@ -8269,6 +8270,46 @@ Upgrade your plan
 |------|-------------|---------|----------|
 | `--yearly` | Use yearly billing cycle (default: monthly) | - | No |
 | `--no-browser` | Don't open browser, just show the URL | - | No |
+
+### `cloud console-access`
+
+Console access through Temps Cloud (ADR-045) -- Cloud members with the owner/admin role can open this console with no inbound port
+
+**Subcommands:**
+
+- `status` - Show whether Temps Cloud can open this console
+- `enable` - Allow Temps Cloud to open this console
+- `disable` - Stop Temps Cloud from opening this console (revokes its sign-in provider and sessions immediately)
+
+#### `cloud console-access status`
+
+Show whether Temps Cloud can open this console
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output JSON | - | No |
+
+#### `cloud console-access enable`
+
+Allow Temps Cloud to open this console
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output JSON | - | No |
+
+#### `cloud console-access disable`
+
+Stop Temps Cloud from opening this console (revokes its sign-in provider and sessions immediately)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output JSON | - | No |
 
 ### `cloud telemetry`
 

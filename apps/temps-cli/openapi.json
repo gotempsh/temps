@@ -12454,7 +12454,7 @@
         "description": "A new pairing and the one command to run on the node. The command holds\na secret and is returned only here.",
         "properties": {
           "join_command": {
-            "description": "Run this on the node, as root: `temps join --pair <code>`.",
+            "description": "Run this on the node, as root. It pipes the pairing code into `temps join --pair -`, so the code stays out of the process list and shell history.",
             "type": "string"
           },
           "pairing": {

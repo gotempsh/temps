@@ -94,7 +94,7 @@ describe('credentialSource', () => {
       method: 'password',
       from: 'prompt',
     })
-    expect(() => credentialSource({}, false)).toThrow(/--password-stdin.*--identity-file.*--agent/)
+    expect(() => credentialSource({}, false)).toThrow(/--password-stdin.*--identity-file/)
   })
 
   test('reads the password from piped stdin', () => {
@@ -106,13 +106,17 @@ describe('credentialSource', () => {
   })
 
   test('allows one login method', () => {
-    expect(() => credentialSource({ identityFile: 'k', agent: true }, true)).toThrow(/use one of/)
-    expect(() => credentialSource({ agent: true, passwordStdin: true }, false)).toThrow(
+    expect(() => credentialSource({ identityFile: 'k', passwordStdin: true }, false)).toThrow(
       /use one of/,
     )
-    expect(credentialSource({ agent: true }, false)).toEqual({
-      method: 'agent',
-    })
+  })
+
+  test('does not offer the control plane SSH agent, which API callers may not use', () => {
+    // The server refuses the agent method to CLI tokens and API keys: only an
+    // instance admin signed in to the console may use it.
+    expect(() => credentialSource({ agent: true } as never, false)).toThrow(
+      /--password-stdin.*--identity-file/,
+    )
   })
 
   test('takes the passphrase of an identity file from a prompt or stdin', () => {

@@ -170,7 +170,6 @@ Add the server at --host. Shows its SSH host key to confirm first (or pass --hos
 | `--identity-file <path>` | Log in with this private key | - | No |
 | `--ask-passphrase` | Prompt for the private key passphrase | - | No |
 | `--passphrase-stdin` | Read the private key passphrase from stdin (not with --password-stdin) | - | No |
-| `--agent` | Log in with the SSH agent of the control plane's temps serve process | - | No |
 | `--password-stdin` | Read the password from stdin (default: prompt for it) | - | No |
 | `--host-key <fingerprint>` | The SHA256:… host key fingerprint you verified (see `nodes ssh host-key`) | - | No |
 | `--name <name>` | Name the node registers under (default: worker-<random>) | - | No |

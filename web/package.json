@@ -132,7 +132,7 @@
     "eslint-plugin-react-refresh": "^0.5.7",
     "eslint-plugin-unused-imports": "^4.4.1",
     "prettier": "^3.9.9",
-    "typescript": "npm:@typescript/typescript6@^6.0.2",
+    "typescript": "~6.0.3",
     "typescript-eslint": "^8.71.0"
   },
   "overrides": {

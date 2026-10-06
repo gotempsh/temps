@@ -22,6 +22,10 @@ use crate::providers::external_http_client;
 /// batch objects are far smaller; this only bounds a misbehaving upstream.
 pub const MAX_NATIVE_JSON_BYTES: usize = 32 * 1024 * 1024;
 
+// Shared with reconciliation so its deadline cannot cancel a supported transfer.
+pub(crate) const NATIVE_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+pub(crate) const FILE_TRANSFER_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
 /// Upstream identifiers (`file-…`, `batch_…`) are interpolated into request
 /// paths, so anything outside this alphabet is rejected before it can change
 /// the path (`../`, `?`, `#`, encoded separators).
@@ -60,6 +64,7 @@ pub fn validate_upstream_id(kind: &str, id: &str) -> Result<(), AiGatewayError> 
     }
 }
 
+#[derive(Clone)]
 pub struct OpenAiNativeClient {
     /// Inference and object metadata calls.
     client: reqwest::Client,
@@ -77,8 +82,8 @@ impl Default for OpenAiNativeClient {
 impl OpenAiNativeClient {
     pub fn new() -> Self {
         Self {
-            client: external_http_client(Duration::from_secs(300)),
-            transfer_client: external_http_client(Duration::from_secs(30 * 60)),
+            client: external_http_client(NATIVE_REQUEST_TIMEOUT),
+            transfer_client: external_http_client(FILE_TRANSFER_TIMEOUT),
         }
     }
 

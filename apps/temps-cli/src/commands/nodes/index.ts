@@ -748,6 +748,9 @@ async function pairCreateAction(options: {
   newline()
   console.log(`  ${colors.muted('On the node, as root (the command holds a secret; it is shown once):')}`)
   console.log(`    ${result.join_command}`)
+  console.log(
+    `  ${colors.muted('It pipes the code to `temps join --pair -`, keeping it out of the process list. Not in a root shell? Put sudo right before `temps join`.')}`
+  )
   console.log(`  ${colors.muted('Then:')} temps agent service install`)
   newline()
   console.log(

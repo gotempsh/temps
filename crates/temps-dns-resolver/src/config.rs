@@ -72,6 +72,8 @@ pub struct ResolverConfig {
     /// Trust root (PEM) for the control plane: the cluster CA, for a node
     /// whose join pinned it. When set it replaces the public roots.
     pub control_plane_ca_pem: Option<Vec<u8>>,
+    /// Optional independently provisioned exact legacy control-plane leaf pin.
+    pub control_plane_legacy_cert_pem: Option<Vec<u8>>,
 }
 
 impl ResolverConfig {
@@ -103,6 +105,7 @@ impl ResolverConfig {
             ],
             disable_sync: false,
             control_plane_ca_pem: None,
+            control_plane_legacy_cert_pem: None,
         }
     }
 
@@ -129,6 +132,7 @@ impl ResolverConfig {
             ],
             disable_sync: true,
             control_plane_ca_pem: None,
+            control_plane_legacy_cert_pem: None,
         }
     }
 

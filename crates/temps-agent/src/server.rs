@@ -968,6 +968,7 @@ mod tests {
             mesh_key_dir: std::path::PathBuf::from("/tmp/temps-wireguard"),
             wg_endpoint: None,
             control_plane_trust: Some(crate::ControlPlaneTrust::PublicRoots),
+            control_plane_legacy_cert_path: None,
         }
     }
 

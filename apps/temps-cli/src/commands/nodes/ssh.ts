@@ -83,14 +83,12 @@ export interface CredentialOptions {
   identityFile?: string
   askPassphrase?: boolean
   passphraseStdin?: boolean
-  agent?: boolean
   passwordStdin?: boolean
 }
 
 /** Where `nodes ssh add` gets the credentials from. */
 export type CredentialSource =
   | { method: 'private_key'; path: string; passphrase: 'none' | 'prompt' | 'stdin' }
-  | { method: 'agent' }
   | { method: 'password'; from: 'prompt' | 'stdin' }
 
 /**
@@ -102,9 +100,8 @@ export function credentialSource(
   options: CredentialOptions,
   interactive: boolean
 ): CredentialSource {
-  const chosen = [options.identityFile, options.agent, options.passwordStdin].filter(Boolean)
-  if (chosen.length > 1) {
-    throw new Error('use one of --identity-file, --agent or --password-stdin')
+  if (options.identityFile && options.passwordStdin) {
+    throw new Error('use one of --identity-file or --password-stdin')
   }
   if (options.passwordStdin && options.passphraseStdin) {
     throw new Error('--password-stdin and --passphrase-stdin both read stdin: use one')
@@ -134,12 +131,11 @@ export function credentialSource(
       passphrase: options.askPassphrase ? 'prompt' : options.passphraseStdin ? 'stdin' : 'none',
     }
   }
-  if (options.agent) return { method: 'agent' }
   if (options.passwordStdin) return { method: 'password', from: 'stdin' }
   if (!interactive) {
     throw new Error(
       'stdin is not a terminal, so the password cannot be prompted for: pass --password-stdin ' +
-        '(and pipe it in), --identity-file <path> or --agent'
+        '(and pipe it in) or --identity-file <path>'
     )
   }
   return { method: 'password', from: 'prompt' }
@@ -194,7 +190,6 @@ export function registerNodesSshCommands(nodes: Command): void {
       '--passphrase-stdin',
       'Read the private key passphrase from stdin (not with --password-stdin)'
     )
-    .option('--agent', "Log in with the SSH agent of the control plane's temps serve process")
     .option('--password-stdin', 'Read the password from stdin (default: prompt for it)')
     .option(
       '--host-key <fingerprint>',
@@ -273,7 +268,6 @@ interface AddOptions {
   identityFile?: string
   askPassphrase?: boolean
   passphraseStdin?: boolean
-  agent?: boolean
   passwordStdin?: boolean
   hostKey?: string
   name?: string
@@ -311,8 +305,6 @@ async function credentials(options: AddOptions, source: CredentialSource): Promi
             : null
       return { method: 'private_key', private_key: privateKey, passphrase }
     }
-    case 'agent':
-      return { method: 'agent' }
     case 'password': {
       const password =
         source.from === 'stdin'

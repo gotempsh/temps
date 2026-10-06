@@ -28,7 +28,7 @@ pub struct PublicIngressConfig {
     /// Trust root for the control plane, replacing the public roots: the
     /// cluster CA, for a node whose join pinned it (see
     /// [`crate::control_plane_ca`]).
-    pub control_plane_ca: Option<reqwest::Certificate>,
+    pub control_plane_ca: Option<crate::ControlPlaneCa>,
     pub node_id: i32,
     pub node_token: String,
 }

@@ -39,7 +39,8 @@ use crate::native_types::{
     ResponsesRequest,
 };
 use crate::providers::openai_native::{
-    read_reply, validate_upstream_id, OpenAiNativeClient, UpstreamReply,
+    read_reply, validate_upstream_id, OpenAiNativeClient, UpstreamReply, FILE_TRANSFER_TIMEOUT,
+    NATIVE_REQUEST_TIMEOUT,
 };
 use crate::services::gateway_service::{
     ByokOverride, CredentialType, GatewayService, ResolvedCredentials,
@@ -48,6 +49,15 @@ use crate::services::usage_service::{AiRequestContext, UsageService};
 
 /// Provider that serves the native endpoints.
 const OPENAI: &str = "openai";
+
+// Allow metadata retrieval, a full result transfer and a minute for accounting.
+// Keep the durable lease longer than the entire job so another worker cannot
+// restart the same download while it is still in progress.
+const BATCH_RECONCILIATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
+    NATIVE_REQUEST_TIMEOUT.as_secs() + FILE_TRANSFER_TIMEOUT.as_secs() + 60,
+);
+const BATCH_RETRY_LEASE: chrono::Duration =
+    chrono::Duration::seconds(BATCH_RECONCILIATION_TIMEOUT.as_secs() as i64 + 60);
 
 /// Largest batch input file accepted, matching OpenAI's limit.
 pub const MAX_BATCH_FILE_BYTES: u64 = 200 * 1024 * 1024;
@@ -330,12 +340,14 @@ pub enum ResponsesOutcome {
     Stream(ByteStream),
 }
 
+#[derive(Clone)]
 pub struct NativeApiService {
     db: Arc<DatabaseConnection>,
     gateway_service: Arc<GatewayService>,
     usage_service: Arc<UsageService>,
     client: OpenAiNativeClient,
     upload_slots: Arc<tokio::sync::Semaphore>,
+    reconciliation_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl NativeApiService {
@@ -350,6 +362,7 @@ impl NativeApiService {
             usage_service,
             client: OpenAiNativeClient::new(),
             upload_slots: Arc::new(tokio::sync::Semaphore::new(2)),
+            reconciliation_slots: Arc::new(tokio::sync::Semaphore::new(2)),
         }
     }
 
@@ -371,20 +384,34 @@ impl NativeApiService {
         });
     }
 
-    async fn reconcile_due_batches(&self) -> Result<(), AiGatewayError> {
+    /// Schedule only work that can start now. Downloads never hold up the next tick.
+    /// Two workers bound accounting buffers to two lines (64 MiB) plus HTTP chunks;
+    /// at saturation, additional jobs remain durable due rows rather than queued tasks.
+    async fn reconcile_due_batches(
+        &self,
+    ) -> Result<Vec<tokio::task::JoinHandle<()>>, AiGatewayError> {
+        let capacity = self.reconciliation_slots.available_permits();
+        if capacity == 0 {
+            return Ok(Vec::new());
+        }
         let now = chrono::Utc::now();
         let due = ai_gateway_objects::Entity::find()
             .filter(ai_gateway_objects::Column::NextPollAt.lte(now))
             .order_by_asc(ai_gateway_objects::Column::NextPollAt)
             .order_by_asc(ai_gateway_objects::Column::Id)
-            .limit(25)
+            .limit(capacity as u64)
             .all(self.db.as_ref())
             .await?;
+        let mut jobs = Vec::with_capacity(due.len());
         for record in due {
+            let Ok(permit) = self.reconciliation_slots.clone().try_acquire_owned() else {
+                break;
+            };
+            let lease_until = chrono::Utc::now() + BATCH_RETRY_LEASE;
             let claimed = ai_gateway_objects::Entity::update_many()
                 .col_expr(
                     ai_gateway_objects::Column::NextPollAt,
-                    Expr::value(now + chrono::Duration::minutes(5)),
+                    Expr::value(lease_until),
                 )
                 .filter(ai_gateway_objects::Column::Id.eq(record.id))
                 .filter(ai_gateway_objects::Column::NextPollAt.lte(now))
@@ -393,20 +420,39 @@ impl NativeApiService {
             if claimed.rows_affected != 1 {
                 continue;
             }
-            // Bound each job as well as rows per tick. A failed/aborted job keeps its durable retry lease.
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(60),
-                self.reconcile_batch(&record),
-            )
-            .await;
-            if !matches!(result, Ok(Ok(()))) {
-                warn!(
-                    object_id = record.id,
-                    "Batch reconciliation incomplete; retry scheduled"
-                );
-            }
+            // Clone the dependencies, not the owning Arc: active jobs must not
+            // keep the weak-reference polling loop alive after plugin shutdown.
+            let service = Self::clone(self);
+            jobs.push(tokio::spawn(async move {
+                let _permit = permit;
+                let result = tokio::time::timeout(
+                    BATCH_RECONCILIATION_TIMEOUT,
+                    service.reconcile_batch(&record),
+                )
+                .await;
+                if !matches!(result, Ok(Ok(()))) {
+                    warn!(object_id = record.id, error = ?result, "Batch reconciliation incomplete");
+                }
+                // Completed accounting clears the lease transactionally. For
+                // errors, running batches or missing usage evidence, retry soon.
+                // Compare the exact lease so this cannot overwrite a new claim
+                // or a completion performed concurrently by a client poll.
+                if let Err(error) = ai_gateway_objects::Entity::update_many()
+                    .col_expr(
+                        ai_gateway_objects::Column::NextPollAt,
+                        Expr::value(chrono::Utc::now() + chrono::Duration::minutes(5)),
+                    )
+                    .filter(ai_gateway_objects::Column::Id.eq(record.id))
+                    .filter(ai_gateway_objects::Column::NextPollAt.eq(lease_until))
+                    .filter(ai_gateway_objects::Column::UsageRecordedAt.is_null())
+                    .exec(service.db.as_ref())
+                    .await
+                {
+                    warn!(object_id = record.id, error = %error, "Batch retry scheduling failed; durable lease remains");
+                }
+            }));
         }
-        Ok(())
+        Ok(jobs)
     }
 
     async fn reconcile_batch(
@@ -1635,19 +1681,45 @@ mod tests {
 
     #[tokio::test]
     async fn byok_batch_is_reconciled_without_a_client_poll() {
+        assert_byok_batch_reconciled(None).await;
+    }
+
+    #[tokio::test]
+    async fn batch_result_transfer_longer_than_a_minute_records_usage() {
+        assert_byok_batch_reconciled(Some(std::time::Duration::from_secs(65))).await;
+    }
+
+    async fn assert_byok_batch_reconciled(output_delay: Option<std::time::Duration>) {
         use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
         use wiremock::{
             matchers::{header, method, path},
             Mock, MockServer, ResponseTemplate,
         };
         let server = MockServer::start().await;
+        let batch = if let Some(delay) = output_delay {
+            Mock::given(method("GET"))
+                .and(path("/v1/files/file-result/content"))
+                .and(header("authorization", "Bearer test-reconciliation-key"))
+                .respond_with(ResponseTemplate::new(200).set_delay(delay).set_body_string(
+                    "{\"response\":{\"status_code\":200,\"body\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}}\n",
+                ))
+                .expect(1)
+                .mount(&server)
+                .await;
+            serde_json::json!({
+                "id":"batch_test", "object":"batch", "status":"completed",
+                "output_file_id":"file-result"
+            })
+        } else {
+            serde_json::json!({
+                "id":"batch_test", "object":"batch", "status":"cancelled",
+                "usage":{"input_tokens":10,"output_tokens":5}
+            })
+        };
         Mock::given(method("GET"))
             .and(path("/v1/batches/batch_test"))
             .and(header("authorization", "Bearer test-reconciliation-key"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id":"batch_test", "object":"batch", "status":"cancelled",
-                "usage":{"input_tokens":10,"output_tokens":5}
-            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(batch))
             .expect(1)
             .mount(&server)
             .await;
@@ -1692,14 +1764,40 @@ mod tests {
                         last_insert_id: 0,
                         rows_affected: 1,
                     },
+                    MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 0,
+                    },
                 ])
                 .into_connection(),
         );
         let mut svc = service(db.clone());
         svc.client = OpenAiNativeClient::for_test();
-        svc.reconcile_due_batches().await.unwrap();
+        let started = chrono::Utc::now();
+        for job in svc.reconcile_due_batches().await.unwrap() {
+            job.await.unwrap();
+        }
         drop(svc);
-        let sql = format!("{:?}", Arc::try_unwrap(db).unwrap().into_transaction_log());
+        let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
+        let claim = transactions
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .find(|statement| {
+                statement.sql.starts_with("UPDATE") && statement.sql.contains("next_poll_at")
+            })
+            .expect("batch retry lease was persisted");
+        let sea_orm::sea_query::Value::ChronoDateTimeUtc(Some(retry_at)) =
+            &claim.values.as_ref().unwrap().0[0]
+        else {
+            panic!("batch lease must be a timestamp: {claim:?}");
+        };
+        assert!(
+            **retry_at
+                > started
+                    + chrono::Duration::seconds(BATCH_RECONCILIATION_TIMEOUT.as_secs() as i64),
+            "another worker must not reclaim the batch before accounting finishes"
+        );
+        let sql = format!("{transactions:?}");
         assert!(
             sql.contains("ai_usage_logs") && sql.contains("COMMIT"),
             "{sql}"
@@ -1712,6 +1810,153 @@ mod tests {
             sql.contains("Bool(Some(true))"),
             "BYOK flag was not logged: {sql}"
         );
+    }
+
+    fn reconciliation_record(server: &wiremock::MockServer) -> ai_gateway_objects::Model {
+        let mut record = batch_record();
+        record.provider_key_id = None;
+        record.credential_scope = "byok:test".into();
+        record.byok_base_url = Some(format!("{}/v1", server.uri()));
+        record.byok_key_encrypted = Some(
+            temps_core::EncryptionService::new("01234567890123456789012345678901")
+                .unwrap()
+                .encrypt_string("test-reconciliation-key")
+                .unwrap(),
+        );
+        record
+    }
+
+    #[tokio::test]
+    async fn unfinished_batch_jobs_retry_in_five_minutes() {
+        use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        // A provider error, an in-progress batch and missing terminal evidence
+        // all need a short retry after the active job has released its lease.
+        for (status, batch_status) in [(503, "failed"), (200, "in_progress"), (200, "completed")] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v1/batches/batch_test"))
+                .respond_with(
+                    ResponseTemplate::new(status).set_body_json(serde_json::json!({
+                        "id":"batch_test", "object":"batch", "status":batch_status
+                    })),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([vec![reconciliation_record(&server)]])
+                    .append_exec_results((0..2).map(|_| MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1,
+                    }))
+                    .into_connection(),
+            );
+            let mut svc = service(db.clone());
+            svc.client = OpenAiNativeClient::for_test();
+            let started = chrono::Utc::now();
+            for job in svc.reconcile_due_batches().await.unwrap() {
+                job.await.unwrap();
+            }
+            drop(svc);
+            let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
+            let updates: Vec<_> = transactions
+                .iter()
+                .flat_map(|t| t.statements())
+                .filter(|s| s.sql.starts_with("UPDATE"))
+                .collect();
+            assert_eq!(updates.len(), 2);
+            let retry = updates[1];
+            let sea_orm::sea_query::Value::ChronoDateTimeUtc(Some(retry_at)) =
+                &retry.values.as_ref().unwrap().0[0]
+            else {
+                panic!("{retry:?}")
+            };
+            assert!(**retry_at >= started + chrono::Duration::minutes(5));
+            assert!(**retry_at < started + chrono::Duration::minutes(6));
+            assert!(
+                retry.sql.contains("usage_recorded_at\" IS NULL"),
+                "{retry:?}"
+            );
+            // The old lease is compared, not just the id: stale jobs cannot
+            // reschedule another claim or resurrect a client-poll completion.
+            assert!(retry.sql.matches("next_poll_at").count() >= 2, "{retry:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_batch_does_not_block_another_job_or_the_next_tick() {
+        use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        for (id, delay) in [("batch_test", 3), ("batch_fast", 0)] {
+            Mock::given(method("GET"))
+                .and(path(format!("/v1/batches/{id}")))
+                .respond_with(
+                    ResponseTemplate::new(503).set_delay(std::time::Duration::from_secs(delay)),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let slow = reconciliation_record(&server);
+        let mut fast = slow.clone();
+        fast.id = 2;
+        fast.upstream_id = "batch_fast".into();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![slow, fast], Vec::<ai_gateway_objects::Model>::new()])
+                .append_exec_results((0..4).map(|_| MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }))
+                .into_connection(),
+        );
+        let mut svc = service(db.clone());
+        svc.client = OpenAiNativeClient::for_test();
+        let deadline = std::time::Duration::from_secs(2);
+        let mut jobs = tokio::time::timeout(deadline, svc.reconcile_due_batches())
+            .await
+            .expect("scheduling must not await provider requests")
+            .unwrap();
+        assert_eq!(jobs.len(), 2);
+        tokio::time::timeout(deadline, jobs.remove(1))
+            .await
+            .expect("the second batch must finish while the first is slow")
+            .unwrap();
+        assert!(!jobs[0].is_finished());
+        assert!(tokio::time::timeout(deadline, svc.reconcile_due_batches())
+            .await
+            .expect("the next tick must not wait for an active transfer")
+            .unwrap()
+            .is_empty());
+        jobs.remove(0).await.unwrap();
+        assert_eq!(svc.reconciliation_slots.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn saturated_batch_workers_leave_due_work_in_the_database() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let svc = service(db.clone());
+        let _permits = svc
+            .reconciliation_slots
+            .clone()
+            .try_acquire_many_owned(2)
+            .unwrap();
+        assert!(svc.reconcile_due_batches().await.unwrap().is_empty());
+        drop(svc);
+        assert!(Arc::try_unwrap(db)
+            .unwrap()
+            .into_transaction_log()
+            .is_empty());
     }
 
     #[tokio::test]

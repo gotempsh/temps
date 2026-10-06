@@ -721,6 +721,12 @@ function CreatedPairing({
         mesh up and registers. Then start the worker with{' '}
         <code>{AGENT_SERVICE_COMMAND}</code>.
       </p>
+      <p className="mt-1 text-xs">
+        The code is piped to <code>temps join --pair -</code> so it never shows
+        in the process list, and the leading space keeps the line out of the
+        shell history. Not in a root shell? Put <code>sudo</code> right before{' '}
+        <code>temps join</code>, after the <code>|</code>.
+      </p>
     </Step>
   )
 }

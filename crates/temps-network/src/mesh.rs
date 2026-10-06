@@ -249,6 +249,128 @@ pub fn control_plane_mesh_address(cidr: Ipv4Net) -> Ipv4Addr {
     cidr.hosts().next().unwrap_or_else(|| cidr.network())
 }
 
+/// `network_config.wireguard_cidr`'s default (migration
+/// `m20260928_000001_wireguard_mesh`): the pool the mesh uses unless the
+/// operator picks another.
+pub const DEFAULT_MESH_CIDR: Ipv4Net = Ipv4Net::new_assert(Ipv4Addr::new(10, 201, 0, 0), 16);
+
+/// The pool whose addresses are reserved for the mesh, whether or not the
+/// mesh is on: the configured `wireguard_cidr`, or [`DEFAULT_MESH_CIDR`] when
+/// that does not parse. Reserved even while the mesh is off because every
+/// address a node registers becomes an IP SAN on a cluster-CA leaf that is
+/// never revoked: a worker that registered with `10.201.0.1` before the mesh
+/// existed would otherwise hold a certificate for the control plane's future
+/// mesh address, or for another member's.
+pub fn reserved_mesh_pool(wireguard_cidr: &str) -> Ipv4Net {
+    wireguard_cidr
+        .trim()
+        .parse::<Ipv4Net>()
+        .map(|cidr| cidr.trunc())
+        .unwrap_or(DEFAULT_MESH_CIDR)
+}
+
+/// The IPv4 address a node's registered name, address or private address
+/// stands for, if it is one: a bare IP, `ip:port`, `[v6]:port` or an
+/// `http(s)://` URL. IPv4-mapped IPv6 addresses count as their IPv4 address,
+/// since that is the address they reach. `None` for DNS names and other IPv6
+/// addresses, which can never be in the (IPv4) mesh pool.
+pub fn identity_ipv4(value: &str) -> Option<Ipv4Addr> {
+    let value = value.trim();
+    let authority = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"))
+        .unwrap_or(value);
+    let authority = authority.split('/').next().unwrap_or(authority);
+    let ip: IpAddr = match authority.parse::<SocketAddr>() {
+        Ok(socket) => socket.ip(),
+        Err(_) => authority
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse()
+            .ok()?,
+    };
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => Some(v4),
+        IpAddr::V6(_) => None,
+    }
+}
+
+/// Who holds a mesh identity a registration claimed; see
+/// `mesh_identity_claimed`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MeshIdentityHolder {
+    /// The control plane's mesh address.
+    ControlPlane { address: Ipv4Addr },
+    /// Another address of the mesh pool, reserved whether or not the mesh
+    /// is on.
+    Pool { pool: Ipv4Net },
+    /// The mesh address of a node.
+    Node { node_id: i32, node_name: String },
+    /// The mesh address a pending pairing reserved.
+    Pairing {
+        pairing_id: i32,
+        pairing_name: String,
+    },
+}
+
+impl std::fmt::Display for MeshIdentityHolder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ControlPlane { address } => {
+                write!(f, "the control plane's mesh address ({address})")
+            }
+            Self::Pool { pool } => write!(
+                f,
+                "inside the WireGuard mesh pool {pool}, whose addresses the control plane \
+                 assigns"
+            ),
+            Self::Node { node_id, node_name } => {
+                write!(f, "the mesh address of node '{node_name}' (id {node_id})")
+            }
+            Self::Pairing {
+                pairing_id,
+                pairing_name,
+            } => write!(
+                f,
+                "the mesh address reserved for pairing '{pairing_name}' (id {pairing_id})"
+            ),
+        }
+    }
+}
+
+/// A mesh identity a registration claimed, and who holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshIdentityClaim {
+    /// The value the registration claimed (name, address or private
+    /// address), as given.
+    pub claimed: String,
+    pub holder: MeshIdentityHolder,
+}
+
+/// The first of `addresses` (claimed value, its IPv4 address) that is the
+/// control plane's mesh address in `pool`, or any other address of `pool`.
+pub fn pool_claim(addresses: &[(String, Ipv4Addr)], pool: Ipv4Net) -> Option<MeshIdentityClaim> {
+    let control_plane = control_plane_mesh_address(pool);
+    addresses
+        .iter()
+        .find(|(_, ip)| *ip == control_plane)
+        .map(|(claimed, _)| MeshIdentityClaim {
+            claimed: claimed.clone(),
+            holder: MeshIdentityHolder::ControlPlane {
+                address: control_plane,
+            },
+        })
+        .or_else(|| {
+            addresses
+                .iter()
+                .find(|(_, ip)| pool.contains(ip))
+                .map(|(claimed, _)| MeshIdentityClaim {
+                    claimed: claimed.clone(),
+                    holder: MeshIdentityHolder::Pool { pool },
+                })
+        })
+}
+
 /// Lowest host address that is neither the control plane's nor taken.
 pub fn next_mesh_address(
     cidr: Ipv4Net,
@@ -450,6 +572,96 @@ mod db {
         settings_from(&cfg)
     }
 
+    /// Reserve all certificate IP SANs before releasing a leaf, under the same lock as
+    /// pool changes. Entries survive node removal and failed registrations.
+    pub async fn reserve_certificate_addresses(
+        db: &DatabaseConnection,
+        ca_cert_pem: &str,
+        identities: &[String],
+    ) -> Result<(), MeshError> {
+        use sea_orm::{ConnectionTrait, Statement};
+        let txn = db.begin().await?;
+        let cfg = lock_config(&txn).await?;
+        let addresses: Vec<_> = identities
+            .iter()
+            .filter_map(|value| identity_ipv4(value).map(|ip| (value.clone(), ip)))
+            .collect();
+        if let Some(claim) = pool_claim(&addresses, reserved_mesh_pool(&cfg.wireguard_cidr)) {
+            return Err(MeshError::InvalidCidr {
+                value: cfg.wireguard_cidr,
+                reason: format!(
+                    "certificate identity {} belongs to the reserved mesh pool",
+                    claim.claimed
+                ),
+            });
+        }
+        let ca_key = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+            ca_cert_pem.as_bytes(),
+        ));
+        for (_, ip) in addresses {
+            txn.execute(Statement::from_sql_and_values(
+                txn.get_database_backend(),
+                "INSERT INTO cluster_certificate_addresses (ca_key, address) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                [ca_key.clone().into(), ip.to_string().into()],
+            )).await?;
+        }
+        txn.commit().await?;
+        Ok(())
+    }
+
+    /// A pre-history CA may have issued certificates for deleted or renamed
+    /// nodes. Current rows cannot prove safety; rotate that CA explicitly.
+    async fn check_certificate_history<C: sea_orm::ConnectionTrait>(
+        txn: &C,
+        pool: Ipv4Net,
+    ) -> Result<(), MeshError> {
+        use sea_orm::{FromQueryResult, Statement};
+        let settings = temps_entities::settings::Entity::find_by_id(1)
+            .one(txn)
+            .await?;
+        let Some(ca) = settings
+            .as_ref()
+            .and_then(|row| row.data.get("multi_node"))
+            .and_then(|value| value.get("cluster_ca_cert_pem"))
+            .and_then(|value| value.as_str())
+        else {
+            return Ok(());
+        };
+        let ca_key = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(ca.as_bytes()));
+        let backend = txn.get_database_backend();
+        if txn
+            .query_one(Statement::from_sql_and_values(
+                backend,
+                "SELECT ca_key FROM cluster_certificate_history WHERE ca_key = $1",
+                [ca_key.clone().into()],
+            ))
+            .await?
+            .is_none()
+        {
+            return Err(MeshError::InvalidCidr {
+                value: pool.to_string(),
+                reason: "the cluster CA predates certificate address history; deleted nodes may still hold certificates for this pool. Rotate the cluster CA in Settings > Worker Nodes and re-enroll workers before enabling or changing the mesh".into(),
+            });
+        }
+        #[derive(FromQueryResult)]
+        struct Address {
+            address: String,
+        }
+        // Indexed by CA and address, and stop on the first conflict. No live
+        // node join: deleted nodes' unrevoked certificates still count.
+        let conflict = Address::find_by_statement(Statement::from_sql_and_values(backend,
+            "SELECT address FROM cluster_certificate_addresses WHERE ca_key = $1 AND address::inet <<= $2::inet LIMIT 1",
+            [ca_key.into(), pool.to_string().into()],
+        )).one(txn).await?;
+        if let Some(conflict) = conflict {
+            return Err(MeshError::InvalidCidr {
+                value: pool.to_string(),
+                reason: format!("the cluster CA has issued a worker certificate for {}; choose another pool or rotate the cluster CA and re-enroll workers. Deleting the node does not revoke its certificate", conflict.address),
+            });
+        }
+        Ok(())
+    }
+
     /// Turn the mesh on (idempotent). The pool can only change while no node
     /// holds a mesh address, because addresses are already in use as
     /// underlays.
@@ -479,10 +691,14 @@ mod db {
         // plane's, --wg-endpoint values) carries the port: both are frozen
         // once any node is on the mesh.
         if requested != current || requested_port != current_port {
+            // A pending pairing holds an address from the current pool and
+            // its code carries the pool and port, so it pins them as firmly
+            // as a node on the mesh does.
             let assigned = nodes::Entity::find()
                 .filter(nodes::Column::MeshWgAddress.is_not_null())
                 .count(&txn)
-                .await?;
+                .await?
+                + crate::pairing::pending_count(&txn).await?;
             if assigned > 0 {
                 return Err(if requested != current {
                     MeshError::InUse {
@@ -499,6 +715,13 @@ mod db {
                 });
             }
         }
+        // Reapplying an active pool (e.g. changing only its API port) does
+        // not introduce a new certificate identity. Keep that idempotent for
+        // existing clusters; enabling a pool or moving it requires full history.
+        if !cfg.wireguard_enabled || requested != current {
+            check_certificate_history(&txn, requested).await?;
+        }
+        check_nodes_outside_pool(&txn, requested).await?;
         let node_api_port = match node_api_port {
             Some(0) => return Err(MeshError::InvalidPort(0)),
             Some(port) => Some(port),
@@ -517,6 +740,131 @@ mod db {
             port: requested_port,
             node_api_port: node_api_port.unwrap_or(requested_port),
         })
+    }
+
+    /// Refuse a mesh pool that contains an address a node registered as its
+    /// own name, address or private address.
+    ///
+    /// The cluster CA signed that node a leaf for the address, and leaves are
+    /// not revoked: it could present it as the control plane's mesh address
+    /// to nodes that verify the control plane by address (agents enrolled
+    /// before the reserved control-plane name existed), or as whichever
+    /// member gets the address. Registration has refused addresses in the
+    /// pool since the pool was reserved while the mesh is off; this catches
+    /// nodes registered before that, and pools moved onto existing nodes.
+    async fn check_nodes_outside_pool<C: sea_orm::ConnectionTrait>(
+        txn: &C,
+        pool: Ipv4Net,
+    ) -> Result<(), MeshError> {
+        let control_plane = control_plane_mesh_address(pool);
+        for node in nodes::Entity::find()
+            .order_by_asc(nodes::Column::Id)
+            .all(txn)
+            .await?
+        {
+            for (field, value) in [
+                ("name", node.name.as_str()),
+                ("address", node.address.as_str()),
+                ("private address", node.private_address.as_str()),
+            ] {
+                let Some(ip) = identity_ipv4(value) else {
+                    continue;
+                };
+                if !pool.contains(&ip) {
+                    continue;
+                }
+                let role = if ip == control_plane {
+                    "the control plane's mesh address in this pool"
+                } else {
+                    "inside this pool"
+                };
+                tracing::warn!(
+                    node_id = node.id,
+                    node_name = %node.name,
+                    field,
+                    value,
+                    pool = %pool,
+                    "refusing the WireGuard mesh pool: a node registered an address inside it"
+                );
+                return Err(MeshError::InvalidCidr {
+                    value: pool.to_string(),
+                    reason: format!(
+                        "node '{name}' (id {id}) registered its {field} as {value}, {role}. The \
+                         cluster CA signed that node a certificate for {ip}, so it could \
+                         impersonate whichever mesh member holds that address. Rotate the cluster CA \
+                         and re-enroll workers, or choose a pool that does not contain {ip}",
+                        name = node.name,
+                        id = node.id,
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The first of `claimed` (a registering node's name and addresses) that
+    /// is a mesh identity, whether or not the mesh is on: the control plane's
+    /// mesh address, any address of the mesh pool, another node's mesh
+    /// address or a pending pairing's. Each becomes an IP SAN on the leaf the
+    /// cluster CA signs, so a node holding one could impersonate its owner.
+    ///
+    /// Every mesh address is inside the pool (the pool cannot move while one
+    /// is assigned or reserved), so the pool check alone covers them; the
+    /// node and pairing lookups keep that true for rows written before the
+    /// pool was frozen for pending pairings, and name the holder.
+    pub async fn mesh_identity_claimed(
+        db: &DatabaseConnection,
+        claimed: &[String],
+    ) -> Result<Option<MeshIdentityClaim>, MeshError> {
+        let addresses: Vec<(String, Ipv4Addr)> = claimed
+            .iter()
+            .filter_map(|value| Some((value.clone(), identity_ipv4(value)?)))
+            .collect();
+        if addresses.is_empty() {
+            return Ok(None);
+        }
+        let cfg = load_config(db).await?;
+        if let Some(claim) = pool_claim(&addresses, reserved_mesh_pool(&cfg.wireguard_cidr)) {
+            return Ok(Some(claim));
+        }
+        let texts: Vec<String> = addresses.iter().map(|(_, ip)| ip.to_string()).collect();
+        let claimed_text = |address: &str| {
+            addresses
+                .iter()
+                .find(|(_, ip)| ip.to_string() == address)
+                .map(|(value, _)| value.clone())
+                .unwrap_or_else(|| address.to_string())
+        };
+        if let Some(node) = nodes::Entity::find()
+            .filter(nodes::Column::MeshWgAddress.is_in(texts.clone()))
+            .order_by_asc(nodes::Column::Id)
+            .one(db)
+            .await?
+        {
+            return Ok(Some(MeshIdentityClaim {
+                claimed: claimed_text(node.mesh_wg_address.as_deref().unwrap_or_default()),
+                holder: MeshIdentityHolder::Node {
+                    node_id: node.id,
+                    node_name: node.name,
+                },
+            }));
+        }
+        if let Some(pairing) = temps_entities::node_pairings::Entity::find()
+            .filter(temps_entities::node_pairings::Column::MeshAddress.is_in(texts))
+            .filter(temps_entities::node_pairings::Column::Status.is_in(crate::pairing::PENDING))
+            .order_by_asc(temps_entities::node_pairings::Column::Id)
+            .one(db)
+            .await?
+        {
+            return Ok(Some(MeshIdentityClaim {
+                claimed: claimed_text(&pairing.mesh_address),
+                holder: MeshIdentityHolder::Pairing {
+                    pairing_id: pairing.id,
+                    pairing_name: pairing.name,
+                },
+            }));
+        }
+        Ok(None)
     }
 
     /// Record the control plane's public key, and the endpoint workers dial
@@ -877,6 +1225,79 @@ mod tests {
             next_mesh_address(cidr, &full),
             Err(MeshError::Exhausted { cidr })
         );
+    }
+
+    #[test]
+    fn identities_are_read_as_ipv4_addresses_in_every_registered_form() {
+        let ip = Ipv4Addr::new(10, 201, 0, 1);
+        for value in [
+            "10.201.0.1",
+            " 10.201.0.1 ",
+            "10.201.0.1:3100",
+            "https://10.201.0.1:3100",
+            "http://10.201.0.1/api",
+            "[::ffff:10.201.0.1]:3100",
+            "::ffff:10.201.0.1",
+        ] {
+            assert_eq!(identity_ipv4(value), Some(ip), "{value}");
+        }
+        for value in [
+            "worker-1",
+            "fd00::1",
+            "[fd00::1]:3100",
+            "",
+            "https://node.example.com",
+        ] {
+            assert_eq!(identity_ipv4(value), None, "{value}");
+        }
+    }
+
+    #[test]
+    fn the_mesh_pool_is_reserved_even_when_unset_or_unreadable() {
+        assert_eq!(
+            reserved_mesh_pool("10.202.0.0/24"),
+            "10.202.0.0/24".parse::<Ipv4Net>().unwrap()
+        );
+        assert_eq!(
+            reserved_mesh_pool("10.202.0.9/24"),
+            "10.202.0.0/24".parse::<Ipv4Net>().unwrap()
+        );
+        assert_eq!(reserved_mesh_pool("garbage"), DEFAULT_MESH_CIDR);
+        assert_eq!(DEFAULT_MESH_CIDR.to_string(), "10.201.0.0/16");
+    }
+
+    #[test]
+    fn a_claim_on_the_control_plane_address_wins_over_one_inside_the_pool() {
+        let pool: Ipv4Net = "10.201.0.0/16".parse().unwrap();
+        let claimed = |values: &[&str]| -> Vec<(String, Ipv4Addr)> {
+            values
+                .iter()
+                .filter_map(|value| Some((value.to_string(), identity_ipv4(value)?)))
+                .collect()
+        };
+        assert_eq!(
+            pool_claim(&claimed(&["10.201.3.4", "https://10.201.0.1:3100"]), pool),
+            Some(MeshIdentityClaim {
+                claimed: "https://10.201.0.1:3100".into(),
+                holder: MeshIdentityHolder::ControlPlane {
+                    address: Ipv4Addr::new(10, 201, 0, 1)
+                },
+            })
+        );
+        assert_eq!(
+            pool_claim(&claimed(&["worker-1", "10.201.3.4"]), pool),
+            Some(MeshIdentityClaim {
+                claimed: "10.201.3.4".into(),
+                holder: MeshIdentityHolder::Pool { pool },
+            })
+        );
+        assert_eq!(
+            pool_claim(&claimed(&["worker-1", "10.100.0.2", "10.202.0.1"]), pool),
+            None
+        );
+        assert!(MeshIdentityHolder::Pool { pool }
+            .to_string()
+            .contains("10.201.0.0/16"));
     }
 
     #[test]

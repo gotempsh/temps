@@ -801,9 +801,11 @@ mod tests {
     #[tokio::test]
     async fn enabling_an_enabled_mesh_records_who_did_it_and_from_where() {
         let db = mock_db()
-            // enable: load_settings, then the locked read and the update
+            // enable: load_settings, then the locked read, the nodes (none
+            // inside the pool) and the update
             .append_query_results(vec![vec![network_config(true, false)]])
             .append_query_results(vec![vec![network_config(true, false)]])
+            .append_query_results(vec![Vec::<temps_entities::nodes::Model>::new()])
             .append_query_results(vec![vec![network_config(true, false)]])
             // status: load_settings, published_control_plane, the nodes
             .append_query_results(vec![vec![network_config(true, false)]])

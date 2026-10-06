@@ -73,6 +73,44 @@ pub(crate) async fn taken_addresses<C: sea_orm::ConnectionTrait>(
     Ok(taken)
 }
 
+/// Pairings in progress that have not expired: each holds an address of the
+/// current pool, and its code carries the pool and port.
+pub(crate) async fn pending_count<C: sea_orm::ConnectionTrait>(db: &C) -> Result<u64, MeshError> {
+    Ok(node_pairings::Entity::find()
+        .filter(node_pairings::Column::Status.is_in(PENDING))
+        .filter(node_pairings::Column::ExpiresAt.gt(chrono::Utc::now()))
+        .count(db)
+        .await?)
+}
+
+/// The pairing `enrollment_token_id` was minted for, if any.
+pub async fn for_enrollment_token(
+    db: &DatabaseConnection,
+    enrollment_token_id: i32,
+) -> Result<Option<node_pairings::Model>, MeshError> {
+    Ok(node_pairings::Entity::find()
+        .filter(node_pairings::Column::EnrollmentTokenId.eq(enrollment_token_id))
+        .one(db)
+        .await?)
+}
+
+/// Whether a registration redeeming `pairing`'s enrollment token arrived
+/// where only the paired node can send it from: the control plane's mesh
+/// node API (`node_api_peer` is the TCP peer that listener saw, `None` for
+/// any other listener), from the mesh address the pairing reserved. That
+/// address is routed only to the WireGuard key the pairing received, so a
+/// leaked pairing code cannot enroll a node from anywhere else (ADR 048).
+pub fn registration_source_matches(
+    pairing: &node_pairings::Model,
+    node_api_peer: Option<std::net::IpAddr>,
+) -> bool {
+    let (Some(peer), Ok(reserved)) = (node_api_peer, pairing.mesh_address.parse::<Ipv4Addr>())
+    else {
+        return false;
+    };
+    peer.to_canonical() == std::net::IpAddr::V4(reserved)
+}
+
 /// Create a pairing and reserve its mesh address.
 pub async fn create(
     db: &DatabaseConnection,
@@ -498,4 +536,66 @@ pub(crate) async fn peering<C: sea_orm::ConnectionTrait>(
         .order_by_asc(node_pairings::Column::Id)
         .all(db)
         .await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pairing(mesh_address: &str) -> node_pairings::Model {
+        let now = chrono::Utc::now();
+        node_pairings::Model {
+            id: 3,
+            pairing_id: "pairing-id".into(),
+            name: "edge-1".into(),
+            node_endpoint: "203.0.113.10:51820".into(),
+            mesh_address: mesh_address.into(),
+            secret_encrypted: "secret".into(),
+            enrollment_token_id: 9,
+            public_key: None,
+            status: STATUS_KEY_RECEIVED.into(),
+            last_error: None,
+            last_rejection: None,
+            last_attempt_at: None,
+            key_received_at: None,
+            expires_at: now,
+            node_id: None,
+            created_by_user_id: None,
+            dialing_until: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn a_pairing_token_is_only_accepted_over_the_mesh_from_the_reserved_address() {
+        let pairing = pairing("10.201.0.7");
+        // Over the mesh node API, from the address the pairing reserved.
+        assert!(registration_source_matches(
+            &pairing,
+            Some("10.201.0.7".parse().unwrap())
+        ));
+        assert!(registration_source_matches(
+            &pairing,
+            Some("::ffff:10.201.0.7".parse().unwrap())
+        ));
+        // The public API: no node API peer at all, whatever address it came
+        // from.
+        assert!(!registration_source_matches(&pairing, None));
+        // Another mesh member.
+        assert!(!registration_source_matches(
+            &pairing,
+            Some("10.201.0.8".parse().unwrap())
+        ));
+        // The pairing's own public endpoint is not its mesh address.
+        assert!(!registration_source_matches(
+            &pairing,
+            Some("203.0.113.10".parse().unwrap())
+        ));
+        // A corrupt reservation matches nothing.
+        assert!(!registration_source_matches(
+            &self::pairing("not-an-address"),
+            Some("10.201.0.7".parse().unwrap())
+        ));
+    }
 }

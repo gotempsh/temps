@@ -2481,6 +2481,16 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             .unwrap_or(true);
 
         if needs_write {
+            transaction
+                .execute(sea_orm::Statement::from_sql_and_values(
+                    transaction.get_database_backend(),
+                    "INSERT INTO cluster_certificate_history (ca_key) VALUES ($1)",
+                    [hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+                        material.0.as_bytes(),
+                    ))
+                    .into()],
+                ))
+                .await?;
             let now = Utc::now();
             if let Some(model) = existing {
                 let merged = current.to_json_merged(&model.data);
@@ -2551,6 +2561,16 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             return Err(ConfigServiceError::ClusterCaFingerprintMismatch);
         }
 
+        transaction
+            .execute(sea_orm::Statement::from_sql_and_values(
+                transaction.get_database_backend(),
+                "INSERT INTO cluster_certificate_history (ca_key) VALUES ($1)",
+                [hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+                    replacement_cert_pem.as_bytes(),
+                ))
+                .into()],
+            ))
+            .await?;
         current.multi_node.cluster_ca_cert_pem = Some(replacement_cert_pem);
         current.multi_node.cluster_ca_key_encrypted = Some(replacement_key_encrypted);
         let now = Utc::now();

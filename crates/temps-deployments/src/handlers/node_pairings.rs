@@ -5,9 +5,10 @@
 //!
 //! For a node the control plane can reach when nodes cannot reach the
 //! control plane (a control plane on a laptop or behind NAT): the operator
-//! enters the node's address, runs the returned `temps join --pair <code>` on
-//! it, and the control plane dials the node to learn its WireGuard public
-//! key. Private keys never leave their host.
+//! enters the node's address, runs the returned command (which feeds the code
+//! to `temps join --pair -` on stdin) on it, and the control plane dials the
+//! node to learn its WireGuard public key. Private keys never leave their
+//! host.
 //!
 //! The logic lives in [`NodePairingAdminService`]; these handlers check
 //! permissions, parse the node's address, record the audit trail and map
@@ -105,7 +106,7 @@ impl From<node_pairings::Model> for NodePairingResponse {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CreateNodePairingResponse {
     pub pairing: NodePairingResponse,
-    /// Run this on the node, as root: `temps join --pair <code>`.
+    /// Run this on the node, as root. It pipes the pairing code into `temps join --pair -`, so the code stays out of the process list and shell history.
     pub join_command: String,
 }
 
@@ -290,10 +291,30 @@ pub async fn create_node_pairing(
         StatusCode::CREATED,
         [(header::CACHE_CONTROL, "no-store")],
         Json(CreateNodePairingResponse {
-            join_command: format!("temps join --pair {}", code.as_str()),
+            join_command: join_command(code.as_str()),
             pairing: pairing.into(),
         }),
     ))
+}
+
+/// The one command the operator pastes on the node for pairing `code`.
+///
+/// The code is a secret for up to the pairing's TTL, so it never goes in a
+/// process's argv: `temps join --pair <code>` would leave it readable by
+/// every local user in `/proc/<pid>/cmdline` for as long as the join waits.
+/// `printf` is a builtin in every POSIX shell, so the code reaches
+/// `temps join --pair -` through a pipe and no process is started with it.
+/// `printf` rather than a `<<<` here-string, which dash lacks.
+///
+/// The leading space keeps the line out of the shell history where the
+/// shell honours it (bash with `HISTCONTROL=ignorespace`/`ignoreboth`, the
+/// Debian/Ubuntu default, zsh with `HIST_IGNORE_SPACE`); the code is
+/// single-use and expires either way.
+fn join_command(code: &str) -> String {
+    // A code is `tpair1.` + base64url and never holds a quote; escape one
+    // anyway so the command can never break out of its quoting.
+    let quoted = code.replace('\'', r"'\''");
+    format!(r" printf '%s\n' '{quoted}' | temps join --pair -")
 }
 
 /// Create a pairing for a node at `node_endpoint` and record it in the audit
@@ -721,10 +742,10 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("no-store")
         );
+        let command = body["join_command"].as_str().unwrap_or_default();
         assert!(
-            body["join_command"]
-                .as_str()
-                .is_some_and(|command| command.starts_with("temps join --pair ")),
+            command.starts_with(r" printf '%s\n' 'tpair1.")
+                && command.ends_with("' | temps join --pair -"),
             "{body}"
         );
         assert_eq!(body["pairing"]["id"], 5);
@@ -734,6 +755,28 @@ mod tests {
         assert_eq!(records[0].operation, "NODE_PAIRING_CREATED");
         assert_eq!(records[0].ip_address.as_deref(), Some(CLIENT_IP));
         assert_eq!(records[0].user_agent, CLIENT_AGENT);
+    }
+
+    #[test]
+    fn the_join_command_keeps_the_code_out_of_argv_and_history() {
+        let command = join_command("tpair1.abc-_9");
+        assert_eq!(
+            command,
+            r" printf '%s\n' 'tpair1.abc-_9' | temps join --pair -"
+        );
+        // The only process started is `temps`, and the code is not among
+        // its arguments.
+        let joined = command.rsplit('|').next().unwrap_or_default();
+        assert!(!joined.contains("tpair1"), "{command}");
+        assert!(command.starts_with(' '), "{command}");
+    }
+
+    #[test]
+    fn a_quote_in_a_code_cannot_break_out_of_the_command() {
+        assert_eq!(
+            join_command("a'b"),
+            r" printf '%s\n' 'a'\''b' | temps join --pair -"
+        );
     }
 
     #[tokio::test]

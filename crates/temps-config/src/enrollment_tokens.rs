@@ -129,23 +129,8 @@ impl EnrollmentTokenService {
         &self,
         plaintext: &str,
     ) -> Result<node_enrollment_tokens::Model, EnrollmentError> {
+        let row = self.validate(plaintext).await?;
         let token_hash = Self::hash(plaintext);
-
-        let row = node_enrollment_tokens::Entity::find()
-            .filter(node_enrollment_tokens::Column::TokenHash.eq(&token_hash))
-            .one(self.db.as_ref())
-            .await?
-            .ok_or(EnrollmentError::InvalidToken)?;
-
-        if row.revoked_at.is_some() {
-            return Err(EnrollmentError::Revoked);
-        }
-        if row.expires_at < chrono::Utc::now() {
-            return Err(EnrollmentError::Expired);
-        }
-        if row.used_count >= row.max_uses {
-            return Err(EnrollmentError::Exhausted);
-        }
 
         // Atomic conditional consume — guards against concurrent over-use.
         let stmt = Statement::from_sql_and_values(
@@ -170,6 +155,32 @@ impl EnrollmentTokenService {
             .await?
             .unwrap_or(row);
         Ok(updated)
+    }
+
+    /// Validate without consuming a use so registration can check its pins and source first.
+    pub async fn validate(
+        &self,
+        plaintext: &str,
+    ) -> Result<node_enrollment_tokens::Model, EnrollmentError> {
+        let token_hash = Self::hash(plaintext);
+
+        let row = node_enrollment_tokens::Entity::find()
+            .filter(node_enrollment_tokens::Column::TokenHash.eq(&token_hash))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(EnrollmentError::InvalidToken)?;
+
+        if row.revoked_at.is_some() {
+            return Err(EnrollmentError::Revoked);
+        }
+        if row.expires_at < chrono::Utc::now() {
+            return Err(EnrollmentError::Expired);
+        }
+        if row.used_count >= row.max_uses {
+            return Err(EnrollmentError::Exhausted);
+        }
+
+        Ok(row)
     }
 
     /// Give back one use consumed by [`Self::validate_and_consume`] when the

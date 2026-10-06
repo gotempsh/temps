@@ -14,8 +14,9 @@
 //! The listener follows the mesh settings: it binds once the control plane's
 //! end of the mesh is up, and binds again when the pool or port changes.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use axum::{
@@ -38,6 +39,27 @@ const SETTINGS_POLL: Duration = Duration::from_secs(10);
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 /// How long a connection has to finish its TLS handshake.
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long an HTTP/1 connection has to send a request's headers. hyper
+/// arms it whenever it waits for a request, so it also closes a keep-alive
+/// connection left idle this long.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// HTTP/2 keep-alive: ping an idle connection this often, and close it
+/// when a ping goes unanswered this long, so a vanished peer does not hold
+/// a connection slot.
+const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Requests in flight on one HTTP/2 connection. An agent makes a handful.
+const HTTP2_MAX_CONCURRENT_STREAMS: u32 = 32;
+/// Connections served at once, TLS handshake included. Every node holds a
+/// few (heartbeat, peer sync, routes); past this a new connection is closed
+/// on accept, so a misbehaving member cannot exhaust the control plane's
+/// tasks and file descriptors.
+const MAX_CONNECTIONS: usize = 1024;
+/// One mesh member cannot occupy every listener slot.
+const MAX_PEER_CONNECTIONS: usize = 16;
+/// At most one warning per this interval about connections refused at the
+/// limit, carrying how many were refused since the last one.
+const REFUSED_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Serve `api` (the console's `/api` routes) to mesh members for the life of
 /// the process.
@@ -49,11 +71,19 @@ pub(crate) fn spawn(
 ) {
     let app = api.layer(axum::middleware::from_fn(only_node_routes));
     tokio::spawn(async move {
+        let mut connections = ConnectionLimits::default();
         loop {
             let bound = match current_address(&db).await {
                 Some(address) => {
-                    serve_while_unchanged(&db, &config_service, &encryption_service, &app, address)
-                        .await
+                    serve_while_unchanged(
+                        &db,
+                        &config_service,
+                        &encryption_service,
+                        &app,
+                        address,
+                        &mut connections,
+                    )
+                    .await
                 }
                 None => false,
             };
@@ -95,6 +125,7 @@ async fn serve_while_unchanged(
     encryption_service: &EncryptionService,
     app: &Router,
     address: SocketAddr,
+    connections: &mut ConnectionLimits,
 ) -> bool {
     let tls = match tls_config(config_service, encryption_service, address.ip()).await {
         Ok(tls) => tls,
@@ -120,10 +151,28 @@ async fn serve_while_unchanged(
     let mut settings_poll =
         tokio::time::interval_at(tokio::time::Instant::now() + SETTINGS_POLL, SETTINGS_POLL);
     settings_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut refused = RefusedConnections::default();
     loop {
         tokio::select! {
             accepted = listener.accept() => match accepted {
-                Ok((stream, peer)) => serve_connection(acceptor.clone(), app.clone(), stream, peer),
+                Ok((stream, peer)) => match connections.acquire(peer.ip()) {
+                    Some(permit) => {
+                        serve_connection(acceptor.clone(), app.clone(), stream, peer, permit)
+                    }
+                    None => {
+                        // Closed at once: no task, no TLS handshake.
+                        drop(stream);
+                        if let Some(count) = refused.record(std::time::Instant::now()) {
+                            warn!(
+                                %address,
+                                %peer,
+                                refused = count,
+                                limit = MAX_CONNECTIONS,
+                                "node API: at its connection limit; refusing new connections"
+                            );
+                        }
+                    }
+                },
                 Err(error) => {
                     warn!(%error, "node API: accept failed");
                     tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
@@ -139,16 +188,111 @@ async fn serve_while_unchanged(
     }
 }
 
+/// The accept loop owns this bounded map; connection tasks only own permits.
+struct ConnectionLimits {
+    global: Arc<tokio::sync::Semaphore>,
+    peers: HashMap<IpAddr, Weak<tokio::sync::Semaphore>>,
+}
+
+struct ConnectionPermits {
+    _global: tokio::sync::OwnedSemaphorePermit,
+    _peer: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Default for ConnectionLimits {
+    fn default() -> Self {
+        Self {
+            global: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
+            peers: HashMap::new(),
+        }
+    }
+}
+
+impl ConnectionLimits {
+    fn acquire(&mut self, ip: IpAddr) -> Option<ConnectionPermits> {
+        let global = self.global.clone().try_acquire_owned().ok()?;
+        let peer = match self.peers.get(&ip).and_then(Weak::upgrade) {
+            Some(peer) => peer,
+            None => {
+                // Only active connections keep entries alive. Sweep at the
+                // bound, rather than scanning every entry on every accept.
+                if self.peers.len() >= MAX_CONNECTIONS {
+                    self.peers.retain(|_, peer| peer.strong_count() > 0);
+                }
+                let peer = Arc::new(tokio::sync::Semaphore::new(MAX_PEER_CONNECTIONS));
+                self.peers.insert(ip, Arc::downgrade(&peer));
+                peer
+            }
+        };
+        Some(ConnectionPermits {
+            _global: global,
+            _peer: peer.try_acquire_owned().ok()?,
+        })
+    }
+}
+
+/// Connections refused at [`MAX_CONNECTIONS`], logged at most once per
+/// [`REFUSED_LOG_INTERVAL`] so a flood does not become a log flood.
+#[derive(Debug, Default)]
+struct RefusedConnections {
+    /// Refused since the last warning.
+    unlogged: u64,
+    last_logged: Option<std::time::Instant>,
+}
+
+impl RefusedConnections {
+    /// Count a refused connection. Returns how many to report when a
+    /// warning is due now.
+    fn record(&mut self, now: std::time::Instant) -> Option<u64> {
+        self.unlogged = self.unlogged.saturating_add(1);
+        let due = self
+            .last_logged
+            .is_none_or(|last| now.saturating_duration_since(last) >= REFUSED_LOG_INTERVAL);
+        if !due {
+            return None;
+        }
+        self.last_logged = Some(now);
+        Some(std::mem::take(&mut self.unlogged))
+    }
+}
+
+/// The HTTP server for one connection: HTTP/1 must send its headers within
+/// `header_read_timeout` ([`HEADER_READ_TIMEOUT`] in production), HTTP/2
+/// must answer keep-alive pings, and neither runs without a timer (hyper
+/// skips both without one).
+fn http_builder(
+    header_read_timeout: Duration,
+) -> hyper_util::server::conn::auto::Builder<hyper_util::rt::TokioExecutor> {
+    use hyper_util::rt::{TokioExecutor, TokioTimer};
+
+    let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(header_read_timeout);
+    builder
+        .http2()
+        .timer(TokioTimer::new())
+        .keep_alive_interval(HTTP2_KEEP_ALIVE_INTERVAL)
+        .keep_alive_timeout(HTTP2_KEEP_ALIVE_TIMEOUT)
+        .max_concurrent_streams(HTTP2_MAX_CONCURRENT_STREAMS);
+    builder
+}
+
+/// Serve one accepted connection. `permit` is its slot under
+/// [`MAX_CONNECTIONS`], released when the connection ends.
 fn serve_connection(
     acceptor: tokio_rustls::TlsAcceptor,
     app: Router,
     stream: tokio::net::TcpStream,
     peer: SocketAddr,
+    permit: ConnectionPermits,
 ) {
-    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::rt::TokioIo;
     use tower::Service;
 
     tokio::spawn(async move {
+        let _permit = permit;
         let tls = match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
             Ok(Ok(tls)) => tls,
             Ok(Err(error)) => {
@@ -162,18 +306,31 @@ fn serve_connection(
         };
         let service = hyper::service::service_fn(
             move |mut request: hyper::Request<hyper::body::Incoming>| {
-                request.extensions_mut().insert(ConnectInfo(peer));
+                mark_node_api_request(request.extensions_mut(), peer);
                 let mut app = app.clone();
                 async move { app.call(request.map(Body::new)).await }
             },
         );
-        if let Err(error) = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+        if let Err(error) = http_builder(HEADER_READ_TIMEOUT)
             .serve_connection(TokioIo::new(tls), service)
             .await
         {
             warn!(%peer, %error, "node API: connection error");
         }
     });
+}
+
+/// Record on a request served by this listener the TCP peer it came from:
+/// as `ConnectInfo` (what the handlers' rate limiting and logs read), and as
+/// [`NodeApiPeer`], which tells the registration handler the request arrived
+/// over the mesh node API so it can accept a pairing's enrollment token from
+/// the pairing's reserved mesh address only. Both come from the accepted
+/// socket; nothing the client sends can set them.
+///
+/// [`NodeApiPeer`]: temps_deployments::handlers::nodes::NodeApiPeer
+fn mark_node_api_request(extensions: &mut axum::http::Extensions, peer: SocketAddr) {
+    extensions.insert(ConnectInfo(peer));
+    extensions.insert(temps_deployments::handlers::nodes::NodeApiPeer(peer));
 }
 
 /// A server certificate for the control plane's mesh address, from the
@@ -190,8 +347,10 @@ async fn tls_config(
     server_config(&ca.cert_pem, &ca.key_pem, address)
 }
 
-/// A TLS server config presenting a fresh leaf for `address`, signed by the
-/// CA in `ca_cert_pem`/`ca_key_pem`, followed by the CA itself.
+/// A TLS server config presenting a fresh leaf, signed by the CA in
+/// `ca_cert_pem`/`ca_key_pem`, followed by the CA itself. The leaf is for the
+/// reserved control-plane name, which nodes verify, and for `address`, which
+/// nodes enrolled before the reserved name existed still verify.
 fn server_config(
     ca_cert_pem: &str,
     ca_key_pem: &str,
@@ -199,7 +358,7 @@ fn server_config(
 ) -> Result<rustls::ServerConfig, String> {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-    let sans = vec![address.to_string()];
+    let sans = temps_core::node_pki::control_plane_node_api_sans(address);
     let csr = temps_core::node_pki::generate_node_keypair_csr("temps-control-plane", &sans)
         .map_err(|error| error.to_string())?;
     let signed = temps_core::node_pki::sign_node_csr(ca_cert_pem, ca_key_pem, &csr.csr_pem, &sans)
@@ -279,6 +438,98 @@ mod tests {
     use super::*;
     use axum::http::{Method, Request as HttpRequest};
     use tower::ServiceExt;
+
+    #[test]
+    fn one_peer_cannot_exhaust_the_listener_and_slots_are_released() {
+        let mut limits = ConnectionLimits::default();
+        let noisy: IpAddr = "10.201.0.2".parse().unwrap();
+        let other: IpAddr = "10.201.0.3".parse().unwrap();
+        let permits: Vec<_> = (0..MAX_PEER_CONNECTIONS)
+            .map(|_| limits.acquire(noisy).unwrap())
+            .collect();
+        assert!(limits.acquire(noisy).is_none());
+        assert!(limits.acquire(other).is_some());
+        drop(permits);
+        assert!(limits.acquire(noisy).is_some());
+        for ip in 1..=2048u32 {
+            assert!(limits.acquire(IpAddr::V4(ip.into())).is_some());
+        }
+        assert!(limits.peers.len() <= MAX_CONNECTIONS);
+    }
+
+    #[test]
+    fn refused_connections_are_counted_and_logged_at_a_bounded_rate() {
+        let start = std::time::Instant::now();
+        let mut refused = RefusedConnections::default();
+        // The first one is reported at once.
+        assert_eq!(refused.record(start), Some(1));
+        // A flood within the interval is only counted.
+        for i in 1..=500 {
+            assert_eq!(refused.record(start + Duration::from_millis(i)), None);
+        }
+        // The next warning carries everything refused since the last.
+        assert_eq!(refused.record(start + REFUSED_LOG_INTERVAL), Some(501));
+        assert_eq!(
+            refused.record(start + REFUSED_LOG_INTERVAL + Duration::from_secs(1)),
+            None
+        );
+    }
+
+    /// Serve one plain-TCP connection with the node API's HTTP settings.
+    async fn one_connection(
+        header_read_timeout: Duration,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        use hyper_util::rt::TokioIo;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let service = hyper::service::service_fn(|_request| async {
+                Ok::<_, std::convert::Infallible>(hyper::Response::new(Body::from("ok")))
+            });
+            let _ = http_builder(header_read_timeout)
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+        (address, server)
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_never_finishes_its_headers_is_closed() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (address, server) = one_connection(Duration::from_millis(200)).await;
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(b"GET /api/internal/nodes/1/heartbeat HTTP/1.1\r\nHost: x\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), client.read_to_end(&mut response))
+            .await
+            .expect("the server kept a connection with unfinished headers open")
+            .ok();
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("the connection task did not end")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_complete_request_is_still_served() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (address, _server) = one_connection(Duration::from_millis(200)).await;
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), client.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+    }
 
     /// The node API's filter in front of a router shaped like the console's:
     /// node routes, admin routes on the same prefix, and a fallback, so a
@@ -455,6 +706,52 @@ mod tests {
             hex::encode(sha2::Sha256::digest(&chain[1])),
             temps_core::node_pki::ca_fingerprint_sha256(&ca.cert_pem).unwrap()
         );
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn requests_on_the_node_api_carry_their_tcp_peer() {
+        let peer: SocketAddr = "10.201.0.7:40312".parse().unwrap();
+        let mut extensions = axum::http::Extensions::new();
+        mark_node_api_request(&mut extensions, peer);
+        assert_eq!(
+            extensions
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|info| info.0),
+            Some(peer)
+        );
+        assert_eq!(
+            extensions.get::<temps_deployments::handlers::nodes::NodeApiPeer>(),
+            Some(&temps_deployments::handlers::nodes::NodeApiPeer(peer))
+        );
+    }
+
+    /// Nodes verify the node API by the reserved control-plane name, not by
+    /// the mesh address they connect to, so a worker's leaf for that address
+    /// is not accepted in its place (see `node_pki::CONTROL_PLANE_SERVER_NAME`).
+    #[tokio::test]
+    async fn nodes_verify_the_node_api_by_the_reserved_name() {
+        use rustls::pki_types::ServerName;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let ca = temps_core::node_pki::generate_cluster_ca().unwrap();
+        let address: IpAddr = "127.0.0.1".parse().unwrap();
+        let config = server_config(&ca.cert_pem, &ca.key_pem, address).unwrap();
+        let listener = tokio::net::TcpListener::bind((address, 0)).await.unwrap();
+        let bound = listener.local_addr().unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _tls = acceptor.accept(stream).await.unwrap();
+        });
+
+        let client =
+            temps_core::node_pki::control_plane_client_config(ca.cert_pem.as_bytes()).unwrap();
+        let stream = tokio::net::TcpStream::connect(bound).await.unwrap();
+        tokio_rustls::TlsConnector::from(Arc::new(client))
+            .connect(ServerName::IpAddress(address.into()), stream)
+            .await
+            .expect("the node API's leaf carries the reserved control-plane name");
         server.await.unwrap();
     }
 

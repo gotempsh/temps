@@ -52,6 +52,10 @@ arc-swap = "1.7"
 # workspace 0.14.8; node_pki.rs was migrated to the 0.14 `Issuer` API in #250
 # (merged from main), so the earlier 0.13.2 pin is no longer needed.
 rcgen = { workspace = true }
+# TLS client config that verifies the control plane's node API by its
+# reserved server name rather than by the address it is reached at
+# (`node_pki::control_plane_client_config`).
+rustls = { workspace = true }
 # The process-wide Docker client handle (`docker_handle`) lives here because
 # every plugin resolves it from the shared service registry, and it must be
 # resolvable in a process that has no daemon at all.

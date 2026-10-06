@@ -299,6 +299,25 @@ pub struct NodeSshEnrollmentFailedAudit {
     pub error: String,
 }
 
+/// An operator read a server's SSH host key (`POST /nodes/ssh/host-key`).
+/// Not a write, but it opens a connection from the control plane to an
+/// address the caller chooses, so every attempt is recorded, whatever its
+/// outcome. Never carries credentials: reading a host key takes none.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeSshHostKeyProbedAudit {
+    pub context: AuditContext,
+    /// The host as the operator typed it.
+    pub host: String,
+    pub port: u16,
+    /// `ip:port` it resolved to, when it did.
+    pub address: Option<String>,
+    /// `host_key_read`, `refused_target` (invalid or not allowed),
+    /// `unreachable` (no SSH server answered) or `error`.
+    pub outcome: String,
+    /// The fingerprint read, when one was.
+    pub fingerprint: Option<String>,
+}
+
 // ── Traefik discovery audits ────────────────────────────────────────────────
 
 /// An operator suppressed or restored a single Traefik-discovered route.
@@ -424,6 +443,7 @@ impl_audit_operation!(
     "NODE_SSH_ENROLLMENT_SUCCEEDED"
 );
 impl_audit_operation!(NodeSshEnrollmentFailedAudit, "NODE_SSH_ENROLLMENT_FAILED");
+impl_audit_operation!(NodeSshHostKeyProbedAudit, "NODE_SSH_HOST_KEY_PROBED");
 impl_audit_operation!(
     TraefikDiscoveredRouteToggledAudit,
     "TRAEFIK_DISCOVERED_ROUTE_TOGGLED"
@@ -440,3 +460,25 @@ impl_audit_operation!(
     TraefikDiscoveredRouteCertDeauthorizedAudit,
     "TRAEFIK_DISCOVERED_ROUTE_CERT_DEAUTHORIZED"
 );
+
+/// A node replaced the WireGuard mesh key it had registered.
+///
+/// Recorded rather than only logged: the key is what every mesh member
+/// trusts as this node, it is supplied by the node itself, and a change
+/// means either the agent re-keyed (a reinstall, a lost key file) or
+/// something holding the node's token took its place on the mesh. Public
+/// keys are not secret, so both are kept in full to compare with
+/// `wg show` on the node. Not recorded on a node's first registration or
+/// when only the endpoint moves.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeMeshKeyChangedAudit {
+    pub context: AuditContext,
+    pub node_id: i32,
+    pub node_name: String,
+    pub old_public_key: String,
+    pub new_public_key: String,
+    pub old_endpoint: Option<String>,
+    pub new_endpoint: String,
+}
+
+impl_audit_operation!(NodeMeshKeyChangedAudit, "NODE_MESH_KEY_CHANGED");
