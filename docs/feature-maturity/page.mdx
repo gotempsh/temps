@@ -78,3 +78,18 @@ capabilities: actual default state, configuration prerequisites, UI onboarding,
 API permission checks and explicit opt-in behavior. Any feature that is enabled
 by default must be fixed or called out as an unresolved release blocker; a badge
 or missing provider configuration does not establish that it is disabled.
+
+### Known default-state gaps to qualify
+
+Source inspection at the qualification base (`e70c36a78`) found the following;
+these are not live execution results and do not close the defaults audit:
+
+| Capability | Observed source default | Release gate |
+| --- | --- | --- |
+| Workspace preview gateway | `PreviewGatewaySettings::default()` has `enabled: true` and `auto_upgrade: true`; legacy settings also deserialize enabled | Verify bootstrap behavior and require an explicit opt-in decision/change for the Experimental preview surface |
+| Agent sandbox creation | `AgentSandboxSettings::default()` has `allowed_node_ids: None` (all nodes eligible); the legacy `enabled` field is always true and ignored at runtime | Verify creation permissions and placement controls; the legacy field is not an off switch |
+
+Both definitions are in `crates/temps-core/src/app_settings.rs`. Missing AI
+credentials may prevent an agent run, but do not prove sandbox creation or
+preview infrastructure is disabled. Retest fresh and upgraded settings after any
+default change, preserving explicit operator choices and visible onboarding.
