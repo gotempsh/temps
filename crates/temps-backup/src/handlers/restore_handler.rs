@@ -51,6 +51,13 @@ impl From<RestoreError> for Problem {
                     .with_title("Cross-Service Restore Not Confirmed")
                     .with_detail(error.to_string())
             }
+            RestoreError::RestoreAlreadyActive { restore_run_id, .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_type("https://temps.sh/probs/restore-already-active")
+                    .with_title("Restore Already In Progress")
+                    .with_detail(error.to_string())
+                    .with_value("active_restore_run_id", restore_run_id)
+            }
             RestoreError::BackupHasNoService { .. }
             | RestoreError::Validation { .. }
             | RestoreError::UnsupportedMode { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
@@ -59,6 +66,7 @@ impl From<RestoreError> for Problem {
             internal_error @ (RestoreError::Database(_)
             | RestoreError::Encryption { .. }
             | RestoreError::ExternalService { .. }
+            | RestoreError::WorkerCrashed { .. }
             | RestoreError::Internal { .. }) => {
                 error!(error = %internal_error, "restore request failed internally");
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
@@ -821,6 +829,48 @@ mod tests {
             .unwrap_or_default()
             .to_string();
         assert!(detail.contains("confirm_cross_service"), "{detail}");
+    }
+
+    /// A second restore onto a service that already has one active is a
+    /// conflict the client can act on (attach to the running restore), not
+    /// the opaque 500 the unique index used to produce.
+    #[test]
+    fn active_restore_conflict_maps_to_409_naming_the_run() {
+        let problem: Problem = RestoreError::RestoreAlreadyActive {
+            service_id: 7,
+            restore_run_id: 42,
+        }
+        .into();
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert_eq!(
+            problem.body.get("type").and_then(|t| t.as_str()),
+            Some("https://temps.sh/probs/restore-already-active")
+        );
+        assert_eq!(
+            problem
+                .body
+                .get("active_restore_run_id")
+                .and_then(|id| id.as_i64()),
+            Some(42)
+        );
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|d| d.as_str())
+            .unwrap_or_default();
+        assert!(detail.contains("run 42"), "{detail}");
+        assert!(detail.contains("Service 7"), "{detail}");
+    }
+
+    #[test]
+    fn worker_crash_maps_to_500_without_leaking_details() {
+        let problem: Problem = RestoreError::WorkerCrashed {
+            restore_run_id: 3,
+            phase: "restore".into(),
+            reason: "task panicked".into(),
+        }
+        .into();
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]

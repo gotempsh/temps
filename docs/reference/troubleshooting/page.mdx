@@ -306,6 +306,20 @@ If the default port is already taken, Temps picks the next free port. For the st
 
 ---
 
+## Restores {{ anchor: true, id: 'restores' }}
+
+A restore runs on the server, not in your browser. Its page address carries the run (`?run=<id>`), so you can reload, leave, or sign in again and pick the run back up. Opening the restore page for a database with a restore in progress attaches to that run.
+
+| Status or message | Meaning and next step |
+|---------|-----|
+| `Restore status could not be refreshed; the restore may still be running.` | The console could not read the run's status (network, server or permission problem). The restore itself is unaffected. Retry, or copy the run ID and check it later |
+| `interrupted` — `This restore was interrupted when Temps restarted during <phase> ...` | Temps restarted while the restore was running. On the next start it stops any restore helper container still writing to the database, then marks the run interrupted. Nothing is rolled back or replayed. The database may be partially restored: check its health and data, then start a new restore |
+| `409 Restore Already In Progress` — `Service <id> already has an active restore (run <run-id>)` | Only one in-place restore (or point-in-time restore in place) can run per database. Follow the named run instead of starting another |
+
+If a run stays `running` after a restart, check the server log for `Restore run left active`. Temps keeps the run active when it cannot confirm that its helper containers have stopped, for example while Docker is still starting, and retries for about 30 minutes.
+
+---
+
 ## Still stuck {{ anchor: true, id: 'still-stuck' }}
 
 - Run `temps doctor` and keep its output.

@@ -267,6 +267,16 @@ curl -X DELETE "https://your-temps-instance/api/external-services/{id}" \
 
 ---
 
+## Restore a service from a backup {{ anchor: true, id: 'restore-a-service' }}
+
+Open the service and choose **Restore…** from its actions menu. You can restore in place (overwrites this database), into a new service, or to a point in time where the engine supports it.
+
+- **The restore keeps running if you leave.** The page address includes the run (`?run=<id>`), and reopening the restore page for the database attaches to any restore that is still running.
+- **One destructive restore at a time.** Starting a second in-place restore while one is running returns `409 Restore Already In Progress`, naming the active run.
+- **Restarts are reconciled.** If Temps restarts mid-restore, the run is marked `interrupted` on the next start, after any restore helper container still running has been stopped. Nothing is rolled back: check the database's health and data before restoring again. See [Troubleshooting](/docs/troubleshooting#restores).
+
+---
+
 ## Upgrade a service {{ anchor: true, id: 'upgrade-a-service' }}
 
 To update the Docker image (e.g. from PostgreSQL 17 to 18):

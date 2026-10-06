@@ -312,6 +312,7 @@ mod m20261002_000001_add_bunny_hostname_owned;
 mod m20261005_000001_ai_gateway_objects;
 mod m20261005_000001_certificate_address_history;
 mod m20261005_000002_ai_batch_reconciliation;
+mod m20261006_000001_restore_runs_interrupted_status;
 
 pub struct Migrator;
 
@@ -695,6 +696,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261005_000001_ai_gateway_objects::Migration),
             Box::new(m20261005_000002_ai_batch_reconciliation::Migration),
             Box::new(m20261005_000001_certificate_address_history::Migration),
+            Box::new(m20261006_000001_restore_runs_interrupted_status::Migration),
         ]
     }
 }

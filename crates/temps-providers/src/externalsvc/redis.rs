@@ -1241,6 +1241,9 @@ impl RedisService {
                 restore_script.to_string(),
             ]),
             env: Some(walg_env),
+            labels: Some(super::restore_helper::restore_helper_labels(
+                target_container_name,
+            )),
             host_config: Some(HostConfig {
                 volumes_from: Some(vec![target_container_name.to_string()]),
                 ..Default::default()
@@ -1505,11 +1508,14 @@ impl RedisService {
     /// archive, so `tar::Archive::new()` failed immediately with "failed to
     /// iterate over archive". This version:
     ///
-    /// 1. Downloads and gzip-decodes the backup to a host temp file.
+    /// 1. Streams the backup to a host temp file and gzip-decodes it to a
+    ///    second one (constant memory).
     /// 2. Disables the container's restart policy then stops it (prevents
     ///    Docker from auto-restarting before the helper can write the volume).
     /// 3. Runs a short-lived helper container with `volumes_from` on the
-    ///    stopped container. The helper copies the RDB, rebuilds the Redis 7+
+    ///    stopped container. The RDB is uploaded into the helper through the
+    ///    Docker archive API (no host bind mount, so it works when Docker
+    ///    runs in a VM or on another host). The helper copies the RDB, rebuilds the Redis 7+
     ///    multi-part AOF directory (`appendonlydir/`) with a manifest pointing
     ///    to the RDB as the base, and chowns everything to `redis:redis`.
     ///    A bare `dump.rdb` is ignored on startup by Redis 7 when AOF is
@@ -1524,45 +1530,32 @@ impl RedisService {
     ) -> Result<()> {
         info!("Restoring Redis from rdb.gz backup: {}", backup_location);
 
-        // ── 1. Download the .rdb.gz from S3 ─────────────────────────────────
-        let get_obj = s3_client
-            .get_object()
-            .bucket(&s3_source.bucket_name)
-            .key(backup_location)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("S3 GetObject failed for {}: {}", backup_location, e))?;
-
-        let gz_bytes = get_obj
-            .body
-            .collect()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to read S3 body: {}", e))?
-            .to_vec();
-
-        // Decompress the gzip to raw RDB bytes.
-        let rdb_bytes = {
-            use std::io::Read;
-            let mut decoder = GzDecoder::new(gz_bytes.as_slice());
-            let mut buf = Vec::new();
-            decoder
-                .read_to_end(&mut buf)
-                .map_err(|e| anyhow::anyhow!("Failed to gunzip Redis backup: {}", e))?;
-            buf
-        };
-
-        // ── 2. Write RDB to a host temp dir (bind-mounted into the helper) ──
-        let temp_dir =
-            tempfile::tempdir().map_err(|e| anyhow::anyhow!("Failed to create temp dir: {}", e))?;
-        let rdb_host_path = temp_dir.path().join("restore.rdb");
-        tokio::fs::write(&rdb_host_path, &rdb_bytes)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to write RDB to temp dir: {}", e))?;
-        let temp_dir_str = temp_dir
-            .path()
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("temp dir path is not valid UTF-8"))?
-            .to_string();
+        // ── 1. Stream the .rdb.gz from S3 and gunzip it on the host ─────────
+        //
+        // Both steps go through files in a private temp dir, so memory stays
+        // constant however large the snapshot is. The temp dir is only read
+        // by Temps itself: the RDB reaches the helper through the Docker
+        // archive API (step 6), never through a bind mount, so it does not
+        // matter whether Docker (Colima, Docker Desktop, a remote daemon)
+        // can see this host's temp dir.
+        let temp_dir = tempfile::tempdir().map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to create a temp dir to stage Redis backup {}: {}",
+                backup_location,
+                e
+            )
+        })?;
+        let gz_host_path = temp_dir.path().join("restore.rdb.gz");
+        let rdb_host_path = temp_dir.path().join(RDB_RESTORE_FILE_NAME);
+        download_s3_object_to_file(
+            s3_client,
+            &s3_source.bucket_name,
+            backup_location,
+            &gz_host_path,
+        )
+        .await?;
+        gunzip_file(&gz_host_path, &rdb_host_path, backup_location).await?;
+        let _ = tokio::fs::remove_file(&gz_host_path).await;
 
         // ── 3. Resolve the target container name ─────────────────────────────
         let container_name = self
@@ -1617,20 +1610,23 @@ impl RedisService {
             })?;
 
         // ── 6. Run helper container to write RDB and rebuild AOF directory ───
-        // The restore script:
-        //   a. Copies the bind-mounted RDB to /data/dump.rdb
+        // The RDB is uploaded into the created (not yet started) helper with
+        // the Docker archive API, then the restore script:
+        //   a. Copies the uploaded RDB to /data/dump.rdb
         //   b. Removes any stale appendonlydir
         //   c. Creates appendonlydir/ with the RDB as the AOF base file
         //   d. Writes the AOF manifest pointing to the base file
         //   e. Chowns everything to redis:redis so Redis can read on startup
-        let restore_script = "cp /restore/restore.rdb /data/dump.rdb && \
+        let restore_script = format!(
+            "cp {RDB_RESTORE_DIR}/{RDB_RESTORE_FILE_NAME} /data/dump.rdb && \
+             rm -f {RDB_RESTORE_DIR}/{RDB_RESTORE_FILE_NAME} && \
              rm -rf /data/appendonlydir && \
              mkdir -p /data/appendonlydir && \
              cp /data/dump.rdb /data/appendonlydir/appendonly.aof.1.base.rdb && \
              printf 'file appendonly.aof.1.base.rdb seq 1 type b\\n' > /data/appendonlydir/appendonly.aof.manifest && \
              chown -R redis:redis /data/dump.rdb /data/appendonlydir && \
              echo 'Legacy restore helper completed successfully'"
-            .to_string();
+        );
 
         let helper_id = uuid::Uuid::new_v4()
             .to_string()
@@ -1645,9 +1641,11 @@ impl RedisService {
             image: Some(redis_image.clone()),
             cmd: Some(vec!["sh".to_string(), "-c".to_string(), restore_script]),
             user: Some("root".to_string()),
+            labels: Some(super::restore_helper::restore_helper_labels(
+                &container_name,
+            )),
             host_config: Some(HostConfig {
                 volumes_from: Some(vec![container_name.clone()]),
-                binds: Some(vec![format!("{}:/restore:ro", temp_dir_str)]),
                 network_mode: Some("none".to_string()),
                 ..Default::default()
             }),
@@ -1667,13 +1665,64 @@ impl RedisService {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to create rdb restore helper container: {}", e))?;
 
-        self.docker
-            .start_container(
-                &helper.id,
-                None::<bollard::query_parameters::StartContainerOptions>,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to start rdb restore helper container: {}", e))?;
+        // Upload, then start. Either failing leaves a created helper behind,
+        // so remove it and give the stopped Redis its restart policy back
+        // before reporting the error.
+        let prepared = match super::container_upload::upload_file_to_container(
+            &self.docker,
+            &helper.id,
+            &rdb_host_path,
+            RDB_RESTORE_DIR,
+            RDB_RESTORE_FILE_NAME,
+            0o644,
+            REDIS_BACKUP_EXEC_TIMEOUT,
+        )
+        .await
+        {
+            Ok(()) => self
+                .docker
+                .start_container(
+                    &helper.id,
+                    None::<bollard::query_parameters::StartContainerOptions>,
+                )
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to start rdb restore helper container {} for '{}': {}",
+                        helper_name,
+                        container_name,
+                        e
+                    )
+                }),
+            Err(e) => Err(anyhow::Error::from(e)),
+        };
+        if let Err(e) = prepared {
+            let _ = self
+                .docker
+                .remove_container(
+                    &helper.id,
+                    Some(bollard::query_parameters::RemoveContainerOptions {
+                        force: true,
+                        v: false,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+            let _ = self
+                .docker
+                .update_container(
+                    &container_name,
+                    bollard::models::ContainerUpdateBody {
+                        restart_policy: Some(bollard::models::RestartPolicy {
+                            name: Some(bollard::models::RestartPolicyNameEnum::ALWAYS),
+                            maximum_retry_count: None,
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            return Err(e);
+        }
 
         // Wait for the helper to finish.
         use futures::StreamExt;
@@ -2028,6 +2077,94 @@ impl RedisService {
 
 /// Internal port used by Redis inside the container
 const REDIS_INTERNAL_PORT: &str = "6379";
+
+/// Directory inside the RDB restore helper that the snapshot is uploaded to.
+/// Exists in every Redis image; never bind-mounted.
+const RDB_RESTORE_DIR: &str = "/tmp";
+/// File name of the uploaded snapshot inside [`RDB_RESTORE_DIR`] (and of the
+/// staged copy in the host temp dir).
+const RDB_RESTORE_FILE_NAME: &str = "temps-restore.rdb";
+
+/// Stream an S3 object into a new file at `dest`, chunk by chunk.
+async fn download_s3_object_to_file(
+    s3_client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    dest: &std::path::Path,
+) -> Result<u64> {
+    use tokio::io::AsyncWriteExt;
+
+    let object = s3_client
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("S3 GetObject failed for s3://{}/{}: {}", bucket, key, e))?;
+    let mut body = object.body;
+    let mut file = tokio::fs::File::create(dest).await.map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to create {} to stage s3://{}/{}: {}",
+            dest.display(),
+            bucket,
+            key,
+            e
+        )
+    })?;
+    let mut written = 0_u64;
+    while let Some(chunk) = body.try_next().await.map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to read s3://{}/{} after {} bytes: {}",
+            bucket,
+            key,
+            written,
+            e
+        )
+    })? {
+        file.write_all(&chunk).await.map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to write s3://{}/{} into {}: {}",
+                bucket,
+                key,
+                dest.display(),
+                e
+            )
+        })?;
+        written += chunk.len() as u64;
+    }
+    file.flush()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to flush {}: {}", dest.display(), e))?;
+    Ok(written)
+}
+
+/// Gunzip `src` into a new file at `dest` on a blocking thread, streaming.
+async fn gunzip_file(
+    src: &std::path::Path,
+    dest: &std::path::Path,
+    backup_location: &str,
+) -> Result<u64> {
+    let src = src.to_path_buf();
+    let dest = dest.to_path_buf();
+    let location = backup_location.to_string();
+    tokio::task::spawn_blocking(move || -> Result<u64> {
+        let input = std::fs::File::open(&src)
+            .map_err(|e| anyhow::anyhow!("Failed to open {}: {}", src.display(), e))?;
+        let mut decoder = GzDecoder::new(std::io::BufReader::new(input));
+        let mut output = std::fs::File::create(&dest)
+            .map_err(|e| anyhow::anyhow!("Failed to create {}: {}", dest.display(), e))?;
+        std::io::copy(&mut decoder, &mut output)
+            .map_err(|e| anyhow::anyhow!("Failed to gunzip Redis backup {}: {}", location, e))
+    })
+    .await
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "Gunzip task for Redis backup {} failed: {}",
+            backup_location,
+            e
+        )
+    })?
+}
 
 /// Docker-free, static metadata about this engine.
 ///
@@ -4446,5 +4583,216 @@ mod tests {
             "redis-test-docker-env-mode"
         );
         assert_eq!(env_vars.get("REDIS_PORT").unwrap(), "6379"); // Internal port
+    }
+
+    // ── RDB restore upload (no host bind mount) ─────────────────────────
+
+    /// End-to-end `.rdb.gz` restore against a plain Redis image (no WAL-G),
+    /// with the snapshot uploaded into the helper through the Docker archive
+    /// API. Run it with the OS default temp dir: on macOS with Colima or
+    /// Docker Desktop that dir is not visible to Docker, which is where the
+    /// old `{temp_dir}:/restore:ro` bind mount failed.
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_redis_rdb_gz_restore_without_a_shared_temp_dir() {
+        tokio::time::timeout(
+            Duration::from_secs(300),
+            run_redis_rdb_gz_restore_without_a_shared_temp_dir(),
+        )
+        .await
+        .expect("rdb.gz restore test exceeded 300s");
+    }
+
+    #[cfg(feature = "docker-tests")]
+    async fn run_redis_rdb_gz_restore_without_a_shared_temp_dir() {
+        use super::super::test_utils::S3TestContainer;
+        use futures::StreamExt;
+        use std::io::{Read, Write};
+
+        async fn exec(docker: &Docker, container: &str, cmd: &[&str]) -> String {
+            use bollard::exec::{CreateExecOptions, StartExecResults};
+            let exec = docker
+                .create_exec(
+                    container,
+                    CreateExecOptions {
+                        cmd: Some(cmd.iter().map(|part| String::from(*part)).collect()),
+                        attach_stdout: Some(true),
+                        attach_stderr: Some(true),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create exec");
+            let mut text = String::new();
+            if let StartExecResults::Attached { mut output, .. } =
+                docker.start_exec(&exec.id, None).await.expect("start exec")
+            {
+                while let Some(Ok(chunk)) = output.next().await {
+                    text.push_str(&chunk.to_string());
+                }
+            }
+            text
+        }
+
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => Arc::new(d),
+            Err(e) => {
+                println!("Docker not available, skipping rdb.gz restore test: {}", e);
+                return;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker daemon not responding, skipping rdb.gz restore test");
+            return;
+        }
+        let minio = match S3TestContainer::start(docker.clone(), "redis-rdb-restore").await {
+            Ok(m) => m,
+            Err(e) => panic!("Failed to start S3 test container: {}", e),
+        };
+        let Some(port) = find_available_port(16480) else {
+            println!("No free port near 16480, skipping rdb.gz restore test");
+            let _ = minio.cleanup().await;
+            return;
+        };
+        let password = "rdb-restore-pass";
+        let service_name = format!(
+            "test_redis_rdb_restore_{}",
+            uuid::Uuid::new_v4()
+                .simple()
+                .to_string()
+                .get(..12)
+                .unwrap_or("x")
+        );
+        let config = ServiceConfig {
+            name: service_name.clone(),
+            service_type: ServiceType::Redis,
+            version: Some("7".to_string()),
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": port.to_string(),
+                "password": password,
+                "docker_image": "redis:7.4.10-alpine",
+            }),
+        };
+        let service = RedisService::new(service_name.clone(), docker.clone());
+        if let Err(e) = service.init(config).await {
+            let _ = minio.cleanup().await;
+            panic!(
+                "Failed to start plain Redis for the rdb.gz restore test: {}",
+                e
+            );
+        }
+        let container = service.get_container_name();
+
+        // Catch a failed assertion so the Redis and S3 containers are still
+        // removed, then re-raise it.
+        let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+            let mut set = String::new();
+            for _ in 0..60 {
+                set = exec(
+                    &docker,
+                    &container,
+                    &["redis-cli", "-a", password, "SET", "k", "before"],
+                )
+                .await;
+                if set.contains("OK") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            assert!(set.contains("OK"), "seed failed: {set}");
+            let saved = exec(&docker, &container, &["redis-cli", "-a", password, "SAVE"]).await;
+            assert!(saved.contains("OK"), "SAVE failed: {saved}");
+
+            // Snapshot -> .rdb.gz in S3, the RedisEngine fallback's format.
+            let mut tar_bytes = Vec::new();
+            let mut download = docker.download_from_container(
+                &container,
+                Some(bollard::query_parameters::DownloadFromContainerOptions {
+                    path: "/data/dump.rdb".to_string(),
+                }),
+            );
+            while let Some(chunk) = download.next().await {
+                tar_bytes.extend_from_slice(&chunk.expect("download dump.rdb"));
+            }
+            let mut rdb = Vec::new();
+            tar::Archive::new(tar_bytes.as_slice())
+                .entries()
+                .expect("entries")
+                .next()
+                .expect("dump.rdb entry")
+                .expect("entry")
+                .read_to_end(&mut rdb)
+                .expect("read dump.rdb");
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(&rdb).expect("gzip");
+            let gz = encoder.finish().expect("gzip finish");
+            let key = "external_services/redis/rdb-restore-test/dump.rdb.gz";
+            minio
+                .s3_client
+                .put_object()
+                .bucket(&minio.bucket_name)
+                .key(key)
+                .body(aws_sdk_s3::primitives::ByteStream::from(gz))
+                .send()
+                .await
+                .expect("upload rdb.gz");
+
+            let changed = exec(
+                &docker,
+                &container,
+                &["redis-cli", "-a", password, "SET", "k", "after"],
+            )
+            .await;
+            assert!(changed.contains("OK"), "{changed}");
+
+            service
+                .restore_from_legacy(&minio.s3_client, key, &minio.s3_source)
+                .await
+                .expect("rdb.gz restore");
+
+            let mut value = String::new();
+            for _ in 0..60 {
+                value = exec(
+                    &docker,
+                    &container,
+                    &["redis-cli", "-a", password, "GET", "k"],
+                )
+                .await;
+                if value.contains("before") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            assert!(value.contains("before"), "restored value: {value}");
+
+            let helpers = docker
+                .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+                    all: true,
+                    filters: Some(HashMap::from([(
+                        "label".to_string(),
+                        vec![format!(
+                            "{}={}",
+                            super::super::restore_helper::RESTORE_TARGET_LABEL,
+                            container
+                        )],
+                    )])),
+                    ..Default::default()
+                }))
+                .await
+                .expect("list helpers");
+            assert!(
+                helpers.is_empty(),
+                "restore helper left behind: {helpers:?}"
+            );
+        }))
+        .await;
+
+        let _ = service.remove().await;
+        let _ = minio.cleanup().await;
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
     }
 }

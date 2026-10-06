@@ -31,7 +31,10 @@ pub struct Model {
     pub target_service_name: Option<String>,
     /// "in_place" | "new_service" | "pitr"
     pub mode: String,
-    /// "pending" | "running" | "completed" | "failed" | "cancelled"
+    /// "pending" | "running" | "completed" | "failed" | "cancelled" | "interrupted".
+    /// `interrupted` is written by startup reconciliation when the worker that
+    /// owned the run died with the previous Temps process; `phase` then keeps
+    /// the phase the run was in.
     pub status: String,
     /// "prepare" | "provision" | "restore" | "recover" | "verify" | "completed" | "failed"
     pub phase: String,

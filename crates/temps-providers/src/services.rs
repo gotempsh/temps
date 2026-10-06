@@ -1574,6 +1574,51 @@ impl ExternalServiceManager {
         }
     }
 
+    /// Stop every restore helper container that may still be writing into
+    /// the service `service_name` (see [`crate::externalsvc::restore_helper`]).
+    ///
+    /// Helpers are matched by the container they restore into, which is the
+    /// engine's own container name for this service and, for an imported
+    /// service, the pre-existing container it runs in (`imported_container`).
+    /// Both are fenced, so a helper labelled with either is found.
+    ///
+    /// Returns `Ok(None)` when this process has no Docker daemon: restores
+    /// drive local containers, so such a process cannot have launched one.
+    pub async fn fence_restore_helpers(
+        &self,
+        service_name: &str,
+        service_type: ServiceType,
+        imported_container: Option<&str>,
+    ) -> Result<
+        Option<crate::externalsvc::restore_helper::RestoreFenceReport>,
+        crate::externalsvc::restore_helper::RestoreFenceError,
+    > {
+        use crate::externalsvc::restore_helper::{fence_restore_helpers, RestoreFenceError};
+
+        let Some(docker) = self.docker.get() else {
+            return Ok(None);
+        };
+        let instance = self
+            .create_service_instance(service_name.to_string(), service_type)
+            .map_err(|e| RestoreFenceError::Resolve {
+                service_name: service_name.to_string(),
+                service_type: service_type.to_string(),
+                reason: e.to_string(),
+            })?;
+        let mut containers = BTreeSet::from([instance.get_docker_container_name()]);
+        if let Some(imported) = imported_container.filter(|c| !c.trim().is_empty()) {
+            containers.insert(imported.to_string());
+        }
+
+        let mut report = crate::externalsvc::restore_helper::RestoreFenceReport::default();
+        for container in containers {
+            let fenced = fence_restore_helpers(docker, &container).await?;
+            report.stopped.extend(fenced.stopped);
+            report.removed.extend(fenced.removed);
+        }
+        Ok(Some(report))
+    }
+
     /// Whether this process may run containers locally. Gates local
     /// provisioning paths independently of whether a Docker socket is
     /// mounted — the profile is a contract, not a capability check.
@@ -5366,6 +5411,11 @@ echo "[restore] Pre-seed complete"
             // Run as root so the chown calls land — the helper drops
             // to postgres internally for the wal-g call.
             user: Some("root".to_string()),
+            // Keyed like a standalone Postgres container so startup
+            // reconciliation of an interrupted restore can fence it.
+            labels: Some(crate::externalsvc::restore_helper::restore_helper_labels(
+                &format!("postgres-{}", service.name),
+            )),
             ..Default::default()
         };
 
@@ -17988,6 +18038,111 @@ mod tests {
         ));
 
         ExternalServiceManager::new_with_handle(db, enc, handle, false, dns)
+    }
+
+    /// A process without a Docker daemon cannot have launched a restore
+    /// helper, so fencing is vacuous rather than an error that would keep
+    /// restores blocked forever.
+    #[tokio::test]
+    async fn fence_restore_helpers_without_docker_is_vacuous() {
+        let manager = control_plane_manager();
+        let fenced = manager
+            .fence_restore_helpers("orders", ServiceType::Mongodb, None)
+            .await
+            .expect("no daemon is not an error");
+        assert!(fenced.is_none());
+    }
+
+    /// The fence resolves the container name from the engine itself
+    /// (MongoDB's is `temps-mongodb-<name>`, not `mongodb-<name>`) and also
+    /// covers an imported service's real container.
+    #[tokio::test]
+    async fn fence_restore_helpers_uses_the_engine_and_imported_container_names() {
+        let Ok(docker) = Docker::connect_with_local_defaults() else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not available, skipping");
+            return;
+        }
+        if crate::utils::pull_image_with_retry(&docker, "busybox:latest", None)
+            .await
+            .is_err()
+        {
+            println!("Could not pull busybox, skipping");
+            return;
+        }
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let service_name = format!("fence-{}", &suffix[..8]);
+        let imported = format!("imported-{}", &suffix[..8]);
+        let mut helper_ids = Vec::new();
+        for (index, target) in [format!("temps-mongodb-{service_name}"), imported.clone()]
+            .iter()
+            .enumerate()
+        {
+            let created = docker
+                .create_container(
+                    Some(
+                        bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                            .name(&format!("temps-fence-mgr-{}-{index}", &suffix[..8]))
+                            .build(),
+                    ),
+                    bollard::models::ContainerCreateBody {
+                        image: Some("busybox:latest".to_string()),
+                        cmd: Some(vec!["sleep".into(), "300".into()]),
+                        labels: Some(crate::externalsvc::restore_helper::restore_helper_labels(
+                            target,
+                        )),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            let Ok(created) = created else {
+                println!("Could not create a helper container, skipping");
+                return;
+            };
+            let _ = docker
+                .start_container(
+                    &created.id,
+                    None::<bollard::query_parameters::StartContainerOptions>,
+                )
+                .await;
+            helper_ids.push(created.id);
+        }
+
+        let manager = mock_service_manager(vec![]);
+        let fenced = manager
+            .fence_restore_helpers(&service_name, ServiceType::Mongodb, Some(&imported))
+            .await;
+
+        let mut left = 0;
+        for id in &helper_ids {
+            if docker
+                .inspect_container(
+                    id,
+                    None::<bollard::query_parameters::InspectContainerOptions>,
+                )
+                .await
+                .is_ok()
+            {
+                left += 1;
+                let _ = docker
+                    .remove_container(
+                        id,
+                        Some(bollard::query_parameters::RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+            }
+        }
+        let report = fenced
+            .expect("fence against a reachable daemon")
+            .expect("a daemon is available");
+        assert_eq!(report.stopped.len(), 2, "{report:?}");
+        assert_eq!(left, 0, "both helpers must be removed");
     }
 
     /// The regression this work fixes: asking for a service type's parameter

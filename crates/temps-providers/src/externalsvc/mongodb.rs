@@ -1771,6 +1771,11 @@ fn build_mongodb_url(
 /// Ideally this should be pinned to an immutable SHA-256 digest
 /// (e.g. `mongo@sha256:<hash>`); update when rotating the image version.
 const MONGO_SIDECAR_IMAGE: &str = "mongo:7.0";
+/// Directory inside the mongorestore sidecar that receives the uploaded
+/// archive and config file. Exists in every image; never bind-mounted.
+const MONGORESTORE_INPUT_DIR: &str = "/tmp";
+/// Upper bound for copying the archive into the sidecar.
+const MONGORESTORE_UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
 
 impl MongodbService {
     /// Build the `MONGODB_*` env vars for a given per-tenant database name.
@@ -1808,8 +1813,11 @@ impl MongodbService {
     /// Run a one-shot `mongo:7` sidecar that executes `mongorestore` against
     /// `target_container` over the temps bridge network.
     ///
-    /// `archive_dir` is the host directory bind-mounted as `/backup`.
-    /// `archive_filename` is the file within that dir (e.g. `dump.archive`).
+    /// `archive_dir` is the host directory holding `archive_filename`. The
+    /// archive is uploaded into the created sidecar through the Docker
+    /// archive API rather than bind-mounted, because a host temp directory is
+    /// not visible to a Docker daemon running in a VM (Colima, Docker
+    /// Desktop) or on another host.
     ///
     /// The container is created with `auto_remove: true` so Docker reaps it
     /// automatically after exit.  The method waits for the container's exit
@@ -1838,18 +1846,19 @@ impl MongodbService {
                 )
             })?;
 
-        let container_archive_path = format!("/backup/{}", archive_filename);
+        let container_archive_path = format!("{}/{}", MONGORESTORE_INPUT_DIR, archive_filename);
         let sidecar_name = format!(
             "temps-mongorestore-{}",
             &uuid::Uuid::new_v4().to_string().replace('-', "")[..12]
         );
 
-        // Write credentials to a bind-mounted config file instead of passing
-        // them on the command line.  Docker stores the full Cmd array in
+        // Put credentials in a config file inside the sidecar instead of
+        // passing them on the command line.  Docker stores the full Cmd array in
         // container metadata and returns it verbatim via `docker inspect`, so
         // a plaintext `-p <password>` flag is readable for the entire duration
-        // of the restore (potentially minutes for large databases).  A
-        // bind-mounted YAML config file with mode 0600 avoids that exposure.
+        // of the restore (potentially minutes for large databases).  A YAML
+        // config file with mode 0600, uploaded straight into the sidecar and
+        // never written to the host's disk, avoids that exposure.
         //
         // mongorestore has supported `--config` since mongo-tools 100.5.0,
         // which shipped with MongoDB 6.0+; mongo:7.0 is well above that floor.
@@ -1867,26 +1876,9 @@ impl MongodbService {
         // no escaping will be needed in practice, but we escape defensively.
         let password_safe = password.replace('\'', "''");
         let config_content = format!("password: '{}'\n", password_safe);
-        let host_config_file = archive_dir.join("restore.yaml");
-        tokio::fs::write(&host_config_file, config_content.as_bytes())
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to write mongorestore config file: {}", e))?;
-        // Restrict to owner-read only (chmod 600) so the password is not
-        // world-readable inside the temp directory.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&host_config_file, std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "Failed to set permissions on mongorestore config file: {}",
-                        e
-                    )
-                })?;
-        }
 
         // Build the command as a vector of argv tokens (no shell, no injection).
-        // The password is in /backup/restore.yaml (bind-mounted, mode 0600) so
+        // The password is in the uploaded restore.yaml (mode 0600) so
         // it does not appear in the Docker Cmd array visible via `docker inspect`.
         // Username and authenticationDatabase are not sensitive and are passed as
         // plain CLI flags (mongorestore's YAML config schema does not support them).
@@ -1895,11 +1887,11 @@ impl MongodbService {
         //   --username             : MongoDB user (non-sensitive, fine on argv)
         //   --authenticationDatabase : always 'admin' for root-level users
         //   --host                 : target MongoDB container name (bridge network)
-        //   --archive              : path inside the sidecar (bind-mounted from host)
+        //   --archive              : path inside the sidecar (uploaded before start)
         //   --gzip                 : the archive was created with mongodump --gzip
         //   --drop                 : drop each collection before restoring (true revert)
         let cmd_args: Vec<String> = vec![
-            "--config=/backup/restore.yaml".to_string(),
+            format!("--config={}/restore.yaml", MONGORESTORE_INPUT_DIR),
             format!("--username={}", username),
             "--authenticationDatabase=admin".to_string(),
             format!("--host={}", target_container),
@@ -1915,10 +1907,7 @@ impl MongodbService {
         // manage the container lifecycle explicitly: wait_container then an
         // unconditional remove_container, matching the mariadb/redis helper
         // pattern used elsewhere in this file.
-        let host_config = bollard::models::HostConfig {
-            binds: Some(vec![format!("{}:/backup:ro", archive_dir.display())]),
-            ..Default::default()
-        };
+        let host_config = bollard::models::HostConfig::default();
 
         // Connect the sidecar to the temps bridge network so it can reach
         // the target container by name.
@@ -1940,6 +1929,9 @@ impl MongodbService {
             cmd: Some(cmd_args),
             user: Some("root".to_string()),
             host_config: Some(host_config),
+            labels: Some(crate::externalsvc::restore_helper::restore_helper_labels(
+                target_container,
+            )),
             networking_config,
             attach_stdout: Some(true),
             attach_stderr: Some(true),
@@ -1969,6 +1961,48 @@ impl MongodbService {
                     e
                 )
             })?;
+
+        // Inputs go in through the Docker archive API while the sidecar is
+        // created but not started: no host path has to be shared with the
+        // daemon, and the password never touches the host's disk.
+        let host_archive = archive_dir.join(archive_filename);
+        let uploaded = async {
+            super::container_upload::upload_bytes_to_container(
+                &self.docker,
+                &sidecar_name,
+                config_content.into_bytes(),
+                MONGORESTORE_INPUT_DIR,
+                "restore.yaml",
+                0o600,
+                MONGORESTORE_UPLOAD_TIMEOUT,
+            )
+            .await?;
+            super::container_upload::upload_file_to_container(
+                &self.docker,
+                &sidecar_name,
+                &host_archive,
+                MONGORESTORE_INPUT_DIR,
+                archive_filename,
+                0o644,
+                MONGORESTORE_UPLOAD_TIMEOUT,
+            )
+            .await
+        }
+        .await;
+        if let Err(e) = uploaded {
+            let _ = self
+                .docker
+                .remove_container(
+                    &sidecar_name,
+                    Some(RemoveContainerOptionsBuilder::new().force(true).build()),
+                )
+                .await;
+            return Err(anyhow::anyhow!(
+                "Failed to copy the restore inputs into mongorestore sidecar '{}': {}",
+                sidecar_name,
+                e
+            ));
+        }
 
         // Attach BEFORE starting so we capture all output from the first byte.
         let attach_result = self
@@ -3011,8 +3045,9 @@ impl ExternalService for MongodbService {
     /// ## Mechanics
     ///
     /// 1. Download the archive from S3 to a host-side temp directory.
-    /// 2. Spin up a one-shot `mongo:7` sidecar with the temp directory
-    ///    bind-mounted as `/backup`, connected to the temps bridge network.
+    /// 2. Create a one-shot `mongo:7` sidecar on the temps bridge network and
+    ///    upload the archive into it through the Docker archive API (no bind
+    ///    mount, so it works when Docker runs in a VM or on another host).
     /// 3. Run `mongorestore --host=<container> --archive=... --gzip --drop ...`
     ///    inside the sidecar. The sidecar connects to the target container
     ///    over the bridge; the target container never needs to be stopped.
@@ -4807,5 +4842,223 @@ mod tests {
 
         println!("✓ Cleanup completed");
         println!("\n✅ MongoDB backup and restore test completed successfully!");
+    }
+
+    /// The in-place / new-service restore path: the mongorestore sidecar gets
+    /// its archive and credentials through the Docker archive API, so it
+    /// works with the OS default temp dir even when that dir is not shared
+    /// with the Docker daemon (macOS with Colima or Docker Desktop).
+    #[tokio::test]
+    #[cfg(feature = "docker-tests")]
+    async fn mongorestore_sidecar_restores_without_a_shared_temp_dir() {
+        use crate::externalsvc::exec_util::run_exec;
+        use futures::StreamExt;
+        use std::io::Read;
+
+        let Ok(docker) = Docker::connect_with_local_defaults() else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not available, skipping");
+            return;
+        }
+        if crate::utils::pull_image_with_retry(&docker, MONGO_SIDECAR_IMAGE, None)
+            .await
+            .is_err()
+        {
+            println!("Could not pull {MONGO_SIDECAR_IMAGE}, skipping");
+            return;
+        }
+        if crate::utils::ensure_network_exists(&docker).await.is_err() {
+            println!("Could not ensure the temps network, skipping");
+            return;
+        }
+        let suffix = &uuid::Uuid::new_v4().simple().to_string()[..10];
+        let target = format!("temps-mongo-sidecar-test-{suffix}");
+        let (user, password) = ("root", "sidecar-test-pw");
+        let created = docker
+            .create_container(
+                Some(
+                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                        .name(&target)
+                        .build(),
+                ),
+                bollard::models::ContainerCreateBody {
+                    image: Some(MONGO_SIDECAR_IMAGE.to_string()),
+                    env: Some(vec![
+                        format!("MONGO_INITDB_ROOT_USERNAME={user}"),
+                        format!("MONGO_INITDB_ROOT_PASSWORD={password}"),
+                    ]),
+                    networking_config: Some(bollard::models::NetworkingConfig {
+                        endpoints_config: Some(HashMap::from([(
+                            temps_core::NETWORK_NAME.to_string(),
+                            bollard::models::EndpointSettings::default(),
+                        )])),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await;
+        if created.is_err() {
+            println!("Could not create the target MongoDB, skipping");
+            return;
+        }
+        let remove_target = || async {
+            let _ = docker
+                .remove_container(
+                    &target,
+                    Some(bollard::query_parameters::RemoveContainerOptions {
+                        force: true,
+                        v: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+        };
+        let _ = docker
+            .start_container(
+                &target,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await;
+
+        let timeout = std::time::Duration::from_secs(60);
+        let mongosh = |eval: &str| {
+            vec![
+                "mongosh".to_string(),
+                "--quiet".to_string(),
+                "-u".to_string(),
+                user.to_string(),
+                "-p".to_string(),
+                password.to_string(),
+                "--authenticationDatabase".to_string(),
+                "admin".to_string(),
+                "--eval".to_string(),
+                eval.to_string(),
+            ]
+        };
+        let mut ready = false;
+        for _ in 0..60 {
+            if let Ok(r) = run_exec(
+                &docker,
+                &target,
+                mongosh("db.runCommand({ping:1}).ok"),
+                None,
+                timeout,
+            )
+            .await
+            {
+                if r.output.trim().ends_with('1') {
+                    ready = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        if !ready {
+            remove_target().await;
+            panic!("target MongoDB never became ready");
+        }
+
+        let outcome: anyhow::Result<String> = async {
+            run_exec(
+                &docker,
+                &target,
+                mongosh("db.getSiblingDB('app').items.insertMany([{n:1},{n:2},{n:3}])"),
+                None,
+                timeout,
+            )
+            .await?;
+            run_exec(
+                &docker,
+                &target,
+                vec![
+                    "mongodump".into(),
+                    format!("--username={user}"),
+                    format!("--password={password}"),
+                    "--authenticationDatabase=admin".into(),
+                    "--db=app".into(),
+                    "--archive=/tmp/dump.archive".into(),
+                    "--gzip".into(),
+                ],
+                None,
+                timeout,
+            )
+            .await?;
+
+            // Copy the archive to the OS default temp dir — deliberately not
+            // a directory shared with Docker.
+            let host_dir = tempfile::tempdir()?;
+            let mut tar_bytes = Vec::new();
+            let mut stream = docker.download_from_container(
+                &target,
+                Some(
+                    bollard::query_parameters::DownloadFromContainerOptionsBuilder::new()
+                        .path("/tmp/dump.archive")
+                        .build(),
+                ),
+            );
+            while let Some(chunk) = stream.next().await {
+                tar_bytes.extend_from_slice(&chunk?);
+            }
+            let mut archive = tar::Archive::new(tar_bytes.as_slice());
+            let mut entry = archive
+                .entries()?
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("empty archive download"))??;
+            let mut dump = Vec::new();
+            entry.read_to_end(&mut dump)?;
+            std::fs::write(host_dir.path().join("dump.archive"), &dump)?;
+
+            run_exec(
+                &docker,
+                &target,
+                mongosh("db.getSiblingDB('app').items.drop()"),
+                None,
+                timeout,
+            )
+            .await?;
+
+            let service =
+                MongodbService::new(format!("sidecar-test-{suffix}"), Arc::new(docker.clone()));
+            service
+                .run_mongorestore_sidecar(host_dir.path(), "dump.archive", &target, user, password)
+                .await?;
+
+            let count = run_exec(
+                &docker,
+                &target,
+                mongosh("db.getSiblingDB('app').items.countDocuments()"),
+                None,
+                timeout,
+            )
+            .await?;
+            Ok(count.output)
+        }
+        .await;
+
+        let leftover_helpers = docker
+            .list_containers(Some(
+                bollard::query_parameters::ListContainersOptionsBuilder::new()
+                    .all(true)
+                    .filters(&HashMap::from([(
+                        "label".to_string(),
+                        vec![format!(
+                            "{}={}",
+                            crate::externalsvc::restore_helper::RESTORE_TARGET_LABEL,
+                            target
+                        )],
+                    )]))
+                    .build(),
+            ))
+            .await
+            .map(|containers| containers.len())
+            .unwrap_or(0);
+        remove_target().await;
+
+        let count = outcome.expect("sidecar restore round trip");
+        assert_eq!(count.trim(), "3", "restored document count");
+        assert_eq!(leftover_helpers, 0, "the sidecar must be removed");
     }
 }
