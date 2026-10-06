@@ -10,8 +10,18 @@
 //! sees an empty directory. Uploading into a created-but-not-started
 //! container works wherever the daemon is, and streams, so memory does not
 //! depend on file size.
+//!
+//! Uploads are bounded by a stall timeout, not a total deadline: a backup can
+//! be arbitrarily large and the link to the daemon arbitrarily slow, so the
+//! only signal that an upload is broken is that the daemon stops accepting
+//! data. The body is pulled under backpressure, so every chunk pulled is a
+//! chunk the daemon took. Once the last byte is sent the daemon may still be
+//! writing the file out, so the wait for its answer gets its own window that
+//! grows with the file's size.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bollard::Docker;
 
@@ -26,16 +36,31 @@ pub enum ContainerUploadError {
     #[error("Invalid upload file name '{name}': {reason}")]
     InvalidName { name: String, reason: String },
 
-    /// The Docker daemon did not finish the upload in time.
+    /// The Docker daemon stopped accepting data for longer than the stall
+    /// timeout, before the whole archive was sent.
     #[error(
-        "Timed out after {timeout_secs}s uploading '{dest_name}' ({size} bytes) into \
-         container {container_id}"
+        "Upload of '{dest_name}' into container {container_id} stalled: the Docker daemon \
+         accepted no data for {stall_secs}s after {sent} of {size} bytes"
     )]
-    Timeout {
+    Stalled {
         container_id: String,
         dest_name: String,
         size: u64,
-        timeout_secs: u64,
+        sent: u64,
+        stall_secs: u64,
+    },
+
+    /// The whole archive was sent, but the Docker daemon did not confirm the
+    /// upload within the window allowed for writing out a file this size.
+    #[error(
+        "Upload of '{dest_name}' into container {container_id} was not confirmed: the Docker \
+         daemon received all {size} bytes but did not answer within {waited_secs}s"
+    )]
+    Unconfirmed {
+        container_id: String,
+        dest_name: String,
+        size: u64,
+        waited_secs: u64,
     },
 
     /// The Docker daemon rejected or aborted the upload.
@@ -53,6 +78,141 @@ pub enum ContainerUploadError {
 
 /// Read size when streaming a host file into a container upload.
 const UPLOAD_CHUNK_BYTES: usize = 256 * 1024;
+
+/// How long the daemon may accept no data before an upload is abandoned.
+const UPLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// Slowest rate at which the daemon is assumed to write out an uploaded file
+/// once it has received all of it. Sizes the wait for its answer.
+const MIN_DAEMON_WRITE_BYTES_PER_SEC: u64 = 8 * 1024 * 1024;
+
+/// How long to wait for the daemon's answer after the last byte of a `size`
+/// byte upload: the stall timeout, plus the time to write the whole file out
+/// at [`MIN_DAEMON_WRITE_BYTES_PER_SEC`] (the daemon normally extracts while
+/// it receives, so this is a generous bound, not an expected duration).
+fn confirmation_timeout(size: u64) -> Duration {
+    UPLOAD_STALL_TIMEOUT + Duration::from_secs(size / MIN_DAEMON_WRITE_BYTES_PER_SEC)
+}
+
+/// Why an upload was abandoned by [`run_until_stalled`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Abandoned {
+    /// No chunk was taken for the stall timeout; `sent` bytes had gone out.
+    Stalled { sent: u64 },
+    /// Every byte was sent, but no answer came within the confirmation window.
+    Unconfirmed { waited: Duration },
+}
+
+/// When an upload last made progress, how far it got, and whether the whole
+/// body has been sent.
+#[derive(Clone)]
+struct UploadProgress {
+    started: tokio::time::Instant,
+    /// Milliseconds after `started` at which the last chunk was taken (or the
+    /// body ended).
+    last_progress_ms: Arc<AtomicU64>,
+    sent: Arc<AtomicU64>,
+    body_sent: Arc<AtomicBool>,
+}
+
+impl UploadProgress {
+    fn new() -> Self {
+        Self {
+            started: tokio::time::Instant::now(),
+            last_progress_ms: Arc::new(AtomicU64::new(0)),
+            sent: Arc::new(AtomicU64::new(0)),
+            body_sent: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn touch(&self) {
+        let elapsed_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_progress_ms.store(elapsed_ms, Ordering::Relaxed);
+    }
+
+    fn record(&self, bytes: usize) {
+        self.touch();
+        self.sent.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// The body is exhausted: from now on the upload is waiting for the
+    /// daemon's answer, not for it to take more data.
+    fn finish_body(&self) {
+        self.touch();
+        self.body_sent.store(true, Ordering::Relaxed);
+    }
+
+    fn body_sent(&self) -> bool {
+        self.body_sent.load(Ordering::Relaxed)
+    }
+
+    fn last_progress(&self) -> tokio::time::Instant {
+        self.started + Duration::from_millis(self.last_progress_ms.load(Ordering::Relaxed))
+    }
+
+    fn sent(&self) -> u64 {
+        self.sent.load(Ordering::Relaxed)
+    }
+}
+
+/// Wrap `stream` so every chunk taken from it, and the end of the body, is
+/// recorded in `progress`.
+fn track_progress<S>(
+    stream: S,
+    progress: UploadProgress,
+) -> impl futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static
+where
+    S: futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static,
+{
+    use futures::{StreamExt, TryStreamExt};
+    let at_end = progress.clone();
+    stream
+        .inspect_ok(move |chunk| progress.record(chunk.len()))
+        .chain(futures::stream::poll_fn(move |_| {
+            at_end.finish_body();
+            std::task::Poll::Ready(None)
+        }))
+}
+
+/// Drive `upload` to completion with two bounds instead of a total deadline:
+/// while the body is being sent, give up after `stall` without a chunk taken;
+/// once it is all sent, give up after `confirmation` without an answer. A slow
+/// upload that keeps moving is never cut off, however long it takes in total,
+/// and a daemon still writing out a large file gets time to finish.
+async fn run_until_stalled<F, T>(
+    upload: F,
+    progress: &UploadProgress,
+    stall: Duration,
+    confirmation: Duration,
+) -> Result<T, Abandoned>
+where
+    F: std::future::Future<Output = T>,
+{
+    let window = |progress: &UploadProgress| {
+        if progress.body_sent() {
+            confirmation
+        } else {
+            stall
+        }
+    };
+    tokio::pin!(upload);
+    loop {
+        let deadline = progress.last_progress() + window(progress);
+        tokio::select! {
+            output = &mut upload => return Ok(output),
+            _ = tokio::time::sleep_until(deadline) => {
+                let window = window(progress);
+                if progress.last_progress() + window <= tokio::time::Instant::now() {
+                    return Err(if progress.body_sent() {
+                        Abandoned::Unconfirmed { waited: window }
+                    } else {
+                        Abandoned::Stalled { sent: progress.sent() }
+                    });
+                }
+            }
+        }
+    }
+}
 
 /// The tar stream that uploads one regular file named `name` of `size`
 /// bytes with permission bits `mode`: header, then `body`, then padding and
@@ -105,29 +265,41 @@ async fn upload_tar_stream<S>(
     dest_dir: &str,
     dest_name: &str,
     size: u64,
-    timeout: std::time::Duration,
     tar_stream: S,
 ) -> Result<(), ContainerUploadError>
 where
     S: futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static,
 {
-    tokio::time::timeout(
-        timeout,
+    let progress = UploadProgress::new();
+    let confirmation = confirmation_timeout(size);
+    run_until_stalled(
         docker.upload_to_container(
             container_id,
             Some(bollard::query_parameters::UploadToContainerOptions {
                 path: dest_dir.to_string(),
                 ..Default::default()
             }),
-            bollard::body_try_stream(tar_stream),
+            bollard::body_try_stream(track_progress(tar_stream, progress.clone())),
         ),
+        &progress,
+        UPLOAD_STALL_TIMEOUT,
+        confirmation,
     )
     .await
-    .map_err(|_| ContainerUploadError::Timeout {
-        container_id: container_id.to_string(),
-        dest_name: dest_name.to_string(),
-        size,
-        timeout_secs: timeout.as_secs(),
+    .map_err(|abandoned| match abandoned {
+        Abandoned::Stalled { sent } => ContainerUploadError::Stalled {
+            container_id: container_id.to_string(),
+            dest_name: dest_name.to_string(),
+            size,
+            sent,
+            stall_secs: UPLOAD_STALL_TIMEOUT.as_secs(),
+        },
+        Abandoned::Unconfirmed { waited } => ContainerUploadError::Unconfirmed {
+            container_id: container_id.to_string(),
+            dest_name: dest_name.to_string(),
+            size,
+            waited_secs: waited.as_secs(),
+        },
     })?
     .map_err(|e| ContainerUploadError::Upload {
         container_id: container_id.to_string(),
@@ -149,7 +321,6 @@ pub(crate) async fn upload_file_to_container(
     dest_dir: &str,
     dest_name: &str,
     mode: u32,
-    timeout: std::time::Duration,
 ) -> Result<(), ContainerUploadError> {
     let source_error = |e: std::io::Error| ContainerUploadError::Source {
         path: host_path.display().to_string(),
@@ -164,16 +335,8 @@ pub(crate) async fn upload_file_to_container(
     let source_failure = Arc::new(Mutex::new(None));
     let body = file_chunks(file, size, Arc::clone(&source_failure));
     let tar_stream = single_file_tar_stream(dest_name, size, mode, body)?;
-    let uploaded = upload_tar_stream(
-        docker,
-        container_id,
-        dest_dir,
-        dest_name,
-        size,
-        timeout,
-        tar_stream,
-    )
-    .await;
+    let uploaded =
+        upload_tar_stream(docker, container_id, dest_dir, dest_name, size, tar_stream).await;
     uploaded.map_err(|error| attribute_upload_failure(error, &source_failure, host_path))
 }
 
@@ -237,21 +400,11 @@ pub(crate) async fn upload_bytes_to_container(
     dest_dir: &str,
     dest_name: &str,
     mode: u32,
-    timeout: std::time::Duration,
 ) -> Result<(), ContainerUploadError> {
     let size = contents.len() as u64;
     let body = futures::stream::once(async move { Ok(bytes::Bytes::from(contents)) });
     let tar_stream = single_file_tar_stream(dest_name, size, mode, body)?;
-    upload_tar_stream(
-        docker,
-        container_id,
-        dest_dir,
-        dest_name,
-        size,
-        timeout,
-        tar_stream,
-    )
-    .await
+    upload_tar_stream(docker, container_id, dest_dir, dest_name, size, tar_stream).await
 }
 
 #[cfg(test)]
@@ -313,17 +466,9 @@ mod tests {
             }
         };
         let missing = std::path::Path::new("/nonexistent/temps-upload-source.gz");
-        let err = upload_file_to_container(
-            &docker,
-            "unused",
-            missing,
-            "/tmp",
-            "archive.gz",
-            0o644,
-            std::time::Duration::from_secs(1),
-        )
-        .await
-        .expect_err("a missing source must fail before contacting Docker");
+        let err = upload_file_to_container(&docker, "unused", missing, "/tmp", "archive.gz", 0o644)
+            .await
+            .expect_err("a missing source must fail before contacting Docker");
         assert!(
             matches!(&err, ContainerUploadError::Source { path, .. } if path.contains("temps-upload-source")),
             "{err:?}"
@@ -382,16 +527,166 @@ mod tests {
     fn a_docker_side_failure_stays_an_upload_error() {
         let untouched = Mutex::new(None);
         let attributed = attribute_upload_failure(
-            ContainerUploadError::Timeout {
+            ContainerUploadError::Stalled {
                 container_id: "helper".into(),
                 dest_name: "archive.gz".into(),
                 size: 10,
-                timeout_secs: 1,
+                sent: 4,
+                stall_secs: 1,
             },
             &untouched,
             std::path::Path::new("/tmp/archive.gz"),
         );
-        assert!(matches!(attributed, ContainerUploadError::Timeout { .. }));
+        assert!(matches!(attributed, ContainerUploadError::Stalled { .. }));
+    }
+
+    /// Drain `stream` like the daemon would, taking one chunk every `pace`.
+    async fn drain_slowly<S>(stream: S, pace: Duration) -> u64
+    where
+        S: futures::Stream<Item = std::io::Result<bytes::Bytes>>,
+    {
+        use futures::StreamExt;
+        tokio::pin!(stream);
+        let mut taken = 0_u64;
+        while let Some(Ok(chunk)) = stream.next().await {
+            taken += chunk.len() as u64;
+            tokio::time::sleep(pace).await;
+        }
+        taken
+    }
+
+    #[tokio::test]
+    async fn a_slow_upload_that_keeps_moving_is_never_cut_off() {
+        let stall = Duration::from_millis(200);
+        let progress = UploadProgress::new();
+        // 12 chunks, one every 50ms: 600ms in total, three times the stall
+        // timeout, but never 200ms without progress.
+        let chunks = futures::stream::iter(
+            (0..12).map(|_| Ok::<_, std::io::Error>(bytes::Bytes::from_static(&[7_u8; 100]))),
+        );
+        let started = tokio::time::Instant::now();
+
+        let outcome = run_until_stalled(
+            drain_slowly(
+                track_progress(chunks, progress.clone()),
+                Duration::from_millis(50),
+            ),
+            &progress,
+            stall,
+            stall,
+        )
+        .await;
+
+        assert_eq!(outcome, Ok(1_200));
+        assert!(
+            started.elapsed() > stall * 2,
+            "the test must outlast the stall timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_upload_that_stops_moving_fails_with_the_bytes_sent() {
+        use futures::StreamExt;
+        let stall = Duration::from_millis(150);
+        let progress = UploadProgress::new();
+        // Two chunks, then the source never yields again.
+        let chunks = futures::stream::iter(
+            (0..2).map(|_| Ok::<_, std::io::Error>(bytes::Bytes::from_static(&[1_u8; 64]))),
+        )
+        .chain(futures::stream::pending());
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_until_stalled(
+                drain_slowly(
+                    track_progress(chunks, progress.clone()),
+                    Duration::from_millis(1),
+                ),
+                &progress,
+                stall,
+                Duration::from_secs(60),
+            ),
+        )
+        .await
+        .expect("a stalled upload must be abandoned, not hang");
+
+        assert_eq!(outcome, Err(Abandoned::Stalled { sent: 128 }));
+    }
+
+    /// Send every chunk at once, then answer only after `answer_after`, like
+    /// a daemon that is still writing out a large file.
+    async fn send_then_answer<S>(stream: S, answer_after: Duration) -> u64
+    where
+        S: futures::Stream<Item = std::io::Result<bytes::Bytes>>,
+    {
+        let taken = drain_slowly(stream, Duration::ZERO).await;
+        tokio::time::sleep(answer_after).await;
+        taken
+    }
+
+    #[tokio::test]
+    async fn a_daemon_still_writing_out_the_file_is_given_time_to_answer() {
+        let stall = Duration::from_millis(100);
+        let progress = UploadProgress::new();
+        let chunks = futures::stream::iter(
+            (0..3).map(|_| Ok::<_, std::io::Error>(bytes::Bytes::from_static(&[2_u8; 10]))),
+        );
+
+        // The answer comes 4x the stall timeout after the last byte, inside
+        // the confirmation window.
+        let outcome = run_until_stalled(
+            send_then_answer(
+                track_progress(chunks, progress.clone()),
+                Duration::from_millis(400),
+            ),
+            &progress,
+            stall,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert_eq!(outcome, Ok(30));
+    }
+
+    #[tokio::test]
+    async fn a_daemon_that_never_answers_after_the_last_byte_is_unconfirmed() {
+        let progress = UploadProgress::new();
+        let chunks = futures::stream::iter(
+            (0..3).map(|_| Ok::<_, std::io::Error>(bytes::Bytes::from_static(&[3_u8; 10]))),
+        );
+        let confirmation = Duration::from_millis(300);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_until_stalled(
+                send_then_answer(
+                    track_progress(chunks, progress.clone()),
+                    Duration::from_secs(3600),
+                ),
+                &progress,
+                Duration::from_millis(100),
+                confirmation,
+            ),
+        )
+        .await
+        .expect("an unanswered upload must be abandoned, not hang");
+
+        assert_eq!(
+            outcome,
+            Err(Abandoned::Unconfirmed {
+                waited: confirmation
+            })
+        );
+    }
+
+    #[test]
+    fn the_confirmation_window_grows_with_the_file() {
+        assert_eq!(confirmation_timeout(0), UPLOAD_STALL_TIMEOUT);
+        // 80 GiB at 8 MiB/s is 10240s on top of the stall timeout.
+        assert_eq!(
+            confirmation_timeout(80 * 1024 * 1024 * 1024),
+            UPLOAD_STALL_TIMEOUT + Duration::from_secs(10_240)
+        );
     }
 
     /// Both upload paths land the file, with its mode, in a container that
@@ -448,7 +743,6 @@ mod tests {
         let host_file = host_dir.path().join("archive.gz");
         let payload: Vec<u8> = (0..300_000).map(|i| (i % 251) as u8).collect();
         let wrote = std::fs::write(&host_file, &payload);
-        let timeout = std::time::Duration::from_secs(60);
 
         let file_upload = match wrote {
             Ok(()) => {
@@ -459,7 +753,6 @@ mod tests {
                     "/tmp",
                     "archive.gz",
                     0o644,
-                    timeout,
                 )
                 .await
             }
@@ -475,7 +768,6 @@ mod tests {
             "/tmp",
             "restore.yaml",
             0o600,
-            timeout,
         )
         .await;
 
