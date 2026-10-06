@@ -40,6 +40,6 @@
     "react-dom": "^19.3.0",
     "react-router": "^8.4.0",
     "recharts": "3.10.1",
-    "typescript": "^6.0.3"
+    "typescript": "^7.0.2"
   }
 }
