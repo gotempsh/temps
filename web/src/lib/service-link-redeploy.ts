@@ -83,15 +83,18 @@ export type RedeployApi = {
   deployFromStatic: typeof deployFromStatic
 }
 
-const sdkRedeployApi: RedeployApi = {
+export const sdkRedeployApi: RedeployApi = {
   getDeployment,
   triggerProjectPipeline,
   deployFromImage,
   deployFromStatic,
 }
 
-/** Redeploy one deployment with the same source it was built from. */
-async function redeployDeployment(
+/**
+ * Redeploy one deployment with the same source it was built from. Resolves to
+ * the reason it could not be redeployed, or `undefined` once it was started.
+ */
+export async function redeployDeployment(
   api: RedeployApi,
   projectId: number,
   projectSourceType: SourceType,

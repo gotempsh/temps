@@ -182,6 +182,42 @@ Monitoring → **Delivery preferences** holds instance-wide preferences (minimum
 
 ---
 
+## Responding to Failures
+
+The console points you at a failure where you are already looking and offers the fix next to it.
+
+### Project header and overview
+
+The status badge next to the project name reads:
+
+- **Failed** when the project's latest deployment failed, even if an older deployment is still serving traffic.
+- **Degraded** when a live container in the project's main environment is stopped (exited or dead) or has restarted in the last 15 minutes. The main environment is the first non-preview environment with a live deployment. Sleeping on-demand environments don't count, since their containers are stopped on purpose.
+
+Click the badge to open the project overview. A banner there explains the problem and offers the next step:
+
+- **Failed deployment**: the failure title and how to fix it, which deployment is still live, and buttons to **Redeploy** the same source, **Roll back to #N (last successful)**, open the settings page that fixes the failure, or view the deployment.
+- **Down or restarting containers**: each affected container with its exit reason or restart count, plus **Restart** and **Logs** buttons.
+
+The failed deployment's own page has the same **Roll back to #N (last successful)** button in its failure banner. See [Rollbacks](/docs/rollbacks).
+
+### Alarms
+
+In **Monitoring & Alerts → Alarms**, each part of an alarm's scope links to its page: the environment, the deployment, the container (its logs), the managed service, or the error group. Alarms that have a direct fix also get a button next to Ack / Resolve / Silence:
+
+| Alarm type | Action |
+| --- | --- |
+| Container restarted, crashed, or OOM-killed | **Restart** the container |
+| Deployment failed or health check failed | **Redeploy** the deployment from the same source |
+| Error-tracking threshold | **Autofix** the error group |
+
+Restart and Redeploy ask for confirmation first.
+
+### Firing metric alerts
+
+When a metric alert rule fires, the Metrics page lists it above the charts. Click the row to open the chart of the metric that fired, with the rule's filters applied. **View alarm** opens the alarm the rule raised, where you can acknowledge or silence it. Rules that alert per series link to the alarm of the first firing series, and other rules open the project's alarm list. **Edit rule** opens the rule.
+
+---
+
 ## Monitoring Best Practices
 
 <Properties>

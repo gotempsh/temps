@@ -5,22 +5,43 @@ import { expect, test } from 'bun:test'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { getEnvironmentsQueryKey } from '@/api/client/@tanstack/react-query.gen'
+import {
+  getEnvironmentsQueryKey,
+  listContainersQueryKey,
+} from '@/api/client/@tanstack/react-query.gen'
 import type { DeploymentResponse, ProjectResponse } from '@/api/client'
 import { ProjectDetailHeader } from './ProjectDetailHeader'
 
 function renderHeader(
   status: string,
   currentId: number | null | undefined,
-  activeVisitors?: number
+  {
+    activeVisitors,
+    containers,
+  }: { activeVisitors?: number; containers?: { status: string }[] } = {}
 ) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
   if (currentId !== undefined) {
     client.setQueryData(getEnvironmentsQueryKey({ path: { project_id: 1 } }), [
-      { id: 1, current_deployment_id: currentId },
+      { id: 1, current_deployment_id: currentId, is_preview: false },
     ])
+  }
+  if (containers) {
+    client.setQueryData(
+      listContainersQueryKey({ path: { project_id: 1, environment_id: 1 } }),
+      {
+        containers: containers.map((container, index) => ({
+          container_id: `c${index}`,
+          container_name: `web-${index}`,
+          image_name: 'web:1',
+          created_at: '2026-10-06T10:00:00Z',
+          ...container,
+        })),
+        total: containers.length,
+      }
+    )
   }
   const html = renderToStaticMarkup(
     <QueryClientProvider client={client}>
@@ -46,7 +67,7 @@ function renderHeader(
   return html
 }
 
-for (const status of ['running', 'failed', 'completed', 'stopped']) {
+for (const status of ['running', 'completed', 'stopped']) {
   test(`current deployment remains Deployed when latest is ${status}`, () => {
     const html = renderHeader(status, 3500)
     expect(html).toContain('>Deployed<')
@@ -69,13 +90,33 @@ for (const status of ['pending', 'queued', 'building', 'running']) {
     expect(html).not.toContain('Not deployed')
   })
 }
-for (const status of ['failed', 'cancelled']) {
-  test(`a first deployment that ${status} reads Not deployed`, () => {
-    const html = renderHeader(status, null)
-    expect(html).toContain('Not deployed')
-    expect(html).not.toContain('Deploying')
+test('a first deployment that cancelled reads Not deployed', () => {
+  const html = renderHeader('cancelled', null)
+  expect(html).toContain('Not deployed')
+  expect(html).not.toContain('Deploying')
+})
+for (const currentId of [3500, null]) {
+  test(`a failed latest deployment reads Failed (live: ${currentId}) and links to the overview`, () => {
+    const html = renderHeader('failed', currentId)
+    expect(html).toContain('>Failed<')
+    expect(html).toContain('href="/projects/temps-cloud-api/project"')
+    expect(html).not.toContain('>Deployed<')
+    expect(html).not.toContain('Not deployed')
   })
 }
+test('a live container that exited reads Degraded', () => {
+  const html = renderHeader('completed', 3500, {
+    containers: [{ status: 'running' }, { status: 'exited' }],
+  })
+  expect(html).toContain('>Degraded<')
+  expect(html).not.toContain('>Deployed<')
+})
+test('healthy live containers keep Deployed', () => {
+  const html = renderHeader('completed', 3500, {
+    containers: [{ status: 'running' }],
+  })
+  expect(html).toContain('>Deployed<')
+})
 test('a redeploy keeps the live version Deployed', () => {
   const html = renderHeader('running', 3500)
   expect(html).toContain('>Deployed<')
@@ -83,7 +124,7 @@ test('a redeploy keeps the live version Deployed', () => {
 })
 for (const activeVisitors of [0, 3]) {
   test(`the live visitors pill is clickable with ${activeVisitors} active visitors`, () => {
-    const html = renderHeader('completed', 3500, activeVisitors)
+    const html = renderHeader('completed', 3500, { activeVisitors })
     const pill = html.match(/<button[^>]*Open Live visitors[^>]*>/)?.[0]
     expect(pill).toBeDefined()
     expect(pill).not.toContain('disabled')

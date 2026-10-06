@@ -38,6 +38,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { EmptyState } from '@/components/ui/empty-state'
+import { RecoveryActionDialog } from '@/components/monitoring/RecoveryActionDialog'
 import {
   Select,
   SelectContent,
@@ -56,13 +57,27 @@ import {
 } from '@/components/ui/table'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import {
+  alarmQuickAction,
+  alarmScopeLinks,
+  type AlarmQuickAction,
+} from '@/lib/alarm-actions'
+import type { RecoveryAction } from '@/lib/recovery-actions'
 import { cn } from '@/lib/utils'
 import { getErrorMessage } from '@/utils/errorHandling'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { format, formatDistanceToNow } from 'date-fns'
-import { AlarmClock, BellOff, Check, CheckCircle2, X } from 'lucide-react'
+import {
+  AlarmClock,
+  BellOff,
+  Check,
+  CheckCircle2,
+  RotateCw,
+  Sparkles,
+  X,
+} from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
-import { useSearchParams } from 'react-router'
+import { Link, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
 import {
   actionAppliesTo,
@@ -174,13 +189,83 @@ function isSilenced(alarm: AlarmResponse): boolean {
   )
 }
 
-function scopeLabel(alarm: AlarmResponse): string {
-  const parts: string[] = []
-  if (alarm.environment_id != null) parts.push(`env #${alarm.environment_id}`)
-  if (alarm.deployment_id != null) parts.push(`deploy #${alarm.deployment_id}`)
-  if (alarm.service_id != null) parts.push(`service #${alarm.service_id}`)
-  if (alarm.container_id != null) parts.push(`container #${alarm.container_id}`)
-  return parts.length > 0 ? parts.join(' · ') : 'project-wide'
+/** The alarm's scope, each part linked to the resource that fired. */
+function AlarmScope({
+  alarm,
+  projectSlug,
+}: {
+  alarm: AlarmResponse
+  projectSlug: string | undefined
+}) {
+  const links = alarmScopeLinks(alarm, projectSlug)
+  return (
+    <span className="flex flex-wrap gap-x-1.5 gap-y-0.5">
+      {links.map((link, index) => (
+        <span key={link.label} className="inline-flex items-center gap-1.5">
+          {index > 0 && <span aria-hidden="true">·</span>}
+          {link.href ? (
+            <Link
+              to={link.href}
+              className="underline-offset-2 hover:text-foreground hover:underline"
+            >
+              {link.label}
+            </Link>
+          ) : (
+            link.label
+          )}
+        </span>
+      ))}
+    </span>
+  )
+}
+
+function AlarmRowQuickAction({
+  alarm,
+  projectSlug,
+  disabled,
+  onRun,
+}: {
+  alarm: AlarmResponse
+  projectSlug: string | undefined
+  disabled: boolean
+  onRun: (action: Exclude<AlarmQuickAction, { kind: 'autofix' }>) => void
+}) {
+  const action = alarmQuickAction(alarm, projectSlug)
+  if (!action) return null
+  return <QuickActionButton action={action} disabled={disabled} onRun={onRun} />
+}
+
+/** The type-specific fix for an alarm row (restart, redeploy, autofix). */
+function QuickActionButton({
+  action,
+  disabled,
+  onRun,
+}: {
+  action: AlarmQuickAction
+  disabled: boolean
+  onRun: (action: Exclude<AlarmQuickAction, { kind: 'autofix' }>) => void
+}) {
+  if (action.kind === 'autofix') {
+    return (
+      <Button variant="outline" size="sm" asChild>
+        <Link to={action.href}>
+          <Sparkles className="mr-1 h-3.5 w-3.5" />
+          Autofix
+        </Link>
+      </Button>
+    )
+  }
+  return (
+    <Button
+      variant="outline"
+      size="sm"
+      disabled={disabled}
+      onClick={() => onRun(action)}
+    >
+      <RotateCw className="mr-1 h-3.5 w-3.5" />
+      {action.kind === 'restart_container' ? 'Restart' : 'Redeploy'}
+    </Button>
+  )
 }
 
 // ── Page ────────────────────────────────────────────────────────────────────
@@ -226,6 +311,34 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
   )
   const projects = useMemo(() => projectsData?.projects ?? [], [projectsData])
   const effectiveProjectId = selectedProjectId ?? projects[0]?.id ?? null
+  const effectiveProject = projects.find(
+    (project) => project.id === effectiveProjectId
+  )
+  // The confirmation for a row's restart/redeploy action, if one is open.
+  const [recoveryAction, setRecoveryAction] = useState<RecoveryAction | null>(
+    null
+  )
+  const runQuickAction = (
+    action: Exclude<AlarmQuickAction, { kind: 'autofix' }>
+  ) => {
+    if (!effectiveProject) return
+    setRecoveryAction(
+      action.kind === 'restart_container'
+        ? {
+            kind: 'restart_container',
+            projectId: effectiveProject.id,
+            environmentId: action.environmentId,
+            containerId: action.containerId,
+            containerName: action.containerName,
+          }
+        : {
+            kind: 'redeploy',
+            projectId: effectiveProject.id,
+            sourceType: effectiveProject.source_type,
+            deploymentId: action.deploymentId,
+          }
+    )
+  }
   const hasProject = effectiveProjectId != null
   const projectPath = { project_id: effectiveProjectId ?? 0 }
 
@@ -771,7 +884,10 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
                       </div>
                     </TableCell>
                     <TableCell className="hidden text-xs text-muted-foreground lg:table-cell">
-                      {scopeLabel(alarm)}
+                      <AlarmScope
+                        alarm={alarm}
+                        projectSlug={effectiveProject?.slug}
+                      />
                     </TableCell>
                     <TableCell>
                       <div className="flex flex-col gap-1">
@@ -804,6 +920,12 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
                     </TableCell>
                     <TableCell className="text-right">
                       <div className="flex justify-end gap-1">
+                        <AlarmRowQuickAction
+                          alarm={alarm}
+                          projectSlug={effectiveProject?.slug}
+                          disabled={isMutating || !effectiveProject}
+                          onRun={runQuickAction}
+                        />
                         {alarm.status === 'firing' && (
                           <Button
                             variant="outline"
@@ -911,6 +1033,11 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
           </div>
         </div>
       )}
+
+      <RecoveryActionDialog
+        action={recoveryAction}
+        onClose={() => setRecoveryAction(null)}
+      />
 
       <AlertDialog
         open={confirmAction != null}

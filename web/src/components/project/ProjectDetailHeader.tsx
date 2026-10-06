@@ -2,20 +2,19 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type { DeploymentResponse, ProjectResponse } from '@/api/client'
-import { getEnvironmentsOptions } from '@/api/client/@tanstack/react-query.gen'
-import { useQuery } from '@tanstack/react-query'
 import { useEffect, useRef } from 'react'
 import {
   describeDockerSocket,
   HOST_DOCKER_ACCESS_SHORT_LABEL,
 } from '@/lib/docker-socket'
-import { projectDeploymentStatus } from '@/lib/project-deployment-status'
+import type { ProjectDeploymentStatus } from '@/lib/project-deployment-status'
 import { isActiveDeploymentStatus } from '@/lib/recent-deployments'
 import { ProjectAvatar } from '@/components/project/ProjectAvatar'
-import { Badge } from '@/components/ui/badge'
+import { Badge, badgeVariants } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { ReloadableImage } from '@/components/utils/ReloadableImage'
 import { useDashboardHealth } from '@/hooks/useDashboardHealth'
+import { useProjectFailureState } from '@/hooks/useProjectFailureState'
 import { useProjectsMonitorHealth } from '@/hooks/useProjectsMonitorHealth'
 import {
   projectHealthIndicator,
@@ -27,6 +26,7 @@ import {
   type GitProviderKind,
 } from '@/lib/project-header-actions'
 import {
+  AlertTriangle,
   ExternalLink,
   GitFork,
   Loader2,
@@ -45,6 +45,21 @@ import { liveVisitorsPillLabel } from '@/components/analytics/analytics-onboardi
  * Tones for the header health badge. Mirrors the projects-list card so the same
  * project reads the same in both places.
  */
+/** Badge variant for the problem states, which link to the overview. */
+const deploymentStatusBadgeVariant: Record<
+  Extract<ProjectDeploymentStatus, 'Failed' | 'Degraded'>,
+  'destructive' | 'warning'
+> = {
+  Failed: 'destructive',
+  Degraded: 'warning',
+}
+
+function isProblemStatus(
+  status: ProjectDeploymentStatus | undefined
+): status is 'Failed' | 'Degraded' {
+  return status === 'Failed' || status === 'Degraded'
+}
+
 const healthToneStyles: Record<ProjectHealthTone, string> = {
   healthy: 'bg-emerald-500',
   degraded: 'bg-amber-500',
@@ -109,16 +124,10 @@ export function ProjectDetailHeader({
   // grant is absent.
   const dockerSocket = describeDockerSocket(project.docker_socket)
   const screenshotLocation = lastDeployment?.screenshot_location
-  const environmentsQuery = useQuery({
-    ...getEnvironmentsOptions({ path: { project_id: project.id } }),
-    refetchInterval: 5_000,
-  })
   // Latest build and currently deployed version can be different, including
   // during builds, after failures, and following a rollback.
-  const deploymentStatus = projectDeploymentStatus(
-    environmentsQuery.data,
-    lastDeployment
-  )
+  const { status: deploymentStatus, environmentsQuery } =
+    useProjectFailureState(project.id, lastDeployment)
   // When a build finishes, its environment pointer is already set; refetch at
   // once so "Deploying" turns into "Deployed" instead of briefly reading
   // "Not deployed" until the next poll.
@@ -175,18 +184,37 @@ export function ProjectDetailHeader({
             <h1 className="text-base sm:text-lg font-semibold truncate">
               {project.slug}
             </h1>
-            <Badge
-              variant={deploymentStatus === 'Deployed' ? 'default' : 'outline'}
-              className="hidden sm:inline-flex shrink-0 gap-1"
-            >
-              {deploymentStatus === 'Deploying' && (
-                <Loader2 aria-hidden="true" className="size-3 animate-spin" />
-              )}
-              {deploymentStatus ??
-                (environmentsQuery.isError
-                  ? 'Deployment status unavailable'
-                  : 'Checking deployment…')}
-            </Badge>
+            {isProblemStatus(deploymentStatus) ? (
+              // Failed / Degraded link to the overview banner that explains
+              // the problem and offers the fix.
+              <Link
+                to={`/projects/${project.slug}/project`}
+                className={`${badgeVariants({ variant: deploymentStatusBadgeVariant[deploymentStatus] })} hidden sm:inline-flex shrink-0 gap-1`}
+                title={
+                  deploymentStatus === 'Failed'
+                    ? 'The latest deployment failed. Open the overview for the reason and recovery actions.'
+                    : 'Live containers are down or restarting. Open the overview for details and recovery actions.'
+                }
+              >
+                <AlertTriangle aria-hidden="true" className="size-3" />
+                {deploymentStatus}
+              </Link>
+            ) : (
+              <Badge
+                variant={
+                  deploymentStatus === 'Deployed' ? 'default' : 'outline'
+                }
+                className="hidden sm:inline-flex shrink-0 gap-1"
+              >
+                {deploymentStatus === 'Deploying' && (
+                  <Loader2 aria-hidden="true" className="size-3 animate-spin" />
+                )}
+                {deploymentStatus ??
+                  (environmentsQuery.isError
+                    ? 'Deployment status unavailable'
+                    : 'Checking deployment…')}
+              </Badge>
+            )}
             {dockerSocket.state === 'granted' && (
               // Deliberately NOT hidden below `sm` like the badges around it:
               // this is the only place the console states that the project is
