@@ -160,6 +160,18 @@ class WaitTests(unittest.TestCase):
         self.assertEqual(len(calls), 7)
         self.assertGreater(clock.now, 120)
 
+    def test_dropped_run_is_annotated_once(self):
+        pending = [run(status="queued", conclusion=None)]
+        clock = FakeClock()
+        with patch("builtins.print") as printed:
+            wait(args(), fetch=lambda *a: [] if printed.call_count else pending,
+                 sleep=clock.sleep, clock=clock)
+        lines = [str(call.args[0]) for call in printed.call_args_list]
+        self.assertEqual(
+            sum(line.startswith("::warning::") and "absent" in line for line in lines), 1
+        )
+        self.assertGreater(sum("absent" in line for line in lines), 1)
+
     def test_flapping_run_still_times_out_as_pending(self):
         pending = [run(status="queued", conclusion=None)]
         with patch("release_test_gate.guidance", wraps=guidance) as described:

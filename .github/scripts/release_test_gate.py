@@ -129,6 +129,7 @@ def wait(args, fetch=fetch_runs, sleep=time.sleep, clock=time.monotonic):
     runs = []
     state = "missing"
     seen_qualifying_run = False
+    warned_run_dropped = False
     while True:
         try:
             fetched = fetch(args.repository, args.workflow, args.sha, token)
@@ -141,11 +142,14 @@ def wait(args, fetch=fetch_runs, sleep=time.sleep, clock=time.monotonic):
                 # The runs listing filtered by `head_sha` sometimes omits a
                 # queued run it returned a minute earlier. A run cannot be
                 # unregistered, so this is the API flapping, not a missing
-                # run: keep waiting on the last answer that listed it.
-                print(
-                    f"::warning::{args.workflow} runs for {args.sha} were listed "
-                    "earlier but are absent from this response; treating as pending"
+                # run: keep waiting on the last answer that listed it. Annotate
+                # once; a long gap would otherwise add one warning per poll.
+                message = (
+                    f"{args.workflow} runs for {args.sha} were listed earlier "
+                    "but are absent from this response; treating as pending"
                 )
+                print(message if warned_run_dropped else f"::warning::{message}")
+                warned_run_dropped = True
                 state = "pending"
             else:
                 runs = fetched
