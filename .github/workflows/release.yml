@@ -658,11 +658,11 @@ jobs:
       - name: Create combined checksums file
         run: |
           cd release
-          cat temps-linux-amd64.tar.gz.sha256 > checksums.txt
-          cat temps-linux-arm64.tar.gz.sha256 >> checksums.txt
-          cat temps-darwin-amd64.tar.gz.sha256 >> checksums.txt
-          cat temps-darwin-arm64.tar.gz.sha256 >> checksums.txt
-          sha256sum runtime-images.json >> checksums.txt
+          {
+            cat temps-linux-amd64.tar.gz.sha256 temps-linux-arm64.tar.gz.sha256 \
+              temps-darwin-amd64.tar.gz.sha256 temps-darwin-arm64.tar.gz.sha256
+            sha256sum runtime-images.json
+          } > checksums.txt
           echo "Combined checksums:"
           cat checksums.txt
 
@@ -1061,14 +1061,14 @@ jobs:
           else
             VERSION="${GITHUB_REF#refs/tags/v}"
           fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Version: $VERSION"
 
       - name: Extract platform tag
         id: platform_tag
         run: |
           PLATFORM_TAG=$(echo "${{ matrix.platform }}" | sed 's/\//-/g')
-          echo "tag=$PLATFORM_TAG" >> $GITHUB_OUTPUT
+          echo "tag=$PLATFORM_TAG" >> "$GITHUB_OUTPUT"
           echo "Platform tag: $PLATFORM_TAG"
 
       - name: Build and push Docker image
@@ -1144,7 +1144,7 @@ jobs:
           else
             VERSION="${GITHUB_REF#refs/tags/v}"
           fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Version: $VERSION"
 
       # Merge per-platform tags into a multi-arch manifest under the channel
@@ -1236,7 +1236,7 @@ jobs:
             echo "::error::Failed to extract SANDBOX_IMAGE_VERSION from docker.rs"
             exit 1
           fi
-          echo "sandbox_image_version=$IMAGE_VERSION" >> $GITHUB_OUTPUT
+          echo "sandbox_image_version=$IMAGE_VERSION" >> "$GITHUB_OUTPUT"
 
           GATEWAY_VERSION=$(grep -E '^version = ' \
             crates/temps-preview-gateway/Cargo.standalone.toml \
@@ -1246,7 +1246,7 @@ jobs:
             echo "::error::Failed to extract preview gateway version"
             exit 1
           fi
-          echo "gateway_version=$GATEWAY_VERSION" >> $GITHUB_OUTPUT
+          echo "gateway_version=$GATEWAY_VERSION" >> "$GITHUB_OUTPUT"
 
           echo "Sandbox image version: $IMAGE_VERSION"
           echo "Gateway version:       $GATEWAY_VERSION"
@@ -1336,7 +1336,7 @@ jobs:
             echo "list<<TAGS_EOF"
             echo "$REPO:$SHA"
             echo "TAGS_EOF"
-          } >> $GITHUB_OUTPUT
+          } >> "$GITHUB_OUTPUT"
 
 
       - name: Build and push sandbox image
@@ -1431,7 +1431,7 @@ jobs:
             echo "list<<TAGS_EOF"
             echo "$REPO:$SHA"
             echo "TAGS_EOF"
-          } >> $GITHUB_OUTPUT
+          } >> "$GITHUB_OUTPUT"
 
       - name: Build and push preview gateway image
         id: image
