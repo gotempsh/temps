@@ -1261,11 +1261,11 @@ impl RestoreService {
             .one(self.db.as_ref())
             .await?
             .ok_or(RestoreError::RestoreRunNotFound { restore_run_id: id })?;
-        Ok(views_with_source_backups(self.db.as_ref(), vec![run])
+        views_with_source_backups(self.db.as_ref(), vec![run])
             .await?
             .into_iter()
             .next()
-            .ok_or(RestoreError::RestoreRunNotFound { restore_run_id: id })?)
+            .ok_or(RestoreError::RestoreRunNotFound { restore_run_id: id })
     }
 
     /// Cancel a restore run that has not yet started writing data.
@@ -2578,13 +2578,13 @@ async fn cancel_run_at_safe_point(
         service_id = current.source_service_id,
         "Restore run cancelled before it wrote any data"
     );
-    Ok(views_with_source_backups(db, vec![current])
+    views_with_source_backups(db, vec![current])
         .await?
         .into_iter()
         .next()
         .ok_or(RestoreError::RestoreRunNotFound {
             restore_run_id: run_id,
-        })?)
+        })
 }
 
 /// `Ok` when `run` can still be cancelled; otherwise the refusal to return.
