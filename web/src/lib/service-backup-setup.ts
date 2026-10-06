@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { withReturnTo } from '@/lib/same-origin-return-to'
+import { withReturnTo } from '@/lib/safe-return-to'
 
 // Links that take an operator from a database's Backups card to the pages
 // that configure its backups, and back again once they are done.

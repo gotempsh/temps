@@ -30,6 +30,8 @@ describe('detailReturnPath', () => {
       '/projects/other-app/environment-variables',
       '/projects/app-two/environment-variables',
       '/settings/general',
+      '/projects/app/../other-app/environment-variables',
+      '/projects/app/\\example.com',
     ]) {
       expect(detailReturnPath({ returnTo }, 'app', fallback)).toBe(fallback)
     }

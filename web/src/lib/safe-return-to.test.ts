@@ -6,6 +6,7 @@ import {
   isReturnFromSetup,
   locationPath,
   returnNavigation,
+  returnToFromSearch,
   safeReturnTo,
   withReturnTo,
 } from './safe-return-to'
@@ -31,6 +32,8 @@ describe('safeReturnTo', () => {
     '/path with space',
     '/tab\tnewline',
     'javascript:alert(1)',
+    '/storage/7\n',
+    '/ storage',
   ])('rejects %p', (value) => {
     expect(safeReturnTo(value)).toBeNull()
   })
@@ -50,10 +53,36 @@ describe('withReturnTo', () => {
     )
   })
 
+  test('keeps a hash on returnTo and existing params on the target', () => {
+    const href = withReturnTo(
+      '/backups/s3-sources/3/schedules/new?service_id=7',
+      '/storage/7#backups'
+    )
+    const url = new URL(href, 'https://temps.invalid')
+    expect(url.pathname).toBe('/backups/s3-sources/3/schedules/new')
+    expect(url.searchParams.get('service_id')).toBe('7')
+    expect(url.searchParams.get('returnTo')).toBe('/storage/7#backups')
+  })
+
   test('drops an unsafe returnTo', () => {
     expect(
       withReturnTo('/settings/notifications/new', 'https://example.com')
     ).toBe('/settings/notifications/new')
+  })
+})
+
+describe('returnToFromSearch', () => {
+  test('reads only a safe returnTo parameter', () => {
+    expect(
+      returnToFromSearch(new URLSearchParams('returnTo=%2Fstorage%2F7'))
+    ).toBe('/storage/7')
+    expect(
+      returnToFromSearch(new URLSearchParams('returnTo=https://example.com'))
+    ).toBeNull()
+    expect(
+      returnToFromSearch(new URLSearchParams('returnTo=%2F%2Fexample.com'))
+    ).toBeNull()
+    expect(returnToFromSearch(new URLSearchParams(''))).toBeNull()
   })
 })
 

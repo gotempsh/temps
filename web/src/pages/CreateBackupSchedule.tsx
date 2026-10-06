@@ -37,7 +37,7 @@ import {
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { scheduleOptions } from '@/lib/schedule-options'
-import { returnToFromSearch } from '@/lib/same-origin-return-to'
+import { returnToFromSearch } from '@/lib/safe-return-to'
 import { preselectedServiceId } from '@/lib/service-backup-setup'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { ArrowLeft } from 'lucide-react'

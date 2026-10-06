@@ -12,6 +12,7 @@
  */
 
 const PLACEHOLDER_ORIGIN = 'https://temps.invalid'
+const PARAM = 'returnTo'
 
 export function safeReturnTo(value: string | null | undefined): string | null {
   if (!value || !value.startsWith('/') || value.startsWith('//')) return null
@@ -28,7 +29,15 @@ export function safeReturnTo(value: string | null | undefined): string | null {
   return `${url.pathname}${url.search}${url.hash}`
 }
 
-/** Appends `returnTo` to `path` when it is a safe in-app path. */
+/** Read and validate the `returnTo` parameter from a page's search params. */
+export function returnToFromSearch(params: URLSearchParams): string | null {
+  return safeReturnTo(params.get(PARAM))
+}
+
+/**
+ * `path` with `returnTo` appended, preserving any query string and hash
+ * already on `path`. An unsafe `returnTo` is dropped rather than forwarded.
+ */
 export function withReturnTo(
   path: string,
   returnTo: string | null | undefined
@@ -36,7 +45,7 @@ export function withReturnTo(
   const safe = safeReturnTo(returnTo)
   if (!safe) return path
   const url = new URL(path, PLACEHOLDER_ORIGIN)
-  url.searchParams.set('returnTo', safe)
+  url.searchParams.set(PARAM, safe)
   return `${url.pathname}${url.search}${url.hash}`
 }
 

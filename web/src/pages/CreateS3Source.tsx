@@ -16,7 +16,7 @@ import {
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { testS3ConnectionPreview } from '@/lib/s3-sources'
-import { returnToFromSearch } from '@/lib/same-origin-return-to'
+import { returnToFromSearch } from '@/lib/safe-return-to'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useMutation } from '@tanstack/react-query'
 import { ArrowLeft, PlugZap, Plus, RefreshCw } from 'lucide-react'
