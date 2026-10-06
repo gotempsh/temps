@@ -30,7 +30,7 @@ pub use restore::{
     RestoreServiceIdentity,
 };
 pub use restore_reconcile::{
-    active_restore_run_ids, reconcile_interrupted_restores, DockerRestoreFence, RestoreHelperFence,
-    RestoreReconcileReport, INTERRUPTED_STATUS,
+    active_restore_run_ids, reconcile_interrupted_restores, FenceTarget, ManagerRestoreFence,
+    RestoreHelperFence, RestoreReconcileReport, INTERRUPTED_STATUS,
 };
 pub use s3_lifecycle::{ReconcileOutcome, S3LifecycleService};

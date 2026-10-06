@@ -465,8 +465,8 @@ impl TempsPlugin for BackupPlugin {
             // and are retried.
             match crate::services::active_restore_run_ids(db.as_ref()).await {
                 Ok(run_ids) if !run_ids.is_empty() => {
-                    let fence = crate::services::DockerRestoreFence::new(
-                        context.require_service::<temps_core::DockerHandle>(),
+                    let fence = crate::services::ManagerRestoreFence::new(
+                        context.require_service::<temps_providers::ExternalServiceManager>(),
                     );
                     let restore_db = db.clone();
                     tokio::spawn(async move {
@@ -729,7 +729,7 @@ const RESTORE_RECONCILE_MAX_ATTEMPTS: u32 = 60;
 async fn reconcile_restores_with_retry(
     db: Arc<sea_orm::DatabaseConnection>,
     mut run_ids: Vec<i32>,
-    fence: crate::services::DockerRestoreFence,
+    fence: crate::services::ManagerRestoreFence,
 ) {
     for attempt in 1..=RESTORE_RECONCILE_MAX_ATTEMPTS {
         match crate::services::reconcile_interrupted_restores(db.as_ref(), &run_ids, &fence).await {

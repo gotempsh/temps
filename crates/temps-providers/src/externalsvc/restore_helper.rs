@@ -95,6 +95,15 @@ pub enum RestoreFenceError {
         helper: String,
         reason: String,
     },
+    #[error(
+        "Could not resolve the container of {service_type} service '{service_name}' to fence \
+         its restore helpers: {reason}"
+    )]
+    Resolve {
+        service_name: String,
+        service_type: String,
+        reason: String,
+    },
 }
 
 /// Stop and remove every restore helper that targets `target_container`.

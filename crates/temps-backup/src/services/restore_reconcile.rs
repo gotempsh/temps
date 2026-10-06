@@ -37,43 +37,70 @@ use async_trait::async_trait;
 use chrono::Utc;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder};
-use temps_providers::externalsvc::restore_helper::{
-    fence_restore_helpers, RestoreFenceError, RestoreFenceReport,
-};
+use temps_providers::externalsvc::restore_helper::{RestoreFenceError, RestoreFenceReport};
+use temps_providers::externalsvc::ServiceType;
+use temps_providers::ExternalServiceManager;
 use tracing::{error, info, warn};
 
-use super::restore::{engine_container_name, RestoreError, ACTIVE_RESTORE_STATUSES};
+use super::restore::{RestoreError, ACTIVE_RESTORE_STATUSES};
 
 /// Terminal status for a run whose worker died with a previous process.
 pub const INTERRUPTED_STATUS: &str = "interrupted";
 
-/// Stops restore helpers that may still be writing into a target container.
+/// The service a restore writes into, identified the way its engine names
+/// containers. Resolving the container name is left to the engine (via
+/// [`ExternalServiceManager::fence_restore_helpers`]) rather than guessed
+/// here, because engines and imported services name containers differently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FenceTarget {
+    /// Service (instance) name the engine derives its container name from.
+    pub service_name: String,
+    /// `external_services.service_type`, e.g. `postgres`.
+    pub service_type: String,
+    /// Real container name of an imported service, when it has one.
+    pub imported_container: Option<String>,
+}
+
+/// Stops restore helpers that may still be writing into a target service.
 #[async_trait]
 pub trait RestoreHelperFence: Send + Sync {
-    /// `Ok` means no helper for `target_container` can still be running.
-    async fn fence(&self, target_container: &str) -> Result<RestoreFenceReport, RestoreFenceError>;
+    /// `Ok` means no helper for `target` can still be running.
+    async fn fence(&self, target: &FenceTarget) -> Result<RestoreFenceReport, RestoreFenceError>;
 }
 
-/// Production fence backed by this process's Docker handle.
-pub struct DockerRestoreFence {
-    docker: Arc<temps_core::DockerHandle>,
+/// Production fence: asks the external-service manager, which owns the
+/// Docker handle and the engines' container naming.
+pub struct ManagerRestoreFence {
+    manager: Arc<ExternalServiceManager>,
 }
 
-impl DockerRestoreFence {
-    pub fn new(docker: Arc<temps_core::DockerHandle>) -> Self {
-        Self { docker }
+impl ManagerRestoreFence {
+    pub fn new(manager: Arc<ExternalServiceManager>) -> Self {
+        Self { manager }
     }
 }
 
 #[async_trait]
-impl RestoreHelperFence for DockerRestoreFence {
-    async fn fence(&self, target_container: &str) -> Result<RestoreFenceReport, RestoreFenceError> {
-        match self.docker.get() {
-            Some(docker) => fence_restore_helpers(docker, target_container).await,
-            // Restores drive local containers, so a process started without
-            // a Docker daemon cannot have launched a helper to fence.
-            None => Ok(RestoreFenceReport::default()),
-        }
+impl RestoreHelperFence for ManagerRestoreFence {
+    async fn fence(&self, target: &FenceTarget) -> Result<RestoreFenceReport, RestoreFenceError> {
+        let service_type = ServiceType::from_str(&target.service_type).map_err(|e| {
+            RestoreFenceError::Resolve {
+                service_name: target.service_name.clone(),
+                service_type: target.service_type.clone(),
+                reason: e.to_string(),
+            }
+        })?;
+        Ok(self
+            .manager
+            .fence_restore_helpers(
+                &target.service_name,
+                service_type,
+                target.imported_container.as_deref(),
+            )
+            .await?
+            // No Docker daemon in this process: restores drive local
+            // containers, so it cannot have launched a helper to fence.
+            .unwrap_or_default())
     }
 }
 
@@ -136,32 +163,22 @@ pub async fn reconcile_interrupted_restores(
 
     for run in runs {
         let service = services.get(&run.source_service_id);
-        let targets = fence_targets(&run, service);
-
-        let mut stopped = 0usize;
-        let mut fence_failure = None;
-        for target in &targets {
-            match fence.fence(target).await {
-                Ok(fenced) => stopped += fenced.stopped.len(),
-                Err(e) => {
-                    fence_failure = Some(e);
-                    break;
-                }
+        let stopped = match fence_run_helpers(&run, service, fence).await {
+            Ok(stopped) => stopped,
+            Err(e) => {
+                warn!(
+                    restore_run_id = run.id,
+                    service_id = run.source_service_id,
+                    phase = %run.phase,
+                    "Restore run left active: its restore helpers could not be fenced \
+                     after a restart, so releasing it could race a surviving helper. \
+                     Will retry: {}",
+                    e
+                );
+                report.deferred.push(run.id);
+                continue;
             }
-        }
-        if let Some(e) = fence_failure {
-            warn!(
-                restore_run_id = run.id,
-                service_id = run.source_service_id,
-                phase = %run.phase,
-                "Restore run left active: its restore helpers could not be fenced \
-                 after a restart, so releasing it could race a surviving helper. \
-                 Will retry: {}",
-                e
-            );
-            report.deferred.push(run.id);
-            continue;
-        }
+        };
 
         let message = interrupted_message(&run, stopped);
         let now = Utc::now();
@@ -201,27 +218,45 @@ pub async fn reconcile_interrupted_restores(
     Ok(report)
 }
 
-/// Containers whose restore helpers must be fenced for `run`.
-///
-/// An in-place restore (or PITR in place) writes into the target service's
-/// own container. A restore to a new service writes into the new container
-/// only, and the source container is deliberately left alone: a later
-/// in-place restore on the source may legitimately be running by the time a
-/// deferred run is retried.
-fn fence_targets(
+/// Fence the restore helpers of `run`, returning how many were stopped.
+/// `service` is the run's target (`source_service_id`) service row; when it
+/// no longer exists the run's data is gone with it and there is nothing to
+/// fence.
+pub(crate) async fn fence_run_helpers(
     run: &temps_entities::restore_runs::Model,
     service: Option<&temps_entities::external_services::Model>,
-) -> Vec<String> {
-    let Some(service) = service else {
-        return Vec::new();
-    };
-    let engine = service.service_type.to_lowercase();
-    match run.target_service_name.as_deref() {
-        Some(new_name) if !new_name.trim().is_empty() => {
-            vec![engine_container_name(&engine, new_name)]
-        }
-        _ => vec![engine_container_name(&engine, &service.name)],
+    fence: &dyn RestoreHelperFence,
+) -> Result<usize, RestoreFenceError> {
+    match fence_target(run, service) {
+        Some(target) => Ok(fence.fence(&target).await?.stopped.len()),
+        None => Ok(0),
     }
+}
+
+/// The service whose restore helpers must be fenced for `run`.
+///
+/// An in-place restore (or PITR in place) writes into the target service's
+/// own container, which for an imported service is its real container. A
+/// restore to a new service writes into the new service's container only,
+/// and the source is deliberately left alone: a later in-place restore on the
+/// source may legitimately be running by the time a deferred run is retried.
+fn fence_target(
+    run: &temps_entities::restore_runs::Model,
+    service: Option<&temps_entities::external_services::Model>,
+) -> Option<FenceTarget> {
+    let service = service?;
+    Some(match run.target_service_name.as_deref() {
+        Some(new_name) if !new_name.trim().is_empty() => FenceTarget {
+            service_name: new_name.to_string(),
+            service_type: service.service_type.clone(),
+            imported_container: None,
+        },
+        _ => FenceTarget {
+            service_name: service.name.clone(),
+            service_type: service.service_type.clone(),
+            imported_container: service.container_name.clone(),
+        },
+    })
 }
 
 /// Plain-language description of where a restore stopped.
@@ -350,14 +385,14 @@ mod tests {
     impl RestoreHelperFence for RecordingFence {
         async fn fence(
             &self,
-            target_container: &str,
+            target: &FenceTarget,
         ) -> Result<RestoreFenceReport, RestoreFenceError> {
             if let Ok(mut calls) = self.calls.lock() {
-                calls.push(target_container.to_string());
+                calls.push(target.service_name.clone());
             }
             if self.fail {
                 return Err(RestoreFenceError::List {
-                    target_container: target_container.to_string(),
+                    target_container: target.service_name.clone(),
                     reason: "daemon unreachable".to_string(),
                 });
             }
@@ -413,26 +448,49 @@ mod tests {
     }
 
     #[test]
-    fn fence_targets_follow_where_the_restore_writes() {
-        let svc = service(10, "orders", "postgres");
+    fn fence_target_follows_where_the_restore_writes() {
+        let svc = service(10, "orders", "mongodb");
+        let in_place = FenceTarget {
+            service_name: "orders".to_string(),
+            service_type: "mongodb".to_string(),
+            imported_container: None,
+        };
         assert_eq!(
-            fence_targets(&run(1, "in_place", "restore", None), Some(&svc)),
-            vec!["postgres-orders".to_string()]
+            fence_target(&run(1, "in_place", "restore", None), Some(&svc)),
+            Some(in_place.clone())
         );
         // PITR in place has no new-service name and writes to the target.
         assert_eq!(
-            fence_targets(&run(2, "pitr", "recover", None), Some(&svc)),
-            vec!["postgres-orders".to_string()]
+            fence_target(&run(2, "pitr", "recover", None), Some(&svc)),
+            Some(in_place)
         );
-        // A new-service restore never fences the source container.
+        // A new-service restore never fences the source service.
         assert_eq!(
-            fence_targets(
+            fence_target(
                 &run(3, "new_service", "provision", Some("orders-copy")),
                 Some(&svc)
             ),
-            vec!["postgres-orders-copy".to_string()]
+            Some(FenceTarget {
+                service_name: "orders-copy".to_string(),
+                service_type: "mongodb".to_string(),
+                imported_container: None,
+            })
         );
-        assert!(fence_targets(&run(4, "in_place", "restore", None), None).is_empty());
+        assert_eq!(
+            fence_target(&run(4, "in_place", "restore", None), None),
+            None
+        );
+    }
+
+    #[test]
+    fn imported_service_is_fenced_by_its_real_container_too() {
+        let mut svc = service(10, "legacy", "postgres");
+        svc.container_name = Some("existing-pg".to_string());
+        assert_eq!(
+            fence_target(&run(1, "in_place", "restore", None), Some(&svc))
+                .and_then(|target| target.imported_container),
+            Some("existing-pg".to_string())
+        );
     }
 
     #[tokio::test]

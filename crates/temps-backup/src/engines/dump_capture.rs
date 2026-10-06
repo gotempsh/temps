@@ -393,7 +393,7 @@ async fn read_failure_log(
     cancel: &CancellationToken,
 ) -> Option<String> {
     match copy_file_out_of_container(docker, container, container_path, host_path, cancel).await {
-        Ok(_) => match tokio::fs::read(host_path).await {
+        Ok(_) => match read_file_tail(host_path, MAX_DIAGNOSTIC_BYTES).await {
             Ok(bytes) => Some(bounded_tail(
                 &String::from_utf8_lossy(&bytes),
                 MAX_DIAGNOSTIC_BYTES,
@@ -414,6 +414,23 @@ async fn read_failure_log(
             None
         }
     }
+}
+
+/// Read at most the last `max_bytes` (plus a few bytes of slack so a UTF-8
+/// character cut by the seek can be dropped cleanly) of the file at `path`.
+/// A failing tool can write an arbitrarily large diagnostics file; only its
+/// tail is ever shown, so only its tail is loaded into memory.
+async fn read_file_tail(path: &Path, max_bytes: usize) -> std::io::Result<Vec<u8>> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let mut file = tokio::fs::File::open(path).await?;
+    let len = file.metadata().await?.len();
+    let window = (max_bytes as u64).saturating_add(4);
+    if len > window {
+        file.seek(std::io::SeekFrom::Start(len - window)).await?;
+    }
+    let mut tail = Vec::with_capacity(len.min(window) as usize);
+    file.take(window).read_to_end(&mut tail).await?;
+    Ok(tail)
 }
 
 /// Why [`copy_file_out_of_container`] did not produce the file.
@@ -976,6 +993,27 @@ mod tests {
             BackupError::from(cancelled),
             BackupError::Cancelled
         ));
+    }
+
+    #[tokio::test]
+    async fn failure_log_tail_is_read_without_loading_the_whole_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("failure.log");
+        let mut log = "x".repeat(MAX_DIAGNOSTIC_BYTES * 50);
+        log.push_str("the real error");
+        std::fs::write(&path, &log).expect("write log");
+
+        let tail = read_file_tail(&path, MAX_DIAGNOSTIC_BYTES)
+            .await
+            .expect("read tail");
+        assert!(tail.len() <= MAX_DIAGNOSTIC_BYTES + 4, "{}", tail.len());
+        assert!(String::from_utf8_lossy(&tail).ends_with("the real error"));
+
+        std::fs::write(&path, "short log").expect("write short log");
+        let short = read_file_tail(&path, MAX_DIAGNOSTIC_BYTES)
+            .await
+            .expect("read short");
+        assert_eq!(short, b"short log");
     }
 
     #[test]

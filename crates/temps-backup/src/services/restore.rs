@@ -1478,19 +1478,28 @@ async fn run_restore_worker(
     // The restore runs in its own task so a panic inside an engine surfaces
     // here as a `JoinError` instead of unwinding past the terminal-state
     // write below and leaving the run `running` with no owner.
+    let fence = super::restore_reconcile::ManagerRestoreFence::new(mgr.clone());
     let inner = tokio::spawn(run_restore_inner(db.clone(), mgr, enc, run_id, mode));
     let result = match inner.await {
         Ok(result) => result,
         Err(join_error) => {
-            let phase = load_run_for_update(&db, run_id)
-                .await
-                .map(|run| run.phase)
-                .unwrap_or_else(|_| "unknown".to_string());
-            Err(RestoreError::WorkerCrashed {
-                restore_run_id: run_id,
-                phase,
-                reason: join_error.to_string(),
-            })
+            match settle_crashed_run(&db, run_id, &fence, join_error.to_string()).await {
+                Ok(crashed) => Err(crashed),
+                Err(keep_active) => {
+                    // A helper may still be writing into the target, so the
+                    // run must keep holding the active-restore constraint.
+                    error!(
+                        "Restore run {} worker crashed and the run was left active: {}",
+                        run_id, keep_active
+                    );
+                    telemetry.report(restore_outcome_event(
+                        mode_label,
+                        started.elapsed(),
+                        Err(keep_active.to_string()),
+                    ));
+                    return Err(keep_active);
+                }
+            }
         }
     };
     let elapsed = started.elapsed();
@@ -2214,6 +2223,41 @@ async fn insert_restore_run(
     Ok(run)
 }
 
+/// Decide how to record a run whose worker task panicked.
+///
+/// The panic may have left a restore helper container running, and marking
+/// the run terminal releases the one-active-restore constraint, so the
+/// helpers are fenced first. `Ok` carries the error to record as the run's
+/// failure; `Err` means the helpers could not be fenced (or the run could not
+/// be read) and the run must stay active until startup reconciliation, which
+/// fences again before releasing it.
+async fn settle_crashed_run(
+    db: &DatabaseConnection,
+    run_id: i32,
+    fence: &dyn super::restore_reconcile::RestoreHelperFence,
+    reason: String,
+) -> Result<RestoreError, RestoreError> {
+    let run = load_run_for_update(db, run_id).await?;
+    let service = temps_entities::external_services::Entity::find_by_id(run.source_service_id)
+        .one(db)
+        .await?;
+    let crashed = RestoreError::WorkerCrashed {
+        restore_run_id: run_id,
+        phase: run.phase.clone(),
+        reason,
+    };
+    match super::restore_reconcile::fence_run_helpers(&run, service.as_ref(), fence).await {
+        Ok(_) => Ok(crashed),
+        Err(e) => Err(RestoreError::Internal {
+            reason: format!(
+                "{}. Its restore helpers could not be stopped ({}), so the run stays \
+                 active until the next restart reconciles it.",
+                crashed, e
+            ),
+        }),
+    }
+}
+
 /// Retry policy for the worker's final status write. A restore that ran to
 /// an outcome must not be left `running` because of a database blip, so the
 /// write is retried for roughly five minutes before giving up to the next
@@ -2444,11 +2488,12 @@ fn slugify(input: &str) -> String {
 /// Engine-specific container-name prefix. Mirrors each engine's
 /// `get_container_name()` implementation. Falls back to the service name
 /// verbatim for engines we don't recognize so the plan still renders.
-pub(crate) fn engine_container_name(engine_lower: &str, service_name: &str) -> String {
+fn engine_container_name(engine_lower: &str, service_name: &str) -> String {
     match engine_lower {
         "postgres" => format!("postgres-{}", service_name),
         "redis" => format!("redis-{}", service_name),
-        "mongodb" => format!("mongodb-{}", service_name),
+        // Matches MongodbService::get_container_name().
+        "mongodb" => format!("temps-mongodb-{}", service_name),
         // Matches MariaDbService::get_container_name() and the dispatch-side
         // PITR-tools probe in engines/dispatch.rs, both `mariadb-{name}`.
         "mariadb" => format!("mariadb-{}", service_name),
@@ -2919,7 +2964,7 @@ fn build_mongodb_steps(
         }
         RestoreRequestMode::NewService { name, .. } => {
             steps.push(format!(
-                "Allocate a new MongoDB container 'mongodb-{}' on a fresh volume",
+                "Allocate a new MongoDB container 'temps-mongodb-{}' on a fresh volume",
                 name
             ));
             steps.push("Start the new container and wait for mongod to initialize".into());
@@ -3294,6 +3339,10 @@ mod tests {
         // dispatch.rs probes; a mismatch silently produces a plan naming a
         // container that doesn't exist.
         assert_eq!(engine_container_name("mariadb", "orders"), "mariadb-orders");
+        assert_eq!(
+            engine_container_name("mongodb", "orders"),
+            "temps-mongodb-orders"
+        );
     }
 
     fn mariadb_steps(
@@ -4406,7 +4455,7 @@ mod tests {
     impl crate::services::RestoreHelperFence for AssertingFence {
         async fn fence(
             &self,
-            target_container: &str,
+            target: &crate::services::FenceTarget,
         ) -> Result<
             temps_providers::externalsvc::restore_helper::RestoreFenceReport,
             temps_providers::externalsvc::restore_helper::RestoreFenceError,
@@ -4426,7 +4475,7 @@ mod tests {
             if self.fail {
                 return Err(
                     temps_providers::externalsvc::restore_helper::RestoreFenceError::List {
-                        target_container: target_container.to_string(),
+                        target_container: target.service_name.clone(),
                         reason: "daemon unreachable".to_string(),
                     },
                 );
@@ -4740,5 +4789,131 @@ mod tests {
             .await
             .expect_err("gives up after the configured attempts");
         assert!(matches!(err, RestoreError::Database(_)));
+    }
+
+    /// Fence double for the crash path; `fail` simulates an unreachable daemon.
+    struct CrashFence {
+        fail: bool,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::RestoreHelperFence for CrashFence {
+        async fn fence(
+            &self,
+            target: &crate::services::FenceTarget,
+        ) -> Result<
+            temps_providers::externalsvc::restore_helper::RestoreFenceReport,
+            temps_providers::externalsvc::restore_helper::RestoreFenceError,
+        > {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail {
+                return Err(
+                    temps_providers::externalsvc::restore_helper::RestoreFenceError::List {
+                        target_container: target.service_name.clone(),
+                        reason: "daemon unreachable".to_string(),
+                    },
+                );
+            }
+            Ok(Default::default())
+        }
+    }
+
+    fn crashed_run_row() -> temps_entities::restore_runs::Model {
+        temps_entities::restore_runs::Model {
+            id: 11,
+            source_backup_id: 1,
+            source_service_id: 3,
+            target_service_id: None,
+            target_service_name: None,
+            mode: "in_place".to_string(),
+            status: "running".to_string(),
+            phase: "restore".to_string(),
+            recovery_target: None,
+            parameter_overrides: serde_json::json!({}),
+            resume_token: None,
+            log_id: "log".to_string(),
+            error_message: None,
+            attempt: 1,
+            started_at: Some(Utc::now()),
+            finished_at: None,
+            created_by: 1,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn crashed_run_service() -> temps_entities::external_services::Model {
+        temps_entities::external_services::Model {
+            id: 3,
+            name: "cache".to_string(),
+            service_type: "redis".to_string(),
+            version: None,
+            status: "running".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            slug: None,
+            config: None,
+            node_id: None,
+            topology: "standalone".to_string(),
+            error_message: None,
+            health_status: None,
+            last_health_check_at: None,
+            last_health_error: None,
+            consecutive_health_failures: 0,
+            health_metadata: None,
+            metrics_enabled: false,
+            default_backup_provisioned: false,
+            container_name: None,
+            ai_data_access: false,
+            created_by_user_id: None,
+            continuous_archive_s3_source_id: None,
+            continuous_archive_pinned_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn crashed_worker_is_recorded_only_after_its_helpers_are_fenced() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![crashed_run_row()]])
+            .append_query_results(vec![vec![crashed_run_service()]])
+            .into_connection();
+        let fence = CrashFence {
+            fail: false,
+            calls: Default::default(),
+        };
+
+        let recorded = settle_crashed_run(&db, 11, &fence, "task panicked".into())
+            .await
+            .expect("fenced, so the crash can be recorded");
+
+        assert_eq!(fence.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            matches!(
+                &recorded,
+                RestoreError::WorkerCrashed { restore_run_id: 11, phase, .. } if phase == "restore"
+            ),
+            "{recorded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn crashed_worker_stays_active_when_its_helpers_cannot_be_fenced() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![crashed_run_row()]])
+            .append_query_results(vec![vec![crashed_run_service()]])
+            .into_connection();
+        let fence = CrashFence {
+            fail: true,
+            calls: Default::default(),
+        };
+
+        let kept = settle_crashed_run(&db, 11, &fence, "task panicked".into())
+            .await
+            .expect_err("an unfenced helper keeps the run active");
+
+        let message = kept.to_string();
+        assert!(message.contains("stays active"), "{message}");
+        assert!(message.contains("phase 'restore'"), "{message}");
     }
 }
