@@ -2479,7 +2479,9 @@ impl NotificationService {
                         );
                         (
                             RouteTestDeliveryStatus::Failed,
-                            Some(format!("Provider configuration could not be loaded: {error}")),
+                            Some(format!(
+                                "Provider configuration could not be loaded: {error}"
+                            )),
                         )
                     }
                 }

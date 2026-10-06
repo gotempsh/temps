@@ -1065,8 +1065,8 @@ mod tests {
         assert!(!empty.any_provider_configured);
 
         let now = Utc::now();
-        let insert_provider = |name: &'static str, enabled: bool| {
-            notification_providers::ActiveModel {
+        let insert_provider =
+            |name: &'static str, enabled: bool| notification_providers::ActiveModel {
                 name: Set(name.to_string()),
                 provider_type: Set("slack".to_string()),
                 config: Set("test-config".to_string()),
@@ -1074,8 +1074,7 @@ mod tests {
                 created_at: Set(now),
                 updated_at: Set(now),
                 ..Default::default()
-            }
-        };
+            };
         let on_call = insert_provider("On-call channel", true)
             .insert(test_db.db.as_ref())
             .await
@@ -1147,8 +1146,7 @@ mod tests {
     #[test]
     fn coverage_severity_parsing_rejects_unknown_values() {
         assert_eq!(
-            NotificationRoutingService::parse_severity(" Warn ")
-                .expect("alias should parse"),
+            NotificationRoutingService::parse_severity(" Warn ").expect("alias should parse"),
             NotificationSeverity::Warning
         );
         assert!(matches!(

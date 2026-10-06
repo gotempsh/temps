@@ -3021,7 +3021,9 @@ mod tests {
         assert!(!response.configured);
         assert_eq!(
             response.reason.as_deref(),
-            Some("No enabled notification route sends warning notifications to an enabled provider")
+            Some(
+                "No enabled notification route sends warning notifications to an enabled provider"
+            )
         );
         assert_eq!(
             response.setup_path.as_deref(),
@@ -3086,8 +3088,7 @@ mod tests {
     // Sends a real message through a route via Mailpit and checks that a
     // disabled provider on the same route is reported, not silently dropped.
     #[tokio::test]
-    async fn test_route_reports_each_provider_outcome() -> Result<(), Box<dyn std::error::Error>>
-    {
+    async fn test_route_reports_each_provider_outcome() -> Result<(), Box<dyn std::error::Error>> {
         let setup = test_setup_or_skip!();
         let service = &setup.notification_state.notification_service;
         let routing = &setup.notification_state.notification_routing_service;
