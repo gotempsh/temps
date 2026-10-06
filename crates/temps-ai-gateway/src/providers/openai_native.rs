@@ -64,6 +64,7 @@ pub fn validate_upstream_id(kind: &str, id: &str) -> Result<(), AiGatewayError> 
     }
 }
 
+#[derive(Clone)]
 pub struct OpenAiNativeClient {
     /// Inference and object metadata calls.
     client: reqwest::Client,
