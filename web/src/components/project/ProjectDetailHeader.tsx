@@ -41,10 +41,6 @@ import GitlabIcon from '@/icons/Gitlab'
 import { Link, useNavigate } from 'react-router'
 import { liveVisitorsPillLabel } from '@/components/analytics/analytics-onboarding'
 
-/**
- * Tones for the header health badge. Mirrors the projects-list card so the same
- * project reads the same in both places.
- */
 /** Badge variant for the problem states, which link to the overview. */
 const deploymentStatusBadgeVariant: Record<
   Extract<ProjectDeploymentStatus, 'Failed' | 'Degraded'>,
@@ -60,6 +56,10 @@ function isProblemStatus(
   return status === 'Failed' || status === 'Degraded'
 }
 
+/**
+ * Tones for the header health badge. Mirrors the projects-list card so the same
+ * project reads the same in both places.
+ */
 const healthToneStyles: Record<ProjectHealthTone, string> = {
   healthy: 'bg-emerald-500',
   degraded: 'bg-amber-500',
@@ -186,10 +186,12 @@ export function ProjectDetailHeader({
             </h1>
             {isProblemStatus(deploymentStatus) ? (
               // Failed / Degraded link to the overview banner that explains
-              // the problem and offers the fix.
+              // the problem and offers the fix. Unlike the routine states it
+              // stays visible on phones, where it shrinks to its icon so the
+              // header's actions still fit.
               <Link
                 to={`/projects/${project.slug}/project`}
-                className={`${badgeVariants({ variant: deploymentStatusBadgeVariant[deploymentStatus] })} hidden sm:inline-flex shrink-0 gap-1`}
+                className={`${badgeVariants({ variant: deploymentStatusBadgeVariant[deploymentStatus] })} inline-flex shrink-0 gap-1`}
                 title={
                   deploymentStatus === 'Failed'
                     ? 'The latest deployment failed. Open the overview for the reason and recovery actions.'
@@ -197,7 +199,9 @@ export function ProjectDetailHeader({
                 }
               >
                 <AlertTriangle aria-hidden="true" className="size-3" />
-                {deploymentStatus}
+                <span className="sr-only sm:not-sr-only">
+                  {deploymentStatus}
+                </span>
               </Link>
             ) : (
               <Badge
