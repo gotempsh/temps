@@ -672,6 +672,16 @@ jobs:
       # job's OIDC token (id-token: write) gets a short-lived certificate
       # from the public-good Sigstore instance. Verify a download with
       #   gh attestation verify temps-linux-amd64.tar.gz --repo gotempsh/temps
+      - name: Set up Cosign for release tarballs
+        if: inputs.dry_run != true
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign and verify release tarballs
+        if: inputs.dry_run != true
+        env:
+          CERTIFICATE_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}
+        run: bash .github/scripts/sign-release-binaries.sh release
+
       - name: Collect SBOM inputs
         run: |
           # Only the manifests that end up in the binary: the Rust workspace
@@ -906,6 +916,16 @@ jobs:
           sha256sum -c checksums.txt --ignore-missing
           ```
 
+          ### Binary signatures
+          Each tarball has a `.sigstore.json` cosign bundle. Download both and
+          verify the release workflow identity before extracting the archive:
+          ```bash
+          cosign verify-blob temps-linux-amd64.tar.gz \
+            --bundle temps-linux-amd64.tar.gz.sigstore.json \
+            --certificate-identity "https://github.com/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+          ```
+
           ### Provenance and SBOM
           Every tarball carries a Sigstore-signed SLSA build provenance
           attestation and an SBOM attestation (`temps-sbom.spdx.json`, also
@@ -952,6 +972,7 @@ jobs:
             release/temps-darwin-amd64.tar.gz.sha256
             release/temps-darwin-arm64.tar.gz
             release/temps-darwin-arm64.tar.gz.sha256
+            release/temps-*.tar.gz.sigstore.json
             release/checksums.txt
             release/runtime-images.json
             release/install.sh

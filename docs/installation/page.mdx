@@ -13,6 +13,53 @@ This guide covers all installation methods and production configuration options 
 
 ---
 
+## Verify release downloads
+
+New releases publish a keyless cosign signature bundle beside each binary
+archive, an SPDX dependency SBOM (`temps-sbom.spdx.json`), and GitHub SLSA build
+provenance and SBOM attestations. Older releases may lack these assets; do not
+interpret a missing signature as successful verification. Install
+[cosign](https://docs.sigstore.dev/cosign/system_config/installation/) and the
+GitHub CLI before running these commands.
+
+Choose a published release tag and the archive for your platform. Verify before
+extracting or executing the binary:
+
+```bash
+tag=v0.1.0
+archive=temps-linux-amd64.tar.gz
+identity="https://github.com/gotempsh/temps/.github/workflows/release.yml@refs/tags/$tag"
+gh release download "$tag" --repo gotempsh/temps \
+  --pattern "$archive" --pattern "$archive.sigstore.json" \
+  --pattern temps-sbom.spdx.json
+cosign verify-blob --bundle "$archive.sigstore.json" \
+  --certificate-identity "$identity" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com "$archive"
+gh attestation verify "$archive" --repo gotempsh/temps \
+  --signer-workflow gotempsh/temps/.github/workflows/release.yml
+```
+
+The exact certificate identity binds the signature to the release workflow and
+chosen tag. A checksum detects corrupted downloads; it does not establish the
+publisher's identity. The installer and `temps upgrade` verify checksums, but do
+not perform this cosign verification automatically.
+
+The main container image is signed by digest. Replace the digest below with the
+published image digest for the release, and use that same digest when deploying:
+
+```bash
+image=ghcr.io/gotempsh/temps@sha256:REPLACE_WITH_RELEASE_DIGEST
+cosign verify "$image" \
+  --certificate-identity "$identity" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+docker buildx imagetools inspect "$image" --format '{{json .SBOM}}'
+docker buildx imagetools inspect "$image" --format '{{json .Provenance}}'
+```
+
+BuildKit publishes image SBOM and provenance metadata per platform. Inspect these
+alongside the signed digest; the binary dependency SBOM describes build inputs
+and is not a claim that all packages are present in the runtime image.
+
 ## System Requirements
 
 ### Minimum Specs (Development/Testing)
