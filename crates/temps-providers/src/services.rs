@@ -5366,6 +5366,11 @@ echo "[restore] Pre-seed complete"
             // Run as root so the chown calls land — the helper drops
             // to postgres internally for the wal-g call.
             user: Some("root".to_string()),
+            // Keyed like a standalone Postgres container so startup
+            // reconciliation of an interrupted restore can fence it.
+            labels: Some(crate::externalsvc::restore_helper::restore_helper_labels(
+                &format!("postgres-{}", service.name),
+            )),
             ..Default::default()
         };
 

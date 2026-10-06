@@ -457,6 +457,29 @@ impl TempsPlugin for BackupPlugin {
                 Err(e) => error!("BackupExecutor: orphan reconcile failed at startup: {}", e,),
             }
 
+            // Restore runs orphaned by the previous process. The snapshot is
+            // taken here, before the API serves requests, so only runs with
+            // no owner in this process are reconciled. Fencing (stopping a
+            // surviving helper container) can take a while, so it runs in the
+            // background; runs whose helpers cannot be fenced yet stay active
+            // and are retried.
+            match crate::services::active_restore_run_ids(db.as_ref()).await {
+                Ok(run_ids) if !run_ids.is_empty() => {
+                    let fence = crate::services::DockerRestoreFence::new(
+                        context.require_service::<temps_core::DockerHandle>(),
+                    );
+                    let restore_db = db.clone();
+                    tokio::spawn(async move {
+                        reconcile_restores_with_retry(restore_db, run_ids, fence).await;
+                    });
+                }
+                Ok(_) => {}
+                Err(e) => error!(
+                    "Failed to list restore runs left active by the previous process: {}",
+                    e
+                ),
+            }
+
             // Alert watcher: detects overdue schedules and stalled jobs. Fires
             // every 5 minutes; `Skip` so a slow DB doesn't accumulate ticks.
             let alert_db = db.clone();
@@ -693,6 +716,50 @@ impl TempsPlugin for BackupPlugin {
 
 /// How often a still-failing *hourly* sweep is re-reported. The default
 /// one-hour reminder would re-log every tick of an hourly loop.
+/// Interval between attempts to fence restore runs whose helpers could not
+/// be stopped yet (e.g. the Docker daemon was still starting).
+const RESTORE_RECONCILE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+/// Attempts before giving up for this process lifetime (~30 minutes). Runs
+/// still left then stay active and are picked up again at the next restart.
+const RESTORE_RECONCILE_MAX_ATTEMPTS: u32 = 60;
+
+/// Reconcile the restore runs orphaned by the previous process, retrying the
+/// ones whose helpers could not be fenced. Only the boot-time snapshot is
+/// ever retried, so a restore started by this process is never touched.
+async fn reconcile_restores_with_retry(
+    db: Arc<sea_orm::DatabaseConnection>,
+    mut run_ids: Vec<i32>,
+    fence: crate::services::DockerRestoreFence,
+) {
+    for attempt in 1..=RESTORE_RECONCILE_MAX_ATTEMPTS {
+        match crate::services::reconcile_interrupted_restores(db.as_ref(), &run_ids, &fence).await {
+            Ok(report) => {
+                if !report.interrupted.is_empty() {
+                    info!(
+                        interrupted = ?report.interrupted,
+                        "Restore runs orphaned by a restart were marked interrupted",
+                    );
+                }
+                if report.deferred.is_empty() {
+                    return;
+                }
+                run_ids = report.deferred;
+            }
+            Err(e) => error!(
+                "Restore startup reconciliation failed (attempt {}/{}): {}",
+                attempt, RESTORE_RECONCILE_MAX_ATTEMPTS, e
+            ),
+        }
+        tokio::time::sleep(RESTORE_RECONCILE_RETRY_INTERVAL).await;
+    }
+    error!(
+        run_ids = ?run_ids,
+        "Restore runs are still active after {} reconciliation attempts because their \
+         restore helpers could not be fenced; they will be retried at the next restart",
+        RESTORE_RECONCILE_MAX_ATTEMPTS
+    );
+}
+
 const HOURLY_SWEEP_REMINDER: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 /// Log a failed run of a periodic backup task on state transitions only.

@@ -64,6 +64,25 @@ pub enum RestoreError {
         origin: String,
     },
 
+    #[error(
+        "Service {service_id} already has an active restore (run {restore_run_id}). \
+         Wait for it to finish, or open that run to check its status, before starting \
+         another restore onto this service."
+    )]
+    RestoreAlreadyActive {
+        service_id: i32,
+        restore_run_id: i32,
+    },
+
+    #[error(
+        "Restore run {restore_run_id} worker stopped unexpectedly during phase '{phase}': {reason}"
+    )]
+    WorkerCrashed {
+        restore_run_id: i32,
+        phase: String,
+        reason: String,
+    },
+
     #[error("Encryption error: {reason}")]
     Encryption { reason: String },
 
@@ -1140,22 +1159,14 @@ impl RestoreService {
             created_at: NotSet,
             updated_at: NotSet,
         };
-        let run = if let Some(backup_id) = resolved_backup_id {
-            let transaction = self.db.begin().await?;
-            let backup = temps_entities::backups::Entity::find_by_id(backup_id)
-                .lock_exclusive()
-                .one(&transaction)
-                .await?
-                .ok_or(RestoreError::BackupNotFound { backup_id })?;
-            if backup.state == "deleting" {
-                return Err(RestoreError::BackupDeleting { backup_id });
-            }
-            let run = run_active.insert(&transaction).await?;
-            transaction.commit().await?;
-            run
-        } else {
-            run_active.insert(self.db.as_ref()).await?
-        };
+        let run = insert_restore_run(
+            self.db.as_ref(),
+            run_active,
+            resolved_backup_id,
+            target_service_id,
+            mode.is_destructive(),
+        )
+        .await?;
 
         // Spawn the worker — it owns Arc clones and updates the row as it goes.
         let run_id = run.id;
@@ -1464,34 +1475,36 @@ async fn run_restore_worker(
 ) -> Result<(), RestoreError> {
     let started = std::time::Instant::now();
     let mode_label = mode.as_str();
-    let result = run_restore_inner(db.clone(), mgr, enc, run_id, mode).await;
+    // The restore runs in its own task so a panic inside an engine surfaces
+    // here as a `JoinError` instead of unwinding past the terminal-state
+    // write below and leaving the run `running` with no owner.
+    let inner = tokio::spawn(run_restore_inner(db.clone(), mgr, enc, run_id, mode));
+    let result = match inner.await {
+        Ok(result) => result,
+        Err(join_error) => {
+            let phase = load_run_for_update(&db, run_id)
+                .await
+                .map(|run| run.phase)
+                .unwrap_or_else(|_| "unknown".to_string());
+            Err(RestoreError::WorkerCrashed {
+                restore_run_id: run_id,
+                phase,
+                reason: join_error.to_string(),
+            })
+        }
+    };
     let elapsed = started.elapsed();
 
-    let finished_at = Utc::now();
-    let persisted: Result<(), RestoreError> = async {
-        let mut active: temps_entities::restore_runs::ActiveModel =
-            load_run_for_update(&db, run_id).await?.into();
-        active.finished_at = Set(Some(finished_at));
-        match &result {
-            Ok(target_service_id) => {
-                active.status = Set("completed".to_string());
-                active.phase = Set("completed".to_string());
-                active.target_service_id = Set(*target_service_id);
-                active.error_message = Set(None);
-                active.update(db.as_ref()).await?;
-                info!("Restore run {} completed successfully", run_id);
-            }
-            Err(e) => {
-                active.status = Set("failed".to_string());
-                active.phase = Set("failed".to_string());
-                active.error_message = Set(Some(e.to_string()));
-                active.update(db.as_ref()).await?;
-                error!("Restore run {} failed: {}", run_id, e);
-            }
-        }
-        Ok(())
+    let persisted = persist_terminal_state(&db, run_id, &result, TERMINAL_WRITE_RETRY).await;
+    match (&result, &persisted) {
+        (Ok(_), Ok(())) => info!("Restore run {} completed successfully", run_id),
+        (Err(e), Ok(())) => error!("Restore run {} failed: {}", run_id, e),
+        (_, Err(e)) => error!(
+            "Restore run {} finished but its terminal state could not be recorded: {}. \
+             It stays active until the next restart reconciles it as interrupted.",
+            run_id, e
+        ),
     }
-    .await;
 
     // Reported only once the run's final state is persisted: a restore whose
     // completion could not be recorded is not a success.
@@ -2008,7 +2021,14 @@ async fn run_restore_inner(
         }
     };
 
-    update_phase(&db, run_id, "verify").await?;
+    // The destructive step is done. Failing the run now because a progress
+    // write failed would report a restore that happened as one that did not.
+    if let Err(e) = update_phase(&db, run_id, "verify").await {
+        warn!(
+            "Restore run {} could not record its 'verify' phase; continuing: {}",
+            run_id, e
+        );
+    }
 
     // If a new service was created, insert its row now and link it to
     // the run. The template is the TARGET service (we're provisioning a
@@ -2130,6 +2150,181 @@ async fn patch_service_password(
     Ok(())
 }
 
+/// Insert a restore run while holding the source backup's row lock (so a
+/// concurrent backup deletion cannot remove data underneath it) and, for a
+/// destructive restore, the target service's row lock plus a check that no
+/// other destructive restore is active on it. A second destructive restore
+/// gets [`RestoreError::RestoreAlreadyActive`] naming the active run.
+async fn insert_restore_run(
+    db: &DatabaseConnection,
+    run_active: temps_entities::restore_runs::ActiveModel,
+    resolved_backup_id: Option<i32>,
+    target_service_id: i32,
+    destructive: bool,
+) -> Result<temps_entities::restore_runs::Model, RestoreError> {
+    let transaction = db.begin().await?;
+    if let Some(backup_id) = resolved_backup_id {
+        let backup = temps_entities::backups::Entity::find_by_id(backup_id)
+            .lock_exclusive()
+            .one(&transaction)
+            .await?
+            .ok_or(RestoreError::BackupNotFound { backup_id })?;
+        if backup.state == "deleting" {
+            return Err(RestoreError::BackupDeleting { backup_id });
+        }
+    }
+    if destructive {
+        // Serialize destructive restores per target: the row lock makes
+        // the check below race-free for PITR-in-place too, which the
+        // partial unique index (in_place only) does not cover.
+        temps_entities::external_services::Entity::find_by_id(target_service_id)
+            .lock_exclusive()
+            .one(&transaction)
+            .await?
+            .ok_or(RestoreError::ServiceNotFound {
+                service_id: target_service_id,
+            })?;
+        if let Some(active) = find_active_destructive_run(&transaction, target_service_id).await? {
+            return Err(RestoreError::RestoreAlreadyActive {
+                service_id: target_service_id,
+                restore_run_id: active.id,
+            });
+        }
+    }
+    let run = match run_active.insert(&transaction).await {
+        Ok(run) => run,
+        Err(e) if is_active_restore_conflict(&e) => {
+            drop(transaction);
+            // The index fired, so another in-place run committed between
+            // our check and insert. If it already finished, surface the
+            // original error rather than naming a run that is gone.
+            return Err(
+                match find_active_destructive_run(db, target_service_id).await? {
+                    Some(active) => RestoreError::RestoreAlreadyActive {
+                        service_id: target_service_id,
+                        restore_run_id: active.id,
+                    },
+                    None => e.into(),
+                },
+            );
+        }
+        Err(e) => return Err(e.into()),
+    };
+    transaction.commit().await?;
+    Ok(run)
+}
+
+/// Retry policy for the worker's final status write. A restore that ran to
+/// an outcome must not be left `running` because of a database blip, so the
+/// write is retried for roughly five minutes before giving up to the next
+/// startup reconciliation.
+const TERMINAL_WRITE_RETRY: TerminalWriteRetry = TerminalWriteRetry {
+    attempts: 8,
+    base_delay: std::time::Duration::from_secs(1),
+    max_delay: std::time::Duration::from_secs(60),
+};
+
+#[derive(Debug, Clone, Copy)]
+struct TerminalWriteRetry {
+    attempts: u32,
+    base_delay: std::time::Duration,
+    max_delay: std::time::Duration,
+}
+
+/// Record a run's terminal outcome. Only an active (`pending`/`running`) row
+/// is updated, so a run already reconciled as `interrupted` is never
+/// overwritten with an outcome nobody observed end to end.
+async fn persist_terminal_state(
+    db: &DatabaseConnection,
+    run_id: i32,
+    result: &Result<Option<i32>, RestoreError>,
+    retry: TerminalWriteRetry,
+) -> Result<(), RestoreError> {
+    use sea_orm::sea_query::Expr;
+    use temps_entities::restore_runs::{Column, Entity};
+
+    let now = Utc::now();
+    let mut update = Entity::update_many()
+        .col_expr(Column::FinishedAt, Expr::value(now))
+        .col_expr(Column::UpdatedAt, Expr::value(now));
+    update = match result {
+        Ok(target_service_id) => update
+            .col_expr(Column::Status, Expr::value("completed"))
+            .col_expr(Column::Phase, Expr::value("completed"))
+            .col_expr(Column::TargetServiceId, Expr::value(*target_service_id))
+            .col_expr(Column::ErrorMessage, Expr::value(Option::<String>::None)),
+        Err(e) => update
+            .col_expr(Column::Status, Expr::value("failed"))
+            .col_expr(Column::Phase, Expr::value("failed"))
+            .col_expr(Column::ErrorMessage, Expr::value(Some(e.to_string()))),
+    };
+    let update = update
+        .filter(Column::Id.eq(run_id))
+        .filter(Column::Status.is_in(ACTIVE_RESTORE_STATUSES));
+
+    let mut delay = retry.base_delay;
+    let mut attempt = 1;
+    loop {
+        match update.clone().exec(db).await {
+            Ok(outcome) => {
+                if outcome.rows_affected == 0 {
+                    warn!(
+                        "Restore run {} was no longer active when its outcome was recorded; \
+                         leaving its stored status unchanged",
+                        run_id
+                    );
+                }
+                return Ok(());
+            }
+            Err(e) if attempt < retry.attempts => {
+                warn!(
+                    "Recording the outcome of restore run {} failed (attempt {}/{}): {}",
+                    run_id, attempt, retry.attempts, e
+                );
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(retry.max_delay);
+                attempt += 1;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// Statuses that mean a worker still owns the run.
+pub(crate) const ACTIVE_RESTORE_STATUSES: [&str; 2] = ["pending", "running"];
+
+/// The active destructive restore (in-place, or PITR in place) on `service_id`,
+/// if any. At most one can exist.
+async fn find_active_destructive_run<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    service_id: i32,
+) -> Result<Option<temps_entities::restore_runs::Model>, RestoreError> {
+    use sea_orm::Condition;
+    use temps_entities::restore_runs::{Column, Entity};
+    Ok(Entity::find()
+        .filter(Column::SourceServiceId.eq(service_id))
+        .filter(Column::Status.is_in(ACTIVE_RESTORE_STATUSES))
+        .filter(
+            Condition::any().add(Column::Mode.eq("in_place")).add(
+                Condition::all()
+                    .add(Column::Mode.eq("pitr"))
+                    .add(Column::TargetServiceName.is_null()),
+            ),
+        )
+        .order_by_desc(Column::Id)
+        .one(conn)
+        .await?)
+}
+
+/// Whether an insert failed on the one-active-in-place-restore index.
+fn is_active_restore_conflict(error: &sea_orm::DbErr) -> bool {
+    matches!(
+        error.sql_err(),
+        Some(sea_orm::SqlErr::UniqueConstraintViolation(message))
+            if message.contains("idx_restore_runs_source_service_active")
+    )
+}
+
 async fn load_run_for_update(
     db: &DatabaseConnection,
     run_id: i32,
@@ -2249,7 +2444,7 @@ fn slugify(input: &str) -> String {
 /// Engine-specific container-name prefix. Mirrors each engine's
 /// `get_container_name()` implementation. Falls back to the service name
 /// verbatim for engines we don't recognize so the plan still renders.
-fn engine_container_name(engine_lower: &str, service_name: &str) -> String {
+pub(crate) fn engine_container_name(engine_lower: &str, service_name: &str) -> String {
     match engine_lower {
         "postgres" => format!("postgres-{}", service_name),
         "redis" => format!("redis-{}", service_name),
@@ -4193,5 +4388,357 @@ mod tests {
             resolved_for_newer, newer_logical_key,
             "resolving the newer logical backup's own uuid must return its own artifact"
         );
+    }
+
+    // ---- Active-run guard and interrupted-run reconciliation (real Postgres)
+
+    /// Fence double that checks, at the moment it is called, that the run it
+    /// fences still holds the active-restore constraint — proving the
+    /// constraint is released only after fencing.
+    struct AssertingFence {
+        db: Arc<sea_orm::DatabaseConnection>,
+        run_id: i32,
+        fail: bool,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::RestoreHelperFence for AssertingFence {
+        async fn fence(
+            &self,
+            target_container: &str,
+        ) -> Result<
+            temps_providers::externalsvc::restore_helper::RestoreFenceReport,
+            temps_providers::externalsvc::restore_helper::RestoreFenceError,
+        > {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let run = temps_entities::restore_runs::Entity::find_by_id(self.run_id)
+                .one(self.db.as_ref())
+                .await
+                .ok()
+                .flatten()
+                .map(|run| run.status);
+            assert_eq!(
+                run.as_deref(),
+                Some("running"),
+                "the run must still be active while its helpers are fenced"
+            );
+            if self.fail {
+                return Err(
+                    temps_providers::externalsvc::restore_helper::RestoreFenceError::List {
+                        target_container: target_container.to_string(),
+                        reason: "daemon unreachable".to_string(),
+                    },
+                );
+            }
+            Ok(
+                temps_providers::externalsvc::restore_helper::RestoreFenceReport {
+                    stopped: vec!["helper-1".to_string()],
+                    removed: Vec::new(),
+                },
+            )
+        }
+    }
+
+    fn new_run(
+        service_id: i32,
+        backup_id: i32,
+        user_id: i32,
+        mode: &str,
+        target_service_name: Option<&str>,
+    ) -> temps_entities::restore_runs::ActiveModel {
+        temps_entities::restore_runs::ActiveModel {
+            id: NotSet,
+            source_backup_id: Set(backup_id),
+            source_service_id: Set(service_id),
+            target_service_id: Set(None),
+            target_service_name: Set(target_service_name.map(String::from)),
+            mode: Set(mode.to_string()),
+            status: Set("running".to_string()),
+            phase: Set("prepare".to_string()),
+            recovery_target: Set(None),
+            parameter_overrides: Set(serde_json::json!({})),
+            resume_token: Set(None),
+            log_id: Set(uuid::Uuid::new_v4().to_string()),
+            error_message: Set(None),
+            attempt: Set(1),
+            started_at: Set(Some(Utc::now())),
+            finished_at: Set(None),
+            created_by: Set(user_id),
+            created_at: NotSet,
+            updated_at: NotSet,
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_restore_releases_the_service_only_after_fencing() {
+        if Docker::connect_with_local_defaults().is_err() {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("TestDatabase unavailable, skipping: {e}");
+                return;
+            }
+        };
+        let db = test_db.db.clone();
+
+        let user = temps_entities::users::ActiveModel {
+            name: Set("Restore Tester".to_string()),
+            email: Set("restore-tester@example.com".to_string()),
+            password_hash: Set(Some("hash".to_string())),
+            email_verified: Set(true),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert user");
+        let source = temps_entities::s3_sources::ActiveModel {
+            name: Set("restore-source".to_string()),
+            bucket_name: Set("restore-bucket".to_string()),
+            bucket_path: Set("/".to_string()),
+            access_key_id: Set(String::new()),
+            secret_key: Set(String::new()),
+            region: Set("us-east-1".to_string()),
+            force_path_style: Set(Some(true)),
+            is_default: Set(true),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert S3 source");
+        let service = temps_entities::external_services::ActiveModel {
+            name: Set("orders".to_string()),
+            service_type: Set("postgres".to_string()),
+            status: Set("running".to_string()),
+            topology: Set("standalone".to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert service");
+        let backup = temps_entities::backups::ActiveModel {
+            id: NotSet,
+            name: Set("nightly".to_string()),
+            backup_id: Set(uuid::Uuid::new_v4().to_string()),
+            schedule_id: Set(None),
+            schedule_run_id: Set(None),
+            backup_type: Set("full".to_string()),
+            state: Set("completed".to_string()),
+            started_at: Set(Utc::now()),
+            finished_at: Set(Some(Utc::now())),
+            s3_source_id: Set(source.id),
+            s3_location: Set("external_services/postgres/orders/1".to_string()),
+            compression_type: Set("gzip".to_string()),
+            created_by: Set(user.id),
+            tags: Set("[]".to_string()),
+            size_bytes: Set(None),
+            file_count: Set(None),
+            error_message: Set(None),
+            expires_at: Set(None),
+            checksum: Set(None),
+            metadata: Set("{}".to_string()),
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert backup");
+
+        // A genuinely active in-place restore.
+        let active = insert_restore_run(
+            db.as_ref(),
+            new_run(service.id, backup.id, user.id, "in_place", None),
+            Some(backup.id),
+            service.id,
+            true,
+        )
+        .await
+        .expect("first in-place restore is accepted");
+        update_phase(db.as_ref(), active.id, "restore")
+            .await
+            .expect("record restore phase");
+
+        // A second in-place restore, or a PITR in place, is a typed 409.
+        for mode in ["in_place", "pitr"] {
+            let err = insert_restore_run(
+                db.as_ref(),
+                new_run(service.id, backup.id, user.id, mode, None),
+                Some(backup.id),
+                service.id,
+                true,
+            )
+            .await
+            .expect_err("a second destructive restore must conflict");
+            assert!(
+                matches!(
+                    err,
+                    RestoreError::RestoreAlreadyActive { service_id, restore_run_id }
+                        if service_id == service.id && restore_run_id == active.id
+                ),
+                "{mode}: got {err:?}"
+            );
+        }
+        // The unique index still backs the check if it is ever bypassed.
+        let raw = new_run(service.id, backup.id, user.id, "in_place", None)
+            .insert(db.as_ref())
+            .await
+            .expect_err("index must reject a second active in-place run");
+        assert!(is_active_restore_conflict(&raw), "{raw:?}");
+        // A restore into a new service does not touch the target and is allowed.
+        insert_restore_run(
+            db.as_ref(),
+            new_run(
+                service.id,
+                backup.id,
+                user.id,
+                "new_service",
+                Some("orders-copy"),
+            ),
+            Some(backup.id),
+            service.id,
+            false,
+        )
+        .await
+        .expect("new-service restore alongside an in-place one");
+
+        // Fencing fails: the run stays active and keeps blocking.
+        let failing = AssertingFence {
+            db: db.clone(),
+            run_id: active.id,
+            fail: true,
+            calls: Default::default(),
+        };
+        let report =
+            crate::services::reconcile_interrupted_restores(db.as_ref(), &[active.id], &failing)
+                .await
+                .expect("reconcile");
+        assert_eq!(report.deferred, vec![active.id]);
+        assert!(insert_restore_run(
+            db.as_ref(),
+            new_run(service.id, backup.id, user.id, "in_place", None),
+            Some(backup.id),
+            service.id,
+            true,
+        )
+        .await
+        .is_err());
+
+        // Fencing succeeds: the run becomes interrupted, keeping its phase.
+        let fence = AssertingFence {
+            db: db.clone(),
+            run_id: active.id,
+            fail: false,
+            calls: Default::default(),
+        };
+        let report =
+            crate::services::reconcile_interrupted_restores(db.as_ref(), &[active.id], &fence)
+                .await
+                .expect("reconcile");
+        assert_eq!(report.interrupted, vec![active.id]);
+        assert_eq!(fence.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let interrupted = load_run_for_update(db.as_ref(), active.id)
+            .await
+            .expect("reload run");
+        assert_eq!(interrupted.status, "interrupted");
+        assert_eq!(interrupted.phase, "restore");
+        assert!(interrupted.finished_at.is_some());
+        let message = interrupted.error_message.clone().unwrap_or_default();
+        assert!(
+            message.contains("interrupted when Temps restarted during the data restore"),
+            "{message}"
+        );
+        assert!(message.contains("may be partially restored"), "{message}");
+
+        // Reconciling again (another restart) changes nothing.
+        let again =
+            crate::services::reconcile_interrupted_restores(db.as_ref(), &[active.id], &fence)
+                .await
+                .expect("reconcile again");
+        assert_eq!(again, crate::services::RestoreReconcileReport::default());
+        assert_eq!(fence.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let unchanged = load_run_for_update(db.as_ref(), active.id)
+            .await
+            .expect("reload run");
+        assert_eq!(unchanged.error_message, interrupted.error_message);
+
+        // A late outcome from a surviving worker never overwrites it.
+        persist_terminal_state(db.as_ref(), active.id, &Ok(None), TERMINAL_WRITE_RETRY)
+            .await
+            .expect("no-op write");
+        assert_eq!(
+            load_run_for_update(db.as_ref(), active.id)
+                .await
+                .expect("reload run")
+                .status,
+            "interrupted"
+        );
+
+        // The service accepts a new in-place restore again.
+        let next = insert_restore_run(
+            db.as_ref(),
+            new_run(service.id, backup.id, user.id, "in_place", None),
+            Some(backup.id),
+            service.id,
+            true,
+        )
+        .await
+        .expect("restore after reconciliation is accepted");
+
+        // A worker that crashes still records a terminal state.
+        let crash = RestoreError::WorkerCrashed {
+            restore_run_id: next.id,
+            phase: "prepare".to_string(),
+            reason: "task panicked".to_string(),
+        };
+        persist_terminal_state(db.as_ref(), next.id, &Err(crash), TERMINAL_WRITE_RETRY)
+            .await
+            .expect("terminal write");
+        let failed = load_run_for_update(db.as_ref(), next.id)
+            .await
+            .expect("reload run");
+        assert_eq!(failed.status, "failed");
+        assert!(failed.finished_at.is_some());
+        assert!(failed
+            .error_message
+            .unwrap_or_default()
+            .contains("stopped unexpectedly during phase 'prepare'"));
+    }
+
+    #[tokio::test]
+    async fn terminal_write_is_retried_then_reported() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_errors(vec![
+                sea_orm::DbErr::Custom("connection reset".into()),
+                sea_orm::DbErr::Custom("connection reset".into()),
+            ])
+            .append_exec_results(vec![sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .into_connection();
+        let fast = TerminalWriteRetry {
+            attempts: 3,
+            base_delay: std::time::Duration::from_millis(1),
+            max_delay: std::time::Duration::from_millis(2),
+        };
+        persist_terminal_state(&db, 9, &Ok(None), fast)
+            .await
+            .expect("third attempt succeeds");
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_errors(vec![
+                sea_orm::DbErr::Custom("down".into()),
+                sea_orm::DbErr::Custom("down".into()),
+            ])
+            .into_connection();
+        let two = TerminalWriteRetry {
+            attempts: 2,
+            ..fast
+        };
+        let err = persist_terminal_state(&db, 9, &Ok(None), two)
+            .await
+            .expect_err("gives up after the configured attempts");
+        assert!(matches!(err, RestoreError::Database(_)));
     }
 }

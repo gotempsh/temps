@@ -2206,6 +2206,9 @@ impl PostgresService {
                 ..Default::default()
             }),
             user: Some("postgres".to_string()),
+            labels: Some(crate::externalsvc::restore_helper::restore_helper_labels(
+                &container_name,
+            )),
             ..Default::default()
         };
 

@@ -41,6 +41,7 @@ pub mod postgres_upgrade;
 pub mod postgres_wal_health;
 pub mod rc_client;
 pub mod redis;
+pub mod restore_helper;
 pub mod restore_image;
 pub mod rustfs;
 pub mod s3;

@@ -2735,6 +2735,9 @@ impl MariaDbService {
                     image: Some(image),
                     cmd: Some(vec!["sh".to_string(), "-c".to_string(), restore_script]),
                     env: Some(env),
+                    labels: Some(crate::externalsvc::restore_helper::restore_helper_labels(
+                        &container_name,
+                    )),
                     host_config: Some(HostConfig {
                         volumes_from: Some(vec![container_name.clone()]),
                         ..Default::default()
@@ -2988,6 +2991,9 @@ impl MariaDbService {
                 volumes_from: Some(vec![container_name.to_string()]),
                 ..Default::default()
             }),
+            labels: Some(crate::externalsvc::restore_helper::restore_helper_labels(
+                container_name,
+            )),
             ..Default::default()
         };
 

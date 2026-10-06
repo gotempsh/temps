@@ -1881,6 +1881,9 @@ impl ExternalService for RustfsService {
                 network_mode: Some("host".to_string()),
                 ..Default::default()
             }),
+            labels: Some(crate::externalsvc::restore_helper::restore_helper_labels(
+                &self.get_container_name(),
+            )),
             ..Default::default()
         };
 
