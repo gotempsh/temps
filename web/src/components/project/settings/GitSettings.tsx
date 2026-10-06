@@ -65,7 +65,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
-import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { ScrollableTabsList, Tabs, TabsTrigger } from '@/components/ui/tabs'
 import {
   Tooltip,
   TooltipContent,
@@ -2889,10 +2889,8 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
 
       {mode === 'connection' ? (
         <div className="space-y-3 rounded-lg border p-3">
-          <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center">
-            <p className="shrink-0 text-base font-medium sm:text-sm">
-              Git connection
-            </p>
+          <div className="min-w-0 space-y-1">
+            <p className="text-base font-medium sm:text-sm">Git connection</p>
             <Tabs
               value={selectedConnectionId?.toString()}
               onValueChange={(value) => {
@@ -2903,19 +2901,14 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
                   navigate(repositoryConnectionPath(project.slug, connectionId))
                 }
               }}
-              className="min-w-0"
             >
-              <TabsList
-                className="h-9 max-w-full justify-start overflow-x-auto p-1"
-                aria-label="Git provider connections"
-              >
+              <ScrollableTabsList aria-label="Git provider connections">
                 {connections.map((c) => {
                   const provider = providers.find((p) => p.id === c.provider_id)
                   return (
                     <TabsTrigger
                       key={c.id}
                       value={c.id.toString()}
-                      className="h-7 gap-2 px-2.5 py-1"
                       title={`${provider?.name || 'Git'}: ${c.account_name}`}
                     >
                       <ProviderLogo
@@ -2926,12 +2919,12 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
                     </TabsTrigger>
                   )
                 })}
-              </TabsList>
+              </ScrollableTabsList>
             </Tabs>
           </div>
 
           {selectedConnectionId && (
-            <div className="space-y-3 border-t pt-3">
+            <div className="space-y-3">
               <div className="inline-flex rounded-lg border p-0.5">
                 <Button
                   type="button"
