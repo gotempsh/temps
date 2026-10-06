@@ -336,6 +336,12 @@ describe('command palette project pages', () => {
     ).toEqual([])
   })
 
+  test('an unknown hosted project URL says so instead of rendering nothing', () => {
+    expect(
+      resolveLeaf(PROJECT_ROUTES.hosted, 'workspace')?.route.elementName
+    ).toBe('ProjectPageNotFound')
+  })
+
   test('every hosted entry opens the canonical page, not a redirect', () => {
     expect(
       projectNavItems

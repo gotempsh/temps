@@ -40,6 +40,7 @@ import {
   LegacyProjectRouteRedirect,
   RenamedProjectRouteRedirect,
 } from '@/components/project/LegacyProjectRouteRedirect'
+import { ProjectPageNotFound } from '@/components/project/ProjectPageNotFound'
 import { serviceTemplateDeployOverrides } from '@/lib/template-runtime-defaults'
 import { ProjectSpeedInsights } from '@/components/project/ProjectSpeedInsights'
 import { ProjectStorage } from '@/components/project/ProjectStorage'
@@ -916,6 +917,10 @@ export function ProjectDetail() {
               <Route
                 path="environments/*"
                 element={<EnvironmentsTabsView project={project} />}
+              />
+              <Route
+                path="*"
+                element={<ProjectPageNotFound project={project} />}
               />
             </Routes>
           </ProjectSectionLayout>
