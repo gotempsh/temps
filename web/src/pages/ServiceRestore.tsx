@@ -2,22 +2,17 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import {
-  getRestoreCapabilitiesOptions,
-  getRestoreRunOptions,
-  getServiceOptions,
-  listS3SourcesOptions,
-  listSourceBackupsOptions,
   planRestoreMutation,
   startRestoreMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import type {
-  ExternalServiceDetails,
-  RestoreCapabilitiesResponse,
+  ExternalServiceInfo,
   RestorePlan,
   RestoreRunView,
   SourceBackupEntry,
 } from '@/api/client/types.gen'
-import { Alert, AlertDescription } from '@/components/ui/alert'
+import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -27,6 +22,7 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
+import { EmptyState } from '@/components/ui/empty-state'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -38,6 +34,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import { Skeleton } from '@/components/ui/skeleton'
 import {
   Table,
   TableBody,
@@ -49,7 +46,7 @@ import {
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { isPitrCapableFormat } from '@/lib/utils'
-import { useQuery, useMutation } from '@tanstack/react-query'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -65,31 +62,56 @@ import {
   AlertCircle,
   AlertTriangle,
   ArrowLeft,
-  CheckCircle2,
   ChevronLeft,
   ChevronRight,
-  Clock,
-  Database,
+  HardDrive,
   Loader2,
+  RefreshCw,
   RotateCcw,
   Search,
   Star,
-  XCircle,
 } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
-import { useNavigate, useParams } from 'react-router'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  Link,
+  useLocation,
+  useNavigate,
+  useParams,
+  useSearchParams,
+} from 'react-router'
 import { toast } from 'sonner'
+import { RunTrackingPanel } from './service-restore/RunTrackingPanel'
+import {
+  restoreCapabilitiesQuery,
+  restoreRunQuery,
+  restoreServiceQuery,
+  restoreSourceBackupsQuery,
+  restoreSourcesQuery,
+  serviceRestoreRunsQuery,
+} from './service-restore/restore-queries'
+import {
+  activeRestoreConflict,
+  attachReasonFromLocationState,
+  classifyQueryError,
+  completionToast,
+  deriveRunTracking,
+  markRunWatching,
+  observeRun,
+  parseRunParam,
+  phaseLabel,
+  pickActiveRun,
+  restoreGate,
+  runPollInterval,
+  sectionLoadErrorCopy,
+  sectionState,
+  serviceLoadErrorCopy,
+  sourcesState,
+  type AttachReason,
+  type CompletionLedger,
+  type QueryErrorKind,
+} from './service-restore/restore-state'
 
 type Mode = 'in_place' | 'new_service' | 'pitr'
-
-const PHASES: Array<{ id: string; label: string }> = [
-  { id: 'prepare', label: 'Prepare' },
-  { id: 'provision', label: 'Provision' },
-  { id: 'restore', label: 'Restore data' },
-  { id: 'recover', label: 'Recover WAL' },
-  { id: 'verify', label: 'Verify' },
-  { id: 'completed', label: 'Completed' },
-]
 
 // Engine-family check — mirror of the backend `engines_compatible` helper in
 // crates/temps-backup/src/services/restore.rs. S3-compatible object stores
@@ -109,37 +131,142 @@ function enginesCompatible(
 export function ServiceRestore() {
   const { id } = useParams<{ id: string }>()
   const serviceId = id ? Number(id) : NaN
+  const validServiceId = Number.isFinite(serviceId)
   const navigate = useNavigate()
+  const queryClient = useQueryClient()
+  const [searchParams, setSearchParams] = useSearchParams()
+  const location = useLocation()
+  const runParam = parseRunParam(searchParams.get('run'))
   usePageTitle('Restore service')
   const { setBreadcrumbs } = useBreadcrumbs()
 
   // ----- Queries ------------------------------------------------------------
-  const { data: serviceDetails, isLoading: serviceLoading } = useQuery({
-    ...getServiceOptions({ path: { id: serviceId } }),
-    enabled: Number.isFinite(serviceId),
+  // Each read keeps its HTTP status on failure (see restore-queries.ts) so
+  // the page can tell "no access" from "gone" from "API unavailable" instead
+  // of spinning forever.
+  const serviceQuery = useQuery({
+    ...restoreServiceQuery(serviceId),
+    enabled: validServiceId,
   })
-  const service = (serviceDetails as ExternalServiceDetails | undefined)
-    ?.service
+  const service = serviceQuery.data?.service
 
-  const { data: caps } = useQuery({
-    ...getRestoreCapabilitiesOptions({ path: { id: serviceId } }),
-    enabled: Number.isFinite(serviceId),
+  const capsQuery = useQuery({
+    ...restoreCapabilitiesQuery(serviceId),
+    enabled: validServiceId,
   })
-  const capabilities = caps as RestoreCapabilitiesResponse | undefined
+  const capabilities = capsQuery.data
+  const capsSection = sectionState(capsQuery)
+  const capsReady = capsSection.kind === 'ready'
 
-  const { data: s3Sources } = useQuery({
-    ...listS3SourcesOptions(),
-    enabled: Number.isFinite(serviceId),
+  const sourcesQuery = useQuery({
+    ...restoreSourcesQuery(),
+    enabled: validServiceId,
   })
+  const s3Sources = sourcesQuery.data
+  const sourcesView = sourcesState(sourcesQuery)
   const defaultSource = useMemo(
-    () =>
-      s3Sources?.find(
-        (s) => (s as { is_default?: boolean }).is_default === true
-      ),
+    () => s3Sources?.find((s) => s.is_default === true),
     [s3Sources]
   )
 
+  // Without a run in the URL, ask the server whether this service already
+  // has a restore in flight (a reload, another tab, another operator) and
+  // follow it rather than offering to start a second one.
+  const activeRunsQuery = useQuery({
+    ...serviceRestoreRunsQuery(serviceId),
+    enabled: validServiceId && runParam === null,
+  })
+  const activeRun =
+    runParam === null &&
+    activeRunsQuery.isSuccess &&
+    !activeRunsQuery.isFetching
+      ? pickActiveRun(activeRunsQuery.data)
+      : undefined
+  const activeRunsSection =
+    runParam === null
+      ? sectionState(activeRunsQuery)
+      : ({ kind: 'ready' } as const)
+
+  // ----- Run tracking ---------------------------------------------------------
+  // The run being followed lives in the URL (`?run=<id>`), so a reload, a deep
+  // link or signing in again resumes tracking it.
+  const effectiveRunId = runParam ?? activeRun?.id ?? null
+  const trackedRunId =
+    typeof effectiveRunId === 'number' ? effectiveRunId : null
+  // Runs this page has seen active, so completion is announced exactly once
+  // per run, and never for a run that had already finished on arrival.
+  const ledgerRef = useRef<CompletionLedger>({})
+
+  const followRun = useCallback(
+    (runId: number, reason?: AttachReason) => {
+      ledgerRef.current = markRunWatching(ledgerRef.current, runId)
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev)
+          next.set('run', String(runId))
+          return next
+        },
+        {
+          replace: true,
+          state: reason ? { restoreAttach: reason } : null,
+        }
+      )
+    },
+    [setSearchParams]
+  )
+
+  const activeRunsUpdatedAt = activeRunsQuery.dataUpdatedAt
+  useEffect(() => {
+    if (!activeRun) return
+    // The list row is a server-confirmed status: show it straight away, with
+    // the time it was actually read, while the run's own status loads.
+    const runKey = restoreRunQuery(activeRun.id).queryKey
+    if (queryClient.getQueryData(runKey) === undefined) {
+      queryClient.setQueryData(runKey, activeRun, {
+        updatedAt: activeRunsUpdatedAt,
+      })
+    }
+    followRun(activeRun.id, 'reattached')
+  }, [activeRun, activeRunsUpdatedAt, followRun, queryClient])
+
+  const runQuery = useQuery({
+    ...restoreRunQuery(trackedRunId ?? 0),
+    enabled: trackedRunId !== null,
+    refetchInterval: (query) =>
+      runPollInterval(
+        query.state.data,
+        query.state.error,
+        query.state.status === 'error'
+      ),
+  })
+  const runRow = runQuery.data
+
+  useEffect(() => {
+    if (!runRow) return
+    const { ledger, notify } = observeRun(ledgerRef.current, runRow)
+    ledgerRef.current = ledger
+    if (!notify) return
+    const message = completionToast(notify, runRow, service?.name)
+    toast[message.level](message.title, { description: message.description })
+  }, [runRow, service?.name])
+
+  const runView =
+    effectiveRunId === null
+      ? null
+      : deriveRunTracking(effectiveRunId, {
+          isError: runQuery.isError,
+          error: runQuery.error,
+          data: runRow,
+          dataUpdatedAt: runQuery.dataUpdatedAt,
+        })
+  const attachReason: AttachReason | undefined =
+    runParam === null && activeRun
+      ? 'reattached'
+      : attachReasonFromLocationState(location.state)
+
   // ----- Local state --------------------------------------------------------
+  // Kept in this component, which stays mounted through load errors and
+  // retries, so a retry never discards what the user already picked.
   const [selectedSourceId, setSelectedSourceId] = useState<number | undefined>()
   const [selectedBackup, setSelectedBackup] = useState<
     SourceBackupEntry | undefined
@@ -152,7 +279,6 @@ export function ServiceRestore() {
   const [pitrToNewService, setPitrToNewService] = useState(false)
   const [confirmText, setConfirmText] = useState('')
   const [search, setSearch] = useState('')
-  const [runningRunId, setRunningRunId] = useState<number | null>(null)
   const [showDestructiveConfirm, setShowDestructiveConfirm] = useState(false)
   const effectiveSourceId = selectedSourceId ?? defaultSource?.id
   const effectiveNewServiceName =
@@ -160,32 +286,32 @@ export function ServiceRestore() {
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
 
-  // Breadcrumbs
+  // Breadcrumbs: a safe label while the database is loading or unreadable.
+  const serviceName = service?.name
   useEffect(() => {
-    if (!service) return
+    if (!validServiceId) return
     setBreadcrumbs([
       { label: 'Databases', href: '/storage' },
-      { label: service.name, href: `/storage/${serviceId}` },
+      {
+        label: serviceName ?? `Database ${serviceId}`,
+        href: `/storage/${serviceId}`,
+      },
       { label: 'Restore' },
     ])
     return () => setBreadcrumbs([])
-  }, [service, serviceId, setBreadcrumbs])
+  }, [serviceName, serviceId, validServiceId, setBreadcrumbs])
 
   // ----- Backups list ------------------------------------------------------
-  const {
-    data: backupIndex,
-    isLoading: backupsLoading,
-    error: backupsError,
-    refetch: refetchBackups,
-  } = useQuery({
-    ...listSourceBackupsOptions({ path: { id: effectiveSourceId ?? 0 } }),
+  const backupsQuery = useQuery({
+    ...restoreSourceBackupsQuery(effectiveSourceId ?? 0),
     enabled: effectiveSourceId !== undefined,
   })
+  const backupIndex = backupsQuery.data
+  const backupsSection = sectionState(backupsQuery)
+  const refetchBackups = backupsQuery.refetch
 
   const allBackups = useMemo<SourceBackupEntry[]>(
-    () =>
-      (backupIndex as { backups?: SourceBackupEntry[] } | undefined)?.backups ??
-      [],
+    () => backupIndex?.backups ?? [],
     [backupIndex]
   )
 
@@ -252,44 +378,21 @@ export function ServiceRestore() {
     return allBackups.filter((b) => !enginesCompatible(b.engine, engine)).length
   }, [allBackups, service?.service_type])
 
-  // ----- Run polling --------------------------------------------------------
-  const { data: runRow } = useQuery({
-    ...getRestoreRunOptions({ path: { id: runningRunId ?? 0 } }),
-    enabled: runningRunId != null,
-    refetchInterval: (query) => {
-      const row = query.state.data as RestoreRunView | undefined
-      if (!row) return 2000
-      return row.status === 'completed' || row.status === 'failed'
-        ? false
-        : 2000
-    },
-  })
-
-  useEffect(() => {
-    if (!runRow || runningRunId == null) return
-    if (runRow.status === 'completed') {
-      toast.success('Restore completed', {
-        description:
-          runRow.target_service_id != null
-            ? `New service id: ${runRow.target_service_id}`
-            : `Restored onto ${service?.name ?? 'service'}.`,
-      })
-    } else if (runRow.status === 'failed') {
-      toast.error('Restore failed', {
-        description: runRow.error_message ?? 'Unknown error',
-      })
-    }
-  }, [runRow?.status, runningRunId, runRow, service?.name])
-
   // ----- Mutations ---------------------------------------------------------
+  // Starting a restore is never retried automatically: a failed status read
+  // or a lost response is not evidence that the restore did not start.
   const startMutation = useMutation({
     ...startRestoreMutation(),
+    retry: false,
     meta: { errorTitle: 'Failed to start restore' },
     onSuccess: (run) => {
       const r = run as RestoreRunView
-      setRunningRunId(r.id)
+      // The 202 body is the server's first confirmed status for this run.
+      queryClient.setQueryData(restoreRunQuery(r.id).queryKey, r)
+      setShowDestructiveConfirm(false)
+      followRun(r.id)
       toast.success('Restore started', {
-        description: `Run ${r.id} (phase: ${r.phase}).`,
+        description: `Run ${r.id} (phase: ${phaseLabel(r.phase)}).`,
       })
     },
     onError: (error, variables) => {
@@ -297,6 +400,24 @@ export function ServiceRestore() {
         handleSensitiveActionError(error, () => startMutation.mutate(variables))
       ) {
         setShowDestructiveConfirm(false)
+        return
+      }
+      // 409 restore-already-active: follow the restore that is running
+      // instead of reporting a failure.
+      const activeRunId = activeRestoreConflict(error)
+      if (activeRunId !== undefined) {
+        setShowDestructiveConfirm(false)
+        if (activeRunId !== null) {
+          followRun(activeRunId, 'already_active')
+        } else {
+          void activeRunsQuery.refetch()
+        }
+        toast.info('A restore is already running on this database', {
+          description:
+            activeRunId !== null
+              ? `Following run #${activeRunId} instead of starting a new one.`
+              : 'Looking up the running restore instead of starting a new one.',
+        })
         return
       }
       const problem = error as { detail?: string; message?: string }
@@ -410,7 +531,12 @@ export function ServiceRestore() {
   // can authorize the confirmation and start action.
   const crossServiceRestore = plan?.cross_service ?? false
 
+  // Capabilities and the active-run check must both be known before a
+  // restore can be started.
+  const gate = restoreGate(capsSection, activeRunsSection)
+
   const canSubmit = (() => {
+    if (!gate.enabled) return false
     if (
       !selectedBackup ||
       !plan ||
@@ -489,62 +615,85 @@ export function ServiceRestore() {
     }
   }
 
+  const startNewRestore = () => {
+    // Forget the cached history so the active-run check reads the server
+    // again rather than reattaching from a list fetched before this run ended.
+    void queryClient.resetQueries({
+      queryKey: serviceRestoreRunsQuery(serviceId).queryKey,
+    })
+    setConfirmText('')
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev)
+      next.delete('run')
+      return next
+    })
+  }
+
   // ---------- Render --------------------------------------------------------
 
-  if (!Number.isFinite(serviceId)) {
+  if (!validServiceId) {
     return (
-      <div className="w-full px-4 py-8 sm:px-6 lg:px-8">
+      <PageContainer>
         <Alert variant="destructive">
           <AlertCircle className="h-4 w-4" />
           <AlertDescription>Invalid service id.</AlertDescription>
         </Alert>
-      </div>
+      </PageContainer>
     )
   }
 
-  if (serviceLoading || !service) {
+  const serviceSection = sectionState(serviceQuery)
+
+  if (!service) {
     return (
-      <div className="w-full flex items-center justify-center px-4 py-12 sm:px-6 lg:px-8">
-        <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
-      </div>
+      <PageContainer>
+        <RestorePageHeader />
+        {serviceSection.kind === 'error' ? (
+          <ServiceLoadError
+            kind={serviceSection.errorKind}
+            retrying={serviceQuery.isFetching}
+            onRetry={() => void serviceQuery.refetch()}
+            onBack={() => navigate('/storage')}
+          />
+        ) : (
+          <RestorePageSkeleton />
+        )}
+      </PageContainer>
     )
   }
 
-  // Running view — takes over the whole page once a run is in flight.
-  if (runningRunId != null) {
+  // Running view: takes over the page while a run is followed. It never
+  // offers the restore form's Start action; only a terminal run (or an id
+  // that does not exist) leads back to the form.
+  if (effectiveRunId !== null && runView) {
     return (
-      <div className="w-full px-4 py-8 sm:px-6 lg:px-8">
-        <PageHeader service={service} />
-        <RunProgress run={runRow} />
-        <div className="mt-6 flex gap-2">
-          <Button
-            variant="outline"
-            onClick={() => navigate(`/storage/${serviceId}`)}
-            disabled={
-              runRow?.status !== 'completed' && runRow?.status !== 'failed'
-            }
-          >
-            <ArrowLeft className="h-4 w-4 mr-2" />
-            Back to service
-          </Button>
-          {runRow?.status === 'completed' &&
-          runRow.target_service_id != null ? (
-            <Button
-              onClick={() => navigate(`/storage/${runRow.target_service_id}`)}
-            >
-              <Database className="h-4 w-4 mr-2" />
-              Open restored service
-            </Button>
-          ) : null}
-        </div>
-      </div>
+      <PageContainer>
+        <RestorePageHeader service={service} />
+        <RunTrackingPanel
+          serviceId={serviceId}
+          runId={effectiveRunId}
+          view={runView}
+          attachReason={attachReason}
+          onRetryStatus={() => void runQuery.refetch()}
+          retrying={runQuery.isFetching}
+          onBack={() => navigate(`/storage/${serviceId}`)}
+          onStartNew={startNewRestore}
+          onOpenRestored={(targetId) => navigate(`/storage/${targetId}`)}
+        />
+      </PageContainer>
     )
   }
 
-  // Configure view
+  // Configure view. Modes stay disabled until the server has said which
+  // ones this database supports.
+  const inPlaceDisabled = !capsReady || capabilities?.restore_in_place === false
+  const newServiceDisabled =
+    !capsReady || capabilities?.restore_to_new_service === false
+  const pitrDisabled =
+    !capsReady || capabilities?.pitr === false || !selectedSupportsPitr
   return (
-    <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
-      <PageHeader service={service} />
+    <PageContainer>
+      <RestorePageHeader service={service} />
 
       {/* Step 1: S3 source */}
       <Card>
@@ -561,37 +710,65 @@ export function ServiceRestore() {
           </CardDescription>
         </CardHeader>
         <CardContent>
-          <Select
-            value={effectiveSourceId?.toString()}
-            onValueChange={(v) => {
-              setSelectedSourceId(Number(v))
-              setSelectedBackup(undefined)
-              setBackupsPage(1)
-            }}
-          >
-            <SelectTrigger className="max-w-md">
-              <SelectValue placeholder="Select an S3 source" />
-            </SelectTrigger>
-            <SelectContent>
-              {s3Sources?.map((source) => {
-                const isDefault =
-                  (source as { is_default?: boolean }).is_default === true
-                return (
-                  <SelectItem key={source.id} value={source.id.toString()}>
-                    <span className="flex items-center gap-2">
-                      {source.name}
-                      {isDefault ? (
-                        <Star className="h-3 w-3 fill-amber-500 text-amber-500" />
-                      ) : null}
-                      <span className="text-xs text-muted-foreground">
-                        {source.bucket_name}
+          {sourcesView.kind === 'loading' ? (
+            <Skeleton
+              className="h-10 w-full max-w-md"
+              aria-label="Loading storage sources"
+            />
+          ) : sourcesView.kind === 'error' ? (
+            <InlineLoadError
+              title="Could not load storage sources"
+              description={sectionLoadErrorCopy(
+                'the storage sources',
+                sourcesView.errorKind
+              )}
+              retrying={sourcesQuery.isFetching}
+              onRetry={() => void sourcesQuery.refetch()}
+            />
+          ) : sourcesView.kind === 'empty' ? (
+            <EmptyState
+              size="compact"
+              icon={HardDrive}
+              title="No storage sources yet"
+              description="Backups are read from an S3-compatible storage source. Add one to list the backups you can restore from."
+              action={
+                <Button variant="outline" asChild>
+                  <Link to="/backups/s3-sources/new">Add storage source</Link>
+                </Button>
+              }
+            />
+          ) : (
+            <Select
+              value={effectiveSourceId?.toString()}
+              onValueChange={(v) => {
+                setSelectedSourceId(Number(v))
+                setSelectedBackup(undefined)
+                setBackupsPage(1)
+              }}
+            >
+              <SelectTrigger className="max-w-md">
+                <SelectValue placeholder="Select an S3 source" />
+              </SelectTrigger>
+              <SelectContent>
+                {s3Sources?.map((source) => {
+                  const isDefault = source.is_default === true
+                  return (
+                    <SelectItem key={source.id} value={source.id.toString()}>
+                      <span className="flex items-center gap-2">
+                        {source.name}
+                        {isDefault ? (
+                          <Star className="h-3 w-3 fill-amber-500 text-amber-500" />
+                        ) : null}
+                        <span className="text-xs text-muted-foreground">
+                          {source.bucket_name}
+                        </span>
                       </span>
-                    </span>
-                  </SelectItem>
-                )
-              })}
-            </SelectContent>
-          </Select>
+                    </SelectItem>
+                  )
+                })}
+              </SelectContent>
+            </Select>
+          )}
         </CardContent>
       </Card>
 
@@ -628,7 +805,9 @@ export function ServiceRestore() {
               variant="outline"
               size="sm"
               onClick={() => refetchBackups()}
-              disabled={backupsLoading}
+              disabled={
+                effectiveSourceId === undefined || backupsQuery.isFetching
+              }
             >
               Refresh
             </Button>
@@ -640,19 +819,39 @@ export function ServiceRestore() {
             ) : null}
           </div>
 
-          {backupsLoading ? (
-            <div className="flex items-center text-sm text-muted-foreground py-8 justify-center">
-              <Loader2 className="h-4 w-4 animate-spin mr-2" />
-              Loading backups…
+          {backupsQuery.isError && backupIndex !== undefined ? (
+            <InlineLoadError
+              title="Could not refresh backups"
+              description={`Showing the backups loaded earlier. ${sectionLoadErrorCopy('the backups on this source', classifyQueryError(backupsQuery.error))}`}
+              retrying={backupsQuery.isFetching}
+              onRetry={() => void refetchBackups()}
+            />
+          ) : null}
+
+          {effectiveSourceId === undefined ? (
+            <div className="text-sm text-muted-foreground py-8 text-center border rounded-md">
+              {sourcesView.kind === 'ready'
+                ? 'Select a storage source to list its backups.'
+                : sourcesView.kind === 'empty'
+                  ? 'Add a storage source to list its backups.'
+                  : 'Backups are listed once a storage source is available.'}
             </div>
-          ) : backupsError ? (
-            <Alert variant="destructive">
-              <AlertCircle className="h-4 w-4" />
-              <AlertDescription>
-                Failed to load backups from this source. Check that the S3
-                endpoint and bucket path are correct.
-              </AlertDescription>
-            </Alert>
+          ) : backupsSection.kind === 'loading' ? (
+            <BackupsSkeleton />
+          ) : backupsSection.kind === 'error' ? (
+            <InlineLoadError
+              title="Could not load backups from this source"
+              description={
+                backupsSection.errorKind === 'unavailable'
+                  ? 'Could not load the backups on this source. Check your connection, and that the S3 endpoint and bucket path are correct, then retry.'
+                  : sectionLoadErrorCopy(
+                      'the backups on this source',
+                      backupsSection.errorKind
+                    )
+              }
+              retrying={backupsQuery.isFetching}
+              onRetry={() => void refetchBackups()}
+            />
           ) : filteredBackups.length === 0 ? (
             <div className="text-sm text-muted-foreground py-8 text-center border rounded-md">
               No compatible backups on this source.
@@ -723,58 +922,62 @@ export function ServiceRestore() {
             </div>
           )}
 
-          {!backupsLoading && !backupsError && backupsTotalPages > 1 && (
-            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-              <div className="text-sm text-muted-foreground">
-                <span className="hidden sm:inline tabular-nums">
-                  Showing {(backupsPage - 1) * BACKUPS_PAGE_SIZE + 1} to{' '}
-                  {Math.min(
-                    backupsPage * BACKUPS_PAGE_SIZE,
-                    filteredBackups.length
-                  )}{' '}
-                  of {filteredBackups.length} backups
-                </span>
-                <span className="sm:hidden tabular-nums">
-                  {backupsPage} / {backupsTotalPages}
-                </span>
-              </div>
-              <div className="flex items-center gap-2">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => setBackupsPage((p) => Math.max(1, p - 1))}
-                  disabled={backupsPage === 1}
-                >
-                  <ChevronLeft className="h-4 w-4" />
-                  <span className="hidden sm:inline">Previous</span>
-                </Button>
-                <div className="hidden sm:flex items-center gap-1">
-                  {backupsPageWindow.map((pageNum) => (
-                    <Button
-                      key={pageNum}
-                      variant={pageNum === backupsPage ? 'default' : 'outline'}
-                      size="sm"
-                      onClick={() => setBackupsPage(pageNum)}
-                      className="w-10"
-                    >
-                      {pageNum}
-                    </Button>
-                  ))}
+          {effectiveSourceId !== undefined &&
+            backupsSection.kind === 'ready' &&
+            backupsTotalPages > 1 && (
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                <div className="text-sm text-muted-foreground">
+                  <span className="hidden sm:inline tabular-nums">
+                    Showing {(backupsPage - 1) * BACKUPS_PAGE_SIZE + 1} to{' '}
+                    {Math.min(
+                      backupsPage * BACKUPS_PAGE_SIZE,
+                      filteredBackups.length
+                    )}{' '}
+                    of {filteredBackups.length} backups
+                  </span>
+                  <span className="sm:hidden tabular-nums">
+                    {backupsPage} / {backupsTotalPages}
+                  </span>
                 </div>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() =>
-                    setBackupsPage((p) => Math.min(backupsTotalPages, p + 1))
-                  }
-                  disabled={backupsPage === backupsTotalPages}
-                >
-                  <span className="hidden sm:inline">Next</span>
-                  <ChevronRight className="h-4 w-4" />
-                </Button>
+                <div className="flex items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setBackupsPage((p) => Math.max(1, p - 1))}
+                    disabled={backupsPage === 1}
+                  >
+                    <ChevronLeft className="h-4 w-4" />
+                    <span className="hidden sm:inline">Previous</span>
+                  </Button>
+                  <div className="hidden sm:flex items-center gap-1">
+                    {backupsPageWindow.map((pageNum) => (
+                      <Button
+                        key={pageNum}
+                        variant={
+                          pageNum === backupsPage ? 'default' : 'outline'
+                        }
+                        size="sm"
+                        onClick={() => setBackupsPage(pageNum)}
+                        className="w-10"
+                      >
+                        {pageNum}
+                      </Button>
+                    ))}
+                  </div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() =>
+                      setBackupsPage((p) => Math.min(backupsTotalPages, p + 1))
+                    }
+                    disabled={backupsPage === backupsTotalPages}
+                  >
+                    <span className="hidden sm:inline">Next</span>
+                    <ChevronRight className="h-4 w-4" />
+                  </Button>
+                </div>
               </div>
-            </div>
-          )}
+            )}
 
           {selectedBackup ? (
             <div className="text-xs text-muted-foreground font-mono break-all pt-2">
@@ -810,6 +1013,18 @@ export function ServiceRestore() {
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
+          {capsSection.kind === 'loading' ? (
+            <p className="text-sm text-muted-foreground">
+              Checking which restore modes this database supports…
+            </p>
+          ) : capsSection.kind === 'error' ? (
+            <InlineLoadError
+              title="Could not load the restore options"
+              description={`${sectionLoadErrorCopy('the restore options for this database', capsSection.errorKind)} Restore modes stay disabled until they load.`}
+              retrying={capsQuery.isFetching}
+              onRetry={() => void capsQuery.refetch()}
+            />
+          ) : null}
           <RadioGroup
             value={mode}
             onValueChange={(v) => setMode(v as Mode)}
@@ -819,12 +1034,12 @@ export function ServiceRestore() {
               htmlFor="mode-in-place"
               className={`flex items-start gap-3 rounded-md border p-3 cursor-pointer ${
                 mode === 'in_place' ? 'border-primary bg-accent/50' : ''
-              } ${capabilities?.restore_in_place === false ? 'opacity-50 cursor-not-allowed' : ''}`}
+              } ${inPlaceDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}
             >
               <RadioGroupItem
                 value="in_place"
                 id="mode-in-place"
-                disabled={capabilities?.restore_in_place === false}
+                disabled={inPlaceDisabled}
                 className="mt-0.5"
               />
               <div className="flex-1">
@@ -844,12 +1059,12 @@ export function ServiceRestore() {
               htmlFor="mode-new"
               className={`flex items-start gap-3 rounded-md border p-3 cursor-pointer ${
                 mode === 'new_service' ? 'border-primary bg-accent/50' : ''
-              } ${capabilities?.restore_to_new_service === false ? 'opacity-50 cursor-not-allowed' : ''}`}
+              } ${newServiceDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}
             >
               <RadioGroupItem
                 value="new_service"
                 id="mode-new"
-                disabled={capabilities?.restore_to_new_service === false}
+                disabled={newServiceDisabled}
                 className="mt-0.5"
               />
               <div className="flex-1">
@@ -865,12 +1080,12 @@ export function ServiceRestore() {
               htmlFor="mode-pitr"
               className={`flex items-start gap-3 rounded-md border p-3 cursor-pointer ${
                 mode === 'pitr' ? 'border-primary bg-accent/50' : ''
-              } ${capabilities?.pitr === false || !selectedSupportsPitr ? 'opacity-50 cursor-not-allowed' : ''}`}
+              } ${pitrDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}
             >
               <RadioGroupItem
                 value="pitr"
                 id="mode-pitr"
-                disabled={capabilities?.pitr === false || !selectedSupportsPitr}
+                disabled={pitrDisabled}
                 className="mt-0.5"
               />
               <div className="flex-1">
@@ -1073,6 +1288,18 @@ export function ServiceRestore() {
       ) : null}
 
       {/* Action bar */}
+      {!gate.enabled && gate.reason ? (
+        gate.retry === 'active_runs' ? (
+          <InlineLoadError
+            title="Could not check for a running restore"
+            description={gate.reason}
+            retrying={activeRunsQuery.isFetching}
+            onRetry={() => void activeRunsQuery.refetch()}
+          />
+        ) : (
+          <p className="text-sm text-muted-foreground">{gate.reason}</p>
+        )
+      ) : null}
       <div className="flex justify-between items-center gap-3 pt-2">
         <Button
           variant="outline"
@@ -1145,29 +1372,131 @@ export function ServiceRestore() {
       </AlertDialog>
 
       {verificationDialog}
-    </div>
+    </PageContainer>
   )
 }
 
 // ----- Smaller pieces ------------------------------------------------------
 
-function PageHeader({
+function RestorePageHeader({
   service,
 }: {
-  service: { name: string; service_type: string }
+  service?: Pick<ExternalServiceInfo, 'name' | 'service_type'>
 }) {
   return (
-    <div className="space-y-1">
-      <div className="flex items-center gap-2">
-        <RotateCcw className="h-5 w-5 text-muted-foreground" />
-        <h1 className="text-2xl font-semibold">Restore service</h1>
+    <PageHeader
+      title="Restore service"
+      description={
+        service ? (
+          <>
+            Target: <strong>{service.name}</strong> ({service.service_type})
+          </>
+        ) : undefined
+      }
+    />
+  )
+}
+
+/** A read that failed: what failed, why, and a Retry that repeats it. */
+function InlineLoadError({
+  title,
+  description,
+  retrying,
+  onRetry,
+}: {
+  title: string
+  description: string
+  retrying: boolean
+  onRetry: () => void
+}) {
+  return (
+    <Alert variant="destructive">
+      <AlertCircle className="h-4 w-4" />
+      <AlertTitle>{title}</AlertTitle>
+      <AlertDescription className="space-y-3">
+        <p>{description}</p>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={onRetry}
+          disabled={retrying}
+        >
+          {retrying ? (
+            <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+          ) : (
+            <RefreshCw className="h-4 w-4 mr-2" />
+          )}
+          Retry
+        </Button>
+      </AlertDescription>
+    </Alert>
+  )
+}
+
+function ServiceLoadError({
+  kind,
+  retrying,
+  onRetry,
+  onBack,
+}: {
+  kind: QueryErrorKind
+  retrying: boolean
+  onRetry: () => void
+  onBack: () => void
+}) {
+  const copy = serviceLoadErrorCopy(kind)
+  return (
+    <div className="space-y-4">
+      <Alert variant="destructive">
+        <AlertCircle className="h-4 w-4" />
+        <AlertTitle>{copy.title}</AlertTitle>
+        <AlertDescription>{copy.description}</AlertDescription>
+      </Alert>
+      <div className="flex flex-wrap gap-2">
+        <Button onClick={onRetry} disabled={retrying}>
+          {retrying ? (
+            <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+          ) : (
+            <RefreshCw className="h-4 w-4 mr-2" />
+          )}
+          Retry
+        </Button>
+        <Button variant="outline" onClick={onBack}>
+          <ArrowLeft className="h-4 w-4 mr-2" />
+          Back to databases
+        </Button>
       </div>
-      <p className="text-sm text-muted-foreground">
-        Target: <strong>{service.name}</strong>{' '}
-        <Badge variant="outline" className="ml-1 text-xs">
-          {service.service_type}
-        </Badge>
-      </p>
+    </div>
+  )
+}
+
+/** Placeholder shaped like the restore steps while the database loads. */
+function RestorePageSkeleton() {
+  return (
+    <div className="space-y-6" aria-label="Loading restore options">
+      {[0, 1, 2].map((step) => (
+        <div key={step} className="space-y-3 rounded-lg border p-6">
+          <div className="flex items-center gap-2">
+            <Skeleton className="h-6 w-6 rounded-full" />
+            <Skeleton className="h-5 w-40" />
+          </div>
+          <Skeleton className="h-4 w-full max-w-lg" />
+          <Skeleton className="h-10 w-full max-w-md" />
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function BackupsSkeleton() {
+  return (
+    <div
+      className="space-y-2 rounded-md border p-3"
+      aria-label="Loading backups"
+    >
+      {[0, 1, 2, 3, 4].map((row) => (
+        <Skeleton key={row} className="h-8 w-full" />
+      ))}
     </div>
   )
 }
@@ -1201,90 +1530,6 @@ function FormatBadge({ format }: { format?: string | null }) {
     <Badge variant="secondary" className="text-xs">
       {format}
     </Badge>
-  )
-}
-
-function RunProgress({ run }: { run: RestoreRunView | undefined }) {
-  if (!run) {
-    return (
-      <Card>
-        <CardContent className="py-12 flex items-center justify-center text-sm text-muted-foreground">
-          <Loader2 className="h-4 w-4 animate-spin mr-2" />
-          Starting…
-        </CardContent>
-      </Card>
-    )
-  }
-  const currentIdx = PHASES.findIndex((p) => p.id === run.phase)
-  const isTerminal = run.status === 'completed' || run.status === 'failed'
-
-  return (
-    <Card>
-      <CardHeader>
-        <div className="flex items-center gap-2">
-          <Badge
-            variant={
-              run.status === 'completed'
-                ? 'default'
-                : run.status === 'failed'
-                  ? 'destructive'
-                  : 'secondary'
-            }
-          >
-            {run.status}
-          </Badge>
-          <span className="text-sm text-muted-foreground">
-            mode <code>{run.mode}</code> · run #{run.id}
-          </span>
-        </div>
-      </CardHeader>
-      <CardContent>
-        <ol className="space-y-3">
-          {PHASES.map((p, idx) => {
-            const state =
-              run.status === 'failed' && p.id === run.phase
-                ? 'failed'
-                : idx < currentIdx || (isTerminal && run.status === 'completed')
-                  ? 'done'
-                  : idx === currentIdx
-                    ? 'active'
-                    : 'pending'
-            return (
-              <li key={p.id} className="flex items-center gap-3 text-sm">
-                {state === 'done' ? (
-                  <CheckCircle2 className="h-5 w-5 text-green-600" />
-                ) : state === 'active' ? (
-                  <Loader2 className="h-5 w-5 animate-spin text-blue-600" />
-                ) : state === 'failed' ? (
-                  <XCircle className="h-5 w-5 text-red-600" />
-                ) : (
-                  <Clock className="h-5 w-5 text-muted-foreground" />
-                )}
-                <span
-                  className={
-                    state === 'pending'
-                      ? 'text-muted-foreground'
-                      : state === 'failed'
-                        ? 'text-red-600'
-                        : ''
-                  }
-                >
-                  {p.label}
-                </span>
-              </li>
-            )
-          })}
-        </ol>
-        {run.error_message ? (
-          <Alert variant="destructive" className="mt-4">
-            <AlertCircle className="h-4 w-4" />
-            <AlertDescription className="break-all">
-              {run.error_message}
-            </AlertDescription>
-          </Alert>
-        ) : null}
-      </CardContent>
-    </Card>
   )
 }
 
