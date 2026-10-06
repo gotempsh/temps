@@ -74,9 +74,7 @@ pub enum RestoreError {
         restore_run_id: i32,
     },
 
-    #[error(
-        "Restore run {restore_run_id} is already {status}, so there is nothing to cancel"
-    )]
+    #[error("Restore run {restore_run_id} is already {status}, so there is nothing to cancel")]
     RestoreNotActive { restore_run_id: i32, status: String },
 
     #[error(
@@ -1418,7 +1416,9 @@ async fn views_with_source_backups(
     Ok(runs
         .into_iter()
         .map(|run| {
-            let source_backup = backups.get(&run.source_backup_id).map(RestoreRunSourceBackup::from_backup);
+            let source_backup = backups
+                .get(&run.source_backup_id)
+                .map(RestoreRunSourceBackup::from_backup);
             let mut view = RestoreRunView::from(run);
             if let Some(source_backup) = source_backup {
                 view.source_backup = source_backup;
@@ -2316,10 +2316,61 @@ async fn insert_restore_run(
     destructive: bool,
 ) -> Result<temps_entities::restore_runs::Model, RestoreError> {
     let transaction = db.begin().await?;
+    let inserted = lock_and_insert_restore_run(
+        &transaction,
+        run_active,
+        resolved_backup_id,
+        target_service_id,
+        destructive,
+    )
+    .await;
+    let error = match inserted {
+        Ok(run) => {
+            transaction.commit().await?;
+            return Ok(run);
+        }
+        Err(error) => error,
+    };
+    // Roll back explicitly instead of on drop: a dropped transaction only
+    // queues its ROLLBACK, so the backup and service row locks taken above
+    // would stay held until the pool next touches that connection.
+    if let Err(rollback_error) = transaction.rollback().await {
+        warn!(
+            "Rolling back the refused restore run for service {} failed: {}",
+            target_service_id, rollback_error
+        );
+    }
+    match error {
+        RestoreError::Database(db_error) if is_active_restore_conflict(&db_error) => {
+            // The index fired, so another in-place run committed between
+            // our check and insert. If it already finished, surface the
+            // original error rather than naming a run that is gone.
+            Err(
+                match find_active_destructive_run(db, target_service_id).await? {
+                    Some(active) => RestoreError::RestoreAlreadyActive {
+                        service_id: target_service_id,
+                        restore_run_id: active.id,
+                    },
+                    None => RestoreError::Database(db_error),
+                },
+            )
+        }
+        other => Err(other),
+    }
+}
+
+/// The checks and insert of [`insert_restore_run`], inside its transaction.
+async fn lock_and_insert_restore_run(
+    transaction: &sea_orm::DatabaseTransaction,
+    run_active: temps_entities::restore_runs::ActiveModel,
+    resolved_backup_id: Option<i32>,
+    target_service_id: i32,
+    destructive: bool,
+) -> Result<temps_entities::restore_runs::Model, RestoreError> {
     if let Some(backup_id) = resolved_backup_id {
         let backup = temps_entities::backups::Entity::find_by_id(backup_id)
             .lock_exclusive()
-            .one(&transaction)
+            .one(transaction)
             .await?
             .ok_or(RestoreError::BackupNotFound { backup_id })?;
         if backup.state == "deleting" {
@@ -2332,39 +2383,19 @@ async fn insert_restore_run(
         // partial unique index (in_place only) does not cover.
         temps_entities::external_services::Entity::find_by_id(target_service_id)
             .lock_exclusive()
-            .one(&transaction)
+            .one(transaction)
             .await?
             .ok_or(RestoreError::ServiceNotFound {
                 service_id: target_service_id,
             })?;
-        if let Some(active) = find_active_destructive_run(&transaction, target_service_id).await? {
+        if let Some(active) = find_active_destructive_run(transaction, target_service_id).await? {
             return Err(RestoreError::RestoreAlreadyActive {
                 service_id: target_service_id,
                 restore_run_id: active.id,
             });
         }
     }
-    let run = match run_active.insert(&transaction).await {
-        Ok(run) => run,
-        Err(e) if is_active_restore_conflict(&e) => {
-            drop(transaction);
-            // The index fired, so another in-place run committed between
-            // our check and insert. If it already finished, surface the
-            // original error rather than naming a run that is gone.
-            return Err(
-                match find_active_destructive_run(db, target_service_id).await? {
-                    Some(active) => RestoreError::RestoreAlreadyActive {
-                        service_id: target_service_id,
-                        restore_run_id: active.id,
-                    },
-                    None => e.into(),
-                },
-            );
-        }
-        Err(e) => return Err(e.into()),
-    };
-    transaction.commit().await?;
-    Ok(run)
+    Ok(run_active.insert(transaction).await?)
 }
 
 /// Decide how to record a run whose worker task panicked.
@@ -2517,7 +2548,10 @@ async fn cancel_run_at_safe_point(
     let now = Utc::now();
     let outcome = Entity::update_many()
         .col_expr(Column::Status, Expr::value(CANCELLED_STATUS))
-        .col_expr(Column::ErrorMessage, Expr::value(Some(cancelled_message(&run))))
+        .col_expr(
+            Column::ErrorMessage,
+            Expr::value(Some(cancelled_message(&run))),
+        )
         .col_expr(Column::FinishedAt, Expr::value(now))
         .col_expr(Column::UpdatedAt, Expr::value(now))
         .filter(Column::Id.eq(run_id))
@@ -5321,7 +5355,10 @@ mod tests {
     #[test]
     fn cancelled_message_says_nothing_was_modified() {
         let in_place = cancelled_message(&run_in("running", "prepare"));
-        assert!(in_place.contains("before any data was written"), "{in_place}");
+        assert!(
+            in_place.contains("before any data was written"),
+            "{in_place}"
+        );
         assert!(in_place.contains("was not modified"), "{in_place}");
 
         let new_service = cancelled_message(&temps_entities::restore_runs::Model {
@@ -5350,7 +5387,10 @@ mod tests {
             status: "completed".to_string(),
         }
         .to_string();
-        assert!(message.contains("Restore run 42 is already completed"), "{message}");
+        assert!(
+            message.contains("Restore run 42 is already completed"),
+            "{message}"
+        );
     }
 
     #[tokio::test]
@@ -5362,7 +5402,12 @@ mod tests {
             .await
             .expect_err("missing run");
         assert!(
-            matches!(err, RestoreError::RestoreRunNotFound { restore_run_id: 404 }),
+            matches!(
+                err,
+                RestoreError::RestoreRunNotFound {
+                    restore_run_id: 404
+                }
+            ),
             "{err:?}"
         );
     }
@@ -5566,21 +5611,30 @@ mod tests {
             .await
             .expect("reload");
         assert_eq!(stored.status, CANCELLED_STATUS);
-        assert_eq!(stored.phase, CANCELLABLE_PHASE, "the worker did not advance it");
+        assert_eq!(
+            stored.phase, CANCELLABLE_PHASE,
+            "the worker did not advance it"
+        );
 
         // A cancelled run's outcome is never overwritten by a late worker.
         persist_terminal_state(db.as_ref(), first.id, &Ok(None), TERMINAL_WRITE_RETRY)
             .await
             .expect("conditional write is a no-op");
         assert_eq!(
-            load_run_for_update(db.as_ref(), first.id).await.unwrap().status,
+            load_run_for_update(db.as_ref(), first.id)
+                .await
+                .unwrap()
+                .status,
             CANCELLED_STATUS
         );
 
         let err = cancel_run_at_safe_point(db.as_ref(), first.id)
             .await
             .expect_err("cancelling twice is refused");
-        assert!(matches!(err, RestoreError::RestoreNotActive { .. }), "{err:?}");
+        assert!(
+            matches!(err, RestoreError::RestoreNotActive { .. }),
+            "{err:?}"
+        );
 
         // Once the worker is past the safe point, cancellation is refused and
         // the run keeps holding the service.
@@ -5598,12 +5652,18 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(
-            load_run_for_update(db.as_ref(), second.id).await.unwrap().status,
+            load_run_for_update(db.as_ref(), second.id)
+                .await
+                .unwrap()
+                .status,
             "running"
         );
         let err = insert(db.clone())
             .await
             .expect_err("the writing run still holds the service");
-        assert!(matches!(err, RestoreError::RestoreAlreadyActive { .. }), "{err:?}");
+        assert!(
+            matches!(err, RestoreError::RestoreAlreadyActive { .. }),
+            "{err:?}"
+        );
     }
 }
