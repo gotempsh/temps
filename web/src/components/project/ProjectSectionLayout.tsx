@@ -40,6 +40,7 @@ import {
   Radio,
   Bot,
   Plug,
+  Route,
   type LucideIcon,
 } from 'lucide-react'
 
@@ -57,6 +58,9 @@ const sectionIcons: Record<string, LucideIcon> = {
   'errors/alert-rules': Bell,
   analytics: BarChart3,
   'analytics/visitors': Users,
+  'analytics/live-visitors': Radio,
+  'analytics/live': Globe,
+  'analytics/journey': Route,
   'analytics/activity': Activity,
   'analytics/pages': FileText,
   'analytics/replays': Play,
@@ -86,6 +90,7 @@ import {
   resolveProjectPrimaryRoute,
   resolveProjectSectionLink,
 } from '@/lib/project-navigation'
+import { projectSectionLinkMatches } from '@/lib/project-section-search'
 import { cn } from '@/lib/utils'
 
 /** One flat contextual navigation beside the project page; never a nested menu. */
@@ -167,11 +172,7 @@ export function ProjectSectionLayout({
       )}
       <nav aria-label={`${title} pages`} className="space-y-0.5">
         {links
-          .filter((link) =>
-            `${link.title} ${link.url}`
-              .toLowerCase()
-              .includes(search.toLowerCase())
-          )
+          .filter((link) => projectSectionLinkMatches(link, search))
           .map((link) => (
             <Link
               key={link.href}
@@ -200,11 +201,7 @@ export function ProjectSectionLayout({
               </span>
             </Link>
           ))}
-        {!links.some((link) =>
-          `${link.title} ${link.url}`
-            .toLowerCase()
-            .includes(search.toLowerCase())
-        ) && (
+        {!links.some((link) => projectSectionLinkMatches(link, search)) && (
           <p className="px-2 py-3 text-xs text-muted-foreground">
             No matching pages.
           </p>

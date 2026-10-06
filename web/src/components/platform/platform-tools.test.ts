@@ -34,3 +34,9 @@ test('global observability is discoverable from platform tools', () => {
     expect(observe?.items.some((item) => item.url === path)).toBe(true)
   }
 })
+
+test('cross-project revenue is reachable from platform tools with its maturity badge', () => {
+  const observe = platformToolGroups.find((group) => group.label === 'Observe')
+  const revenue = observe?.items.find((item) => item.url === '/revenue')
+  expect(revenue?.featureKey).toBe('revenue-tracking')
+})

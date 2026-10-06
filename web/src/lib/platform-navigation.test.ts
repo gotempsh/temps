@@ -7,6 +7,7 @@ import { isPlatformToolsRoute } from './platform-navigation'
 describe('platform navigation route resolution', () => {
   test('groups secondary platform capabilities under all platform tools', () => {
     expect(isPlatformToolsRoute('/proxy-logs/31')).toBe(true)
+    expect(isPlatformToolsRoute('/revenue')).toBe(true)
     expect(isPlatformToolsRoute('/dns-providers/add')).toBe(true)
   })
 

@@ -20,6 +20,8 @@ export interface ProjectSectionLink {
   title: string
   url: string
   aliases?: string[]
+  /** Extra terms the section's page finder matches besides title and URL. */
+  keywords?: string[]
 }
 export const PROJECT_SECTION_LINKS: Partial<
   Record<ProjectSection, ProjectSectionLink[]>
@@ -53,6 +55,21 @@ export const PROJECT_SECTION_LINKS: Partial<
   analytics: [
     { title: 'Overview', url: 'analytics' },
     { title: 'Visitors', url: 'analytics/visitors' },
+    {
+      title: 'Live visitors',
+      url: 'analytics/live-visitors',
+      keywords: ['live', 'realtime', 'online', 'active', 'now'],
+    },
+    {
+      title: 'Live globe',
+      url: 'analytics/live',
+      keywords: ['live', 'globe', 'map', 'realtime', 'world'],
+    },
+    {
+      title: 'Journey',
+      url: 'analytics/journey',
+      keywords: ['journey', 'flow', 'paths', 'navigation', 'sankey'],
+    },
     { title: 'Activity report', url: 'analytics/activity' },
     { title: 'Pages', url: 'analytics/pages' },
     { title: 'Sessions', url: 'analytics/replays' },

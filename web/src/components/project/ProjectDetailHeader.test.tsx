@@ -9,7 +9,11 @@ import { getEnvironmentsQueryKey } from '@/api/client/@tanstack/react-query.gen'
 import type { DeploymentResponse, ProjectResponse } from '@/api/client'
 import { ProjectDetailHeader } from './ProjectDetailHeader'
 
-function renderHeader(status: string, currentId: number | null | undefined) {
+function renderHeader(
+  status: string,
+  currentId: number | null | undefined,
+  activeVisitors?: number
+) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
@@ -29,6 +33,11 @@ function renderHeader(status: string, currentId: number | null | undefined) {
             { id: 3513, status, is_current: false } as DeploymentResponse
           }
           onDeploy={() => {}}
+          activeVisitorsCount={
+            activeVisitors === undefined
+              ? undefined
+              : { active_visitors: activeVisitors }
+          }
         />
       </MemoryRouter>
     </QueryClientProvider>
@@ -72,3 +81,12 @@ test('a redeploy keeps the live version Deployed', () => {
   expect(html).toContain('>Deployed<')
   expect(html).not.toContain('Deploying')
 })
+for (const activeVisitors of [0, 3]) {
+  test(`the live visitors pill is clickable with ${activeVisitors} active visitors`, () => {
+    const html = renderHeader('completed', 3500, activeVisitors)
+    const pill = html.match(/<button[^>]*Open Live visitors[^>]*>/)?.[0]
+    expect(pill).toBeDefined()
+    expect(pill).not.toContain('disabled')
+    expect(pill).toContain('cursor-pointer')
+  })
+}

@@ -39,6 +39,7 @@ import GiteaIcon from '@/icons/Gitea'
 import GithubIcon from '@/icons/Github'
 import GitlabIcon from '@/icons/Gitlab'
 import { Link, useNavigate } from 'react-router'
+import { liveVisitorsPillLabel } from '@/components/analytics/analytics-onboarding'
 
 /**
  * Tones for the header health badge. Mirrors the projects-list card so the same
@@ -142,11 +143,14 @@ export function ProjectDetailHeader({
     ? gitProviderKind(repositoryProviderType, repositoryCloneUrl)
     : null
 
+  // Always navigable: at zero, Live visitors explains why it is empty and
+  // links to analytics setup when nothing has been installed yet.
   const handleVisitorsClick = () => {
-    if ((activeVisitorsCount?.active_visitors ?? 0) > 0) {
-      navigate(`/projects/${project.slug}/analytics/live-visitors`)
-    }
+    navigate(`/projects/${project.slug}/analytics/live-visitors`)
   }
+  const visitorsLabel = liveVisitorsPillLabel(
+    activeVisitorsCount?.active_visitors ?? 0
+  )
 
   return (
     <header className="flex h-12 sm:h-16 shrink-0 items-center gap-2 border-b px-3 sm:px-4">
@@ -219,18 +223,11 @@ export function ProjectDetailHeader({
         <div className="flex items-center gap-2">
           {activeVisitorsCount !== undefined && (
             <button
+              type="button"
               onClick={handleVisitorsClick}
-              disabled={(activeVisitorsCount?.active_visitors ?? 0) === 0}
-              className={`flex items-center gap-1.5 px-2.5 py-1.5 bg-muted/30 rounded-full transition-colors ${
-                (activeVisitorsCount?.active_visitors ?? 0) > 0
-                  ? 'cursor-pointer hover:bg-muted/50 active:bg-muted/70'
-                  : 'cursor-default'
-              }`}
-              title={
-                (activeVisitorsCount?.active_visitors ?? 0) > 0
-                  ? 'Click to view live visitors'
-                  : 'No active visitors'
-              }
+              className="flex cursor-pointer items-center gap-1.5 rounded-full bg-muted/30 px-2.5 py-1.5 transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring active:bg-muted/70"
+              title={visitorsLabel}
+              aria-label={visitorsLabel}
             >
               <div
                 className={`h-2 w-2 rounded-full ${activeVisitorsCount?.active_visitors > 0 ? 'bg-green-500 animate-pulse' : 'bg-gray-400'}`}

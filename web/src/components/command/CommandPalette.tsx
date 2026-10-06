@@ -805,6 +805,24 @@ export const projectNavItems: NavigationItem[] = [
     keywords: ['users', 'visitors', 'traffic', 'analytics'],
   },
   {
+    title: 'Live Visitors',
+    url: 'analytics/live-visitors',
+    icon: Users,
+    keywords: ['live', 'realtime', 'online', 'active', 'now', 'analytics'],
+  },
+  {
+    title: 'Live Globe',
+    url: 'analytics/live',
+    icon: Globe,
+    keywords: ['live', 'globe', 'map', 'realtime', 'world', 'analytics'],
+  },
+  {
+    title: 'Journey',
+    url: 'analytics/journey',
+    icon: Activity,
+    keywords: ['journey', 'flow', 'paths', 'navigation', 'analytics'],
+  },
+  {
     title: 'Pages',
     url: 'analytics/pages',
     icon: Activity,

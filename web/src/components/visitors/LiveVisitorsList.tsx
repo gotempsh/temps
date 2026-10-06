@@ -13,7 +13,7 @@ import {
 } from '@/components/ui/card'
 import { useQuery } from '@tanstack/react-query'
 import { Globe, Users as UserIcon, RefreshCw, ChevronRight } from 'lucide-react'
-import { useNavigate } from 'react-router'
+import { Link, useNavigate } from 'react-router'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useState } from 'react'
 
@@ -89,11 +89,28 @@ export function LiveVisitorsList({ project }: LiveVisitorsListProps) {
               </Button>
             </div>
           ) : !data || data.visitors.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-12">
+            <div className="flex flex-col items-center justify-center py-12 text-center">
               <UserIcon className="h-12 w-12 text-muted-foreground mb-4" />
-              <p className="text-muted-foreground">
-                No visitors currently active
+              <p className="text-sm font-medium">
+                No visitors in the last 5 minutes
               </p>
+              <p className="mt-1 max-w-md text-sm text-muted-foreground">
+                Visitors appear here within seconds of loading a page that sends
+                analytics events. If you just deployed, open your site in
+                another tab to check that events arrive.
+              </p>
+              <div className="mt-4 flex flex-wrap justify-center gap-2">
+                <Button asChild variant="outline" size="sm">
+                  <Link to={`/projects/${project.slug}/analytics/visitors`}>
+                    View recent visitors
+                  </Link>
+                </Button>
+                <Button asChild variant="ghost" size="sm">
+                  <Link to={`/projects/${project.slug}/analytics/setup`}>
+                    Check analytics setup
+                  </Link>
+                </Button>
+              </div>
             </div>
           ) : (
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
