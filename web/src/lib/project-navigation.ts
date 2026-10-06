@@ -175,3 +175,40 @@ export function resolveProjectSectionLink(
 export function isProjectToolsRoute(activeRoute: string): boolean {
   return activeRoute === 'tools'
 }
+
+/**
+ * Project-relative pages a monitoring-only (`source_type: 'external'`)
+ * project registers — see the external route table in `ProjectDetail`.
+ * Everything else is a hosting page (deployments, variables, delivery
+ * settings, ...) that such a project answers with "Add hosting", so the
+ * command palette does not offer it as a destination.
+ */
+const EXTERNAL_PROJECT_PAGES = [
+  'project',
+  'hosting',
+  'analytics',
+  'speed',
+  'revenue',
+  'errors',
+  'traces',
+  'ai-gateway',
+  'telemetry-logs',
+  'metrics',
+  'monitors',
+  'settings/general',
+  'settings/telemetry',
+] as const
+
+/** Whether a project-relative URL is a page an external project has. */
+export function isExternalProjectPage(url: string): boolean {
+  const route = url.split('?')[0]
+  return EXTERNAL_PROJECT_PAGES.some((page) => matches(route, page))
+}
+
+/** Whether `url` is a page `project` has, given its kind. */
+export function projectHasPage(
+  project: { source_type?: string | null },
+  url: string
+): boolean {
+  return project.source_type !== 'external' || isExternalProjectPage(url)
+}

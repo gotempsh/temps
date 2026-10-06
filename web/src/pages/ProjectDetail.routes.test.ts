@@ -8,8 +8,15 @@ import { matchRoutes, type RouteObject } from 'react-router'
 import ts from 'typescript'
 
 import { autopilotPaths } from '@/components/agents/AutopilotPage'
-import { projectNavItems } from '@/components/command/CommandPalette'
-import { PROJECT_SECTION_LINKS } from '@/lib/project-navigation'
+import {
+  projectNavItems,
+  projectNavItemsFor,
+} from '@/components/command/CommandPalette'
+import {
+  isExternalProjectPage,
+  PROJECT_SECTION_LINKS,
+} from '@/lib/project-navigation'
+import { LEGACY_PROJECT_ROUTES } from '@/lib/project-settings-sections'
 
 /**
  * The project route tables live inline in JSX, so read them from the source
@@ -197,6 +204,63 @@ function resolveUrl(routes: ParsedRoute[], url: string): string {
   return 'ok'
 }
 
+/** Elements that only forward to another URL. */
+const REDIRECT_ELEMENTS = new Set([
+  'Navigate',
+  'LegacyProjectRouteRedirect',
+  'RenamedProjectRouteRedirect',
+])
+
+/**
+ * The innermost route a URL lands on, following splat routes into the nested
+ * route tables this suite knows about, with the full pattern that matched.
+ */
+function resolveLeaf(
+  routes: ParsedRoute[],
+  url: string
+): { route: ParsedRoute; pattern: string } | undefined {
+  const pathname = url.split('?')[0]
+  const matches = matchRoutes(routes, `/${pathname}`)
+  if (!matches) return undefined
+  const leaf = matches[matches.length - 1]
+  const route = leaf.route as ParsedRoute
+  const pattern = matches
+    .map((match) => (match.route as ParsedRoute).path)
+    .filter(Boolean)
+    .join('/')
+  const nestedFile = route.elementName && NESTED_ROUTE_TABLES[route.elementName]
+  if (nestedFile && route.path?.endsWith('/*')) {
+    const nested = resolveLeaf(
+      readRouteTables(nestedFile).hosted[0],
+      leaf.params['*'] ?? ''
+    )
+    return (
+      nested && {
+        route: nested.route,
+        pattern: `${pattern.replace(/\/\*$/, '')}/${nested.pattern}`,
+      }
+    )
+  }
+  return { route, pattern }
+}
+
+/** Paths registered more than once at the same level of a route table. */
+function duplicatePaths(routes: ParsedRoute[], prefix = ''): string[] {
+  const seen = new Set<string>()
+  const duplicates: string[] = []
+  for (const route of routes) {
+    if (route.children)
+      duplicates.push(
+        ...duplicatePaths(route.children as ParsedRoute[], `${route.path}/`)
+      )
+    if (!route.path) continue
+    const path = `${prefix}${route.path}`
+    if (seen.has(path)) duplicates.push(path)
+    seen.add(path)
+  }
+  return duplicates
+}
+
 /** The section-nav links ProjectSectionLayout renders for an external project. */
 function externalSectionUrls(): string[] {
   const hidden = ['analytics/api-traffic', 'ai-crawlers']
@@ -272,10 +336,81 @@ describe('command palette project pages', () => {
     ).toEqual([])
   })
 
+  test('every hosted entry opens the canonical page, not a redirect', () => {
+    expect(
+      projectNavItems
+        .map((item) => ({
+          url: item.url,
+          element: resolveLeaf(PROJECT_ROUTES.hosted, item.url)?.route
+            .elementName,
+        }))
+        .filter(({ element }) => element && REDIRECT_ELEMENTS.has(element))
+    ).toEqual([])
+  })
+
+  test('an external project is offered only the pages it registers', () => {
+    const external = projectNavItemsFor({ source_type: 'external' })
+    expect(external.length).toBeGreaterThan(5)
+    expect(external.map((item) => item.url)).not.toContain('deployments')
+    expect(external.map((item) => item.url)).not.toContain(
+      'environment-variables'
+    )
+    for (const item of external) {
+      expect(resolveUrl(PROJECT_ROUTES.external, item.url)).toBe('ok')
+      // `settings/*` renders General settings for anything under it, so a
+      // settings entry must land on its own route, not on that fallback.
+      if (item.url.startsWith('settings/'))
+        expect(resolveLeaf(PROJECT_ROUTES.external, item.url)?.route.path).toBe(
+          item.url.split('?')[0]
+        )
+    }
+  })
+
+  test('hosting pages are not offered for an external project', () => {
+    for (const item of projectNavItems) {
+      if (isExternalProjectPage(item.url)) continue
+      const leaf = resolveLeaf(PROJECT_ROUTES.external, item.url)
+      // What such a URL would show: "Add hosting", or the general settings
+      // page standing in for a hosting-only settings page.
+      expect([`*`, 'settings/*']).toContain(leaf?.route.path ?? '*')
+    }
+    expect(projectNavItemsFor({ source_type: 'git' })).toEqual(projectNavItems)
+  })
+
   test('Build & Deploy opens the combined delivery settings', () => {
     expect(
       projectNavItems.find((item) => item.title === 'Build & Deploy')?.url
     ).toBe('settings/delivery')
+  })
+})
+
+describe('legacy routes', () => {
+  test('each redirects to a page that renders', () => {
+    for (const [legacy, target] of Object.entries(LEGACY_PROJECT_ROUTES)) {
+      const element = resolveLeaf(PROJECT_ROUTES.hosted, legacy)?.route
+        .elementName
+      expect({ legacy, element }).toEqual({
+        legacy,
+        element: 'LegacyProjectRouteRedirect',
+      })
+      const landing = resolveLeaf(PROJECT_ROUTES.hosted, target)
+      expect({ target, ok: resolveUrl(PROJECT_ROUTES.hosted, target) }).toEqual(
+        { target, ok: 'ok' }
+      )
+      expect(REDIRECT_ELEMENTS.has(landing?.route.elementName ?? '')).toBe(
+        false
+      )
+    }
+  })
+
+  test('no path is both redirected and rendered', () => {
+    expect(duplicatePaths(PROJECT_ROUTES.hosted)).toEqual([])
+    expect(duplicatePaths(PROJECT_ROUTES.external)).toEqual([])
+    expect(
+      duplicatePaths(
+        readRouteTables('components/project/ProjectSettings.tsx').hosted[0]
+      )
+    ).toEqual([])
   })
 })
 

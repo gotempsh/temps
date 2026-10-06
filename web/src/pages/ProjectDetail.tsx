@@ -497,11 +497,21 @@ export function ProjectDetail() {
               />
               <Route
                 path="errors/alert-rules/new"
-                element={<AlertRuleForm projectId={project.id} />}
+                element={
+                  <AlertRuleForm
+                    projectId={project.id}
+                    projectName={project.name}
+                  />
+                }
               />
               <Route
                 path="errors/alert-rules/:ruleId/edit"
-                element={<AlertRuleForm projectId={project.id} />}
+                element={
+                  <AlertRuleForm
+                    projectId={project.id}
+                    projectName={project.name}
+                  />
+                }
               />
               <Route
                 path="errors/:errorGroupId"
@@ -538,12 +548,18 @@ export function ProjectDetail() {
                 path="settings/telemetry"
                 element={<TelemetrySettings project={project} />}
               />
-              <Route
-                path="settings/*"
-                element={
-                  <GeneralSettings project={project} refetch={refetch} />
-                }
-              />
+              {/* General settings has its own route so links to it never
+                  depend on the fallback below, which stands in for the
+                  hosting-only settings pages a monitoring project lacks. */}
+              {['settings/general', 'settings/*'].map((path) => (
+                <Route
+                  key={path}
+                  path={path}
+                  element={
+                    <GeneralSettings project={project} refetch={refetch} />
+                  }
+                />
+              ))}
               <Route
                 path="*"
                 element={<AddProjectHosting project={project} />}

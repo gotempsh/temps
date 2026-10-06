@@ -22,6 +22,7 @@ import { usePluginsContext } from '@/contexts/PluginsContext'
 import { useCanViewAuditLogs } from '@/hooks/useAuditAccess'
 import { useFrecency } from '@/hooks/useFrecency'
 import { normalizeFrecency } from '@/lib/frecency'
+import { projectHasPage } from '@/lib/project-navigation'
 import { settingsSectionPath } from '@/lib/project-settings-sections'
 import {
   buildCommandSampleQueries,
@@ -1126,6 +1127,17 @@ export const projectNavItems: NavigationItem[] = [
   },
 ]
 
+/**
+ * The project pages `project` actually has: a monitoring-only (external)
+ * project registers no hosting pages, so offering them would land on
+ * "Add hosting" or, for settings, on the wrong page.
+ */
+export function projectNavItemsFor(project: {
+  source_type?: string | null
+}): NavigationItem[] {
+  return projectNavItems.filter((item) => projectHasPage(project, item.url))
+}
+
 export function CommandPalette() {
   const [open, setOpen] = useState(false)
   const [search, setSearch] = useState('')
@@ -1368,7 +1380,7 @@ export function CommandPalette() {
     // Add project-specific navigation if we're on a project page
     if (currentProjectSlug && currentProject) {
       const projectSpecificItems = [
-        ...projectNavItems,
+        ...projectNavItemsFor(currentProject),
         ...projectPluginNavItems,
       ].map((item) => ({
         ...item,
@@ -1434,17 +1446,19 @@ export function CommandPalette() {
       CROSS_PROJECT_PAGE_URLS.has(item.url)
     )
     return projects.flatMap((project) =>
-      pages.map((page) => ({
-        title: page.title,
-        projectName: project.name,
-        url: `/projects/${project.slug}/${page.url}`,
-        icon: page.icon,
-        // One field so a two-word query ("demo deploy") can match the project
-        // and the page at once.
-        searchText: `${project.name} ${project.slug} ${page.title} ${(
-          page.keywords ?? []
-        ).join(' ')}`,
-      }))
+      pages
+        .filter((page) => projectHasPage(project, page.url))
+        .map((page) => ({
+          title: page.title,
+          projectName: project.name,
+          url: `/projects/${project.slug}/${page.url}`,
+          icon: page.icon,
+          // One field so a two-word query ("demo deploy") can match the project
+          // and the page at once.
+          searchText: `${project.name} ${project.slug} ${page.title} ${(
+            page.keywords ?? []
+          ).join(' ')}`,
+        }))
     )
   }, [projects])
 
@@ -1481,10 +1495,12 @@ export function CommandPalette() {
   const browseResults = useMemo(() => {
     const projectNavigation =
       currentProjectSlug && currentProject
-        ? [...projectNavItems, ...projectPluginNavItems].map((item) => ({
-            ...item,
-            url: `/projects/${currentProjectSlug}/${item.url}`,
-          }))
+        ? [...projectNavItemsFor(currentProject), ...projectPluginNavItems].map(
+            (item) => ({
+              ...item,
+              url: `/projects/${currentProjectSlug}/${item.url}`,
+            })
+          )
         : []
 
     return {
@@ -1555,7 +1571,7 @@ export function CommandPalette() {
         project.id === currentProject?.id
           ? `Current project · ${project.slug}`
           : `Project · ${project.slug}`
-      const pages = projectNavItems.map((item) => {
+      const pages = projectNavItemsFor(project).map((item) => {
         const url = `/projects/${project.slug}/${item.url}`
         return destination(
           `project:${project.slug}:${item.url}`,
@@ -1884,10 +1900,12 @@ export function CommandPalette() {
     ]
     const projectNavigation =
       currentProjectSlug && currentProject
-        ? [...projectNavItems, ...projectPluginNavItems].map((item) => ({
-            ...item,
-            url: `/projects/${currentProjectSlug}/${item.url}`,
-          }))
+        ? [...projectNavItemsFor(currentProject), ...projectPluginNavItems].map(
+            (item) => ({
+              ...item,
+              url: `/projects/${currentProjectSlug}/${item.url}`,
+            })
+          )
         : []
     const navByUrl = buildAccessibleNavigationMap(
       [...allNavItems, ...projectNavigation],
