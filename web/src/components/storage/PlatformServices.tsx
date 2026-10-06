@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useState } from 'react'
+import { useAuth } from '@/contexts/AuthContext'
+import { ReadFailure } from '@/components/ui/read-failure'
 import {
   kvStatusOptions,
   kvEnableMutation,
@@ -58,6 +60,7 @@ interface EditDockerImageDialogProps {
   onDockerImageChange: (image: string) => void
   onSave: (newImage: string) => void
   isPending: boolean
+  available: boolean
 }
 
 function EditDockerImageDialog({
@@ -68,9 +71,10 @@ function EditDockerImageDialog({
   onDockerImageChange,
   onSave,
   isPending,
+  available,
 }: EditDockerImageDialogProps) {
   const handleSave = () => {
-    if (dockerImage.trim()) {
+    if (available && dockerImage.trim()) {
       onSave(dockerImage.trim())
     }
   }
@@ -105,6 +109,12 @@ function EditDockerImageDialog({
             </p>
           </div>
         </div>
+        {!available && (
+          <p role="status" className="text-sm text-muted-foreground">
+            Configuration changes require administrator access and a successful
+            status check. Close this dialog and retry the status read.
+          </p>
+        )}
         <DialogFooter>
           <Button
             variant="outline"
@@ -115,7 +125,7 @@ function EditDockerImageDialog({
           </Button>
           <Button
             onClick={handleSave}
-            disabled={isPending || !dockerImage.trim()}
+            disabled={isPending || !available || !dockerImage.trim()}
           >
             {isPending ? (
               <>
@@ -134,20 +144,24 @@ function EditDockerImageDialog({
 
 export function PlatformServices() {
   const queryClient = useQueryClient()
+  const { user } = useAuth()
+  const canManage = user?.role === 'admin' || user?.role === 'platform_admin'
   const [editDialogOpen, setEditDialogOpen] = useState(false)
   const [editingService, setEditingService] = useState<ServiceType | null>(null)
   const [editDockerImage, setEditDockerImage] = useState('')
 
   // Fetch KV status
-  const { data: kvStatus, isLoading: kvLoading } = useQuery({
+  const kvQuery = useQuery({
     ...kvStatusOptions(),
     refetchInterval: 10000,
+    retry: false,
   })
 
   // Fetch Blob status
-  const { data: blobStatus, isLoading: blobLoading } = useQuery({
+  const blobQuery = useQuery({
     ...blobStatusOptions(),
     refetchInterval: 10000,
+    retry: false,
   })
 
   // KV mutations
@@ -222,7 +236,8 @@ export function PlatformServices() {
     },
   })
 
-  const isLoading = kvLoading || blobLoading
+  const kvStatus = kvQuery.data
+  const blobStatus = blobQuery.data
 
   const handleEditKv = () => {
     setEditDockerImage(kvStatus?.docker_image || 'redis:8-alpine')
@@ -237,22 +252,12 @@ export function PlatformServices() {
   }
 
   const handleSaveDockerImage = (newImage: string) => {
-    if (editingService === 'kv') {
+    if (!canManage) return
+    if (editingService === 'kv' && kvQuery.isSuccess) {
       kvUpdateMut.mutate({ body: { docker_image: newImage } })
-    } else if (editingService === 'blob') {
+    } else if (editingService === 'blob' && blobQuery.isSuccess) {
       blobUpdateMut.mutate({ body: { docker_image: newImage } })
     }
-  }
-
-  if (isLoading) {
-    return (
-      <div className="space-y-6">
-        <div className="grid gap-6 md:grid-cols-2">
-          <ServiceCardSkeleton />
-          <ServiceCardSkeleton />
-        </div>
-      </div>
-    )
   }
 
   const currentServiceName =
@@ -276,7 +281,13 @@ export function PlatformServices() {
           name="KV Store"
           description="Redis-backed key-value storage for caching, sessions, and real-time data"
           icon={Database}
-          enabled={kvStatus?.enabled ?? false}
+          loading={kvQuery.isPending}
+          error={kvQuery.isError ? kvQuery.error : undefined}
+          lastChecked={kvQuery.dataUpdatedAt}
+          onRetry={() => kvQuery.refetch()}
+          retrying={kvQuery.isFetching}
+          canManage={canManage && kvQuery.isSuccess}
+          enabled={kvStatus?.enabled}
           healthy={kvStatus?.healthy ?? false}
           version={kvStatus?.version}
           dockerImage={kvStatus?.docker_image}
@@ -298,7 +309,13 @@ export function PlatformServices() {
           name="Blob Storage"
           description="S3-compatible object storage for files, images, and large data"
           icon={HardDrive}
-          enabled={blobStatus?.enabled ?? false}
+          loading={blobQuery.isPending}
+          error={blobQuery.isError ? blobQuery.error : undefined}
+          lastChecked={blobQuery.dataUpdatedAt}
+          onRetry={() => blobQuery.refetch()}
+          retrying={blobQuery.isFetching}
+          canManage={canManage && blobQuery.isSuccess}
+          enabled={blobStatus?.enabled}
           healthy={blobStatus?.healthy ?? false}
           version={blobStatus?.version}
           dockerImage={blobStatus?.docker_image}
@@ -328,6 +345,10 @@ export function PlatformServices() {
         onDockerImageChange={setEditDockerImage}
         onSave={handleSaveDockerImage}
         isPending={kvUpdateMut.isPending || blobUpdateMut.isPending}
+        available={
+          canManage &&
+          (editingService === 'kv' ? kvQuery.isSuccess : blobQuery.isSuccess)
+        }
       />
     </div>
   )
@@ -337,7 +358,13 @@ interface ServiceCardProps {
   name: string
   description: string
   icon: React.ComponentType<{ className?: string }>
-  enabled: boolean
+  loading: boolean
+  error?: unknown
+  lastChecked: number
+  onRetry: () => void
+  retrying: boolean
+  canManage: boolean
+  enabled?: boolean
   healthy: boolean
   version?: string | null
   dockerImage?: string | null
@@ -353,6 +380,12 @@ function ServiceCard({
   name,
   description,
   icon: Icon,
+  loading,
+  error,
+  lastChecked,
+  onRetry,
+  retrying,
+  canManage,
   enabled,
   healthy,
   version,
@@ -364,10 +397,12 @@ function ServiceCard({
   isEnabling,
   isDisabling,
 }: ServiceCardProps) {
-  const isPending = isEnabling || isDisabling
+  const isPending = isEnabling || isDisabling || !canManage
+  const unknown = !!error || enabled === undefined
+  if (loading) return <ServiceCardSkeleton />
 
   return (
-    <Card className="flex flex-col">
+    <Card className="flex flex-col shadow-none">
       <CardHeader>
         <div className="flex items-start justify-between">
           <div className="flex items-center gap-3">
@@ -378,11 +413,23 @@ function ServiceCard({
               <CardTitle className="text-lg">{name}</CardTitle>
               <Badge
                 variant={
-                  enabled ? (healthy ? 'default' : 'destructive') : 'secondary'
+                  unknown
+                    ? 'secondary'
+                    : enabled
+                      ? healthy
+                        ? 'default'
+                        : 'destructive'
+                      : 'secondary'
                 }
                 className="mt-1"
               >
-                {enabled ? (
+                {unknown ? (
+                  lastChecked ? (
+                    'Status unavailable · stale'
+                  ) : (
+                    'Status unknown'
+                  )
+                ) : enabled ? (
                   healthy ? (
                     <>
                       <CheckCircle2 className="h-3 w-3 mr-1" />
@@ -408,6 +455,7 @@ function ServiceCard({
               variant="ghost"
               size="icon"
               onClick={onEdit}
+              disabled={isPending}
               title="Edit configuration"
             >
               <Settings className="h-4 w-4" />
@@ -418,6 +466,33 @@ function ServiceCard({
       </CardHeader>
 
       <CardContent className="flex-1 space-y-4">
+        {error != null && (
+          <ReadFailure
+            embedded
+            resource={`${name} status`}
+            error={error}
+            cached={lastChecked > 0}
+            onRetry={onRetry}
+            retrying={retrying}
+          />
+        )}
+        <p className="text-xs text-muted-foreground">
+          Last checked:{' '}
+          {lastChecked
+            ? new Date(lastChecked).toLocaleString()
+            : 'Never successfully checked'}
+        </p>
+        {unknown && lastChecked > 0 && (
+          <p className="text-sm text-muted-foreground">
+            Last known state:{' '}
+            {enabled ? (healthy ? 'Healthy' : 'Unhealthy') : 'Disabled'}
+          </p>
+        )}
+        {!canManage && !unknown && (
+          <p className="text-sm text-muted-foreground">
+            Administrator permission is required to change platform services.
+          </p>
+        )}
         {enabled && (
           <div className="grid gap-2 sm:grid-cols-2">
             <div className="p-3 rounded-lg border bg-muted/30">
@@ -449,7 +524,7 @@ function ServiceCard({
       </CardContent>
 
       <div className="p-6 pt-0">
-        {enabled ? (
+        {enabled === undefined ? null : enabled ? (
           <Button
             variant="destructive"
             className="w-full gap-2"
