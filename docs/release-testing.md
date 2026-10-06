@@ -655,6 +655,131 @@ test the supported WireGuard setup: an operator-run tunnel plus direct mode.
 
 ---
 
+### 10.6 Restore source identity and authorization (#1210)
+
+- **Setup**: Two disposable projects with separately owned managed services;
+  a backup from service A and an in-place restore target B. Use credentials
+  entitled to both services, then repeat with credentials entitled only to B.
+- **Steps**: Restore A's backup onto B without `confirm_cross_service`, then
+  explicitly confirm and retry. Repeat with a backup location whose source
+  identity cannot be established. Exercise both in-place and PITR modes.
+- **Pass**:
+  - An authorized caller must explicitly confirm a destructive restore from a
+    different or unknown source; rejection starts no restore or target mutation.
+  - A caller lacking source access is denied even with confirmation and is not
+    shown source identity or prompted for MFA before authorization succeeds.
+  - Own-source restores work without cross-service confirmation; destructive
+    modes still require enrolled MFA step-up when applicable.
+  - Audit records identify the authorized source, target, and confirmation.
+- **Existing regression coverage**: `crates/temps-backup/src/services/restore.rs`
+  tests `RestoreOriginBinding`; handler authorization and confirmation precede
+  step-up in `crates/temps-backup/src/handlers/restore_handler.rs`.
+
+### 10.7 Error-group mutations and agent credentials (#1210)
+
+- **Steps**: Update an error group's status with project-authorized credentials,
+  repeat with a different project's group ID, and run an agent workflow.
+- **Pass**:
+  - A successful status change emits `ERROR_GROUP_UPDATED` with actor,
+    project/group IDs, and new status. A refused update emits no success event.
+  - Agent workflows receive no API token while they require no API permissions.
+    If a workflow needs a token in future, it must receive only purpose-built
+    permissions, project scope, bounded expiry, and completion/cancellation
+    revocation; it must never receive `FullAccess` by default.
+- **Existing regression coverage**: `crates/temps-error-tracking/src/handlers/handler.rs`
+  tests audit emission; `crates/temps-agents/src/services/executor.rs` tests
+  minimal run permissions, absent issuance, and token cleanup.
+
+### 10.8 Metrics injection and alert capacity (#1210)
+
+- **Steps**: In a disposable TimescaleDB schema, round-trip metric engine,
+  environment, label keys, and label values containing quotes and backslashes.
+  Submit an invalid metric name. Fill a managed service's alert capacity, then
+  attempt concurrent creates and enable built-in alerts with insufficient room.
+- **Pass**:
+  - Accepted strings round-trip as data, invalid names are rejected/dropped,
+    and no supplied value changes query structure or executes SQL.
+  - At most 100 alert rules exist per managed service, including built-ins;
+    concurrent requests cannot bypass the cap. Capacity rejection leaves no
+    partial built-in rule set and does not retain the creation lock.
+  - Another service retains its independent capacity. This implementation is
+    **per service**, not an aggregate per-project cap; a project-wide policy
+    would need separately defined semantics for shared managed services.
+- **Existing regression coverage**: `crates/temps-metrics/src/store/timescale.rs`
+  has SQL binding and real-DB hostile-value tests;
+  `crates/temps-providers/src/handlers/metrics_handlers.rs` covers concurrent
+  creation, built-in capacity and rollback;
+  `crates/temps-monitoring/src/evaluator.rs` tests the built-in rule catalog.
+
+### 10.9 Dependency exception review and HA boundary (#1210)
+
+- **Steps**: Run `cargo audit` against the release lockfile with a freshly
+  fetched advisory database. Compare every result with the explicit exceptions
+  in `.github/workflows/dependency-scan.yml` and the assessments in `Cargo.toml`.
+  Check the resolved production feature graph with
+  `cargo tree --locked --target all -e normal -i rkyv` and
+  `cargo tree --locked --target all -e normal -i lru@0.16.4`.
+- **Pass**:
+  - No new finding is silently ignored. Each retained exception has a reviewed
+    dependency path, reachability assessment, and removal/re-review trigger.
+    A passing scan with exceptions is not an independent security assessment.
+  - rkyv must remain absent from the production feature graph for its current
+    non-reachability rationale to hold. Re-review AWS SDK cache keys/operations
+    and RSA private-key use when dependencies or consumers change.
+- **Review snapshot (2026-10-06, main `e70c36a78`)**: cargo-audit 0.22.2 with
+  advisory-db `ef6173cbc5c50ec8166f9a5b28f07834144373ee` reported RSA in both
+  locked versions, rkyv, lru unsoundness, and four unmaintained crates. All are
+  already listed exceptions; the scan also warned that locked chacha20 0.10.0
+  and spin 0.9.8/0.10.0 are yanked. rkyv had no normal-dependency consumers. The
+  locked AWS SDK's only lru cache uses `CacheKey(String)` without custom Drop
+  and `get_or_insert_mut`, so the advisory's panicking-key prerequisite was
+  absent in that reviewed consumer. RSA risk acceptance remains a maintainer
+  gate; no independent timing assessment is available.
+- **HA/multi-node boundary**: New HA infrastructure roles use SCRAM, and legacy
+  roles have a phased credential/HBA upgrade in
+  `crates/temps-providers/src/externalsvc/postgres_cluster.rs`, with permanent
+  SCRAM guards before regenerated peer rules. This does not close every
+  ADR-020 finding. HA TLS identity, role privileges, network scoping and
+  fencing require their own qualification before multi-node GA, as specified
+  in `docs/adr/020-multi-node-deployment-hardening.md`. Do not count source
+  inspection as a live cluster authentication or failover test.
+
+### 10.10 External penetration test (#1216)
+
+**Pending external evidence.** No assessor engagement, budget approval, test
+report, or independent retest is recorded by this checklist. If budgeted,
+arrange the engagement during hardening and leave time to fix findings before
+RC; automated regression tests do not fulfill this external assessment.
+
+- **Before testing**: Record the authorized assessor, exact candidate commit
+  and artifact digests, dates, staging hosts, permitted techniques, request
+  rate ceilings, data handling, and emergency stop contact in a private
+  engagement record. Use disposable tenants and synthetic data. Agree scope
+  and permission before probing any external or production system.
+- **Auth scope**: Password/magic-link/OIDC login, reset and MFA flows, session
+  expiry/revocation, CSRF, rate limiting, scoped API keys and deployment/run
+  credentials, and privilege escalation between unrelated projects.
+- **Proxy scope**: Host and forwarded-header spoofing, domain/route ownership,
+  private admin-listener exposure, websocket and preview access, path
+  normalization, upstream targeting/SSRF, and certificate handling.
+- **API scope**: Object-level authorization on reads and writes, backups and
+  restores across projects, secret masking/one-time issuance, upload/archive
+  traversal, query/metrics injection, resource limits, and audit coverage.
+  Inventory intentionally public ingest/webhook routes separately from
+  management routes; anonymous acceptance alone is not a finding on a route
+  deliberately designed for public ingestion.
+- **Completion evidence**: A private report tied to the tested candidate with
+  scope, methods, reproducible findings, severity, and coverage limitations;
+  fix commits and regression results for each finding; independent retest of
+  fixes against the RC. Publish only a sanitized summary without credentials,
+  customer identities, or unresolved exploit details.
+- **Release decision**: Record unresolved findings and explicit maintainer
+  disposition. Until an engagement and retest exist, report this issue as
+  pending (or explicitly unbudgeted), never as passed. ADR-020 multi-node GA
+  remains a separate gate.
+
+---
+
 ## 11. Performance regression gates
 
 ### 11.1 Cold-start latency

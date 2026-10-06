@@ -476,11 +476,14 @@ debug = false
 #      release has moved past lru 0.16 yet. A [patch.crates-io] override to
 #      0.18.2 would violate aws-sdk-s3's own semver requirement and risks
 #      breaking whatever internal caching it does with the crate.
-#    - Reachability: the bug requires a panicking `Drop` impl on a cache key
-#      type, unwound through `catch_unwind`, during `LruCache::pop()`. Not
-#      yet audited which key type aws-sdk-s3/aws-smithy-runtime uses for this
-#      cache or whether panicking-Drop keys are reachable from request
-#      handling -- re-verify this before renewing the exception long-term.
+#    - Reachability review (2026-10-06, locked aws-sdk-s3 1.138.1): the only
+#      LruCache in that crate is S3ExpressIdentityCache in src/s3_express.rs.
+#      Its private key is CacheKey(String), with no custom Drop implementation;
+#      get_or_load uses get_or_insert_mut, not pop. The advisory requires a
+#      panicking key destructor during pop plus reuse after catching the panic.
+#      Those prerequisites are absent in this reviewed consumer. This does not
+#      fix the dependency or establish safety for other consumers/features;
+#      re-review the key type and operations on every aws-sdk-s3 upgrade.
 #
 # Previously resolved:
 # - atty 0.2.14: RESOLVED in Pingora 0.7.0 (upgraded to clap 4.5)
@@ -544,12 +547,12 @@ debug = false
 #      paths above are RSA *signing* only (OIDC verification is a separate,
 #      unaffected public-key op). Signing uses a non-constant-time modexp, which is
 #      a real but much narrower timing side-channel than Marvin's decryption
-#      oracle: exploiting it needs millions of samples at nanosecond precision, the
-#      signing op itself (~10-50us) is buried inside git/DNS operations dominated
-#      by 100-500ms of network I/O, and the signed payload (app_id/iat/exp or
-#      service-account claims) isn't attacker-controlled. Blast radius if ever
-#      exploited is per-customer only: each org supplies its own GitHub App or GCP
-#      service-account private key, not a shared temps platform secret.
+#      oracle. Network latency is not a security boundary and does not prove
+#      signing timing unobservable. No exploitability measurement or independent
+#      review is recorded here; this remains a dependency exception requiring
+#      maintainer risk review, not a security assurance. russh also pulls
+#      rsa 0.10.0-rc.18 for SSH enrollment signatures/verification; the advisory
+#      still lists no patched release for either locked version.
 #    - Follow-up: monitor upstream `rsa` for a constant-time release; evaluate
 #      ring/aws-lc-rs-backed signing as a replacement for both paths.
 #

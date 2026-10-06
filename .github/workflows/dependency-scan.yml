@@ -102,7 +102,7 @@ jobs:
       # - RUSTSEC-2024-0388 (derivative): transitive via pingora-core ->
       #   derivative. Proc-macro only; the pinned Pingora dependency includes it.
       #
-      # The three below are real vulnerabilities (not just "unmaintained"
+      # The three below are vulnerability/unsoundness advisories (not "unmaintained"
       # notices), blocked on upstream fixes with no non-forking workaround.
       # Full reachability analysis for each lives in the root Cargo.toml
       # under "Dependency Overrides - Security Fixes" -- re-verify that
@@ -114,10 +114,9 @@ jobs:
       #   decryption path exists in SSH2): Marvin Attack is a chosen-ciphertext
       #   *decryption* oracle attack; temps has zero RSA decryption, only
       #   RSA signing (GitHub App JWTs, GCP DNS service-account JWTs). The
-      #   signing timing side-channel isn't remotely exploitable here
-      #   (signing latency is buried in 100-500ms of network I/O, and the
-      #   signed payload isn't attacker-controlled). Keys are per-customer,
-      #   not a shared temps secret. No fixed `rsa` release exists upstream
+      #   signing timing side-channel has not been independently assessed;
+      #   network latency alone does not prove it unobservable. This exception
+      #   requires maintainer risk review. No fixed `rsa` release exists upstream
       #   yet -- tracked for a ring/aws-lc-rs-backed signing migration.
       # - RUSTSEC-2026-0235 (rkyv 0.7.46 via rust_decimal <- sea-orm):
       #   out-of-bounds read when validating archives containing Rc/Arc.
@@ -137,6 +136,10 @@ jobs:
       #   2026-08-24 against aws-sdk-s3 1.143.0 (crates.io latest as of that
       #   date) that the requirement is unchanged -- upgrading aws-sdk-s3
       #   does not pull the fixed lru 0.18.2.
+      #   Reviewed 2026-10-06 in locked aws-sdk-s3 1.138.1: its sole LruCache
+      #   consumer uses CacheKey(String), without a custom Drop, and calls
+      #   get_or_insert_mut rather than pop. The advisory's panicking-key-Drop
+      #   prerequisite is absent there. Re-review when the SDK changes.
       # Remove an entry once its upstream is fixed/replaced.
       # Install a checksum-verified release binary before audit-check runs.
       # audit-check otherwise compiles cargo-audit from a newly-resolved
