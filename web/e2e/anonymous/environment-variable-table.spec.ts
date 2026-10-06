@@ -366,7 +366,7 @@ for (const width of [1440, 390]) {
     })
     await expect(
       breadcrumbs.getByRole('link', {
-        name: 'Environment variables',
+        name: 'Environment Variables',
         exact: true,
       })
     ).toHaveAttribute('href', '/projects/example-app/environment-variables')

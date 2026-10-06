@@ -109,7 +109,7 @@ test('direct project links and direct flat settings navigation', async ({
     ['Logs', 3],
     ['Traces', 2],
     ['Monitoring', 3],
-    ['Analytics', 11],
+    ['Analytics', 14],
   ] as const) {
     await primary.getByRole('link', { name: section, exact: true }).click()
     const nav = page.getByRole('navigation', { name: `${section} pages` })
