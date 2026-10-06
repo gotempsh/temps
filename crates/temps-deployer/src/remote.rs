@@ -16,7 +16,7 @@ use std::time::Duration;
 use crate::build_protocol::{
     validate_archive_path, BuildEvent, BuildFailureKind, BuildSpec, DockerIgnore,
     BUILD_PROTOCOL_VERSION, MAX_BUILD_CONTEXT_BYTES, MAX_BUILD_CONTEXT_ENTRIES,
-    MAX_BUILD_EVENT_BYTES,
+    MAX_BUILD_EVENT_BYTES, WORKSPACE_ROOT_IGNORE_MARKER,
 };
 
 use crate::{
@@ -87,6 +87,7 @@ async fn agent_error_detail(response: reqwest::Response) -> String {
 /// What to archive from a build context, decided before anything is read.
 pub(crate) struct ContextFilter {
     ignore: DockerIgnore,
+    root_ignore: Option<DockerIgnore>,
     /// Paths the Docker CLI always sends even when ignored: the Dockerfile
     /// and the ignore file itself.
     always_include: Vec<PathBuf>,
@@ -94,12 +95,21 @@ pub(crate) struct ContextFilter {
 
 impl ContextFilter {
     pub(crate) fn includes(&self, path: &Path) -> bool {
-        self.always_include.iter().any(|kept| kept == path) || !self.ignore.is_excluded(path)
+        self.always_include.iter().any(|kept| kept == path)
+            || (!self.ignore.is_excluded(path)
+                && !self
+                    .root_ignore
+                    .as_ref()
+                    .is_some_and(|ignore| ignore.is_excluded(path)))
     }
 
     /// Whether an excluded directory may still contain something to send.
     pub(crate) fn must_descend(&self, directory: &Path) -> bool {
         self.ignore.has_exceptions()
+            || self
+                .root_ignore
+                .as_ref()
+                .is_some_and(DockerIgnore::has_exceptions)
             || self
                 .always_include
                 .iter()
@@ -180,7 +190,9 @@ fn append_build_context(
 
 /// Load the ignore rules Docker would apply for `dockerfile`: a
 /// `<Dockerfile>.dockerignore` beside it takes precedence over the context
-/// root's `.dockerignore`, as with BuildKit.
+/// root's `.dockerignore`, as with BuildKit. Generated widened-workspace
+/// contexts opt in via WORKSPACE_ROOT_IGNORE_MARKER: root exclusions are then
+/// enforced independently, so app negations cannot expose private siblings.
 pub(crate) fn load_context_filter(
     root: &Path,
     dockerfile: &Path,
@@ -196,27 +208,86 @@ pub(crate) fn load_context_filter(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(BuilderError::IoError(error)),
         };
-        if !metadata.is_file() {
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
             return Err(BuilderError::InvalidContext(format!(
                 "'{}' must be a regular file",
                 candidate.display()
             )));
         }
-        let contents = std::fs::read_to_string(&full).map_err(|error| {
-            BuilderError::InvalidContext(format!("Cannot read '{}': {error}", candidate.display()))
-        })?;
+        let contents = read_ignore_file(root, &candidate)?;
         let ignore = DockerIgnore::parse(&contents, &candidate.to_string_lossy())
             .map_err(BuilderError::InvalidContext)?;
+        let root_ignore = if candidate != Path::new(".dockerignore")
+            && contents
+                .lines()
+                .any(|line| line == WORKSPACE_ROOT_IGNORE_MARKER)
+        {
+            let root_file = Path::new(".dockerignore");
+            let root_contents = match std::fs::symlink_metadata(root.join(root_file)) {
+                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                    Some(read_ignore_file(root, root_file)?)
+                }
+                Ok(_) => {
+                    return Err(BuilderError::InvalidContext(
+                        "Workspace root .dockerignore must be a regular non-symlink file".into(),
+                    ))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(BuilderError::IoError(error)),
+            };
+            if let Some(contents) = root_contents {
+                always_include.push(root_file.to_path_buf());
+                Some(
+                    DockerIgnore::parse(&contents, ".dockerignore")
+                        .map_err(BuilderError::InvalidContext)?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         always_include.push(candidate);
         return Ok(ContextFilter {
             ignore,
+            root_ignore,
             always_include,
         });
     }
     Ok(ContextFilter {
         ignore: DockerIgnore::empty(),
+        root_ignore: None,
         always_include,
     })
+}
+
+fn read_ignore_file(root: &Path, relative: &Path) -> Result<String, BuilderError> {
+    use std::io::Read;
+    let full = root.join(relative);
+    let canonical_root = root.canonicalize().map_err(BuilderError::IoError)?;
+    let canonical_file = full.canonicalize().map_err(BuilderError::IoError)?;
+    if !canonical_file.starts_with(&canonical_root) {
+        return Err(BuilderError::InvalidContext(format!(
+            "Ignore file '{}' escapes the build context",
+            relative.display()
+        )));
+    }
+    const MAX_IGNORE_BYTES: u64 = 1024 * 1024;
+    let mut contents = String::new();
+    std::fs::File::open(&full)
+        .map_err(BuilderError::IoError)?
+        .take(MAX_IGNORE_BYTES + 1)
+        .read_to_string(&mut contents)
+        .map_err(|error| {
+            BuilderError::InvalidContext(format!("Cannot read '{}': {error}", relative.display()))
+        })?;
+    if contents.len() as u64 > MAX_IGNORE_BYTES {
+        return Err(BuilderError::InvalidContext(format!(
+            "Ignore file '{}' exceeds the {MAX_IGNORE_BYTES} byte limit",
+            relative.display()
+        )));
+    }
+    Ok(contents)
 }
 
 fn prepare_build_context(
@@ -1602,6 +1673,73 @@ mod tests {
                 "{dropped} transferred: {paths:?}"
             );
         }
+    }
+
+    #[test]
+    fn worker_workspace_archive_intersects_root_and_specific_rules() {
+        let source = tempfile::tempdir().unwrap();
+        let root = source.path();
+        for directory in ["apps/web", "private-data", "app-private", "src", "docs"] {
+            std::fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        for file in [
+            "apps/web/Dockerfile",
+            "private-data/secret",
+            "app-private/secret",
+            "src/keep.ts",
+            "src/drop.ts",
+            "docs/readme",
+        ] {
+            std::fs::write(root.join(file), "fixture").unwrap();
+        }
+        std::fs::write(
+            root.join(".dockerignore"),
+            "private-data\nsrc\n!src/keep.ts\n!app-private\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("apps/web/Dockerfile.dockerignore"),
+            format!("{WORKSPACE_ROOT_IGNORE_MARKER}\napp-private\n!private-data\n!src\n"),
+        )
+        .unwrap();
+        let paths = archive_paths(&context_request(
+            root,
+            Some(PathBuf::from("apps/web/Dockerfile")),
+        ));
+        for kept in [
+            "apps/web/Dockerfile",
+            "apps/web/Dockerfile.dockerignore",
+            ".dockerignore",
+            "src/keep.ts",
+            "docs/readme",
+        ] {
+            assert!(
+                paths.iter().any(|path| path == kept),
+                "missing {kept}: {paths:?}"
+            );
+        }
+        for excluded in ["private-data/secret", "app-private/secret", "src/drop.ts"] {
+            assert!(
+                !paths.iter().any(|path| path == excluded),
+                "exposed {excluded}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_archive_rejects_invalid_root_rules_even_with_specific_ignore() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("Dockerfile"), "FROM scratch").unwrap();
+        std::fs::write(
+            source.path().join("Dockerfile.dockerignore"),
+            WORKSPACE_ROOT_IGNORE_MARKER,
+        )
+        .unwrap();
+        std::fs::write(source.path().join(".dockerignore"), "[broken").unwrap();
+        assert!(matches!(
+            prepare_build_context(&context_request(source.path(), None)),
+            Err(BuilderError::InvalidContext(_))
+        ));
     }
 
     /// BuildKit's `<Dockerfile>.dockerignore` wins over the root file.

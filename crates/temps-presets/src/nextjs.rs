@@ -50,7 +50,19 @@ impl Preset for NextJs {
         "/presets/nextjs.svg".to_string()
     }
 
-    async fn dockerfile(&self, config: super::DockerfileConfig<'_>) -> DockerfileWithArgs {
+    async fn dockerfile(&self, mut config: super::DockerfileConfig<'_>) -> DockerfileWithArgs {
+        if config.root_local_path != config.local_path
+            && config.root_local_path.join("pnpm-workspace.yaml").exists()
+        {
+            match super::autopack_preset::pnpm_app_directory(&config) {
+                Ok(Some(_)) => {}
+                Ok(None) => config.root_local_path = config.local_path,
+                Err(message) => return DockerfileWithArgs::new(format!(
+                    "# {}\nFROM node:22\nRUN echo 'Invalid pnpm workspace configuration' >&2; exit 1\n",
+                    message.replace('\n', "\n# ")
+                )),
+            }
+        }
         let project_slug: String = config
             .project_slug
             .chars()
@@ -1044,6 +1056,36 @@ mod tests {
             })
             .await
             .content
+    }
+
+    #[tokio::test]
+    async fn nonmember_nextjs_app_uses_its_local_package_manager() {
+        let repo = tempfile::tempdir().unwrap();
+        let app = repo.path().join("apps/web");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            repo.path().join("pnpm-workspace.yaml"),
+            "packages: ['apps/*', '!apps/web']",
+        )
+        .unwrap();
+        std::fs::write(repo.path().join("pnpm-lock.yaml"), "lockfileVersion: '9.0'").unwrap();
+        std::fs::write(repo.path().join("turbo.json"), "{}").unwrap();
+        std::fs::write(
+            app.join("package.json"),
+            r#"{"scripts":{"build":"next build"}}"#,
+        )
+        .unwrap();
+        let dockerfile = NextJs
+            .dockerfile(super::super::DockerfileConfig::new(
+                repo.path(),
+                &app,
+                "fixture",
+            ))
+            .await
+            .content;
+        assert!(!dockerfile.contains("--filter"), "{dockerfile}");
+        assert!(!dockerfile.contains("pnpm install"), "{dockerfile}");
+        assert!(!dockerfile.contains("apps/web"), "{dockerfile}");
     }
 
     /// A Turborepo laid out the way the deploy job sees it: the project

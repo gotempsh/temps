@@ -114,8 +114,14 @@ jobs:
       - name: Test stateless file migration safety
         run: python3 scripts/test_migrate_stateless_files.py
 
+      - name: Test release qualification evidence checker
+        run: python3 scripts/test_check_release_qualification.py
+
       - name: Test release test gate
         run: python3 .github/scripts/test_release_test_gate.py
+
+      - name: Test release binary signing
+        run: python3 .github/scripts/test_sign_release_binaries.py
 
       - name: Test installer release lookup errors
         run: python3 .github/scripts/test_install_release_lookup.py

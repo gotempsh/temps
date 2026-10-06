@@ -39,7 +39,7 @@ pub struct FeatureMaturity {
 }
 
 const STABLE_REASON: &str =
-    "Verified end to end. Its public surface will remain compatible within 0.1.x.";
+    "Its public surface is intended to remain compatible within 0.1.x; release qualification is recorded separately.";
 
 const fn feature(key: &'static str, maturity: Maturity, reason: &'static str) -> FeatureMaturity {
     FeatureMaturity {

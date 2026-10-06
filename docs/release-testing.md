@@ -8,12 +8,116 @@ forward or revert the offending PR.
 Conventions used below:
 
 - `temps` = the server binary; `cli` = `bunx @temps-sdk/cli`
-- "fresh staging" = clean control plane + 1 worker, no projects, no services
-- "sample app" = `https://github.com/dviejokfs/sandbox-test-nextjs` (PortBoard)
+- "fresh staging" = disposable single-node control plane, no projects or services;
+  add run-owned workers only for explicitly multi-node scenarios
+- "sample app" = a generic owned test repository with an HTTP health endpoint
 - All HTTP checks use the cookie auth set by the UI login — assert the JSON
   body, not just the status code
 
 ---
+
+## v0.1.0 qualification and promotion record
+
+Tracking: [#1195](https://github.com/gotempsh/temps/issues/1195),
+[#1214](https://github.com/gotempsh/temps/issues/1214), and
+[#1215](https://github.com/gotempsh/temps/issues/1215). This checklist is a runbook,
+not evidence of completion. **RC publication and stable promotion remain blocked
+until the gates below have actual, reviewed results.** Do not infer qualification
+from merged fixes, a green unit test, a maturity badge, or a short idle soak.
+
+Record the exact source commit, candidate tag, binary/image digests, platform,
+database version, fixture identities, test commands, UTC start/end times,
+expected/actual results, and reviewer for each run. Keep raw reports, credentials,
+logs and user feedback private; link sanitized evidence from the release record.
+Use `untested`, `passed`, `failed`, `blocked`, or `inconclusive`, and give every
+blocked/inconclusive result a reason and owner. A new candidate invalidates prior
+candidate results unless the reviewer explicitly documents why evidence applies.
+
+### Before publishing rc.1 (or a replacement RC)
+
+| Gate | Required evidence | Current qualification state |
+| --- | --- | --- |
+| Combined integration CI | Required Rust, console, CLI, generated SDK, attribution and security checks on the integrated commit; links to full results and runtime skip counts | Untested for the final combined candidate |
+| Fresh installation | Empty database and first-admin bootstrap; Docker image, Git/Dockerfile, Node, Compose and static deploy flows; UI/CLI feedback; actual proxy responses, service readback and restart persistence | Untested for the final combined candidate |
+| Seeded upgrade from v0.0.8 | Previous released binary and candidate digests; migrations, pre-migration backup, projects/environments/secrets/services/deployments preserved; app served through proxy | Untested |
+| Actual rollback to v0.0.8 | Restore pre-migration database and matching data directory with the old binary, read back seeded data and app response; verify schema-ahead refusal without data mutation | Untested |
+| Healthy 24-hour workload soak | Continuous workload health, deployed app requests, service checks, deploy/error/upgrade metrics, bounded memory/disk/log growth, no unexplained restart or stuck jobs; log report and UTC window | Untested; no 24-hour run claimed |
+| Security | GA-scope findings reviewed, external penetration test report and remediation/retest, authorization/SSRF/secret masking/defaults reviewed independently of labels | External assessment and sign-off pending (#1210, #1216) |
+| Release packaging | Required architecture binaries/images, checksums, signatures, SBOM and provenance verified for candidate artifacts; installer channel behavior and upgrade policy reviewed | Candidate artifact verification pending (#1207, #1208, #1213) |
+| Maturity and actual defaults | Maintainer approves scope; source registry, UI/API/CLI consistency and each experimental capability's actual enablement, prerequisites and authorization checked | Decision and defaults audit pending (#1214) |
+
+Use the existing `scripts/first-run/run-first-run.sh` and
+`scripts/test-upgrade-from-release.sh` as executable starting points; inspect their
+prerequisites before running. The upgrade harness expects the previous binary
+to expose `migrate`; the checksum-verified macOS arm64 v0.0.8 binary does **not**
+(`temps migrate --help` rejects the subcommand). Therefore this harness cannot
+qualify v0.0.8 unchanged. Adapt its old-version bootstrap/seeding path, or define
+and verify an explicit supported intermediate upgrade route, before using it as
+evidence for #1195. Set `OLD_BIN` to the verified previous binary and `NEW_BIN`
+to the candidate only after establishing command/API compatibility. Use a
+dedicated test database container/engine and unused database names. Never stop,
+remove or mutate operator-owned Docker resources. Additional feature-specific scenarios below remain required
+for shipped scope; automation definitions alone do not count as successful runs.
+
+The published [v0.0.8 assets](https://github.com/gotempsh/temps/releases/tag/v0.0.8)
+include Linux amd64 and macOS amd64/arm64 archives, but no Linux arm64 archive.
+Record the architecture actually upgraded and rolled back. A Linux arm64
+migration route needs a separately reviewed strategy and execution evidence;
+other architecture results do not establish that route.
+
+The quiet-log harness (`SOAK_MINUTES=1440
+scripts/first-run/quiet-logs-soak.sh`) checks a small idle fixture and end-of-window
+health. It is **only part of** the healthy workload soak: collect periodic health,
+request/deploy/error counts, resource usage and restart history throughout the
+window. Twenty minutes in CI cannot establish 24-hour reliability. The full run
+needs a supervised dedicated host; keep the workload and evidence isolated.
+
+### After RC publication, before stable promotion
+
+- Freeze the candidate scope and document exceptions. A maintainer publishes
+  the qualified RC; this checklist and its checker never publish anything.
+- Invite beta users to upgrade through the approved communication channel.
+  Observe **5–7 actual days** of tester feedback after publication, recording
+  upgraded versions, upgrade outcomes, deploy success, error summaries and
+  unresolved regressions. No responses is not affirmative compatibility evidence.
+- If a blocker requires rc.2, document the fix and repeat affected qualification;
+  the reviewer decides and records whether the feedback window must restart.
+- Reverify the published artifact digests, signatures/SBOM/provenance, supported
+  architecture downloads, and stable installer selection. Verify that stable
+  selection excludes prereleases and pinned upgrades select the requested version.
+- Publish reviewed release notes (generated changelog plus verified limitations),
+  final GA/Beta/Experimental list, and a link to the supported compatibility and
+  upgrade/rollback policy. Never hand-edit `CHANGELOG.md`.
+- Name the patch owner, security reporting route, and **30-day patch window**
+  starting at the actual stable publication time, with an explicit end date.
+  Regressions must have severity, reproduction, mitigation and patch/retest plan.
+- Require a named maintainer's promotion approval after reviewing all evidence.
+  Do not publish automatically, merge the qualification PR, or close operational
+  issues merely because the checklist is present. beta.57 is optional.
+
+### Private evidence ledger
+
+The repository includes a fail-closed completeness checker. Initialize outside
+the checkout so raw operational evidence cannot enter a commit:
+
+```bash
+python3 scripts/check-release-qualification.py /tmp/temps-v010-evidence/ledger.json --init
+python3 scripts/check-release-qualification.py /tmp/temps-v010-evidence/ledger.json \
+  --phase rc --commit "$(git rev-parse HEAD)"
+# After RC feedback and the remaining promotion gates:
+python3 scripts/check-release-qualification.py /tmp/temps-v010-evidence/ledger.json \
+  --phase stable --commit "$(git rev-parse HEAD)"
+```
+
+Initialization marks every gate untested. Fill `candidate_commit`,
+`candidate_version`, and each gate's `status`, `reviewer`, and `evidence` list.
+Each evidence item contains a path relative to the ledger directory and the
+file's lowercase SHA-256 (`sha256sum` or `shasum -a 256`). For `workload-soak` and
+`tester-feedback`, also record timezone-qualified `started_at` and `ended_at`.
+The checker rejects missing gates, missing/changed files, stale source commits,
+short windows and future end times. It cannot authenticate reports or determine
+whether a workload was healthy; a reviewer must inspect the evidence and verify
+candidate artifact identities. A zero exit code is not authorization to release.
 
 ## 1. Onboarding & auth
 
@@ -562,6 +666,131 @@ test the supported WireGuard setup: an operator-run tunnel plus direct mode.
 
 ---
 
+### 10.6 Restore source identity and authorization (#1210)
+
+- **Setup**: Two disposable projects with separately owned managed services;
+  a backup from service A and an in-place restore target B. Use credentials
+  entitled to both services, then repeat with credentials entitled only to B.
+- **Steps**: Restore A's backup onto B without `confirm_cross_service`, then
+  explicitly confirm and retry. Repeat with a backup location whose source
+  identity cannot be established. Exercise both in-place and PITR modes.
+- **Pass**:
+  - An authorized caller must explicitly confirm a destructive restore from a
+    different or unknown source; rejection starts no restore or target mutation.
+  - A caller lacking source access is denied even with confirmation and is not
+    shown source identity or prompted for MFA before authorization succeeds.
+  - Own-source restores work without cross-service confirmation; destructive
+    modes still require enrolled MFA step-up when applicable.
+  - Audit records identify the authorized source, target, and confirmation.
+- **Existing regression coverage**: `crates/temps-backup/src/services/restore.rs`
+  tests `RestoreOriginBinding`; handler authorization and confirmation precede
+  step-up in `crates/temps-backup/src/handlers/restore_handler.rs`.
+
+### 10.7 Error-group mutations and agent credentials (#1210)
+
+- **Steps**: Update an error group's status with project-authorized credentials,
+  repeat with a different project's group ID, and run an agent workflow.
+- **Pass**:
+  - A successful status change emits `ERROR_GROUP_UPDATED` with actor,
+    project/group IDs, and new status. A refused update emits no success event.
+  - Agent workflows receive no API token while they require no API permissions.
+    If a workflow needs a token in future, it must receive only purpose-built
+    permissions, project scope, bounded expiry, and completion/cancellation
+    revocation; it must never receive `FullAccess` by default.
+- **Existing regression coverage**: `crates/temps-error-tracking/src/handlers/handler.rs`
+  tests audit emission; `crates/temps-agents/src/services/executor.rs` tests
+  minimal run permissions, absent issuance, and token cleanup.
+
+### 10.8 Metrics injection and alert capacity (#1210)
+
+- **Steps**: In a disposable TimescaleDB schema, round-trip metric engine,
+  environment, label keys, and label values containing quotes and backslashes.
+  Submit an invalid metric name. Fill a managed service's alert capacity, then
+  attempt concurrent creates and enable built-in alerts with insufficient room.
+- **Pass**:
+  - Accepted strings round-trip as data, invalid names are rejected/dropped,
+    and no supplied value changes query structure or executes SQL.
+  - At most 100 alert rules exist per managed service, including built-ins;
+    concurrent requests cannot bypass the cap. Capacity rejection leaves no
+    partial built-in rule set and does not retain the creation lock.
+  - Another service retains its independent capacity. This implementation is
+    **per service**, not an aggregate per-project cap; a project-wide policy
+    would need separately defined semantics for shared managed services.
+- **Existing regression coverage**: `crates/temps-metrics/src/store/timescale.rs`
+  has SQL binding and real-DB hostile-value tests;
+  `crates/temps-providers/src/handlers/metrics_handlers.rs` covers concurrent
+  creation, built-in capacity and rollback;
+  `crates/temps-monitoring/src/evaluator.rs` tests the built-in rule catalog.
+
+### 10.9 Dependency exception review and HA boundary (#1210)
+
+- **Steps**: Run `cargo audit` against the release lockfile with a freshly
+  fetched advisory database. Compare every result with the explicit exceptions
+  in `.github/workflows/dependency-scan.yml` and the assessments in `Cargo.toml`.
+  Check the resolved production feature graph with
+  `cargo tree --locked --target all -e normal -i rkyv` and
+  `cargo tree --locked --target all -e normal -i lru@0.16.4`.
+- **Pass**:
+  - No new finding is silently ignored. Each retained exception has a reviewed
+    dependency path, reachability assessment, and removal/re-review trigger.
+    A passing scan with exceptions is not an independent security assessment.
+  - rkyv must remain absent from the production feature graph for its current
+    non-reachability rationale to hold. Re-review AWS SDK cache keys/operations
+    and RSA private-key use when dependencies or consumers change.
+- **Review snapshot (2026-10-06, main `e70c36a78`)**: cargo-audit 0.22.2 with
+  advisory-db `ef6173cbc5c50ec8166f9a5b28f07834144373ee` reported RSA in both
+  locked versions, rkyv, lru unsoundness, and four unmaintained crates. All are
+  already listed exceptions; the scan also warned that locked chacha20 0.10.0
+  and spin 0.9.8/0.10.0 are yanked. rkyv had no normal-dependency consumers. The
+  locked AWS SDK's only lru cache uses `CacheKey(String)` without custom Drop
+  and `get_or_insert_mut`, so the advisory's panicking-key prerequisite was
+  absent in that reviewed consumer. RSA risk acceptance remains a maintainer
+  gate; no independent timing assessment is available.
+- **HA/multi-node boundary**: New HA infrastructure roles use SCRAM, and legacy
+  roles have a phased credential/HBA upgrade in
+  `crates/temps-providers/src/externalsvc/postgres_cluster.rs`, with permanent
+  SCRAM guards before regenerated peer rules. This does not close every
+  ADR-020 finding. HA TLS identity, role privileges, network scoping and
+  fencing require their own qualification before multi-node GA, as specified
+  in `docs/adr/020-multi-node-deployment-hardening.md`. Do not count source
+  inspection as a live cluster authentication or failover test.
+
+### 10.10 External penetration test (#1216)
+
+**Pending external evidence.** No assessor engagement, budget approval, test
+report, or independent retest is recorded by this checklist. If budgeted,
+arrange the engagement during hardening and leave time to fix findings before
+RC; automated regression tests do not fulfill this external assessment.
+
+- **Before testing**: Record the authorized assessor, exact candidate commit
+  and artifact digests, dates, staging hosts, permitted techniques, request
+  rate ceilings, data handling, and emergency stop contact in a private
+  engagement record. Use disposable tenants and synthetic data. Agree scope
+  and permission before probing any external or production system.
+- **Auth scope**: Password/magic-link/OIDC login, reset and MFA flows, session
+  expiry/revocation, CSRF, rate limiting, scoped API keys and deployment/run
+  credentials, and privilege escalation between unrelated projects.
+- **Proxy scope**: Host and forwarded-header spoofing, domain/route ownership,
+  private admin-listener exposure, websocket and preview access, path
+  normalization, upstream targeting/SSRF, and certificate handling.
+- **API scope**: Object-level authorization on reads and writes, backups and
+  restores across projects, secret masking/one-time issuance, upload/archive
+  traversal, query/metrics injection, resource limits, and audit coverage.
+  Inventory intentionally public ingest/webhook routes separately from
+  management routes; anonymous acceptance alone is not a finding on a route
+  deliberately designed for public ingestion.
+- **Completion evidence**: A private report tied to the tested candidate with
+  scope, methods, reproducible findings, severity, and coverage limitations;
+  fix commits and regression results for each finding; independent retest of
+  fixes against the RC. Publish only a sanitized summary without credentials,
+  customer identities, or unresolved exploit details.
+- **Release decision**: Record unresolved findings and explicit maintainer
+  disposition. Until an engagement and retest exist, report this issue as
+  pending (or explicitly unbudgeted), never as passed. ADR-020 multi-node GA
+  remains a separate gate.
+
+---
+
 ## 11. Performance regression gates
 
 ### 11.1 Cold-start latency
@@ -797,7 +1026,7 @@ releases:
   security review is approved.
 ## How to use this document
 
-1. Open a `RELEASE_CHECKLIST_vX.Y.Z.md` for the release in flight.
+1. Create a private release evidence ledger for the release in flight (see above).
 2. **Run** every scenario above against staging. Tick the boxes as you go.
 3. Skip with a written reason any scenario that does not apply (e.g., "no
    migrations this release"). Never skip silently.

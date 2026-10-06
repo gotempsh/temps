@@ -14,11 +14,15 @@ on:
   push:
     branches: [main]
     paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - 'crates/temps-presets/**'
       - '.github/workflows/starters.yml'
   pull_request:
     branches: [main]
     paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - 'crates/temps-presets/**'
       - '.github/workflows/starters.yml'
   workflow_dispatch:
@@ -36,6 +40,34 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  deployment-regressions:
+    name: Generated preset deployment regressions
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: starters
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Require Docker and Buildx
+        run: |
+          docker info
+          docker buildx version
+
+      - name: Build and run deployment regression images
+        # Each scenario owns and removes its builder, images and containers.
+        # Run sequentially to bound image-build memory and disk on the runner.
+        run: cargo test --locked -p temps-presets --test deployment_regressions -- --nocapture --test-threads=1
+
   starters:
     name: ${{ matrix.starter }}
     runs-on: ubuntu-latest

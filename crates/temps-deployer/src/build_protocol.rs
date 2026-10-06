@@ -13,6 +13,11 @@ use std::path::{Component, Path};
 
 use crate::BuildResult;
 
+// Internal opt-in for generated Dockerfiles whose app context was widened.
+// Archive builders evaluate root exclusions independently of app-specific rules;
+// ordinary custom Dockerfiles retain Docker's specific-file precedence.
+pub const WORKSPACE_ROOT_IGNORE_MARKER: &str = "# temps: preserve-workspace-root-ignore";
+
 pub const BUILD_PROTOCOL_VERSION: u16 = 1;
 pub const MAX_BUILD_SPEC_BYTES: usize = 64 * 1024;
 pub const MAX_BUILD_CONTEXT_BYTES: u64 = 512 * 1024 * 1024;
