@@ -40316,7 +40316,7 @@ export type StartRestoreErrors = {
      */
     404: ProblemDetails;
     /**
-     * Destructive cross-service restore requires explicit confirmation
+     * Conflict: a destructive cross-service restore requires explicit confirmation (`cross-service-restore-not-confirmed`), another restore is already active on this service (`restore-already-active`, with `active_restore_run_id`), or the backup is being deleted
      */
     409: ProblemDetails;
 };
