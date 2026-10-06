@@ -60,7 +60,6 @@ fn extra_restore_image_repositories() -> &'static [String] {
 const MIN_PASSWORD_LENGTH: usize = 8;
 const MARIADB_BACKUP_EXEC_TIMEOUT: Duration = Duration::from_secs(4 * 3600);
 const MARIADB_IMAGE_PULL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-const MARIADB_BINLOG_UPLOAD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MARIADB_BINLOG_REPLAY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MARIADB_RESTORE_HELPER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const MAX_BINLOG_POSITION: u64 = u32::MAX as u64;
@@ -606,9 +605,6 @@ fn generate_password() -> String {
         .map(char::from)
         .collect()
 }
-
-/// Upper bound for streaming a staged logical dump into the container.
-const RESTORE_UPLOAD_TIMEOUT: Duration = Duration::from_secs(3600);
 
 pub struct MariaDbService {
     name: String,
@@ -2330,7 +2326,6 @@ impl MariaDbService {
             "/tmp",
             restore_filename,
             0o644,
-            RESTORE_UPLOAD_TIMEOUT,
         )
         .await
         .map_err(|e| anyhow::anyhow!("Failed to upload MariaDB restore SQL: {}", e))?;
@@ -3016,7 +3011,6 @@ impl MariaDbService {
                 mbstream_host_path,
                 "/var/tmp",
                 "restore.mbstream",
-                MARIADB_BACKUP_EXEC_TIMEOUT,
             )
             .await;
         if let Err(e) = upload_result {
@@ -3105,7 +3099,6 @@ impl MariaDbService {
         host_path: &std::path::Path,
         dest_dir: &str,
         dest_name: &str,
-        timeout: Duration,
     ) -> Result<()> {
         // Streamed from disk, so memory does not grow with the backup's size.
         super::container_upload::upload_file_to_container(
@@ -3115,7 +3108,6 @@ impl MariaDbService {
             dest_dir,
             dest_name,
             0o644,
-            timeout,
         )
         .await
         .map_err(|e| anyhow::anyhow!("Failed to upload {} to container: {}", dest_name, e))
@@ -3360,14 +3352,8 @@ impl MariaDbService {
                 file = %file,
                 "Uploading MariaDB PITR binlog segment to restored container"
             );
-            self.upload_file_to_container(
-                &container_name,
-                host_path,
-                container_dir,
-                file,
-                MARIADB_BINLOG_UPLOAD_TIMEOUT,
-            )
-            .await?;
+            self.upload_file_to_container(&container_name, host_path, container_dir, file)
+                .await?;
             container_files.push(format!("{}/{}", container_dir, file));
         }
         info!(

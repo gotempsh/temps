@@ -1679,7 +1679,6 @@ impl RedisService {
             RDB_RESTORE_DIR,
             RDB_RESTORE_FILE_NAME,
             0o644,
-            REDIS_BACKUP_EXEC_TIMEOUT,
         )
         .await
         {

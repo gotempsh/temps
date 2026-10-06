@@ -10,8 +10,16 @@
 //! sees an empty directory. Uploading into a created-but-not-started
 //! container works wherever the daemon is, and streams, so memory does not
 //! depend on file size.
+//!
+//! Uploads are bounded by a stall timeout, not a total deadline: a backup can
+//! be arbitrarily large and the link to the daemon arbitrarily slow, so the
+//! only signal that an upload is broken is that the daemon stops accepting
+//! data. The body is pulled under backpressure, so every chunk pulled is a
+//! chunk the daemon took.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bollard::Docker;
 
@@ -26,16 +34,18 @@ pub enum ContainerUploadError {
     #[error("Invalid upload file name '{name}': {reason}")]
     InvalidName { name: String, reason: String },
 
-    /// The Docker daemon did not finish the upload in time.
+    /// The Docker daemon stopped accepting data (or never answered after the
+    /// last byte) for longer than the stall timeout.
     #[error(
-        "Timed out after {timeout_secs}s uploading '{dest_name}' ({size} bytes) into \
-         container {container_id}"
+        "Upload of '{dest_name}' into container {container_id} stalled: the Docker daemon \
+         accepted no data for {stall_secs}s after {sent} of {size} bytes"
     )]
-    Timeout {
+    Stalled {
         container_id: String,
         dest_name: String,
         size: u64,
-        timeout_secs: u64,
+        sent: u64,
+        stall_secs: u64,
     },
 
     /// The Docker daemon rejected or aborted the upload.
@@ -53,6 +63,80 @@ pub enum ContainerUploadError {
 
 /// Read size when streaming a host file into a container upload.
 const UPLOAD_CHUNK_BYTES: usize = 256 * 1024;
+
+/// How long the daemon may accept no data before an upload is abandoned.
+/// Covers the time from the last chunk to the daemon's response too.
+const UPLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// When an upload last made progress, and how far it got.
+#[derive(Clone)]
+struct UploadProgress {
+    started: tokio::time::Instant,
+    /// Milliseconds after `started` at which the last chunk was taken.
+    last_progress_ms: Arc<AtomicU64>,
+    sent: Arc<AtomicU64>,
+}
+
+impl UploadProgress {
+    fn new() -> Self {
+        Self {
+            started: tokio::time::Instant::now(),
+            last_progress_ms: Arc::new(AtomicU64::new(0)),
+            sent: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn record(&self, bytes: usize) {
+        let elapsed_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_progress_ms.store(elapsed_ms, Ordering::Relaxed);
+        self.sent.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    fn last_progress(&self) -> tokio::time::Instant {
+        self.started + Duration::from_millis(self.last_progress_ms.load(Ordering::Relaxed))
+    }
+
+    fn sent(&self) -> u64 {
+        self.sent.load(Ordering::Relaxed)
+    }
+}
+
+/// Wrap `stream` so every chunk taken from it is recorded in `progress`.
+fn track_progress<S>(
+    stream: S,
+    progress: UploadProgress,
+) -> impl futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static
+where
+    S: futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static,
+{
+    use futures::TryStreamExt;
+    stream.inspect_ok(move |chunk| progress.record(chunk.len()))
+}
+
+/// Drive `upload` to completion unless `progress` shows no new chunk for
+/// `stall`. Returns the bytes sent when it gives up. A slow upload that keeps
+/// moving is never cut off, however long it takes in total.
+async fn run_until_stalled<F, T>(
+    upload: F,
+    progress: &UploadProgress,
+    stall: Duration,
+) -> Result<T, u64>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::pin!(upload);
+    loop {
+        let deadline = progress.last_progress() + stall;
+        tokio::select! {
+            output = &mut upload => return Ok(output),
+            _ = tokio::time::sleep_until(deadline) => {
+                if progress.last_progress() + stall <= tokio::time::Instant::now() {
+                    return Err(progress.sent());
+                }
+            }
+        }
+    }
+}
 
 /// The tar stream that uploads one regular file named `name` of `size`
 /// bytes with permission bits `mode`: header, then `body`, then padding and
@@ -105,29 +189,31 @@ async fn upload_tar_stream<S>(
     dest_dir: &str,
     dest_name: &str,
     size: u64,
-    timeout: std::time::Duration,
     tar_stream: S,
 ) -> Result<(), ContainerUploadError>
 where
     S: futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static,
 {
-    tokio::time::timeout(
-        timeout,
+    let progress = UploadProgress::new();
+    run_until_stalled(
         docker.upload_to_container(
             container_id,
             Some(bollard::query_parameters::UploadToContainerOptions {
                 path: dest_dir.to_string(),
                 ..Default::default()
             }),
-            bollard::body_try_stream(tar_stream),
+            bollard::body_try_stream(track_progress(tar_stream, progress.clone())),
         ),
+        &progress,
+        UPLOAD_STALL_TIMEOUT,
     )
     .await
-    .map_err(|_| ContainerUploadError::Timeout {
+    .map_err(|sent| ContainerUploadError::Stalled {
         container_id: container_id.to_string(),
         dest_name: dest_name.to_string(),
         size,
-        timeout_secs: timeout.as_secs(),
+        sent,
+        stall_secs: UPLOAD_STALL_TIMEOUT.as_secs(),
     })?
     .map_err(|e| ContainerUploadError::Upload {
         container_id: container_id.to_string(),
@@ -149,7 +235,6 @@ pub(crate) async fn upload_file_to_container(
     dest_dir: &str,
     dest_name: &str,
     mode: u32,
-    timeout: std::time::Duration,
 ) -> Result<(), ContainerUploadError> {
     let source_error = |e: std::io::Error| ContainerUploadError::Source {
         path: host_path.display().to_string(),
@@ -164,16 +249,8 @@ pub(crate) async fn upload_file_to_container(
     let source_failure = Arc::new(Mutex::new(None));
     let body = file_chunks(file, size, Arc::clone(&source_failure));
     let tar_stream = single_file_tar_stream(dest_name, size, mode, body)?;
-    let uploaded = upload_tar_stream(
-        docker,
-        container_id,
-        dest_dir,
-        dest_name,
-        size,
-        timeout,
-        tar_stream,
-    )
-    .await;
+    let uploaded =
+        upload_tar_stream(docker, container_id, dest_dir, dest_name, size, tar_stream).await;
     uploaded.map_err(|error| attribute_upload_failure(error, &source_failure, host_path))
 }
 
@@ -237,21 +314,11 @@ pub(crate) async fn upload_bytes_to_container(
     dest_dir: &str,
     dest_name: &str,
     mode: u32,
-    timeout: std::time::Duration,
 ) -> Result<(), ContainerUploadError> {
     let size = contents.len() as u64;
     let body = futures::stream::once(async move { Ok(bytes::Bytes::from(contents)) });
     let tar_stream = single_file_tar_stream(dest_name, size, mode, body)?;
-    upload_tar_stream(
-        docker,
-        container_id,
-        dest_dir,
-        dest_name,
-        size,
-        timeout,
-        tar_stream,
-    )
-    .await
+    upload_tar_stream(docker, container_id, dest_dir, dest_name, size, tar_stream).await
 }
 
 #[cfg(test)]
@@ -313,17 +380,9 @@ mod tests {
             }
         };
         let missing = std::path::Path::new("/nonexistent/temps-upload-source.gz");
-        let err = upload_file_to_container(
-            &docker,
-            "unused",
-            missing,
-            "/tmp",
-            "archive.gz",
-            0o644,
-            std::time::Duration::from_secs(1),
-        )
-        .await
-        .expect_err("a missing source must fail before contacting Docker");
+        let err = upload_file_to_container(&docker, "unused", missing, "/tmp", "archive.gz", 0o644)
+            .await
+            .expect_err("a missing source must fail before contacting Docker");
         assert!(
             matches!(&err, ContainerUploadError::Source { path, .. } if path.contains("temps-upload-source")),
             "{err:?}"
@@ -382,16 +441,88 @@ mod tests {
     fn a_docker_side_failure_stays_an_upload_error() {
         let untouched = Mutex::new(None);
         let attributed = attribute_upload_failure(
-            ContainerUploadError::Timeout {
+            ContainerUploadError::Stalled {
                 container_id: "helper".into(),
                 dest_name: "archive.gz".into(),
                 size: 10,
-                timeout_secs: 1,
+                sent: 4,
+                stall_secs: 1,
             },
             &untouched,
             std::path::Path::new("/tmp/archive.gz"),
         );
-        assert!(matches!(attributed, ContainerUploadError::Timeout { .. }));
+        assert!(matches!(attributed, ContainerUploadError::Stalled { .. }));
+    }
+
+    /// Drain `stream` like the daemon would, taking one chunk every `pace`.
+    async fn drain_slowly<S>(stream: S, pace: Duration) -> u64
+    where
+        S: futures::Stream<Item = std::io::Result<bytes::Bytes>>,
+    {
+        use futures::StreamExt;
+        tokio::pin!(stream);
+        let mut taken = 0_u64;
+        while let Some(Ok(chunk)) = stream.next().await {
+            taken += chunk.len() as u64;
+            tokio::time::sleep(pace).await;
+        }
+        taken
+    }
+
+    #[tokio::test]
+    async fn a_slow_upload_that_keeps_moving_is_never_cut_off() {
+        let stall = Duration::from_millis(200);
+        let progress = UploadProgress::new();
+        // 12 chunks, one every 50ms: 600ms in total, three times the stall
+        // timeout, but never 200ms without progress.
+        let chunks = futures::stream::iter(
+            (0..12).map(|_| Ok::<_, std::io::Error>(bytes::Bytes::from_static(&[7_u8; 100]))),
+        );
+        let started = tokio::time::Instant::now();
+
+        let outcome = run_until_stalled(
+            drain_slowly(
+                track_progress(chunks, progress.clone()),
+                Duration::from_millis(50),
+            ),
+            &progress,
+            stall,
+        )
+        .await;
+
+        assert_eq!(outcome, Ok(1_200));
+        assert!(
+            started.elapsed() > stall * 2,
+            "the test must outlast the stall timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_upload_that_stops_moving_fails_with_the_bytes_sent() {
+        use futures::StreamExt;
+        let stall = Duration::from_millis(150);
+        let progress = UploadProgress::new();
+        // Two chunks, then the source never yields again.
+        let chunks = futures::stream::iter(
+            (0..2).map(|_| Ok::<_, std::io::Error>(bytes::Bytes::from_static(&[1_u8; 64]))),
+        )
+        .chain(futures::stream::pending());
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_until_stalled(
+                drain_slowly(
+                    track_progress(chunks, progress.clone()),
+                    Duration::from_millis(1),
+                ),
+                &progress,
+                stall,
+            ),
+        )
+        .await
+        .expect("a stalled upload must be abandoned, not hang");
+
+        assert_eq!(outcome, Err(128));
     }
 
     /// Both upload paths land the file, with its mode, in a container that
@@ -448,7 +579,6 @@ mod tests {
         let host_file = host_dir.path().join("archive.gz");
         let payload: Vec<u8> = (0..300_000).map(|i| (i % 251) as u8).collect();
         let wrote = std::fs::write(&host_file, &payload);
-        let timeout = std::time::Duration::from_secs(60);
 
         let file_upload = match wrote {
             Ok(()) => {
@@ -459,7 +589,6 @@ mod tests {
                     "/tmp",
                     "archive.gz",
                     0o644,
-                    timeout,
                 )
                 .await
             }
@@ -475,7 +604,6 @@ mod tests {
             "/tmp",
             "restore.yaml",
             0o600,
-            timeout,
         )
         .await;
 

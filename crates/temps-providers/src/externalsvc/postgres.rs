@@ -533,9 +533,6 @@ fn example_docker_image() -> &'static str {
 
 use super::port_util::{find_available_port, find_available_port_async, is_port_conflict_error};
 
-/// Upper bound for streaming a staged pg_dump file into the container.
-const LEGACY_RESTORE_UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
-
 pub struct PostgresService {
     name: String,
     config: Arc<RwLock<Option<PostgresConfig>>>,
@@ -1767,7 +1764,6 @@ impl PostgresService {
             "/",
             "backup.sql",
             0o644,
-            LEGACY_RESTORE_UPLOAD_TIMEOUT,
         )
         .await
         .map_err(|e| {
@@ -1829,7 +1825,6 @@ impl PostgresService {
             "/",
             "backup.pgdump",
             0o644,
-            LEGACY_RESTORE_UPLOAD_TIMEOUT,
         )
         .await
         .map_err(|e| {

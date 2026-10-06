@@ -1406,7 +1406,6 @@ impl MongodbService {
             "/tmp",
             "backup.gz",
             0o644,
-            MONGORESTORE_UPLOAD_TIMEOUT,
         )
         .await?;
         drop(staging);
@@ -1763,8 +1762,31 @@ const MONGO_SIDECAR_IMAGE: &str = "mongo:7.0";
 /// Directory inside the mongorestore sidecar that receives the uploaded
 /// archive and config file. Exists in every image; never bind-mounted.
 const MONGORESTORE_INPUT_DIR: &str = "/tmp";
-/// Upper bound for copying the archive into the sidecar.
-const MONGORESTORE_UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Create this restore's own staging directory under
+/// `<tmp>/temps-mongo-restore`. The returned guard deletes it when dropped,
+/// so the archive (or a partial one left by a failed download) is removed on
+/// every exit path, not only after the sidecar ran.
+fn new_restore_staging_dir() -> Result<tempfile::TempDir> {
+    let base = std::env::temp_dir().join("temps-mongo-restore");
+    std::fs::create_dir_all(&base).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to create restore staging root {}: {}",
+            base.display(),
+            e
+        )
+    })?;
+    tempfile::Builder::new()
+        .prefix("restore-")
+        .tempdir_in(&base)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to create restore staging dir under {}: {}",
+                base.display(),
+                e
+            )
+        })
+}
 
 impl MongodbService {
     /// Build the `MONGODB_*` env vars for a given per-tenant database name.
@@ -1963,7 +1985,6 @@ impl MongodbService {
                 MONGORESTORE_INPUT_DIR,
                 "restore.yaml",
                 0o600,
-                MONGORESTORE_UPLOAD_TIMEOUT,
             )
             .await?;
             super::container_upload::upload_file_to_container(
@@ -1973,7 +1994,6 @@ impl MongodbService {
                 MONGORESTORE_INPUT_DIR,
                 archive_filename,
                 0o644,
-                MONGORESTORE_UPLOAD_TIMEOUT,
             )
             .await
         }
@@ -3078,25 +3098,16 @@ impl ExternalService for MongodbService {
         // ── Download archive from S3 ────────────────────────────────────────
         // Each restore operation gets its own unique subdirectory so that
         // concurrent restores (different services, or the same service twice)
-        // cannot overwrite each other's archive file.  The whole directory is
-        // removed in the cleanup step below.
-        let restore_dir = std::env::temp_dir()
-            .join("temps-mongo-restore")
-            .join(uuid::Uuid::new_v4().to_string());
-        tokio::fs::create_dir_all(&restore_dir).await.map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to create restore temp dir {}: {}",
-                restore_dir.display(),
-                e
-            )
-        })?;
+        // cannot overwrite each other's archive file. The guard removes it on
+        // every exit path, including a download that fails part-way.
+        let restore_dir = new_restore_staging_dir()?;
 
         let archive_filename = std::path::Path::new(ctx.backup_location)
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("dump.archive")
             .to_string();
-        let host_archive_path = restore_dir.join(&archive_filename);
+        let host_archive_path = restore_dir.path().join(&archive_filename);
 
         // Streamed to disk: memory does not grow with the archive's size.
         let archive_size = super::restore_staging::download_s3_object_to_file(
@@ -3116,7 +3127,7 @@ impl ExternalService for MongodbService {
         // ── Run mongorestore sidecar ────────────────────────────────────────
         let result = self
             .run_mongorestore_sidecar(
-                &restore_dir,
+                restore_dir.path(),
                 &archive_filename,
                 &target_container,
                 &config.username,
@@ -3124,9 +3135,9 @@ impl ExternalService for MongodbService {
             )
             .await;
 
-        // Always clean up the unique temp directory (archive + credentials
-        // config file) even if the restore failed.
-        let _ = tokio::fs::remove_dir_all(&restore_dir).await;
+        // Remove the staging directory now rather than at the end of the
+        // function, whether or not the restore succeeded.
+        drop(restore_dir);
 
         result?;
 
@@ -3218,24 +3229,16 @@ impl ExternalService for MongodbService {
 
         // ── Download archive + run mongorestore ────────────────────────────
         // Each restore operation gets its own unique subdirectory so that
-        // concurrent restores cannot overwrite each other's archive file.
-        let restore_dir = std::env::temp_dir()
-            .join("temps-mongo-restore")
-            .join(uuid::Uuid::new_v4().to_string());
-        tokio::fs::create_dir_all(&restore_dir).await.map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to create restore temp dir {}: {}",
-                restore_dir.display(),
-                e
-            )
-        })?;
+        // concurrent restores cannot overwrite each other's archive file. The
+        // guard removes it on every exit path, including a failed download.
+        let restore_dir = new_restore_staging_dir()?;
 
         let archive_filename = std::path::Path::new(ctx.backup_location)
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("dump.archive")
             .to_string();
-        let host_archive_path = restore_dir.join(&archive_filename);
+        let host_archive_path = restore_dir.path().join(&archive_filename);
 
         // Streamed to disk: memory does not grow with the archive's size.
         let archive_size = super::restore_staging::download_s3_object_to_file(
@@ -3253,7 +3256,7 @@ impl ExternalService for MongodbService {
 
         let restore_result = new_service
             .run_mongorestore_sidecar(
-                &restore_dir,
+                restore_dir.path(),
                 &archive_filename,
                 &new_container,
                 &new_config.username,
@@ -3261,9 +3264,9 @@ impl ExternalService for MongodbService {
             )
             .await;
 
-        // Always clean up the unique temp directory (archive + credentials
-        // config file) even if the restore failed.
-        let _ = tokio::fs::remove_dir_all(&restore_dir).await;
+        // Remove the staging directory now rather than at the end of the
+        // function, whether or not the restore succeeded.
+        drop(restore_dir);
 
         restore_result?;
 
@@ -4128,22 +4131,33 @@ mod tests {
 
     #[test]
     fn test_restore_temp_dirs_are_unique_per_operation() {
-        // Each restore operation must compute a distinct temp directory so that
+        // Each restore operation must get a distinct staging directory so that
         // two concurrent restores targeting different services (or the same
         // service twice) cannot write to the same path and corrupt each other's
-        // downloaded archive.
-        //
-        // This mirrors the actual code path in `restore_in_place` and
-        // `restore_to_new_service`: each call generates a fresh UUID and appends
-        // it to the base directory.
-        let base = std::env::temp_dir().join("temps-mongo-restore");
-        let dir1 = base.join(uuid::Uuid::new_v4().to_string());
-        let dir2 = base.join(uuid::Uuid::new_v4().to_string());
+        // downloaded archive. `restore_in_place` and `restore_to_new_service`
+        // both stage through `new_restore_staging_dir`.
+        let first = new_restore_staging_dir().expect("first staging dir");
+        let second = new_restore_staging_dir().expect("second staging dir");
         assert_ne!(
-            dir1, dir2,
+            first.path(),
+            second.path(),
             "Two restore operations must produce distinct temp directories; \
              a shared path would allow concurrent restores to corrupt each other's archive"
         );
+        assert!(first.path().is_dir() && second.path().is_dir());
+    }
+
+    #[test]
+    fn test_restore_staging_dir_is_removed_with_a_partial_archive() {
+        // A download that fails part-way returns early with `?`; the partial
+        // archive must not outlive the restore and fill the host temp dir.
+        let staging = new_restore_staging_dir().expect("staging dir");
+        let dir = staging.path().to_path_buf();
+        std::fs::write(dir.join("dump.archive"), vec![0_u8; 4096]).expect("partial archive");
+
+        drop(staging);
+
+        assert!(!dir.exists(), "{} must be removed", dir.display());
     }
 
     #[test]
