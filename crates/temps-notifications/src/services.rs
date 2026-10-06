@@ -581,6 +581,33 @@ fn is_human_visible_metadata_key(
     true
 }
 
+/// Decide whether a metadata key becomes a Slack attachment field. Slack is
+/// read by people scanning a channel, where a raw database ID carries no
+/// meaning, so every `<prefix>_id` key is dropped — including ones without a
+/// readable twin. Producers that want an entity identified in Slack must send
+/// its `<prefix>_name` or `<prefix>_slug` (e.g. `project_slug`). The IDs still
+/// reach webhook payloads and persisted metadata for correlation.
+fn is_slack_visible_metadata_key(
+    key: &str,
+    metadata: &std::collections::HashMap<String, String>,
+) -> bool {
+    is_human_visible_metadata_key(key, metadata) && !key.ends_with("_id")
+}
+
+/// Turn a metadata key into a readable label: `project_slug` -> `Project Slug`.
+fn metadata_label(key: &str) -> String {
+    key.split('_')
+        .map(|w| {
+            let mut c = w.chars();
+            match c.next() {
+                None => String::new(),
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// HTML-encode the five characters that can break element structure or inject
 /// new tags when user-controlled text is interpolated into an HTML template.
 fn html_escape(s: &str) -> String {
@@ -1194,20 +1221,7 @@ impl EmailProvider {
             let rows: String = visible_metadata
                 .iter()
                 .map(|(k, v)| {
-                    // Format key: replace underscores with spaces and title-case
-                    let label = k
-                        .split('_')
-                        .map(|w| {
-                            let mut c = w.chars();
-                            match c.next() {
-                                None => String::new(),
-                                Some(f) => {
-                                    f.to_uppercase().collect::<String>() + c.as_str()
-                                }
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" ");
+                    let label = metadata_label(k);
                     format!(
                         r#"<tr>
                             <td style="padding: 8px 12px; color: #6b7280; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; font-size: 13px; white-space: nowrap; vertical-align: top;">{}</td>
@@ -1540,10 +1554,10 @@ impl NotificationProvider for SlackProvider {
         let metadata_fields = notification
             .metadata
             .iter()
-            .filter(|(k, _)| is_human_visible_metadata_key(k, &notification.metadata))
+            .filter(|(k, _)| is_slack_visible_metadata_key(k, &notification.metadata))
             .map(|(k, v)| {
                 serde_json::json!({
-                    "title": slack_escape(k),
+                    "title": slack_escape(&metadata_label(k)),
                     "value": slack_escape(v),
                     "short": true
                 })
@@ -5084,7 +5098,86 @@ FOR EACH ROW EXECUTE FUNCTION reject_notification_route_assignment()
     }
 
     #[test]
-    fn slack_send_omits_ids_with_readable_twins_but_keeps_others() {
+    fn metadata_label_title_cases_words() {
+        assert_eq!(metadata_label("project_slug"), "Project Slug");
+        assert_eq!(metadata_label("branch"), "Branch");
+    }
+
+    #[test]
+    fn slack_visible_metadata_drops_every_id_key() {
+        let notification = Notification {
+            id: "test-outage".to_string(),
+            title: "Monitor is down".to_string(),
+            message: "Monitor 'prod' is down".to_string(),
+            notification_type: NotificationType::Error,
+            priority: NotificationPriority::High,
+            severity: None,
+            timestamp: Utc::now(),
+            metadata: vec![
+                ("monitor_id".to_string(), "22".to_string()),
+                ("monitor_name".to_string(), "production Monitor".to_string()),
+                ("project_id".to_string(), "19".to_string()),
+                ("project_slug".to_string(), "my-app".to_string()),
+                ("incident_id".to_string(), "5".to_string()),
+                ("_chart_svg".to_string(), "<svg/>".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            bypass_throttling: false,
+        };
+
+        let visible_keys: std::collections::HashSet<&str> = notification
+            .metadata
+            .iter()
+            .filter(|(k, _)| is_slack_visible_metadata_key(k, &notification.metadata))
+            .map(|(k, _)| k.as_str())
+            .collect();
+
+        assert_eq!(
+            visible_keys,
+            ["monitor_name", "project_slug"].into_iter().collect()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_slack_send_shows_project_slug_instead_of_ids() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let provider = SlackProvider {
+            webhook_url: server.uri(),
+            channel: None,
+        };
+
+        // Same metadata shape an HTTP/expiry check alert sends.
+        let notification = Notification::new(
+            "Expiry check 'Example endpoint' failed",
+            "Certificate 'svc.example.test' expired.",
+        )
+        .with_metadata("project_id", "2")
+        .with_metadata("project_slug", "checkout-api")
+        .with_metadata("http_check_id", "72");
+
+        provider.send(&notification).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let fields = body["attachments"][0]["fields"].as_array().unwrap();
+        assert_eq!(fields.len(), 1, "only the project slug is shown: {body}");
+        assert_eq!(fields[0]["title"], "Project Slug");
+        assert_eq!(fields[0]["value"], "checkout-api");
+    }
+
+    #[test]
+    fn human_visible_metadata_omits_ids_with_readable_twins_but_keeps_others() {
         let notification = Notification {
             id: "test-outage".to_string(),
             title: "Monitor is down".to_string(),

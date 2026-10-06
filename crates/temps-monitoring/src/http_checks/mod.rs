@@ -704,6 +704,44 @@ impl HttpChecksService {
                 .map(|f| f.message.as_str())
                 .collect::<Vec<_>>()
                 .join(" ");
+            // Human-facing channels render the project by slug; the numeric
+            // IDs stay in the metadata for webhook correlation only. The lookup
+            // is bounded so a stalled read can't hold the check past its lease,
+            // and a failed one falls back to a project reference rather than
+            // leaving the alert with no project at all.
+            let project_slug = match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                projects::Entity::find_by_id(row.project_id).one(self.db.as_ref()),
+            )
+            .await
+            {
+                Ok(Ok(Some(project))) => project.slug,
+                Ok(Ok(None)) => {
+                    tracing::warn!(
+                        project_id = row.project_id,
+                        check_id = row.id,
+                        "Project not found while resolving slug for HTTP check notification"
+                    );
+                    format!("project #{}", row.project_id)
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        project_id = row.project_id,
+                        check_id = row.id,
+                        error = %e,
+                        "Failed to look up project slug for HTTP check notification"
+                    );
+                    format!("project #{}", row.project_id)
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        project_id = row.project_id,
+                        check_id = row.id,
+                        "Project slug lookup for HTTP check notification timed out after 5s"
+                    );
+                    format!("project #{}", row.project_id)
+                }
+            };
             let kind_label = match CheckKind::from_stored(&row.kind) {
                 Some(CheckKind::Local) => "Expiry",
                 Some(CheckKind::Http) | None => "HTTP",
@@ -723,6 +761,7 @@ impl HttpChecksService {
                 },
                 metadata: [
                     ("project_id".into(), row.project_id.to_string()),
+                    ("project_slug".into(), project_slug),
                     ("http_check_id".into(), row.id.to_string()),
                 ]
                 .into(),
@@ -1142,6 +1181,58 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].title, "Expiry check 'Example endpoint' warning");
         assert!(sent[0].message.contains("expires within 7 days"));
+        // The mock has no project row queued, so the slug lookup fails: the
+        // alert must still go out and still say which project it is about.
+        assert_eq!(
+            sent[0].metadata.get("project_slug").map(String::as_str),
+            Some("project #10")
+        );
+    }
+    #[tokio::test]
+    async fn alerts_name_the_project_by_slug_and_keep_ids_for_correlation() {
+        let mut service = service(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![crate::outage::tests::make_project_model(
+                    10,
+                    "checkout-api",
+                )]])
+                .append_exec_results([
+                    MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1,
+                    },
+                    MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1,
+                    },
+                ]),
+        );
+        let notifications = Arc::new(RecordingNotifications(Default::default()));
+        service.notifications = notifications.clone();
+        service.transport = Arc::new(NoNetwork);
+        let mut record = row();
+        record.kind = "local".into();
+        record.encrypted_spec = service
+            .encryption
+            .encrypt_string(&serde_json::to_string(&LocalCheckSpec::default()).unwrap())
+            .unwrap();
+        record.encrypted_credential = Some(
+            service
+                .encryption
+                .encrypt_string(&certificate_pem(5))
+                .unwrap(),
+        );
+        record.lease_token = Some("test-lease".into());
+        service.execute(record).await.unwrap();
+        let sent = notifications.0.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        let metadata = &sent[0].metadata;
+        assert_eq!(
+            metadata.get("project_slug").map(String::as_str),
+            Some("checkout-api")
+        );
+        assert_eq!(metadata.get("project_id").map(String::as_str), Some("10"));
+        assert_eq!(metadata.get("http_check_id").map(String::as_str), Some("1"));
     }
     #[test]
     fn views_report_kind_and_secret_and_reject_unknown_kinds() {
