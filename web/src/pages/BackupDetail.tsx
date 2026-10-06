@@ -48,6 +48,7 @@ import { listBackupChildrenOptions } from '@/lib/backup-children'
 import { deleteBackup } from '@/lib/backup-cleanup'
 import { cancelBackup } from '@/lib/schedule-runs'
 import { cn } from '@/lib/utils'
+import { restoreBackupHref } from '@/pages/service-restore/restore-selection'
 import {
   Button,
   Callout,
@@ -72,6 +73,7 @@ import {
   FileArchive,
   HardDrive,
   Loader2,
+  RotateCcw,
   Trash2,
   XCircle,
 } from 'lucide-react'
@@ -472,6 +474,21 @@ export function BackupDetail() {
           <>
             {backAction}
             <CopyAction value={backup.s3_location}>Copy S3 path</CopyAction>
+            {/* Restore — a completed backup of a database opens that
+              database's restore page with this backup already selected. */}
+            {state === 'completed' && backup.external_service && sourceId ? (
+              <Button variant="outline" size="sm" className="gap-2" asChild>
+                <Link
+                  to={restoreBackupHref(backup.external_service.id, {
+                    sourceId,
+                    backupId: backup.id,
+                  })}
+                >
+                  <RotateCcw className="h-4 w-4" />
+                  Restore this backup
+                </Link>
+              </Button>
+            ) : null}
             {/* Cancel — only live backups can be cancelled. Soft cancel:
               the DB row flips immediately + the engine sees the
               cancellation token on its next heartbeat tick. */}

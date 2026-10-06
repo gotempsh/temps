@@ -7,6 +7,7 @@
 //! - `GET  /external-services/{id}/restore-runs`
 //! - `POST /external-services/{id}/restore`
 //! - `GET  /restore-runs/{id}`
+//! - `POST /restore-runs/{id}/cancel`
 
 use axum::{
     extract::{Extension, Path, State},
@@ -25,11 +26,11 @@ use temps_core::SensitiveAction;
 use tracing::{error, warn};
 use utoipa::{OpenApi, ToSchema};
 
-use crate::handlers::audit::{AuditContext, RestoreRunAudit};
+use crate::handlers::audit::{AuditContext, RestoreRunAudit, RestoreRunCancelledAudit};
 use crate::handlers::types::BackupAppState;
 use crate::services::{
-    PlanSourceBackup, PlanTarget, RestoreError, RestorePlan, RestoreRequestMode, RestoreRunView,
-    RestoreService,
+    PlanSourceBackup, PlanTarget, RestoreError, RestorePlan, RestoreRequestMode,
+    RestoreRunSourceBackup, RestoreRunView, RestoreService,
 };
 use temps_providers::externalsvc::{RecoveryTarget, RestoreCapabilities};
 
@@ -58,6 +59,26 @@ impl From<RestoreError> for Problem {
                     .with_detail(error.to_string())
                     .with_value("active_restore_run_id", restore_run_id)
             }
+            RestoreError::RestoreNotActive { ref status, .. } => {
+                let status = status.clone();
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_type("https://temps.sh/probs/restore-not-active")
+                    .with_title("Restore Already Finished")
+                    .with_detail(error.to_string())
+                    .with_value("run_status", status)
+            }
+            RestoreError::RestoreNotCancellable { ref phase, .. } => {
+                let phase = phase.clone();
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_type("https://temps.sh/probs/restore-not-cancellable")
+                    .with_title("Restore Can No Longer Be Cancelled")
+                    .with_detail(error.to_string())
+                    .with_value("phase", phase)
+            }
+            RestoreError::Cancelled { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_type("https://temps.sh/probs/restore-cancelled")
+                .with_title("Restore Cancelled")
+                .with_detail(error.to_string()),
             RestoreError::BackupHasNoService { .. }
             | RestoreError::Validation { .. }
             | RestoreError::UnsupportedMode { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
@@ -84,6 +105,7 @@ impl From<RestoreError> for Problem {
         list_restore_runs_for_service,
         start_restore,
         get_restore_run,
+        cancel_restore_run,
         plan_restore,
     ),
     components(
@@ -93,6 +115,7 @@ impl From<RestoreError> for Problem {
             RecoveryTarget,
             RestoreCapabilities,
             RestoreRunView,
+            RestoreRunSourceBackup,
             RestoreCapabilitiesResponse,
             RestorePlan,
             PlanTarget,
@@ -566,9 +589,27 @@ async fn get_restore_run(
         .get_restore_run(id)
         .await
         .map_err(Problem::from)?;
+    require_restore_run_read_access(&app_state, &auth, &run, "read a restore run").await?;
 
+    Ok(Json(run))
+}
+
+/// Authorize reading `run`: the caller must reach its target service, any
+/// service it created, and every service that produced its backup. A run
+/// over a raw S3 location or an ownerless (control-plane) backup is
+/// administrators-only. Shared by every endpoint that returns a run.
+async fn require_restore_run_read_access(
+    app_state: &BackupAppState,
+    auth: &temps_auth::AuthContext,
+    run: &RestoreRunView,
+    operation: &str,
+) -> Result<(), Problem> {
     if run.source_backup_id <= 0 {
-        require_ownerless_restore_admin(&app_state, &auth, "read a raw-location restore run")?;
+        require_ownerless_restore_admin(
+            app_state,
+            auth,
+            &format!("{operation} that reads a raw backup location"),
+        )?;
     }
 
     let mut related_service_ids = vec![run.source_service_id];
@@ -596,16 +637,94 @@ async fn get_restore_run(
         related_service_ids.extend(producer_service_ids);
     }
     require_services_access(
-        &app_state,
-        &auth,
+        app_state,
+        auth,
         &related_service_ids,
         Permission::BackupsRead,
         "restore run services",
-        "read restore run",
+        operation,
     )
     .await?;
 
-    Ok(Json(run))
+    Ok(())
+}
+
+#[utoipa::path(
+    tag = "Restore",
+    post,
+    path = "/restore-runs/{id}/cancel",
+    params(("id" = i32, Path, description = "Restore run id")),
+    responses(
+        (status = 200, description = "Restore run cancelled before it wrote any data. The returned run is `cancelled` and its target was not modified.", body = RestoreRunView),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 404, description = "Restore run not found", body = ProblemDetails),
+        (status = 409, description = "Conflict: the run already finished (`restore-not-active`, with `run_status`), or it has started writing data and can no longer be stopped safely (`restore-not-cancellable`, with `phase`). A run is only cancellable while its phase is `prepare`.", body = ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn cancel_restore_run(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<BackupAppState>>,
+    Path(id): Path<i32>,
+    Extension(metadata): Extension<RequestMetadata>,
+) -> Result<impl IntoResponse, Problem> {
+    // Cancelling changes what happens to the target service, so it needs the
+    // same write access as starting an in-place restore on it.
+    permission_guard!(auth, BackupsWrite);
+    permission_guard!(auth, ExternalServicesWrite);
+
+    let run = app_state
+        .restore_service
+        .get_restore_run(id)
+        .await
+        .map_err(Problem::from)?;
+    require_restore_run_read_access(&app_state, &auth, &run, "cancel a restore run").await?;
+    require_service_access(
+        &app_state,
+        &auth,
+        run.source_service_id,
+        Permission::ExternalServicesWrite,
+        "target service",
+        "cancel restore run",
+    )
+    .await?;
+
+    let target_service = app_state
+        .restore_service
+        .get_service_identity(run.source_service_id)
+        .await
+        .map_err(Problem::from)?;
+
+    let cancelled = app_state
+        .restore_service
+        .cancel_restore_run(id)
+        .await
+        .map_err(Problem::from)?;
+
+    let audit = RestoreRunCancelledAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        restore_run_id: cancelled.id,
+        service_id: target_service.id,
+        service_name: target_service.name,
+        service_type: target_service.service_type,
+        source_backup_id: cancelled.source_backup_id,
+        mode: cancelled.mode.clone(),
+        target_service_name: cancelled.target_service_name.clone(),
+        phase: cancelled.phase.clone(),
+    };
+    if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+        error!(
+            "Failed to create audit log for cancelling restore run {}: {}",
+            cancelled.id, e
+        );
+    }
+
+    Ok(Json(cancelled))
 }
 
 /// Authorize the *source* of a restore: what the caller is about to read.
@@ -784,6 +903,7 @@ pub fn configure_routes() -> Router<Arc<BackupAppState>> {
         .route("/external-services/{id}/restore-plan", post(plan_restore))
         .route("/external-services/{id}/restore", post(start_restore))
         .route("/restore-runs/{id}", get(get_restore_run))
+        .route("/restore-runs/{id}/cancel", post(cancel_restore_run))
 }
 
 #[cfg(test)]
@@ -811,6 +931,53 @@ mod tests {
     fn status_for(err: RestoreError) -> StatusCode {
         let p: Problem = err.into();
         p.status_code
+    }
+
+    /// A cancel request the server refuses is a conflict the client can
+    /// explain: the run already finished, or it is writing data and will run
+    /// to completion. Both carry the field the console renders.
+    #[test]
+    fn cancellation_refusals_map_to_typed_409s() {
+        let problem: Problem = RestoreError::RestoreNotCancellable {
+            restore_run_id: 42,
+            phase: "restore".to_string(),
+        }
+        .into();
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert_eq!(
+            problem.body.get("type").and_then(|t| t.as_str()),
+            Some("https://temps.sh/probs/restore-not-cancellable")
+        );
+        assert_eq!(
+            problem.body.get("phase").and_then(|p| p.as_str()),
+            Some("restore")
+        );
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|d| d.as_str())
+            .unwrap_or_default();
+        assert!(detail.contains("Restore run 42"), "{detail}");
+
+        let problem: Problem = RestoreError::RestoreNotActive {
+            restore_run_id: 42,
+            status: "completed".to_string(),
+        }
+        .into();
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert_eq!(
+            problem.body.get("type").and_then(|t| t.as_str()),
+            Some("https://temps.sh/probs/restore-not-active")
+        );
+        assert_eq!(
+            problem.body.get("run_status").and_then(|s| s.as_str()),
+            Some("completed")
+        );
+
+        assert_eq!(
+            status_for(RestoreError::Cancelled { restore_run_id: 42 }),
+            StatusCode::CONFLICT
+        );
     }
 
     #[test]
