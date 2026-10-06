@@ -11,8 +11,43 @@
 //! container works wherever the daemon is, and streams, so memory does not
 //! depend on file size.
 
-use anyhow::Result;
 use bollard::Docker;
+
+/// Why a file could not be put into a container.
+#[derive(Debug, thiserror::Error)]
+pub enum ContainerUploadError {
+    /// The host-side source file could not be opened or read.
+    #[error("Failed to read upload source '{path}': {reason}")]
+    Source { path: String, reason: String },
+
+    /// The destination file name cannot be encoded in a tar header.
+    #[error("Invalid upload file name '{name}': {reason}")]
+    InvalidName { name: String, reason: String },
+
+    /// The Docker daemon did not finish the upload in time.
+    #[error(
+        "Timed out after {timeout_secs}s uploading '{dest_name}' ({size} bytes) into \
+         container {container_id}"
+    )]
+    Timeout {
+        container_id: String,
+        dest_name: String,
+        size: u64,
+        timeout_secs: u64,
+    },
+
+    /// The Docker daemon rejected or aborted the upload.
+    #[error(
+        "Failed to upload '{dest_name}' ({size} bytes) into {container_id}:{dest_dir}: {reason}"
+    )]
+    Upload {
+        container_id: String,
+        dest_dir: String,
+        dest_name: String,
+        size: u64,
+        reason: String,
+    },
+}
 
 /// Read size when streaming a host file into a container upload.
 const UPLOAD_CHUNK_BYTES: usize = 256 * 1024;
@@ -26,7 +61,10 @@ pub(crate) fn single_file_tar_stream<S>(
     size: u64,
     mode: u32,
     body: S,
-) -> Result<impl futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static>
+) -> Result<
+    impl futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static,
+    ContainerUploadError,
+>
 where
     S: futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static,
 {
@@ -35,7 +73,10 @@ where
     let mut header = tar::Header::new_gnu();
     header
         .set_path(name)
-        .map_err(|e| anyhow::anyhow!("Invalid upload file name '{}': {}", name, e))?;
+        .map_err(|e| ContainerUploadError::InvalidName {
+            name: name.to_string(),
+            reason: e.to_string(),
+        })?;
     header.set_size(size);
     header.set_mode(mode);
     header.set_mtime(
@@ -64,7 +105,7 @@ async fn upload_tar_stream<S>(
     size: u64,
     timeout: std::time::Duration,
     tar_stream: S,
-) -> Result<()>
+) -> Result<(), ContainerUploadError>
 where
     S: futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static,
 {
@@ -80,24 +121,18 @@ where
         ),
     )
     .await
-    .map_err(|_| {
-        anyhow::anyhow!(
-            "Timed out after {:?} uploading {} ({} bytes) into container {}",
-            timeout,
-            dest_name,
-            size,
-            container_id
-        )
+    .map_err(|_| ContainerUploadError::Timeout {
+        container_id: container_id.to_string(),
+        dest_name: dest_name.to_string(),
+        size,
+        timeout_secs: timeout.as_secs(),
     })?
-    .map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to upload {} bytes into {}:{}/{}: {}",
-            size,
-            container_id,
-            dest_dir,
-            dest_name,
-            e
-        )
+    .map_err(|e| ContainerUploadError::Upload {
+        container_id: container_id.to_string(),
+        dest_dir: dest_dir.to_string(),
+        dest_name: dest_name.to_string(),
+        size,
+        reason: e.to_string(),
     })
 }
 
@@ -113,15 +148,15 @@ pub(crate) async fn upload_file_to_container(
     dest_name: &str,
     mode: u32,
     timeout: std::time::Duration,
-) -> Result<()> {
+) -> Result<(), ContainerUploadError> {
+    let source_error = |e: std::io::Error| ContainerUploadError::Source {
+        path: host_path.display().to_string(),
+        reason: e.to_string(),
+    };
     let file = tokio::fs::File::open(host_path)
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to open {} for upload: {}", host_path.display(), e))?;
-    let size = file
-        .metadata()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to stat {}: {}", host_path.display(), e))?
-        .len();
+        .map_err(source_error)?;
+    let size = file.metadata().await.map_err(source_error)?.len();
     let body = futures::stream::try_unfold((file, size), |(mut file, remaining)| async move {
         use tokio::io::AsyncReadExt;
         if remaining == 0 {
@@ -146,7 +181,6 @@ pub(crate) async fn upload_file_to_container(
         tar_stream,
     )
     .await
-    .map_err(|e| anyhow::anyhow!("{} (source {})", e, host_path.display()))
 }
 
 /// Upload a small in-memory file (e.g. a credentials file) into a container
@@ -159,7 +193,7 @@ pub(crate) async fn upload_bytes_to_container(
     dest_name: &str,
     mode: u32,
     timeout: std::time::Duration,
-) -> Result<()> {
+) -> Result<(), ContainerUploadError> {
     let size = contents.len() as u64;
     let body = futures::stream::once(async move { Ok(bytes::Bytes::from(contents)) });
     let tar_stream = single_file_tar_stream(dest_name, size, mode, body)?;
@@ -222,6 +256,33 @@ mod tests {
             drop(entry);
             assert!(entries.next().is_none(), "size {size}: extra entries");
         }
+    }
+
+    #[tokio::test]
+    async fn a_missing_source_is_a_typed_source_error() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(docker) => docker,
+            Err(_) => {
+                println!("Docker client unavailable, skipping");
+                return;
+            }
+        };
+        let missing = std::path::Path::new("/nonexistent/temps-upload-source.gz");
+        let err = upload_file_to_container(
+            &docker,
+            "unused",
+            missing,
+            "/tmp",
+            "archive.gz",
+            0o644,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect_err("a missing source must fail before contacting Docker");
+        assert!(
+            matches!(&err, ContainerUploadError::Source { path, .. } if path.contains("temps-upload-source")),
+            "{err:?}"
+        );
     }
 
     /// Both upload paths land the file, with its mode, in a container that
@@ -293,7 +354,10 @@ mod tests {
                 )
                 .await
             }
-            Err(e) => Err(anyhow::anyhow!("write host file: {e}")),
+            Err(e) => Err(ContainerUploadError::Source {
+                path: host_file.display().to_string(),
+                reason: e.to_string(),
+            }),
         };
         let bytes_upload = upload_bytes_to_container(
             &docker,

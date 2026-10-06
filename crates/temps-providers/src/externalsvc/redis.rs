@@ -1694,7 +1694,7 @@ impl RedisService {
                         e
                     )
                 }),
-            Err(e) => Err(e),
+            Err(e) => Err(anyhow::Error::from(e)),
         };
         if let Err(e) = prepared {
             let _ = self
