@@ -56,17 +56,22 @@ pub struct MigrateCommand {
     #[arg(long, short = 'y')]
     pub yes: bool,
 
-    /// Data directory of the installation (same as `temps serve`). The
-    /// automatic pre-migration backup is written to
+    /// Data directory of the installation (same as `temps serve`). With
+    /// `--pre-migration-backup` the backup is written to
     /// `<data dir>/backups/pre-migration/`. Defaults to `~/.temps`.
     #[arg(long, env = "TEMPS_DATA_DIR")]
     pub data_dir: Option<std::path::PathBuf>,
 
-    /// Apply the migrations WITHOUT first taking the automatic pre-migration
-    /// backup. Without this flag, migrating an existing database first dumps
-    /// it to `<data dir>/backups/pre-migration/` and nothing is applied if
-    /// that dump fails. Use only after taking your own backup.
-    #[arg(long)]
+    /// Before applying the migrations, dump the database to
+    /// `<data dir>/backups/pre-migration/` so you can roll back to the
+    /// previous release; nothing is applied if that dump fails. Off by
+    /// default.
+    #[arg(long, conflicts_with = "skip_pre_migration_backup")]
+    pub pre_migration_backup: bool,
+
+    /// No-op, kept so existing scripts keep working: the pre-migration
+    /// backup is now off unless `--pre-migration-backup` is passed.
+    #[arg(long, hide = true)]
     pub skip_pre_migration_backup: bool,
 
     /// Log level (trace, debug, info, warn, error)
@@ -324,16 +329,7 @@ impl MigrateCommand {
             // to the plan and before the first migration is applied.
             let data_dir = resolve_data_dir(self.data_dir.as_deref())?;
             if !use_json {
-                if self.skip_pre_migration_backup {
-                    println!(
-                        "{}",
-                        format!(
-                            "! Skipping the automatic pre-migration backup ({}).",
-                            crate::commands::schema_upgrade::SKIP_BACKUP_FLAG
-                        )
-                        .yellow()
-                    );
-                } else {
+                if self.pre_migration_backup {
                     println!(
                         "{}",
                         format!(
@@ -343,15 +339,22 @@ impl MigrateCommand {
                         )
                         .dimmed()
                     );
+                } else {
+                    println!(
+                        "{}",
+                        format!(
+                            "Migrating without a pre-migration backup (pass {} to take one).",
+                            crate::commands::schema_upgrade::BACKUP_FLAG
+                        )
+                        .dimmed()
+                    );
                 }
             }
             let prepared = crate::commands::schema_upgrade::prepare_schema_upgrade(
                 &db,
                 &self.database_url,
                 &data_dir,
-                crate::commands::schema_upgrade::BackupPolicy::from_skip_flag(
-                    self.skip_pre_migration_backup,
-                ),
+                crate::commands::schema_upgrade::BackupPolicy::from_flag(self.pre_migration_backup),
             )
             .await
             .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -946,5 +949,36 @@ mod tests {
     async fn maintenance_race_returns_completed_work() {
         let result = race_maintenance(std::future::ready(42), std::future::pending::<()>()).await;
         assert!(matches!(result, MaintenanceRace::Completed(42)));
+    }
+
+    #[derive(clap::Parser)]
+    struct Cli {
+        #[command(flatten)]
+        migrate: super::MigrateCommand,
+    }
+
+    fn parse(extra: &[&str]) -> Result<super::MigrateCommand, clap::Error> {
+        use clap::Parser;
+        let mut args = vec!["temps", "--database-url", "postgres://localhost/temps"];
+        args.extend_from_slice(extra);
+        Cli::try_parse_from(args).map(|cli| cli.migrate)
+    }
+
+    #[test]
+    fn the_pre_migration_backup_is_opt_in() {
+        let default = parse(&[]).expect("no flags parse");
+        assert!(!default.pre_migration_backup);
+        let enabled = parse(&["--pre-migration-backup"]).expect("opt-in parses");
+        assert!(enabled.pre_migration_backup);
+    }
+
+    #[test]
+    fn the_retired_skip_flag_is_still_accepted() {
+        let skipped = parse(&["--skip-pre-migration-backup"]).expect("old scripts keep working");
+        assert!(!skipped.pre_migration_backup);
+        assert!(
+            parse(&["--pre-migration-backup", "--skip-pre-migration-backup"]).is_err(),
+            "asking for and against the backup at once must be rejected"
+        );
     }
 }

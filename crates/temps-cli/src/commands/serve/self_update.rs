@@ -90,6 +90,8 @@ pub struct BinarySelfUpdater {
     /// Database URL passed explicitly to the migrate child process so it works
     /// even when the parent was started with `--database-url` (not the env var).
     database_url: String,
+    /// `temps serve --pre-migration-backup`, forwarded to the migrate child.
+    pre_migration_backup: bool,
 }
 
 impl BinarySelfUpdater {
@@ -108,6 +110,7 @@ impl BinarySelfUpdater {
         topology_caveat: Option<String>,
         update_status: Arc<UpdateStatusSlot>,
         database_url: String,
+        pre_migration_backup: bool,
     ) -> Self {
         let binary_path = std::env::current_exe()
             .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
@@ -133,6 +136,7 @@ impl BinarySelfUpdater {
             update_status,
             state: Arc::new(RwLock::new(UpdaterState::default())),
             database_url,
+            pre_migration_backup,
         };
 
         let last_attempt = updater.reconcile_journal();
@@ -507,6 +511,7 @@ impl SelfUpdater for BinarySelfUpdater {
             channel,
             state: self.state.clone(),
             database_url: self.database_url.clone(),
+            pre_migration_backup: self.pre_migration_backup.then(|| self.data_dir.clone()),
         };
         tokio::spawn(job.run());
 
@@ -600,6 +605,9 @@ struct UpdateJob {
     /// guaranteed to be in its environment regardless of how the parent
     /// received it (flag vs env var).
     database_url: String,
+    /// Data dir to pass with `--pre-migration-backup` to the migrate child,
+    /// when `temps serve` was started with that flag.
+    pre_migration_backup: Option<PathBuf>,
 }
 
 /// Failure discriminator for `UpdateJob::execute`.
@@ -990,10 +998,18 @@ impl UpdateJob {
             migrations_total: self.state.read().ok().and_then(|s| s.migrations_total),
         };
 
-        let mut child = tokio::process::Command::new(&self.binary_path)
+        let mut command = tokio::process::Command::new(&self.binary_path);
+        command
             .arg("migrate")
             .arg("--yes")
-            .arg("--progress-format=json")
+            .arg("--progress-format=json");
+        if let Some(data_dir) = &self.pre_migration_backup {
+            command
+                .arg(crate::commands::schema_upgrade::BACKUP_FLAG)
+                .arg("--data-dir")
+                .arg(data_dir);
+        }
+        let mut child = command
             // Explicit env set: if the parent received the DB URL as a
             // `--database-url` flag it is not in the environment, so a naive
             // child spawn would fail clap's required-arg check.
@@ -1420,6 +1436,7 @@ mod tests {
             // Tests don't exercise the migrate subprocess, so the URL value
             // doesn't matter — it only needs to be present in the struct.
             database_url: String::new(),
+            pre_migration_backup: false,
         }
     }
 

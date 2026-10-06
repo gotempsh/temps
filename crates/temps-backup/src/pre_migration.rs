@@ -77,6 +77,15 @@ const ENGINE_LABEL: &str = "pre_migration";
 const MAX_STDERR_BYTES: usize = 4096;
 /// Where `pg_dump` writes inside the one-shot container.
 const CONTAINER_DUMP_PATH: &str = "/tmp/temps-pre-migration.dump";
+/// Label marking the one-shot `pg_dump` containers.
+const CONTAINER_KIND_LABEL: &str = "sh.temps.kind";
+const CONTAINER_KIND: &str = "pre-migration-backup";
+/// Label recording which backup directory a container writes for, so the
+/// orphan cleanup never touches another installation's dump on a shared
+/// Docker daemon.
+const CONTAINER_DIR_LABEL: &str = "sh.temps.pre-migration-backup-dir";
+/// Bound on finding and removing orphaned dump containers.
+const ORPHAN_CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// libpq URI query parameters forwarded to `pg_dump`. Anything else in the
 /// Temps database URL (driver-specific options) is not a libpq parameter and
@@ -259,6 +268,7 @@ pub async fn create_pre_migration_backup(
     // cleanup, writing and retention so another process cannot unlink our dump.
     let _backup_lock = acquire_backup_lock(&dir)?;
     remove_incomplete_backups(&dir);
+    remove_orphaned_containers(&dir).await;
 
     let server_version_num = read_server_version_num(request.db).await?;
     let server_major = server_major(server_version_num);
@@ -515,6 +525,126 @@ fn remove_incomplete_backups(dir: &Path) {
     }
 }
 
+/// Remove `pg_dump` containers left running by an interrupted backup.
+///
+/// Stopping Temps mid-backup (Ctrl+C, a supervisor kill) ends this process
+/// but not the container it started, and that `pg_dump` keeps an
+/// `ACCESS SHARE` lock on every table it dumps. The next migration that
+/// alters one of them then fails with `canceling statement due to lock
+/// timeout`. Call this before migrating, whether or not a backup will be
+/// taken.
+///
+/// Best effort and never fails: it does nothing when no backup was ever
+/// taken here, when another process holds the backup lock (its container is
+/// not an orphan), or when Docker is unreachable.
+pub async fn remove_orphaned_pre_migration_backup_containers(data_dir: &Path) {
+    let dir = pre_migration_backup_dir(data_dir);
+    if !dir.is_dir() {
+        return;
+    }
+    let _backup_lock = match acquire_backup_lock(&dir) {
+        Ok(lock) => lock,
+        Err(error) => {
+            debug!(
+                dir = %dir.display(),
+                "Not checking for orphaned pre-migration backup containers: {error}"
+            );
+            return;
+        }
+    };
+    remove_orphaned_containers(&dir).await;
+}
+
+/// Only called while holding the backup lock, so no live backup of this
+/// directory owns a container.
+async fn remove_orphaned_containers(dir: &Path) {
+    let dir_label = dir.display().to_string();
+    match tokio::time::timeout(
+        ORPHAN_CLEANUP_TIMEOUT,
+        remove_orphaned_containers_inner(&dir_label),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(reason)) => debug!(
+            dir = %dir_label,
+            "Could not check for orphaned pre-migration backup containers: {reason}"
+        ),
+        Err(_) => warn!(
+            dir = %dir_label,
+            timeout_secs = ORPHAN_CLEANUP_TIMEOUT.as_secs(),
+            "Timed out removing orphaned pre-migration backup containers; if a migration \
+             fails with a lock timeout, remove them with `docker rm -f $(docker ps -aq \
+             --filter label={CONTAINER_KIND_LABEL}={CONTAINER_KIND})`"
+        ),
+    }
+}
+
+async fn remove_orphaned_containers_inner(dir_label: &str) -> Result<(), String> {
+    let docker = bollard::Docker::connect_with_local_defaults()
+        .map_err(|error| format!("cannot connect to the Docker daemon: {error}"))?;
+    let filters = std::collections::HashMap::from([(
+        "label".to_string(),
+        vec![format!("{CONTAINER_KIND_LABEL}={CONTAINER_KIND}")],
+    )]);
+    let containers = docker
+        .list_containers(Some(
+            bollard::query_parameters::ListContainersOptionsBuilder::new()
+                .all(true)
+                .filters(&filters)
+                .build(),
+        ))
+        .await
+        .map_err(|error| format!("listing containers failed: {error}"))?;
+    for container in containers {
+        let owner = container
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(CONTAINER_DIR_LABEL));
+        if !is_orphan_of(owner.map(String::as_str), dir_label) {
+            continue;
+        }
+        let Some(id) = container.id else { continue };
+        let name = container
+            .names
+            .and_then(|names| names.into_iter().next())
+            .unwrap_or_else(|| id.clone());
+        match docker
+            .remove_container(
+                &id,
+                Some(
+                    bollard::query_parameters::RemoveContainerOptionsBuilder::new()
+                        .force(true)
+                        .build(),
+                ),
+            )
+            .await
+        {
+            Ok(()) => warn!(
+                container = %name,
+                state = ?container.state,
+                dir = %dir_label,
+                "Removed a pre-migration backup container left behind by an interrupted \
+                 backup; its pg_dump would have blocked the migrations"
+            ),
+            Err(error) => warn!(
+                container = %name,
+                dir = %dir_label,
+                "Could not remove an orphaned pre-migration backup container; if a migration \
+                 fails with a lock timeout, remove it with `docker rm -f {name}`: {error}"
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Whether a dump container belongs to this backup directory. Containers
+/// from before the directory label existed carry none and are claimed too:
+/// the only process that ever ran them is an interrupted backup.
+fn is_orphan_of(owner_dir: Option<&str>, dir: &str) -> bool {
+    owner_dir.is_none_or(|owner| owner == dir)
+}
+
 fn restrict_file_permissions(path: &Path) {
     #[cfg(unix)]
     {
@@ -767,10 +897,10 @@ async fn run_docker_pg_dump(
 
     let name = format!("temps-pre-migration-backup-{}", uuid::Uuid::new_v4());
     let mut labels = std::collections::HashMap::new();
-    labels.insert(
-        "sh.temps.kind".to_string(),
-        "pre-migration-backup".to_string(),
-    );
+    labels.insert(CONTAINER_KIND_LABEL.to_string(), CONTAINER_KIND.to_string());
+    if let Some(dir) = partial_path.parent() {
+        labels.insert(CONTAINER_DIR_LABEL.to_string(), dir.display().to_string());
+    }
     let body = bollard::models::ContainerCreateBody {
         image: Some(image.to_string()),
         entrypoint: Some(vec!["pg_dump".to_string()]),
@@ -1268,5 +1398,28 @@ mod tests {
         assert!(message.contains("PostgreSQL 18"), "{message}");
         assert!(message.contains("no pg_dump on PATH"), "{message}");
         assert!(message.contains("postgres:18"), "{message}");
+    }
+
+    #[test]
+    fn orphan_cleanup_only_claims_containers_of_this_directory() {
+        let dir = "/srv/temps/backups/pre-migration";
+        assert!(is_orphan_of(Some(dir), dir));
+        // Written before the directory label existed.
+        assert!(is_orphan_of(None, dir));
+        // Another installation sharing the Docker daemon.
+        assert!(!is_orphan_of(
+            Some("/home/other/.temps/backups/pre-migration"),
+            dir
+        ));
+    }
+
+    #[tokio::test]
+    async fn orphan_cleanup_is_a_no_op_where_no_backup_was_ever_taken() {
+        let data_dir = std::env::temp_dir().join(format!("temps-orphans-{}", uuid::Uuid::new_v4()));
+        remove_orphaned_pre_migration_backup_containers(&data_dir).await;
+        assert!(
+            !pre_migration_backup_dir(&data_dir).exists(),
+            "the cleanup must not create the backup directory"
+        );
     }
 }
