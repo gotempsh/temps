@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::types::{Notification, NotificationPriority, NotificationSeverity, NotificationType};
-use crate::NotificationRoutingService;
+use crate::{
+    NotificationRouteError, NotificationRouteTestResult, NotificationRoutingService,
+    RouteTestDelivery, RouteTestDeliveryStatus,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -2416,6 +2419,87 @@ impl NotificationService {
                 provider_id
             ))
         }
+    }
+
+    /// Whether Temps Cloud delivers notifications in addition to the routed
+    /// providers. When it does, every notification reaches someone even with
+    /// no provider configured locally.
+    pub fn cloud_notifications_enabled(&self) -> bool {
+        self.cloud
+            .as_ref()
+            .is_some_and(|cloud| cloud.notifications_enabled())
+    }
+
+    /// Sends a sample notification through one route: once to each provider
+    /// assigned to it, at the lowest severity the route matches. Per-provider
+    /// failures are reported in the result rather than failing the call, so
+    /// the operator can see which destination is broken.
+    pub async fn test_route(
+        &self,
+        route_id: i32,
+    ) -> std::result::Result<NotificationRouteTestResult, NotificationRouteError> {
+        let (route, providers) = self.routing_service.route_with_providers(route_id).await?;
+        let severity = NotificationRoutingService::parse_severity(&route.min_severity)?;
+        let notification = Notification::new(
+            format!("Temps test notification: route \"{}\"", route.name),
+            "This is a test alert sent through a notification route from your Temps notification settings. No action is required.",
+        )
+        .with_severity(severity);
+
+        let mut deliveries = Vec::with_capacity(providers.len());
+        for provider in providers {
+            let (status, message) = if !provider.enabled {
+                (
+                    RouteTestDeliveryStatus::SkippedDisabled,
+                    Some("Provider is disabled, so real notifications skip it too".to_string()),
+                )
+            } else {
+                match self.load_provider(&provider).await {
+                    Ok(loaded) => match loaded.send(&notification).await {
+                        Ok(()) => (RouteTestDeliveryStatus::Sent, None),
+                        Err(error) => {
+                            tracing::warn!(
+                                route_id,
+                                provider_id = provider.id,
+                                error = %error,
+                                "Route test notification failed to deliver"
+                            );
+                            (
+                                RouteTestDeliveryStatus::Failed,
+                                Some(format!("Delivery failed: {error}")),
+                            )
+                        }
+                    },
+                    Err(error) => {
+                        tracing::warn!(
+                            route_id,
+                            provider_id = provider.id,
+                            error = %error,
+                            "Route test could not load provider configuration"
+                        );
+                        (
+                            RouteTestDeliveryStatus::Failed,
+                            Some(format!("Provider configuration could not be loaded: {error}")),
+                        )
+                    }
+                }
+            };
+            deliveries.push(RouteTestDelivery {
+                provider_id: provider.id,
+                provider_name: provider.name,
+                provider_type: provider.provider_type,
+                status,
+                message,
+            });
+        }
+
+        Ok(NotificationRouteTestResult {
+            route_id: route.id,
+            route_name: route.name,
+            route_enabled: route.enabled,
+            severity: severity.as_str().to_string(),
+            deliveries,
+        })
     }
 
     // Add a method to clean up old notifications

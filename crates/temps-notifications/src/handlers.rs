@@ -3,8 +3,9 @@
 
 use crate::digest::DigestService;
 use crate::routing::{
-    CreateNotificationRoute, NotificationRoute, NotificationRouteError, NotificationRoutePage,
-    NotificationRoutingService, UpdateNotificationRoute,
+    CreateNotificationRoute, NotificationRoute, NotificationRouteCoverage, NotificationRouteError,
+    NotificationRoutePage, NotificationRouteTestResult, NotificationRoutingService,
+    RouteTestDelivery, RouteTestDeliveryStatus, UpdateNotificationRoute,
 };
 use crate::services::{
     NotificationPreferences, NotificationPreferencesService, NotificationProviderConfigMergeError,
@@ -182,6 +183,8 @@ fn make_audit_context(auth: &temps_auth::AuthContext, metadata: &RequestMetadata
         create_notification_route,
         update_notification_route,
         delete_notification_route,
+        get_notification_delivery_coverage,
+        test_notification_route,
         create_slack_provider,
         create_notification_email_provider,
         create_webhook_provider,
@@ -205,6 +208,10 @@ fn make_audit_context(auth: &temps_auth::AuthContext, metadata: &RequestMetadata
             NotificationRoutePage,
             CreateNotificationRouteRequest,
             UpdateNotificationRouteRequest,
+            NotificationDeliveryCoverageResponse,
+            NotificationRouteTestResult,
+            RouteTestDelivery,
+            RouteTestDeliveryStatus,
             SensitiveConfigValueResponse,
             SlackConfig,
             EmailConfig,
@@ -1980,6 +1987,9 @@ fn notification_route_problem(error: NotificationRouteError) -> Problem {
         | NotificationRouteError::ProviderNotFound { .. } => {
             (StatusCode::BAD_REQUEST, "Invalid notification route")
         }
+        NotificationRouteError::InvalidSeverity { .. } => {
+            (StatusCode::BAD_REQUEST, "Invalid notification severity")
+        }
         NotificationRouteError::RouteNotFound { .. } => {
             (StatusCode::NOT_FOUND, "Notification route not found")
         }
@@ -2185,11 +2195,151 @@ async fn delete_notification_route(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct NotificationDeliveryCoverageQuery {
+    /// Severity of the notification to check: debug, info, warning, error,
+    /// critical or emergency.
+    pub severity: String,
+}
+
+/// Whether a notification of one severity would reach anyone, with the
+/// console page that fixes it when it would not.
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct NotificationDeliveryCoverageResponse {
+    pub severity: String,
+    /// Whether at least one destination would receive the notification.
+    pub configured: bool,
+    /// Enabled routes whose severity range contains `severity`.
+    pub route_ids: Vec<i32>,
+    /// Enabled providers those routes deliver to.
+    pub provider_ids: Vec<i32>,
+    /// Whether Temps Cloud also delivers notifications from this instance.
+    pub cloud_delivery: bool,
+    /// Why nothing would be delivered, when `configured` is false.
+    pub reason: Option<String>,
+    /// Console path that fixes the gap, when `configured` is false.
+    pub setup_path: Option<String>,
+}
+
+fn delivery_coverage_response(
+    coverage: NotificationRouteCoverage,
+    cloud_delivery: bool,
+) -> NotificationDeliveryCoverageResponse {
+    let configured = cloud_delivery || !coverage.provider_ids.is_empty();
+    let (reason, setup_path) = if configured {
+        (None, None)
+    } else if !coverage.any_provider_configured {
+        (
+            Some("No notification provider is configured".to_string()),
+            Some("/settings/notifications/new".to_string()),
+        )
+    } else {
+        (
+            Some(format!(
+                "No enabled notification route sends {} notifications to an enabled provider",
+                coverage.severity
+            )),
+            Some("/settings/notifications?tab=routes".to_string()),
+        )
+    };
+    NotificationDeliveryCoverageResponse {
+        severity: coverage.severity,
+        configured,
+        route_ids: coverage.route_ids,
+        provider_ids: coverage.provider_ids,
+        cloud_delivery,
+        reason,
+        setup_path,
+    }
+}
+
+/// Check whether a notification of the given severity would be delivered
+#[utoipa::path(
+    get,
+    path = "/notification-routes/coverage",
+    params(NotificationDeliveryCoverageQuery),
+    responses(
+        (status = 200, description = "Delivery coverage for the severity", body = NotificationDeliveryCoverageResponse),
+        (status = 400, description = "Invalid severity", body = temps_core::problemdetails::ProblemDetails),
+        (status = 401, description = "Unauthorized", body = temps_core::problemdetails::ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = temps_core::problemdetails::ProblemDetails),
+        (status = 500, description = "Internal server error", body = temps_core::problemdetails::ProblemDetails)
+    ),
+    tag = "Notification Routes",
+    security(("bearer_auth" = []))
+)]
+async fn get_notification_delivery_coverage(
+    State(app_state): State<Arc<NotificationState>>,
+    RequireAuth(auth): RequireAuth,
+    Query(query): Query<NotificationDeliveryCoverageQuery>,
+) -> Result<Json<NotificationDeliveryCoverageResponse>, Problem> {
+    permission_guard!(auth, NotificationProvidersRead);
+    let severity = NotificationRoutingService::parse_severity(&query.severity)
+        .map_err(notification_route_problem)?;
+    let coverage = app_state
+        .notification_routing_service
+        .coverage(severity)
+        .await
+        .map_err(notification_route_problem)?;
+    Ok(Json(delivery_coverage_response(
+        coverage,
+        app_state.notification_service.cloud_notifications_enabled(),
+    )))
+}
+
+/// Send a test notification through a route to each of its providers
+#[utoipa::path(
+    post,
+    path = "/notification-routes/{id}/test",
+    params(("id" = i32, Path, description = "Route ID")),
+    responses(
+        (status = 200, description = "Per-provider test results", body = NotificationRouteTestResult),
+        (status = 401, description = "Unauthorized", body = temps_core::problemdetails::ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = temps_core::problemdetails::ProblemDetails),
+        (status = 404, description = "Route not found", body = temps_core::problemdetails::ProblemDetails),
+        (status = 500, description = "Internal server error", body = temps_core::problemdetails::ProblemDetails)
+    ),
+    tag = "Notification Routes",
+    security(("bearer_auth" = []))
+)]
+async fn test_notification_route(
+    State(app_state): State<Arc<NotificationState>>,
+    Path(id): Path<i32>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+) -> Result<Json<NotificationRouteTestResult>, Problem> {
+    // Sends real messages to every destination on the route, like the
+    // provider test, so it requires write.
+    permission_guard!(auth, NotificationProvidersWrite);
+    let result = app_state
+        .notification_service
+        .test_route(id)
+        .await
+        .map_err(notification_route_problem)?;
+    let audit = NotificationRouteAudit {
+        context: make_audit_context(&auth, &metadata),
+        route_id: id,
+        action: "NOTIFICATION_ROUTE_TESTED".to_string(),
+    };
+    if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
+        tracing::error!(route_id = id, error = %error, "Failed to audit notification route test");
+    }
+    Ok(Json(result))
+}
+
 pub fn configure_routes() -> Router<Arc<NotificationState>> {
     Router::new()
         .route(
             "/notification-routes",
             get(list_notification_routes).post(create_notification_route),
+        )
+        .route(
+            "/notification-routes/coverage",
+            get(get_notification_delivery_coverage),
+        )
+        .route(
+            "/notification-routes/{id}/test",
+            post(test_notification_route),
         )
         .route(
             "/notification-routes/{id}",
@@ -2834,6 +2984,165 @@ mod tests {
             "The notification route operation could not be completed"
         );
         assert!(!body.to_string().contains("secret schema detail"));
+    }
+
+    fn coverage(
+        route_ids: Vec<i32>,
+        provider_ids: Vec<i32>,
+        any_provider_configured: bool,
+    ) -> NotificationRouteCoverage {
+        NotificationRouteCoverage {
+            severity: "warning".to_string(),
+            route_ids,
+            provider_ids,
+            any_provider_configured,
+        }
+    }
+
+    #[test]
+    fn delivery_coverage_without_providers_onboards_to_add_provider() {
+        let response = delivery_coverage_response(coverage(vec![], vec![], false), false);
+        assert!(!response.configured);
+        assert_eq!(
+            response.reason.as_deref(),
+            Some("No notification provider is configured")
+        );
+        assert_eq!(
+            response.setup_path.as_deref(),
+            Some("/settings/notifications/new")
+        );
+    }
+
+    #[test]
+    fn delivery_coverage_with_unrouted_severity_points_at_routes() {
+        // A provider exists but no enabled route delivers warnings to an
+        // enabled provider (e.g. the only route is critical-only).
+        let response = delivery_coverage_response(coverage(vec![3], vec![], true), false);
+        assert!(!response.configured);
+        assert_eq!(
+            response.reason.as_deref(),
+            Some("No enabled notification route sends warning notifications to an enabled provider")
+        );
+        assert_eq!(
+            response.setup_path.as_deref(),
+            Some("/settings/notifications?tab=routes")
+        );
+    }
+
+    #[test]
+    fn delivery_coverage_with_routed_provider_is_configured() {
+        let response = delivery_coverage_response(coverage(vec![3], vec![7], true), false);
+        assert!(response.configured);
+        assert_eq!(response.route_ids, vec![3]);
+        assert_eq!(response.provider_ids, vec![7]);
+        assert!(response.reason.is_none());
+        assert!(response.setup_path.is_none());
+    }
+
+    #[test]
+    fn delivery_coverage_counts_cloud_delivery_as_configured() {
+        let response = delivery_coverage_response(coverage(vec![], vec![], false), true);
+        assert!(response.configured);
+        assert!(response.cloud_delivery);
+        assert!(response.reason.is_none());
+    }
+
+    #[test]
+    fn invalid_coverage_severity_maps_to_bad_request() {
+        let error = NotificationRoutingService::parse_severity("loud")
+            .expect_err("unknown severity must be rejected");
+        let problem = notification_route_problem(error);
+        let body = serde_json::to_value(&problem.body).expect("problem body should serialize");
+        assert_eq!(problem.into_response().status(), StatusCode::BAD_REQUEST);
+        assert!(body["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("'loud'")));
+    }
+
+    #[tokio::test]
+    async fn notification_route_test_and_coverage_require_auth(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let setup = test_setup_or_skip!();
+        for (method, uri) in [
+            ("POST", "/notification-routes/1/test"),
+            ("GET", "/notification-routes/coverage?severity=warning"),
+        ] {
+            let app = configure_routes().with_state(setup.notification_state.clone());
+            let request = Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::empty())?;
+            let response = app.oneshot(request).await?;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri} must require authentication"
+            );
+        }
+        setup.cleanup().await?;
+        Ok(())
+    }
+
+    // Sends a real message through a route via Mailpit and checks that a
+    // disabled provider on the same route is reported, not silently dropped.
+    #[tokio::test]
+    async fn test_route_reports_each_provider_outcome() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let setup = test_setup_or_skip!();
+        let service = &setup.notification_state.notification_service;
+        let routing = &setup.notification_state.notification_routing_service;
+        let email_config = serde_json::to_value(setup.create_test_email_config())?;
+        let enabled = service
+            .add_provider(
+                "Mailpit route test".to_string(),
+                "email".to_string(),
+                email_config.clone(),
+                true,
+            )
+            .await?;
+        let disabled = service
+            .add_provider(
+                "Disabled route test".to_string(),
+                "email".to_string(),
+                email_config,
+                false,
+            )
+            .await?;
+        let route = routing
+            .create(CreateNotificationRoute {
+                name: "Errors and above".to_string(),
+                enabled: false,
+                min_severity: "error".to_string(),
+                max_severity: "emergency".to_string(),
+                provider_ids: vec![enabled.id, disabled.id],
+            })
+            .await?;
+
+        let result = service.test_route(route.id).await?;
+        assert_eq!(result.route_id, route.id);
+        assert!(!result.route_enabled, "disabled routes can still be tested");
+        assert_eq!(result.severity, "error");
+        assert_eq!(result.deliveries.len(), 2);
+        let outcome = |provider_id: i32| {
+            result
+                .deliveries
+                .iter()
+                .find(|delivery| delivery.provider_id == provider_id)
+                .map(|delivery| delivery.status)
+        };
+        assert_eq!(outcome(enabled.id), Some(RouteTestDeliveryStatus::Sent));
+        assert_eq!(
+            outcome(disabled.id),
+            Some(RouteTestDeliveryStatus::SkippedDisabled)
+        );
+
+        assert!(matches!(
+            service.test_route(i32::MAX).await,
+            Err(NotificationRouteError::RouteNotFound { route_id }) if route_id == i32::MAX
+        ));
+
+        setup.cleanup().await?;
+        Ok(())
     }
 
     // Integration test that actually sends an email through Mailpit

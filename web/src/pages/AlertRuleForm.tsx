@@ -37,12 +37,16 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowLeft } from 'lucide-react'
-import { useMemo } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
-import { useParams } from 'react-router'
+import { useLocation, useNavigate, useParams } from 'react-router'
 import { useGoBack } from '@/hooks/useGoBack'
 import { toast } from 'sonner'
 import { z } from 'zod'
+import { NotificationCoverageNotice } from '@/components/monitoring/NotificationCoverageNotice'
+import { clearFormDraft, readFormDraft, saveFormDraft } from '@/lib/form-draft'
+import { errorRulePrioritySeverity } from '@/lib/notification-severity'
+import { isReturnFromSetup } from '@/lib/safe-return-to'
 
 const TRIGGER_TYPES = [
   {
@@ -115,13 +119,43 @@ function needsConfig(triggerType: string): boolean {
 
 interface AlertRuleFormProps {
   projectId: number
+  /** Shown on the form so it is clear the rule only covers this project. */
+  projectName?: string
 }
 
-export function AlertRuleForm({ projectId }: AlertRuleFormProps) {
+const NEW_RULE_DEFAULTS: AlertRuleFormData = {
+  name: '',
+  trigger_type: 'new_issue',
+  trigger_config: {},
+  cooldown_minutes: 60,
+  notification_priority: 'High',
+  environment_filter: null,
+  error_level_filter: null,
+  enabled: true,
+}
+
+export function AlertRuleForm({ projectId, projectName }: AlertRuleFormProps) {
   const queryClient = useQueryClient()
   const { ruleId, slug } = useParams()
-  const goBack = useGoBack(`/projects/${slug}/errors/alert-rules`)
+  const listPath = `/projects/${slug}/errors/alert-rules`
+  const historyBack = useGoBack(listPath)
+  const navigate = useNavigate()
+  const location = useLocation()
+  // After a detour to set up notifications, history holds the setup pages;
+  // leave for the rule list rather than stepping back into them.
+  const returnedFromSetup = isReturnFromSetup(location.state)
+  const goBack = () =>
+    returnedFromSetup ? navigate(listPath, { replace: true }) : historyBack()
   const isEditing = !!ruleId
+  // A new rule's unsaved fields survive a detour to add a notification
+  // provider (which returns here via `returnTo`).
+  const draftKey = `error-alert-rule:${projectId}:new`
+  const [draft] = useState(() =>
+    isEditing ? null : alertRuleSchema.safeParse(readFormDraft(draftKey))
+  )
+  useEffect(() => {
+    if (!isEditing) clearFormDraft(draftKey)
+  }, [draftKey, isEditing])
 
   const { data: existingRule, isLoading: ruleLoading } = useQuery({
     ...getAlertRuleOptions({
@@ -151,17 +185,8 @@ export function AlertRuleForm({ projectId }: AlertRuleFormProps) {
         enabled: existingRule.enabled,
       }
     }
-    return {
-      name: '',
-      trigger_type: 'new_issue',
-      trigger_config: {},
-      cooldown_minutes: 60,
-      notification_priority: 'High',
-      environment_filter: null,
-      error_level_filter: null,
-      enabled: true,
-    }
-  }, [existingRule])
+    return draft?.success ? draft.data : NEW_RULE_DEFAULTS
+  }, [existingRule, draft])
 
   const form = useForm<AlertRuleFormData>({
     resolver: zodResolver(alertRuleSchema),
@@ -172,12 +197,17 @@ export function AlertRuleForm({ projectId }: AlertRuleFormProps) {
     control: form.control,
     name: 'trigger_type',
   })
+  const watchedPriority = useWatch({
+    control: form.control,
+    name: 'notification_priority',
+  })
 
   const createMutation = useMutation({
     ...createAlertRuleMutation(),
     meta: { errorTitle: 'Failed to create alert rule' },
     onSuccess: () => {
       toast.success('Alert rule created')
+      clearFormDraft(draftKey)
       queryClient.invalidateQueries({
         predicate: (query) =>
           (query.queryKey[0] as Record<string, unknown>)?._id ===
@@ -264,7 +294,18 @@ export function AlertRuleForm({ projectId }: AlertRuleFormProps) {
           <p className="text-sm text-muted-foreground">
             {isEditing
               ? 'Update the alert rule configuration.'
-              : 'Configure a new error alert rule.'}
+              : 'Configure a new error alert rule.'}{' '}
+            {projectName ? (
+              <>
+                Applies only to errors in project{' '}
+                <span className="font-medium text-foreground">
+                  {projectName}
+                </span>
+                .
+              </>
+            ) : (
+              'Applies only to errors in this project.'
+            )}
           </p>
         </div>
       </div>
@@ -276,7 +317,15 @@ export function AlertRuleForm({ projectId }: AlertRuleFormProps) {
             Define when and how this alert should fire.
           </CardDescription>
         </CardHeader>
-        <CardContent>
+        <CardContent className="space-y-6">
+          <NotificationCoverageNotice
+            severity={errorRulePrioritySeverity(watchedPriority)}
+            onLeave={
+              isEditing
+                ? undefined
+                : () => saveFormDraft(draftKey, form.getValues())
+            }
+          />
           <Form {...form}>
             <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-6">
               <FormField

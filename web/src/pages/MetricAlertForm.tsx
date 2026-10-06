@@ -95,8 +95,11 @@ import {
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
-import { Link, useNavigate, useParams } from 'react-router'
+import { Link, useLocation, useNavigate, useParams } from 'react-router'
 import { useGoBack } from '@/hooks/useGoBack'
+import { NotificationCoverageNotice } from '@/components/monitoring/NotificationCoverageNotice'
+import { clearFormDraft, readFormDraft, saveFormDraft } from '@/lib/form-draft'
+import { isReturnFromSetup } from '@/lib/safe-return-to'
 import { toast } from 'sonner'
 import { z } from 'zod'
 
@@ -224,8 +227,24 @@ function AlertFormBody({
   existing,
 }: AlertFormBodyProps) {
   const navigate = useNavigate()
-  const goBack = useGoBack(`/projects/${project.slug}/metrics/alerts`)
+  const location = useLocation()
+  const listPath = `/projects/${project.slug}/metrics/alerts`
+  const historyBack = useGoBack(listPath)
+  // After a detour to set up notifications, history holds the setup pages;
+  // leave for the alert list rather than stepping back into them.
+  const returnedFromSetup = isReturnFromSetup(location.state)
+  const goBack = () =>
+    returnedFromSetup ? navigate(listPath, { replace: true }) : historyBack()
   const queryClient = useQueryClient()
+  // A new alert's unsaved fields survive a detour to add a notification
+  // provider (which returns here via `returnTo`).
+  const draftKey = `metric-alert:${project.id}:new`
+  const [draft] = useState(() =>
+    isEditing ? null : alertSchema.safeParse(readFormDraft(draftKey))
+  )
+  useEffect(() => {
+    if (!isEditing) clearFormDraft(draftKey)
+  }, [draftKey, isEditing])
 
   const namesQuery = useQuery({
     ...listMetricNamesOptions({ path: { project_id: project.id } }),
@@ -284,8 +303,8 @@ function AlertFormBody({
         grouped_notification_threshold: existing.grouped_notification_threshold,
       }
     }
-    return emptyDefaults()
-  }, [existing])
+    return draft?.success ? draft.data : emptyDefaults()
+  }, [existing, draft])
 
   // `defaultValues` (mount-once), not `values`: this body is remounted via `key`
   // when the edited rule loads, so the form never resets a Select post-mount.
@@ -321,6 +340,7 @@ function AlertFormBody({
   const deviations = useWatch({ control: form.control, name: 'deviations' })
   const direction = useWatch({ control: form.control, name: 'direction' })
   const seasonality = useWatch({ control: form.control, name: 'seasonality' })
+  const watchedSeverity = useWatch({ control: form.control, name: 'severity' })
   const alarmsBasePath = '/monitoring/alarms'
 
   // "Scope" (label filters + break-down/per-series settings) is the least
@@ -435,11 +455,12 @@ function AlertFormBody({
     meta: { errorTitle: 'Failed to create alert rule' },
     onSuccess: () => {
       toast.success('Alert rule created')
+      clearFormDraft(draftKey)
       queryClient.invalidateQueries({
         predicate: (query) =>
           (query.queryKey[0] as Record<string, unknown>)?._id === 'listAlerts',
       })
-      navigate('..')
+      navigate(listPath, { replace: returnedFromSetup })
     },
   })
 
@@ -551,7 +572,10 @@ function AlertFormBody({
           <p className="text-sm text-muted-foreground">
             {isEditing
               ? 'Update the signal, threshold, and notification settings.'
-              : 'Fire a notification when a metric crosses a threshold.'}
+              : 'Fire a notification when a metric crosses a threshold.'}{' '}
+            Watches metrics from project{' '}
+            <span className="font-medium text-foreground">{project.name}</span>{' '}
+            only.
           </p>
         </div>
       </div>
@@ -653,6 +677,15 @@ function AlertFormBody({
           projectName={project.name}
         />
       )}
+
+      <NotificationCoverageNotice
+        severity={watchedSeverity}
+        onLeave={
+          isEditing
+            ? undefined
+            : () => saveFormDraft(draftKey, form.getValues())
+        }
+      />
 
       <Form {...form}>
         <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-6">
@@ -1331,8 +1364,8 @@ function AlertFormBody({
                     </Select>
                     <FormDescription>
                       Maps to the notification severity. Alerts are delivered
-                      through the notification channels configured for this
-                      project.
+                      through notification routes, which apply to all projects;
+                      routes match on this severity.
                     </FormDescription>
                     <FormMessage />
                   </FormItem>

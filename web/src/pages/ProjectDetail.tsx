@@ -860,11 +860,21 @@ export function ProjectDetail() {
               />
               <Route
                 path="errors/alert-rules/new"
-                element={<AlertRuleForm projectId={project.id} />}
+                element={
+                  <AlertRuleForm
+                    projectId={project.id}
+                    projectName={project.name}
+                  />
+                }
               />
               <Route
                 path="errors/alert-rules/:ruleId/edit"
-                element={<AlertRuleForm projectId={project.id} />}
+                element={
+                  <AlertRuleForm
+                    projectId={project.id}
+                    projectName={project.name}
+                  />
+                }
               />
               <Route
                 path="errors/:errorGroupId"

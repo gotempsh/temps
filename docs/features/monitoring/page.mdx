@@ -163,6 +163,25 @@ def health():
 
 ---
 
+## Alert Notifications
+
+Alerts reach people through two instance-wide pieces and one per-project piece:
+
+- **Providers** (Settings → Notifications → Providers) are destinations: email, Slack, webhook, or Cloudflare Email. They apply to **all projects**. Adding a provider also creates a route that sends it every notification.
+- **Routes** (Settings → Notifications → Routes) decide which severities go to which providers. They also apply to **all projects**.
+- **Alert rules** (a project's error alert rules and metric alerts, or Monitoring → Alert rules with a project picked) belong to **one project**. A rule fires at a severity, and every enabled route whose range contains that severity delivers it.
+
+When you create or edit an alert rule, the form checks whether its severity would reach anyone. If no enabled route sends that severity to an enabled provider, it shows **"This rule won't notify anyone yet"** with a link to add a provider or review routes. Setup pages reached from that link bring you back to the form afterwards, and a new rule keeps what you had typed.
+
+To confirm delivery:
+
+- After adding a provider, use **Send test notification** on the final step of the wizard.
+- On the routes list or a route's edit page, use **Test route**. It sends a sample notification at the route's lowest severity to each provider on the route and reports, for each one, whether it was sent, failed, or skipped because the provider is disabled.
+
+Monitoring → **Delivery preferences** holds instance-wide preferences (minimum severity, batching, the weekly digest). It does not configure destinations. Slack messages are sent by a Slack provider, so there is no webhook URL to enter there.
+
+---
+
 ## Monitoring Best Practices
 
 <Properties>

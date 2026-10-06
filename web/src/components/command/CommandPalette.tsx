@@ -300,6 +300,12 @@ const mainNavItems: NavigationItem[] = [
     keywords: ['metrics', 'resources', 'alerts', 'alarms', 'health'],
   },
   {
+    title: 'Delivery preferences',
+    url: '/monitoring/notifications',
+    icon: Gauge,
+    keywords: ['notification', 'preferences', 'severity', 'digest', 'email'],
+  },
+  {
     title: 'Proxy',
     url: '/proxy',
     icon: Activity,

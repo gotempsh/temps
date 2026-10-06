@@ -37,6 +37,7 @@ import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { Bell, EllipsisVertical } from 'lucide-react'
 import { useNavigate } from 'react-router'
+import { withReturnTo } from '@/lib/safe-return-to'
 import { useMemo, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
@@ -73,8 +74,16 @@ interface ExtendedNotificationProvider extends NotificationProviderResponse {
   }
 }
 
-export function ProvidersManagement() {
+interface ProvidersManagementProps {
+  /** Forwarded to the add-provider wizard so it returns to the task. */
+  returnTo?: string | null
+}
+
+export function ProvidersManagement({
+  returnTo = null,
+}: ProvidersManagementProps = {}) {
   const navigate = useNavigate()
+  const addProviderHref = withReturnTo('/settings/notifications/new', returnTo)
   const [editingProvider, setEditingProvider] =
     useState<ExtendedNotificationProvider | null>(null)
   const [isEditDialogOpen, setIsEditDialogOpen] = useState(false)
@@ -334,12 +343,16 @@ export function ProvidersManagement() {
   )
   return (
     <div className="space-y-4">
-      <div className="flex justify-end">
+      <div className="flex items-center justify-between gap-4">
+        <p className="text-sm text-muted-foreground">
+          Providers apply to all projects. A route decides which alerts reach
+          each one.
+        </p>
         {/* Only one of this and the empty-state button is ever mounted, so
             the `N` shortcut is registered exactly once either way. */}
         {hasProviders && (
           <CreateActionButton
-            onClick={() => navigate('/settings/notifications/new')}
+            onClick={() => navigate(addProviderHref)}
             label="Add Provider"
           />
         )}
@@ -352,7 +365,7 @@ export function ProvidersManagement() {
           description="Add your first notification provider to start receiving alerts about your deployments and infrastructure."
           action={
             <CreateActionButton
-              onClick={() => navigate('/settings/notifications/new')}
+              onClick={() => navigate(addProviderHref)}
               label="Add Provider"
             />
           }

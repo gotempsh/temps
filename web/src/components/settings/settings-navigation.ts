@@ -63,7 +63,12 @@ export const settingsNavigationGroups: SettingsNavigationGroup[] = [
     items: [
       { title: 'Platform', url: '/settings', icon: Settings2 },
       { title: 'Version', url: '/settings/version', icon: ArrowUpCircle },
-      { title: 'Notifications', url: '/settings/notifications', icon: Bell },
+      {
+        title: 'Notifications',
+        url: '/settings/notifications',
+        icon: Bell,
+        keywords: ['providers', 'routes', 'slack', 'email', 'webhook'],
+      },
       { title: 'Temps Cloud', url: '/settings/cloud', icon: Cloud },
       {
         title: 'Telemetry',
