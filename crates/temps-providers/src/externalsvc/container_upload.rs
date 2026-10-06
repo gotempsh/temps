@@ -11,6 +11,8 @@
 //! container works wherever the daemon is, and streams, so memory does not
 //! depend on file size.
 
+use std::sync::{Arc, Mutex};
+
 use bollard::Docker;
 
 /// Why a file could not be put into a container.
@@ -157,21 +159,12 @@ pub(crate) async fn upload_file_to_container(
         .await
         .map_err(source_error)?;
     let size = file.metadata().await.map_err(source_error)?.len();
-    let body = futures::stream::try_unfold((file, size), |(mut file, remaining)| async move {
-        use tokio::io::AsyncReadExt;
-        if remaining == 0 {
-            return Ok(None);
-        }
-        let want = remaining.min(UPLOAD_CHUNK_BYTES as u64) as usize;
-        let mut buf = vec![0_u8; want];
-        file.read_exact(&mut buf).await?;
-        Ok(Some((
-            bytes::Bytes::from(buf),
-            (file, remaining - want as u64),
-        )))
-    });
+    // A read error on the host file mid-stream reaches the daemon as an
+    // aborted upload; remember it so it is reported as what it is.
+    let source_failure = Arc::new(Mutex::new(None));
+    let body = file_chunks(file, size, Arc::clone(&source_failure));
     let tar_stream = single_file_tar_stream(dest_name, size, mode, body)?;
-    upload_tar_stream(
+    let uploaded = upload_tar_stream(
         docker,
         container_id,
         dest_dir,
@@ -180,7 +173,59 @@ pub(crate) async fn upload_file_to_container(
         timeout,
         tar_stream,
     )
-    .await
+    .await;
+    uploaded.map_err(|error| attribute_upload_failure(error, &source_failure, host_path))
+}
+
+/// Stream `size` bytes of `file` in chunks. A read failure is recorded in
+/// `failure` (as well as ending the stream) so the caller can tell a bad
+/// source from a Docker-side failure.
+fn file_chunks(
+    file: tokio::fs::File,
+    size: u64,
+    failure: Arc<Mutex<Option<String>>>,
+) -> impl futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static {
+    futures::stream::try_unfold(
+        (file, size, failure),
+        |(mut file, remaining, failure)| async move {
+            use tokio::io::AsyncReadExt;
+            if remaining == 0 {
+                return Ok(None);
+            }
+            let want = remaining.min(UPLOAD_CHUNK_BYTES as u64) as usize;
+            let mut buf = vec![0_u8; want];
+            if let Err(e) = file.read_exact(&mut buf).await {
+                if let Ok(mut slot) = failure.lock() {
+                    *slot = Some(format!(
+                        "read failed with {} bytes still expected: {}",
+                        remaining, e
+                    ));
+                }
+                return Err(e);
+            }
+            Ok(Some((
+                bytes::Bytes::from(buf),
+                (file, remaining - want as u64, failure),
+            )))
+        },
+    )
+}
+
+/// Report a failed upload as a source error when reading the host file is
+/// what broke it, so the message names the file instead of the daemon.
+fn attribute_upload_failure(
+    error: ContainerUploadError,
+    source_failure: &Mutex<Option<String>>,
+    host_path: &std::path::Path,
+) -> ContainerUploadError {
+    let recorded = source_failure.lock().ok().and_then(|mut slot| slot.take());
+    match recorded {
+        Some(reason) => ContainerUploadError::Source {
+            path: host_path.display().to_string(),
+            reason,
+        },
+        None => error,
+    }
 }
 
 /// Upload a small in-memory file (e.g. a credentials file) into a container
@@ -283,6 +328,70 @@ mod tests {
             matches!(&err, ContainerUploadError::Source { path, .. } if path.contains("temps-upload-source")),
             "{err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_source_that_shrinks_mid_stream_is_reported_as_a_source_error() {
+        use futures::StreamExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("restore.rdb");
+        std::fs::write(&path, vec![7_u8; 1_000]).expect("write source");
+        let file = tokio::fs::File::open(&path).await.expect("open source");
+        let failure = Arc::new(Mutex::new(None));
+
+        // Claim more bytes than the file holds: the read hits EOF exactly as
+        // it would if the file were truncated after its size was checked.
+        let mut chunks = Box::pin(file_chunks(file, 5_000, Arc::clone(&failure)));
+        let mut saw_error = false;
+        while let Some(chunk) = chunks.next().await {
+            if chunk.is_err() {
+                saw_error = true;
+                break;
+            }
+        }
+        assert!(
+            saw_error,
+            "a short source must end the stream with an error"
+        );
+
+        let attributed = attribute_upload_failure(
+            ContainerUploadError::Upload {
+                container_id: "helper".into(),
+                dest_dir: "/tmp".into(),
+                dest_name: "restore.rdb".into(),
+                size: 5_000,
+                reason: "error trying to connect".into(),
+            },
+            &failure,
+            &path,
+        );
+        match attributed {
+            ContainerUploadError::Source {
+                path: reported,
+                reason,
+            } => {
+                assert!(reported.ends_with("restore.rdb"), "{reported}");
+                assert!(reason.contains("5000 bytes still expected"), "{reason}");
+            }
+            other => panic!("expected a source error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_docker_side_failure_stays_an_upload_error() {
+        let untouched = Mutex::new(None);
+        let attributed = attribute_upload_failure(
+            ContainerUploadError::Timeout {
+                container_id: "helper".into(),
+                dest_name: "archive.gz".into(),
+                size: 10,
+                timeout_secs: 1,
+            },
+            &untouched,
+            std::path::Path::new("/tmp/archive.gz"),
+        );
+        assert!(matches!(attributed, ContainerUploadError::Timeout { .. }));
     }
 
     /// Both upload paths land the file, with its mode, in a container that
