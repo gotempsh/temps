@@ -30,8 +30,7 @@ const base: NotificationDeliveryCoverageResponse = {
 
 function hrefs(html: string): URL[] {
   return [...html.matchAll(/href="([^"]+)"/g)].map(
-    (match) =>
-      new URL(match[1].replaceAll('&amp;', '&'), 'https://temps.invalid')
+    (match) => new URL(match[1].replace(/&amp;/g, '&'), 'https://temps.invalid')
   )
 }
 
