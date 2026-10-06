@@ -17,11 +17,14 @@ describe('deployment failure guidance', () => {
 
   test('deep-links project sections under the project', () => {
     expect(failureSettingsLink('deploy', 'my-app')).toEqual({
-      href: '/projects/my-app/settings/build?tab=deploy',
+      href: '/projects/my-app/settings/delivery?section=deployment',
       label: 'Deployment settings',
     })
     expect(failureSettingsLink('environment_variables', 'my-app')?.href).toBe(
-      '/projects/my-app/settings/environment-variables'
+      '/projects/my-app/environment-variables'
+    )
+    expect(failureSettingsLink('git', 'my-app')?.href).toBe(
+      '/projects/my-app/settings/delivery?section=repository'
     )
   })
 

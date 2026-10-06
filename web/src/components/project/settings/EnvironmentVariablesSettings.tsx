@@ -89,7 +89,10 @@ import {
   type EnvironmentVariableCheck,
 } from './EnvironmentVariableChecks'
 import { useHttpChecks, indicatorsBySubject } from './http-checks'
-import { Link, useNavigate } from 'react-router'
+import { Link, useLocation, useNavigate } from 'react-router'
+import { detailReturnState } from '@/lib/detail-return-path'
+import { useVariableChangeRedeploy } from '@/hooks/useVariableChangeRedeploy'
+import { combinedScope } from '@/lib/variable-change-redeploy'
 import {
   parsePublicRepositoryUrl,
   publicRepositoryProvider,
@@ -180,6 +183,8 @@ function EnvironmentVariableRow({
   allEnvironments,
   environmentChoicesAvailable,
 }: EnvironmentVariableRowProps) {
+  const location = useLocation()
+  const notifyChange = useVariableChangeRedeploy(project)
   const overridesService =
     resolved?.source.type === 'manual'
       ? (resolved.source.overrides_service ?? undefined)
@@ -277,7 +282,10 @@ function EnvironmentVariableRow({
     },
     onSuccess: () => {
       refetchEnvVariables()
-      toast.success('Environment variable deleted')
+      void notifyChange(
+        `${variable.key} deleted`,
+        variable.environments.map((env) => env.id)
+      )
     },
   })
 
@@ -286,13 +294,21 @@ function EnvironmentVariableRow({
     meta: {
       errorTitle: 'Failed to update environment variable',
     },
-    onSuccess: () => {
+    onSuccess: (_data, request) => {
       revealGuard.current.cancel('value')
       setRevealedValue(undefined)
       setEditValue('')
       setIsEditMultiline(false)
       refetchEnvVariables()
-      toast.success('Environment variable updated')
+      // Environments removed from the scope are affected as much as the
+      // ones that stay: their running app still has the old value.
+      void notifyChange(
+        `${variable.key} updated`,
+        combinedScope([
+          variable.environments.map((env) => env.id),
+          request.body.environment_ids ?? [],
+        ])
+      )
     },
   })
 
@@ -418,6 +434,7 @@ function EnvironmentVariableRow({
               )}
               <RecordLink
                 to={`/projects/${project.slug}/environment-variables/${variable.id}`}
+                state={detailReturnState(location)}
                 className="font-mono"
                 aria-label={`View ${variable.key} details`}
               >
@@ -1275,6 +1292,8 @@ export function EnvironmentVariablesSettings({
 }: EnvironmentVariablesSettingsProps) {
   const checksQuery = useHttpChecks(project.id)
   const navigate = useNavigate()
+  const location = useLocation()
+  const notifyChange = useVariableChangeRedeploy(project)
   const checksByVariable = useMemo(
     () => indicatorsBySubject(checksQuery.data ?? [], 'env_var'),
     [checksQuery.data]
@@ -1526,7 +1545,6 @@ export function EnvironmentVariablesSettings({
     onSuccess: () => {
       setIsAddDialogOpen(false)
       refetch()
-      toast.success('Environment variable created')
     },
   })
 
@@ -1549,6 +1567,7 @@ export function EnvironmentVariablesSettings({
         is_secret: values.isSecret,
       },
     })
+    void notifyChange(`${values.key} created`, values.environments)
   }
 
   const handleImportVariables = async (
@@ -1556,6 +1575,7 @@ export function EnvironmentVariablesSettings({
   ) => {
     let successCount = 0
     let errorCount = 0
+    const importedScopes: number[][] = []
 
     for (const variable of variables) {
       try {
@@ -1571,14 +1591,16 @@ export function EnvironmentVariablesSettings({
           },
         })
         successCount++
+        importedScopes.push(variable.environments || [])
       } catch {
         errorCount++
       }
     }
 
     if (successCount > 0) {
-      toast.success(
-        `Successfully imported ${successCount} variable${successCount !== 1 ? 's' : ''}`
+      void notifyChange(
+        `Successfully imported ${successCount} variable${successCount !== 1 ? 's' : ''}`,
+        combinedScope(importedScopes)
       )
     }
     if (errorCount > 0) {
@@ -1704,6 +1726,7 @@ export function EnvironmentVariablesSettings({
   const handleBulkDelete = async () => {
     let successCount = 0
     let errorCount = 0
+    const deletedScopes: number[][] = []
 
     for (const varId of visibleSelectedIds) {
       try {
@@ -1714,14 +1737,20 @@ export function EnvironmentVariablesSettings({
           },
         })
         successCount++
+        deletedScopes.push(
+          (envVariables ?? [])
+            .find((variable) => variable.id === varId)
+            ?.environments.map((env) => env.id) ?? []
+        )
       } catch {
         errorCount++
       }
     }
 
     if (successCount > 0) {
-      toast.success(
-        `Successfully deleted ${successCount} variable${successCount !== 1 ? 's' : ''}`
+      void notifyChange(
+        `Successfully deleted ${successCount} variable${successCount !== 1 ? 's' : ''}`,
+        combinedScope(deletedScopes)
       )
     }
     if (errorCount > 0) {
@@ -2082,7 +2111,8 @@ export function EnvironmentVariablesSettings({
                         }
                         onManageChecks={() =>
                           navigate(
-                            `/projects/${project.slug}/environment-variables/${variable.id}`
+                            `/projects/${project.slug}/environment-variables/${variable.id}`,
+                            { state: detailReturnState(location) }
                           )
                         }
                         previewIds={previewIds}

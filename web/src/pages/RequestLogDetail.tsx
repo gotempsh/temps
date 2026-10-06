@@ -40,7 +40,10 @@ interface RequestLogDetailProps {
 // Tone from the HTTP status class — the Detail template's single verdict.
 // Color only ever appears through `Status`, never a hand-picked bg-*/text-*
 // pair, so this replaces the old getStatusColor()/getMethodColor() helpers.
-function statusVerdict(statusCode: number): { tone: StatusTone; label: string } {
+function statusVerdict(statusCode: number): {
+  tone: StatusTone
+  label: string
+} {
   switch (httpStatusClass(statusCode)) {
     case '2xx':
       return { tone: 'ok', label: String(statusCode) }
@@ -55,7 +58,11 @@ function statusVerdict(statusCode: number): { tone: StatusTone; label: string } 
   }
 }
 
-function RequestLogDetailSkeleton({ backAction }: { backAction: React.ReactNode }) {
+function RequestLogDetailSkeleton({
+  backAction,
+}: {
+  backAction: React.ReactNode
+}) {
   return (
     <Detail
       title={<div className="h-7 w-56 animate-pulse rounded bg-muted" />}
@@ -117,7 +124,7 @@ export default function RequestLogDetail({
   } = isLegacyNumericId ? byId : byRequestId
 
   const handleBack = () => {
-    navigate(`/projects/${projectResponse.slug}/logs`)
+    navigate(`/projects/${projectResponse.slug}/request-logs`)
   }
 
   const backAction = (
@@ -156,14 +163,25 @@ export default function RequestLogDetail({
   const verdict = statusVerdict(logDetail.status_code)
 
   const facts: DetailFact[] = [
-    { label: 'Method', value: <Badge variant="outline">{logDetail.method}</Badge> },
+    {
+      label: 'Method',
+      value: <Badge variant="outline">{logDetail.method}</Badge>,
+    },
     {
       label: 'Duration',
-      value: logDetail.response_time_ms ? `${logDetail.response_time_ms}ms` : 'N/A',
+      value: logDetail.response_time_ms
+        ? `${logDetail.response_time_ms}ms`
+        : 'N/A',
     },
     { label: 'Timestamp', value: fmtDateTime(logDetail.timestamp) },
-    { label: 'Routing status', value: <Badge variant="outline">{logDetail.routing_status}</Badge> },
-    { label: 'Request source', value: <Badge variant="outline">{logDetail.request_source}</Badge> },
+    {
+      label: 'Routing status',
+      value: <Badge variant="outline">{logDetail.routing_status}</Badge>,
+    },
+    {
+      label: 'Request source',
+      value: <Badge variant="outline">{logDetail.request_source}</Badge>,
+    },
   ]
 
   const hasSizes = Boolean(
@@ -177,7 +195,9 @@ export default function RequestLogDetail({
     <Detail
       title="Request log"
       description={
-        <span className="font-mono text-xs break-all">{logDetail.request_id}</span>
+        <span className="font-mono text-xs break-all">
+          {logDetail.request_id}
+        </span>
       }
       verdict={<Status tone={verdict.tone} label={verdict.label} />}
       actions={backAction}
@@ -261,7 +281,11 @@ export default function RequestLogDetail({
                   <h4 className="text-sm font-medium text-muted-foreground">
                     System Request
                   </h4>
-                  <Badge variant={logDetail.is_system_request ? 'default' : 'secondary'}>
+                  <Badge
+                    variant={
+                      logDetail.is_system_request ? 'default' : 'secondary'
+                    }
+                  >
                     {logDetail.is_system_request ? 'Yes' : 'No'}
                   </Badge>
                 </div>
@@ -317,7 +341,9 @@ export default function RequestLogDetail({
                   <h4 className="text-sm font-medium text-muted-foreground">
                     IP Address
                   </h4>
-                  <p className="text-sm font-mono">{logDetail.client_ip || 'N/A'}</p>
+                  <p className="text-sm font-mono">
+                    {logDetail.client_ip || 'N/A'}
+                  </p>
                 </div>
                 {logDetail.device_type && (
                   <div className="space-y-1">
@@ -371,7 +397,8 @@ export default function RequestLogDetail({
                   </h4>
                   <p className="text-sm">
                     {logDetail.browser}{' '}
-                    {logDetail.browser_version && `v${logDetail.browser_version}`}
+                    {logDetail.browser_version &&
+                      `v${logDetail.browser_version}`}
                   </p>
                 </div>
               )}
@@ -411,7 +438,9 @@ export default function RequestLogDetail({
                       <h4 className="text-sm font-medium text-muted-foreground">
                         Request Size
                       </h4>
-                      <p className="text-sm">{fmtBytes(logDetail.request_size_bytes)}</p>
+                      <p className="text-sm">
+                        {fmtBytes(logDetail.request_size_bytes)}
+                      </p>
                     </div>
                   )}
                   {logDetail.response_size_bytes && (
@@ -419,7 +448,9 @@ export default function RequestLogDetail({
                       <h4 className="text-sm font-medium text-muted-foreground">
                         Response Size
                       </h4>
-                      <p className="text-sm">{fmtBytes(logDetail.response_size_bytes)}</p>
+                      <p className="text-sm">
+                        {fmtBytes(logDetail.response_size_bytes)}
+                      </p>
                     </div>
                   )}
                 </div>

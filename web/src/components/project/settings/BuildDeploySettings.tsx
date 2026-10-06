@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { ProjectResponse } from '@/api/client'
-import { useSearchParams } from 'react-router'
 import { BuildSettings } from './GitSettings'
 import { DeployDefaultsCard } from './DeployDefaultsCard'
 import { DeploymentSourceCard } from './DeploymentSourceCard'
@@ -11,12 +10,7 @@ import { ImageRetentionCard } from './ImageRetentionCard'
 import { PreviewEnvironmentsCard } from './PreviewEnvironmentsCard'
 import { ServiceTemplateRuntimeCard } from './ServiceTemplateRuntimeCard'
 
-const TABS = ['source', 'build', 'deploy', 'previews'] as const
-type TabValue = (typeof TABS)[number]
-
-function isTab(value: string | null): value is TabValue {
-  return value !== null && (TABS as readonly string[]).includes(value)
-}
+type BuildDeploySection = 'source' | 'build' | 'deploy' | 'previews'
 
 /**
  * Everything about how a project turns into a running deployment, in pipeline
@@ -28,8 +22,9 @@ function isTab(value: string | null): value is TabValue {
  * that can rewrite them. Observability toggles deliberately stay on General —
  * they describe what a deployment reports, not how it ships.
  *
- * The flat Settings sidebar selects the page. Existing tab query parameters
- * remain supported so saved links keep opening the same configuration.
+ * Each part renders inside its own titled section of the Build & deploy page,
+ * which owns the heading. Links to the old `?tab=` page are redirected to the
+ * matching section (`legacyProjectRouteTarget`).
  */
 export function BuildDeploySettings({
   project,
@@ -38,30 +33,12 @@ export function BuildDeploySettings({
 }: {
   project: ProjectResponse
   refetch: () => void
-  section?: TabValue
+  section: BuildDeploySection
 }) {
-  const [searchParams] = useSearchParams()
-  const requested = searchParams.get('tab')
-  const active: TabValue = section ?? (isTab(requested) ? requested : 'source')
+  const active = section
 
   return (
     <div className="space-y-6">
-      <div className="space-y-1">
-        <h2 className="text-xl font-semibold text-balance">
-          {
-            {
-              source: 'Source',
-              build: 'Build',
-              deploy: 'Deployment',
-              previews: 'Preview environments',
-            }[active]
-          }
-        </h2>
-        <p className="max-w-[72ch] text-pretty text-base/7 text-muted-foreground sm:text-sm/6">
-          Configure how Temps turns your source into a running application.
-        </p>
-      </div>
-
       {active === 'source' && (
         <div className="space-y-6">
           <DeploymentSourceCard project={project} refetch={refetch} />

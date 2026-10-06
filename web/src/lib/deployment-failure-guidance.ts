@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { settingsSectionHref } from './project-settings-sections'
 import type {
   DeploymentFailureInfo,
   DeploymentFailureStage,
@@ -40,24 +41,32 @@ export function failureSettingsLink(
   projectSlug: string
 ): FailureSettingsLink | null {
   if (!section) return null
-  const project = `/projects/${projectSlug}/settings`
   switch (section) {
     case 'source':
-      return { href: `${project}/build?tab=source`, label: 'Source settings' }
+      return {
+        href: settingsSectionHref(projectSlug, 'delivery', 'source'),
+        label: 'Source settings',
+      }
     case 'build':
-      return { href: `${project}/build?tab=build`, label: 'Build settings' }
+      return {
+        href: settingsSectionHref(projectSlug, 'delivery', 'build'),
+        label: 'Build settings',
+      }
     case 'deploy':
       return {
-        href: `${project}/build?tab=deploy`,
+        href: settingsSectionHref(projectSlug, 'delivery', 'deployment'),
         label: 'Deployment settings',
       }
     case 'environment_variables':
       return {
-        href: `${project}/environment-variables`,
-        label: 'Environment variables',
+        href: `/projects/${projectSlug}/environment-variables`,
+        label: 'Environment Variables',
       }
     case 'git':
-      return { href: `${project}/git`, label: 'Git settings' }
+      return {
+        href: settingsSectionHref(projectSlug, 'delivery', 'repository'),
+        label: 'Git settings',
+      }
     case 'docker_registry':
       return { href: '/settings/docker-registry', label: 'Docker registries' }
     case 'build_limits':

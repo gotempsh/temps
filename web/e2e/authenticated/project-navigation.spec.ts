@@ -58,9 +58,10 @@ test('direct project links and direct flat settings navigation', async ({
     .locator('summary')
     .filter({ hasText: /^Build$/ })
     .click()
-  await expect(
-    page.getByRole('heading', { name: 'Build', exact: true })
-  ).toBeVisible()
+  await expect(page.locator('#settings-section-build')).toHaveAttribute(
+    'open',
+    ''
+  )
   await expect(
     settings.getByRole('link', { name: 'Build & deploy', exact: true })
   ).toHaveAttribute('aria-current', 'page')
@@ -71,9 +72,10 @@ test('direct project links and direct flat settings navigation', async ({
     .locator('summary')
     .filter({ hasText: /^Deployment$/ })
     .click()
-  await expect(
-    page.getByRole('heading', { name: 'Deployment', exact: true })
-  ).toBeVisible()
+  await expect(page.locator('#settings-section-deployment')).toHaveAttribute(
+    'open',
+    ''
+  )
   await expect(page).toHaveURL(/settings\/delivery$/)
   await page.screenshot({
     path: '/tmp/temps-project-settings-compact-icons.png',
@@ -143,10 +145,18 @@ test('legacy build links and mobile contextual navigation stay usable', async ({
   expect(projects.length).toBeGreaterThan(0)
   const root = `/projects/${projects[0].slug}`
   await page.setViewportSize({ width: 390, height: 844 })
+  // The old standalone build page redirects to its section of Build & deploy,
+  // opened and scrolled into view.
   await page.goto(`${root}/settings/build?tab=previews`)
-  await expect(
-    page.getByRole('heading', { name: 'Preview environments', exact: true })
-  ).toBeVisible()
+  await expect(page).toHaveURL(/settings\/delivery\?section=previews$/)
+  await expect(page.locator('#settings-section-previews')).toHaveAttribute(
+    'open',
+    ''
+  )
+  await expect(page.locator('#settings-section-build')).not.toHaveAttribute(
+    'open',
+    ''
+  )
   await page
     .getByRole('button', { name: 'Settings pages', exact: true })
     .click()

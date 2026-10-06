@@ -128,3 +128,23 @@ export function shouldShowDockerSocketBadge(
 ): boolean {
   return describeDockerSocket(capability).state === 'granted'
 }
+
+/** Where the Build & deploy page shows host Docker access, if anywhere. */
+export type HostDockerAccessPlacement = 'prominent' | 'advanced' | 'hidden'
+
+/**
+ * A granted project is root-equivalent on its hosts, which everyone editing
+ * its build settings should see first. For every other project the grant is
+ * an operator-only capability almost nobody needs, so its onboarding goes in
+ * a collapsed "Advanced" section at the bottom instead of leading the page —
+ * still there to be found, never in the way.
+ */
+export function hostDockerAccessPlacement(
+  capability: DockerSocketCapability | null | undefined,
+  canManageNodes: boolean
+): HostDockerAccessPlacement {
+  if (describeDockerSocket(capability).state === 'granted') return 'prominent'
+  return shouldShowDockerSocketOnboarding(capability, canManageNodes)
+    ? 'advanced'
+    : 'hidden'
+}

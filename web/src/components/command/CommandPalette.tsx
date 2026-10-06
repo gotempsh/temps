@@ -22,6 +22,7 @@ import { usePluginsContext } from '@/contexts/PluginsContext'
 import { useCanViewAuditLogs } from '@/hooks/useAuditAccess'
 import { useFrecency } from '@/hooks/useFrecency'
 import { normalizeFrecency } from '@/lib/frecency'
+import { settingsSectionPath } from '@/lib/project-settings-sections'
 import {
   buildCommandSampleQueries,
   dedupeCommandDestinations,
@@ -929,7 +930,7 @@ export const projectNavItems: NavigationItem[] = [
   },
   {
     title: 'Feature Flags',
-    url: 'flags',
+    url: settingsSectionPath('delivery', 'feature-flags'),
     icon: Flag,
     keywords: ['flags', 'feature flags', 'toggles', 'rollout'],
   },
@@ -953,13 +954,19 @@ export const projectNavItems: NavigationItem[] = [
   },
   {
     title: 'Secrets',
-    url: 'settings/secrets',
+    url: settingsSectionPath('variables', 'secrets'),
     icon: FileLock2,
     keywords: ['secrets', 'secret files', 'mounted secrets', '/run/secrets'],
   },
   {
+    title: 'Deployment Tokens',
+    url: settingsSectionPath('variables', 'deployment-tokens'),
+    icon: Key,
+    keywords: ['tokens', 'deployment tokens', 'TEMPS_API_TOKEN', 'api'],
+  },
+  {
     title: 'Git',
-    url: 'git',
+    url: settingsSectionPath('delivery', 'repository'),
     icon: GitBranch,
     keywords: ['git', 'repository', 'repo', 'source'],
   },
@@ -983,25 +990,25 @@ export const projectNavItems: NavigationItem[] = [
   },
   {
     title: 'Cron Jobs',
-    url: 'settings/cron-jobs',
+    url: settingsSectionPath('automation', 'cron-jobs'),
     icon: Activity,
     keywords: ['cron', 'jobs', 'scheduled', 'tasks'],
   },
   {
     title: 'Webhooks',
-    url: 'settings/webhooks',
+    url: settingsSectionPath('integrations', 'webhooks'),
     icon: Workflow,
     keywords: ['webhooks', 'hooks', 'events', 'callbacks', 'integrations'],
   },
   {
     title: 'Project Skills',
-    url: 'settings/skills',
+    url: settingsSectionPath('integrations', 'skills'),
     icon: Wand2,
     keywords: ['skills', 'ai', 'agents', 'claude', 'instructions', 'project'],
   },
   {
     title: 'Project MCP Servers',
-    url: 'settings/mcp-servers',
+    url: settingsSectionPath('integrations', 'mcp-servers'),
     icon: Server,
     keywords: [
       'mcp',
@@ -1083,13 +1090,13 @@ export const projectNavItems: NavigationItem[] = [
   },
   {
     title: 'Agents',
-    url: 'agents',
+    url: settingsSectionPath('automation', 'agents'),
     icon: Bot,
     keywords: ['agents', 'autopilot', 'ai', 'automation', 'workflows'],
   },
   {
     title: 'Autofixer',
-    url: 'autofixer',
+    url: settingsSectionPath('automation', 'autofixer'),
     icon: Wand2,
     keywords: ['autofix', 'autofixer', 'ai', 'errors', 'repair'],
   },

@@ -35,7 +35,7 @@ test('Compose policy exceptions require acknowledgment and persist independently
       },
     })
     expect(denied.status()).toBe(400)
-    await page.goto(`/projects/${project.slug}/settings/build?tab=build`)
+    await page.goto(`/projects/${project.slug}/settings/delivery?section=build`)
     const trigger = page.getByRole('button', {
       name: 'Advanced security settings',
     })

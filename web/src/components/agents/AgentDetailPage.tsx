@@ -35,6 +35,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import type { AgentRunResponse as AgentRun } from '@/api/client/types.gen'
 import { AutopilotStatusBadge } from './AutopilotStatusBadge'
+import { settingsSectionHref } from '@/lib/project-settings-sections'
 
 interface AgentDetailPageProps {
   project: ProjectResponse
@@ -462,7 +463,9 @@ export function AgentDetailPage({ project }: AgentDetailPageProps) {
       <div className="flex flex-col items-center justify-center py-20">
         <p className="text-muted-foreground text-sm">Workflow not found</p>
         <Button variant="ghost" size="sm" className="mt-4" asChild>
-          <Link to={`/projects/${project.slug}/agents`}>Back to workflows</Link>
+          <Link to={settingsSectionHref(project.slug, 'automation', 'agents')}>
+            Back to workflows
+          </Link>
         </Button>
       </div>
     )
@@ -474,7 +477,9 @@ export function AgentDetailPage({ project }: AgentDetailPageProps) {
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex items-center gap-3">
           <Button variant="ghost" size="icon" asChild>
-            <Link to={`/projects/${project.slug}/agents`}>
+            <Link
+              to={settingsSectionHref(project.slug, 'automation', 'agents')}
+            >
               <ArrowLeft className="h-4 w-4" />
             </Link>
           </Button>
