@@ -150,6 +150,24 @@ class WaitTests(unittest.TestCase):
         code, _, _ = self.drive([[], pending, [run()]])
         self.assertEqual(code, 0)
 
+    def test_run_dropping_out_of_the_listing_is_still_waited_for(self):
+        # The head_sha listing intermittently omits a queued run it returned
+        # on the previous poll. That must not end the gate as "missing".
+        pending = [run(status="queued", conclusion=None)]
+        responses = [pending, [], [], [], pending, [], [run()]]
+        code, calls, clock = self.drive(responses)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(calls), 7)
+        self.assertGreater(clock.now, 120)
+
+    def test_flapping_run_still_times_out_as_pending(self):
+        pending = [run(status="queued", conclusion=None)]
+        with patch("release_test_gate.guidance", wraps=guidance) as described:
+            code, _, clock = self.drive([pending, []])
+        self.assertEqual(code, 1)
+        self.assertEqual(clock.now, 600)
+        self.assertEqual(described.call_args.args[0], "pending")
+
     def test_pending_run_times_out(self):
         code, _, clock = self.drive([[run(status="in_progress", conclusion=None)]])
         self.assertEqual(code, 1)
