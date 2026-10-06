@@ -39,7 +39,8 @@ use crate::native_types::{
     ResponsesRequest,
 };
 use crate::providers::openai_native::{
-    read_reply, validate_upstream_id, OpenAiNativeClient, UpstreamReply,
+    read_reply, validate_upstream_id, OpenAiNativeClient, UpstreamReply, FILE_TRANSFER_TIMEOUT,
+    NATIVE_REQUEST_TIMEOUT,
 };
 use crate::services::gateway_service::{
     ByokOverride, CredentialType, GatewayService, ResolvedCredentials,
@@ -48,6 +49,15 @@ use crate::services::usage_service::{AiRequestContext, UsageService};
 
 /// Provider that serves the native endpoints.
 const OPENAI: &str = "openai";
+
+// Allow metadata retrieval, a full result transfer and a minute for accounting.
+// Keep the durable lease longer than the entire job so another worker cannot
+// restart the same download while it is still in progress.
+const BATCH_RECONCILIATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
+    NATIVE_REQUEST_TIMEOUT.as_secs() + FILE_TRANSFER_TIMEOUT.as_secs() + 60,
+);
+const BATCH_RETRY_LEASE: chrono::Duration =
+    chrono::Duration::seconds(BATCH_RECONCILIATION_TIMEOUT.as_secs() as i64 + 60);
 
 /// Largest batch input file accepted, matching OpenAI's limit.
 pub const MAX_BATCH_FILE_BYTES: u64 = 200 * 1024 * 1024;
@@ -384,7 +394,7 @@ impl NativeApiService {
             let claimed = ai_gateway_objects::Entity::update_many()
                 .col_expr(
                     ai_gateway_objects::Column::NextPollAt,
-                    Expr::value(now + chrono::Duration::minutes(5)),
+                    Expr::value(chrono::Utc::now() + BATCH_RETRY_LEASE),
                 )
                 .filter(ai_gateway_objects::Column::Id.eq(record.id))
                 .filter(ai_gateway_objects::Column::NextPollAt.lte(now))
@@ -394,11 +404,9 @@ impl NativeApiService {
                 continue;
             }
             // Bound each job as well as rows per tick. A failed/aborted job keeps its durable retry lease.
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(60),
-                self.reconcile_batch(&record),
-            )
-            .await;
+            let result =
+                tokio::time::timeout(BATCH_RECONCILIATION_TIMEOUT, self.reconcile_batch(&record))
+                    .await;
             if !matches!(result, Ok(Ok(()))) {
                 warn!(
                     object_id = record.id,
@@ -1635,19 +1643,45 @@ mod tests {
 
     #[tokio::test]
     async fn byok_batch_is_reconciled_without_a_client_poll() {
+        assert_byok_batch_reconciled(None).await;
+    }
+
+    #[tokio::test]
+    async fn batch_result_transfer_longer_than_a_minute_records_usage() {
+        assert_byok_batch_reconciled(Some(std::time::Duration::from_secs(65))).await;
+    }
+
+    async fn assert_byok_batch_reconciled(output_delay: Option<std::time::Duration>) {
         use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
         use wiremock::{
             matchers::{header, method, path},
             Mock, MockServer, ResponseTemplate,
         };
         let server = MockServer::start().await;
+        let batch = if let Some(delay) = output_delay {
+            Mock::given(method("GET"))
+                .and(path("/v1/files/file-result/content"))
+                .and(header("authorization", "Bearer test-reconciliation-key"))
+                .respond_with(ResponseTemplate::new(200).set_delay(delay).set_body_string(
+                    "{\"response\":{\"status_code\":200,\"body\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}}\n",
+                ))
+                .expect(1)
+                .mount(&server)
+                .await;
+            serde_json::json!({
+                "id":"batch_test", "object":"batch", "status":"completed",
+                "output_file_id":"file-result"
+            })
+        } else {
+            serde_json::json!({
+                "id":"batch_test", "object":"batch", "status":"cancelled",
+                "usage":{"input_tokens":10,"output_tokens":5}
+            })
+        };
         Mock::given(method("GET"))
             .and(path("/v1/batches/batch_test"))
             .and(header("authorization", "Bearer test-reconciliation-key"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id":"batch_test", "object":"batch", "status":"cancelled",
-                "usage":{"input_tokens":10,"output_tokens":5}
-            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(batch))
             .expect(1)
             .mount(&server)
             .await;
@@ -1697,9 +1731,29 @@ mod tests {
         );
         let mut svc = service(db.clone());
         svc.client = OpenAiNativeClient::for_test();
+        let started = chrono::Utc::now();
         svc.reconcile_due_batches().await.unwrap();
         drop(svc);
-        let sql = format!("{:?}", Arc::try_unwrap(db).unwrap().into_transaction_log());
+        let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
+        let claim = transactions
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .find(|statement| {
+                statement.sql.starts_with("UPDATE") && statement.sql.contains("next_poll_at")
+            })
+            .expect("batch retry lease was persisted");
+        let sea_orm::sea_query::Value::ChronoDateTimeUtc(Some(retry_at)) =
+            &claim.values.as_ref().unwrap().0[0]
+        else {
+            panic!("batch lease must be a timestamp: {claim:?}");
+        };
+        assert!(
+            **retry_at
+                > started
+                    + chrono::Duration::seconds(BATCH_RECONCILIATION_TIMEOUT.as_secs() as i64),
+            "another worker must not reclaim the batch before accounting finishes"
+        );
+        let sql = format!("{transactions:?}");
         assert!(
             sql.contains("ai_usage_logs") && sql.contains("COMMIT"),
             "{sql}"
