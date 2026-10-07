@@ -57,7 +57,19 @@ function mergeObject(base: PlainObject, draft: PlainObject): PlainObject {
   for (const key of new Set([...Object.keys(base), ...Object.keys(draft)])) {
     const baseValue = base[key]
     const draftValue = draft[key]
+    if (!(key in draft)) {
+      // Drafts are full snapshots (`getValues()`), and JSON drops undefined:
+      // a field missing from the draft is one the user cleared.
+      merged[key] = undefined
+      continue
+    }
     if (draftValue === undefined) continue
+    if (draftValue === null) {
+      // An explicitly cleared field (e.g. "All environments").
+      if (!isPlainObject(baseValue) && !Array.isArray(baseValue))
+        merged[key] = null
+      continue
+    }
     if (!(key in base)) {
       // Optional fields the defaults leave out (e.g. trigger thresholds).
       if (isPrimitive(draftValue)) merged[key] = draftValue
@@ -83,6 +95,11 @@ function mergeObject(base: PlainObject, draft: PlainObject): PlainObject {
  * throw away every other field the user had already filled in. Each field
  * only has to have the same shape as its starting value; the submit schema
  * still runs when the user saves.
+ *
+ * The draft is a complete snapshot of the form, so fields the user cleared
+ * stay cleared: `null` replaces a value, and a field missing from the draft
+ * (JSON drops `undefined`) becomes `undefined`, rather than falling back to
+ * the saved rule's value.
  */
 export function mergeFormDraft<T extends object>(base: T, draft: unknown): T {
   if (!isPlainObject(draft)) return base

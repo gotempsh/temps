@@ -85,16 +85,40 @@ describe('mergeFormDraft', () => {
     })
   })
 
-  test('lays edits over a loaded rule and keeps fields the draft lacks', () => {
+  test('lays edits over a loaded rule', () => {
     const loaded = { ...base, name: 'Checkout errors', cooldown_minutes: 30 }
-    expect(mergeFormDraft(loaded, { cooldown_minutes: 5 })).toEqual({
+    expect(mergeFormDraft(loaded, { ...loaded, cooldown_minutes: 5 })).toEqual({
       ...loaded,
       cooldown_minutes: 5,
     })
   })
 
+  test('keeps fields the user cleared while editing a saved rule', () => {
+    const loaded = {
+      ...base,
+      name: 'Checkout errors',
+      trigger_config: { count: 10, window_minutes: 5 },
+      environment_filter: 3 as number | null,
+    }
+    // What getValues() serializes after clearing the environment filter and
+    // the count: null for the select, and the emptied number dropped by JSON.
+    const draft = JSON.parse(
+      JSON.stringify({
+        ...loaded,
+        trigger_config: { count: undefined, window_minutes: 5 },
+        environment_filter: null,
+      })
+    )
+    const merged = mergeFormDraft(loaded, draft)
+    expect(merged.environment_filter).toBeNull()
+    expect(merged.trigger_config.count).toBeUndefined()
+    expect(merged.trigger_config.window_minutes).toBe(5)
+    expect(merged.name).toBe('Checkout errors')
+  })
+
   test('ignores fields whose shape does not match the starting value', () => {
     const merged = mergeFormDraft(base, {
+      ...base,
       cooldown_minutes: '15',
       enabled: 'yes',
       label_filters: 'route=/checkout',
