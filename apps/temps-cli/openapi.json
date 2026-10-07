@@ -91149,6 +91149,16 @@
             },
             "description": "Insufficient permissions"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The project already has the maximum number of metric alert rules"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -107835,6 +107845,9 @@
           },
           "400": {
             "description": "Validation error"
+          },
+          "409": {
+            "description": "The project already has the maximum number of error alert rules"
           },
           "500": {
             "description": "Internal server error"
