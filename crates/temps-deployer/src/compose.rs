@@ -371,7 +371,7 @@ pub(crate) const RESERVED_GENERATED_COMPOSE_FILES: &[&str] = &[
 /// stack root, and a same-named file in a subdirectory is not passed to
 /// `docker compose -f`, so it is harmless.
 pub(crate) fn is_reserved_generated_compose_file(path: &Path) -> bool {
-    // Only the stack root is dangerous: `append_compose_file_args` looks for
+    // Only the stack root is dangerous: `compose_input_args` looks for
     // these names directly under the project directory.
     if path.parent().is_some_and(|parent| {
         !parent.as_os_str().is_empty() && parent != Path::new(".") && parent != Path::new("")
@@ -693,6 +693,10 @@ pub struct ComposeDeployRequest {
     /// [`COMPOSE_READY_TIMEOUT`]; the project's startup-timeout setting
     /// supplies an override.
     pub ready_timeout: Option<std::time::Duration>,
+    /// Services Temps routes public traffic to. They must stay running: a
+    /// routed service that exits — even with status 0 — fails the deploy,
+    /// while other services may exit 0 as completed one-shot tasks.
+    pub routed_services: Vec<String>,
 }
 
 /// Result for a single compose service after deployment.
@@ -1766,6 +1770,11 @@ impl ComposeExecutor {
         // `running` (and `healthy`, for services that define a healthcheck)
         // so a crash-looping or slow-starting service surfaces as a failed
         // deployment instead of a false "success".
+        let expectations = Self::readiness_expectations(
+            &request.compose_content,
+            request.compose_override.as_deref(),
+            &request.routed_services,
+        );
         if let Err(error) = self
             .wait_for_services_ready(
                 &effective_dir,
@@ -1773,6 +1782,7 @@ impl ComposeExecutor {
                 &compose_file,
                 &redact_values,
                 request.ready_timeout.unwrap_or(COMPOSE_READY_TIMEOUT),
+                &expectations,
             )
             .await
         {
@@ -1788,11 +1798,29 @@ impl ComposeExecutor {
             ));
         }
 
-        // 5. Discover running containers
+        // 5. Discover running containers. One-shot tasks that completed
+        // (exit 0) are not part of the running deployment: registering them
+        // would make an exited migration container the stack's "main"
+        // container and a target for routing and monitoring.
         let containers = self
             .discover_containers(&effective_dir, &project_name, &compose_file)
             .await
             .map_err(|error| Box::new(ComposeDeployFailure::without_containers(error)))?;
+        let containers: Vec<ComposeServiceResult> = containers
+            .into_iter()
+            .filter(|container| {
+                let completed = container.status == "exited"
+                    && expectations.why_long_running(&container.service_name).is_none();
+                if completed {
+                    info!(
+                        project = %project_name,
+                        service = %container.service_name,
+                        "Compose service completed as a one-shot task; not registering it as a running container"
+                    );
+                }
+                !completed
+            })
+            .collect();
 
         // 5b. Verify the ownership labels written by the generated override.
         // Never register containers cleanup cannot prove belong to this stack.
@@ -1927,26 +1955,8 @@ impl ComposeExecutor {
 
         // down WITHOUT --volumes: removes containers and networks, keeps volumes
         let mut command = isolated_docker_command();
-        command
-            .args(["compose", "-p", project_name])
-            .args(["-f", &compose_file]);
-        for generated in [
-            "docker-compose.temps-env.yml",
-            "docker-compose.temps-network.yml",
-            "docker-compose.temps-override.yml",
-            "docker-compose.temps-labels.yml",
-            "docker-compose.temps-security.yml",
-            TEMPS_SECRETS_OVERRIDE,
-        ] {
-            if project_dir.join(generated).exists() {
-                command.args(["-f", generated]);
-            }
-        }
-        for env_file in [".env.temps", ".env"] {
-            if project_dir.join(env_file).exists() {
-                command.args(["--env-file", env_file]);
-            }
-        }
+        command.args(["compose", "-p", project_name]);
+        Self::append_compose_input_args(&mut command, &project_dir, &compose_file);
         command
             .args(["down", "--remove-orphans", "--timeout", "30"])
             .current_dir(&project_dir)
@@ -1999,9 +2009,9 @@ impl ComposeExecutor {
 
             // down WITH --volumes: removes everything including persistent data
             let mut command = isolated_docker_command();
+            command.args(["compose", "-p", project_name]);
+            Self::append_compose_input_args(&mut command, &project_dir, &compose_file);
             command
-                .args(["compose", "-p", project_name])
-                .args(["-f", &compose_file])
                 .args(["down", "--remove-orphans", "--volumes", "--timeout", "30"])
                 .current_dir(&project_dir);
             let output = Self::bounded_command_output(
@@ -2112,22 +2122,8 @@ impl ComposeExecutor {
             .map(ToString::to_string)
             .unwrap_or_else(|| self.find_compose_file(&project_dir));
         let mut command = isolated_docker_command();
-        command
-            .args(["compose", "-p", project_name])
-            .args(["-f", &compose_file]);
-        for generated in [
-            "docker-compose.temps-env.yml",
-            "docker-compose.temps-network.yml",
-            "docker-compose.temps-override.yml",
-            "docker-compose.temps-labels.yml",
-            "docker-compose.temps-security.yml",
-            TEMPS_SECRETS_OVERRIDE,
-        ] {
-            if project_dir.join(generated).exists() {
-                command.args(["-f", generated]);
-            }
-        }
-        Self::append_compose_env_file_args(&mut command, &project_dir);
+        command.args(["compose", "-p", project_name]);
+        Self::append_compose_input_args(&mut command, &project_dir, &compose_file);
         command
             .args(["stop", "--timeout", "30"])
             .current_dir(&project_dir);
@@ -2239,7 +2235,11 @@ impl ComposeExecutor {
             .env_content
             .as_deref()
             .is_some_and(|content| !content.trim().is_empty());
-        for plan in Self::plan_env_files(&request.compose_content, request.repo_dir.as_deref()) {
+        for plan in Self::plan_env_files_for_compose_file(
+            &request.compose_content,
+            compose_file,
+            request.repo_dir.as_deref(),
+        ) {
             if already_written_env && plan.path == ".env" {
                 continue;
             }
@@ -2308,9 +2308,13 @@ impl ComposeExecutor {
                 Path::new("docker-compose.temps-env.yml"),
                 "docker-compose.temps-env.yml",
             )?;
+            // Absolute: Compose resolves relative paths in every `-f` file
+            // against the directory of the *first* one, so with the compose
+            // file in `deploy/` a relative `.env.temps` would point at
+            // `deploy/.env.temps`, which does not exist.
             let override_content = self.generate_env_override(
                 &request.compose_content,
-                ".env.temps",
+                &temps_env_path.to_string_lossy(),
                 &request.environment_vars,
             );
             tokio::fs::write(&temps_override_path, &override_content)
@@ -4385,12 +4389,46 @@ impl ComposeExecutor {
                 return Err(ComposeError::SecurityPolicyViolation {
                     service: service_name.to_string(),
                     field: "ports".to_string(),
-                    reason: "published ports must explicitly bind to 127.0.0.1 so traffic cannot bypass the Temps proxy"
-                        .to_string(),
+                    reason: Self::loopback_port_remediation(port),
                 });
             }
         }
         Ok(())
+    }
+
+    /// Rejection text for a published port that is not loopback-only, naming
+    /// the exact entry and the exact replacement. Temps does not rewrite the
+    /// file itself: which ports a stack exposes is the author's decision.
+    fn loopback_port_remediation(port: &YamlValue) -> String {
+        const WHY: &str = "published ports must explicitly bind to 127.0.0.1 so traffic cannot \
+                           bypass the Temps proxy";
+        const ROUTE: &str = "then select the service as public in the project settings so Temps \
+                             routes traffic to it";
+        let short_form = match port {
+            YamlValue::String(binding) => Some(binding.clone()),
+            YamlValue::Number(number) => Some(number.to_string()),
+            _ => None,
+        };
+        match short_form {
+            Some(binding) if Self::contains_interpolation(&binding) => format!(
+                "{WHY}: port \"{binding}\" uses a variable, which cannot be validated; replace \
+                 it with a literal loopback binding such as \"127.0.0.1::<container-port>\" \
+                 (or remove the host port), {ROUTE}"
+            ),
+            Some(binding) => {
+                // `[host_ip:][host_port:]container_port[/protocol]`: keep only
+                // the container side and let Docker pick a free loopback port.
+                let container = binding.rsplit(':').next().unwrap_or(&binding);
+                format!(
+                    "{WHY}: change \"{binding}\" to \"127.0.0.1::{container}\" (or remove the \
+                     host port), {ROUTE}"
+                )
+            }
+            None => format!(
+                "{WHY}: add `host_ip: 127.0.0.1` to the long-form port entry (or remove \
+                 `published` so no fixed host port is claimed), {ROUTE}"
+            ),
+        }
     }
 
     /// Whether a Compose service name is safe to interpolate into generated YAML.
@@ -4832,8 +4870,20 @@ impl ComposeExecutor {
         Ok(())
     }
 
+    /// The host side of a volume entry, or `None` when the entry has none.
+    ///
+    /// Short syntax with no `:` (`- /app/node_modules`) is an *anonymous
+    /// volume*: the single path is the mount point inside the container and
+    /// Docker creates a fresh volume for it. There is no host path to
+    /// validate, so it is reported as sourceless — exactly like a long-form
+    /// `type: volume` entry without `source`. The one exception is an entry
+    /// containing interpolation: `${MOUNT}` can expand to `/etc:/etc`, so it
+    /// is returned as-is for the interpolation guard to reject.
     fn volume_source(entry: &YamlValue) -> Option<String> {
         if let Some(value) = entry.as_str() {
+            if !value.contains(':') && !Self::contains_interpolation(value) {
+                return None;
+            }
             return value.split(':').next().map(str::to_string);
         }
 
@@ -5833,8 +5883,7 @@ impl ComposeExecutor {
     ) -> tokio::process::Command {
         let mut cmd = isolated_docker_command();
         cmd.args(["compose", "-p", project_name]);
-        Self::append_compose_file_args(&mut cmd, project_dir, compose_file);
-        Self::append_compose_env_file_args(&mut cmd, project_dir);
+        Self::append_compose_input_args(&mut cmd, project_dir, compose_file);
         cmd.args(["build", "--pull"])
             .current_dir(project_dir)
             .env("PWD", project_dir.to_string_lossy().to_string());
@@ -5915,34 +5964,39 @@ impl ComposeExecutor {
         Ok(captured)
     }
 
-    fn append_compose_file_args(
+    /// The `-f` and `--env-file` arguments shared by every `docker compose`
+    /// command against a deployed stack (`build`, `pull`, `up`, `ps`, `stop`,
+    /// `down`), so each one sees exactly the model `up` deployed.
+    ///
+    /// Generated overrides follow the user's compose file; the secrets
+    /// override is last so a repository cannot redirect where secrets land.
+    /// Env files are passed repository `.env` first and Temps' `.env.temps`
+    /// second: Compose lets a later `--env-file` override an earlier one, and
+    /// project variables configured in Temps must win over repository
+    /// defaults — the same order configuration resolution uses.
+    fn compose_input_args(project_dir: &Path, compose_file: &str) -> Vec<String> {
+        let mut args = vec!["-f".to_string(), compose_file.to_string()];
+        for generated in RESERVED_GENERATED_COMPOSE_FILES {
+            if project_dir.join(generated).exists() {
+                args.push("-f".to_string());
+                args.push((*generated).to_string());
+            }
+        }
+        for env_file in [".env", ".env.temps"] {
+            if project_dir.join(env_file).exists() {
+                args.push("--env-file".to_string());
+                args.push(env_file.to_string());
+            }
+        }
+        args
+    }
+
+    fn append_compose_input_args(
         cmd: &mut tokio::process::Command,
         project_dir: &Path,
         compose_file: &str,
     ) {
-        cmd.args(["-f", compose_file]);
-        for generated in [
-            "docker-compose.temps-env.yml",
-            "docker-compose.temps-network.yml",
-            "docker-compose.temps-override.yml",
-            "docker-compose.temps-labels.yml",
-            "docker-compose.temps-security.yml",
-            // Last: applied after the user override so a repository cannot
-            // redirect where secrets land.
-            TEMPS_SECRETS_OVERRIDE,
-        ] {
-            if project_dir.join(generated).exists() {
-                cmd.args(["-f", generated]);
-            }
-        }
-    }
-
-    fn append_compose_env_file_args(cmd: &mut tokio::process::Command, project_dir: &Path) {
-        for env_file in [".env.temps", ".env"] {
-            if project_dir.join(env_file).exists() {
-                cmd.args(["--env-file", env_file]);
-            }
-        }
+        cmd.args(Self::compose_input_args(project_dir, compose_file));
     }
 
     async fn detect_image_owned_init_services(
@@ -5954,8 +6008,7 @@ impl ComposeExecutor {
     ) -> Result<HashSet<String>, ComposeError> {
         let mut cmd = isolated_docker_command();
         cmd.args(["compose", "-p", project_name]);
-        Self::append_compose_file_args(&mut cmd, project_dir, compose_file);
-        Self::append_compose_env_file_args(&mut cmd, project_dir);
+        Self::append_compose_input_args(&mut cmd, project_dir, compose_file);
         cmd.arg("config")
             .current_dir(project_dir)
             .env("PWD", project_dir.to_string_lossy().to_string());
@@ -6205,8 +6258,7 @@ impl ComposeExecutor {
     ) -> Result<(), ComposeError> {
         let mut cmd = isolated_docker_command();
         cmd.args(["compose", "-p", project_name]);
-        Self::append_compose_file_args(&mut cmd, project_dir, compose_file);
-        Self::append_compose_env_file_args(&mut cmd, project_dir);
+        Self::append_compose_input_args(&mut cmd, project_dir, compose_file);
 
         cmd.args(["pull", "--ignore-buildable"])
             .current_dir(project_dir)
@@ -6248,8 +6300,7 @@ impl ComposeExecutor {
     ) -> Result<(), ComposeError> {
         let mut cmd = isolated_docker_command();
         cmd.args(["compose", "-p", project_name]);
-        Self::append_compose_file_args(&mut cmd, project_dir, compose_file);
-        Self::append_compose_env_file_args(&mut cmd, project_dir);
+        Self::append_compose_input_args(&mut cmd, project_dir, compose_file);
 
         cmd.args(["up", "-d", "--remove-orphans", "--force-recreate"])
             .current_dir(project_dir);
@@ -6310,10 +6361,13 @@ impl ComposeExecutor {
         project_name: &str,
         compose_file: &str,
     ) -> Result<Vec<ComposePsEntry>, ComposeError> {
+        // Same `-f`/`--env-file` inputs as `up`: a `${VAR:?}` that only the
+        // Temps variables satisfy would otherwise fail discovery after a
+        // successful `up`, and generated overrides change the model.
         let mut command = isolated_docker_command();
+        command.args(["compose", "-p", project_name]);
+        Self::append_compose_input_args(&mut command, project_dir, compose_file);
         command
-            .args(["compose", "-p", project_name])
-            .args(["-f", compose_file])
             .args(["ps", "--format", "json", "--all"])
             .current_dir(project_dir);
         let output = Self::bounded_command_output(
@@ -6501,6 +6555,7 @@ impl ComposeExecutor {
         compose_file: &str,
         redact_values: &[String],
         timeout: std::time::Duration,
+        expectations: &ReadinessExpectations,
     ) -> Result<(), ComposeError> {
         let start = std::time::Instant::now();
         let mut observed_ready_once = false;
@@ -6508,7 +6563,7 @@ impl ComposeExecutor {
             let entries = self
                 .compose_ps(project_dir, project_name, compose_file)
                 .await?;
-            match Self::classify_readiness(&entries) {
+            match Self::classify_readiness_with(&entries, expectations) {
                 ComposeReadiness::Ready => {
                     // `docker compose ps` reports a container "running" the
                     // instant its process starts — for a service with no
@@ -6591,12 +6646,28 @@ impl ComposeExecutor {
         }
     }
 
+    /// Classify a `docker compose ps` snapshot with every service required
+    /// to keep running (no one-shot tasks). See [`Self::classify_readiness_with`].
+    #[cfg(test)]
+    fn classify_readiness(entries: &[ComposePsEntry]) -> ComposeReadiness {
+        Self::classify_readiness_with(entries, &ReadinessExpectations::all_long_running())
+    }
+
     /// Classify a `docker compose ps` snapshot into ready/pending/failed.
     /// A service is ready once it's `running` and, if it declares a
-    /// healthcheck, `healthy`. `exited`/`dead` fail fast rather than waiting
-    /// out the full timeout; any other state (`created`, `restarting`,
-    /// `starting` health) is still pending.
-    fn classify_readiness(entries: &[ComposePsEntry]) -> ComposeReadiness {
+    /// healthcheck, `healthy`. `dead`, and `exited` with a non-zero status,
+    /// fail fast rather than waiting out the full timeout; any other state
+    /// (`created`, `restarting`, `starting` health) is still pending.
+    ///
+    /// A service that exited with status 0 is a completed one-shot task — a
+    /// migration, seed or init container — unless `expectations` says it
+    /// must keep running (it is routed, publishes ports, has a healthcheck,
+    /// or another service waits for it to be healthy). A stack in which
+    /// nothing is left running is still a failure.
+    fn classify_readiness_with(
+        entries: &[ComposePsEntry],
+        expectations: &ReadinessExpectations,
+    ) -> ComposeReadiness {
         if entries.is_empty() {
             return ComposeReadiness::Pending(vec![
                 "no containers found after 'docker compose up'".to_string(),
@@ -6605,16 +6676,32 @@ impl ComposeExecutor {
 
         let mut failed = Vec::new();
         let mut pending = Vec::new();
+        let mut running = 0_usize;
         for entry in entries {
             match entry.state.as_str() {
-                "running" => match entry.health.as_str() {
-                    "" | "healthy" => {}
-                    "unhealthy" => failed.push(format!("service '{}' is unhealthy", entry.service)),
-                    other => pending.push(format!("service '{}' is {other}", entry.service)),
-                },
-                "exited" | "dead" => {
-                    failed.push(format!("service '{}' {}", entry.service, entry.state))
+                "running" => {
+                    running += 1;
+                    match entry.health.as_str() {
+                        "" | "healthy" => {}
+                        "unhealthy" => {
+                            failed.push(format!("service '{}' is unhealthy", entry.service))
+                        }
+                        other => pending.push(format!("service '{}' is {other}", entry.service)),
+                    }
                 }
+                "exited" if entry.exit_code == 0 => {
+                    if let Some(reason) = expectations.why_long_running(&entry.service) {
+                        failed.push(format!(
+                            "service '{}' exited (code 0) but must keep running because it {reason}",
+                            entry.service
+                        ));
+                    }
+                }
+                "exited" => failed.push(format!(
+                    "service '{}' exited (code {})",
+                    entry.service, entry.exit_code
+                )),
+                "dead" => failed.push(format!("service '{}' dead", entry.service)),
                 other => pending.push(format!("service '{}' is {other}", entry.service)),
             }
         }
@@ -6623,8 +6710,87 @@ impl ComposeExecutor {
             ComposeReadiness::Failed(failed)
         } else if !pending.is_empty() {
             ComposeReadiness::Pending(pending)
+        } else if running == 0 {
+            ComposeReadiness::Failed(vec![
+                "every service exited before the stack became ready: one-shot tasks completed, \
+                 but no service keeps running to serve the deployment"
+                    .to_string(),
+            ])
         } else {
             ComposeReadiness::Ready
+        }
+    }
+
+    /// Work out which services must stay running, from the compose file, the
+    /// inline override and the services Temps routes to. An unparseable
+    /// document falls back to requiring every service to run, which is the
+    /// behaviour before one-shot tasks were recognised.
+    fn readiness_expectations(
+        compose_content: &str,
+        compose_override: Option<&str>,
+        routed_services: &[String],
+    ) -> ReadinessExpectations {
+        let mut reasons: HashMap<String, &'static str> = HashMap::new();
+        for service in routed_services {
+            reasons.insert(service.clone(), "receives the deployment's public traffic");
+        }
+        for document in std::iter::once(compose_content).chain(compose_override) {
+            let mut root: YamlValue = match serde_yaml::from_str(document) {
+                Ok(root) => root,
+                Err(_) => return ReadinessExpectations::all_long_running(),
+            };
+            if root.apply_merge().is_err() {
+                return ReadinessExpectations::all_long_running();
+            }
+            let Some(services) = root.get("services").and_then(YamlValue::as_mapping) else {
+                continue;
+            };
+            for (name, definition) in services {
+                let (Some(name), Some(definition)) = (name.as_str(), definition.as_mapping())
+                else {
+                    continue;
+                };
+                let field = |key: &str| definition.get(YamlValue::String(key.to_string()));
+                if field("ports")
+                    .and_then(YamlValue::as_sequence)
+                    .is_some_and(|ports| !ports.is_empty())
+                {
+                    reasons.entry(name.to_string()).or_insert("publishes ports");
+                }
+                let healthcheck_disabled = field("healthcheck")
+                    .and_then(|check| check.get("disable"))
+                    .and_then(YamlValue::as_bool)
+                    .unwrap_or(false);
+                if field("healthcheck").is_some_and(YamlValue::is_mapping) && !healthcheck_disabled
+                {
+                    reasons
+                        .entry(name.to_string())
+                        .or_insert("declares a healthcheck");
+                }
+                if matches!(
+                    field("restart").and_then(YamlValue::as_str),
+                    Some("always" | "unless-stopped")
+                ) {
+                    reasons
+                        .entry(name.to_string())
+                        .or_insert("has an always/unless-stopped restart policy");
+                }
+                if let Some(depends_on) = field("depends_on").and_then(YamlValue::as_mapping) {
+                    for (dependency, condition) in depends_on {
+                        let healthy = condition.get("condition").and_then(YamlValue::as_str)
+                            == Some("service_healthy");
+                        if let (true, Some(dependency)) = (healthy, dependency.as_str()) {
+                            reasons
+                                .entry(dependency.to_string())
+                                .or_insert("is a dependency other services wait on to be healthy");
+                        }
+                    }
+                }
+            }
+        }
+        ReadinessExpectations {
+            all_long_running: false,
+            long_running: reasons,
         }
     }
 
@@ -7535,6 +7701,14 @@ impl ComposeExecutor {
     /// repository the operator does not control, so an `env_file` entry must
     /// never be able to name a location outside the stack directory.
     pub fn collect_env_file_refs(compose_content: &str) -> Vec<String> {
+        Self::raw_env_file_refs(compose_content)
+            .into_iter()
+            .filter(|path| Self::validate_relative_path(path, "env_file").is_ok())
+            .collect()
+    }
+
+    /// Every `env_file` path exactly as written, de-duplicated, unvalidated.
+    fn raw_env_file_refs(compose_content: &str) -> Vec<String> {
         let mut root: YamlValue = match serde_yaml::from_str(compose_content) {
             Ok(value) => value,
             Err(_) => return Vec::new(),
@@ -7547,9 +7721,6 @@ impl ComposeExecutor {
         let mut refs: Vec<String> = Vec::new();
         let push = |candidate: Option<&str>, refs: &mut Vec<String>| {
             let Some(path) = candidate else { return };
-            if Self::validate_relative_path(path, "env_file").is_err() {
-                return;
-            }
             if !refs.iter().any(|existing| existing == path) {
                 refs.push(path.to_string());
             }
@@ -7586,7 +7757,52 @@ impl ComposeExecutor {
     /// is about to execute — an operator must be able to see that Temps created
     /// a file the repository never contained.
     pub fn plan_env_files(compose_content: &str, repo_dir: Option<&Path>) -> Vec<EnvFilePlan> {
-        Self::collect_env_file_refs(compose_content)
+        Self::plan_env_files_for_compose_file(compose_content, "docker-compose.yml", repo_dir)
+    }
+
+    /// `env_file` paths resolved the way Docker Compose resolves them:
+    /// relative to the directory of the compose file, then expressed relative
+    /// to the stack root. A compose file at `deploy/compose.yml` that names
+    /// `env_file: .env.app` therefore reads `deploy/.env.app`, and
+    /// `../.env` reads the root `.env`. A reference that leaves the stack
+    /// root after resolution is dropped, as before.
+    pub fn env_file_refs_for_compose_file(
+        compose_content: &str,
+        compose_file: &str,
+    ) -> Vec<String> {
+        let compose_dir = Path::new(compose_file)
+            .parent()
+            .map(|parent| parent.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut resolved_refs: Vec<String> = Vec::new();
+        for path in Self::raw_env_file_refs(compose_content) {
+            if path.starts_with('/') || path.starts_with('~') {
+                continue;
+            }
+            let joined = if compose_dir.is_empty() {
+                path
+            } else {
+                format!("{compose_dir}/{path}")
+            };
+            let resolved = Self::lexically_normalize(&joined);
+            if resolved == "." || Self::validate_relative_path(&resolved, "env_file").is_err() {
+                continue;
+            }
+            if !resolved_refs.contains(&resolved) {
+                resolved_refs.push(resolved);
+            }
+        }
+        resolved_refs
+    }
+
+    /// [`Self::plan_env_files`] for a compose file that may live in a
+    /// subdirectory of the stack root. Plan paths are stack-root relative.
+    pub fn plan_env_files_for_compose_file(
+        compose_content: &str,
+        compose_file: &str,
+        repo_dir: Option<&Path>,
+    ) -> Vec<EnvFilePlan> {
+        Self::env_file_refs_for_compose_file(compose_content, compose_file)
             .into_iter()
             .map(|path| {
                 let from_repo = repo_dir.and_then(|dir| {
@@ -7826,17 +8042,45 @@ impl ComposeExecutor {
     }
 
     fn find_compose_file(&self, project_dir: &Path) -> String {
+        // Docker Compose's own precedence, matching the deployment default.
         for name in &[
-            "docker-compose.yml",
-            "docker-compose.yaml",
-            "compose.yml",
             "compose.yaml",
+            "compose.yml",
+            "docker-compose.yaml",
+            "docker-compose.yml",
         ] {
             if project_dir.join(name).exists() {
                 return name.to_string();
             }
         }
         "docker-compose.yml".to_string()
+    }
+}
+
+/// Which services a Compose deployment needs running to be ready.
+#[derive(Debug, Clone, Default)]
+struct ReadinessExpectations {
+    /// Every service must keep running (no service may exit, even with 0).
+    all_long_running: bool,
+    /// Services that must keep running, with the reason shown when one exits.
+    long_running: HashMap<String, &'static str>,
+}
+
+impl ReadinessExpectations {
+    fn all_long_running() -> Self {
+        Self {
+            all_long_running: true,
+            long_running: HashMap::new(),
+        }
+    }
+
+    /// Why `service` must keep running, or `None` when a clean exit is a
+    /// completed one-shot task.
+    fn why_long_running(&self, service: &str) -> Option<&'static str> {
+        if self.all_long_running {
+            return Some("is required to keep running");
+        }
+        self.long_running.get(service).copied()
     }
 }
 
@@ -7865,6 +8109,9 @@ struct ComposePsEntry {
     /// healthcheck (older Compose CLI versions omit the field entirely).
     #[serde(default)]
     health: String,
+    /// Process exit status for an `exited` container (`0` otherwise).
+    #[serde(default)]
+    exit_code: i64,
     #[serde(default)]
     publishers: Vec<ComposePsPublisher>,
 }
@@ -7914,6 +8161,7 @@ mod tests {
             image: "img:latest".to_string(),
             state: state.to_string(),
             health: health.to_string(),
+            exit_code: 0,
             publishers: Vec::new(),
         }
     }
@@ -9645,6 +9893,7 @@ services:
             relaxed_capability_services: Vec::new(),
             unsandboxed_services: Vec::new(),
             ready_timeout: None,
+            routed_services: Vec::new(),
         };
         executor
             .write_compose_files(project_dir.path(), &request, "failed-test")
@@ -9771,6 +10020,7 @@ services:
             relaxed_capability_services: Vec::new(),
             unsandboxed_services: Vec::new(),
             ready_timeout: None,
+            routed_services: Vec::new(),
         };
         executor
             .write_compose_files(project_dir.path(), &request, "quick-exit")
@@ -9880,6 +10130,7 @@ services:
             relaxed_capability_services: Vec::new(),
             unsandboxed_services: Vec::new(),
             ready_timeout: None,
+            routed_services: Vec::new(),
         };
         executor
             .write_compose_files(project_dir.path(), &request, "failed-public-port")
@@ -10066,6 +10317,7 @@ services:
             relaxed_capability_services: Vec::new(),
             unsandboxed_services: vec!["webserver".to_string()],
             ready_timeout: None,
+            routed_services: Vec::new(),
         };
 
         executor
@@ -10138,6 +10390,7 @@ services:
             relaxed_capability_services: Vec::new(),
             unsandboxed_services: vec!["app".to_string()],
             ready_timeout: None,
+            routed_services: Vec::new(),
         };
 
         let err = executor
@@ -10183,6 +10436,7 @@ services:
             relaxed_capability_services: Vec::new(),
             unsandboxed_services: vec!["app".to_string()],
             ready_timeout: None,
+            routed_services: Vec::new(),
         };
 
         let err = executor
@@ -10215,6 +10469,7 @@ services:
             relaxed_capability_services: Vec::new(),
             unsandboxed_services: vec!["app".to_string()],
             ready_timeout: None,
+            routed_services: Vec::new(),
         };
 
         let err = executor
@@ -10249,6 +10504,7 @@ services:
             relaxed_capability_services: Vec::new(),
             unsandboxed_services: vec!["app".to_string()],
             ready_timeout: None,
+            routed_services: Vec::new(),
         };
 
         executor
@@ -10352,6 +10608,7 @@ services:
             relaxed_capability_services: Vec::new(),
             unsandboxed_services: Vec::new(),
             ready_timeout: None,
+            routed_services: Vec::new(),
         }
     }
 
@@ -14103,5 +14360,428 @@ services:
                 .await,
             Err(ComposeError::SecurityPolicyViolation { .. })
         ));
+    }
+
+    // ── Deploy-success regressions: anonymous volumes, one-shot services,
+    //    subdirectory compose files, shared command inputs ─────────────────
+
+    fn ps(service: &str, state: &str, exit_code: i64) -> ComposePsEntry {
+        let mut ps_entry = entry(service, state, "");
+        ps_entry.exit_code = exit_code;
+        ps_entry
+    }
+
+    fn deploy_request(compose_content: &str, compose_path: &str) -> ComposeDeployRequest {
+        let mut request = secrets_test_request("temps-9-9", compose_content, HashMap::new());
+        request.compose_path = Some(compose_path.to_string());
+        request
+    }
+
+    #[test]
+    fn anonymous_short_syntax_volume_is_not_a_host_bind() {
+        let executor = executor_with_checks_disabled(&[]);
+        let anonymous = "services:\n  web:\n    image: node:22\n    volumes:\n      - /app/node_modules\n      - cache:/cache\nvolumes:\n  cache: {}\n";
+        executor.preflight_validate(anonymous, None).unwrap();
+
+        let long_form = "services:\n  web:\n    image: node:22\n    volumes:\n      - type: volume\n        target: /app/node_modules\n";
+        executor.preflight_validate(long_form, None).unwrap();
+
+        // Real host binds and interpolated entries stay guarded.
+        for rejected in [
+            "services:\n  web:\n    image: node:22\n    volumes:\n      - /etc:/host-etc\n",
+            "services:\n  web:\n    image: node:22\n    volumes:\n      - ${MOUNT}\n",
+            "services:\n  web:\n    image: node:22\n    volumes:\n      - type: bind\n        target: /data\n",
+        ] {
+            assert!(
+                matches!(
+                    executor.preflight_validate(rejected, None),
+                    Err(ComposeError::SecurityPolicyViolation { .. })
+                ),
+                "{rejected}"
+            );
+        }
+        assert_eq!(
+            ComposeExecutor::volume_source(&YamlValue::String("/app/node_modules".into())),
+            None
+        );
+        assert_eq!(
+            ComposeExecutor::volume_source(&YamlValue::String("./data:/data:ro".into())),
+            Some("./data".to_string())
+        );
+    }
+
+    #[test]
+    fn one_shot_service_that_exits_zero_completes_instead_of_failing() {
+        let compose = r#"
+services:
+  migrate:
+    image: app:latest
+    command: ["./migrate"]
+  web:
+    image: app:latest
+    ports: ["127.0.0.1::3000"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+"#;
+        let expectations = ComposeExecutor::readiness_expectations(compose, None, &[]);
+        assert_eq!(
+            ComposeExecutor::classify_readiness_with(
+                &[ps("migrate", "exited", 0), ps("web", "running", 0)],
+                &expectations
+            ),
+            ComposeReadiness::Ready
+        );
+
+        // A failing migration still fails fast, with its status.
+        let ComposeReadiness::Failed(reasons) = ComposeExecutor::classify_readiness_with(
+            &[ps("migrate", "exited", 1), ps("web", "running", 0)],
+            &expectations,
+        ) else {
+            panic!("non-zero exit must fail");
+        };
+        assert_eq!(reasons, vec!["service 'migrate' exited (code 1)"]);
+    }
+
+    #[test]
+    fn services_that_must_keep_running_fail_even_on_a_clean_exit() {
+        let compose = r#"
+services:
+  api:
+    image: app:latest
+    ports: ["127.0.0.1::8080"]
+  db:
+    image: postgres:18
+    healthcheck:
+      test: ["CMD", "pg_isready"]
+  cache:
+    image: redis:7
+    restart: unless-stopped
+  queue:
+    image: queue:latest
+  worker:
+    image: app:latest
+    depends_on:
+      queue:
+        condition: service_healthy
+  router:
+    image: app:latest
+"#;
+        let expectations =
+            ComposeExecutor::readiness_expectations(compose, None, &["router".to_string()]);
+        for (service, reason) in [
+            ("api", "publishes ports"),
+            ("db", "declares a healthcheck"),
+            ("cache", "restart policy"),
+            ("queue", "wait on to be healthy"),
+            ("router", "public traffic"),
+        ] {
+            let ComposeReadiness::Failed(reasons) = ComposeExecutor::classify_readiness_with(
+                &[ps(service, "exited", 0), ps("worker", "running", 0)],
+                &expectations,
+            ) else {
+                panic!("{service} exiting must fail the deploy");
+            };
+            assert!(reasons[0].contains(&format!("service '{service}' exited (code 0)")));
+            assert!(reasons[0].contains(reason), "{service}: {reasons:?}");
+        }
+        // The worker itself is a plain service: a clean exit is a completion.
+        assert_eq!(
+            ComposeExecutor::classify_readiness_with(
+                &[ps("worker", "exited", 0), ps("api", "running", 0)],
+                &expectations
+            ),
+            ComposeReadiness::Ready
+        );
+    }
+
+    #[test]
+    fn a_stack_with_nothing_left_running_is_not_ready() {
+        let expectations = ComposeExecutor::readiness_expectations(
+            "services:\n  task:\n    image: busybox\n",
+            None,
+            &[],
+        );
+        assert!(matches!(
+            ComposeExecutor::classify_readiness_with(&[ps("task", "exited", 0)], &expectations),
+            ComposeReadiness::Failed(_)
+        ));
+        // Unparseable input keeps the strict behaviour.
+        let strict = ComposeExecutor::readiness_expectations("{{{", None, &[]);
+        assert!(matches!(
+            ComposeExecutor::classify_readiness_with(
+                &[ps("task", "exited", 0), ps("web", "running", 0)],
+                &strict
+            ),
+            ComposeReadiness::Failed(_)
+        ));
+        // Ports added by the inline override count too.
+        let with_override = ComposeExecutor::readiness_expectations(
+            "services:\n  web:\n    image: app\n",
+            Some("services:\n  web:\n    ports: ['127.0.0.1::80']\n"),
+            &[],
+        );
+        assert!(with_override.why_long_running("web").is_some());
+    }
+
+    #[test]
+    fn compose_ps_exit_code_is_parsed() {
+        let json = r#"{"ID":"abc","Name":"temps-1-2-migrate-1","Service":"migrate","Image":"app","State":"exited","ExitCode":3,"Publishers":[]}"#;
+        let parsed: ComposePsEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.exit_code, 3);
+        let running = r#"{"ID":"abc","Name":"n","Service":"web","Image":"app","State":"running"}"#;
+        assert_eq!(
+            serde_json::from_str::<ComposePsEntry>(running)
+                .unwrap()
+                .exit_code,
+            0
+        );
+    }
+
+    #[test]
+    fn every_compose_command_shares_files_and_env_files_in_override_order() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            ComposeExecutor::compose_input_args(dir.path(), "deploy/compose.yaml"),
+            vec!["-f", "deploy/compose.yaml"]
+        );
+        for file in [
+            "docker-compose.temps-env.yml",
+            "docker-compose.temps-labels.yml",
+            TEMPS_SECRETS_OVERRIDE,
+            ".env",
+            ".env.temps",
+        ] {
+            std::fs::write(dir.path().join(file), "").unwrap();
+        }
+        assert_eq!(
+            ComposeExecutor::compose_input_args(dir.path(), "deploy/compose.yaml"),
+            vec![
+                "-f",
+                "deploy/compose.yaml",
+                "-f",
+                "docker-compose.temps-env.yml",
+                "-f",
+                "docker-compose.temps-labels.yml",
+                "-f",
+                TEMPS_SECRETS_OVERRIDE,
+                // Later --env-file wins: Temps variables override the repo .env.
+                "--env-file",
+                ".env",
+                "--env-file",
+                ".env.temps",
+            ]
+        );
+    }
+
+    #[test]
+    fn env_files_resolve_relative_to_the_compose_file_directory() {
+        let compose = r#"
+services:
+  web:
+    image: app
+    env_file:
+      - app.env
+      - ../.env
+      - ../../outside.env
+      - /etc/passwd
+      - ./config/web.env
+"#;
+        assert_eq!(
+            ComposeExecutor::env_file_refs_for_compose_file(compose, "deploy/compose.yaml"),
+            vec!["deploy/app.env", ".env", "deploy/config/web.env"]
+        );
+        // Root compose files keep their previous behaviour.
+        assert_eq!(
+            ComposeExecutor::env_file_refs_for_compose_file(compose, "compose.yaml"),
+            vec!["app.env", "config/web.env"]
+        );
+    }
+
+    #[tokio::test]
+    async fn subdirectory_compose_gets_absolute_temps_env_and_env_files_next_to_it() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let executor = disabled_executor(data_dir.path().to_path_buf());
+        let checkout = tempfile::tempdir().unwrap();
+        let compose = "services:\n  web:\n    image: app\n    env_file: app.env\n";
+        let mut request = deploy_request(compose, "deploy/compose.yaml");
+        request.repo_dir = Some(checkout.path().to_path_buf());
+        request.environment_vars = HashMap::from([("GREETING".into(), "hello".into())]);
+
+        executor
+            .write_compose_files(checkout.path(), &request, "gen-1")
+            .await
+            .unwrap();
+
+        let env_override =
+            std::fs::read_to_string(checkout.path().join("docker-compose.temps-env.yml")).unwrap();
+        let temps_env = checkout.path().join(".env.temps");
+        assert!(temps_env.is_file());
+        assert!(
+            env_override.contains(&temps_env.to_string_lossy().to_string()),
+            "override must reference .env.temps absolutely: {env_override}"
+        );
+        // Synthesized where Compose will look for it: next to the compose file.
+        assert!(checkout.path().join("deploy/app.env").is_file());
+        assert!(!checkout.path().join("app.env").exists());
+    }
+
+    #[tokio::test]
+    async fn env_file_resolving_onto_a_generated_compose_file_is_rejected() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let executor = disabled_executor(data_dir.path().to_path_buf());
+        let checkout = tempfile::tempdir().unwrap();
+        let compose =
+            "services:\n  web:\n    image: app\n    env_file: ../docker-compose.temps-env.yml\n";
+        let mut request = deploy_request(compose, "deploy/compose.yaml");
+        request.repo_dir = Some(checkout.path().to_path_buf());
+        let error = executor
+            .write_compose_files(checkout.path(), &request, "gen-1")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ComposeError::SecurityPolicyViolation { ref field, .. } if field == "env_file"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn non_loopback_port_rejection_names_the_exact_fix() {
+        let executor = executor_with_checks_disabled(&[]);
+        let cases = [
+            (
+                "- \"3000:3000\"",
+                "change \"3000:3000\" to \"127.0.0.1::3000\"",
+            ),
+            (
+                "- \"0.0.0.0:8080:80/udp\"",
+                "change \"0.0.0.0:8080:80/udp\" to \"127.0.0.1::80/udp\"",
+            ),
+            ("- 5432", "change \"5432\" to \"127.0.0.1::5432\""),
+            ("- \"${PORT}:3000\"", "uses a variable"),
+            (
+                "- target: 80\n        published: 8080",
+                "host_ip: 127.0.0.1",
+            ),
+        ];
+        for (entry, expected) in cases {
+            let compose = format!("services:\n  web:\n    image: app\n    ports:\n      {entry}\n");
+            let Err(ComposeError::SecurityPolicyViolation { reason, .. }) =
+                executor.preflight_validate(&compose, None)
+            else {
+                panic!("{entry} must be rejected");
+            };
+            assert!(reason.contains(expected), "{entry}: {reason}");
+            assert!(reason.contains("select the service as public"), "{reason}");
+            assert!(reason.contains("127.0.0.1"), "{reason}");
+        }
+        executor
+            .preflight_validate(
+                "services:\n  web:\n    image: app\n    ports:\n      - \"127.0.0.1::3000\"\n",
+                None,
+            )
+            .unwrap();
+    }
+
+    /// Scenario: the generic `sample-compose-app` fixture (compose file in a
+    /// subdirectory, anonymous volume, one-shot migration, shared env file,
+    /// loopback-published web service) passes policy, gets consistent
+    /// command inputs and env files, and is ready once the migration exits 0.
+    #[tokio::test]
+    async fn sample_compose_app_scenario_is_deployable() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample-compose-app");
+        let checkout = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(checkout.path().join("deploy")).unwrap();
+        for file in ["deploy/compose.yaml", "deploy/app.env"] {
+            std::fs::copy(fixture.join(file), checkout.path().join(file)).unwrap();
+        }
+        let compose_file = "deploy/compose.yaml";
+        let compose = std::fs::read_to_string(checkout.path().join(compose_file)).unwrap();
+
+        let executor = executor_with_checks_disabled(&[]);
+        executor.preflight_validate(&compose, None).unwrap();
+        executor
+            .preflight_validate_filesystem(checkout.path(), compose_file, &compose, None)
+            .unwrap();
+
+        let plans = ComposeExecutor::plan_env_files_for_compose_file(
+            &compose,
+            compose_file,
+            Some(checkout.path()),
+        );
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].path, "deploy/app.env");
+        assert!(matches!(plans[0].source, EnvFileSource::Repository(_)));
+
+        let mut request = deploy_request(&compose, compose_file);
+        request.repo_dir = Some(checkout.path().to_path_buf());
+        request.environment_vars = HashMap::from([("GREETING".into(), "from-temps".into())]);
+        request.env_content = Some("GREETING=from-repository\n".into());
+        request.routed_services = vec!["web".into()];
+        let data_dir = tempfile::tempdir().unwrap();
+        let writer = disabled_executor(data_dir.path().to_path_buf());
+        writer
+            .write_compose_files(checkout.path(), &request, "gen-1")
+            .await
+            .unwrap();
+        let args = ComposeExecutor::compose_input_args(checkout.path(), compose_file);
+        assert_eq!(&args[..2], ["-f", compose_file]);
+        let env_files: Vec<&String> = args
+            .windows(2)
+            .filter(|pair| pair[0] == "--env-file")
+            .map(|pair| &pair[1])
+            .collect();
+        assert_eq!(env_files, [".env", ".env.temps"]);
+
+        let expectations = ComposeExecutor::readiness_expectations(
+            &request.compose_content,
+            None,
+            &request.routed_services,
+        );
+        assert_eq!(
+            ComposeExecutor::classify_readiness_with(
+                &[ps("migrate", "exited", 0), ps("web", "running", 0)],
+                &expectations
+            ),
+            ComposeReadiness::Ready
+        );
+        assert!(matches!(
+            ComposeExecutor::classify_readiness_with(
+                &[ps("migrate", "exited", 0), ps("web", "exited", 0)],
+                &expectations
+            ),
+            ComposeReadiness::Failed(_)
+        ));
+
+        // With the Compose CLI available, confirm Compose itself resolves the
+        // model the same way: `${GREETING:?}` is satisfied by the Temps value
+        // (which wins over the repository .env), and both env files load.
+        let compose_cli = tokio::process::Command::new("docker")
+            .args(["compose", "version"])
+            .output()
+            .await
+            .is_ok_and(|output| output.status.success());
+        if !compose_cli {
+            println!("Docker Compose CLI not available; skipping `docker compose config` check");
+            return;
+        }
+        let output = tokio::process::Command::new("docker")
+            .args(["compose", "-p", "temps-scenario-test"])
+            .args(&args)
+            .args(["config", "--format", "json"])
+            .current_dir(checkout.path())
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "docker compose config failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let model: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let web_env = &model["services"]["web"]["environment"];
+        assert_eq!(web_env["GREETING"], "from-temps", "{web_env}");
+        assert_eq!(web_env["APP_NAME"], "sample-compose-app", "{web_env}");
     }
 }

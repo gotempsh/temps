@@ -17,7 +17,7 @@ use autopack_core::{analyze, App, Environment};
 use autopack_dockerfile::to_dockerfile;
 use tracing::{debug, info, warn};
 
-use crate::{DockerfileConfig, DockerfileWithArgs, Preset, ProjectType};
+use crate::{BuildPlanFailure, DockerfileConfig, DockerfileWithArgs, Preset, ProjectType};
 
 /// Builds any application autopack recognises.
 #[derive(Debug, Clone, Copy, Default)]
@@ -193,7 +193,42 @@ pub(crate) fn render(
     }
 
     let dockerfile = to_dockerfile(&analysis.plan).map_err(|e| e.to_string())?;
-    Ok(DockerfileWithArgs::new(dockerfile))
+    let mut rendered = DockerfileWithArgs::new(dockerfile);
+    // The tracing line above only reaches the server log. Carry the same notes
+    // back to the build job so the user sees which settings were ignored in the
+    // deployment log, next to the build they affect.
+    rendered.warnings = untranslated_config_notes(
+        analysis
+            .metadata
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+    );
+    Ok(rendered)
+}
+
+/// Settings from a compatibility config (`nixpacks.toml`, `railpack.json`)
+/// that autopack could not carry over, in the order autopack reported them.
+///
+/// Autopack records each as a `configNote<N>` metadata entry whose text names
+/// the skipped keys (e.g. "nixPkgs with no mise equivalent were skipped: ...").
+/// Ordering is by `N`, not by map order, so the log reads the same way as
+/// autopack's own output.
+pub(crate) fn untranslated_config_notes<'a>(
+    metadata: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Vec<String> {
+    let mut notes: Vec<(u32, String)> = metadata
+        .into_iter()
+        .filter_map(|(key, value)| {
+            let index = key.strip_prefix("configNote")?.parse::<u32>().ok()?;
+            let value = value.trim();
+            (!value.is_empty()).then(|| (index, value.to_string()))
+        })
+        .collect();
+    notes.sort_by_key(|(index, _)| *index);
+    notes
+        .into_iter()
+        .map(|(_, note)| format!("Build config setting not applied: {note}"))
+        .collect()
 }
 
 /// A pnpm workspace app directory safe to use in Dockerfile paths and shell filters.
@@ -243,6 +278,8 @@ fn is_build_arg_name(name: &str) -> bool {
 /// The trait cannot return an error, and returning an empty or plausible
 /// Dockerfile would turn a detection failure into a confusing runtime failure
 /// several minutes later — or, worse, an image that builds and then exits.
+/// The failure is also recorded as [`BuildPlanFailure::Unplannable`] so the
+/// deployment pipeline can refuse to build at all.
 pub(crate) fn render_or_explain(
     config: &DockerfileConfig<'_>,
     provider: Option<&str>,
@@ -251,29 +288,18 @@ pub(crate) fn render_or_explain(
         Ok(dockerfile) => dockerfile,
         Err(message) => {
             warn!("autopack could not plan this application: {message}");
-            // `message` can itself contain newlines (e.g. a multi-line "how to
-            // fix this" hint). A raw newline inside the `RUN echo '...'`
-            // argument would split it into a second physical Dockerfile line
-            // that Docker parses as its own instruction — collapse to spaces
-            // so the RUN instruction stays on one line; the comment block
-            // above still renders the message with its original line breaks.
-            let single_line_message = message.split_whitespace().collect::<Vec<_>>().join(" ");
-            DockerfileWithArgs::new(format!(
-                "# autopack could not plan this application.\n\
-                 #\n\
-                 # {}\n\
-                 FROM debian:bookworm-slim\n\
-                 RUN echo {} >&2 && exit 1\n",
-                message.replace('\n', "\n# "),
-                shell_quote(&single_line_message)
-            ))
+            // `failing` keeps the RUN instruction on one physical line even
+            // when `message` spans several (e.g. a multi-line "how to fix
+            // this" hint); the comment block keeps the original line breaks.
+            DockerfileWithArgs::failing(BuildPlanFailure::Unplannable {
+                preset: match provider {
+                    Some(provider) => format!("autopack ({provider})"),
+                    None => "autopack".to_string(),
+                },
+                reason: message.trim().to_string(),
+            })
         }
     }
-}
-
-/// Quote a message for safe interpolation into a shell command.
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', r"'\''"))
 }
 
 #[async_trait]
@@ -900,5 +926,75 @@ mod tests {
             let result = render(&buildkit_config(repo.path()), Some("ruby")).unwrap().content;
             assert!(result.contains("ruby:3.4"), "{result}");
         }
+    }
+
+    #[tokio::test]
+    async fn an_unplannable_app_reports_a_typed_plan_failure() {
+        let dir = fixture(&[("notes.txt", "nothing to build here")]);
+
+        let result = AutopackPreset::new()
+            .dockerfile_with_build_dir(dir.path())
+            .await;
+
+        let Some(BuildPlanFailure::Unplannable { preset, reason }) = result.plan_failure else {
+            panic!(
+                "expected an Unplannable plan failure, got {:?}",
+                result.plan_failure
+            );
+        };
+        assert_eq!(preset, "autopack");
+        assert!(reason.contains("no provider could be detected"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn a_plannable_app_reports_no_plan_failure() {
+        let dir = node_app();
+        let result = AutopackPreset::new()
+            .dockerfile_with_build_dir(dir.path())
+            .await;
+        assert!(result.plan_failure.is_none(), "{:?}", result.plan_failure);
+    }
+
+    #[test]
+    fn untranslated_config_notes_are_ordered_by_index_and_ignore_other_metadata() {
+        let notes = untranslated_config_notes([
+            ("provider", "node"),
+            ("configNote10", "tenth"),
+            (
+                "configNote2",
+                "phases other than setup/install/build were skipped: release",
+            ),
+            (
+                "configNote1",
+                "nixPkgs with no mise equivalent were skipped: ffmpeg",
+            ),
+            ("configNoteX", "not a numbered note"),
+            ("configNote3", "   "),
+        ]);
+        assert_eq!(
+            notes,
+            vec![
+                "Build config setting not applied: nixPkgs with no mise equivalent were skipped: ffmpeg",
+                "Build config setting not applied: phases other than setup/install/build were skipped: release",
+                "Build config setting not applied: tenth",
+            ]
+        );
+        assert!(untranslated_config_notes([("provider", "node")]).is_empty());
+    }
+
+    #[test]
+    fn legacy_nixpacks_keys_that_cannot_be_translated_surface_as_warnings() {
+        let dir = fixture(&[
+            ("package.json", r#"{"scripts":{"start":"node server.js"}}"#),
+            ("server.js", ""),
+            (
+                "nixpacks.toml",
+                "[phases.setup]\nnixPkgs = ['definitely-not-a-mise-tool']\n\n[phases.release]\ncmds = ['echo release']\n",
+            ),
+        ]);
+        let result = render(&buildkit_config(dir.path()), None).unwrap();
+        let joined = result.warnings.join("\n");
+        assert!(joined.contains("definitely-not-a-mise-tool"), "{joined}");
+        assert!(joined.contains("release"), "{joined}");
     }
 }

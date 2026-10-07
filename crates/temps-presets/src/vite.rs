@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use super::{DockerfileWithArgs, PackageManager, Preset, ProjectType};
+use super::{BuildPlanFailure, DockerfileWithArgs, PackageManager, Preset, ProjectType};
 use async_trait::async_trait;
 use std::path::Path;
 
@@ -30,29 +30,43 @@ impl Preset for Vite {
             Ok(Some(relative)) => return workspace_dockerfile(&config, &relative),
             Ok(None) => {}
             Err(message) => {
-                return DockerfileWithArgs::new(format!(
-                "# {}\nFROM node:22\nRUN echo 'Invalid pnpm workspace configuration' >&2; exit 1\n",
-                message.replace('\n', "\n# ")
-            ))
+                return DockerfileWithArgs::failing(BuildPlanFailure::InvalidConfiguration {
+                    preset: "vite".to_string(),
+                    reason: format!("invalid pnpm workspace configuration: {message}"),
+                });
+            }
+        }
+        // Without a build script `npm run build` stops with "Missing script:
+        // build" only after every dependency has been installed. Say so now.
+        if config.build_command.is_none() {
+            if let Some(failure) = missing_build_script(config.local_path) {
+                return DockerfileWithArgs::failing(failure);
             }
         }
         let package_manager = PackageManager::detect(config.local_path);
+        let toolchain = JsToolchain::detect(config.local_path, package_manager);
         let install_cmd = config
             .install_command
-            .unwrap_or(package_manager.install_command());
+            .unwrap_or(toolchain.install_command());
         let build_cmd = config
             .build_command
             .unwrap_or(package_manager.build_command());
-        let output = config.output_dir.unwrap_or("dist");
+        let mut warnings = Vec::new();
+        let output = resolve_output_dir(config.output_dir, config.local_path, &mut warnings);
 
-        // Use multi-stage build without BuildKit-specific --mount syntax
+        // Use multi-stage build without BuildKit-specific --mount syntax.
+        // Install-time configuration is copied before the install step: the
+        // registry/auth settings in `.npmrc`, Yarn Berry's `.yarnrc.yml` (and
+        // the release/plugins it points at), and patch directories applied
+        // during install. The `*` suffix tolerates files that are absent or
+        // excluded by `.dockerignore`.
         let mut dockerfile = format!(
             r#"FROM {} as builder
 WORKDIR /app
 
-# Copy package files
-COPY package.json package-lock.json* yarn.lock* pnpm-lock.yaml* bun.lockb* ./
-{}
+# Copy package files and install-time configuration
+COPY package.json package-lock.json* yarn.lock* pnpm-lock.yaml* bun.lock* .npmrc* .yarnrc* ./
+{}{}{}
 # Install dependencies
 RUN {}{}
 
@@ -61,7 +75,13 @@ COPY . .
 "#,
             package_manager.base_image(),
             package_manager.dependency_config_copy(config.local_path),
-            if matches!(package_manager, PackageManager::Pnpm) {
+            install_directory_copies(config.local_path),
+            if toolchain.corepack {
+                "ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0\n"
+            } else {
+                ""
+            },
+            if toolchain.corepack {
                 "corepack enable && "
             } else {
                 ""
@@ -90,7 +110,9 @@ CMD ["nginx", "-g", "daemon off;"]
             build_cmd, output
         ));
 
-        DockerfileWithArgs::new(dockerfile)
+        let mut rendered = DockerfileWithArgs::new(dockerfile);
+        rendered.warnings = warnings;
+        rendered
     }
 
     async fn dockerfile_with_build_dir(&self, local_path: &Path) -> DockerfileWithArgs {
@@ -168,9 +190,376 @@ fn workspace_dockerfile(
     for variable in config.build_vars.into_iter().flatten() {
         dockerfile.push_str(&format!("ARG {variable}\n"));
     }
-    let output = config.output_dir.unwrap_or("dist");
+    let mut warnings = Vec::new();
+    let output = resolve_output_dir(config.output_dir, config.local_path, &mut warnings);
     dockerfile.push_str(&format!("RUN {build}\nFROM nginx:alpine\nCOPY --from=builder /app/{relative}/{output} /usr/share/nginx/html\nEXPOSE 80\nCMD [\"nginx\", \"-g\", \"daemon off;\"]\n"));
-    DockerfileWithArgs::new(dockerfile)
+    let mut rendered = DockerfileWithArgs::new(dockerfile);
+    rendered.warnings = warnings;
+    rendered
+}
+
+/// Upper bound on the manifests and config files read while planning. A
+/// legitimate `package.json` or `vite.config.*` is a few kilobytes.
+const MAX_PLANNING_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Read a small planning input from the build context. Symlinks, directories
+/// and oversized files are treated as absent: planning must never follow a
+/// repository symlink out of the checkout.
+fn read_planning_file(path: &Path) -> Option<String> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_PLANNING_FILE_BYTES {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
+/// A [`BuildPlanFailure::MissingBuildScript`] when `package.json` parses and
+/// declares no `build` script. An absent or unparseable manifest is left to
+/// the build itself, which reports the precise problem.
+fn missing_build_script(local_path: &Path) -> Option<BuildPlanFailure> {
+    let manifest_path = local_path.join("package.json");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&read_planning_file(&manifest_path)?).ok()?;
+    let has_build = manifest
+        .get("scripts")
+        .and_then(|scripts| scripts.get("build"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|script| !script.trim().is_empty());
+    (!has_build).then(|| BuildPlanFailure::MissingBuildScript {
+        preset: "vite".to_string(),
+        package_json: manifest_path.display().to_string(),
+    })
+}
+
+/// How the dependency install step must provision and invoke the package
+/// manager.
+#[derive(Debug, Clone, Copy)]
+struct JsToolchain {
+    package_manager: PackageManager,
+    /// Yarn 2+ ("Berry"), which rejects Yarn 1's `--frozen-lockfile`.
+    yarn_berry: bool,
+    /// Run `corepack enable` so the version pinned by `packageManager` (or
+    /// pnpm itself, which the Node image does not ship) is used.
+    corepack: bool,
+}
+
+impl JsToolchain {
+    fn detect(local_path: &Path, package_manager: PackageManager) -> Self {
+        let package_manager_field = read_planning_file(&local_path.join("package.json"))
+            .and_then(|manifest| serde_json::from_str::<serde_json::Value>(&manifest).ok())
+            .and_then(|manifest| {
+                manifest
+                    .get("packageManager")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            });
+        let has_yarnrc_yml = local_path.join(".yarnrc.yml").is_file();
+        let yarn_berry = matches!(package_manager, PackageManager::Yarn)
+            && (has_yarnrc_yml
+                || package_manager_field
+                    .as_deref()
+                    .and_then(|field| field.strip_prefix("yarn@"))
+                    .and_then(|version| version.split('.').next())
+                    .and_then(|major| major.parse::<u32>().ok())
+                    .is_some_and(|major| major >= 2)
+                || read_planning_file(&local_path.join("yarn.lock"))
+                    .is_some_and(|lock| lock.contains("__metadata:")));
+        // The Bun image has no corepack; it runs `bun install` regardless.
+        let corepack = !matches!(package_manager, PackageManager::Bun)
+            && (matches!(package_manager, PackageManager::Pnpm)
+                || package_manager_field.is_some()
+                || has_yarnrc_yml);
+        Self {
+            package_manager,
+            yarn_berry,
+            corepack,
+        }
+    }
+
+    fn install_command(&self) -> &'static str {
+        if self.yarn_berry {
+            "yarn install --immutable"
+        } else {
+            self.package_manager.install_command()
+        }
+    }
+}
+
+/// Directories the install step reads, copied ahead of it when present:
+/// Yarn Berry's pinned release, plugins and patches, and the `patches/`
+/// directory used by pnpm `patchedDependencies` and `patch-package`.
+///
+/// A directory COPY cannot use the glob trick the file COPY uses (a glob that
+/// matches a directory copies its *contents*), so each line is emitted only
+/// for a directory that exists and that `.dockerignore` does not exclude.
+fn install_directory_copies(local_path: &Path) -> String {
+    let ignore = read_planning_file(&local_path.join(".dockerignore")).unwrap_or_default();
+    [
+        ".yarn/releases",
+        ".yarn/plugins",
+        ".yarn/patches",
+        "patches",
+    ]
+    .into_iter()
+    .filter(|relative| {
+        std::fs::symlink_metadata(local_path.join(relative)).is_ok_and(|metadata| metadata.is_dir())
+            && !dockerignore_may_exclude(&ignore, relative)
+    })
+    .map(|relative| format!("COPY {relative} ./{relative}\n"))
+    .collect()
+}
+
+/// Conservative `.dockerignore` check: `true` when any rule could exclude
+/// `relative` or one of its parent directories. A false positive only skips
+/// an optimisation (the full source COPY still runs before the build); a
+/// false negative would make the generated COPY fail, so uncertain rules —
+/// negations included — count as excluding.
+fn dockerignore_may_exclude(ignore: &str, relative: &str) -> bool {
+    let segments: Vec<&str> = relative.split('/').collect();
+    let ancestors: Vec<String> = (1..=segments.len())
+        .map(|length| segments[..length].join("/"))
+        .collect();
+    ignore
+        .lines()
+        .map(str::trim)
+        .filter(|rule| !rule.is_empty() && !rule.starts_with('#'))
+        .any(|rule| {
+            let rule = rule.trim_start_matches('!');
+            let rule = rule.trim_start_matches("./").trim_start_matches('/');
+            let rule = rule
+                .trim_end_matches("/**")
+                .trim_end_matches("/*")
+                .trim_end_matches('/');
+            if let Some(rest) = rule.strip_prefix("**/") {
+                return segments.iter().any(|segment| may_match(rest, segment));
+            }
+            ancestors.iter().any(|ancestor| may_match(rule, ancestor))
+        })
+}
+
+/// `true` when `pattern` equals `candidate`, or `pattern` contains a glob
+/// metacharacter and its literal prefix is a prefix of `candidate`.
+fn may_match(pattern: &str, candidate: &str) -> bool {
+    match pattern.find(['*', '?', '[']) {
+        Some(index) => candidate.starts_with(&pattern[..index]),
+        None => pattern == candidate,
+    }
+}
+
+/// Vite config file names, in Vite's own resolution order.
+const VITE_CONFIG_FILES: [&str; 6] = [
+    "vite.config.js",
+    "vite.config.mjs",
+    "vite.config.ts",
+    "vite.config.cjs",
+    "vite.config.mts",
+    "vite.config.cts",
+];
+
+/// Output directory for the nginx stage, relative to the app directory.
+///
+/// Precedence: an explicit override (`.temps.yaml`, then project settings,
+/// resolved by the caller), then a plain string-literal `build.outDir` in the
+/// Vite config, then Vite's default `dist`.
+fn resolve_output_dir(
+    configured: Option<&str>,
+    local_path: &Path,
+    warnings: &mut Vec<String>,
+) -> String {
+    if let Some(configured) = configured {
+        return configured.to_string();
+    }
+    let Some((file, contents)) = VITE_CONFIG_FILES
+        .iter()
+        .find_map(|name| read_planning_file(&local_path.join(name)).map(|text| (*name, text)))
+    else {
+        return "dist".to_string();
+    };
+    match parse_vite_out_dir(&contents) {
+        OutDir::Literal(dir) => {
+            tracing::info!(file, out_dir = %dir, "Using build.outDir from the Vite config");
+            dir
+        }
+        OutDir::Absent => "dist".to_string(),
+        OutDir::Unresolvable(reason) => {
+            let message = format!(
+                "{file} sets build.outDir to a value Temps cannot read statically ({reason}); \
+                 assuming 'dist'. If the build output is elsewhere, set the output directory \
+                 in the project's build settings or in .temps.yaml (build.output_dir)."
+            );
+            tracing::warn!("{message}");
+            warnings.push(message);
+            "dist".to_string()
+        }
+    }
+}
+
+/// What a conservative read of a Vite config found for `build.outDir`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OutDir {
+    /// A single plain string literal that is a safe relative path.
+    Literal(String),
+    /// No `build.outDir` key.
+    Absent,
+    /// Present but not statically known (expression, several values, unsafe).
+    Unresolvable(&'static str),
+}
+
+/// Lexical token of the JavaScript subset this reader understands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Token {
+    Word(String),
+    Str(String),
+    /// A template literal containing `${...}`.
+    Template,
+    Punct(char),
+}
+
+/// Tokenize JS/TS source, skipping whitespace and comments. Strings are read
+/// with their escapes so a `//` inside a URL is not mistaken for a comment.
+fn tokenize(source: &str) -> Vec<Token> {
+    let chars: Vec<char> = source.chars().collect();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() {
+            i += 1;
+        } else if c == '/' && chars.get(i + 1) == Some(&'/') {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+        } else if c == '/' && chars.get(i + 1) == Some(&'*') {
+            i += 2;
+            while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
+                i += 1;
+            }
+            i += 2;
+        } else if matches!(c, '\'' | '"' | '`') {
+            let quote = c;
+            let mut value = String::new();
+            let mut interpolated = false;
+            i += 1;
+            while i < chars.len() && chars[i] != quote {
+                if chars[i] == '\\' {
+                    if let Some(next) = chars.get(i + 1) {
+                        value.push(*next);
+                    }
+                    i += 2;
+                    continue;
+                }
+                if quote == '`' && chars[i] == '$' && chars.get(i + 1) == Some(&'{') {
+                    interpolated = true;
+                }
+                value.push(chars[i]);
+                i += 1;
+            }
+            i += 1;
+            tokens.push(if interpolated {
+                Token::Template
+            } else {
+                Token::Str(value)
+            });
+        } else if c.is_alphanumeric() || c == '_' || c == '$' {
+            let begin = i;
+            while i < chars.len()
+                && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '$')
+            {
+                i += 1;
+            }
+            tokens.push(Token::Word(chars[begin..i].iter().collect()));
+        } else {
+            tokens.push(Token::Punct(c));
+            i += 1;
+        }
+    }
+    tokens
+}
+
+/// Find `build: { outDir: '<literal>' }` in a Vite config.
+///
+/// Only an `outDir` whose enclosing object is the value of a `build` key
+/// counts — plugins commonly take their own `outDir` option (e.g. a type
+/// declaration plugin) that has nothing to do with the bundle. The value must
+/// be a plain string literal immediately followed by `,` or `}`; anything else
+/// (a call such as `resolve(__dirname, 'out')`, a concatenation, a template
+/// with interpolation, a variable) is reported as unresolvable rather than
+/// guessed.
+fn parse_vite_out_dir(source: &str) -> OutDir {
+    let tokens = tokenize(source);
+    // One entry per open `{`: the key whose value that object is, if any.
+    let mut objects: Vec<Option<String>> = Vec::new();
+    let mut found: Vec<String> = Vec::new();
+    let mut unresolvable = false;
+    let key_at = |index: usize| -> Option<String> {
+        match tokens.get(index) {
+            Some(Token::Word(word)) | Some(Token::Str(word)) => Some(word.clone()),
+            _ => None,
+        }
+    };
+    for (index, token) in tokens.iter().enumerate() {
+        match token {
+            Token::Punct('{') => {
+                let key = (index >= 2 && tokens.get(index - 1) == Some(&Token::Punct(':')))
+                    .then(|| key_at(index - 2))
+                    .flatten();
+                objects.push(key);
+            }
+            Token::Punct('}') => {
+                objects.pop();
+            }
+            Token::Word(_) | Token::Str(_)
+                if key_at(index).as_deref() == Some("outDir")
+                    && tokens.get(index + 1) == Some(&Token::Punct(':'))
+                    && objects.last().cloned().flatten().as_deref() == Some("build") =>
+            {
+                match (tokens.get(index + 2), tokens.get(index + 3)) {
+                    (Some(Token::Str(value)), Some(Token::Punct(',' | '}'))) => {
+                        found.push(value.clone())
+                    }
+                    _ => unresolvable = true,
+                }
+            }
+            // `build: { outDir }` shorthand names a variable.
+            Token::Word(word)
+                if word == "outDir"
+                    && matches!(tokens.get(index + 1), Some(Token::Punct(',' | '}')))
+                    && objects.last().cloned().flatten().as_deref() == Some("build") =>
+            {
+                unresolvable = true;
+            }
+            _ => {}
+        }
+    }
+    if unresolvable {
+        return OutDir::Unresolvable("build.outDir is not a plain string literal");
+    }
+    found.sort();
+    found.dedup();
+    match found.as_slice() {
+        [] => OutDir::Absent,
+        [value] => match safe_relative_dir(value) {
+            Some(dir) => OutDir::Literal(dir),
+            None => OutDir::Unresolvable("build.outDir must be a relative path inside the app"),
+        },
+        _ => OutDir::Unresolvable("build.outDir has more than one value"),
+    }
+}
+
+/// Normalize `./build/` to `build`; reject absolute, parent-relative and
+/// shell/Dockerfile-unsafe paths, since the value lands in a COPY line.
+fn safe_relative_dir(value: &str) -> Option<String> {
+    let trimmed = value.trim().trim_end_matches('/');
+    let trimmed = trimmed.strip_prefix("./").unwrap_or(trimmed);
+    let valid = !trimmed.is_empty()
+        && !trimmed.starts_with('/')
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+        && trimmed
+            .split('/')
+            .all(|segment| !segment.is_empty() && segment != "." && segment != "..");
+    valid.then(|| trimmed.to_string())
 }
 
 #[cfg(test)]
@@ -257,7 +646,11 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         let app = repo.path().join("apps/web");
         std::fs::create_dir_all(&app).unwrap();
-        std::fs::write(app.join("package.json"), "{}").unwrap();
+        std::fs::write(
+            app.join("package.json"),
+            r#"{"scripts":{"build":"vite build"}}"#,
+        )
+        .unwrap();
         for packages in [
             "packages: [packages/*]",
             "packages: ['apps/*', '!apps/web']",
@@ -283,5 +676,283 @@ mod tests {
             .content;
         assert!(result.contains("RUN corepack enable && pnpm install --frozen-lockfile"));
         assert!(!result.contains("--filter"));
+    }
+
+    fn app(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (path, contents) in files {
+            let target = dir.path().join(path);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, contents).unwrap();
+        }
+        dir
+    }
+
+    const BUILDABLE: &str = r#"{"scripts":{"build":"vite build"},"devDependencies":{"vite":"6"}}"#;
+
+    async fn render(dir: &Path) -> DockerfileWithArgs {
+        Vite.dockerfile(DockerfileConfig::new(dir, dir, "fixture"))
+            .await
+    }
+
+    #[tokio::test]
+    async fn missing_build_script_fails_fast_with_the_classifier_pattern() {
+        let dir = app(&[("package.json", r#"{"scripts":{"dev":"vite"}}"#)]);
+        let result = render(dir.path()).await;
+        let failure = result
+            .plan_failure
+            .expect("missing build script must fail planning");
+        assert!(matches!(
+            failure,
+            BuildPlanFailure::MissingBuildScript { .. }
+        ));
+        let message = failure.to_string();
+        assert!(
+            message.to_lowercase().contains("missing script: build"),
+            "{message}"
+        );
+        assert!(message.contains("\"build\": \"vite build\""), "{message}");
+        assert!(result.content.contains("exit 1"), "{}", result.content);
+    }
+
+    #[tokio::test]
+    async fn custom_build_command_skips_the_build_script_check() {
+        let dir = app(&[("package.json", r#"{"scripts":{}}"#)]);
+        let mut config = DockerfileConfig::new(dir.path(), dir.path(), "fixture");
+        config.build_command = Some("npx vite build");
+        let result = Vite.dockerfile(config).await;
+        assert!(result.plan_failure.is_none());
+        assert!(
+            result.content.contains("RUN npx vite build"),
+            "{}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn buildable_app_has_no_plan_failure_and_copies_install_config_first() {
+        let dir = app(&[
+            ("package.json", BUILDABLE),
+            (".npmrc", "registry=https://registry.example.com/\n"),
+        ]);
+        let result = render(dir.path()).await;
+        assert!(result.plan_failure.is_none(), "{:?}", result.plan_failure);
+        let content = result.content;
+        let config_copy = content.find(".npmrc*").expect("npmrc copied");
+        let install = content.find("RUN npm install").expect("install step");
+        let source = content.find("COPY . .").expect("source copy");
+        assert!(config_copy < install && install < source, "{content}");
+        assert!(
+            content.contains(".yarnrc*") && content.contains("bun.lock*"),
+            "{content}"
+        );
+        assert!(!content.contains("corepack"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn yarn_berry_uses_immutable_install_corepack_and_copies_yarn_dirs() {
+        let dir = app(&[
+            (
+                "package.json",
+                r#"{"packageManager":"yarn@4.5.0","scripts":{"build":"vite build"}}"#,
+            ),
+            ("yarn.lock", "__metadata:\n  version: 8\n"),
+            (".yarnrc.yml", "yarnPath: .yarn/releases/yarn-4.5.0.cjs\n"),
+            (".yarn/releases/yarn-4.5.0.cjs", "// release"),
+            (".yarn/plugins/plugin.cjs", "// plugin"),
+            ("patches/left-pad.patch", "diff"),
+        ]);
+        let content = render(dir.path()).await.content;
+        assert!(
+            content.contains("RUN corepack enable && yarn install --immutable"),
+            "{content}"
+        );
+        assert!(!content.contains("--frozen-lockfile"), "{content}");
+        let install = content.find("yarn install").unwrap();
+        for line in [
+            "COPY .yarn/releases ./.yarn/releases",
+            "COPY .yarn/plugins ./.yarn/plugins",
+            "COPY patches ./patches",
+        ] {
+            let at = content
+                .find(line)
+                .unwrap_or_else(|| panic!("{line} missing: {content}"));
+            assert!(at < install, "{line} must precede install: {content}");
+        }
+        assert!(
+            !content.contains("COPY .yarn/patches"),
+            "absent dir copied: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn yarn_classic_keeps_frozen_lockfile_and_package_manager_field_enables_corepack() {
+        let classic = app(&[
+            ("package.json", BUILDABLE),
+            ("yarn.lock", "# yarn lockfile v1\n"),
+        ]);
+        let content = render(classic.path()).await.content;
+        assert!(
+            content.contains("RUN yarn install --frozen-lockfile"),
+            "{content}"
+        );
+
+        let pinned = app(&[
+            (
+                "package.json",
+                r#"{"packageManager":"yarn@1.22.22","scripts":{"build":"vite build"}}"#,
+            ),
+            ("yarn.lock", "# yarn lockfile v1\n"),
+        ]);
+        let content = render(pinned.path()).await.content;
+        assert!(
+            content.contains("RUN corepack enable && yarn install --frozen-lockfile"),
+            "{content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dockerignored_install_dirs_are_not_copied_early() {
+        let dir = app(&[
+            ("package.json", BUILDABLE),
+            ("patches/x.patch", "diff"),
+            (".dockerignore", "**/node_modules\npatches/\n"),
+        ]);
+        let content = render(dir.path()).await.content;
+        assert!(!content.contains("COPY patches"), "{content}");
+    }
+
+    #[test]
+    fn dockerignore_matching_is_conservative() {
+        assert!(dockerignore_may_exclude(".yarn\n", ".yarn/releases"));
+        assert!(dockerignore_may_exclude(".yarn/*\n", ".yarn/releases"));
+        assert!(dockerignore_may_exclude("**/patches\n", "patches"));
+        assert!(dockerignore_may_exclude("*\n!package.json\n", "patches"));
+        assert!(dockerignore_may_exclude("!patches\n", "patches"));
+        assert!(!dockerignore_may_exclude(
+            "**/node_modules\n# patches\n",
+            "patches"
+        ));
+        assert!(!dockerignore_may_exclude("dist\n.git\n", ".yarn/releases"));
+    }
+
+    #[tokio::test]
+    async fn vite_config_out_dir_reaches_the_nginx_stage() {
+        for (file, config) in [
+            ("vite.config.ts", "export default defineConfig({ build: { outDir: 'build' } })"),
+            ("vite.config.mjs", "export default { build: { \"outDir\": \"./build/\", sourcemap: true } }"),
+            ("vite.config.mts", "export default defineConfig(({ mode }) => ({\n  plugins: [dts({ outDir: 'types' })],\n  build: {\n    // outDir: 'old',\n    outDir: `build`,\n  },\n}))"),
+            ("vite.config.cjs", "module.exports = { server: { proxy: { '/api': 'http://localhost:3000' } }, build: { outDir: 'build' } }"),
+        ] {
+            let dir = app(&[("package.json", BUILDABLE), (file, config)]);
+            let result = render(dir.path()).await;
+            assert!(
+                result.content.contains("COPY --from=builder /app/build /usr/share/nginx/html"),
+                "{file}: {}",
+                result.content
+            );
+            assert!(result.warnings.is_empty(), "{file}: {:?}", result.warnings);
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_output_dir_beats_vite_config() {
+        let dir = app(&[
+            ("package.json", BUILDABLE),
+            (
+                "vite.config.ts",
+                "export default { build: { outDir: 'build' } }",
+            ),
+        ]);
+        let mut config = DockerfileConfig::new(dir.path(), dir.path(), "fixture");
+        config.output_dir = Some("public");
+        let content = Vite.dockerfile(config).await.content;
+        assert!(
+            content.contains("/app/public /usr/share/nginx/html"),
+            "{content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unreadable_out_dir_falls_back_to_dist_with_a_warning() {
+        let dir = app(&[
+            ("package.json", BUILDABLE),
+            (
+                "vite.config.ts",
+                "export default { build: { outDir: resolve(__dirname, 'out') } }",
+            ),
+        ]);
+        let result = render(dir.path()).await;
+        assert!(
+            result.content.contains("/app/dist /usr/share/nginx/html"),
+            "{}",
+            result.content
+        );
+        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+        assert!(
+            result.warnings[0].contains("build.outDir"),
+            "{:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn out_dir_parser_rejects_everything_that_is_not_a_plain_literal() {
+        assert_eq!(parse_vite_out_dir("export default {}"), OutDir::Absent);
+        assert_eq!(
+            parse_vite_out_dir("export default { plugins: [dts({ outDir: 'types' })] }"),
+            OutDir::Absent
+        );
+        assert_eq!(
+            parse_vite_out_dir(
+                "const u = 'http://x//y'; export default { build: { outDir: 'out' } }"
+            ),
+            OutDir::Literal("out".into())
+        );
+        for unresolvable in [
+            "export default { build: { outDir: 'a' + suffix } }",
+            "export default { build: { outDir: `${base}/out` } }",
+            "export default { build: { outDir } }",
+            "export default { build: { outDir: mode === 'x' ? 'a' : 'b' } }",
+            "export default { build: { outDir: '../outside' } }",
+            "export default { build: { outDir: '/abs' } }",
+            "export default { build: { outDir: 'a b' } }",
+            "export default (m) => m ? { build: { outDir: 'a' } } : { build: { outDir: 'b' } }",
+        ] {
+            assert!(
+                matches!(parse_vite_out_dir(unresolvable), OutDir::Unresolvable(_)),
+                "{unresolvable}"
+            );
+        }
+        assert_eq!(
+            parse_vite_out_dir(
+                "export default (m) => m ? { build: { outDir: 'a' } } : { build: { outDir: 'a' } }"
+            ),
+            OutDir::Literal("a".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_workspace_member_path_is_a_typed_configuration_failure() {
+        let repo = tempfile::tempdir().unwrap();
+        let app = repo.path().join("apps/we b");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("package.json"), BUILDABLE).unwrap();
+        std::fs::write(
+            repo.path().join("pnpm-workspace.yaml"),
+            "packages: ['apps/*']",
+        )
+        .unwrap();
+        let result = Vite
+            .dockerfile(DockerfileConfig::new(repo.path(), &app, "fixture"))
+            .await;
+        assert!(
+            matches!(
+                result.plan_failure,
+                Some(BuildPlanFailure::InvalidConfiguration { .. })
+            ),
+            "{:?}",
+            result.plan_failure
+        );
     }
 }

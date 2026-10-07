@@ -853,6 +853,16 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
                 ],
             ));
 
+    // ── Build planning (the preset refused before any build ran, so no
+    //    resource, network or registry signal can be the cause) ──────────
+    if r.contains("build plan failed for preset") {
+        return if r.contains("missing script: build") {
+            make(S::Build, C::MissingBuildScript)
+        } else {
+            make(S::Configuration, C::InvalidConfiguration)
+        };
+    }
+
     // ── Resources ───────────────────────────────────────────────────────
     if contains_any(r, &["out of memory", "oomkilled", "exit code 137"]) || contains_word(r, "oom")
     {
@@ -1185,6 +1195,24 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
     ) {
         return make(S::Build, C::CompileError);
     }
+    // BuildKit's COPY of a build-stage path that the build never produced,
+    // e.g. `COPY --from=builder /app/dist ...` after a build that wrote to
+    // `build/`: `failed to compute cache key: failed to calculate checksum of
+    // ref ...: "/app/dist": not found`. Generated images build under /app, so
+    // an absolute /app path is the build output, never a context file (those
+    // are context-relative). Checked before the generic Dockerfile and
+    // "image ... not found" rules, which the same text also matches.
+    if contains_any(
+        r,
+        &[
+            "failed to calculate checksum",
+            "failed to compute cache key",
+        ],
+    ) && r.contains("/app/")
+        && r.contains("not found")
+    {
+        return make(S::Build, C::StaticOutputMissing);
+    }
     if r.contains("dockerfile")
         && contains_any(
             r,
@@ -1474,6 +1502,56 @@ mod tests {
         // BuildKit's "failed to solve" without a registry cause is a service
         // build failure, not a base image pull.
         assert_class(&reason, S::Build, C::ComposeBuildFailed);
+    }
+
+    #[test]
+    fn missing_static_output_is_not_a_missing_image() {
+        let reason = wrapped(
+            "build_image",
+            "Failed to build image: Build failed: Docker stream error: failed to solve: failed to compute cache key: failed to calculate checksum of ref 3c1f::q8m2: \"/app/dist\": not found",
+        );
+        assert_class(&reason, S::Build, C::StaticOutputMissing);
+
+        let with_dockerfile_excerpt = wrapped(
+            "build_image",
+            "Failed to build image: Dockerfile:14\n--------------------\n  14 | >>> COPY --from=builder /app/build /usr/share/nginx/html\n--------------------\nERROR: failed to solve: failed to compute cache key: failed to calculate checksum of ref abc: \"/app/build\": not found",
+        );
+        assert_class(&with_dockerfile_excerpt, S::Build, C::StaticOutputMissing);
+
+        // A missing *context* file is a Dockerfile/source problem, not output.
+        let context_file = wrapped(
+            "build_image",
+            "Failed to build image: failed to solve: failed to compute cache key: failed to calculate checksum of ref abc: \"/requirements.txt\": not found",
+        );
+        assert_ne!(
+            classify_failure_reason(Some(&context_file)).code,
+            C::StaticOutputMissing
+        );
+
+        // The deploy-time "image not found" classification is unchanged.
+        let image = wrapped(
+            "deploy_container",
+            "Failed to deploy container: image 'app:latest' not found",
+        );
+        assert_ne!(
+            classify_failure_reason(Some(&image)).code,
+            C::StaticOutputMissing
+        );
+    }
+
+    #[test]
+    fn build_plan_failures_are_classified_before_building() {
+        let missing = wrapped(
+            "build_image",
+            "Build plan failed for preset 'vite': package.json at '/tmp/x/package.json' has no \"build\" script, so the build would stop with \"Missing script: build\". Add a build script to package.json (for a Vite app: \"build\": \"vite build\"), or set a custom build command in the project's build settings.",
+        );
+        assert_class(&missing, S::Build, C::MissingBuildScript);
+
+        let unplannable = wrapped(
+            "build_image",
+            "Build plan failed for preset 'autopack': autopack could not plan this application: python: no start command found; the image was not found to timeout. Select the preset that matches the application in the project's build settings, add a start command, or commit a Dockerfile.",
+        );
+        assert_class(&unplannable, S::Configuration, C::InvalidConfiguration);
     }
 
     #[test]

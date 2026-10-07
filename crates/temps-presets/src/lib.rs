@@ -865,7 +865,7 @@ mod tests {
                     let dir = TempDir::new().unwrap();
                     fs::write(
                         dir.path().join("package.json"),
-                        r#"{"name":"test-app","packageManager":"pnpm@11.9.0"}"#,
+                        r#"{"name":"test-app","packageManager":"pnpm@11.9.0","scripts":{"build":"echo build"}}"#,
                     )
                     .unwrap();
                     fs::write(

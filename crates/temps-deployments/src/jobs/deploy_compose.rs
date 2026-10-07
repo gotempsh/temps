@@ -676,11 +676,11 @@ impl DeployComposeJob {
         );
         labels.insert("sh.temps.managed".to_string(), "true".to_string());
 
-        // Read compose file from repo checkout or inline content
-        let compose_file_name = self.compose_path.as_deref().unwrap_or("docker-compose.yml");
         // Confine user-supplied paths to the repo checkout / project directory
         // so a project writer cannot escape the intended work directory.
-        validate_relative_path(compose_file_name, "compose_path")?;
+        if let Some(compose_path) = self.compose_path.as_deref() {
+            validate_relative_path(compose_path, "compose_path")?;
+        }
         validate_relative_path(&self.directory, "directory")?;
 
         // Resolve the selected repository subdirectory once and carry the
@@ -710,6 +710,27 @@ impl DeployComposeJob {
         } else {
             None
         };
+
+        // Read compose file from repo checkout or inline content. With no
+        // configured path, use the first standard name the checkout has.
+        let compose_file_name_owned =
+            resolve_compose_file_name(self.compose_path.as_deref(), repo_path.as_deref());
+        let compose_file_name = compose_file_name_owned.as_str();
+        validate_relative_path(compose_file_name, "compose_path")?;
+        if self.compose_path.is_none() {
+            if let Some(ref log_id) = self.log_id {
+                let _ = self
+                    .log_service
+                    .log_info(
+                        log_id,
+                        &format!(
+                            "No compose file path configured; using '{compose_file_name}' (first of {} found)",
+                            STANDARD_COMPOSE_FILE_NAMES.join(", ")
+                        ),
+                    )
+                    .await;
+            }
+        }
 
         let compose_content = if let Some(ref inline) = self.compose_content {
             // Inline compose content (manual project, no git repo)
@@ -906,7 +927,11 @@ impl DeployComposeJob {
         // an empty DATABASE_URL and fails later with something unrelated — the
         // person debugging this has no support channel, so the deployment log
         // has to say what was created and where it came from.
-        for plan in ComposeExecutor::plan_env_files(&compose_content, repo_path.as_deref()) {
+        for plan in ComposeExecutor::plan_env_files_for_compose_file(
+            &compose_content,
+            compose_file_name,
+            repo_path.as_deref(),
+        ) {
             let message = match plan.source {
                 EnvFileSource::Repository(_) => format!(
                     "Compose references env file '{}' — copied from the repository",
@@ -1048,7 +1073,7 @@ impl DeployComposeJob {
             compose_content,
             env_content,
             work_dir: PathBuf::from("/tmp"),
-            compose_path: self.compose_path.clone(),
+            compose_path: Some(compose_file_name.to_string()),
             environment_vars: self.environment_vars.clone(),
             secrets: self.secrets.clone(),
             secret_compose_services: self.secret_compose_services.clone(),
@@ -1059,6 +1084,11 @@ impl DeployComposeJob {
             relaxed_capability_services: self.relaxed_capability_services.clone(),
             unsandboxed_services: self.unsandboxed_services.clone(),
             ready_timeout: self.ready_timeout_secs.map(std::time::Duration::from_secs),
+            routed_services: self
+                .public_ports
+                .iter()
+                .map(|port| port.service.clone())
+                .collect(),
         };
 
         // Prepare compose files, build (if needed), and pull images BEFORE
@@ -1624,8 +1654,9 @@ impl WorkflowTask for DeployComposeJob {
     /// Docker keeps crash-looping the containers forever on the node.
     async fn cleanup(&self, context: &WorkflowContext) -> Result<(), WorkflowError> {
         let project_name = format!("temps-{}-{}", self.project_id, self.environment_id);
-        let compose_file_name = self.compose_path.as_deref().unwrap_or("docker-compose.yml");
-        validate_relative_path(compose_file_name, "compose_path")?;
+        if let Some(compose_path) = self.compose_path.as_deref() {
+            validate_relative_path(compose_path, "compose_path")?;
+        }
         validate_relative_path(&self.directory, "directory")?;
 
         let cleanup_repo_path = if self.compose_content.is_none() {
@@ -1644,6 +1675,10 @@ impl WorkflowTask for DeployComposeJob {
         } else {
             None
         };
+        let compose_file_name_owned =
+            resolve_compose_file_name(self.compose_path.as_deref(), cleanup_repo_path.as_deref());
+        let compose_file_name = compose_file_name_owned.as_str();
+        validate_relative_path(compose_file_name, "compose_path")?;
 
         if let Some(ref log_id) = self.log_id {
             let _ = self
@@ -1675,6 +1710,34 @@ impl WorkflowTask for DeployComposeJob {
                 ))
             })
     }
+}
+
+/// Compose file names Docker Compose itself looks for, in its precedence order.
+const STANDARD_COMPOSE_FILE_NAMES: [&str; 4] = [
+    "compose.yaml",
+    "compose.yml",
+    "docker-compose.yaml",
+    "docker-compose.yml",
+];
+
+/// The compose file to deploy: the configured path, else the first standard
+/// name present as a regular file in the selected repository directory, else
+/// `docker-compose.yml` (inline compose content and projects that predate
+/// auto-detection keep their historical default).
+fn resolve_compose_file_name(configured: Option<&str>, repo_dir: Option<&Path>) -> String {
+    if let Some(configured) = configured {
+        return configured.to_string();
+    }
+    repo_dir
+        .and_then(|dir| {
+            STANDARD_COMPOSE_FILE_NAMES.iter().find(|name| {
+                std::fs::symlink_metadata(dir.join(name)).is_ok_and(|metadata| metadata.is_file())
+            })
+        })
+        .map_or_else(
+            || "docker-compose.yml".to_string(),
+            |name| (*name).to_string(),
+        )
 }
 
 /// Confine a user-supplied path (`compose_path`, `directory`) to the repo
@@ -2467,5 +2530,50 @@ services:
         assert_eq!(deployed_dependencies.len(), 1);
         assert!(preview_dependencies.contains_key("web"));
         assert!(deployed_dependencies.contains_key("web"));
+    }
+
+    #[test]
+    fn default_compose_file_follows_docker_compose_precedence() {
+        let repo = tempfile::tempdir().unwrap();
+        // Nothing present: keep the historical default.
+        assert_eq!(
+            resolve_compose_file_name(None, Some(repo.path())),
+            "docker-compose.yml"
+        );
+        assert_eq!(resolve_compose_file_name(None, None), "docker-compose.yml");
+
+        std::fs::write(repo.path().join("docker-compose.yml"), "services: {}\n").unwrap();
+        assert_eq!(
+            resolve_compose_file_name(None, Some(repo.path())),
+            "docker-compose.yml"
+        );
+        std::fs::write(repo.path().join("compose.yml"), "services: {}\n").unwrap();
+        assert_eq!(
+            resolve_compose_file_name(None, Some(repo.path())),
+            "compose.yml"
+        );
+        std::fs::write(repo.path().join("compose.yaml"), "services: {}\n").unwrap();
+        assert_eq!(
+            resolve_compose_file_name(None, Some(repo.path())),
+            "compose.yaml"
+        );
+        // A configured path always wins, even when it does not exist yet.
+        assert_eq!(
+            resolve_compose_file_name(Some("deploy/stack.yml"), Some(repo.path())),
+            "deploy/stack.yml"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_compose_file_ignores_directories_and_symlinks() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join("compose.yaml")).unwrap();
+        std::os::unix::fs::symlink("/etc/hosts", repo.path().join("compose.yml")).unwrap();
+        std::fs::write(repo.path().join("docker-compose.yaml"), "services: {}\n").unwrap();
+        assert_eq!(
+            resolve_compose_file_name(None, Some(repo.path())),
+            "docker-compose.yaml"
+        );
     }
 }
