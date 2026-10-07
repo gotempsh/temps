@@ -41,6 +41,7 @@ import {
 import { useState } from 'react'
 import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
+import { getErrorMessage } from '@/utils/errorHandling'
 import {
   AlertStateBadge,
   alertSummary,
@@ -127,11 +128,10 @@ export default function MetricAlerts({ project }: MetricAlertsProps) {
           <EmptyState
             icon={Bell}
             title="Failed to load alerts"
-            description={
-              alertsQuery.error instanceof Error && alertsQuery.error.message
-                ? `Could not fetch alert rules for ${project.name}: ${alertsQuery.error.message}`
-                : `Could not fetch alert rules for ${project.name}.`
-            }
+            description={`Could not fetch alert rules for ${project.name}: ${getErrorMessage(
+              alertsQuery.error,
+              'the request failed'
+            )}`}
             action={
               <Button
                 size="sm"

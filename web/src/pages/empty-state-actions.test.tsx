@@ -83,15 +83,21 @@ test('error alert rules with no projects links to project creation', () => {
 test('metric alerts load failure names the cause and offers a retry', () => {
   const client = createClient()
   const project = { id: 7, slug: 'demo', name: 'Demo' } as ProjectResponse
+  // The generated client throws the parsed problem body, not an Error.
   fail(
     client,
     listAlertsOptions({ query: { project_id: project.id } }).queryKey,
-    new Error('upstream timed out')
+    {
+      type: 'about:blank',
+      title: 'Internal Server Error',
+      status: 500,
+      detail: 'metrics store timed out',
+    } as unknown as Error
   )
   const html = render(client, <MetricAlerts project={project} />)
   expect(html).toContain('Failed to load alerts')
   expect(html).toContain(
-    'Could not fetch alert rules for Demo: upstream timed out'
+    'Could not fetch alert rules for Demo: metrics store timed out'
   )
   expect(html).toContain('Retry')
   expect(html).not.toContain('Try refreshing the page')

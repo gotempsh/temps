@@ -63,17 +63,17 @@ export function certificatesEmptyStateCopy(
       return {
         title: 'No certificate attempts yet',
         description:
-          'On-demand TLS is on. An attempt is recorded here the first time a hostname routed through the proxy is requested over HTTPS.',
+          'On-demand TLS is turned on in settings. Once Temps is running with that setting and nothing blocks issuance, an attempt is recorded here the first time a routed hostname is requested over HTTPS. The settings page lists anything that blocks it.',
         action: {
-          label: 'On-demand TLS settings',
+          label: 'Check on-demand TLS settings',
           href: ON_DEMAND_TLS_SETTINGS_PATH,
         },
       }
     case 'disabled':
       return {
-        title: 'On-demand TLS is off',
+        title: 'On-demand TLS is turned off',
         description:
-          "When it is on, the proxy requests a Let's Encrypt certificate the first time a routed hostname is visited over HTTPS, and every attempt is listed here. Nothing is issued automatically while it is off.",
+          "Turned on, the proxy requests a Let's Encrypt certificate the first time a routed hostname is visited over HTTPS, and every attempt is listed here. The change takes effect after Temps restarts.",
         action: {
           label: 'Turn on on-demand TLS',
           href: ON_DEMAND_TLS_SETTINGS_PATH,

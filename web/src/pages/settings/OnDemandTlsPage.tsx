@@ -205,7 +205,12 @@ export function OnDemandTlsPage() {
         title="On-demand TLS"
         description="Issue a Let's Encrypt certificate the first time a routed hostname is requested over HTTPS. Every attempt is listed under Certificates."
       />
-      <div className="max-w-5xl space-y-10">
+      {/* Locked while saving: the form resets to the submitted values when
+          the save completes, so edits made meanwhile would be lost. */}
+      <fieldset
+        disabled={isSubmitting}
+        className="min-w-0 max-w-5xl space-y-10 disabled:opacity-70"
+      >
         <SettingsGroup
           title="Issuance"
           description={`Saved state: ${savedEnabled ? 'on' : 'off'}. Changes apply after Temps restarts.`}
@@ -367,7 +372,7 @@ export function OnDemandTlsPage() {
             )}
           />
         </SettingsGroup>
-      </div>
+      </fieldset>
 
       <div className="sticky bottom-0 bg-background border-t pt-4 pb-2">
         <div className="flex flex-wrap justify-between items-center gap-3">

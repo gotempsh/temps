@@ -37,14 +37,16 @@ describe('certificatesEmptyStateCopy', () => {
   test('enabled does not tell the user to enable it', () => {
     const copy = certificatesEmptyStateCopy('enabled')
     expect(copy.title).toBe('No certificate attempts yet')
-    expect(copy.description).toContain('On-demand TLS is on')
+    expect(copy.description).toContain('turned on in settings')
+    expect(copy.description).toContain('lists anything that blocks it')
     expect(copy.description.toLowerCase()).not.toContain('enable on-demand')
     expect(copy.action?.href).toBe(ON_DEMAND_TLS_SETTINGS_PATH)
   })
 
   test('disabled says it is off and links to the switch', () => {
     const copy = certificatesEmptyStateCopy('disabled')
-    expect(copy.title).toBe('On-demand TLS is off')
+    expect(copy.title).toBe('On-demand TLS is turned off')
+    expect(copy.description).toContain('after Temps restarts')
     expect(copy.action).toEqual({
       label: 'Turn on on-demand TLS',
       href: ON_DEMAND_TLS_SETTINGS_PATH,
@@ -54,8 +56,8 @@ describe('certificatesEmptyStateCopy', () => {
   test('unknown is neutral and offers no settings link', () => {
     const copy = certificatesEmptyStateCopy('unknown')
     expect(copy.title).toBe('No certificate attempts yet')
-    expect(copy.description).not.toContain('is off')
-    expect(copy.description).not.toContain('is on.')
+    expect(copy.description).not.toContain('turned off')
+    expect(copy.description).not.toContain('turned on in settings')
     expect(copy.action).toBeNull()
   })
 })

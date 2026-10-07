@@ -84,7 +84,7 @@ for (const width of [360, 768, 1440]) {
     await mockApi(page, false)
 
     await page.goto('/certificates')
-    await expect(page.getByText('On-demand TLS is off')).toBeVisible()
+    await expect(page.getByText('On-demand TLS is turned off')).toBeVisible()
     const action = page.getByRole('link', { name: 'Turn on on-demand TLS' })
     await expect(action).toBeVisible()
     await expectNoHorizontalScroll(page, width)
