@@ -3951,7 +3951,7 @@ export function AiGatewayPage() {
       display_name: string
       api_key: string
       base_url?: string
-    }) => createProviderKey({ body: data }),
+    }) => createProviderKey({ body: data, throwOnError: true }),
     meta: { errorTitle: 'Failed to create provider key' },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['providerKeys'] })
@@ -4021,6 +4021,7 @@ export function AiGatewayPage() {
   // test surfaces as a 400 on the create call itself.
 
   const resetForm = () => {
+    createMutation.reset()
     setNewProvider('')
     setNewDisplayName('')
     setNewApiKey('')
@@ -4564,6 +4565,14 @@ console.log(response.choices[0].message.content);`,
               We&apos;ll verify the key works before saving — this usually takes
               1–2 seconds.
             </p>
+            {createMutation.isError && (
+              <p role="alert" className="text-sm text-destructive">
+                {problemDetail(
+                  createMutation.error,
+                  'Could not add the provider key. Please try again.'
+                )}
+              </p>
+            )}
             <DialogFooter>
               <Button
                 onClick={handleCreate}
