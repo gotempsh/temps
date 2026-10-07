@@ -79,6 +79,11 @@ pub enum CronServiceError {
 /// See [`DatabaseCronConfigService::duration_until_next_minute`].
 const MIN_SCHEDULER_SLEEP: Duration = Duration::from_secs(1);
 
+/// Upper bound on raising and delivering one cron failure alarm. Delivery runs
+/// off the scheduler, so this only bounds how long a stalled notification
+/// provider can keep the task alive.
+const ALARM_DELIVERY_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Database-backed cron configuration service
 pub struct DatabaseCronConfigService {
     db: Arc<DatabaseConnection>,
@@ -630,13 +635,33 @@ impl DatabaseCronConfigService {
                 };
 
                 if let Some(alarm_service) = self.alarm_service.get() {
+                    let alarm_service = Arc::clone(alarm_service);
                     let request = Self::failure_alarm(cron, &e, &url, last_successful_run);
-                    if let Err(alarm_err) = alarm_service.fire_alarm(request).await {
-                        error!(
-                            "Failed to raise alarm for failed cron {} in project {}: {}",
-                            cron.id, cron.project_id, alarm_err
-                        );
-                    }
+                    let (cron_id, project_id) = (cron.id, cron.project_id);
+                    // Delivery waits on notification providers; the scheduler
+                    // must not, or one stalled provider would hold up every
+                    // later cron.
+                    tokio::spawn(async move {
+                        match time::timeout(
+                            ALARM_DELIVERY_TIMEOUT,
+                            alarm_service.fire_alarm(request),
+                        )
+                        .await
+                        {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(alarm_err)) => error!(
+                                "Failed to raise alarm for failed cron {} in project {}: {}",
+                                cron_id, project_id, alarm_err
+                            ),
+                            Err(_) => error!(
+                                "Raising the alarm for failed cron {} in project {} did not \
+                                 finish within {}s; notification delivery may be stalled",
+                                cron_id,
+                                project_id,
+                                ALARM_DELIVERY_TIMEOUT.as_secs()
+                            ),
+                        }
+                    });
                 } else {
                     warn!(
                         "Cron {} in project {} failed but no alarm service is wired; \
@@ -1738,6 +1763,50 @@ mod tests {
         }
     }
 
+    /// A notification provider that accepts the request and never answers.
+    struct StalledNotificationService;
+
+    #[async_trait]
+    impl temps_core::notifications::NotificationService for StalledNotificationService {
+        async fn send_notification(
+            &self,
+            _notification: temps_core::notifications::NotificationData,
+        ) -> Result<(), temps_core::notifications::NotificationError> {
+            std::future::pending().await
+        }
+        async fn send_email(
+            &self,
+            _message: temps_core::notifications::EmailMessage,
+        ) -> Result<(), temps_core::notifications::NotificationError> {
+            std::future::pending().await
+        }
+        async fn is_configured(
+            &self,
+        ) -> Result<bool, temps_core::notifications::NotificationError> {
+            Ok(true)
+        }
+    }
+
+    /// Wait (bounded) for the detached alarm task to record its alarm rows.
+    async fn wait_for_cron_alarms(
+        db: &sea_orm::DatabaseConnection,
+        project_id: i32,
+    ) -> Vec<temps_entities::alarms::Model> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let alarms = temps_entities::alarms::Entity::find()
+                .filter(temps_entities::alarms::Column::ProjectId.eq(project_id))
+                .filter(temps_entities::alarms::Column::AlarmType.eq("cron_job_failed"))
+                .all(db)
+                .await
+                .expect("alarm query");
+            if !alarms.is_empty() || tokio::time::Instant::now() >= deadline {
+                return alarms;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// Serve `HTTP 503` to every connection, as a broken cron endpoint would.
     async fn failing_endpoint() -> u16 {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1759,15 +1828,15 @@ mod tests {
         port
     }
 
-    /// #1289: a failed invocation records the endpoint's real status, raises
-    /// a cron alarm, and publishes the queue event with the last success.
-    #[tokio::test]
-    async fn failed_invocation_records_status_and_raises_an_alarm() {
-        let Ok(test_db) = TestDatabase::with_migrations().await else {
-            println!("Docker not available, skipping");
-            return;
-        };
-        let db = test_db.connection_arc();
+    /// A project, environment and cron whose deployment resolves to an
+    /// endpoint that always answers `503`.
+    async fn failing_cron_fixture(
+        db: &Arc<DatabaseConnection>,
+    ) -> (
+        temps_entities::projects::Model,
+        temps_entities::environments::Model,
+        crons::Model,
+    ) {
         let (project, environment) = create_test_project_and_environment(db.as_ref())
             .await
             .expect("fixtures");
@@ -1810,6 +1879,19 @@ mod tests {
             Some(Utc::now() - chrono::Duration::minutes(1)),
         )
         .await;
+        (project, environment, cron)
+    }
+
+    /// #1289: a failed invocation records the endpoint's real status, raises
+    /// a cron alarm, and publishes the queue event with the last success.
+    #[tokio::test]
+    async fn failed_invocation_records_status_and_raises_an_alarm() {
+        let Ok(test_db) = TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let (project, environment, cron) = failing_cron_fixture(&db).await;
         let last_success = Utc::now() - chrono::Duration::hours(2);
         cron_executions::ActiveModel {
             cron_id: Set(cron.id),
@@ -1855,12 +1937,7 @@ mod tests {
             .expect("execution recorded");
         assert_eq!(latest.status_code, 503, "the real status, not a fixed 500");
 
-        let alarms = temps_entities::alarms::Entity::find()
-            .filter(temps_entities::alarms::Column::ProjectId.eq(project.id))
-            .filter(temps_entities::alarms::Column::AlarmType.eq("cron_job_failed"))
-            .all(db.as_ref())
-            .await
-            .unwrap();
+        let alarms = wait_for_cron_alarms(db.as_ref(), project.id).await;
         assert_eq!(alarms.len(), 1, "one alarm for the failed invocation");
         assert_eq!(alarms[0].environment_id, Some(environment.id));
 
@@ -1877,5 +1954,44 @@ mod tests {
             (recorded - last_success).num_milliseconds().abs() < 1000,
             "{recorded} vs {last_success}"
         );
+    }
+
+    /// A notification provider that never answers must not hold up the
+    /// scheduler: the alarm is raised off the scheduler's awaited work.
+    #[tokio::test]
+    async fn stalled_alarm_delivery_does_not_block_the_scheduler() {
+        let Ok(test_db) = TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let (project, _environment, cron) = failing_cron_fixture(&db).await;
+        let queue = Arc::new(RecordingQueue(std::sync::Mutex::new(Vec::new())));
+        let service = DatabaseCronConfigService::new(
+            db.clone(),
+            queue.clone(),
+            create_test_deployment_token_service(db.clone()),
+        );
+        service.set_alarm_service(Arc::new(AlarmService::new(
+            db.clone(),
+            Arc::new(StalledNotificationService),
+            queue.clone(),
+        )));
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            service.process_cron(&cron, Utc::now()),
+        )
+        .await
+        .expect("process_cron must not wait for notification delivery");
+        assert!(
+            matches!(
+                result,
+                Err(CronServiceError::ExecutionFailed { status: 503, .. })
+            ),
+            "{result:?}"
+        );
+        // The alarm row is still recorded even though delivery never finishes.
+        assert_eq!(wait_for_cron_alarms(db.as_ref(), project.id).await.len(), 1);
     }
 }
