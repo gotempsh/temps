@@ -35,7 +35,7 @@
 //! in [`RateLimiter::overflow_admissions`]. A client that gets its own entry
 //! once space frees up takes over its overflow bucket's live counts, so
 //! moving out of overflow never resets a budget mid-window, even under
-//! concurrent requests (see `RateLimiter::take_overflow`).
+//! concurrent requests (see `RateLimiter::take_untracked`).
 
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
@@ -43,7 +43,7 @@ use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 use std::net::IpAddr;
 use std::str::FromStr;
-use std::sync::atomic::{fence, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Upper bound on (scope, client IP) pairs tracked by one proxy process.
@@ -127,34 +127,12 @@ struct ClientWindows {
 }
 
 impl ClientWindows {
-    /// Add `bucket`'s live counts to these counters.
-    fn absorb(&self, bucket: &ClientWindows) {
-        absorb_cell(&self.minute, bucket.minute.load(Ordering::Relaxed));
-        absorb_cell(&self.hour, bucket.hour.load(Ordering::Relaxed));
-    }
-}
-
-/// Add the count packed in `from` to `cell`. A count from a window older than
-/// the cell's is already expired and is dropped; a cell on an older window is
-/// expired and is replaced.
-fn absorb_cell(cell: &AtomicU64, from: u64) {
-    let (from_window, from_count) = unpack(from);
-    if from_count == 0 {
-        return;
-    }
-    let mut current = cell.load(Ordering::Relaxed);
-    loop {
-        let (window, count) = unpack(current);
-        let next = if window == from_window {
-            pack(window, count.saturating_add(from_count))
-        } else if window < from_window {
-            pack(from_window, from_count)
-        } else {
-            return;
-        };
-        match cell.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => return,
-            Err(observed) => current = observed,
+    /// A new entry that starts from `bucket`'s counts. Cells from an expired
+    /// window behave as zero, so this only carries over live counts.
+    fn seeded_from(bucket: &ClientWindows) -> Self {
+        Self {
+            minute: AtomicU64::new(bucket.minute.load(Ordering::Relaxed)),
+            hour: AtomicU64::new(bucket.hour.load(Ordering::Relaxed)),
         }
     }
 }
@@ -281,62 +259,50 @@ impl RateLimiter {
                 drop(existing);
                 Self::take(&windows, policy, now_secs)
             }
-            None if self.clients.len() >= self.capacity => {
-                self.take_overflow(key, policy, now_secs)
+            None => {
+                // Read before taking the shard lock below: `len` locks every
+                // shard. The cap is soft, so a stale answer is harmless.
+                let full = self.clients.len() >= self.capacity;
+                self.take_untracked(key, full, policy, now_secs)
             }
-            None => self.take_new(key, policy, now_secs),
         }
     }
 
-    // A client can move between its overflow bucket and its own entry while
-    // its windows are live: counted in overflow while the table is full, then
-    // given an entry once a sweep frees space. Neither side may lose the
-    // other's counts, including when both happen at once. Each side publishes
-    // first (the bucket increment, the entry insert), then a SeqCst fence, then
-    // reads the other; so at least one of them sees the other. The worst case
-    // is a request counted twice: stricter, never a fresh budget.
-
-    /// Count a request from an untracked client while the table is full.
-    fn take_overflow(
+    /// Count a request from a client with no entry yet.
+    ///
+    /// A client can move from its overflow bucket to its own entry while its
+    /// windows are live: counted in overflow while the table is full, then
+    /// given an entry once a sweep frees space. Both the overflow count and
+    /// the new entry's seed happen under the shard lock for the client's key,
+    /// and the entry is seeded before it becomes visible. So every overflow
+    /// request either lands in the seed or finds the entry, and no request
+    /// ever sees an unseeded entry: the move never hands out a fresh budget.
+    fn take_untracked(
         &self,
         key: (i64, IpAddr),
+        full: bool,
         policy: &RateLimitPolicy<'_>,
         now_secs: u64,
     ) -> RateLimitDecision {
-        self.overflow_admissions.fetch_add(1, Ordering::Relaxed);
-        let decision = Self::take(self.overflow_bucket(key), policy, now_secs);
-        if decision != RateLimitDecision::Allow {
-            return decision;
-        }
-        fence(Ordering::SeqCst);
-        // The client got its own entry meanwhile: count there too.
-        match self.clients.get(&key) {
-            Some(existing) => {
-                let windows = Arc::clone(existing.value());
+        let bucket = self.overflow_bucket(key);
+        match self.clients.entry(key) {
+            Entry::Occupied(existing) => {
+                let windows = Arc::clone(existing.get());
                 drop(existing);
                 Self::take(&windows, policy, now_secs)
             }
-            None => decision,
+            Entry::Vacant(vacant) if full => {
+                self.overflow_admissions.fetch_add(1, Ordering::Relaxed);
+                let decision = Self::take(bucket, policy, now_secs);
+                drop(vacant);
+                decision
+            }
+            Entry::Vacant(vacant) => {
+                let windows = Arc::new(ClientWindows::seeded_from(bucket));
+                vacant.insert(Arc::clone(&windows));
+                Self::take(&windows, policy, now_secs)
+            }
         }
-    }
-
-    /// Count a request from an untracked client while the table has room.
-    fn take_new(
-        &self,
-        key: (i64, IpAddr),
-        policy: &RateLimitPolicy<'_>,
-        now_secs: u64,
-    ) -> RateLimitDecision {
-        let (windows, inserted) = match self.clients.entry(key) {
-            Entry::Occupied(existing) => (Arc::clone(existing.get()), false),
-            Entry::Vacant(vacant) => (Arc::clone(vacant.insert(Arc::default()).value()), true),
-        };
-        if inserted {
-            fence(Ordering::SeqCst);
-            // Carry over what the client used in its overflow bucket.
-            windows.absorb(self.overflow_bucket(key));
-        }
-        Self::take(&windows, policy, now_secs)
     }
 
     fn overflow_bucket(&self, key: (i64, IpAddr)) -> &ClientWindows {
@@ -715,46 +681,45 @@ mod tests {
     }
 
     #[test]
-    fn overflow_requests_also_count_on_an_entry_created_meanwhile() {
-        let limiter = RateLimiter::with_capacity(1);
-        let p = policy(0, 5);
-        let key = (INSTANCE_SCOPE, ip("198.51.100.7"));
-        // Another request created the client's entry between this request's
-        // capacity check and its overflow increment.
-        limiter.clients.insert(key, Arc::default());
-        for _ in 0..5 {
-            assert_eq!(limiter.take_overflow(key, &p, T0), RateLimitDecision::Allow);
+    fn concurrent_requests_moving_out_of_overflow_share_one_budget() {
+        let limiter = Arc::new(RateLimiter::with_capacity(1));
+        let client: IpAddr = "198.51.100.7".parse().unwrap();
+        let scope = RateLimitScope::Environment(3);
+        // A minute-only entry fills the table; the client uses 20 of its 50
+        // hourly requests in overflow.
+        limiter.check(scope, ip("192.0.2.1"), &policy(1, 0), T0);
+        for _ in 0..20 {
+            assert_eq!(
+                limiter.check(scope, client, &policy(0, 50), T0),
+                RateLimitDecision::Allow
+            );
         }
-        let entry = Arc::clone(limiter.clients.get(&key).expect("entry").value());
-        assert_eq!(unpack(entry.hour.load(Ordering::Relaxed)).1, 5);
-        assert!(matches!(
-            limiter.check(RateLimitScope::Instance, key.1, &p, T0),
-            RateLimitDecision::Limited {
-                window: RateLimitWindow::Hour,
-                ..
-            }
-        ));
-    }
 
-    #[test]
-    fn absorb_adds_live_counts_and_drops_expired_ones() {
-        let cell = AtomicU64::new(pack(10, 2));
-        absorb_cell(&cell, pack(10, 3));
-        assert_eq!(unpack(cell.load(Ordering::Relaxed)), (10, 5));
-        absorb_cell(&cell, pack(9, 7));
-        assert_eq!(
-            unpack(cell.load(Ordering::Relaxed)),
-            (10, 5),
-            "older window"
-        );
-        absorb_cell(&cell, pack(11, 1));
-        assert_eq!(
-            unpack(cell.load(Ordering::Relaxed)),
-            (11, 1),
-            "cell was expired"
-        );
-        absorb_cell(&cell, pack(11, 0));
-        assert_eq!(unpack(cell.load(Ordering::Relaxed)), (11, 1));
+        // Two minutes later the first request sweeps the filler away while the
+        // others race it, so some count in overflow and some create or use the
+        // client's own entry. Together they get exactly the 30 left.
+        let later = T0 + 120;
+        let allowed = Arc::new(AtomicU64::new(0));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let limiter = Arc::clone(&limiter);
+                let allowed = Arc::clone(&allowed);
+                std::thread::spawn(move || {
+                    for _ in 0..100 {
+                        if limiter.check(scope, client, &policy(0, 50), later)
+                            == RateLimitDecision::Allow
+                        {
+                            allowed.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(allowed.load(Ordering::Relaxed), 30);
+        assert_eq!(limiter.tracked_clients(), 1, "the client is tracked now");
     }
 
     #[test]
