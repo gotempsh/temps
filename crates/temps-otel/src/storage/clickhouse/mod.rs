@@ -1484,7 +1484,14 @@ impl OtelStorage for ClickHouseOtelStorage {
         &self,
         query: crate::storage::global_traces::GlobalTraceQuery,
     ) -> StorageResult<crate::storage::global_traces::GlobalTraceStream> {
-        super::global_traces::clickhouse(&self.ch, &query, None).await
+        // Same lock-free snapshot the project trace list filters with, so a
+        // faceted attribute uses its indexed slot column here too.
+        let facets = self
+            .facet_cache
+            .as_ref()
+            .map(|c| c.load_full())
+            .unwrap_or_default();
+        super::global_traces::clickhouse_local(&self.ch, &query, &facets).await
     }
     // ── Span write (ClickHouse — system of record) ──────────────────────────
 

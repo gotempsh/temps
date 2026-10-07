@@ -33,16 +33,21 @@
 //!   applies `ORDER BY _version DESC LIMIT 1 BY project_id, trace_id, span_id`
 //!   to that handful of rows. The aggregation is the one the single-stage query
 //!   used, so the values it returns are unchanged.
-//! * **Total** is `uniqExact(project_id, trace_id)` over the same narrow,
-//!   projection-eligible read — duplicate rows cannot inflate it.
+//! * **Total** counts the groups of `GROUP BY project_id, trace_id` over the
+//!   same narrow, projection-eligible read — duplicate rows cannot inflate it.
+//!   It is deliberately not `uniqExact(project_id, trace_id)`: that keeps one
+//!   hash per distinct trace in a set that cannot spill, so its memory grows
+//!   with the window, while a grouped count spills like stage 1 does and is
+//!   also faster (1.4 s vs 1.7 s on 6M traces).
 //!
 //! # Memory
 //!
-//! Stage 2 is page-sized. Stage 1 and the total keep one small group per
-//! distinct trace in the window; that state is spilled to disk past
-//! [`SPILL_BYTES`] (and aggregation streams in primary-key order where it can),
-//! and every statement carries a hard [`MAX_MEMORY_BYTES`] cap and a
-//! [`QUERY_BUDGET`] wall-clock budget. Hitting either one fails the request
+//! Stage 2 is page-sized. Stage 1 and the total group by trace over the whole
+//! window, and that state is spilled to disk past [`SPILL_BYTES`] (aggregation
+//! streams in primary-key order where it can), so peak memory follows the spill
+//! threshold rather than the number of traces: about 140 MiB for 6M traces and
+//! no more for more. Every statement also carries a hard [`MAX_MEMORY_BYTES`]
+//! cap and a [`QUERY_BUDGET`] wall-clock budget. Hitting either one fails the request
 //! with a typed [`OtelError::Storage`] naming the stage and the limit — never a
 //! partial page.
 //!
@@ -54,10 +59,10 @@
 //!
 //! | | single-stage (before) | page-first (after) |
 //! |---|---|---|
-//! | page | 18.8 s, 1.83 GiB, 19.1M rows | 0.67 s, 269 MiB, 10.2M rows |
-//! | total | 5.1 s, 1.55 GiB, 19.1M rows | 0.57 s, 149 MiB, 10.0M rows |
+//! | page | 18.8 s, 1.83 GiB, 19.1M rows | 0.7 s, ~140 MiB, 10.2M rows |
+//! | total | 5.1 s, 1.55 GiB, 19.1M rows | 0.5 s, ~150 MiB, 10.0M rows |
 //! | sort by duration | — | 1.0 s, 46 MiB (in-order grouping) |
-//! | 3-day window (30M spans) | `MEMORY_LIMIT_EXCEEDED` at 2.79 GiB | 2.0 s, 307 MiB (spilling) |
+//! | 3-day window (30M spans, 6M traces) | `MEMORY_LIMIT_EXCEEDED` at 2.79 GiB | page 1.7 s / 136 MiB, total 1.4 s / 280 MiB |
 //!
 //! The pages are byte-identical for both sort orders. Stage 1 and the total
 //! stay proportional to the window (they must look at every span in it), but
@@ -70,16 +75,18 @@
 //! (a Postgres backfill next to a live row, see `query_trace_summaries`), page
 //! membership at the very edge of a page can follow the superseded copy. The
 //! rows returned are always the deduped ones, and the page is ordered by the
-//! values it displays. Filtering on an attribute reads the `attributes` column
-//! in stage 1 (and the total) for every span in the window; that is the one
-//! filter whose cost grows with window size, bounded by the same spill and
-//! memory caps. The total holds one 128-bit hash per distinct trace in a set
-//! that cannot spill, so a single window with more than roughly ten million
-//! distinct traces exceeds [`MAX_MEMORY_BYTES`] and fails with the typed
-//! memory-budget error naming the stage.
+//! values it displays. Filtering on a faceted attribute key reads its
+//! `facet_attr_N` slot column through the bloom-filter skip index (0008), the
+//! same as the project trace list: 21 ms / 327k rows against 1.4 s / 30M rows
+//! for the JSON path on the 30M-span table above. An UNFACETED key still has to
+//! parse the `attributes` blob of every span in the window in stage 1 and the
+//! total; that cost grows with the window (bounded by the spill, memory and
+//! time caps), and marking the key as a facet is the fix. A facet still
+//! backfilling answers from the rows populated so far, as it does for the
+//! project trace list.
 
 use super::{
-    can_use_lifetime_summaries, ch_query, invalid, Bind, GlobalTraceQuery, GlobalTraceRow,
+    can_use_lifetime_summaries, ch_query, invalid, Bind, Facets, GlobalTraceQuery, GlobalTraceRow,
     GlobalTraceStream, MAX_LIFETIME_CANDIDATES,
 };
 use crate::{
@@ -90,10 +97,13 @@ use crate::{
 use std::time::Duration;
 
 /// Hard per-query memory ceiling for every statement on this path. Sized for a
-/// 4 GiB host that also runs the rest of the stack.
-pub(super) const MAX_MEMORY_BYTES: u64 = 1 << 30;
+/// 4 GiB host that also runs the rest of the stack; the page and the total run
+/// concurrently, so a request stays under twice this.
+pub(super) const MAX_MEMORY_BYTES: u64 = 512 << 20;
 /// Aggregation / sort state beyond this spills to disk instead of growing.
-pub(super) const SPILL_BYTES: u64 = 256 << 20;
+/// Measured on 6M traces: 128 MiB gives the lowest peak (~136 MiB) at the same
+/// speed as 256 MiB (~306 MiB); smaller values spill more for no gain.
+pub(super) const SPILL_BYTES: u64 = 128 << 20;
 /// Server-side wall-clock budget per statement.
 pub(super) const QUERY_BUDGET: Duration = Duration::from_secs(30);
 /// Client-side backstop, a little longer than the server budget so the server's
@@ -215,7 +225,7 @@ fn scope(q: &GlobalTraceQuery) -> Frag {
 
 /// ` AND ..` for every span-level filter. Same predicates, same semantics as
 /// the Postgres/Cloud builder.
-fn span_filters(q: &GlobalTraceQuery) -> StorageResult<Frag> {
+fn span_filters(q: &GlobalTraceQuery, facets: &Facets) -> StorageResult<Frag> {
     let f = &q.filter;
     let mut out = Frag::default();
     for (column, value) in [("trace_id", &f.trace_id), ("service_name", &f.service_name)] {
@@ -237,21 +247,32 @@ fn span_filters(q: &GlobalTraceQuery) -> StorageResult<Frag> {
         ));
     }
     for (k, v) in f.attributes.iter().flatten() {
-        out.text(" AND JSONExtractString(attributes, ")
-            .bind(Bind::Text(k.clone()))
-            .text(") = ")
+        if let Some(&slot) = facets.get(k.as_str()) {
+            // Faceted key: the slot column carries a bloom-filter skip index, so
+            // ClickHouse skips granules that cannot hold the value instead of
+            // parsing the JSON of every span in the window.
+            out.text(&format!(
+                " AND {} = ",
+                crate::services::facet_service::facet_column_name(slot)
+            ))
             .bind(Bind::Text(v.clone()));
+        } else {
+            out.text(" AND JSONExtractString(attributes, ")
+                .bind(Bind::Text(k.clone()))
+                .text(") = ")
+                .bind(Bind::Text(v.clone()));
+        }
     }
     Ok(out)
 }
 
 /// `WHERE (scope) AND filters`.
-fn where_clause(q: &GlobalTraceQuery) -> StorageResult<Frag> {
+fn where_clause(q: &GlobalTraceQuery, facets: &Facets) -> StorageResult<Frag> {
     let mut f = Frag::default();
     f.text(" WHERE (")
         .frag(scope(q))
         .text(")")
-        .frag(span_filters(q)?);
+        .frag(span_filters(q, facets)?);
     Ok(f)
 }
 
@@ -298,7 +319,12 @@ fn pick(field: &str) -> String {
 
 /// Stage 2 for trace summaries: dedup the page's spans, then fold them into one
 /// row per trace. `keys` selects the page's `(project_id, trace_id)` pairs.
-fn summaries_hydration(q: &GlobalTraceQuery, values: Values, keys: Frag) -> StorageResult<Frag> {
+fn summaries_hydration(
+    q: &GlobalTraceQuery,
+    facets: &Facets,
+    values: Values,
+    keys: Frag,
+) -> StorageResult<Frag> {
     let mut f = Frag::default();
     f.text(
         "WITH raw AS (SELECT project_id AS project_id, trace_id, span_id, \
@@ -311,7 +337,7 @@ fn summaries_hydration(q: &GlobalTraceQuery, values: Values, keys: Frag) -> Stor
         f.text("(")
             .frag(scope(q))
             .text(")")
-            .frag(span_filters(q)?)
+            .frag(span_filters(q, facets)?)
             .text(" AND ");
     }
     let status = match values {
@@ -361,10 +387,10 @@ fn summary_keys(q: &GlobalTraceQuery, source: Frag, having: Frag, limit: u64) ->
 /// Stage 1 for raw spans: the page's `(project_id, trace_id, span_id)` keys.
 /// Grouping by the whole primary key dedups physical copies without `LIMIT BY`
 /// and streams in key order.
-fn span_keys(q: &GlobalTraceQuery, limit: u64) -> StorageResult<Frag> {
+fn span_keys(q: &GlobalTraceQuery, facets: &Facets, limit: u64) -> StorageResult<Frag> {
     let mut f = Frag::default();
     f.text("SELECT project_id, trace_id, span_id FROM spans")
-        .frag(where_clause(q)?)
+        .frag(where_clause(q, facets)?)
         .frag(span_row_filters(q))
         .text(&format!(
             " GROUP BY project_id, trace_id, span_id ORDER BY {} {}, project_id, trace_id, span_id \
@@ -377,7 +403,7 @@ fn span_keys(q: &GlobalTraceQuery, limit: u64) -> StorageResult<Frag> {
 }
 
 /// Stage 2 for raw spans: the wide columns of the page's spans, deduplicated.
-fn span_hydration(q: &GlobalTraceQuery, keys: Frag) -> StorageResult<Frag> {
+fn span_hydration(q: &GlobalTraceQuery, facets: &Facets, keys: Frag) -> StorageResult<Frag> {
     let mut f = Frag::default();
     f.text(
         "WITH raw AS (SELECT project_id AS project_id, trace_id, span_id, \
@@ -387,7 +413,7 @@ fn span_hydration(q: &GlobalTraceQuery, keys: Frag) -> StorageResult<Frag> {
          duration_ms AS duration, attributes AS attributes, events AS events, \
          status_message AS status_message FROM spans",
     )
-    .frag(where_clause(q)?)
+    .frag(where_clause(q, facets)?)
     .text(" AND (project_id, trace_id, span_id) IN (")
     .frag(keys)
     .text(&format!(
@@ -402,36 +428,31 @@ fn span_hydration(q: &GlobalTraceQuery, keys: Frag) -> StorageResult<Frag> {
     Ok(f)
 }
 
-/// Distinct traces (or spans) matching the filters. Narrow and
-/// projection-eligible; duplicate physical rows cannot inflate it.
-fn total(q: &GlobalTraceQuery) -> StorageResult<Frag> {
+/// Distinct traces (or spans) matching the filters, counted as the groups of a
+/// spillable `GROUP BY` (see the module docs for why not `uniqExact`). Narrow
+/// and projection-eligible; duplicate physical rows cannot inflate it.
+fn total(q: &GlobalTraceQuery, facets: &Facets) -> StorageResult<Frag> {
     let mut f = Frag::default();
     if !q.summaries {
         // Distinct spans: stream the primary-key groups rather than hashing
         // three strings per span in a set that grows with the window.
         f.text("SELECT count() FROM (SELECT project_id FROM spans")
-            .frag(where_clause(q)?)
+            .frag(where_clause(q, facets)?)
             .frag(span_row_filters(q))
             .text(" GROUP BY project_id, trace_id, span_id)");
         return Ok(f);
     }
-    let having = trace_having(q);
-    if having.sql.is_empty() {
-        f.text("SELECT uniqExact(project_id, trace_id) FROM spans")
-            .frag(where_clause(q)?);
-    } else {
-        f.text("SELECT count() FROM (SELECT project_id FROM spans")
-            .frag(where_clause(q)?)
-            .text(" GROUP BY project_id, trace_id")
-            .frag(having)
-            .text(")");
-    }
+    f.text("SELECT count() FROM (SELECT project_id FROM spans")
+        .frag(where_clause(q, facets)?)
+        .text(" GROUP BY project_id, trace_id")
+        .frag(trace_having(q))
+        .text(")");
     Ok(f)
 }
 
 /// Build the statements for one request. `lifetime` selects whole-trace values
 /// for an unfiltered read whose candidate count fits the cap.
-pub(super) fn plan(q: &GlobalTraceQuery, lifetime: bool) -> StorageResult<Plan> {
+pub(super) fn plan(q: &GlobalTraceQuery, lifetime: bool, facets: &Facets) -> StorageResult<Plan> {
     let requested = requested_rows(q);
     let limit = if lifetime {
         // At most one row per candidate trace exists, so this only bounds the
@@ -451,30 +472,33 @@ pub(super) fn plan(q: &GlobalTraceQuery, lifetime: bool) -> StorageResult<Plan> 
     let fits = filters_fit_projection(q);
     let (page, page_in_order) = if !q.summaries {
         (
-            span_hydration(q, span_keys(q, limit)?)?,
+            span_hydration(q, facets, span_keys(q, facets, limit)?)?,
             !(fits && q.filter.sort_by == TraceSortField::StartTime),
         )
     } else if lifetime {
         let mut candidates = Frag::default();
         candidates
             .text(" WHERE (project_id, trace_id) IN (SELECT project_id, trace_id FROM spans")
-            .frag(where_clause(q)?)
+            .frag(where_clause(q, facets)?)
             .text(" GROUP BY project_id, trace_id)");
         let keys = summary_keys(q, candidates, Frag::default(), limit);
         // At most `MAX_LIFETIME_CANDIDATES` groups: hashing them is cheap, and
         // the membership subquery wants the projection.
-        (summaries_hydration(q, Values::Lifetime, keys)?, false)
-    } else {
-        let keys = summary_keys(q, where_clause(q)?, trace_having(q), limit);
         (
-            summaries_hydration(q, Values::Window, keys)?,
+            summaries_hydration(q, facets, Values::Lifetime, keys)?,
+            false,
+        )
+    } else {
+        let keys = summary_keys(q, where_clause(q, facets)?, trace_having(q), limit);
+        (
+            summaries_hydration(q, facets, Values::Window, keys)?,
             !(fits && q.filter.sort_by == TraceSortField::StartTime),
         )
     };
     let total = if lifetime {
         None
     } else {
-        let t = total(q)?;
+        let t = total(q, facets)?;
         Some(Stmt {
             sql: t.sql,
             binds: t.binds,
@@ -622,10 +646,11 @@ fn stream(total: u64, rows: Vec<GlobalTraceRow>) -> GlobalTraceStream {
 pub(super) async fn read(
     client: &::clickhouse::Client,
     q: &GlobalTraceQuery,
+    facets: &Facets,
 ) -> StorageResult<GlobalTraceStream> {
     if can_use_lifetime_summaries(q) {
         // Unfiltered, so the candidate count IS the window total.
-        let count = total(q)?;
+        let count = total(q, facets)?;
         let count = Stmt {
             sql: count.sql,
             binds: count.binds,
@@ -633,11 +658,11 @@ pub(super) async fn read(
         };
         let candidates = fetch_total(client, q, "candidate count", &count).await?;
         let lifetime = candidates <= MAX_LIFETIME_CANDIDATES;
-        let plan = plan(q, lifetime)?;
+        let plan = plan(q, lifetime, facets)?;
         let rows = fetch_page(client, q, &plan.page).await?;
         return Ok(stream(candidates, rows));
     }
-    let plan = plan(q, false)?;
+    let plan = plan(q, false, facets)?;
     let Some(total_sql) = plan.total.as_ref() else {
         return Err(invalid("Local global trace plan has no total statement"));
     };
@@ -652,6 +677,11 @@ pub(super) async fn read(
 mod tests {
     use super::*;
     use chrono::DateTime;
+
+    /// Plans without any facets, the shape most tests are about.
+    fn plan(q: &GlobalTraceQuery, lifetime: bool) -> StorageResult<Plan> {
+        super::plan(q, lifetime, &Facets::new())
+    }
 
     fn query(scopes: usize) -> GlobalTraceQuery {
         let from = DateTime::from_timestamp_millis(1_000).unwrap();
@@ -734,11 +764,12 @@ mod tests {
         let total = plan.total.unwrap();
         assert!(total
             .sql
-            .starts_with("SELECT uniqExact(project_id, trace_id) FROM spans WHERE ("));
+            .starts_with("SELECT count() FROM (SELECT project_id FROM spans WHERE ("));
         assert!(total
             .sql
             .contains("start_time >= fromUnixTimestamp64Milli(?)"));
-        assert!(!total.sql.contains("count() FROM ("));
+        assert!(!total.sql.contains("uniqExact"));
+        assert!(total.sql.ends_with("GROUP BY project_id, trace_id)"));
         assert_eq!(total.binds.len(), 6);
         assert!(!total.sql.contains("attributes"));
         let rendered = render(&total.sql, &total.binds);
@@ -921,6 +952,28 @@ mod tests {
     }
 
     #[test]
+    fn faceted_attribute_keys_filter_on_their_indexed_slot_column() {
+        let mut q = query(1);
+        let attributes = q.filter.attributes.get_or_insert_default();
+        attributes.insert("tier".into(), "free".into());
+        attributes.insert("region".into(), "eu".into());
+        let facets = Facets::from([("tier".to_string(), 3u8)]);
+        let page = super::plan(&q, false, &facets).unwrap().page;
+        // Faceted: the slot column, no JSON parsing. Unfaceted: JSON fallback.
+        assert!(page.sql.contains(" AND facet_attr_3 = ?"));
+        assert!(page
+            .sql
+            .contains(" AND JSONExtractString(attributes, ?) = ?"));
+        assert_eq!(placeholders(&page.sql), page.binds.len());
+        let rendered = render(&page.sql, &page.binds);
+        assert!(rendered.contains("facet_attr_3 = 'free'"));
+        assert!(rendered.contains("JSONExtractString(attributes, 'region') = 'eu'"));
+        // Both stages repeat the predicate.
+        assert_eq!(page.sql.matches("facet_attr_3 = ?").count(), 2);
+        assert!(!page.sql.contains("JSONExtractString(attributes, 'tier')"));
+    }
+
+    #[test]
     fn the_production_memory_error_is_recognised_and_reported_with_its_limit() {
         let production = ::clickhouse::error::Error::BadResponse(
             "Code: 241. DB::Exception: Query memory limit exceeded: would use 2.80 GiB \
@@ -933,7 +986,7 @@ mod tests {
         let error = failure("page", &q, production);
         let message = error.to_string();
         assert!(
-            message.contains("page query exceeded its 1024 MiB memory budget"),
+            message.contains("page query exceeded its 512 MiB memory budget"),
             "{message}"
         );
         assert!(message.contains("3 project scope(s)"), "{message}");

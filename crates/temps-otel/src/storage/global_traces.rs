@@ -18,6 +18,9 @@ use utoipa::ToSchema;
 
 mod local_clickhouse;
 
+/// Attribute key -> facet slot (1..=20), as cached by `FacetService`.
+pub type Facets = std::collections::HashMap<String, u8>;
+
 #[derive(Debug, Clone)]
 pub struct TraceReadScope {
     pub project_id: i32,
@@ -711,8 +714,22 @@ pub async fn clickhouse(
     }
     match refs {
         Some(refs) => cloud_clickhouse(client, q, refs).await,
-        None => local_clickhouse::read(client, q).await,
+        None => local_clickhouse::read(client, q, &Facets::new()).await,
     }
+}
+
+/// [`clickhouse`] for the local `spans` table, filtering faceted attribute keys
+/// on their indexed slot column. `facets` is the `FacetService` key -> slot
+/// snapshot; the same mapping the project trace list uses.
+pub async fn clickhouse_local(
+    client: &clickhouse::Client,
+    q: &GlobalTraceQuery,
+    facets: &Facets,
+) -> StorageResult<GlobalTraceStream> {
+    if q.scopes.is_empty() {
+        return Ok(GlobalTraceStream::empty());
+    }
+    local_clickhouse::read(client, q, facets).await
 }
 
 async fn cloud_clickhouse(
@@ -966,7 +983,7 @@ mod tests {
                 window_clamped_at: None,
             })
             .collect();
-        let plan = local_clickhouse::plan(&q, false).unwrap();
+        let plan = local_clickhouse::plan(&q, false, &Facets::new()).unwrap();
         let (page, binds) = (&plan.page.sql, &plan.page.binds);
         // The scope is rendered once for the hydration and once for the page
         // selection; every value is bound, none interpolated.

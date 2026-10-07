@@ -1021,6 +1021,7 @@ mod global_page_first {
     const LIFETIME: i32 = 818;
     /// Outside every scope in the scopes test: must never contribute.
     const DECOY: i32 = 819;
+    const FACETED: i32 = 821;
     const BULK: i32 = 820;
 
     fn window(projects: &[i32], hours: i64) -> GlobalTraceQuery {
@@ -1601,6 +1602,98 @@ mod global_page_first {
         );
     }
 
+    /// A faceted attribute is filtered on its indexed slot column, written at
+    /// ingest by a storage that shares the facet cache; the answer matches the
+    /// JSON path, which a storage without the key in its cache still uses.
+    #[tokio::test]
+    async fn faceted_attribute_filters_use_the_slot_column_and_agree_with_json() {
+        let Some(server) = SERVER.get_or_init(setup).await.clone() else {
+            return;
+        };
+        let cache: temps_otel::services::FacetCache = Arc::new(arc_swap::ArcSwap::from_pointee(
+            std::collections::HashMap::from([("tier".to_string(), 2u8)]),
+        ));
+        let inner = Arc::new(TimescaleDbStorage::new(
+            Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
+            None,
+        ));
+        let faceted = ClickHouseOtelStorage::new(
+            ClickHouseOtelConfig::new(&server.url, DB, "default", "test"),
+            inner,
+            Arc::new(temps_core::FixedRetentionResolver),
+            Some(cache),
+        );
+        faceted
+            .store_spans(vec![
+                span(
+                    FACETED,
+                    "fac-free",
+                    "r",
+                    None,
+                    "GET /f",
+                    "api",
+                    SpanStatusCode::Ok,
+                    5,
+                    10.0,
+                    None,
+                    &[("tier", "free")],
+                ),
+                span(
+                    FACETED,
+                    "fac-paid",
+                    "r",
+                    None,
+                    "GET /p",
+                    "api",
+                    SpanStatusCode::Ok,
+                    6,
+                    10.0,
+                    None,
+                    &[("tier", "paid")],
+                ),
+                span(
+                    FACETED,
+                    "fac-none",
+                    "r",
+                    None,
+                    "GET /n",
+                    "api",
+                    SpanStatusCode::Ok,
+                    7,
+                    10.0,
+                    None,
+                    &[("region", "eu")],
+                ),
+            ])
+            .await
+            .unwrap();
+
+        let mut q = window(&[FACETED], 1);
+        q.filter.attributes = Some(BTreeMap::from([("tier".to_string(), "free".to_string())]));
+        let via_slot = faceted.global_trace_page(q.clone()).await.unwrap();
+        assert_eq!(ids(&via_slot), ["fac-free"]);
+        assert_eq!(via_slot.total, 1);
+
+        // The statement really filtered on the slot column.
+        let h = harness().await.unwrap();
+        let used = logged_like(&h, "facet_attr_2 = 'free'").await;
+        assert!(
+            used >= 2,
+            "the page and the total must both use facet_attr_2"
+        );
+
+        // Unfaceted key on the same data: JSON fallback, same machinery.
+        let mut region = window(&[FACETED], 1);
+        region.filter.attributes = Some(BTreeMap::from([("region".to_string(), "eu".to_string())]));
+        let via_json = faceted.global_trace_page(region).await.unwrap();
+        assert_eq!(ids(&via_json), ["fac-none"]);
+
+        // A storage that does not know the facet falls back to JSON and agrees,
+        // because the attributes blob still holds the value.
+        let plain = page(&h, q).await;
+        assert_eq!(ids(&plain), ids(&via_slot));
+    }
+
     /// The raw-span listing shares the machinery: dedup, filters, sort, total.
     #[tokio::test]
     async fn raw_span_pages_dedup_filter_and_count_distinct_spans() {
@@ -1702,6 +1795,33 @@ mod global_page_first {
         read_rows: u64,
         query_duration_ms: u64,
         projections: Vec<String>,
+    }
+
+    /// How many finished statements contain `needle` (client-side binds are
+    /// already substituted into the logged text).
+    async fn logged_like(h: &Harness, needle: &str) -> u64 {
+        #[derive(::clickhouse::Row, serde::Deserialize)]
+        struct Cnt {
+            cnt: u64,
+        }
+        h.probe
+            .query("SYSTEM FLUSH LOGS")
+            .execute()
+            .await
+            .expect("flush logs");
+        h.probe
+            .query(
+                "SELECT count() AS cnt FROM system.query_log \
+                 WHERE type = 'QueryFinish' AND current_database = ? \
+                   AND positionCaseInsensitive(query, ?) > 0 \
+                   AND query NOT LIKE '%system.query_log%'",
+            )
+            .bind(DB)
+            .bind(needle)
+            .fetch_one::<Cnt>()
+            .await
+            .expect("count query_log")
+            .cnt
     }
 
     /// What ClickHouse recorded for the statements that mention `project`.
