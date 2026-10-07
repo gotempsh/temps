@@ -531,8 +531,19 @@ struct Frame {
     /// `None` for anything else: an export, a merged `mergeConfig` input, an
     /// arrow-returned helper object.
     branch_group: Option<usize>,
-    /// Unique id, used as the branch group of objects opened inside a `(`.
+    /// Unique id; a group of alternative configs is keyed by the id of the
+    /// frame that holds them.
     id: usize,
+    /// Token index of the opening `{`, `(` or `[`.
+    open_index: usize,
+    /// A block that is a function body (after `=>` or a parameter list), as
+    /// opposed to an `if`/`for`/`else` block.
+    function_body: bool,
+    /// A function body of the config function itself: passed to a config
+    /// call (`defineConfig(() => { ... })`) or exported directly.
+    config_body: bool,
+    /// A block whose current statement is a `return`.
+    returning: bool,
     /// For a config object: it has at least one member.
     has_members: bool,
     /// For a config object: one of its keys is a Vite top-level option.
@@ -553,6 +564,10 @@ impl Frame {
             build: Slot::Absent,
             branch_group: None,
             id: 0,
+            open_index: 0,
+            function_body: false,
+            config_body: false,
+            returning: false,
             has_members: false,
             vite_key: false,
             opaque_members: false,
@@ -662,6 +677,105 @@ fn paren_keeps_config_scope(tokens: &[Token], index: usize) -> bool {
     }
 }
 
+/// Keywords whose `( ... ) {` opens a control-flow block, not a function body.
+const CONTROL_KEYWORDS: &[&str] = &["if", "while", "for", "switch", "catch", "with"];
+
+/// If the `{` at `brace` opens a function body, the index where the
+/// function's head starts (`async`, `function name`, or its parameters);
+/// `None` for a control-flow or plain block. `paren_open` maps each `)` to
+/// its `(`.
+fn function_head(
+    tokens: &[Token],
+    brace: usize,
+    paren_open: &std::collections::HashMap<usize, usize>,
+) -> Option<usize> {
+    let word = |i: usize| match tokens.get(i) {
+        Some(Token::Word(w)) => Some(w.as_str()),
+        _ => None,
+    };
+    let punct = |i: usize, c: char| matches!(tokens.get(i), Some(Token::Punct(p)) if *p == c);
+    let prev = brace.checked_sub(1)?;
+    let mut head = if punct(prev, '>') && prev >= 1 && punct(prev - 1, '=') {
+        // Arrow function: `(params) => {` or `param => {`.
+        let params_end = prev.checked_sub(2)?;
+        if punct(params_end, ')') {
+            *paren_open.get(&params_end)?
+        } else if word(params_end).is_some() {
+            params_end
+        } else {
+            return None;
+        }
+    } else if punct(prev, ')') {
+        let open = *paren_open.get(&prev)?;
+        if open
+            .checked_sub(1)
+            .and_then(word)
+            .is_some_and(|w| CONTROL_KEYWORDS.contains(&w))
+        {
+            return None;
+        }
+        // `function name(...) {`, `function (...) {` or a method `name(...) {`.
+        let mut head = open;
+        if head >= 2 && word(head - 2) == Some("function") && word(head - 1).is_some() {
+            head -= 2;
+        } else if head >= 1 && word(head - 1) == Some("function") {
+            head -= 1;
+        }
+        head
+    } else {
+        return None;
+    };
+    if head >= 1 && word(head - 1) == Some("async") {
+        head -= 1;
+    }
+    Some(head)
+}
+
+/// Whether the function whose head starts at `head` is exported as the
+/// config (`export default ...`, `module.exports = ...`).
+fn exported_function(tokens: &[Token], head: usize) -> bool {
+    let word_at = |i: usize, w: &str| matches!(tokens.get(i), Some(Token::Word(x)) if x == w);
+    (head >= 1 && word_at(head - 1, "default"))
+        || (head >= 2
+            && matches!(tokens.get(head - 1), Some(Token::Punct('=')))
+            && word_at(head - 2, "exports"))
+}
+
+/// The group of a `return {` alternative: the id of the enclosing function
+/// body if that is the config function, looking through `if`/`else` blocks.
+/// Returns of any other function (a helper) are not config alternatives.
+fn return_group(frames: &[Frame]) -> Option<usize> {
+    for frame in frames.iter().rev() {
+        match frame.kind {
+            FrameKind::Block if frame.function_body => {
+                return frame.config_body.then_some(frame.id);
+            }
+            FrameKind::Block => continue,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// The group of a ternary arm `? {` / `: {`: the config call or parenthesis
+/// that holds the ternary (`defineConfig(() => c ? {..} : {..})`), or the
+/// config function when the ternary is what it returns. A ternary anywhere
+/// else (inside a helper function, at top level) is not a config alternative.
+fn ternary_group(frames: &[Frame]) -> Option<usize> {
+    let holder = frames.last()?;
+    let inside_helper = frames
+        .iter()
+        .any(|frame| frame.kind == FrameKind::Block && frame.function_body && !frame.config_body);
+    if inside_helper {
+        return None;
+    }
+    match holder.kind {
+        FrameKind::Paren if holder.config_scope => Some(holder.id),
+        FrameKind::Block if holder.returning => return_group(frames),
+        _ => None,
+    }
+}
+
 /// Hand a closed frame's findings on: the config's `build` object becomes the
 /// config's `build` value (a later `build` key replaces an earlier one, as in
 /// JavaScript), and a config object that had a `build` key reports it.
@@ -710,6 +824,7 @@ fn parse_vite_out_dir(source: &str) -> OutDir {
     let mut frames: Vec<Frame> = Vec::new();
     let mut results: Vec<(Slot, Option<usize>)> = Vec::new();
     let mut next_frame_id = 1;
+    let mut paren_open: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     let key_at = |index: usize| -> Option<String> {
         match tokens.get(index) {
             Some(Token::Word(word)) | Some(Token::Str(word)) => Some(word.clone()),
@@ -741,39 +856,50 @@ fn parse_vite_out_dir(source: &str) -> OutDir {
                     let parent_is_object = frames
                         .last()
                         .is_some_and(|frame| frame.kind == FrameKind::Object);
-                    let alternative = match prev {
-                        Some(Token::Punct('?')) => true,
-                        Some(Token::Punct(':')) => !parent_is_object,
-                        Some(Token::Word(word)) => word == "return",
-                        _ => false,
+                    let group = match prev {
+                        Some(Token::Word(word)) if word == "return" => return_group(&frames),
+                        Some(Token::Punct('?')) => ternary_group(&frames),
+                        Some(Token::Punct(':')) if !parent_is_object => ternary_group(&frames),
+                        _ => None,
                     };
-                    let group = alternative.then(|| {
-                        frames
-                            .iter()
-                            .rev()
-                            .find(|frame| frame.kind == FrameKind::Paren)
-                            .map_or(0, |frame| frame.id)
-                    });
                     Frame::object(
                         config_scope,
                         parent_is_config && key.as_deref() == Some("build"),
                         group,
                     )
                 } else {
-                    Frame::new(FrameKind::Block, config_scope)
+                    let mut block = Frame::new(FrameKind::Block, config_scope);
+                    if let Some(head) = function_head(&tokens, index, &paren_open) {
+                        block.function_body = true;
+                        let in_config_call = frames
+                            .last()
+                            .is_some_and(|f| f.kind == FrameKind::Paren && f.config_scope)
+                            && !frames.iter().any(|f| {
+                                f.kind == FrameKind::Block && f.function_body && !f.config_body
+                            });
+                        block.config_body = in_config_call || exported_function(&tokens, head);
+                    }
+                    block
                 };
-                frames.push(frame);
+                frames.push(Frame {
+                    id: next_frame_id,
+                    open_index: index,
+                    ..frame
+                });
+                next_frame_id += 1;
             }
             Token::Punct('(') => {
                 let frame = if paren_keeps_config_scope(&tokens, index) {
-                    let mut frame = Frame::new(FrameKind::Paren, config_scope);
-                    frame.id = next_frame_id;
-                    next_frame_id += 1;
-                    frame
+                    Frame::new(FrameKind::Paren, config_scope)
                 } else {
                     Frame::new(FrameKind::Opaque, false)
                 };
-                frames.push(frame);
+                frames.push(Frame {
+                    id: next_frame_id,
+                    open_index: index,
+                    ..frame
+                });
+                next_frame_id += 1;
             }
             Token::Punct('[') => {
                 if tracked_member {
@@ -784,10 +910,16 @@ fn parse_vite_out_dir(source: &str) -> OutDir {
                         frame.has_members = true;
                     }
                 }
-                frames.push(Frame::new(FrameKind::Opaque, false));
+                frames.push(Frame {
+                    open_index: index,
+                    ..Frame::new(FrameKind::Opaque, false)
+                });
             }
             Token::Punct('}' | ')' | ']') => {
                 if let Some(mut frame) = frames.pop() {
+                    if matches!(token, Token::Punct(')')) {
+                        paren_open.insert(index, frame.open_index);
+                    }
                     // `({ mode }) =>` and `{ a } = x` destructure; they are
                     // patterns, not config branches.
                     if frame.kind == FrameKind::Object
@@ -865,6 +997,18 @@ fn parse_vite_out_dir(source: &str) -> OutDir {
                         }
                     }
                     _ => {}
+                }
+            }
+            Token::Word(word) if word == "return" => {
+                if let Some(frame) = frames.last_mut() {
+                    if frame.kind == FrameKind::Block {
+                        frame.returning = true;
+                    }
+                }
+            }
+            Token::Punct(';') => {
+                if let Some(frame) = frames.last_mut() {
+                    frame.returning = false;
                 }
             }
             _ => {}
@@ -1407,6 +1551,10 @@ mod tests {
             "export default defineConfig(({ command }) => command === 'build' ? {} : { build: { outDir: 'build' } })",
             "export default defineConfig(({ mode }) => mode === 'x' ? { build: { outDir: 'build' } } : { plugins: [react()] })",
             "export default defineConfig(({ mode }) => { if (mode === 'x') { return { server: { port: 1 } } } return { build: { outDir: 'build' } } })",
+            "export default defineConfig(({ mode }) => { if (mode === 'x') return {}; else return { build: { outDir: 'build' } } })",
+            "export default defineConfig(async ({ mode }) => { const env = loadEnv(mode, process.cwd()); return mode === 'x' ? {} : { build: { outDir: 'build' } } })",
+            "export default function ({ mode }) { if (mode === 'x') { return { plugins: [] } } return { build: { outDir: 'build' } } }",
+            "module.exports = (env) => { if (env.x) { return {} } return { build: { outDir: 'build' } } }",
         ] {
             assert!(
                 matches!(parse_vite_out_dir(config), OutDir::Unresolvable(_)),
@@ -1432,6 +1580,12 @@ mod tests {
             "const defaults = () => ({})\nexport default { build: { outDir: 'build' } }",
             "function defaults() { return {} }\nexport default { build: { outDir: 'build' } }",
             "export default defineConfig(({ mode }) => mergeConfig({ plugins: [] }, { build: { outDir: 'build' } }))",
+            // REGRESSION (Greptile on #1295): a helper's returns are not the
+            // config function's alternatives, wherever the helper is defined.
+            "export default defineConfig(() => { const base = () => { return {} }; return { build: { outDir: 'build' } } })",
+            "export default defineConfig(() => { function base() { return { plugins: [] } } return { build: { outDir: 'build' } } })",
+            "export default defineConfig(() => { const pick = (c) => c ? {} : { server: {} }; return { build: { outDir: 'build' } } })",
+            "function defaults() { return {} }\nexport default defineConfig(({ mode }) => mode === 'x' ? { build: { outDir: 'build' } } : { build: { outDir: 'build' } })",
             "const pkg = { name: 'app' }; export default { build: { outDir: 'build' } }",
             "function helper() { return { name: 'p', apply: 'build' } }\nexport default { build: { outDir: 'build' } }",
             "const shared = { plugins: [] }; export default { ...shared, build: { outDir: 'build' } }",
