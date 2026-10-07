@@ -1850,20 +1850,21 @@ mod global_page_first {
 
     /// Peak memory of a global page must follow the page, not the window.
     ///
-    /// 600k wide spans (120k traces) land in one project's current window. The
-    /// legacy shape cannot finish inside 128 MiB — the `LIMIT BY` and the
-    /// sort hold every deduped span, `attributes` and `events` included — while
-    /// the page-first read finishes well inside it, from the projection, reading
-    /// roughly one row per span in the window rather than the table.
+    /// 1.6M wide spans (320k traces) land in one project's current window. The
+    /// legacy shape cannot finish inside the memory budget the page-first read
+    /// runs under — the `LIMIT BY` and the sort hold every deduped span,
+    /// `attributes` and `events` included — while the page-first read peaks at a
+    /// fraction of that budget, from the projection, reading the window rather
+    /// than the table.
     #[tokio::test]
     async fn window_size_does_not_drive_query_memory() {
         let Some(h) = harness().await else { return };
-        // One trace in four starts inside the queried hour (600k spans); the
+        // One trace in three starts inside the queried hour (1.6M spans); the
         // rest start 70-120 minutes ago. They share every part, as they would
         // in a merged table, so no part or partition can be skipped on time
-        // alone — only a read ordered by start_time can avoid the other 1.8M.
-        const SPANS: u64 = 600_000;
-        const TABLE_SPANS: u64 = 2_400_000;
+        // alone — only a read ordered by start_time can avoid the other 3.2M.
+        const SPANS: u64 = 1_600_000;
+        const TABLE_SPANS: u64 = 4_800_000;
         h.probe
             .query(&format!(
                 "INSERT INTO spans (project_id, deployment_id, service_name, service_version, \
@@ -1874,17 +1875,19 @@ mod global_page_first {
                    lower(hex(sipHash128(t))), lower(hex(sipHash64(t, k))), \
                    if(k = 0, '', lower(hex(sipHash64(t, k - 1)))), \
                    concat('GET /route/', toString((t * 7 + k) % 200)), 'SERVER', \
-                   now64(3) - toIntervalSecond(if(t % 4 = 0, t % 1800, 4200 + t % 3000)), \
-                   now64(3) - toIntervalSecond(if(t % 4 = 0, t % 1800, 4200 + t % 3000)) \
+                   now64(3) - toIntervalSecond(if(t % 3 = 0, t % 1800, 4200 + t % 3000)), \
+                   now64(3) - toIntervalSecond(if(t % 3 = 0, t % 1800, 4200 + t % 3000)) \
                      + toIntervalMillisecond(10), \
                    toFloat64(sipHash64(t, k) % 5000) / 10 + k, \
                    if(sipHash64(t, k, 1) % 50 = 0, 'ERROR', 'OK'), '', \
                    concat('{{\"http.url\":\"https://example.test/route/', toString(t % 200), '&q=', \
-                          lower(hex(sipHash64(t, k, 2))), lower(hex(sipHash64(t, k, 4))), \
+                          lower(hex(sipHash64(t, k, 2))), \
+                          '\",\"http.body\":\"', repeat(lower(hex(sipHash64(t, k, 4))), 40), \
                           '\",\"http.user_agent\":\"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36\",\
                           \"db.statement\":\"SELECT * FROM orders WHERE id = ', toString(t), '\"}}'), \
                    concat('[{{\"name\":\"log\",\"attributes\":{{\"message\":\"processed ', \
-                          lower(hex(sipHash64(t, k, 3))), lower(hex(sipHash64(t, k, 5))), '\"}}}}]'), \
+                          lower(hex(sipHash64(t, k, 3))), \
+                          repeat(lower(hex(sipHash64(t, k, 5))), 30), '\"}}}}]'), \
                    toUInt64(toUnixTimestamp64Milli(now64())) \
                  FROM (SELECT intDiv(number, 5) AS t, number % 5 AS k FROM numbers({TABLE_SPANS}))"
             ))
@@ -1925,7 +1928,8 @@ mod global_page_first {
                 query.memory_usage >> 20
             );
             assert!(
-                query.memory_usage < 96 << 20,
+                query.memory_usage
+                    < temps_otel::storage::global_traces::LOCAL_READ_MEMORY_BUDGET_BYTES / 2,
                 "peak memory must not follow the window: {query:?}"
             );
             assert!(
@@ -1938,16 +1942,39 @@ mod global_page_first {
             );
         }
 
-        // Under the same cap the single-stage shape does not finish.
+        // The same budget decides both shapes. The page-first statements peaked
+        // far below it (asserted above); the single-stage query needs more than
+        // it, so under that cap it does not finish.
+        let budget = temps_otel::storage::global_traces::LOCAL_READ_MEMORY_BUDGET_BYTES;
         let from = q.scopes[0].from.timestamp_millis();
         let to = q.scopes[0].to.timestamp_millis();
-        let legacy = h
-            .probe
-            .query(&legacy_single_stage_page(BULK, from, to))
-            .with_setting("max_memory_usage", (128u64 << 20).to_string())
-            .fetch_all::<temps_otel::storage::global_traces::GlobalTraceRow>()
-            .await;
-        let error = legacy.expect_err("the legacy shape must exceed 128 MiB on this window");
+        let legacy_sql = legacy_single_stage_page(BULK, from, to);
+        let run_legacy = |cap: u64| {
+            h.probe
+                .query(&legacy_sql)
+                .with_setting("max_memory_usage", cap.to_string())
+                .fetch_all::<temps_otel::storage::global_traces::GlobalTraceRow>()
+        };
+        // Given room, it does finish — so the failure above is the budget, not a
+        // broken query — and what it needed is what the new read avoids.
+        run_legacy(budget * 16)
+            .await
+            .expect("the legacy shape succeeds when the memory cap is lifted");
+        let legacy_peak = logged(&h, BULK)
+            .await
+            .into_iter()
+            .map(|l| l.memory_usage)
+            .max()
+            .unwrap_or_default();
+        println!("legacy peak with the cap lifted: {} MiB", legacy_peak >> 20);
+        assert!(
+            legacy_peak > budget,
+            "legacy peaked at {legacy_peak} bytes, which fits the {budget}-byte budget"
+        );
+
+        let error = run_legacy(budget)
+            .await
+            .expect_err("the legacy shape must not fit the budget the new read runs under");
         assert!(
             error.to_string().contains("MEMORY_LIMIT_EXCEEDED"),
             "unexpected failure: {error}"

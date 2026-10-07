@@ -99,7 +99,7 @@ use std::time::Duration;
 /// Hard per-query memory ceiling for every statement on this path. Sized for a
 /// 4 GiB host that also runs the rest of the stack; the page and the total run
 /// concurrently, so a request stays under twice this.
-pub(super) const MAX_MEMORY_BYTES: u64 = 512 << 20;
+pub const MAX_MEMORY_BYTES: u64 = 512 << 20;
 /// Aggregation / sort state beyond this spills to disk instead of growing.
 /// Measured on 6M traces: 128 MiB gives the lowest peak (~136 MiB) at the same
 /// speed as 256 MiB (~306 MiB); smaller values spill more for no gain.

@@ -18,6 +18,11 @@ use utoipa::ToSchema;
 
 mod local_clickhouse;
 
+/// The hard per-statement memory cap every local ClickHouse global trace read
+/// runs under. Public so a regression test can hold the old query shape to the
+/// very same budget.
+pub use local_clickhouse::MAX_MEMORY_BYTES as LOCAL_READ_MEMORY_BUDGET_BYTES;
+
 /// Attribute key -> facet slot (1..=20), as cached by `FacetService`.
 pub type Facets = std::collections::HashMap<String, u8>;
 
