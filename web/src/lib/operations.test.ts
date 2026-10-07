@@ -1,10 +1,15 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import type { OperationEntry } from '@/api/client/types.gen'
+import type {
+  OperationEntry,
+  OperationsListResponse,
+} from '@/api/client/types.gen'
 import { QueryClient } from '@tanstack/react-query'
 import { describe, expect, test } from 'bun:test'
 import {
+  FINISHED_OPERATIONS_QUERY,
+  flattenOperationPages,
   formatRelativeShort,
   groupOperations,
   invalidateOperations,
@@ -13,10 +18,14 @@ import {
   OPERATIONS_OPEN_POLL_MS,
   operationContext,
   operationsBadgeText,
+  operationsLeftRunning,
+  operationsNextPage,
   operationsPollInterval,
+  operationsTrayFeed,
   operationStatusVariant,
   operationsTriggerLabel,
   operationTimestamp,
+  RUNNING_OPERATIONS_QUERY,
 } from './operations'
 
 function entry(overrides: Partial<OperationEntry> = {}): OperationEntry {
@@ -169,5 +178,155 @@ describe('invalidateOperations', () => {
 
     expect(queryClient.getQueryState(operationsKey)?.isInvalidated).toBe(true)
     expect(queryClient.getQueryState(otherKey)?.isInvalidated).toBe(false)
+  })
+})
+
+function page(
+  operations: OperationEntry[],
+  overrides: Partial<OperationsListResponse> = {}
+): OperationsListResponse {
+  return {
+    operations,
+    page: 1,
+    page_size: 20,
+    running_count: 0,
+    total: operations.length,
+    ...overrides,
+  }
+}
+
+describe('tray queries', () => {
+  test('running work is fetched apart from history, at the API maximum', () => {
+    expect(RUNNING_OPERATIONS_QUERY).toEqual({
+      status: 'running',
+      page_size: 100,
+    })
+    expect(FINISHED_OPERATIONS_QUERY).toEqual({
+      status: 'finished',
+      page_size: 20,
+    })
+  })
+})
+
+describe('operationsNextPage', () => {
+  test('asks for the next page while rows remain on the server', () => {
+    expect(
+      operationsNextPage(page([entry()], { page: 1, page_size: 20, total: 45 }))
+    ).toBe(2)
+    expect(
+      operationsNextPage(page([entry()], { page: 2, page_size: 20, total: 45 }))
+    ).toBe(3)
+  })
+
+  test('stops once every row is loaded', () => {
+    expect(
+      operationsNextPage(page([entry()], { page: 3, page_size: 20, total: 45 }))
+    ).toBeUndefined()
+    expect(
+      operationsNextPage(page([entry()], { page: 1, page_size: 20, total: 20 }))
+    ).toBeUndefined()
+  })
+
+  test('stops on an empty page even if the total says otherwise', () => {
+    expect(
+      operationsNextPage(page([], { page: 2, page_size: 20, total: 45 }))
+    ).toBeUndefined()
+  })
+})
+
+describe('flattenOperationPages', () => {
+  test('concatenates pages in order and drops repeated ids', () => {
+    const a = entry({ id: 'deployment:3' })
+    const b = entry({ id: 'deployment:2' })
+    const c = entry({ id: 'deployment:1' })
+    // `b` shifted onto page 2 after a new operation arrived.
+    const rows = flattenOperationPages([page([a, b]), page([b, c])])
+    expect(rows.map((op) => op.id)).toEqual([
+      'deployment:3',
+      'deployment:2',
+      'deployment:1',
+    ])
+  })
+
+  test('skips excluded ids and tolerates no data', () => {
+    const rows = flattenOperationPages(
+      [page([entry({ id: 'a' }), entry({ id: 'b' })])],
+      new Set(['a'])
+    )
+    expect(rows.map((op) => op.id)).toEqual(['b'])
+    expect(flattenOperationPages(undefined)).toEqual([])
+  })
+})
+
+describe('operationsTrayFeed', () => {
+  test('badge count and running rows come from the running feed', () => {
+    const restore = entry({
+      id: 'restore:7',
+      kind: 'restore',
+      created_at: '2026-10-01T00:00:00Z',
+    })
+    const finished = Array.from({ length: 20 }, (_, index) =>
+      entry({ id: `deployment:${index}`, status: 'succeeded' })
+    )
+    const feed = operationsTrayFeed({
+      runningPages: [page([restore], { running_count: 1, page_size: 100 })],
+      finishedPages: [page(finished, { running_count: 1, total: 60 })],
+    })
+    expect(feed.runningCount).toBe(1)
+    expect(feed.running.map((op) => op.id)).toEqual(['restore:7'])
+    expect(feed.recent).toHaveLength(20)
+    expect(feed.runningNotLoaded).toBe(0)
+  })
+
+  test('reports counted running work that is not loaded yet', () => {
+    const feed = operationsTrayFeed({
+      runningPages: [
+        page([entry({ id: 'a' }), entry({ id: 'b' })], {
+          running_count: 5,
+          total: 5,
+          page_size: 2,
+        }),
+      ],
+      finishedPages: undefined,
+    })
+    expect(feed.runningCount).toBe(5)
+    expect(feed.runningNotLoaded).toBe(3)
+  })
+
+  test('a row in both feeds is shown once, under running', () => {
+    const feed = operationsTrayFeed({
+      runningPages: [page([entry({ id: 'x' })], { running_count: 1 })],
+      finishedPages: [
+        page([entry({ id: 'x', status: 'succeeded' }), entry({ id: 'y' })]),
+      ],
+    })
+    expect(feed.running.map((op) => op.id)).toEqual(['x'])
+    expect(feed.recent.map((op) => op.id)).toEqual(['y'])
+  })
+
+  test('nothing loaded yet means nothing counted', () => {
+    const feed = operationsTrayFeed({
+      runningPages: undefined,
+      finishedPages: undefined,
+    })
+    expect(feed).toEqual({
+      running: [],
+      recent: [],
+      runningCount: 0,
+      runningNotLoaded: 0,
+    })
+  })
+})
+
+describe('operationsLeftRunning', () => {
+  test('detects an operation dropping out of the running feed', () => {
+    expect(operationsLeftRunning(['a', 'b'], ['b'])).toBe(true)
+    expect(operationsLeftRunning(['a'], ['c'])).toBe(true)
+  })
+
+  test('ignores additions, no change, and the first response', () => {
+    expect(operationsLeftRunning(['a'], ['a', 'b'])).toBe(false)
+    expect(operationsLeftRunning(['a', 'b'], ['b', 'a'])).toBe(false)
+    expect(operationsLeftRunning([], ['a'])).toBe(false)
   })
 })

@@ -11,6 +11,7 @@ import type {
   OperationEntry,
   OperationKind,
   OperationStatus,
+  OperationsListResponse,
 } from '@/api/client/types.gen'
 import type { QueryClient } from '@tanstack/react-query'
 import {
@@ -27,8 +28,30 @@ import {
 /** The generated query id for `GET /operations` (`listOperationsQueryKey`). */
 export const OPERATIONS_QUERY_ID = 'listOperations'
 
-/** Rows shown in the tray. The API's default page size. */
-export const OPERATIONS_TRAY_PAGE_SIZE = 20
+/**
+ * Page size for in-flight work. The API maximum, so a single request almost
+ * always holds every counted operation; further pages are fetched on demand.
+ */
+export const OPERATIONS_RUNNING_PAGE_SIZE = 100
+
+/** Page size for finished history. The API's default page size. */
+export const OPERATIONS_HISTORY_PAGE_SIZE = 20
+
+/**
+ * Query for the tray's "Running" section. Fetched separately from history so
+ * an old in-flight operation can never be pushed off the list by newer
+ * finished ones: every operation the badge counts is in this result set.
+ */
+export const RUNNING_OPERATIONS_QUERY = {
+  status: 'running',
+  page_size: OPERATIONS_RUNNING_PAGE_SIZE,
+} as const
+
+/** Query for the tray's "Recent" (finished) section. */
+export const FINISHED_OPERATIONS_QUERY = {
+  status: 'finished',
+  page_size: OPERATIONS_HISTORY_PAGE_SIZE,
+} as const
 
 /** Poll interval while the tray is open. */
 export const OPERATIONS_OPEN_POLL_MS = 5_000
@@ -169,6 +192,92 @@ export function formatRelativeShort(iso: string, now: number): string {
   if (hours < 24) return `${hours}h ago`
   const days = Math.round(hours / 24)
   return `${days}d ago`
+}
+
+/**
+ * `getNextPageParam` for the feed: the next 1-based page, or `undefined` once
+ * every operation matching the query has been loaded.
+ */
+export function operationsNextPage(
+  lastPage: OperationsListResponse
+): number | undefined {
+  if (lastPage.operations.length === 0) return undefined
+  const loadedThrough = lastPage.page * lastPage.page_size
+  return loadedThrough < lastPage.total ? lastPage.page + 1 : undefined
+}
+
+/**
+ * Concatenate feed pages newest-first, dropping repeated ids (offset paging
+ * can repeat a row when new operations arrive between page fetches) and any
+ * id in `exclude`.
+ */
+export function flattenOperationPages(
+  pages: readonly OperationsListResponse[] | undefined,
+  exclude?: ReadonlySet<string>
+): OperationEntry[] {
+  const seen = new Set<string>(exclude)
+  const result: OperationEntry[] = []
+  for (const page of pages ?? []) {
+    for (const operation of page.operations) {
+      if (seen.has(operation.id)) continue
+      seen.add(operation.id)
+      result.push(operation)
+    }
+  }
+  return result
+}
+
+export interface OperationsTrayFeed {
+  /** Every loaded in-flight operation, newest first. */
+  running: OperationEntry[]
+  /** Loaded finished operations, newest first, never repeating a running row. */
+  recent: OperationEntry[]
+  /** Server-side in-flight count. Drives the badge. */
+  runningCount: number
+  /** In-flight operations the badge counts that are not loaded as rows yet. */
+  runningNotLoaded: number
+}
+
+/**
+ * Derive the tray's sections from the running and finished feeds. The badge
+ * count and the running rows come from the same (`status=running`) response,
+ * so a counted operation is always either a row or covered by
+ * `runningNotLoaded`, which the tray offers to load.
+ */
+export function operationsTrayFeed({
+  runningPages,
+  finishedPages,
+}: {
+  runningPages: readonly OperationsListResponse[] | undefined
+  finishedPages: readonly OperationsListResponse[] | undefined
+}): OperationsTrayFeed {
+  const running = flattenOperationPages(runningPages)
+  // A row that just finished may briefly appear in both feeds; show it once,
+  // where the badge counts it, until the next poll moves it.
+  const recent = flattenOperationPages(
+    finishedPages,
+    new Set(running.map((operation) => operation.id))
+  )
+  const runningCount = runningPages?.[0]?.running_count ?? 0
+  return {
+    running,
+    recent,
+    runningCount,
+    runningNotLoaded: Math.max(0, runningCount - running.length),
+  }
+}
+
+/**
+ * Whether any operation in `previousIds` is missing from `currentIds`, i.e.
+ * something finished (or was cancelled) between two running-feed responses.
+ */
+export function operationsLeftRunning(
+  previousIds: readonly string[],
+  currentIds: readonly string[]
+): boolean {
+  if (previousIds.length === 0) return false
+  const current = new Set(currentIds)
+  return previousIds.some((id) => !current.has(id))
 }
 
 export interface OperationGroups {

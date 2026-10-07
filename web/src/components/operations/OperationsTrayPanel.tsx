@@ -13,7 +13,6 @@ import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   formatRelativeShort,
-  groupOperations,
   LOCAL_OPERATION_ICON,
   OPERATION_KIND_ICON,
   OPERATION_KIND_LABEL,
@@ -30,14 +29,31 @@ import type { LocalOperation } from './operations-tray-store'
 export const OPERATIONS_EMPTY_MESSAGE =
   'Nothing running. Deployments, rollbacks, restores, backups and autofix runs you start appear here.'
 
-export interface OperationsTrayPanelProps {
+/** One independently fetched, independently paged section of the tray. */
+export interface OperationsSectionState {
   operations: readonly OperationEntry[]
-  localOperations: readonly LocalOperation[]
-  runningCount: number
   isPending: boolean
   isError: boolean
   errorMessage?: string | null
   onRetry: () => void
+  /** More pages exist on the server. */
+  hasMore: boolean
+  isFetchingMore: boolean
+  onLoadMore: () => void
+}
+
+export interface RunningSectionState extends OperationsSectionState {
+  /** Counted in-flight operations not loaded as rows yet. */
+  notLoaded: number
+}
+
+export interface OperationsTrayPanelProps {
+  /** In-flight work (`status=running`); the badge counts exactly these. */
+  running: RunningSectionState
+  /** Finished history (`status=finished`), newest first. */
+  recent: OperationsSectionState
+  localOperations: readonly LocalOperation[]
+  runningCount: number
   /** Called when a row is followed, so the popover can close. */
   onNavigate: () => void
   /** Epoch milliseconds used for relative times. */
@@ -45,13 +61,10 @@ export interface OperationsTrayPanelProps {
 }
 
 export function OperationsTrayPanel({
-  operations,
+  running,
+  recent,
   localOperations,
   runningCount,
-  isPending,
-  isError,
-  errorMessage,
-  onRetry,
   onNavigate,
   now,
 }: OperationsTrayPanelProps) {
@@ -78,12 +91,9 @@ export function OperationsTrayPanel({
           </ul>
         )}
         <OperationsTrayBody
-          operations={operations}
+          running={running}
+          recent={recent}
           hasLocal={localOperations.length > 0}
-          isPending={isPending}
-          isError={isError}
-          errorMessage={errorMessage}
-          onRetry={onRetry}
           onNavigate={onNavigate}
           now={now}
         />
@@ -93,45 +103,54 @@ export function OperationsTrayPanel({
 }
 
 function OperationsTrayBody({
-  operations,
+  running,
+  recent,
   hasLocal,
-  isPending,
-  isError,
-  errorMessage,
-  onRetry,
   onNavigate,
   now,
 }: {
-  operations: readonly OperationEntry[]
+  running: RunningSectionState
+  recent: OperationsSectionState
   hasLocal: boolean
-  isPending: boolean
-  isError: boolean
-  errorMessage?: string | null
-  onRetry: () => void
   onNavigate: () => void
   now: number
 }) {
-  if (isPending) return <OperationsTraySkeleton />
-  if (isError) {
-    return <OperationsTrayError message={errorMessage} onRetry={onRetry} />
+  if (running.isPending && recent.isPending) return <OperationsTraySkeleton />
+  if (running.isError && recent.isError) {
+    return (
+      <OperationsTrayError
+        title="Couldn't load operations"
+        message={running.errorMessage ?? recent.errorMessage}
+        onRetry={() => {
+          running.onRetry()
+          recent.onRetry()
+        }}
+      />
+    )
   }
-  if (operations.length === 0) {
-    return hasLocal ? null : <OperationsTrayEmpty />
-  }
-  const { active, finished } = groupOperations(operations)
+  const settledEmpty =
+    !running.isPending &&
+    !recent.isPending &&
+    !running.isError &&
+    !recent.isError &&
+    running.operations.length === 0 &&
+    recent.operations.length === 0
+  if (settledEmpty) return hasLocal ? null : <OperationsTrayEmpty />
   return (
     <>
-      <OperationGroup
-        label="In progress"
-        showLabel={finished.length > 0}
-        operations={active}
+      <OperationSection
+        label="Running"
+        errorTitle="Couldn't load running operations"
+        loadMoreLabel={runningLoadMoreLabel(running.notLoaded)}
+        state={running}
         onNavigate={onNavigate}
         now={now}
       />
-      <OperationGroup
+      <OperationSection
         label="Recent"
-        showLabel={active.length > 0}
-        operations={finished}
+        errorTitle="Couldn't load recent operations"
+        loadMoreLabel="Load older operations"
+        state={recent}
         onNavigate={onNavigate}
         now={now}
       />
@@ -139,29 +158,45 @@ function OperationsTrayBody({
   )
 }
 
-function OperationGroup({
+function runningLoadMoreLabel(notLoaded: number): string {
+  return notLoaded > 0 ? `Show ${notLoaded} more running` : 'Show more running'
+}
+
+function OperationSection({
   label,
-  showLabel,
-  operations,
+  errorTitle,
+  loadMoreLabel,
+  state,
   onNavigate,
   now,
 }: {
   label: string
-  showLabel: boolean
-  operations: readonly OperationEntry[]
+  errorTitle: string
+  loadMoreLabel: string
+  state: OperationsSectionState
   onNavigate: () => void
   now: number
 }) {
-  if (operations.length === 0) return null
+  if (state.isPending) {
+    return <OperationsTraySkeleton rows={1} label={`Loading ${label}`} />
+  }
+  if (state.isError) {
+    return (
+      <OperationsTrayError
+        title={errorTitle}
+        message={state.errorMessage}
+        onRetry={state.onRetry}
+      />
+    )
+  }
+  if (state.operations.length === 0) return null
   return (
-    <section aria-label={label}>
-      {showLabel && (
-        <p className="px-3 pb-1 pt-2.5 text-xs font-medium text-muted-foreground">
-          {label}
-        </p>
-      )}
+    <section aria-label={label} className="border-b last:border-b-0">
+      <p className="px-3 pb-1 pt-2.5 text-xs font-medium text-muted-foreground">
+        {label}
+      </p>
       <ul role="list" className="divide-y divide-border">
-        {operations.map((operation) => (
+        {state.operations.map((operation) => (
           <li key={operation.id}>
             <OperationRow
               operation={operation}
@@ -171,6 +206,19 @@ function OperationGroup({
           </li>
         ))}
       </ul>
+      {state.hasMore && (
+        <div className="border-t px-3 py-2">
+          <Button
+            variant="ghost"
+            size="sm"
+            className="w-full"
+            disabled={state.isFetchingMore}
+            onClick={state.onLoadMore}
+          >
+            {state.isFetchingMore ? 'Loading…' : loadMoreLabel}
+          </Button>
+        </div>
+      )}
     </section>
   )
 }
@@ -295,10 +343,17 @@ function LocalOperationRow({
   )
 }
 
-export function OperationsTraySkeleton() {
+export function OperationsTraySkeleton({
+  rows = 3,
+  label = 'Loading operations',
+}: {
+  rows?: number
+  label?: string
+}) {
+  const indexes = Array.from({ length: rows }, (_, index) => index)
   return (
-    <div aria-busy="true" aria-label="Loading operations">
-      {[0, 1, 2].map((index) => (
+    <div aria-busy="true" aria-label={label}>
+      {indexes.map((index) => (
         <div
           key={index}
           className={cn(
@@ -321,16 +376,18 @@ export function OperationsTraySkeleton() {
 }
 
 function OperationsTrayError({
+  title,
   message,
   onRetry,
 }: {
+  title: string
   message?: string | null
   onRetry: () => void
 }) {
   return (
     <div className="flex flex-col items-center gap-2 px-3 py-6 text-center">
       <AlertCircle className="size-4 text-destructive" aria-hidden="true" />
-      <p className="text-sm font-medium">Couldn&apos;t load operations</p>
+      <p className="text-sm font-medium">{title}</p>
       {message && (
         <p className="line-clamp-3 text-xs text-muted-foreground">{message}</p>
       )}
