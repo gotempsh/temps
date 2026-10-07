@@ -132,6 +132,39 @@ export function lastSuccessfulDeployment(
   return best
 }
 
+/** Page size used when searching history for a rollback target (API max). */
+export const ROLLBACK_SEARCH_PAGE_SIZE = 100
+/**
+ * Upper bound on pages read while searching (2,000 deployments). Keeps a
+ * project with a very long run of failures from fanning out unbounded
+ * requests; beyond it the button is simply not offered.
+ */
+export const ROLLBACK_SEARCH_MAX_PAGES = 20
+
+/**
+ * Pages back through an environment's deployment history (newest first) until
+ * it finds the newest deployment that is older than `failed` and can be
+ * rolled back to. Looking at only the first page would miss the target when
+ * the failure is old, or after a long run of failed attempts.
+ */
+export async function findLastSuccessfulDeployment(
+  fetchPage: (page: number, perPage: number) => Promise<DeploymentResponse[]>,
+  failed: Pick<DeploymentResponse, 'id' | 'environment_id' | 'created_at'>,
+  {
+    perPage = ROLLBACK_SEARCH_PAGE_SIZE,
+    maxPages = ROLLBACK_SEARCH_MAX_PAGES,
+  }: { perPage?: number; maxPages?: number } = {}
+): Promise<DeploymentResponse | null> {
+  for (let page = 1; page <= maxPages; page++) {
+    const deployments = await fetchPage(page, perPage)
+    // Pages are newest first, so the first page with a match holds the newest.
+    const target = lastSuccessfulDeployment(deployments, failed)
+    if (target) return target
+    if (deployments.length < perPage) return null
+  }
+  return null
+}
+
 function capitalize(value: string): string {
   return value.charAt(0).toUpperCase() + value.slice(1)
 }

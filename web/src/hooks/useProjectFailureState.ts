@@ -4,7 +4,6 @@
 import type { DeploymentResponse } from '@/api/client'
 import {
   getEnvironmentsOptions,
-  getProjectDeploymentsOptions,
   listContainersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import {
@@ -14,8 +13,8 @@ import {
 import {
   containerHealthIssues,
   healthEnvironment,
-  lastSuccessfulDeployment,
 } from '@/lib/project-failure-state'
+import { useLastSuccessfulDeployment } from '@/hooks/useLastSuccessfulDeployment'
 import { useQuery } from '@tanstack/react-query'
 import { useMemo } from 'react'
 
@@ -62,22 +61,8 @@ export function useProjectFailureState(
   const failedDeployment =
     lastDeployment?.status === 'failed' ? lastDeployment : undefined
 
-  const deploymentsQuery = useQuery({
-    ...getProjectDeploymentsOptions({
-      path: { id: projectId },
-      query: {
-        environment_id: failedDeployment?.environment_id,
-        per_page: 50,
-      },
-    }),
-    enabled: !!failedDeployment,
-  })
-  const rollbackTarget = failedDeployment
-    ? lastSuccessfulDeployment(
-        deploymentsQuery.data?.deployments,
-        failedDeployment
-      )
-    : undefined
+  const rollbackTargetQuery = useLastSuccessfulDeployment(failedDeployment)
+  const rollbackTarget = rollbackTargetQuery.data ?? undefined
 
   const status: ProjectDeploymentStatus | undefined = projectDeploymentStatus(
     environmentsQuery.data,
@@ -93,6 +78,6 @@ export function useProjectFailureState(
     containerIssues,
     failedDeployment,
     rollbackTarget,
-    rollbackTargetLoading: !!failedDeployment && deploymentsQuery.isPending,
+    rollbackTargetLoading: !!failedDeployment && rollbackTargetQuery.isPending,
   }
 }

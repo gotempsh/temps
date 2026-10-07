@@ -2,13 +2,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type { DeploymentResponse } from '@/api/client'
-import { getProjectDeploymentsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { RecoveryActionDialog } from '@/components/monitoring/RecoveryActionDialog'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
-import { lastSuccessfulDeployment } from '@/lib/project-failure-state'
+import { useLastSuccessfulDeployment } from '@/hooks/useLastSuccessfulDeployment'
 import type { RecoveryAction } from '@/lib/recovery-actions'
-import { useQuery } from '@tanstack/react-query'
 import { RotateCcw } from 'lucide-react'
 import { useState } from 'react'
 import { useNavigate } from 'react-router'
@@ -30,20 +28,12 @@ export function RollbackToLastSuccessful({
   const [pendingAction, setPendingAction] = useState<RecoveryAction | null>(
     null
   )
-  const deploymentsQuery = useQuery({
-    ...getProjectDeploymentsOptions({
-      path: { id: deployment.project_id },
-      query: { environment_id: deployment.environment_id, per_page: 50 },
-    }),
-  })
-  const target = lastSuccessfulDeployment(
-    deploymentsQuery.data?.deployments,
-    deployment
-  )
+  const targetQuery = useLastSuccessfulDeployment(deployment)
+  const target = targetQuery.data
 
   return (
     <>
-      {deploymentsQuery.isPending ? (
+      {targetQuery.isPending ? (
         <Skeleton className="h-7 w-56" />
       ) : target ? (
         <Button

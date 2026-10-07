@@ -9,6 +9,7 @@ import type {
 } from '@/api/client'
 import {
   containerHealthIssues,
+  findLastSuccessfulDeployment,
   healthEnvironment,
   lastSuccessfulDeployment,
   RECENT_RESTART_WINDOW_MS,
@@ -219,5 +220,75 @@ describe('lastSuccessfulDeployment', () => {
   test('returns nothing when the environment never succeeded', () => {
     expect(lastSuccessfulDeployment([failed], failed)).toBe(undefined)
     expect(lastSuccessfulDeployment(undefined, failed)).toBe(undefined)
+  })
+})
+
+describe('findLastSuccessfulDeployment', () => {
+  // Newest-first history, paged like the API: ids 300 down to 1.
+  function history(statusOf: (id: number) => string) {
+    const all = Array.from({ length: 300 }, (_, i) => 300 - i).map((id) =>
+      deployment(id, statusOf(id))
+    )
+    const pages: number[] = []
+    const fetchPage = async (page: number, perPage: number) => {
+      pages.push(page)
+      return all.slice((page - 1) * perPage, page * perPage)
+    }
+    return { all, pages, fetchPage }
+  }
+
+  test('reads past a page of newer deployments to find an older target', async () => {
+    // The failure is old: every deployment on the first page is newer.
+    const { all, pages, fetchPage } = history((id) =>
+      id === 40 ? 'completed' : 'failed'
+    )
+    const failed = all.find((d) => d.id === 120)!
+    const target = await findLastSuccessfulDeployment(fetchPage, failed, {
+      perPage: 50,
+    })
+    expect(target?.id).toBe(40)
+    expect(pages).toEqual([1, 2, 3, 4, 5, 6])
+  })
+
+  test('finds the target after a long run of failed attempts', async () => {
+    const { all, fetchPage } = history((id) =>
+      id === 10 ? 'completed' : 'failed'
+    )
+    const target = await findLastSuccessfulDeployment(fetchPage, all[0], {
+      perPage: 100,
+    })
+    expect(target?.id).toBe(10)
+  })
+
+  test('stops at the first page that has a target', async () => {
+    const { all, pages, fetchPage } = history(() => 'completed')
+    const target = await findLastSuccessfulDeployment(fetchPage, all[0], {
+      perPage: 100,
+    })
+    expect(target?.id).toBe(299)
+    expect(pages).toEqual([1])
+  })
+
+  test('returns null when history runs out or the page cap is reached', async () => {
+    const exhausted = history(() => 'failed')
+    expect(
+      await findLastSuccessfulDeployment(
+        exhausted.fetchPage,
+        exhausted.all[0],
+        {
+          perPage: 100,
+        }
+      )
+    ).toBeNull()
+    expect(exhausted.pages).toEqual([1, 2, 3, 4])
+
+    const capped = history((id) => (id === 1 ? 'completed' : 'failed'))
+    expect(
+      await findLastSuccessfulDeployment(capped.fetchPage, capped.all[0], {
+        perPage: 50,
+        maxPages: 2,
+      })
+    ).toBeNull()
+    expect(capped.pages).toEqual([1, 2])
   })
 })
