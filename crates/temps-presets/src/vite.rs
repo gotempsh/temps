@@ -698,6 +698,31 @@ fn paren_keeps_config_scope(tokens: &[Token], index: usize) -> bool {
     }
 }
 
+/// Keywords that cannot end an expression: each needs an operand after it
+/// (`typeof x`, `await p`, `a instanceof B`, `export default x`), so a line
+/// break right after one never ends the statement.
+const NEEDS_OPERAND: &[&str] = &[
+    "typeof",
+    "void",
+    "await",
+    "new",
+    "delete",
+    "yield",
+    "in",
+    "instanceof",
+    "of",
+    "as",
+    "satisfies",
+    "keyof",
+    "extends",
+    "case",
+    "default",
+    "export",
+    "throw",
+    "else",
+    "do",
+];
+
 /// Keywords whose `( ... ) {` opens a control-flow block, not a function body.
 const CONTROL_KEYWORDS: &[&str] = &["if", "while", "for", "switch", "catch", "with"];
 
@@ -877,7 +902,7 @@ fn parse_vite_out_dir(source: &str) -> OutDir {
                     | Some(Token::Str(_))
                     | Some(Token::Template)
                     | Some(Token::Punct(')' | ']' | '}'))
-            ) && !matches!(prev, Some(Token::Word(w)) if w == "default" || w == "export");
+            ) && !matches!(prev, Some(Token::Word(w)) if NEEDS_OPERAND.contains(&w.as_str()));
             let starts_statement = matches!(
                 token,
                 Token::Word(_) | Token::Str(_) | Token::Template
@@ -1659,6 +1684,11 @@ mod tests {
             // A ternary split over lines (Prettier's style) is one statement.
             "export default process.env.CI\n  ? {}\n  : { build: { outDir: 'build' } }",
             "module.exports =\n  process.env.CI\n    ? { plugins: [] }\n    : { build: { outDir: 'build' } }",
+            // REGRESSION (Greptile on #1295): a unary keyword needs an operand,
+            // so a line break after it continues the exported expression.
+            "export default typeof\n  window === 'undefined' ? {} : { build: { outDir: 'build' } }",
+            "export default await\n  isCi() ? {} : { build: { outDir: 'build' } }",
+            "export default void 0, typeof\n  process === 'object' ? { plugins: [] } : { build: { outDir: 'build' } }",
             "export default process.env.CI ? defineConfig({}) : defineConfig({ build: { outDir: 'build' } })",
         ] {
             assert!(
