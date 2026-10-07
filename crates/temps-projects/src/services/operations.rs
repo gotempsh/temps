@@ -9,8 +9,8 @@
 //! | Kind | Source table | Notes |
 //! |---|---|---|
 //! | `deployment` / `rollback` / `promotion` | `deployments` | A redeploy is indistinguishable from a deployment: no column records it, so it is reported as `deployment`. |
-//! | `restore` | `restore_runs` | Scoped through the source service's `project_services` links. |
-//! | `backup` | `backups` (+ `external_service_backups`) | Control-plane backups have no service link and are visible to instance administrators only. |
+//! | `restore` | `restore_runs` | Scoped through the restored service's `project_services` links, every producer of the source backup, and any distinct clone target. Restores of ownerless (control-plane) backups are visible to instance administrators only. |
+//! | `backup` | `backups` (+ `external_service_backups`) | Scoped through every producer service. Control-plane backups have no service link and are visible to instance administrators only. |
 //! | `autofix` | `agent_runs` where `trigger_type = 'autofixer'` | |
 //!
 //! The four sources are merged with a single `UNION ALL` statement so the
@@ -648,15 +648,23 @@ impl ProjectFilters<'_> {
         conditions
     }
 
-    /// Conditions for a row scoped through a storage service's project links.
+    /// Conditions for a row scoped through a storage service's project links:
+    /// the caller's visibility scope plus the optional `project_id` filter.
     fn via_service(&self, service_column: &str) -> Vec<String> {
-        let linked = |extra: &str| {
-            format!(
-                "EXISTS (SELECT 1 FROM project_services ps \
-                 JOIN projects lp ON lp.id = ps.project_id AND lp.is_deleted = false \
-                 WHERE ps.service_id = {service_column}{extra})"
-            )
-        };
+        let mut conditions = self.service_visible(service_column);
+        if let Some(project) = self.filter_project {
+            conditions.push(linked_service_sql(
+                service_column,
+                &format!(" AND ps.project_id = {project}"),
+            ));
+        }
+        conditions
+    }
+
+    /// Conditions under which the caller's scope may see a storage service.
+    /// Empty for instance administrators (every service, linked or not).
+    fn service_visible(&self, service_column: &str) -> Vec<String> {
+        let linked = |extra: &str| linked_service_sql(service_column, extra);
         let mut conditions = Vec::new();
         match self.scope {
             OperationsScope::Instance => {}
@@ -679,11 +687,57 @@ impl ProjectFilters<'_> {
                 }
             }
         }
-        if let Some(project) = self.filter_project {
-            conditions.push(linked(&format!(" AND ps.project_id = {project}")));
+        conditions
+    }
+
+    /// Conditions requiring that the caller may see *every* service that
+    /// produced the backup in `backup_column`, mirroring the authorization of
+    /// `GET /restore-runs/{id}`. A backup with no producer service (a
+    /// control-plane backup, or a raw-location restore whose backup id has no
+    /// producer link) is administrator-only, so for any non-instance scope it
+    /// must have at least one producer, and none of its producers may fall
+    /// outside the scope. Empty for instance administrators.
+    fn all_producers_visible(&self, backup_column: &str) -> Vec<String> {
+        if matches!(self.scope, OperationsScope::Instance) {
+            return Vec::new();
+        }
+        let mut conditions = vec![format!(
+            "EXISTS (SELECT 1 FROM external_service_backups pb WHERE pb.backup_id = {backup_column})"
+        )];
+        let producer_visible = self.service_visible("pb.service_id");
+        if !producer_visible.is_empty() {
+            conditions.push(format!(
+                "NOT EXISTS (SELECT 1 FROM external_service_backups pb \
+                 WHERE pb.backup_id = {backup_column} AND NOT ({}))",
+                producer_visible.join(" AND ")
+            ));
         }
         conditions
     }
+
+    /// Conditions requiring that the caller may see a restore's clone target
+    /// (`target_service_id`) when it is a different service from the one the
+    /// row is scoped by. Empty for instance administrators.
+    fn optional_target_visible(&self, target_column: &str, source_column: &str) -> Vec<String> {
+        let target_visible = self.service_visible(target_column);
+        if target_visible.is_empty() {
+            return Vec::new();
+        }
+        vec![format!(
+            "({target_column} IS NULL OR {target_column} = {source_column} OR ({}))",
+            target_visible.join(" AND ")
+        )]
+    }
+}
+
+/// `EXISTS` a live project link for the service in `service_column`, with an
+/// optional extra predicate on `ps`.
+fn linked_service_sql(service_column: &str, extra: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM project_services ps \
+         JOIN projects lp ON lp.id = ps.project_id AND lp.is_deleted = false \
+         WHERE ps.service_id = {service_column}{extra})"
+    )
 }
 
 fn where_clause(base: Vec<String>, extra: Vec<String>) -> String {
@@ -764,8 +818,22 @@ fn restore_branch(window: &str, filters: &ProjectFilters<'_>) -> String {
          LEFT JOIN external_services es ON es.id = r.source_service_id \
          {} {}",
         sole_project_join("r.source_service_id"),
-        where_clause(base, filters.via_service("r.source_service_id"))
+        where_clause(base, restore_visibility(filters))
     )
+}
+
+/// Visibility of a restore row. `r.source_service_id` is the service being
+/// restored (for `in_place` it is also the target), so scoping by it alone
+/// would let a caller who can see that service read the history of a backup
+/// produced by a hidden service. Mirror `GET /restore-runs/{id}`: the caller
+/// must also see every producer of the source backup (ownerless backups are
+/// administrator-only) and a distinct clone target.
+fn restore_visibility(filters: &ProjectFilters<'_>) -> Vec<String> {
+    let mut conditions = filters.via_service("r.source_service_id");
+    conditions
+        .extend(filters.optional_target_visible("r.target_service_id", "r.source_service_id"));
+    conditions.extend(filters.all_producers_visible("r.source_backup_id"));
+    conditions
 }
 
 fn backups_branch(window: &str, filters: &ProjectFilters<'_>) -> String {
@@ -792,8 +860,17 @@ fn backups_branch(window: &str, filters: &ProjectFilters<'_>) -> String {
          LEFT JOIN external_services es ON es.id = esb.service_id \
          {} {}",
         sole_project_join("esb.service_id"),
-        where_clause(base, filters.via_service("esb.service_id"))
+        where_clause(base, backup_visibility(filters))
     )
+}
+
+/// Visibility of a backup row. The row displays its first producer only, but
+/// a backup of several services must stay hidden unless the caller can see
+/// every one of them.
+fn backup_visibility(filters: &ProjectFilters<'_>) -> Vec<String> {
+    let mut conditions = filters.via_service("esb.service_id");
+    conditions.extend(filters.all_producers_visible("b.id"));
+    conditions
 }
 
 fn autofix_branch(window: &str, filters: &ProjectFilters<'_>) -> String {
@@ -1413,6 +1490,69 @@ mod tests {
     }
 
     #[test]
+    fn restore_rows_require_every_backup_producer_to_be_visible() {
+        let scope = OperationsScope::Projects {
+            hidden_project_ids: vec![8],
+        };
+        let restore_only =
+            OperationsQuery::normalize(None, None, None, Some(OperationKind::Restore), None);
+        let sql = built(&restore_only, &scope, all_access()).page_sql;
+
+        // Ownerless (control-plane / raw) backups have no producer row, so
+        // requiring one makes their restores administrator-only.
+        assert!(sql.contains(
+            "EXISTS (SELECT 1 FROM external_service_backups pb WHERE pb.backup_id = r.source_backup_id)"
+        ));
+        // No producer may be unlinked or linked to a hidden project.
+        assert!(sql.contains(
+            "NOT EXISTS (SELECT 1 FROM external_service_backups pb WHERE pb.backup_id = r.source_backup_id AND NOT (EXISTS (SELECT 1 FROM project_services ps JOIN projects lp ON lp.id = ps.project_id AND lp.is_deleted = false WHERE ps.service_id = pb.service_id) AND NOT EXISTS (SELECT 1 FROM project_services ps WHERE ps.service_id = pb.service_id AND ps.project_id IN ($2))))"
+        ));
+        // A distinct clone target must be visible too.
+        assert!(sql.contains(
+            "(r.target_service_id IS NULL OR r.target_service_id = r.source_service_id OR (EXISTS (SELECT 1 FROM project_services ps JOIN projects lp ON lp.id = ps.project_id AND lp.is_deleted = false WHERE ps.service_id = r.target_service_id)"
+        ));
+    }
+
+    #[test]
+    fn restore_producer_check_is_confined_for_single_project_tokens() {
+        let restore_only =
+            OperationsQuery::normalize(None, None, None, Some(OperationKind::Restore), None);
+        let sql = built(
+            &restore_only,
+            &OperationsScope::SingleProject { project_id: 77 },
+            all_access(),
+        )
+        .page_sql;
+        assert!(sql.contains(
+            "NOT EXISTS (SELECT 1 FROM project_services ps WHERE ps.service_id = pb.service_id AND ps.project_id <> $2)"
+        ));
+        assert!(sql.contains(
+            "EXISTS (SELECT 1 FROM external_service_backups pb WHERE pb.backup_id = r.source_backup_id)"
+        ));
+    }
+
+    #[test]
+    fn backup_rows_require_every_producer_to_be_visible() {
+        let scope = OperationsScope::Projects {
+            hidden_project_ids: vec![8],
+        };
+        let backup_only =
+            OperationsQuery::normalize(None, None, None, Some(OperationKind::Backup), None);
+        let sql = built(&backup_only, &scope, all_access()).page_sql;
+        assert!(sql.contains(
+            "NOT EXISTS (SELECT 1 FROM external_service_backups pb WHERE pb.backup_id = b.id AND NOT ("
+        ));
+        assert!(sql.contains("ps.service_id = pb.service_id AND ps.project_id IN ($2)"));
+    }
+
+    #[test]
+    fn instance_admins_skip_producer_and_target_checks() {
+        let sql = built_sql_for(&OperationsScope::Instance);
+        assert!(!sql.contains("external_service_backups pb"));
+        assert!(!sql.contains("r.target_service_id IS NULL"));
+    }
+
+    #[test]
     fn single_project_scope_binds_the_project() {
         let built = built(
             &default_query(),
@@ -1908,5 +2048,239 @@ mod tests {
             .expect("other list");
         assert_eq!(other.total, 1);
         assert_eq!(other.operations[0].project_id, Some(hidden));
+    }
+
+    /// A restore is scoped by the service it restores *and* by the backup it
+    /// reads: a caller who can see the restored service must not learn about
+    /// a restore whose backup came from a service they cannot see, nor about
+    /// a restore of an ownerless (control-plane) backup.
+    #[tokio::test]
+    async fn restores_of_hidden_or_ownerless_backups_are_not_listed_for_regular_principals() {
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_entities::projects;
+
+        let Some(test_db) = test_database().await else {
+            return;
+        };
+        let db = test_db.db.clone();
+
+        let mut project_ids = Vec::new();
+        for slug in ["visible-app", "hidden-app"] {
+            let project = projects::ActiveModel {
+                name: Set(slug.to_string()),
+                slug: Set(slug.to_string()),
+                repo_name: Set("repo".to_string()),
+                repo_owner: Set("owner".to_string()),
+                directory: Set("/".to_string()),
+                main_branch: Set("main".to_string()),
+                preset: Set(temps_presets::PresetType::Nixpacks),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .expect("insert project");
+            project_ids.push(project.id);
+        }
+        let (visible, hidden) = (project_ids[0], project_ids[1]);
+        let now = Utc::now();
+        let minutes_ago = |m: i64| now - Duration::minutes(m);
+
+        let operator = exec(
+            &db,
+            "INSERT INTO users (name, email, email_verified, must_change_password, mfa_enabled, \
+             created_at, updated_at) VALUES ('Operator', 'operator@example.test', true, false, \
+             false, NOW(), NOW()) RETURNING id",
+            vec![],
+        )
+        .await;
+
+        let service_sql = "INSERT INTO external_services (name, service_type, status, created_at, \
+             updated_at) VALUES ($1, 'postgres', 'running', NOW(), NOW()) RETURNING id";
+        let link_sql = "INSERT INTO project_services (project_id, service_id, created_at, \
+             updated_at) VALUES ($1, $2, NOW(), NOW()) RETURNING id";
+        let visible_service = exec(&db, service_sql, vec!["visible-db".into()]).await;
+        exec(&db, link_sql, vec![visible.into(), visible_service.into()]).await;
+        let hidden_service = exec(&db, service_sql, vec!["hidden-db".into()]).await;
+        exec(&db, link_sql, vec![hidden.into(), hidden_service.into()]).await;
+
+        let s3_source = exec(
+            &db,
+            "INSERT INTO s3_sources (name, bucket_name, bucket_path, region, access_key_id, secret_key, \
+             created_at, updated_at) VALUES ('primary', 'bucket', '/', 'us-east-1', 'k', 's', NOW(), NOW()) \
+             RETURNING id",
+            vec![],
+        )
+        .await;
+        let backup_sql = "INSERT INTO backups (name, backup_id, backup_type, state, started_at, \
+             s3_source_id, s3_location, metadata, compression_type, created_by, tags) \
+             VALUES ($1, $2, 'full', 'completed', $3, $4, 's3://bucket/x', '{}', 'gzip', $5, '[]') \
+             RETURNING id";
+        let producer_sql = "INSERT INTO external_service_backups (service_id, backup_id, \
+             backup_type, state, started_at, s3_location, metadata, compression_type, created_by) \
+             VALUES ($1, $2, 'full', 'completed', NOW(), 's3://bucket/x', '{}', 'gzip', $3) \
+             RETURNING id";
+        let backup = |name: &'static str, minutes: i64| {
+            let db = db.clone();
+            let started_at = minutes_ago(minutes);
+            async move {
+                exec(
+                    &db,
+                    backup_sql,
+                    vec![
+                        name.into(),
+                        format!("uuid-{name}").into(),
+                        started_at.into(),
+                        s3_source.into(),
+                        operator.into(),
+                    ],
+                )
+                .await
+            }
+        };
+        let own_backup = backup("own", 90).await;
+        exec(
+            &db,
+            producer_sql,
+            vec![visible_service.into(), own_backup.into(), operator.into()],
+        )
+        .await;
+        let hidden_backup = backup("hidden", 80).await;
+        exec(
+            &db,
+            producer_sql,
+            vec![hidden_service.into(), hidden_backup.into(), operator.into()],
+        )
+        .await;
+        // Produced by both services: the visible one is its first producer, so
+        // the row would previously have been scoped by it alone.
+        let shared_backup = backup("shared", 70).await;
+        exec(
+            &db,
+            producer_sql,
+            vec![
+                visible_service.into(),
+                shared_backup.into(),
+                operator.into(),
+            ],
+        )
+        .await;
+        exec(
+            &db,
+            producer_sql,
+            vec![hidden_service.into(), shared_backup.into(), operator.into()],
+        )
+        .await;
+        // Control-plane backup: no producer row at all.
+        let ownerless_backup = backup("ownerless", 60).await;
+
+        let restore_sql = "INSERT INTO restore_runs (source_backup_id, source_service_id, \
+             target_service_id, mode, status, phase, parameter_overrides, log_id, attempt, \
+             error_message, created_by, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, 'failed', 'failed', '{}', 'restore-log', 1, \
+             'restore failed', $5, $6, $6) RETURNING id";
+        let restore = |backup_id: i32, target: Option<i32>, mode: &'static str, minutes: i64| {
+            let db = db.clone();
+            let created_at = minutes_ago(minutes);
+            async move {
+                exec(
+                    &db,
+                    restore_sql,
+                    vec![
+                        backup_id.into(),
+                        visible_service.into(),
+                        target.into(),
+                        mode.into(),
+                        operator.into(),
+                        created_at.into(),
+                    ],
+                )
+                .await
+            }
+        };
+        // Every restore runs onto the visible service.
+        let own_restore = restore(own_backup, None, "in_place", 50).await;
+        let hidden_restore = restore(hidden_backup, None, "in_place", 40).await;
+        let shared_restore = restore(shared_backup, None, "in_place", 30).await;
+        let ownerless_restore = restore(ownerless_backup, None, "in_place", 20).await;
+        // A clone of the visible backup whose new service lives in the
+        // hidden project.
+        let hidden_clone = restore(own_backup, Some(hidden_service), "new_service", 10).await;
+
+        let service_under_test = OperationsService::new(db.clone());
+        let kind_query = |kind| OperationsQuery::normalize(None, None, None, Some(kind), None);
+        let listed_ids = |page: OperationsPage| -> Vec<String> {
+            page.operations.into_iter().map(|op| op.id).collect()
+        };
+
+        let regular = OperationsScope::Projects {
+            hidden_project_ids: vec![hidden],
+        };
+        let regular_restores = service_under_test
+            .list_operations(&kind_query(OperationKind::Restore), &regular, all_access())
+            .await
+            .expect("list restores for a regular principal");
+        assert_eq!(
+            listed_ids(regular_restores.clone()),
+            vec![format!("restore:{own_restore}")],
+            "restores of hidden-producer, shared, ownerless backups and hidden clones must be excluded"
+        );
+        assert_eq!(regular_restores.total, 1);
+        assert_eq!(
+            regular_restores.operations[0].failure_reason.as_deref(),
+            Some("restore failed")
+        );
+
+        // A deployment token for the visible project gets the same answer.
+        let token = OperationsScope::SingleProject {
+            project_id: visible,
+        };
+        let token_restores = service_under_test
+            .list_operations(&kind_query(OperationKind::Restore), &token, all_access())
+            .await
+            .expect("list restores for a project token");
+        assert_eq!(
+            listed_ids(token_restores),
+            vec![format!("restore:{own_restore}")]
+        );
+
+        // Backups of several services stay hidden unless every producer is
+        // visible; the control-plane backup is administrator-only.
+        let regular_backups = service_under_test
+            .list_operations(&kind_query(OperationKind::Backup), &regular, all_access())
+            .await
+            .expect("list backups for a regular principal");
+        assert_eq!(
+            listed_ids(regular_backups),
+            vec![format!("backup:{own_backup}")]
+        );
+
+        // An instance administrator sees every restore and backup.
+        let admin_restores = service_under_test
+            .list_operations(
+                &kind_query(OperationKind::Restore),
+                &OperationsScope::Instance,
+                all_access(),
+            )
+            .await
+            .expect("list restores for an administrator");
+        assert_eq!(
+            listed_ids(admin_restores),
+            vec![
+                format!("restore:{hidden_clone}"),
+                format!("restore:{ownerless_restore}"),
+                format!("restore:{shared_restore}"),
+                format!("restore:{hidden_restore}"),
+                format!("restore:{own_restore}"),
+            ]
+        );
+        let admin_backups = service_under_test
+            .list_operations(
+                &kind_query(OperationKind::Backup),
+                &OperationsScope::Instance,
+                all_access(),
+            )
+            .await
+            .expect("list backups for an administrator");
+        assert_eq!(admin_backups.total, 4);
     }
 }
