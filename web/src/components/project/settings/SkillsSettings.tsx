@@ -91,8 +91,7 @@ export function SkillsSettings({ project }: SkillsSettingsProps) {
     <div>
       <div className="flex items-center justify-between mb-4">
         <div>
-          <h2 className="text-lg font-semibold">Skills</h2>
-          <p className="text-sm text-muted-foreground mt-1">
+          <p className="text-sm text-muted-foreground">
             Define reusable skill definitions that can be assigned to AI
             workflows. Skills are injected as{' '}
             <code className="text-xs bg-muted px-1 rounded">

@@ -7,7 +7,6 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useProjectSetup } from '@/hooks/useProjectSetup'
-import { usePageTitle } from '@/hooks/usePageTitle'
 import { cn } from '@/lib/utils'
 import {
   ArrowRight,
@@ -20,7 +19,6 @@ import { Link } from 'react-router'
 
 export function ProjectSetup({ project }: { project: ProjectResponse }) {
   const setup = useProjectSetup(project)
-  usePageTitle(`${project.name} setup`)
 
   if (setup.isLoading) {
     return <ProjectSetupSkeleton />
@@ -46,10 +44,7 @@ export function ProjectSetup({ project }: { project: ProjectResponse }) {
             <BadgeCheck className="size-4" />
             Production readiness
           </div>
-          <h1 className="text-2xl font-semibold tracking-tight sm:text-3xl">
-            Project setup
-          </h1>
-          <p className="mt-1.5 max-w-2xl text-sm leading-relaxed text-muted-foreground">
+          <p className="max-w-2xl text-sm leading-relaxed text-muted-foreground">
             Connect the pieces that make {project.name} observable, reachable,
             and ready to operate in production.
           </p>
@@ -215,7 +210,6 @@ function ProjectSetupSkeleton() {
     <div className="w-full space-y-6 py-2 sm:py-4">
       <div className="space-y-2">
         <Skeleton className="h-4 w-36" />
-        <Skeleton className="h-9 w-52" />
         <Skeleton className="h-4 w-full max-w-xl" />
       </div>
       <Skeleton className="h-44 w-full rounded-xl" />

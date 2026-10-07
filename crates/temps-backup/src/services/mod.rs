@@ -26,8 +26,8 @@ pub use notifier::BackupNotificationAdapter;
 pub use reconcile::reconcile_orphan_backups;
 pub use restore::{
     BackupProducerServices, BackupSelector, PlanSourceBackup, PlanTarget, RestoreError,
-    RestoreOriginBinding, RestorePlan, RestoreRequestMode, RestoreRunView, RestoreService,
-    RestoreServiceIdentity,
+    RestoreOriginBinding, RestorePlan, RestoreRequestMode, RestoreRunSourceBackup, RestoreRunView,
+    RestoreService, RestoreServiceIdentity,
 };
 pub use restore_reconcile::{
     active_restore_run_ids, reconcile_interrupted_restores, FenceTarget, ManagerRestoreFence,

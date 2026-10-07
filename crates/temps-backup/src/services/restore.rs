@@ -74,6 +74,19 @@ pub enum RestoreError {
         restore_run_id: i32,
     },
 
+    #[error("Restore run {restore_run_id} is already {status}, so there is nothing to cancel")]
+    RestoreNotActive { restore_run_id: i32, status: String },
+
+    #[error(
+        "Restore run {restore_run_id} can no longer be cancelled: it is in phase '{phase}' and \
+         has started writing data. Stopping it now would leave the target partially restored, \
+         so it will run to completion. Wait for it to finish, then check the result."
+    )]
+    RestoreNotCancellable { restore_run_id: i32, phase: String },
+
+    #[error("Restore run {restore_run_id} was cancelled before it wrote any data")]
+    Cancelled { restore_run_id: i32 },
+
     #[error(
         "Restore run {restore_run_id} worker stopped unexpectedly during phase '{phase}': {reason}"
     )]
@@ -294,6 +307,63 @@ pub struct RestoreRunView {
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
     pub created_at: String,
+    /// The backup this run restores from, so a client can show and link to
+    /// it. Always present; its fields are `None` where they are unknown.
+    pub source_backup: RestoreRunSourceBackup,
+}
+
+/// The backup a restore run reads.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct RestoreRunSourceBackup {
+    /// `backups.id` of a tracked backup. `None` for a restore from a raw S3
+    /// location (a backup this instance did not record).
+    pub id: Option<i32>,
+    /// The backup's UUID, which addresses it in the console and the
+    /// `/backups/{id}` API. `None` for a raw-location restore, or when the
+    /// tracked backup has since been deleted.
+    pub backup_id: Option<String>,
+    /// S3 source holding the backup.
+    pub s3_source_id: Option<i32>,
+    /// Object key or `s3://` URL of the backup.
+    pub location: Option<String>,
+    /// When the backup was taken (ISO 8601). `None` when unknown.
+    pub taken_at: Option<String>,
+}
+
+impl RestoreRunSourceBackup {
+    /// What the run row alone records: the tracked id, or the raw location
+    /// and S3 source stored in its resume token.
+    fn from_run(run: &temps_entities::restore_runs::Model) -> Self {
+        let token = run.resume_token.as_ref();
+        Self {
+            id: (run.source_backup_id > 0).then_some(run.source_backup_id),
+            backup_id: None,
+            s3_source_id: token
+                .and_then(|t| t.get("s3_source_id"))
+                .and_then(|v| v.as_i64())
+                .and_then(|v| i32::try_from(v).ok()),
+            location: token
+                .and_then(|t| t.get("backup_location"))
+                .and_then(|v| v.as_str())
+                .filter(|l| !l.is_empty())
+                .map(String::from),
+            taken_at: None,
+        }
+    }
+
+    fn from_backup(backup: &temps_entities::backups::Model) -> Self {
+        Self {
+            id: Some(backup.id),
+            backup_id: Some(backup.backup_id.clone()),
+            s3_source_id: Some(backup.s3_source_id),
+            location: Some(backup.s3_location.clone()).filter(|l| !l.is_empty()),
+            taken_at: Some(
+                backup
+                    .started_at
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            ),
+        }
+    }
 }
 
 /// Non-sensitive service identity used by restore handlers for response
@@ -316,7 +386,9 @@ pub struct BackupProducerServices {
 
 impl From<temps_entities::restore_runs::Model> for RestoreRunView {
     fn from(m: temps_entities::restore_runs::Model) -> Self {
+        let source_backup = RestoreRunSourceBackup::from_run(&m);
         Self {
+            source_backup,
             id: m.id,
             source_backup_id: m.source_backup_id,
             source_service_id: m.source_service_id,
@@ -1189,7 +1261,25 @@ impl RestoreService {
             .one(self.db.as_ref())
             .await?
             .ok_or(RestoreError::RestoreRunNotFound { restore_run_id: id })?;
-        Ok(run.into())
+        views_with_source_backups(self.db.as_ref(), vec![run])
+            .await?
+            .into_iter()
+            .next()
+            .ok_or(RestoreError::RestoreRunNotFound { restore_run_id: id })
+    }
+
+    /// Cancel a restore run that has not yet started writing data.
+    ///
+    /// A restore can only stop safely before its destructive step: once the
+    /// engine is replacing data, stopping it would leave the target partially
+    /// restored. The run's `prepare` phase is that safe point. Cancellation
+    /// and the worker's move into the `restore` phase are both conditional
+    /// updates on `phase = 'prepare'` (see [`enter_restore_phase`]), so exactly
+    /// one of them wins: either the run is cancelled and its worker stops
+    /// without touching the target, or the restore proceeds and the request is
+    /// refused with [`RestoreError::RestoreNotCancellable`].
+    pub async fn cancel_restore_run(&self, run_id: i32) -> Result<RestoreRunView, RestoreError> {
+        cancel_run_at_safe_point(self.db.as_ref(), run_id).await
     }
 
     /// List restore runs for a given source service, newest first.
@@ -1203,7 +1293,7 @@ impl RestoreService {
             .limit(50)
             .all(self.db.as_ref())
             .await?;
-        Ok(runs.into_iter().map(RestoreRunView::from).collect())
+        views_with_source_backups(self.db.as_ref(), runs).await
     }
 
     /// Resolve every external service that produced a backup. An empty result
@@ -1300,6 +1390,42 @@ impl RestoreService {
             .await?
             .ok_or(RestoreError::ServiceNotFound { service_id: id })
     }
+}
+
+/// Views of `runs` with their source backups resolved in one query.
+async fn views_with_source_backups(
+    db: &DatabaseConnection,
+    runs: Vec<temps_entities::restore_runs::Model>,
+) -> Result<Vec<RestoreRunView>, RestoreError> {
+    let backup_ids: BTreeSet<i32> = runs
+        .iter()
+        .map(|run| run.source_backup_id)
+        .filter(|id| *id > 0)
+        .collect();
+    let backups: BTreeMap<i32, temps_entities::backups::Model> = if backup_ids.is_empty() {
+        BTreeMap::new()
+    } else {
+        temps_entities::backups::Entity::find()
+            .filter(temps_entities::backups::Column::Id.is_in(backup_ids))
+            .all(db)
+            .await?
+            .into_iter()
+            .map(|backup| (backup.id, backup))
+            .collect()
+    };
+    Ok(runs
+        .into_iter()
+        .map(|run| {
+            let source_backup = backups
+                .get(&run.source_backup_id)
+                .map(RestoreRunSourceBackup::from_backup);
+            let mut view = RestoreRunView::from(run);
+            if let Some(source_backup) = source_backup {
+                view.source_backup = source_backup;
+            }
+            view
+        })
+        .collect())
 }
 
 /// Engine-family check: two engines are restore-compatible if they
@@ -1504,6 +1630,17 @@ async fn run_restore_worker(
     };
     let elapsed = started.elapsed();
 
+    // A cancelled run's terminal state was written by the cancellation
+    // itself, before the worker reached its first write. It is neither a
+    // success nor a failure, so no outcome is recorded or reported.
+    if let Err(RestoreError::Cancelled { .. }) = &result {
+        info!(
+            restore_run_id = run_id,
+            "Restore run stopped at its safe point after being cancelled; the target was not modified"
+        );
+        return Ok(());
+    }
+
     let persisted = persist_terminal_state(&db, run_id, &result, TERMINAL_WRITE_RETRY).await;
     match (&result, &persisted) {
         (Ok(_), Ok(())) => info!("Restore run {} completed successfully", run_id),
@@ -1551,6 +1688,11 @@ async fn run_restore_inner(
     mode: RestoreRequestMode,
 ) -> Result<Option<i32>, RestoreError> {
     let run = load_run_for_update(&db, run_id).await?;
+    if run.status == CANCELLED_STATUS {
+        return Err(RestoreError::Cancelled {
+            restore_run_id: run_id,
+        });
+    }
 
     // Resolve backup identity. `source_backup_id == 0` is the sentinel
     // for orphan-backup restores, where everything we need lives in
@@ -1948,7 +2090,9 @@ async fn run_restore_inner(
         }
     }
 
-    update_phase(&db, run_id, "restore").await?;
+    // Safe point: nothing has been written yet. A cancellation recorded
+    // during preparation wins here and the target is never touched.
+    enter_restore_phase(&db, run_id).await?;
 
     let ctx = RestoreContext {
         s3_client: &s3_client,
@@ -2172,10 +2316,61 @@ async fn insert_restore_run(
     destructive: bool,
 ) -> Result<temps_entities::restore_runs::Model, RestoreError> {
     let transaction = db.begin().await?;
+    let inserted = lock_and_insert_restore_run(
+        &transaction,
+        run_active,
+        resolved_backup_id,
+        target_service_id,
+        destructive,
+    )
+    .await;
+    let error = match inserted {
+        Ok(run) => {
+            transaction.commit().await?;
+            return Ok(run);
+        }
+        Err(error) => error,
+    };
+    // Roll back explicitly instead of on drop: a dropped transaction only
+    // queues its ROLLBACK, so the backup and service row locks taken above
+    // would stay held until the pool next touches that connection.
+    if let Err(rollback_error) = transaction.rollback().await {
+        warn!(
+            "Rolling back the refused restore run for service {} failed: {}",
+            target_service_id, rollback_error
+        );
+    }
+    match error {
+        RestoreError::Database(db_error) if is_active_restore_conflict(&db_error) => {
+            // The index fired, so another in-place run committed between
+            // our check and insert. If it already finished, surface the
+            // original error rather than naming a run that is gone.
+            Err(
+                match find_active_destructive_run(db, target_service_id).await? {
+                    Some(active) => RestoreError::RestoreAlreadyActive {
+                        service_id: target_service_id,
+                        restore_run_id: active.id,
+                    },
+                    None => RestoreError::Database(db_error),
+                },
+            )
+        }
+        other => Err(other),
+    }
+}
+
+/// The checks and insert of [`insert_restore_run`], inside its transaction.
+async fn lock_and_insert_restore_run(
+    transaction: &sea_orm::DatabaseTransaction,
+    run_active: temps_entities::restore_runs::ActiveModel,
+    resolved_backup_id: Option<i32>,
+    target_service_id: i32,
+    destructive: bool,
+) -> Result<temps_entities::restore_runs::Model, RestoreError> {
     if let Some(backup_id) = resolved_backup_id {
         let backup = temps_entities::backups::Entity::find_by_id(backup_id)
             .lock_exclusive()
-            .one(&transaction)
+            .one(transaction)
             .await?
             .ok_or(RestoreError::BackupNotFound { backup_id })?;
         if backup.state == "deleting" {
@@ -2188,39 +2383,19 @@ async fn insert_restore_run(
         // partial unique index (in_place only) does not cover.
         temps_entities::external_services::Entity::find_by_id(target_service_id)
             .lock_exclusive()
-            .one(&transaction)
+            .one(transaction)
             .await?
             .ok_or(RestoreError::ServiceNotFound {
                 service_id: target_service_id,
             })?;
-        if let Some(active) = find_active_destructive_run(&transaction, target_service_id).await? {
+        if let Some(active) = find_active_destructive_run(transaction, target_service_id).await? {
             return Err(RestoreError::RestoreAlreadyActive {
                 service_id: target_service_id,
                 restore_run_id: active.id,
             });
         }
     }
-    let run = match run_active.insert(&transaction).await {
-        Ok(run) => run,
-        Err(e) if is_active_restore_conflict(&e) => {
-            drop(transaction);
-            // The index fired, so another in-place run committed between
-            // our check and insert. If it already finished, surface the
-            // original error rather than naming a run that is gone.
-            return Err(
-                match find_active_destructive_run(db, target_service_id).await? {
-                    Some(active) => RestoreError::RestoreAlreadyActive {
-                        service_id: target_service_id,
-                        restore_run_id: active.id,
-                    },
-                    None => e.into(),
-                },
-            );
-        }
-        Err(e) => return Err(e.into()),
-    };
-    transaction.commit().await?;
-    Ok(run)
+    Ok(run_active.insert(transaction).await?)
 }
 
 /// Decide how to record a run whose worker task panicked.
@@ -2336,6 +2511,134 @@ async fn persist_terminal_state(
 
 /// Statuses that mean a worker still owns the run.
 pub(crate) const ACTIVE_RESTORE_STATUSES: [&str; 2] = ["pending", "running"];
+
+/// Terminal status for a run cancelled at its safe point.
+pub const CANCELLED_STATUS: &str = "cancelled";
+
+/// The phase a run is in until it starts writing data. It is the only phase
+/// in which a run can be cancelled.
+pub const CANCELLABLE_PHASE: &str = "prepare";
+
+/// The message stored on a cancelled run.
+fn cancelled_message(run: &temps_entities::restore_runs::Model) -> String {
+    match run.target_service_name.as_deref() {
+        Some(new_name) if !new_name.trim().is_empty() => format!(
+            "Restore cancelled before any data was written. The source database was not \
+             modified and the new service '{}' was not created.",
+            new_name
+        ),
+        _ => "Restore cancelled before any data was written. The database was not modified."
+            .to_string(),
+    }
+}
+
+/// Mark `run_id` cancelled if, and only if, it is still active and has not
+/// left its `prepare` phase. Refusals name why: the run is already terminal,
+/// or it has passed the safe point.
+async fn cancel_run_at_safe_point(
+    db: &DatabaseConnection,
+    run_id: i32,
+) -> Result<RestoreRunView, RestoreError> {
+    use sea_orm::sea_query::Expr;
+    use temps_entities::restore_runs::{Column, Entity};
+
+    let run = load_run_for_update(db, run_id).await?;
+    refuse_unless_cancellable(&run)?;
+
+    let now = Utc::now();
+    let outcome = Entity::update_many()
+        .col_expr(Column::Status, Expr::value(CANCELLED_STATUS))
+        .col_expr(
+            Column::ErrorMessage,
+            Expr::value(Some(cancelled_message(&run))),
+        )
+        .col_expr(Column::FinishedAt, Expr::value(now))
+        .col_expr(Column::UpdatedAt, Expr::value(now))
+        .filter(Column::Id.eq(run_id))
+        .filter(Column::Status.is_in(ACTIVE_RESTORE_STATUSES))
+        .filter(Column::Phase.eq(CANCELLABLE_PHASE))
+        .exec(db)
+        .await?;
+
+    let current = load_run_for_update(db, run_id).await?;
+    if outcome.rows_affected == 0 {
+        // The worker moved past the safe point (or finished) between the
+        // read above and the update: report what it is doing now.
+        refuse_unless_cancellable(&current)?;
+        return Err(RestoreError::Internal {
+            reason: format!(
+                "Restore run {} looked cancellable but the cancellation did not apply \
+                 (status '{}', phase '{}')",
+                run_id, current.status, current.phase
+            ),
+        });
+    }
+    info!(
+        restore_run_id = run_id,
+        service_id = current.source_service_id,
+        "Restore run cancelled before it wrote any data"
+    );
+    views_with_source_backups(db, vec![current])
+        .await?
+        .into_iter()
+        .next()
+        .ok_or(RestoreError::RestoreRunNotFound {
+            restore_run_id: run_id,
+        })
+}
+
+/// `Ok` when `run` can still be cancelled; otherwise the refusal to return.
+fn refuse_unless_cancellable(
+    run: &temps_entities::restore_runs::Model,
+) -> Result<(), RestoreError> {
+    if !ACTIVE_RESTORE_STATUSES.contains(&run.status.as_str()) {
+        return Err(RestoreError::RestoreNotActive {
+            restore_run_id: run.id,
+            status: run.status.clone(),
+        });
+    }
+    if run.phase != CANCELLABLE_PHASE {
+        return Err(RestoreError::RestoreNotCancellable {
+            restore_run_id: run.id,
+            phase: run.phase.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// Move `run_id` from `prepare` to `restore`: the worker's last safe point.
+/// Conditional on the run still being active and in `prepare`, so it cannot
+/// race a cancellation. Returns [`RestoreError::Cancelled`] when the run was
+/// cancelled first.
+async fn enter_restore_phase(db: &DatabaseConnection, run_id: i32) -> Result<(), RestoreError> {
+    use sea_orm::sea_query::Expr;
+    use temps_entities::restore_runs::{Column, Entity};
+
+    let outcome = Entity::update_many()
+        .col_expr(Column::Phase, Expr::value("restore"))
+        .col_expr(Column::UpdatedAt, Expr::value(Utc::now()))
+        .filter(Column::Id.eq(run_id))
+        .filter(Column::Status.is_in(ACTIVE_RESTORE_STATUSES))
+        .filter(Column::Phase.eq(CANCELLABLE_PHASE))
+        .exec(db)
+        .await?;
+    if outcome.rows_affected > 0 {
+        return Ok(());
+    }
+    let run = load_run_for_update(db, run_id).await?;
+    if run.status == CANCELLED_STATUS {
+        return Err(RestoreError::Cancelled {
+            restore_run_id: run_id,
+        });
+    }
+    Err(RestoreError::Internal {
+        reason: format!(
+            "Restore run {} could not enter its restore phase: expected an active run in \
+             phase '{}', found status '{}' in phase '{}'",
+            run_id, CANCELLABLE_PHASE, run.status, run.phase
+        ),
+    })
+}
 
 /// The active destructive restore (in-place, or PITR in place) on `service_id`,
 /// if any. At most one can exist.
@@ -3801,6 +4104,99 @@ mod tests {
         assert!(v.started_at.unwrap().contains('T'));
     }
 
+    fn tracked_backup(id: i32) -> temps_entities::backups::Model {
+        temps_entities::backups::Model {
+            id,
+            name: "nightly".to_string(),
+            backup_id: format!("uuid-{id}"),
+            schedule_id: None,
+            schedule_run_id: None,
+            backup_type: "full".to_string(),
+            state: "completed".to_string(),
+            started_at: chrono::DateTime::parse_from_rfc3339("2026-10-01T02:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            finished_at: None,
+            size_bytes: None,
+            file_count: None,
+            s3_source_id: 3,
+            s3_location: format!("external_services/postgres/orders/{id}"),
+            error_message: None,
+            metadata: "{}".to_string(),
+            checksum: None,
+            compression_type: "gzip".to_string(),
+            created_by: 1,
+            expires_at: None,
+            tags: "[]".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_views_name_their_source_backup_in_one_query() {
+        let tracked = temps_entities::restore_runs::Model {
+            id: 1,
+            source_backup_id: 5,
+            ..crashed_run_row()
+        };
+        let deleted = temps_entities::restore_runs::Model {
+            id: 2,
+            source_backup_id: 6,
+            ..crashed_run_row()
+        };
+        let raw = temps_entities::restore_runs::Model {
+            id: 3,
+            source_backup_id: 0,
+            resume_token: Some(serde_json::json!({
+                "backup_location": "s3://bucket/base_000000010000000000000002",
+                "engine_hint": "postgres",
+                "s3_source_id": 4,
+            })),
+            ..crashed_run_row()
+        };
+        // One batched lookup for every tracked id; backup 6 no longer exists.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![tracked_backup(5)]])
+            .into_connection();
+
+        let views = views_with_source_backups(&db, vec![tracked, deleted, raw])
+            .await
+            .expect("views");
+
+        assert_eq!(
+            views[0].source_backup,
+            RestoreRunSourceBackup {
+                id: Some(5),
+                backup_id: Some("uuid-5".to_string()),
+                s3_source_id: Some(3),
+                location: Some("external_services/postgres/orders/5".to_string()),
+                taken_at: Some("2026-10-01T02:00:00Z".to_string()),
+            }
+        );
+        assert_eq!(views[1].source_backup.id, Some(6));
+        assert_eq!(views[1].source_backup.backup_id, None, "deleted backup");
+        assert_eq!(views[2].source_backup.id, None);
+        assert_eq!(views[2].source_backup.s3_source_id, Some(4));
+        assert_eq!(
+            views[2].source_backup.location.as_deref(),
+            Some("s3://bucket/base_000000010000000000000002")
+        );
+        assert_eq!(db.into_transaction_log().len(), 1, "a single backups query");
+    }
+
+    #[tokio::test]
+    async fn run_views_skip_the_backup_lookup_for_raw_location_restores() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let raw = temps_entities::restore_runs::Model {
+            source_backup_id: 0,
+            ..crashed_run_row()
+        };
+        let views = views_with_source_backups(&db, vec![raw])
+            .await
+            .expect("views");
+        assert_eq!(views[0].source_backup, RestoreRunSourceBackup::default());
+        assert!(db.into_transaction_log().is_empty());
+    }
+
     // ---- MockDatabase-backed validation tests ---------------------------
 
     /// Construct a RestoreService wired to the provided MockDatabase. Uses a
@@ -4915,5 +5311,359 @@ mod tests {
         let message = kept.to_string();
         assert!(message.contains("stays active"), "{message}");
         assert!(message.contains("phase 'restore'"), "{message}");
+    }
+
+    // ---- Cancellation at the pre-write safe point
+
+    fn run_in(status: &str, phase: &str) -> temps_entities::restore_runs::Model {
+        temps_entities::restore_runs::Model {
+            status: status.to_string(),
+            phase: phase.to_string(),
+            ..crashed_run_row()
+        }
+    }
+
+    #[test]
+    fn only_an_active_run_still_preparing_is_cancellable() {
+        assert!(refuse_unless_cancellable(&run_in("running", "prepare")).is_ok());
+        assert!(refuse_unless_cancellable(&run_in("pending", "prepare")).is_ok());
+
+        for phase in ["restore", "provision", "recover", "verify"] {
+            let err = refuse_unless_cancellable(&run_in("running", phase))
+                .expect_err("a run writing data must not be cancellable");
+            assert!(
+                matches!(
+                    &err,
+                    RestoreError::RestoreNotCancellable { restore_run_id: 11, phase: p } if p == phase
+                ),
+                "{err:?}"
+            );
+        }
+        for status in ["completed", "failed", "cancelled", "interrupted"] {
+            let err = refuse_unless_cancellable(&run_in(status, "prepare"))
+                .expect_err("a finished run has nothing to cancel");
+            assert!(
+                matches!(
+                    &err,
+                    RestoreError::RestoreNotActive { restore_run_id: 11, status: s } if s == status
+                ),
+                "{err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cancelled_message_says_nothing_was_modified() {
+        let in_place = cancelled_message(&run_in("running", "prepare"));
+        assert!(
+            in_place.contains("before any data was written"),
+            "{in_place}"
+        );
+        assert!(in_place.contains("was not modified"), "{in_place}");
+
+        let new_service = cancelled_message(&temps_entities::restore_runs::Model {
+            target_service_name: Some("orders-copy".to_string()),
+            ..run_in("running", "prepare")
+        });
+        assert!(
+            new_service.contains("'orders-copy' was not created"),
+            "{new_service}"
+        );
+    }
+
+    #[test]
+    fn cancellation_errors_name_the_run_and_phase() {
+        let message = RestoreError::RestoreNotCancellable {
+            restore_run_id: 42,
+            phase: "restore".to_string(),
+        }
+        .to_string();
+        assert!(message.contains("Restore run 42"), "{message}");
+        assert!(message.contains("phase 'restore'"), "{message}");
+        assert!(message.contains("partially restored"), "{message}");
+
+        let message = RestoreError::RestoreNotActive {
+            restore_run_id: 42,
+            status: "completed".to_string(),
+        }
+        .to_string();
+        assert!(
+            message.contains("Restore run 42 is already completed"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_returns_not_found_for_a_missing_run() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results::<temps_entities::restore_runs::Model, _, _>(vec![vec![]])
+            .into_connection();
+        let err = cancel_run_at_safe_point(&db, 404)
+            .await
+            .expect_err("missing run");
+        assert!(
+            matches!(
+                err,
+                RestoreError::RestoreRunNotFound {
+                    restore_run_id: 404
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_marks_a_preparing_run_cancelled() {
+        let cancelled = temps_entities::restore_runs::Model {
+            error_message: Some("cancelled".to_string()),
+            finished_at: Some(Utc::now()),
+            ..run_in("cancelled", "prepare")
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![run_in("running", "prepare")]])
+            .append_exec_results(vec![sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .append_query_results(vec![vec![cancelled]])
+            .append_query_results::<temps_entities::backups::Model, _, _>(vec![vec![]])
+            .into_connection();
+
+        let view = cancel_run_at_safe_point(&db, 11)
+            .await
+            .expect("a preparing run is cancellable");
+        assert_eq!(view.status, "cancelled");
+        assert_eq!(view.phase, "prepare");
+        assert!(view.finished_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn cancel_that_loses_the_race_reports_the_phase_the_worker_reached() {
+        // Read as preparing, but the worker entered `restore` before the
+        // conditional update ran: the update matches nothing.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![run_in("running", "prepare")]])
+            .append_exec_results(vec![sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }])
+            .append_query_results(vec![vec![run_in("running", "restore")]])
+            .into_connection();
+
+        let err = cancel_run_at_safe_point(&db, 11)
+            .await
+            .expect_err("the restore already started writing");
+        assert!(
+            matches!(
+                &err,
+                RestoreError::RestoreNotCancellable { phase, .. } if phase == "restore"
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_stops_at_its_safe_point_when_cancelled_first() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_results(vec![sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }])
+            .append_query_results(vec![vec![run_in("cancelled", "prepare")]])
+            .into_connection();
+        let err = enter_restore_phase(&db, 11)
+            .await
+            .expect_err("a cancelled run must not start writing");
+        assert!(
+            matches!(err, RestoreError::Cancelled { restore_run_id: 11 }),
+            "{err:?}"
+        );
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_results(vec![sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .into_connection();
+        enter_restore_phase(&db, 11)
+            .await
+            .expect("an uncancelled run proceeds");
+    }
+
+    #[tokio::test]
+    async fn worker_refuses_to_write_when_the_run_left_prepare_unexpectedly() {
+        // Reconciled as interrupted by another process: neither cancelled
+        // nor ours to continue.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_results(vec![sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }])
+            .append_query_results(vec![vec![run_in("interrupted", "prepare")]])
+            .into_connection();
+        let err = enter_restore_phase(&db, 11)
+            .await
+            .expect_err("an inactive run must not start writing");
+        let message = err.to_string();
+        assert!(matches!(err, RestoreError::Internal { .. }), "{message}");
+        assert!(message.contains("status 'interrupted'"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn cancellation_and_the_restore_step_exclude_each_other() {
+        if Docker::connect_with_local_defaults().is_err() {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("TestDatabase unavailable, skipping: {e}");
+                return;
+            }
+        };
+        let db = test_db.db.clone();
+
+        let user = temps_entities::users::ActiveModel {
+            name: Set("Cancel Tester".to_string()),
+            email: Set("cancel-tester@example.com".to_string()),
+            password_hash: Set(Some("hash".to_string())),
+            email_verified: Set(true),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert user");
+        let source = temps_entities::s3_sources::ActiveModel {
+            name: Set("cancel-source".to_string()),
+            bucket_name: Set("cancel-bucket".to_string()),
+            bucket_path: Set("/".to_string()),
+            access_key_id: Set(String::new()),
+            secret_key: Set(String::new()),
+            region: Set("us-east-1".to_string()),
+            force_path_style: Set(Some(true)),
+            is_default: Set(true),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert S3 source");
+        let service = temps_entities::external_services::ActiveModel {
+            name: Set("ledger".to_string()),
+            service_type: Set("postgres".to_string()),
+            status: Set("running".to_string()),
+            topology: Set("standalone".to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert service");
+        let backup = temps_entities::backups::ActiveModel {
+            id: NotSet,
+            name: Set("nightly".to_string()),
+            backup_id: Set(uuid::Uuid::new_v4().to_string()),
+            schedule_id: Set(None),
+            schedule_run_id: Set(None),
+            backup_type: Set("full".to_string()),
+            state: Set("completed".to_string()),
+            started_at: Set(Utc::now()),
+            finished_at: Set(Some(Utc::now())),
+            s3_source_id: Set(source.id),
+            s3_location: Set("external_services/postgres/ledger/1".to_string()),
+            compression_type: Set("gzip".to_string()),
+            created_by: Set(user.id),
+            tags: Set("[]".to_string()),
+            size_bytes: Set(None),
+            file_count: Set(None),
+            error_message: Set(None),
+            expires_at: Set(None),
+            checksum: Set(None),
+            metadata: Set("{}".to_string()),
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert backup");
+        let insert = |db: Arc<sea_orm::DatabaseConnection>| async move {
+            insert_restore_run(
+                db.as_ref(),
+                new_run(service.id, backup.id, user.id, "in_place", None),
+                Some(backup.id),
+                service.id,
+                true,
+            )
+            .await
+        };
+
+        // Cancelled while preparing: the run is terminal, the service is
+        // released for a new restore, and the worker never starts writing.
+        let first = insert(db.clone()).await.expect("first restore accepted");
+        let view = cancel_run_at_safe_point(db.as_ref(), first.id)
+            .await
+            .expect("a preparing run is cancellable");
+        assert_eq!(view.status, CANCELLED_STATUS);
+        assert_eq!(view.phase, CANCELLABLE_PHASE);
+        assert!(view.finished_at.is_some());
+        let err = enter_restore_phase(db.as_ref(), first.id)
+            .await
+            .expect_err("the cancelled worker must stop at its safe point");
+        assert!(matches!(err, RestoreError::Cancelled { .. }), "{err:?}");
+        let stored = load_run_for_update(db.as_ref(), first.id)
+            .await
+            .expect("reload");
+        assert_eq!(stored.status, CANCELLED_STATUS);
+        assert_eq!(
+            stored.phase, CANCELLABLE_PHASE,
+            "the worker did not advance it"
+        );
+
+        // A cancelled run's outcome is never overwritten by a late worker.
+        persist_terminal_state(db.as_ref(), first.id, &Ok(None), TERMINAL_WRITE_RETRY)
+            .await
+            .expect("conditional write is a no-op");
+        assert_eq!(
+            load_run_for_update(db.as_ref(), first.id)
+                .await
+                .unwrap()
+                .status,
+            CANCELLED_STATUS
+        );
+
+        let err = cancel_run_at_safe_point(db.as_ref(), first.id)
+            .await
+            .expect_err("cancelling twice is refused");
+        assert!(
+            matches!(err, RestoreError::RestoreNotActive { .. }),
+            "{err:?}"
+        );
+
+        // Once the worker is past the safe point, cancellation is refused and
+        // the run keeps holding the service.
+        let second = insert(db.clone())
+            .await
+            .expect("the cancelled run released the service");
+        enter_restore_phase(db.as_ref(), second.id)
+            .await
+            .expect("an uncancelled run enters its restore phase");
+        let err = cancel_run_at_safe_point(db.as_ref(), second.id)
+            .await
+            .expect_err("a run writing data is not cancellable");
+        assert!(
+            matches!(&err, RestoreError::RestoreNotCancellable { phase, .. } if phase == "restore"),
+            "{err:?}"
+        );
+        assert_eq!(
+            load_run_for_update(db.as_ref(), second.id)
+                .await
+                .unwrap()
+                .status,
+            "running"
+        );
+        let err = insert(db.clone())
+            .await
+            .expect_err("the writing run still holds the service");
+        assert!(
+            matches!(err, RestoreError::RestoreAlreadyActive { .. }),
+            "{err:?}"
+        );
     }
 }

@@ -6,6 +6,7 @@ import { cn } from './lib/cn'
 
 /** Native disclosures retain mounted form fields and their unsaved values. */
 export function SettingsSection({
+  id,
   title,
   icon: Icon,
   children,
@@ -14,6 +15,11 @@ export function SettingsSection({
   description,
   className,
 }: {
+  /**
+   * DOM id of the disclosure, so a page can deep-link to it. Setting the
+   * element's `open` after mount is picked up through the `toggle` event.
+   */
+  id?: string
   title: string
   icon: LucideIcon
   children: ReactNode
@@ -51,6 +57,7 @@ export function SettingsSection({
 
   return (
     <details
+      id={id}
       ref={detailsRef}
       open={open || hasError}
       onToggle={(event) => {

@@ -16,11 +16,12 @@ import {
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { testS3ConnectionPreview } from '@/lib/s3-sources'
+import { returnToFromSearch } from '@/lib/safe-return-to'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useMutation } from '@tanstack/react-query'
 import { ArrowLeft, PlugZap, Plus, RefreshCw } from 'lucide-react'
 import { useState } from 'react'
-import { Link, useNavigate } from 'react-router'
+import { Link, useNavigate, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
 
 interface NewS3Source {
@@ -36,6 +37,10 @@ interface NewS3Source {
 export function CreateS3Source() {
   usePageTitle('Create S3 Source')
   const navigate = useNavigate()
+  // `?returnTo=` brings the operator back to the page that sent them here
+  // (for example a database's Backups card) on save or cancel.
+  const [searchParams] = useSearchParams()
+  const returnTo = returnToFromSearch(searchParams) ?? '/backups'
   const [formData, setFormData] = useState<Partial<NewS3Source>>({
     force_path_style: false,
   })
@@ -47,7 +52,7 @@ export function CreateS3Source() {
     },
     onSuccess: () => {
       toast.success('S3 source created successfully')
-      navigate('/backups')
+      navigate(returnTo)
     },
   })
 
@@ -131,7 +136,8 @@ export function CreateS3Source() {
       <div className="mb-6">
         <div className="flex items-center gap-2 mb-2">
           <Link
-            to="/backups"
+            to={returnTo}
+            aria-label="Back"
             className="flex items-center text-muted-foreground hover:text-foreground"
           >
             <ArrowLeft className="h-4 w-4" />
@@ -286,7 +292,7 @@ export function CreateS3Source() {
               <Button
                 type="button"
                 variant="outline"
-                onClick={() => navigate('/backups')}
+                onClick={() => navigate(returnTo)}
                 disabled={
                   createMutation.isPending || testConnectionMutation.isPending
                 }

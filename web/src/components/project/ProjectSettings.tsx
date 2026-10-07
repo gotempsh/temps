@@ -4,24 +4,15 @@
 import { ProjectResponse } from '@/api/client'
 import { Navigate, Route, Routes } from 'react-router'
 import { CronJobDetail } from './settings/CronJobDetail'
-import { CronJobsSettings } from './settings/CronJobsSettings'
-import { DomainsSettings } from './settings/DomainsSettings'
-import { EnvironmentVariablesSettings } from './settings/EnvironmentVariablesSettings'
+import { LegacyProjectRouteRedirect } from './LegacyProjectRouteRedirect'
 import { CombinedProjectSettings } from './settings/CombinedProjectSettings'
-import { GitSettings } from './settings/GitSettings'
-import { BuildDeploySettings } from './settings/BuildDeploySettings'
 import { ProjectAccessSettings } from './settings/ProjectAccessSettings'
 import { ProjectSecuritySettings } from './settings/ProjectSecuritySettings'
-import { McpServersSettings } from './settings/McpServersSettings'
-import { SecretsSettings } from './settings/SecretsSettings'
 import { SecretPage } from './settings/SecretPage'
-import { SkillsSettings } from './settings/SkillsSettings'
 import { TelemetrySettings } from './settings/TelemetrySettings'
-import { WebhooksSettings } from './settings/WebhooksSettings'
 import { CreateWebhookPage } from './settings/webhooks/CreateWebhookPage'
 import { EditWebhookPage } from './settings/webhooks/EditWebhookPage'
 import { WebhookDetail } from './settings/webhooks/WebhookDetail'
-import { DeploymentTokensSettings } from './settings/DeploymentTokensSettings'
 
 interface ProjectSettingsProps {
   project: ProjectResponse
@@ -58,12 +49,33 @@ export function ProjectSettings({ project, refetch }: ProjectSettingsProps) {
             />
           }
         />
-        <Route path="domains" element={<DomainsSettings project={project} />} />
+        <Route
+          path="domains"
+          element={
+            <LegacyProjectRouteRedirect
+              projectSlug={project.slug}
+              route="settings/domains"
+            />
+          }
+        />
         <Route
           path="environment-variables"
-          element={<EnvironmentVariablesSettings project={project} />}
+          element={
+            <LegacyProjectRouteRedirect
+              projectSlug={project.slug}
+              route="settings/environment-variables"
+            />
+          }
         />
-        <Route path="secrets" element={<SecretsSettings project={project} />} />
+        <Route
+          path="secrets"
+          element={
+            <LegacyProjectRouteRedirect
+              projectSlug={project.slug}
+              route="settings/secrets"
+            />
+          }
+        />
         <Route
           path="secrets/:secretId"
           element={<SecretPage project={project} />}
@@ -74,11 +86,21 @@ export function ProjectSettings({ project, refetch }: ProjectSettingsProps) {
         />
         <Route
           path="git"
-          element={<GitSettings project={project} refetch={refetch} />}
+          element={
+            <LegacyProjectRouteRedirect
+              projectSlug={project.slug}
+              route="settings/git"
+            />
+          }
         />
         <Route
           path="build"
-          element={<BuildDeploySettings project={project} refetch={refetch} />}
+          element={
+            <LegacyProjectRouteRedirect
+              projectSlug={project.slug}
+              route="settings/build"
+            />
+          }
         />
         <Route
           path="security"
@@ -91,14 +113,30 @@ export function ProjectSettings({ project, refetch }: ProjectSettingsProps) {
           element={<ProjectAccessSettings project={project} />}
         />
         <Route path="cron-jobs">
-          <Route index element={<CronJobsSettings project={project} />} />
+          <Route
+            index
+            element={
+              <LegacyProjectRouteRedirect
+                projectSlug={project.slug}
+                route="settings/cron-jobs"
+              />
+            }
+          />
           <Route
             path=":environmentId/:cronId"
             element={<CronJobDetail project={project} />}
           />
         </Route>
         <Route path="webhooks">
-          <Route index element={<WebhooksSettings project={project} />} />
+          <Route
+            index
+            element={
+              <LegacyProjectRouteRedirect
+                projectSlug={project.slug}
+                route="settings/webhooks"
+              />
+            }
+          />
           <Route path="new" element={<CreateWebhookPage project={project} />} />
           <Route
             path=":webhookId/edit"
@@ -109,14 +147,32 @@ export function ProjectSettings({ project, refetch }: ProjectSettingsProps) {
           path="webhooks/:webhookId"
           element={<WebhookDetail project={project} />}
         />
-        <Route path="skills" element={<SkillsSettings project={project} />} />
+        <Route
+          path="skills"
+          element={
+            <LegacyProjectRouteRedirect
+              projectSlug={project.slug}
+              route="settings/skills"
+            />
+          }
+        />
         <Route
           path="mcp-servers"
-          element={<McpServersSettings project={project} />}
+          element={
+            <LegacyProjectRouteRedirect
+              projectSlug={project.slug}
+              route="settings/mcp-servers"
+            />
+          }
         />
         <Route
           path="deployment-tokens"
-          element={<DeploymentTokensSettings project={project} />}
+          element={
+            <LegacyProjectRouteRedirect
+              projectSlug={project.slug}
+              route="settings/deployment-tokens"
+            />
+          }
         />
         <Route
           path="telemetry"

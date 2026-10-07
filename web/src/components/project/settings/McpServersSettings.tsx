@@ -99,8 +99,7 @@ export function McpServersSettings({ project }: McpServersSettingsProps) {
     <div>
       <div className="flex items-center justify-between mb-4">
         <div>
-          <h2 className="text-lg font-semibold">MCP Servers</h2>
-          <p className="text-sm text-muted-foreground mt-1">
+          <p className="text-sm text-muted-foreground">
             Define MCP server configurations that can be assigned to AI
             workflows. Configs are merged into{' '}
             <code className="text-xs bg-muted px-1 rounded">

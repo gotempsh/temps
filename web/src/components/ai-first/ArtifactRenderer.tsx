@@ -80,7 +80,7 @@ function CredentialRequestArtifact({
   const requirements = rows(payload.requirements ?? payload.rows)
   const projectId = positiveInteger(payload.project_id)
   const destination = projectId
-    ? `/projects/${projectId}/settings/environment-variables`
+    ? `/projects/${projectId}/environment-variables`
     : '/projects'
 
   return (

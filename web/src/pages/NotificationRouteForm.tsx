@@ -8,6 +8,7 @@ import {
   listNotificationRoutesQueryKey,
   updateNotificationRouteMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { RouteTestButton } from '@/components/monitoring/RouteTestButton'
 import type { NotificationProviderResponse } from '@/api/client/types.gen'
 import {
   configuredSlackChannel,
@@ -41,7 +42,18 @@ import { usePageTitle } from '@/hooks/usePageTitle'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowLeft, BellRing, Route as RouteIcon } from 'lucide-react'
 import { FormEvent, useEffect, useMemo, useState } from 'react'
-import { useNavigate, useParams } from 'react-router'
+import {
+  useLocation,
+  useNavigate,
+  useParams,
+  useSearchParams,
+} from 'react-router'
+import {
+  locationPath,
+  returnNavigation,
+  safeReturnTo,
+  withReturnTo,
+} from '@/lib/safe-return-to'
 import { toast } from 'sonner'
 
 type RouteDraft = {
@@ -63,6 +75,10 @@ const emptyDraft = (): RouteDraft => ({
 export function NotificationRouteForm() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
+  const location = useLocation()
+  const [searchParams] = useSearchParams()
+  // Set when a task sent the user here to add a route first.
+  const returnTo = safeReturnTo(searchParams.get('returnTo'))
   const queryClient = useQueryClient()
   const { setBreadcrumbs } = useBreadcrumbs()
   const routeId = Number.parseInt(id || '0', 10)
@@ -127,7 +143,10 @@ export function NotificationRouteForm() {
     [providers]
   )
 
-  const returnToRoutes = () => navigate('/settings/notifications?tab=routes')
+  const returnToRoutes = () =>
+    returnTo
+      ? navigate(returnTo, returnNavigation())
+      : navigate('/settings/notifications?tab=routes')
   const onSaved = async (message: string) => {
     await queryClient.invalidateQueries({
       queryKey: listNotificationRoutesQueryKey(),
@@ -202,17 +221,23 @@ export function NotificationRouteForm() {
         <div className="space-y-4">
           <Button variant="ghost" className="-ml-3" onClick={returnToRoutes}>
             <ArrowLeft className="mr-2 h-4 w-4" />
-            Back to Routes
+            {returnTo ? 'Back' : 'Back to Routes'}
           </Button>
-          <div>
-            <h1 className="text-2xl font-semibold tracking-tight">
-              {isEditing
-                ? 'Edit Notification Route'
-                : 'Create Notification Route'}
-            </h1>
-            <p className="mt-1 text-muted-foreground">
-              Match a severity range to one or more notification destinations.
-            </p>
+          <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+            <div>
+              <h1 className="text-2xl font-semibold tracking-tight">
+                {isEditing
+                  ? 'Edit Notification Route'
+                  : 'Create Notification Route'}
+              </h1>
+              <p className="mt-1 text-muted-foreground">
+                Match a severity range to one or more notification destinations.
+                Routes apply to all projects.
+              </p>
+            </div>
+            {isEditing && route && (
+              <RouteTestButton routeId={route.id} routeName={route.name} />
+            )}
           </div>
         </div>
 
@@ -328,7 +353,14 @@ export function NotificationRouteForm() {
                         type="button"
                         variant="outline"
                         className="mt-4"
-                        onClick={() => navigate('/settings/notifications/new')}
+                        onClick={() =>
+                          navigate(
+                            withReturnTo(
+                              '/settings/notifications/new',
+                              locationPath(location)
+                            )
+                          )
+                        }
                       >
                         Add Provider
                       </Button>

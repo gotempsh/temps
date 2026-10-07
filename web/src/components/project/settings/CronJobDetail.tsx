@@ -28,6 +28,7 @@ import {
 } from '@temps-sdk/ds'
 import { useParams } from 'react-router'
 import { useGoBack } from '@/hooks/useGoBack'
+import { settingsSectionHref } from '@/lib/project-settings-sections'
 
 const executionColumns: DataTableColumn<CronExecutionInfo>[] = [
   {
@@ -75,7 +76,9 @@ interface CronJobDetailProps {
 }
 
 export function CronJobDetail({ project }: CronJobDetailProps) {
-  const goBack = useGoBack(`/projects/${project.slug}/settings/cron-jobs`)
+  const goBack = useGoBack(
+    settingsSectionHref(project.slug, 'automation', 'cron-jobs')
+  )
   const { environmentId, cronId } = useParams<{
     environmentId: string
     cronId: string

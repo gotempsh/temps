@@ -17,6 +17,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { EmptyState } from '@/components/ui/empty-state'
 import { getProjectsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { settingsSectionHref } from '@/lib/project-settings-sections'
 
 // AI Workflows (autofixer/agent runs) are configured per project, unlike
 // the other AI tabs (Providers/Usage/Chats/Skills/MCP Servers) which are
@@ -75,7 +76,7 @@ export function AiWorkflowsOverview() {
             {projects.map((project) => (
               <Link
                 key={project.id}
-                to={`/projects/${project.slug}/agents`}
+                to={settingsSectionHref(project.slug, 'automation', 'agents')}
                 className="flex items-center justify-between rounded-md px-3 py-2.5 transition-colors hover:bg-accent"
               >
                 <span className="flex items-center gap-2 text-sm font-medium">

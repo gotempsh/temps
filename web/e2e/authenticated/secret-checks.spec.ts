@@ -72,7 +72,9 @@ test.describe('secret credential checks', () => {
       uniqueSlug('secret-checks', testInfo)
     )
     try {
-      await page.goto(`/projects/${project.slug}/settings/secrets`)
+      await page.goto(
+        `/projects/${project.slug}/settings/variables?section=secrets`
+      )
       await page
         .getByRole('button', { name: /New secret/ })
         .first()

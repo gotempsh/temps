@@ -38,7 +38,10 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { FileLock2, Plus, Trash2 } from 'lucide-react'
 import { useMemo, useState } from 'react'
-import { Link, useNavigate } from 'react-router'
+import { Link, useLocation, useNavigate } from 'react-router'
+import { detailReturnState } from '@/lib/detail-return-path'
+import { useVariableChangeRedeploy } from '@/hooks/useVariableChangeRedeploy'
+import type { VariableChangeScope } from '@/lib/variable-change-redeploy'
 import { toast } from 'sonner'
 import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
 import {
@@ -59,6 +62,8 @@ const KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,254}$/
 export function SecretsSettings({ project }: SecretsSettingsProps) {
   const queryClient = useQueryClient()
   const navigate = useNavigate()
+  const location = useLocation()
+  const notifyChange = useVariableChangeRedeploy(project)
   const checksQuery = useHttpChecks(project.id)
   const checksBySecret = useMemo(
     () => indicatorsBySubject(checksQuery.data ?? [], 'secret'),
@@ -105,10 +110,6 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
     <div className="space-y-6">
       <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
         <div>
-          <h2 className="text-lg font-semibold flex items-center gap-2">
-            <FileLock2 className="h-5 w-5" />
-            Secrets
-          </h2>
           <p className="text-sm text-muted-foreground max-w-2xl">
             Secrets are mounted into your containers as files at{' '}
             <code className="text-xs bg-muted px-1.5 py-0.5 rounded">
@@ -161,8 +162,18 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
               projectId={project.id}
               detailPath={secretPath(s.id)}
               checks={checksBySecret.get(s.id) ?? []}
-              onManageChecks={() => navigate(secretPath(s.id))}
-              onDeleted={refetchSecrets}
+              onManageChecks={() =>
+                navigate(secretPath(s.id), {
+                  state: detailReturnState(location),
+                })
+              }
+              onDeleted={() => {
+                refetchSecrets()
+                void notifyChange(
+                  `Secret ${s.key} deleted`,
+                  secretScope(s.environments)
+                )
+              }}
             />
           ))}
         </div>
@@ -175,10 +186,23 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
         environments={environments}
         composeServiceNames={composeServiceNames}
         isComposeProject={isComposeProject}
-        onCreated={refetchSecrets}
+        onCreated={(key, environmentIds) => {
+          refetchSecrets()
+          void notifyChange(
+            `Secret ${key} created`,
+            secretScope(environmentIds.map((id) => ({ id })))
+          )
+        }}
       />
     </div>
   )
+}
+
+/** A secret with no environments is mounted in every environment. */
+function secretScope(environments: Array<{ id: number }>): VariableChangeScope {
+  return environments.length === 0
+    ? 'all'
+    : environments.map((environment) => environment.id)
 }
 
 /** Compose service names the project last synced from its compose file.
@@ -227,10 +251,10 @@ function SecretRow({
   onManageChecks,
   onDeleted,
 }: SecretRowProps) {
+  const location = useLocation()
   const deleteMutation = useMutation({
     ...deleteProjectSecretMutation(),
     onSuccess: () => {
-      toast.success(`Secret ${secret.key} deleted. Redeploy to take effect.`)
       onDeleted()
     },
     onError: (err: Error) => {
@@ -246,6 +270,7 @@ function SecretRow({
       <div className="min-w-0 flex-1">
         <Link
           to={detailPath}
+          state={detailReturnState(location)}
           className="block font-mono text-sm truncate underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-ring"
         >
           {secret.key}
@@ -309,7 +334,8 @@ interface CreateSecretDialogProps {
   environments: Array<{ id: number; name: string }>
   composeServiceNames: string[]
   isComposeProject: boolean
-  onCreated: () => void
+  /** Called with the new secret's key and the environments it was scoped to. */
+  onCreated: (key: string, environmentIds: number[]) => void
 }
 
 // Default-select environments whose name matches production or preview.
@@ -356,11 +382,8 @@ function CreateSecretDialog({
 
   const createMutation = useMutation({
     ...createProjectSecretMutation(),
-    onSuccess: () => {
-      toast.success(
-        `Secret ${key} created. Redeploy to mount it at /run/secrets/${key}.`
-      )
-      onCreated()
+    onSuccess: (_data, request) => {
+      onCreated(request.body.key, request.body.environment_ids ?? [])
       setKey('')
       setValue('')
       setEnvironmentIds(defaultEnvironmentSelection(environments))

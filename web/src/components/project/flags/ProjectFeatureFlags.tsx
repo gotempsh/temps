@@ -117,9 +117,6 @@ export function ProjectFeatureFlags({ project }: ProjectFeatureFlagsProps) {
     <div className="space-y-6">
       <div className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
         <div className="space-y-1">
-          <h2 className="text-2xl font-semibold tracking-tight">
-            Feature flags
-          </h2>
           <p className="text-sm text-muted-foreground">
             Change how your app behaves at runtime. Unlike environment
             variables, a flag takes effect in seconds without a redeploy.

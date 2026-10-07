@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import {
+  cancelRestoreRunMutation,
   planRestoreMutation,
   startRestoreMutation,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -110,6 +111,14 @@ import {
   type CompletionLedger,
   type QueryErrorKind,
 } from './service-restore/restore-state'
+import {
+  hasBackupSelection,
+  isSelectedBackup,
+  parseRestoreSelection,
+  patchRestoreSelection,
+  type RestoreSelectionPatch,
+} from './service-restore/restore-selection'
+import { cancelRefusal } from './service-restore/run-context'
 
 type Mode = 'in_place' | 'new_service' | 'pitr'
 
@@ -264,14 +273,24 @@ export function ServiceRestore() {
       ? 'reattached'
       : attachReasonFromLocationState(location.state)
 
+  // ----- Selection ----------------------------------------------------------
+  // The source, backup and mode live in the URL (`?source=&backup=&mode=`),
+  // so a reload, a shared link or a "Restore this backup" link reproduces
+  // them. See restore-selection.ts.
+  const selection = parseRestoreSelection(searchParams)
+  const selectedSourceId = selection.sourceId
+  const mode: Mode = selection.mode
+  const updateSelection = useCallback(
+    (patch: RestoreSelectionPatch) =>
+      setSearchParams((prev) => patchRestoreSelection(prev, patch), {
+        replace: true,
+      }),
+    [setSearchParams]
+  )
+
   // ----- Local state --------------------------------------------------------
   // Kept in this component, which stays mounted through load errors and
   // retries, so a retry never discards what the user already picked.
-  const [selectedSourceId, setSelectedSourceId] = useState<number | undefined>()
-  const [selectedBackup, setSelectedBackup] = useState<
-    SourceBackupEntry | undefined
-  >()
-  const [mode, setMode] = useState<Mode>('in_place')
   // `undefined` means the suggestion has not been edited. An explicit empty
   // string must stay empty so validation can reject a cleared name.
   const [newServiceName, setNewServiceName] = useState<string | undefined>()
@@ -315,6 +334,20 @@ export function ServiceRestore() {
     [backupIndex]
   )
 
+  // The backup the URL selects, once this source's backups have loaded. A
+  // backup of another engine is never selected, even by a crafted link.
+  // `find` returns the list's own entry, so its identity is stable.
+  const targetEngine = (service?.service_type ?? '').toLowerCase()
+  const selectedBackup = allBackups.find(
+    (b) =>
+      isSelectedBackup(b, selection) &&
+      enginesCompatible(b.engine, targetEngine)
+  )
+  const selectionMissing =
+    hasBackupSelection(selection) &&
+    backupsSection.kind === 'ready' &&
+    !selectedBackup
+
   // Filter rule: the backup row's `engine` must be in the same engine family
   // as the target service. Today the only multi-engine family is the
   // S3-compatible object stores (s3/rustfs/minio/blob), which all use the
@@ -349,6 +382,20 @@ export function ServiceRestore() {
   )
 
   if (backupsPage > backupsTotalPages) setBackupsPage(backupsTotalPages)
+
+  // Open the page of the list that holds a backup selected by the URL, once.
+  const pagedToSelectionRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (!selectedBackup) return
+    const key = `${selectedBackup.source}-${selectedBackup.id}-${selectedBackup.location}`
+    if (pagedToSelectionRef.current === key) return
+    pagedToSelectionRef.current = key
+    const index = filteredBackups.indexOf(selectedBackup)
+    if (index >= 0) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setBackupsPage(Math.floor(index / BACKUPS_PAGE_SIZE) + 1)
+    }
+  }, [selectedBackup, filteredBackups])
 
   const paginatedBackups = useMemo(
     () =>
@@ -424,6 +471,24 @@ export function ServiceRestore() {
       toast.error('Failed to start restore', {
         description: problem.detail || problem.message || 'Unknown error',
       })
+    },
+  })
+
+  // Cancelling is refused by the server once the run starts writing data;
+  // the run's own status (and its completion toast) report a success.
+  const cancelMutation = useMutation({
+    ...cancelRestoreRunMutation(),
+    retry: false,
+    onSuccess: (run) => {
+      queryClient.setQueryData(restoreRunQuery(run.id).queryKey, run)
+      void queryClient.invalidateQueries({
+        queryKey: serviceRestoreRunsQuery(serviceId).queryKey,
+      })
+    },
+    onError: (error) => {
+      const copy = cancelRefusal(error)
+      toast[copy.level](copy.title, { description: copy.description })
+      void runQuery.refetch()
     },
   })
 
@@ -679,6 +744,11 @@ export function ServiceRestore() {
           onBack={() => navigate(`/storage/${serviceId}`)}
           onStartNew={startNewRestore}
           onOpenRestored={(targetId) => navigate(`/storage/${targetId}`)}
+          onCancel={() => {
+            if (typeof effectiveRunId === 'number')
+              cancelMutation.mutate({ path: { id: effectiveRunId } })
+          }}
+          cancelling={cancelMutation.isPending}
         />
       </PageContainer>
     )
@@ -741,8 +811,7 @@ export function ServiceRestore() {
             <Select
               value={effectiveSourceId?.toString()}
               onValueChange={(v) => {
-                setSelectedSourceId(Number(v))
-                setSelectedBackup(undefined)
+                updateSelection({ sourceId: Number(v), backup: null })
                 setBackupsPage(1)
               }}
             >
@@ -880,7 +949,15 @@ export function ServiceRestore() {
                       <TableRow
                         key={`${b.source}-${b.id}-${b.location}`}
                         className={`cursor-pointer ${isSel ? 'bg-accent' : ''}`}
-                        onClick={() => setSelectedBackup(b)}
+                        onClick={() =>
+                          // Pin the source too: with only the backup in the
+                          // URL, a saved link would follow a later change of
+                          // the default source and no longer find it.
+                          updateSelection({
+                            sourceId: effectiveSourceId,
+                            backup: b,
+                          })
+                        }
                       >
                         <TableCell>
                           <RadioGroup value={isSel ? 'on' : ''}>
@@ -979,6 +1056,18 @@ export function ServiceRestore() {
               </div>
             )}
 
+          {selectionMissing ? (
+            <Alert variant="warning">
+              <AlertTriangle className="h-4 w-4" />
+              <AlertTitle>The linked backup is not on this source</AlertTitle>
+              <AlertDescription>
+                This page was opened for a backup that this storage source does
+                not list for a {service.service_type} database. It may have been
+                deleted, or it is stored on another source. Pick a backup below.
+              </AlertDescription>
+            </Alert>
+          ) : null}
+
           {selectedBackup ? (
             <div className="text-xs text-muted-foreground font-mono break-all pt-2">
               Selected: {selectedBackup.location || '(no location)'}
@@ -1027,7 +1116,7 @@ export function ServiceRestore() {
           ) : null}
           <RadioGroup
             value={mode}
-            onValueChange={(v) => setMode(v as Mode)}
+            onValueChange={(v) => updateSelection({ mode: v as Mode })}
             className="grid gap-3"
           >
             <label

@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
-import { Link, useParams } from 'react-router'
+import { Link, useLocation, useParams } from 'react-router'
+import { ArrowLeft } from 'lucide-react'
+import { detailReturnPath } from '@/lib/detail-return-path'
 import { useQuery } from '@tanstack/react-query'
+import { useState } from 'react'
 import type { ProjectResponse } from '@/api/client'
 import { getEnvironmentVariablesOptions } from '@/api/client/@tanstack/react-query.gen'
 import { CheckLoading } from './CheckLoading'
@@ -27,8 +30,22 @@ export function EnvironmentVariablePage({
   const variable = variables.data?.find((item) => item.id === id)
   const listPath = `/projects/${project.slug}/environment-variables`
   const detailPath = `${listPath}/${id}`
+  const location = useLocation()
+  // Captured on arrival: switching tabs on this page replaces the location
+  // state, and the way back should not change because of it.
+  const [backPath] = useState(() =>
+    detailReturnPath(location.state, project.slug, listPath)
+  )
+  const backLabel = backPath === listPath ? 'Environment Variables' : 'Back'
   return (
     <div className="w-full min-w-0 space-y-5">
+      <Link
+        to={backPath}
+        className="inline-flex items-center gap-1.5 text-sm text-muted-foreground underline-offset-4 hover:text-foreground hover:underline"
+      >
+        <ArrowLeft className="size-4" aria-hidden="true" />
+        {backLabel}
+      </Link>
       {valid && variables.isPending ? (
         <CheckLoading label="Loading variable…" />
       ) : variables.isError ? (
@@ -45,7 +62,7 @@ export function EnvironmentVariablePage({
             This variable may have been deleted or is not part of this project.
           </p>
           <Button asChild variant="outline">
-            <Link to={listPath}>Back to environment variables</Link>
+            <Link to={backPath}>Back to Environment Variables</Link>
           </Button>
         </div>
       ) : configure ? (

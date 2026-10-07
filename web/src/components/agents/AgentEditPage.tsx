@@ -37,6 +37,7 @@ import type {
   UpsertAgentRequest,
 } from '@/api/client/types.gen'
 import { aiProviderCatalogQueryOptions } from '@/lib/ai-provider-catalog-query'
+import { settingsSectionHref } from '@/lib/project-settings-sections'
 
 export interface TriggerConfig {
   error?: { new_issue?: boolean; regression?: boolean }
@@ -90,7 +91,9 @@ export function AgentEditPage({ project }: AgentEditPageProps) {
       <div className="flex flex-col items-center justify-center py-20">
         <p className="text-muted-foreground text-sm">Workflow not found</p>
         <Button variant="ghost" size="sm" className="mt-4" asChild>
-          <Link to={`/projects/${project.slug}/agents`}>Back to workflows</Link>
+          <Link to={settingsSectionHref(project.slug, 'automation', 'agents')}>
+            Back to workflows
+          </Link>
         </Button>
       </div>
     )

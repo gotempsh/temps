@@ -148,7 +148,7 @@ export function PageDetail({
     const params = new URLSearchParams()
     params.set('path', pagePath)
     params.set('show_bots', 'yes')
-    navigate(`/projects/${project.slug}/logs?${params.toString()}`)
+    navigate(`/projects/${project.slug}/request-logs?${params.toString()}`)
   }
 
   const totalPages = visitorsData

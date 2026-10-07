@@ -5,6 +5,7 @@ import { linkedResourceCopy } from '@/lib/service-link-copy'
 import {
   deleteServiceMutation,
   getProjectsOptions,
+  listS3SourcesOptions,
   getServiceOptions,
   getServicePreviewEnvironmentVariablesMaskedOptions,
   linkServiceToProjectMutation,
@@ -26,6 +27,15 @@ import {
 } from '@/components/storage/ServiceHealthCard'
 import { WalHealthPanel } from '@/components/storage/WalHealthPanel'
 import { TriggerBackupDialog } from '@/components/storage/TriggerBackupDialog'
+import {
+  ScheduleBackupsAction,
+  ServiceBackupsEmpty,
+} from '@/components/storage/ServiceBackupSetup'
+import {
+  SERVICE_BACKUPS_ANCHOR,
+  backupDestinationState,
+} from '@/lib/service-backup-setup'
+import { ActiveRestoreBanner } from '@/pages/service-restore/ActiveRestoreBanner'
 import { UpgradeServiceDialog } from '@/components/storage/UpgradeServiceDialog'
 import {
   listPgUpgrades,
@@ -326,6 +336,15 @@ export function ServiceDetail() {
   })
 
   const serviceBackups = serviceBackupsData?.backups ?? []
+
+  // Backup destinations decide whether the Backups card can offer to back
+  // this database up or must onboard a destination first.
+  const backupSourcesQuery = useQuery({
+    ...listS3SourcesOptions(),
+    retry: false,
+  })
+  const backupSources = backupSourcesQuery.data ?? []
+  const backupSetupState = backupDestinationState(backupSourcesQuery)
   const backupsTotalPages = Math.max(
     1,
     Math.ceil((serviceBackupsData?.total ?? 0) / BACKUPS_PAGE_SIZE)
@@ -401,6 +420,15 @@ export function ServiceDetail() {
   }, [setBreadcrumbs, id, service])
 
   usePageTitle(service?.service?.name || 'Service Details')
+
+  // Links back from backup setup land on the Backups card (`#backups`).
+  const serviceLoaded = !!service
+  useEffect(() => {
+    if (!serviceLoaded || location.hash !== `#${SERVICE_BACKUPS_ANCHOR}`) return
+    document
+      .getElementById(SERVICE_BACKUPS_ANCHOR)
+      ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }, [serviceLoaded, location.hash])
 
   // Notify when cluster creation completes or fails
   useEffect(() => {
@@ -931,6 +959,8 @@ export function ServiceDetail() {
           <>
             {error ? <Callout tone="error">{error}</Callout> : null}
 
+            <ActiveRestoreBanner serviceId={service.service.id} />
+
             {/*
               Health is the highest-signal block on this page, so it sits
               directly under the header.
@@ -1202,7 +1232,7 @@ export function ServiceDetail() {
             />
 
             {/* Backups Section */}
-            <Card>
+            <Card id={SERVICE_BACKUPS_ANCHOR} className="scroll-mt-20">
               <CardHeader>
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                   <div className="space-y-1.5 min-w-0">
@@ -1220,7 +1250,7 @@ export function ServiceDetail() {
                       Backups of this service stored across your S3 sources
                     </CardDescription>
                   </div>
-                  <div className="flex shrink-0 items-center gap-2">
+                  <div className="flex shrink-0 flex-wrap items-center gap-2">
                     <Button
                       variant="outline"
                       size="icon"
@@ -1247,6 +1277,11 @@ export function ServiceDetail() {
                       <span className="hidden sm:inline">Trigger backup</span>
                       <span className="sm:hidden">Backup</span>
                     </Button>
+                    <ScheduleBackupsAction
+                      serviceId={service.service.id}
+                      state={backupSetupState}
+                      sources={backupSources}
+                    />
                   </div>
                 </div>
               </CardHeader>
@@ -1259,10 +1294,12 @@ export function ServiceDetail() {
                     </span>
                   </div>
                 ) : serviceBackups.length === 0 ? (
-                  <div className="text-sm text-muted-foreground text-center py-8">
-                    No backups found for this service yet. Trigger one or
-                    configure a schedule from an S3 source.
-                  </div>
+                  <ServiceBackupsEmpty
+                    serviceId={service.service.id}
+                    state={backupSetupState}
+                    sources={backupSources}
+                    onTriggerBackup={() => setIsBackupDialogOpen(true)}
+                  />
                 ) : (
                   <ul role="list" className="divide-y divide-border">
                     {paginatedBackups.map((backup) => {

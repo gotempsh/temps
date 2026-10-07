@@ -2,20 +2,19 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type { DeploymentResponse, ProjectResponse } from '@/api/client'
-import { getEnvironmentsOptions } from '@/api/client/@tanstack/react-query.gen'
-import { useQuery } from '@tanstack/react-query'
 import { useEffect, useRef } from 'react'
 import {
   describeDockerSocket,
   HOST_DOCKER_ACCESS_SHORT_LABEL,
 } from '@/lib/docker-socket'
-import { projectDeploymentStatus } from '@/lib/project-deployment-status'
+import type { ProjectDeploymentStatus } from '@/lib/project-deployment-status'
 import { isActiveDeploymentStatus } from '@/lib/recent-deployments'
 import { ProjectAvatar } from '@/components/project/ProjectAvatar'
-import { Badge } from '@/components/ui/badge'
+import { Badge, badgeVariants } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { ReloadableImage } from '@/components/utils/ReloadableImage'
 import { useDashboardHealth } from '@/hooks/useDashboardHealth'
+import { useProjectFailureState } from '@/hooks/useProjectFailureState'
 import { useProjectsMonitorHealth } from '@/hooks/useProjectsMonitorHealth'
 import {
   projectHealthIndicator,
@@ -27,6 +26,7 @@ import {
   type GitProviderKind,
 } from '@/lib/project-header-actions'
 import {
+  AlertTriangle,
   ExternalLink,
   GitFork,
   Loader2,
@@ -39,6 +39,22 @@ import GiteaIcon from '@/icons/Gitea'
 import GithubIcon from '@/icons/Github'
 import GitlabIcon from '@/icons/Gitlab'
 import { Link, useNavigate } from 'react-router'
+import { liveVisitorsPillLabel } from '@/components/analytics/analytics-onboarding'
+
+/** Badge variant for the problem states, which link to the overview. */
+const deploymentStatusBadgeVariant: Record<
+  Extract<ProjectDeploymentStatus, 'Failed' | 'Degraded'>,
+  'destructive' | 'warning'
+> = {
+  Failed: 'destructive',
+  Degraded: 'warning',
+}
+
+function isProblemStatus(
+  status: ProjectDeploymentStatus | undefined
+): status is 'Failed' | 'Degraded' {
+  return status === 'Failed' || status === 'Degraded'
+}
 
 /**
  * Tones for the header health badge. Mirrors the projects-list card so the same
@@ -108,16 +124,10 @@ export function ProjectDetailHeader({
   // grant is absent.
   const dockerSocket = describeDockerSocket(project.docker_socket)
   const screenshotLocation = lastDeployment?.screenshot_location
-  const environmentsQuery = useQuery({
-    ...getEnvironmentsOptions({ path: { project_id: project.id } }),
-    refetchInterval: 5_000,
-  })
   // Latest build and currently deployed version can be different, including
   // during builds, after failures, and following a rollback.
-  const deploymentStatus = projectDeploymentStatus(
-    environmentsQuery.data,
-    lastDeployment
-  )
+  const { status: deploymentStatus, environmentsQuery } =
+    useProjectFailureState(project.id, lastDeployment)
   // When a build finishes, its environment pointer is already set; refetch at
   // once so "Deploying" turns into "Deployed" instead of briefly reading
   // "Not deployed" until the next poll.
@@ -142,11 +152,14 @@ export function ProjectDetailHeader({
     ? gitProviderKind(repositoryProviderType, repositoryCloneUrl)
     : null
 
+  // Always navigable: at zero, Live visitors explains why it is empty and
+  // links to analytics setup when nothing has been installed yet.
   const handleVisitorsClick = () => {
-    if ((activeVisitorsCount?.active_visitors ?? 0) > 0) {
-      navigate(`/projects/${project.slug}/analytics/live-visitors`)
-    }
+    navigate(`/projects/${project.slug}/analytics/live-visitors`)
   }
+  const visitorsLabel = liveVisitorsPillLabel(
+    activeVisitorsCount?.active_visitors ?? 0
+  )
 
   return (
     <header className="flex h-12 sm:h-16 shrink-0 items-center gap-2 border-b px-3 sm:px-4">
@@ -171,18 +184,41 @@ export function ProjectDetailHeader({
             <h1 className="text-base sm:text-lg font-semibold truncate">
               {project.slug}
             </h1>
-            <Badge
-              variant={deploymentStatus === 'Deployed' ? 'default' : 'outline'}
-              className="hidden sm:inline-flex shrink-0 gap-1"
-            >
-              {deploymentStatus === 'Deploying' && (
-                <Loader2 aria-hidden="true" className="size-3 animate-spin" />
-              )}
-              {deploymentStatus ??
-                (environmentsQuery.isError
-                  ? 'Deployment status unavailable'
-                  : 'Checking deployment…')}
-            </Badge>
+            {isProblemStatus(deploymentStatus) ? (
+              // Failed / Degraded link to the overview banner that explains
+              // the problem and offers the fix. Unlike the routine states it
+              // stays visible on phones, where it shrinks to its icon so the
+              // header's actions still fit.
+              <Link
+                to={`/projects/${project.slug}/project`}
+                className={`${badgeVariants({ variant: deploymentStatusBadgeVariant[deploymentStatus] })} inline-flex shrink-0 gap-1`}
+                title={
+                  deploymentStatus === 'Failed'
+                    ? 'The latest deployment failed. Open the overview for the reason and recovery actions.'
+                    : 'Live containers are down or restarting. Open the overview for details and recovery actions.'
+                }
+              >
+                <AlertTriangle aria-hidden="true" className="size-3" />
+                <span className="sr-only sm:not-sr-only">
+                  {deploymentStatus}
+                </span>
+              </Link>
+            ) : (
+              <Badge
+                variant={
+                  deploymentStatus === 'Deployed' ? 'default' : 'outline'
+                }
+                className="hidden sm:inline-flex shrink-0 gap-1"
+              >
+                {deploymentStatus === 'Deploying' && (
+                  <Loader2 aria-hidden="true" className="size-3 animate-spin" />
+                )}
+                {deploymentStatus ??
+                  (environmentsQuery.isError
+                    ? 'Deployment status unavailable'
+                    : 'Checking deployment…')}
+              </Badge>
+            )}
             {dockerSocket.state === 'granted' && (
               // Deliberately NOT hidden below `sm` like the badges around it:
               // this is the only place the console states that the project is
@@ -219,18 +255,11 @@ export function ProjectDetailHeader({
         <div className="flex items-center gap-2">
           {activeVisitorsCount !== undefined && (
             <button
+              type="button"
               onClick={handleVisitorsClick}
-              disabled={(activeVisitorsCount?.active_visitors ?? 0) === 0}
-              className={`flex items-center gap-1.5 px-2.5 py-1.5 bg-muted/30 rounded-full transition-colors ${
-                (activeVisitorsCount?.active_visitors ?? 0) > 0
-                  ? 'cursor-pointer hover:bg-muted/50 active:bg-muted/70'
-                  : 'cursor-default'
-              }`}
-              title={
-                (activeVisitorsCount?.active_visitors ?? 0) > 0
-                  ? 'Click to view live visitors'
-                  : 'No active visitors'
-              }
+              className="flex cursor-pointer items-center gap-1.5 rounded-full bg-muted/30 px-2.5 py-1.5 transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring active:bg-muted/70"
+              title={visitorsLabel}
+              aria-label={visitorsLabel}
             >
               <div
                 className={`h-2 w-2 rounded-full ${activeVisitorsCount?.active_visitors > 0 ? 'bg-green-500 animate-pulse' : 'bg-gray-400'}`}

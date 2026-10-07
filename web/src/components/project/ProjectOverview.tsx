@@ -25,6 +25,7 @@ import { ThresholdLineChart } from '@/components/charts/threshold-line-chart'
 import { VisitorSparkline } from '@/components/dashboard/VisitorSparkline'
 import { LastDeployment } from '@/components/deployments/LastDeployment'
 import { RecentDeployments } from '@/components/deployments/RecentDeployments'
+import { ProjectFailureBanner } from '@/components/project/ProjectFailureBanner'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader } from '@/components/ui/card'
@@ -206,6 +207,7 @@ export function ProjectOverview({
 
   return (
     <>
+      <ProjectFailureBanner project={project} lastDeployment={lastDeployment} />
       <div className="@container/overview">
         <div className="grid gap-4 @5xl/overview:grid-cols-5">
           <Card className="@5xl/overview:col-span-3">

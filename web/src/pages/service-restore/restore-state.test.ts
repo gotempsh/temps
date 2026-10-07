@@ -39,6 +39,7 @@ function run(overrides: Partial<RestoreRunView> = {}): RestoreRunView {
     mode: 'in_place',
     phase: 'prepare',
     source_backup_id: 3,
+    source_backup: { id: 3 },
     source_service_id: 7,
     status: 'pending',
     ...overrides,
