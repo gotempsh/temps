@@ -10,8 +10,11 @@ import {
   OperationsTrayPanel,
   type OperationsSectionState,
   type OperationsTrayPanelProps,
-  type RunningSectionState,
 } from './OperationsTrayPanel'
+import {
+  EMPTY_OPERATIONS_PAGE_NAV,
+  type OperationsPageNav,
+} from '@/lib/operations'
 
 const NOW = Date.parse('2026-10-07T12:00:00Z')
 const noop = () => {}
@@ -52,24 +55,23 @@ function section(
     isError: false,
     errorMessage: null,
     onRetry: noop,
-    hasMore: false,
-    isFetchingMore: false,
-    onLoadMore: noop,
+    nav: EMPTY_OPERATIONS_PAGE_NAV,
+    isPaging: false,
+    onNewer: noop,
+    onOlder: noop,
     ...overrides,
   }
 }
 
-function runningSection(
-  overrides: Partial<RunningSectionState> = {}
-): RunningSectionState {
-  return { ...section(), notLoaded: 0, ...overrides }
+function nav(overrides: Partial<OperationsPageNav>): OperationsPageNav {
+  return { ...EMPTY_OPERATIONS_PAGE_NAV, ...overrides }
 }
 
 function render(props: Partial<OperationsTrayPanelProps> = {}) {
   return renderToStaticMarkup(
     <MemoryRouter>
       <OperationsTrayPanel
-        running={runningSection()}
+        running={section()}
         recent={section()}
         localOperations={[]}
         runningCount={0}
@@ -84,7 +86,7 @@ function render(props: Partial<OperationsTrayPanelProps> = {}) {
 describe('OperationsTrayPanel', () => {
   test('loading renders skeleton rows, not a spinner', () => {
     const html = render({
-      running: runningSection({ isPending: true }),
+      running: section({ isPending: true }),
       recent: section({ isPending: true }),
     })
     expect(html).toContain('animate-pulse')
@@ -93,7 +95,7 @@ describe('OperationsTrayPanel', () => {
 
   test('error state explains and offers retry', () => {
     const html = render({
-      running: runningSection({
+      running: section({
         isError: true,
         errorMessage: 'Database timeout',
       }),
@@ -110,7 +112,7 @@ describe('OperationsTrayPanel', () => {
 
   test('rows link to the resource with status, context and time', () => {
     const html = render({
-      running: runningSection({ operations: [entry()] }),
+      running: section({ operations: [entry()] }),
       runningCount: 1,
     })
     expect(html).toContain('href="/projects/shop/deployments/42"')
@@ -144,7 +146,7 @@ describe('OperationsTrayPanel', () => {
 
   test('renders running and recent work as separate sections', () => {
     const html = render({
-      running: runningSection({ operations: [entry()] }),
+      running: section({ operations: [entry()] }),
       recent: section({
         operations: [
           entry({ id: 'deployment:40', status: 'succeeded', title: 'Deploy' }),
@@ -179,8 +181,11 @@ describe('OperationsTrayPanel', () => {
       })
     )
     const html = render({
-      running: runningSection({ operations: [oldRestore] }),
-      recent: section({ operations: newerFinished, hasMore: true }),
+      running: section({ operations: [oldRestore] }),
+      recent: section({
+        operations: newerFinished,
+        nav: nav({ hasOlder: true, first: 1, last: 20, total: 60 }),
+      }),
       runningCount: 1,
     })
     expect(html).toContain('Restore orders-db')
@@ -189,42 +194,47 @@ describe('OperationsTrayPanel', () => {
     expect(html).toContain('1 running')
   })
 
-  test('offers the counted running operations that are not loaded yet', () => {
+  test('counted running work past the first page is one click away', () => {
     const html = render({
-      running: runningSection({
+      running: section({
         operations: [entry()],
-        hasMore: true,
-        notLoaded: 12,
+        nav: nav({ page: 1, hasOlder: true, first: 1, last: 100, total: 113 }),
       }),
-      runningCount: 13,
+      runningCount: 113,
     })
-    expect(html).toContain('Show 12 more running')
-    expect(html).toContain('13 running')
+    expect(html).toContain('aria-label="Older running operations"')
+    expect(html).toContain('1–100 of 113')
+    expect(html).toContain('113 running')
   })
 
-  test('history offers older pages and disables the button while loading', () => {
+  test('history pages replace each other and disable while loading', () => {
     const finished = section({
       operations: [entry({ id: 'deployment:40', status: 'succeeded' })],
-      hasMore: true,
+      nav: nav({ page: 2, hasNewer: true, hasOlder: true, first: 21, last: 40, total: 60 }),
     })
-    expect(render({ recent: finished })).toContain('Load older operations')
-    const loading = render({ recent: { ...finished, isFetchingMore: true } })
-    expect(loading).toContain('Loading…')
-    expect(loading).toContain('disabled')
+    const html = render({ recent: finished })
+    expect(html).toContain('aria-label="Newer recent operations"')
+    expect(html).toContain('aria-label="Older recent operations"')
+    expect(html).toContain('21–40 of 60')
+    const paging = render({ recent: { ...finished, isPaging: true } })
+    expect(paging).toContain('Loading…')
+    expect(paging).toContain('disabled')
   })
 
-  test('no load-more control once every page is loaded', () => {
+  test('no paging controls when everything fits on one page', () => {
     const html = render({
       recent: section({
         operations: [entry({ id: 'deployment:40', status: 'succeeded' })],
+        nav: nav({ first: 1, last: 1, total: 1 }),
       }),
     })
-    expect(html).not.toContain('Load older operations')
+    expect(html).not.toContain('Older recent operations')
+    expect(html).not.toContain('Newer recent operations')
   })
 
   test('a failing history feed keeps running rows and offers retry', () => {
     const html = render({
-      running: runningSection({ operations: [entry()] }),
+      running: section({ operations: [entry()] }),
       recent: section({ isError: true, errorMessage: 'history timed out' }),
       runningCount: 1,
     })
@@ -236,7 +246,7 @@ describe('OperationsTrayPanel', () => {
 
   test('history still loading shows a skeleton under the running rows', () => {
     const html = render({
-      running: runningSection({ operations: [entry()] }),
+      running: section({ operations: [entry()] }),
       recent: section({ isPending: true }),
       runningCount: 1,
     })

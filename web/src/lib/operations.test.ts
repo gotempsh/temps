@@ -8,8 +8,8 @@ import type {
 import { QueryClient } from '@tanstack/react-query'
 import { describe, expect, test } from 'bun:test'
 import {
+  EMPTY_OPERATIONS_PAGE_NAV,
   FINISHED_OPERATIONS_QUERY,
-  flattenOperationPages,
   formatRelativeShort,
   groupOperations,
   invalidateOperations,
@@ -18,14 +18,17 @@ import {
   OPERATIONS_OPEN_POLL_MS,
   operationContext,
   operationsBadgeText,
+  operationsClampPage,
+  operationsLastPage,
   operationsLeftRunning,
-  operationsNextPage,
+  operationsPageNav,
   operationsPollInterval,
   operationsTrayFeed,
   operationStatusVariant,
   operationsTriggerLabel,
   operationTimestamp,
   RUNNING_OPERATIONS_QUERY,
+  uniqueOperations,
 } from './operations'
 
 function entry(overrides: Partial<OperationEntry> = {}): OperationEntry {
@@ -208,53 +211,64 @@ describe('tray queries', () => {
   })
 })
 
-describe('operationsNextPage', () => {
-  test('asks for the next page while rows remain on the server', () => {
-    expect(
-      operationsNextPage(page([entry()], { page: 1, page_size: 20, total: 45 }))
-    ).toBe(2)
-    expect(
-      operationsNextPage(page([entry()], { page: 2, page_size: 20, total: 45 }))
-    ).toBe(3)
+describe('operationsPageNav', () => {
+  test('locates a page within the feed', () => {
+    const rows = Array.from({ length: 20 }, (_, i) => entry({ id: `d:${i}` }))
+    expect(operationsPageNav(page(rows, { page: 1, total: 45 }))).toEqual({
+      page: 1,
+      hasNewer: false,
+      hasOlder: true,
+      first: 1,
+      last: 20,
+      total: 45,
+    })
+    const tail = rows.slice(0, 5)
+    expect(operationsPageNav(page(tail, { page: 3, total: 45 }))).toEqual({
+      page: 3,
+      hasNewer: true,
+      hasOlder: false,
+      first: 41,
+      last: 45,
+      total: 45,
+    })
   })
 
-  test('stops once every row is loaded', () => {
-    expect(
-      operationsNextPage(page([entry()], { page: 3, page_size: 20, total: 45 }))
-    ).toBeUndefined()
-    expect(
-      operationsNextPage(page([entry()], { page: 1, page_size: 20, total: 20 }))
-    ).toBeUndefined()
+  test('an empty page has no older page even if the total says otherwise', () => {
+    const nav = operationsPageNav(page([], { page: 2, total: 45 }))
+    expect(nav.hasOlder).toBe(false)
+    expect(nav.first).toBe(0)
   })
 
-  test('stops on an empty page even if the total says otherwise', () => {
-    expect(
-      operationsNextPage(page([], { page: 2, page_size: 20, total: 45 }))
-    ).toBeUndefined()
+  test('no response yet is an empty first page', () => {
+    expect(operationsPageNav(undefined)).toEqual(EMPTY_OPERATIONS_PAGE_NAV)
   })
 })
 
-describe('flattenOperationPages', () => {
-  test('concatenates pages in order and drops repeated ids', () => {
-    const a = entry({ id: 'deployment:3' })
-    const b = entry({ id: 'deployment:2' })
-    const c = entry({ id: 'deployment:1' })
-    // `b` shifted onto page 2 after a new operation arrived.
-    const rows = flattenOperationPages([page([a, b]), page([b, c])])
-    expect(rows.map((op) => op.id)).toEqual([
-      'deployment:3',
-      'deployment:2',
-      'deployment:1',
-    ])
+describe('operationsLastPage / operationsClampPage', () => {
+  test('last page holds the remainder', () => {
+    expect(operationsLastPage(45, 20)).toBe(3)
+    expect(operationsLastPage(40, 20)).toBe(2)
+    expect(operationsLastPage(0, 20)).toBe(1)
   })
 
-  test('skips excluded ids and tolerates no data', () => {
-    const rows = flattenOperationPages(
-      [page([entry({ id: 'a' }), entry({ id: 'b' })])],
-      new Set(['a'])
+  test('steps back when the feed shrank under the user', () => {
+    // Running work finished while the user sat on page 3 of 3.
+    expect(operationsClampPage(3, page([], { page: 3, total: 30 }))).toBe(2)
+    expect(operationsClampPage(3, page([entry()], { page: 3, total: 41 }))).toBe(
+      3
     )
-    expect(rows.map((op) => op.id)).toEqual(['b'])
-    expect(flattenOperationPages(undefined)).toEqual([])
+    expect(operationsClampPage(1, undefined)).toBe(1)
+  })
+})
+
+describe('uniqueOperations', () => {
+  test('drops repeated and excluded ids, keeping order', () => {
+    const rows = uniqueOperations(
+      [entry({ id: 'a' }), entry({ id: 'b' }), entry({ id: 'a' })],
+      new Set(['b'])
+    )
+    expect(rows.map((op) => op.id)).toEqual(['a'])
+    expect(uniqueOperations(undefined)).toEqual([])
   })
 })
 
@@ -268,52 +282,55 @@ describe('operationsTrayFeed', () => {
     const finished = Array.from({ length: 20 }, (_, index) =>
       entry({ id: `deployment:${index}`, status: 'succeeded' })
     )
+    // The restore is older than 20 newer finished operations and still
+    // renders: running work never competes with history for a page.
     const feed = operationsTrayFeed({
-      runningPages: [page([restore], { running_count: 1, page_size: 100 })],
-      finishedPages: [page(finished, { running_count: 1, total: 60 })],
+      runningPage: page([restore], { running_count: 1, page_size: 100 }),
+      finishedPage: page(finished, { running_count: 1, total: 60 }),
     })
     expect(feed.runningCount).toBe(1)
     expect(feed.running.map((op) => op.id)).toEqual(['restore:7'])
     expect(feed.recent).toHaveLength(20)
-    expect(feed.runningNotLoaded).toBe(0)
+    expect(feed.recentNav.hasOlder).toBe(true)
   })
 
-  test('reports counted running work that is not loaded yet', () => {
+  test('holds exactly one page per section, never an accumulation', () => {
+    // REGRESSION (Greptile on #1295): history used to be an infinite query
+    // that kept every page loaded. Paging now replaces the rows, so the feed
+    // never holds more than one page of each section.
+    const older = Array.from({ length: 20 }, (_, i) =>
+      entry({ id: `old:${i}`, status: 'succeeded' })
+    )
     const feed = operationsTrayFeed({
-      runningPages: [
-        page([entry({ id: 'a' }), entry({ id: 'b' })], {
-          running_count: 5,
-          total: 5,
-          page_size: 2,
-        }),
-      ],
-      finishedPages: undefined,
+      runningPage: page([], { page_size: 100 }),
+      finishedPage: page(older, { page: 3, total: 300 }),
     })
-    expect(feed.runningCount).toBe(5)
-    expect(feed.runningNotLoaded).toBe(3)
+    expect(feed.recent).toHaveLength(20)
+    expect(feed.recent[0].id).toBe('old:0')
+    expect(feed.recentNav).toMatchObject({ page: 3, first: 41, last: 60 })
   })
 
   test('a row in both feeds is shown once, under running', () => {
     const feed = operationsTrayFeed({
-      runningPages: [page([entry({ id: 'x' })], { running_count: 1 })],
-      finishedPages: [
-        page([entry({ id: 'x', status: 'succeeded' }), entry({ id: 'y' })]),
-      ],
+      runningPage: page([entry({ id: 'x' })], { running_count: 1 }),
+      finishedPage: page([
+        entry({ id: 'x', status: 'succeeded' }),
+        entry({ id: 'y' }),
+      ]),
     })
     expect(feed.running.map((op) => op.id)).toEqual(['x'])
     expect(feed.recent.map((op) => op.id)).toEqual(['y'])
   })
 
   test('nothing loaded yet means nothing counted', () => {
-    const feed = operationsTrayFeed({
-      runningPages: undefined,
-      finishedPages: undefined,
-    })
-    expect(feed).toEqual({
+    expect(
+      operationsTrayFeed({ runningPage: undefined, finishedPage: undefined })
+    ).toEqual({
       running: [],
       recent: [],
       runningCount: 0,
-      runningNotLoaded: 0,
+      runningNav: EMPTY_OPERATIONS_PAGE_NAV,
+      recentNav: EMPTY_OPERATIONS_PAGE_NAV,
     })
   })
 })

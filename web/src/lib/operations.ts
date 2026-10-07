@@ -29,8 +29,8 @@ import {
 export const OPERATIONS_QUERY_ID = 'listOperations'
 
 /**
- * Page size for in-flight work. The API maximum, so a single request almost
- * always holds every counted operation; further pages are fetched on demand.
+ * Page size for in-flight work. The API maximum, so a single page almost
+ * always holds every counted operation; the rest are reachable by paging.
  */
 export const OPERATIONS_RUNNING_PAGE_SIZE = 100
 
@@ -195,75 +195,134 @@ export function formatRelativeShort(iso: string, now: number): string {
 }
 
 /**
- * `getNextPageParam` for the feed: the next 1-based page, or `undefined` once
- * every operation matching the query has been loaded.
+ * Where one page of the feed sits: what the tray's Newer/Older controls and
+ * "1–20 of 45" label need. The tray shows exactly one page per section and a
+ * page change replaces the rows, so memory stays at one page whatever the
+ * user browses.
  */
-export function operationsNextPage(
-  lastPage: OperationsListResponse
-): number | undefined {
-  if (lastPage.operations.length === 0) return undefined
-  const loadedThrough = lastPage.page * lastPage.page_size
-  return loadedThrough < lastPage.total ? lastPage.page + 1 : undefined
+export interface OperationsPageNav {
+  /** 1-based page the response is for. */
+  page: number
+  /** A newer page exists (this is not the first page). */
+  hasNewer: boolean
+  /** An older page exists on the server. */
+  hasOlder: boolean
+  /** 1-based position of the first row on this page; 0 when it is empty. */
+  first: number
+  /** 1-based position of the last row on this page; 0 when it is empty. */
+  last: number
+  /** Operations matching the query on the server. */
+  total: number
+}
+
+/** No response yet: a single empty first page. */
+export const EMPTY_OPERATIONS_PAGE_NAV: OperationsPageNav = {
+  page: 1,
+  hasNewer: false,
+  hasOlder: false,
+  first: 0,
+  last: 0,
+  total: 0,
+}
+
+export function operationsPageNav(
+  response: OperationsListResponse | undefined
+): OperationsPageNav {
+  if (!response) return EMPTY_OPERATIONS_PAGE_NAV
+  const offset = (response.page - 1) * response.page_size
+  const count = response.operations.length
+  return {
+    page: response.page,
+    hasNewer: response.page > 1,
+    hasOlder: count > 0 && offset + count < response.total,
+    first: count > 0 ? offset + 1 : 0,
+    last: offset + count,
+    total: response.total,
+  }
+}
+
+/** Last 1-based page holding any of `total` rows (1 when there are none). */
+export function operationsLastPage(total: number, pageSize: number): number {
+  if (total <= 0 || pageSize <= 0) return 1
+  return Math.ceil(total / pageSize)
 }
 
 /**
- * Concatenate feed pages newest-first, dropping repeated ids (offset paging
- * can repeat a row when new operations arrive between page fetches) and any
- * id in `exclude`.
+ * The page the tray should show once `response` (for `requestedPage`) has
+ * arrived. When the feed shrank under the user, e.g. running work finished
+ * while they were on the last running page, step back to the last page that
+ * still has rows instead of showing an empty one.
  */
-export function flattenOperationPages(
-  pages: readonly OperationsListResponse[] | undefined,
+export function operationsClampPage(
+  requestedPage: number,
+  response: OperationsListResponse | undefined
+): number {
+  if (requestedPage <= 1 || !response) return Math.max(1, requestedPage)
+  if (response.page !== requestedPage || response.operations.length > 0) {
+    return requestedPage
+  }
+  return Math.min(
+    requestedPage,
+    operationsLastPage(response.total, response.page_size)
+  )
+}
+
+/**
+ * Rows of one page in order, dropping repeated ids and any id in `exclude`.
+ */
+export function uniqueOperations(
+  operations: readonly OperationEntry[] | undefined,
   exclude?: ReadonlySet<string>
 ): OperationEntry[] {
   const seen = new Set<string>(exclude)
   const result: OperationEntry[] = []
-  for (const page of pages ?? []) {
-    for (const operation of page.operations) {
-      if (seen.has(operation.id)) continue
-      seen.add(operation.id)
-      result.push(operation)
-    }
+  for (const operation of operations ?? []) {
+    if (seen.has(operation.id)) continue
+    seen.add(operation.id)
+    result.push(operation)
   }
   return result
 }
 
 export interface OperationsTrayFeed {
-  /** Every loaded in-flight operation, newest first. */
+  /** In-flight operations on the current running page, newest first. */
   running: OperationEntry[]
-  /** Loaded finished operations, newest first, never repeating a running row. */
+  /** Finished operations on the current history page, never repeating a running row. */
   recent: OperationEntry[]
   /** Server-side in-flight count. Drives the badge. */
   runningCount: number
-  /** In-flight operations the badge counts that are not loaded as rows yet. */
-  runningNotLoaded: number
+  /** Where the running page sits in the `status=running` feed. */
+  runningNav: OperationsPageNav
+  /** Where the history page sits in the `status=finished` feed. */
+  recentNav: OperationsPageNav
 }
 
 /**
- * Derive the tray's sections from the running and finished feeds. The badge
- * count and the running rows come from the same (`status=running`) response,
- * so a counted operation is always either a row or covered by
- * `runningNotLoaded`, which the tray offers to load.
+ * Derive the tray's sections from one page of the running feed and one page
+ * of the finished feed. The badge count and the running rows come from the
+ * same (`status=running`) response, so every counted operation is on some
+ * running page the tray can step to.
  */
 export function operationsTrayFeed({
-  runningPages,
-  finishedPages,
+  runningPage,
+  finishedPage,
 }: {
-  runningPages: readonly OperationsListResponse[] | undefined
-  finishedPages: readonly OperationsListResponse[] | undefined
+  runningPage: OperationsListResponse | undefined
+  finishedPage: OperationsListResponse | undefined
 }): OperationsTrayFeed {
-  const running = flattenOperationPages(runningPages)
+  const running = uniqueOperations(runningPage?.operations)
   // A row that just finished may briefly appear in both feeds; show it once,
   // where the badge counts it, until the next poll moves it.
-  const recent = flattenOperationPages(
-    finishedPages,
+  const recent = uniqueOperations(
+    finishedPage?.operations,
     new Set(running.map((operation) => operation.id))
   )
-  const runningCount = runningPages?.[0]?.running_count ?? 0
   return {
     running,
     recent,
-    runningCount,
-    runningNotLoaded: Math.max(0, runningCount - running.length),
+    runningCount: runningPage?.running_count ?? 0,
+    runningNav: operationsPageNav(runningPage),
+    recentNav: operationsPageNav(finishedPage),
   }
 }
 

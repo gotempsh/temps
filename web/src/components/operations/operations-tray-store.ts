@@ -14,6 +14,10 @@
  *   shown while the request is in flight and do not survive a refresh.
  * - `announceOperation()` refreshes the feed and shows a toast with a
  *   "View in operations" action.
+ *
+ * It also holds the page each tray section is showing. Closing the tray
+ * returns both to page 1 so browsed history is released rather than kept
+ * (and polled) behind a closed popover.
  */
 import { invalidateOperations } from '@/lib/operations'
 import type { QueryClient } from '@tanstack/react-query'
@@ -28,12 +32,19 @@ export interface LocalOperation {
   startedAt: number
 }
 
+/** A separately paged section of the tray. */
+export type OperationsTraySection = 'running' | 'recent'
+
 interface TrayState {
   open: boolean
   local: readonly LocalOperation[]
+  /** 1-based page shown in each section. */
+  pages: Readonly<Record<OperationsTraySection, number>>
 }
 
-let state: TrayState = { open: false, local: [] }
+const FIRST_PAGES: TrayState['pages'] = { running: 1, recent: 1 }
+
+let state: TrayState = { open: false, local: [], pages: FIRST_PAGES }
 const listeners = new Set<() => void>()
 let localSequence = 0
 
@@ -54,8 +65,24 @@ export function getOperationsTrayState(): TrayState {
 }
 
 export function setOperationsTrayOpen(open: boolean) {
-  if (state.open === open) return
-  setState({ ...state, open })
+  // Closing returns both sections to their first page.
+  const pages = open ? state.pages : FIRST_PAGES
+  const unchanged =
+    state.open === open &&
+    state.pages.running === pages.running &&
+    state.pages.recent === pages.recent
+  if (unchanged) return
+  setState({ ...state, open, pages })
+}
+
+/** Show `page` (1-based, clamped to at least 1) in one tray section. */
+export function setOperationsTrayPage(
+  section: OperationsTraySection,
+  page: number
+) {
+  const next = Number.isFinite(page) ? Math.max(1, Math.floor(page)) : 1
+  if (state.pages[section] === next) return
+  setState({ ...state, pages: { ...state.pages, [section]: next } })
 }
 
 export function openOperationsTray() {
@@ -86,6 +113,10 @@ export function useOperationsTrayOpen(): boolean {
 
 export function useLocalOperations(): readonly LocalOperation[] {
   return useSyncExternalStore(subscribe, () => state.local)
+}
+
+export function useOperationsTrayPage(section: OperationsTraySection): number {
+  return useSyncExternalStore(subscribe, () => state.pages[section])
 }
 
 /** Toast action that opens the tray. */

@@ -20,36 +20,39 @@ import {
   operationContext,
   operationStatusVariant,
   operationTimestamp,
+  type OperationsPageNav,
 } from '@/lib/operations'
 import { cn } from '@/lib/utils'
-import { AlertCircle, ChevronRight } from 'lucide-react'
+import { AlertCircle, ChevronLeft, ChevronRight } from 'lucide-react'
 import { Link } from 'react-router'
 import type { LocalOperation } from './operations-tray-store'
 
 export const OPERATIONS_EMPTY_MESSAGE =
   'Nothing running. Deployments, rollbacks, restores, backups and autofix runs you start appear here.'
 
-/** One independently fetched, independently paged section of the tray. */
+/**
+ * One independently fetched section of the tray. It shows a single page;
+ * Newer/Older replace that page instead of appending to it, so a section
+ * never holds more than one page of rows.
+ */
 export interface OperationsSectionState {
+  /** Rows of the page on screen. */
   operations: readonly OperationEntry[]
+  /** Where that page sits in the feed. */
+  nav: OperationsPageNav
   isPending: boolean
   isError: boolean
   errorMessage?: string | null
   onRetry: () => void
-  /** More pages exist on the server. */
-  hasMore: boolean
-  isFetchingMore: boolean
-  onLoadMore: () => void
-}
-
-export interface RunningSectionState extends OperationsSectionState {
-  /** Counted in-flight operations not loaded as rows yet. */
-  notLoaded: number
+  /** Another page is loading; the current rows stay until it arrives. */
+  isPaging: boolean
+  onNewer: () => void
+  onOlder: () => void
 }
 
 export interface OperationsTrayPanelProps {
   /** In-flight work (`status=running`); the badge counts exactly these. */
-  running: RunningSectionState
+  running: OperationsSectionState
   /** Finished history (`status=finished`), newest first. */
   recent: OperationsSectionState
   localOperations: readonly LocalOperation[]
@@ -109,7 +112,7 @@ function OperationsTrayBody({
   onNavigate,
   now,
 }: {
-  running: RunningSectionState
+  running: OperationsSectionState
   recent: OperationsSectionState
   hasLocal: boolean
   onNavigate: () => void
@@ -140,16 +143,16 @@ function OperationsTrayBody({
     <>
       <OperationSection
         label="Running"
+        noun="running operations"
         errorTitle="Couldn't load running operations"
-        loadMoreLabel={runningLoadMoreLabel(running.notLoaded)}
         state={running}
         onNavigate={onNavigate}
         now={now}
       />
       <OperationSection
         label="Recent"
+        noun="recent operations"
         errorTitle="Couldn't load recent operations"
-        loadMoreLabel="Load older operations"
         state={recent}
         onNavigate={onNavigate}
         now={now}
@@ -158,21 +161,18 @@ function OperationsTrayBody({
   )
 }
 
-function runningLoadMoreLabel(notLoaded: number): string {
-  return notLoaded > 0 ? `Show ${notLoaded} more running` : 'Show more running'
-}
-
 function OperationSection({
   label,
+  noun,
   errorTitle,
-  loadMoreLabel,
   state,
   onNavigate,
   now,
 }: {
   label: string
+  /** Plural noun for the pager, e.g. "running operations". */
+  noun: string
   errorTitle: string
-  loadMoreLabel: string
   state: OperationsSectionState
   onNavigate: () => void
   now: number
@@ -206,20 +206,51 @@ function OperationSection({
           </li>
         ))}
       </ul>
-      {state.hasMore && (
-        <div className="border-t px-3 py-2">
-          <Button
-            variant="ghost"
-            size="sm"
-            className="w-full"
-            disabled={state.isFetchingMore}
-            onClick={state.onLoadMore}
-          >
-            {state.isFetchingMore ? 'Loading…' : loadMoreLabel}
-          </Button>
-        </div>
+      {(state.nav.hasNewer || state.nav.hasOlder) && (
+        <SectionPager noun={noun} state={state} />
       )}
     </section>
+  )
+}
+
+/** Newer/Older controls; each replaces the section's page. */
+function SectionPager({
+  noun,
+  state,
+}: {
+  noun: string
+  state: OperationsSectionState
+}) {
+  const { nav } = state
+  return (
+    <div className="flex items-center justify-between gap-2 border-t px-3 py-2">
+      <Button
+        variant="ghost"
+        size="sm"
+        disabled={!nav.hasNewer || state.isPaging}
+        onClick={state.onNewer}
+        aria-label={`Newer ${noun}`}
+      >
+        <ChevronLeft className="size-4" aria-hidden="true" />
+        Newer
+      </Button>
+      <p
+        className="text-xs text-muted-foreground tabular-nums"
+        aria-live="polite"
+      >
+        {state.isPaging ? 'Loading…' : `${nav.first}–${nav.last} of ${nav.total}`}
+      </p>
+      <Button
+        variant="ghost"
+        size="sm"
+        disabled={!nav.hasOlder || state.isPaging}
+        onClick={state.onOlder}
+        aria-label={`Older ${noun}`}
+      >
+        Older
+        <ChevronRight className="size-4" aria-hidden="true" />
+      </Button>
+    </div>
   )
 }
 
