@@ -35,6 +35,7 @@ const installation = {
 async function mockGitApi(page: Page, alreadyInstalled = false) {
   let webhookReceived = false
   let connectionRequests = 0
+  let installationReadError = false
   const previous = {
     ...installation,
     id: 11,
@@ -64,6 +65,16 @@ async function mockGitApi(page: Page, alreadyInstalled = false) {
       body = provider
     } else if (path === `/git-providers/${provider.id}/connections`) {
       connectionRequests += 1
+      if (installationReadError) {
+        await route.fulfill({
+          status: 503,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            detail: 'Installations temporarily unavailable',
+          }),
+        })
+        return
+      }
       body = connections
     } else if (path === '/git-connections') {
       connectionRequests += 1
@@ -96,6 +107,9 @@ async function mockGitApi(page: Page, alreadyInstalled = false) {
       webhookReceived = true
     },
     requestCount: () => connectionRequests,
+    setInstallationReadError: (failing: boolean) => {
+      installationReadError = failing
+    },
   }
 }
 
@@ -179,4 +193,37 @@ test('installing from the provider list returns to its live connections page', a
   await expect(
     page.getByText(installation.account_name, { exact: true })
   ).toBeVisible({ timeout: 3500 })
+})
+
+test('existing-app setup can retry a failed initial installation read', async ({
+  page,
+}) => {
+  const api = await mockGitApi(page, true)
+  api.setInstallationReadError(true)
+  await page.goto('/git-providers/add')
+  await page.getByRole('button', { name: 'Select GitHub', exact: true }).click()
+  await expect(
+    page.getByText('Could not load existing installations', { exact: true })
+  ).toBeVisible()
+  await expect(
+    page.getByText('Waiting for GitHub installation', { exact: true })
+  ).toHaveCount(0)
+
+  const requestsBeforeRetry = api.requestCount()
+  api.setInstallationReadError(false)
+  await page
+    .getByRole('button', { name: /Retry loading installations/ })
+    .click()
+  await page.getByRole('button', { name: /Install Existing App/ }).click()
+  expect(api.requestCount()).toBeGreaterThan(requestsBeforeRetry)
+  await expect(
+    page.getByText('Waiting for GitHub installation', { exact: true })
+  ).toBeVisible()
+  await expect(
+    page.getByText('Provider Added Successfully!', { exact: true })
+  ).toHaveCount(0)
+  api.deliverWebhook()
+  await expect(
+    page.getByText('Provider Added Successfully!', { exact: true })
+  ).toBeVisible()
 })

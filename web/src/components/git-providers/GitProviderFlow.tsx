@@ -148,7 +148,9 @@ export function GitProviderFlow({
   const {
     data: appConnections,
     isPending: installationsLoading,
+    isFetching: installationsFetching,
     error: installationError,
+    refetch: refetchInstallations,
   } = useQuery({
     ...getProviderConnectionsOptions({
       path: { provider_id: existingGitHubApp?.id ?? 0 },
@@ -553,7 +555,15 @@ export function GitProviderFlow({
     }
 
     if (!appConnections) {
-      toast.info('Existing installations are still loading. Please try again.')
+      if (installationError) {
+        toast.error(
+          'Could not load existing GitHub installations. Please retry.'
+        )
+      } else {
+        toast.info(
+          'Existing installations are still loading. Please try again.'
+        )
+      }
       return
     }
 
@@ -1320,20 +1330,36 @@ export function GitProviderFlow({
                     </AlertDescription>
                   </Alert>
 
+                  {installationError && !appConnections && (
+                    <Callout
+                      tone="error"
+                      title="Could not load existing installations"
+                    >
+                      Check your connection to Temps, then retry before
+                      installing the GitHub App.
+                    </Callout>
+                  )}
+
                   <div className="flex justify-end">
                     <AsyncButton
                       variant={
                         selectedMethod === 'existing-app' ? 'default' : 'ghost'
                       }
-                      busy={installationsLoading}
+                      busy={installationsLoading || installationsFetching}
                       busyLabel="Loading installations..."
                       onClick={(e) => {
                         e.stopPropagation()
+                        if (installationError && !appConnections) {
+                          void refetchInstallations()
+                          return
+                        }
                         handleMethodSelect('existing-app')
                       }}
                     >
                       <GithubIcon className="mr-2 h-4 w-4" />
-                      Install Existing App
+                      {installationError && !appConnections
+                        ? 'Retry loading installations'
+                        : 'Install Existing App'}
                     </AsyncButton>
                   </div>
                 </CardContent>
