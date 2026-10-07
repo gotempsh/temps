@@ -64,9 +64,10 @@ function runRow(overrides: Partial<RestoreRunView> = {}): RestoreRunView {
     mode: 'in_place',
     phase: 'restore',
     source_backup_id: 4,
+    source_backup: { id: 4 },
+    cancellable: true,
     source_service_id: SERVICE_ID,
     status: 'running',
-    cancellable: false,
     ...overrides,
   }
 }

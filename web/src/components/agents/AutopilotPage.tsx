@@ -56,8 +56,25 @@ import { AutopilotStatusBadge } from './AutopilotStatusBadge'
 
 type AgentRun = AgentRunResponse
 
+/** Where harness (AI CLI) credentials are added. */
+export const HARNESSES_PATH = '/agent-sandbox/providers'
+
 interface AutopilotPageProps {
   project: ProjectResponse
+}
+
+/**
+ * Absolute URLs for the agent pages. AutopilotPage is mounted both at
+ * /projects/:slug/agents and inside Settings → Automation, so relative paths
+ * would resolve against whichever mount rendered it.
+ */
+export function autopilotPaths(projectSlug: string) {
+  const base = `/projects/${projectSlug}/agents`
+  return {
+    agent: (agentSlug: string) => `${base}/detail/${agentSlug}`,
+    editAgent: (agentSlug: string) => `${base}/detail/${agentSlug}/edit`,
+    run: (runId: number) => `${base}/${runId}`,
+  }
 }
 
 function formatTimeAgo(dateStr: string): string {
@@ -377,6 +394,7 @@ function AgentCard({
 
 export function AutopilotPage({ project }: AutopilotPageProps) {
   const navigate = useNavigate()
+  const paths = autopilotPaths(project.slug)
   const queryClient = useQueryClient()
 
   const { data: agentsData, isLoading: isLoadingAgents } = useQuery({
@@ -460,15 +478,15 @@ export function AutopilotPage({ project }: AutopilotPageProps) {
                 </div>
                 <p className="text-xs text-muted-foreground">
                   Workflows need an AI CLI (Claude Code, Codex, or OpenCode) to
-                  run. Add credentials once in{' '}
-                  <Link to="/agent-sandbox" className="underline font-medium">
-                    Settings &gt; AI Workflows
+                  run. Add credentials once under{' '}
+                  <Link to={HARNESSES_PATH} className="underline font-medium">
+                    AI runtime settings &gt; Harnesses
                   </Link>
                   .
                 </p>
                 {!hasCredential && (
                   <Button size="sm" variant="outline" asChild>
-                    <Link to="/agent-sandbox">Configure AI provider</Link>
+                    <Link to={HARNESSES_PATH}>Configure AI provider</Link>
                   </Button>
                 )}
               </div>
@@ -544,10 +562,6 @@ prompt: |
 
   return (
     <div className="space-y-4">
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <h1 className="text-xl font-semibold">Workflows</h1>
-      </div>
-
       {/* AI provider credential banner */}
       {providerCatalog && !hasCredential && (
         <Alert variant="destructive">
@@ -558,9 +572,9 @@ prompt: |
                 {defaultProviderName} is not configured
               </p>
               <p className="text-sm opacity-90">
-                Add credentials in{' '}
-                <Link to="/agent-sandbox" className="underline font-medium">
-                  Settings &gt; AI Workflows
+                Add credentials under{' '}
+                <Link to={HARNESSES_PATH} className="underline font-medium">
+                  AI runtime settings &gt; Harnesses
                 </Link>
               </p>
             </div>
@@ -584,8 +598,8 @@ prompt: |
               agent={agent}
               projectId={project.id}
               queryClient={queryClient}
-              onEdit={(a) => navigate(`detail/${a.slug}/edit`)}
-              onNavigate={(slug) => navigate(`detail/${slug}`)}
+              onEdit={(a) => navigate(paths.editAgent(a.slug))}
+              onNavigate={(slug) => navigate(paths.agent(slug))}
             />
           ))}
         </div>
@@ -637,7 +651,7 @@ prompt: |
                           `/projects/${project.slug}/errors/${run.trigger_source_id}/autofix`
                         )
                       } else {
-                        navigate(`${run.id}`)
+                        navigate(paths.run(run.id))
                       }
                     }}
                   >

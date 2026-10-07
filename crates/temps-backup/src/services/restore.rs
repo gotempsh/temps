@@ -74,6 +74,9 @@ pub enum RestoreError {
         restore_run_id: i32,
     },
 
+    #[error("Restore run {restore_run_id} is already {status}, so there is nothing to cancel")]
+    RestoreNotActive { restore_run_id: i32, status: String },
+
     #[error(
         "Restore run {restore_run_id} worker stopped unexpectedly during phase '{phase}': {reason}"
     )]
@@ -320,13 +323,6 @@ impl RestoreRequestMode {
 pub struct RestoreRunView {
     pub id: i32,
     pub source_backup_id: i32,
-    /// S3 source holding the backup being restored, so clients can link to
-    /// it. Absent only for runs recorded before this was tracked.
-    pub source_s3_source_id: Option<i32>,
-    /// The backup's UUID (`backups.backup_id`), which is what backup routes
-    /// take. Absent for raw-location restores and runs recorded before it
-    /// was tracked.
-    pub source_backup_uuid: Option<String>,
     pub source_service_id: i32,
     pub target_service_id: Option<i32>,
     pub target_service_name: Option<String>,
@@ -344,6 +340,63 @@ pub struct RestoreRunView {
     pub cancellable: bool,
     /// Why the run cannot be cancelled now; `None` when `cancellable`.
     pub not_cancellable_reason: Option<String>,
+    /// The backup this run restores from, so a client can show and link to
+    /// it. Always present; its fields are `None` where they are unknown.
+    pub source_backup: RestoreRunSourceBackup,
+}
+
+/// The backup a restore run reads.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct RestoreRunSourceBackup {
+    /// `backups.id` of a tracked backup. `None` for a restore from a raw S3
+    /// location (a backup this instance did not record).
+    pub id: Option<i32>,
+    /// The backup's UUID, which addresses it in the console and the
+    /// `/backups/{id}` API. `None` for a raw-location restore, or when the
+    /// tracked backup has since been deleted.
+    pub backup_id: Option<String>,
+    /// S3 source holding the backup.
+    pub s3_source_id: Option<i32>,
+    /// Object key or `s3://` URL of the backup.
+    pub location: Option<String>,
+    /// When the backup was taken (ISO 8601). `None` when unknown.
+    pub taken_at: Option<String>,
+}
+
+impl RestoreRunSourceBackup {
+    /// What the run row alone records: the tracked id, or the raw location
+    /// and S3 source stored in its resume token.
+    fn from_run(run: &temps_entities::restore_runs::Model) -> Self {
+        let token = run.resume_token.as_ref();
+        Self {
+            id: (run.source_backup_id > 0).then_some(run.source_backup_id),
+            backup_id: None,
+            s3_source_id: token
+                .and_then(|t| t.get("s3_source_id"))
+                .and_then(|v| v.as_i64())
+                .and_then(|v| i32::try_from(v).ok()),
+            location: token
+                .and_then(|t| t.get("backup_location"))
+                .and_then(|v| v.as_str())
+                .filter(|l| !l.is_empty())
+                .map(String::from),
+            taken_at: None,
+        }
+    }
+
+    fn from_backup(backup: &temps_entities::backups::Model) -> Self {
+        Self {
+            id: Some(backup.id),
+            backup_id: Some(backup.backup_id.clone()),
+            s3_source_id: Some(backup.s3_source_id),
+            location: Some(backup.s3_location.clone()).filter(|l| !l.is_empty()),
+            taken_at: Some(
+                backup
+                    .started_at
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            ),
+        }
+    }
 }
 
 /// Non-sensitive service identity used by restore handlers for response
@@ -367,22 +420,9 @@ pub struct BackupProducerServices {
 impl From<temps_entities::restore_runs::Model> for RestoreRunView {
     fn from(m: temps_entities::restore_runs::Model) -> Self {
         let not_cancellable_reason = super::restore_cancel::not_cancellable_reason(&m);
-        let source_s3_source_id = m
-            .resume_token
-            .as_ref()
-            .and_then(|token| token.get("s3_source_id"))
-            .and_then(serde_json::Value::as_i64)
-            .and_then(|id| i32::try_from(id).ok());
-        let source_backup_uuid = m
-            .resume_token
-            .as_ref()
-            .and_then(|token| token.get("backup_uuid"))
-            .and_then(serde_json::Value::as_str)
-            .filter(|uuid| !uuid.is_empty())
-            .map(str::to_string);
+        let source_backup = RestoreRunSourceBackup::from_run(&m);
         Self {
-            source_s3_source_id,
-            source_backup_uuid,
+            source_backup,
             cancel_requested_at: m.cancel_requested_at.map(|d| d.to_rfc3339()),
             cancellable: not_cancellable_reason.is_none(),
             not_cancellable_reason,
@@ -1035,7 +1075,6 @@ impl RestoreService {
             backup_engine_hint,
             s3_source_id,
             backup_started_at,
-            backup_uuid,
         ) = match &selector {
             BackupSelector::Id(id) => {
                 let backup = temps_entities::backups::Entity::find_by_id(*id)
@@ -1070,7 +1109,6 @@ impl RestoreService {
                     engine,
                     backup.s3_source_id,
                     Some(backup.started_at),
-                    Some(backup.backup_id.clone()),
                 )
             }
             BackupSelector::Location {
@@ -1096,7 +1134,6 @@ impl RestoreService {
                     location.clone(),
                     Some(engine.clone()),
                     *s3_source_id,
-                    None,
                     None,
                 )
             }
@@ -1205,7 +1242,6 @@ impl RestoreService {
             "backup_location": backup_location,
             "engine_hint": backup_engine_hint,
             "s3_source_id": s3_source_id,
-            "backup_uuid": backup_uuid,
         });
 
         // Insert the run while holding the source row lock. Deletion uses the
@@ -1299,6 +1335,12 @@ impl RestoreService {
         {
             return Ok(current.into());
         }
+        if !ACTIVE_RESTORE_STATUSES.contains(&current.status.as_str()) {
+            return Err(RestoreError::RestoreNotActive {
+                restore_run_id,
+                status: current.status,
+            });
+        }
         let reason = super::restore_cancel::not_cancellable_reason(&current).unwrap_or_else(|| {
             "The restore changed state while the request was processed; try again.".to_string()
         });
@@ -1315,7 +1357,11 @@ impl RestoreService {
             .one(self.db.as_ref())
             .await?
             .ok_or(RestoreError::RestoreRunNotFound { restore_run_id: id })?;
-        Ok(run.into())
+        views_with_source_backups(self.db.as_ref(), vec![run])
+            .await?
+            .into_iter()
+            .next()
+            .ok_or(RestoreError::RestoreRunNotFound { restore_run_id: id })
     }
 
     /// List restore runs for a given source service, newest first.
@@ -1329,7 +1375,7 @@ impl RestoreService {
             .limit(50)
             .all(self.db.as_ref())
             .await?;
-        Ok(runs.into_iter().map(RestoreRunView::from).collect())
+        views_with_source_backups(self.db.as_ref(), runs).await
     }
 
     /// Resolve every external service that produced a backup. An empty result
@@ -1493,6 +1539,42 @@ fn pick_backup_engine(
         .unwrap_or(ResolvedBackupEngine::Unknown {
             has_producer: !producers.is_empty(),
         })
+}
+
+/// Views of `runs` with their source backups resolved in one query.
+async fn views_with_source_backups(
+    db: &DatabaseConnection,
+    runs: Vec<temps_entities::restore_runs::Model>,
+) -> Result<Vec<RestoreRunView>, RestoreError> {
+    let backup_ids: BTreeSet<i32> = runs
+        .iter()
+        .map(|run| run.source_backup_id)
+        .filter(|id| *id > 0)
+        .collect();
+    let backups: BTreeMap<i32, temps_entities::backups::Model> = if backup_ids.is_empty() {
+        BTreeMap::new()
+    } else {
+        temps_entities::backups::Entity::find()
+            .filter(temps_entities::backups::Column::Id.is_in(backup_ids))
+            .all(db)
+            .await?
+            .into_iter()
+            .map(|backup| (backup.id, backup))
+            .collect()
+    };
+    Ok(runs
+        .into_iter()
+        .map(|run| {
+            let source_backup = backups
+                .get(&run.source_backup_id)
+                .map(RestoreRunSourceBackup::from_backup);
+            let mut view = RestoreRunView::from(run);
+            if let Some(source_backup) = source_backup {
+                view.source_backup = source_backup;
+            }
+            view
+        })
+        .collect())
 }
 
 /// Engine-family check: two engines are restore-compatible if they
@@ -2607,10 +2689,61 @@ async fn insert_restore_run(
     destructive: bool,
 ) -> Result<temps_entities::restore_runs::Model, RestoreError> {
     let transaction = db.begin().await?;
+    let inserted = lock_and_insert_restore_run(
+        &transaction,
+        run_active,
+        resolved_backup_id,
+        target_service_id,
+        destructive,
+    )
+    .await;
+    let error = match inserted {
+        Ok(run) => {
+            transaction.commit().await?;
+            return Ok(run);
+        }
+        Err(error) => error,
+    };
+    // Roll back explicitly instead of on drop: a dropped transaction only
+    // queues its ROLLBACK, so the backup and service row locks taken above
+    // would stay held until the pool next touches that connection.
+    if let Err(rollback_error) = transaction.rollback().await {
+        warn!(
+            "Rolling back the refused restore run for service {} failed: {}",
+            target_service_id, rollback_error
+        );
+    }
+    match error {
+        RestoreError::Database(db_error) if is_active_restore_conflict(&db_error) => {
+            // The index fired, so another in-place run committed between
+            // our check and insert. If it already finished, surface the
+            // original error rather than naming a run that is gone.
+            Err(
+                match find_active_destructive_run(db, target_service_id).await? {
+                    Some(active) => RestoreError::RestoreAlreadyActive {
+                        service_id: target_service_id,
+                        restore_run_id: active.id,
+                    },
+                    None => RestoreError::Database(db_error),
+                },
+            )
+        }
+        other => Err(other),
+    }
+}
+
+/// The checks and insert of [`insert_restore_run`], inside its transaction.
+async fn lock_and_insert_restore_run(
+    transaction: &sea_orm::DatabaseTransaction,
+    run_active: temps_entities::restore_runs::ActiveModel,
+    resolved_backup_id: Option<i32>,
+    target_service_id: i32,
+    destructive: bool,
+) -> Result<temps_entities::restore_runs::Model, RestoreError> {
     if let Some(backup_id) = resolved_backup_id {
         let backup = temps_entities::backups::Entity::find_by_id(backup_id)
             .lock_exclusive()
-            .one(&transaction)
+            .one(transaction)
             .await?
             .ok_or(RestoreError::BackupNotFound { backup_id })?;
         if backup.state == "deleting" {
@@ -2623,39 +2756,19 @@ async fn insert_restore_run(
         // partial unique index (in_place only) does not cover.
         temps_entities::external_services::Entity::find_by_id(target_service_id)
             .lock_exclusive()
-            .one(&transaction)
+            .one(transaction)
             .await?
             .ok_or(RestoreError::ServiceNotFound {
                 service_id: target_service_id,
             })?;
-        if let Some(active) = find_active_destructive_run(&transaction, target_service_id).await? {
+        if let Some(active) = find_active_destructive_run(transaction, target_service_id).await? {
             return Err(RestoreError::RestoreAlreadyActive {
                 service_id: target_service_id,
                 restore_run_id: active.id,
             });
         }
     }
-    let run = match run_active.insert(&transaction).await {
-        Ok(run) => run,
-        Err(e) if is_active_restore_conflict(&e) => {
-            drop(transaction);
-            // The index fired, so another in-place run committed between
-            // our check and insert. If it already finished, surface the
-            // original error rather than naming a run that is gone.
-            return Err(
-                match find_active_destructive_run(db, target_service_id).await? {
-                    Some(active) => RestoreError::RestoreAlreadyActive {
-                        service_id: target_service_id,
-                        restore_run_id: active.id,
-                    },
-                    None => e.into(),
-                },
-            );
-        }
-        Err(e) => return Err(e.into()),
-    };
-    transaction.commit().await?;
-    Ok(run)
+    Ok(run_active.insert(transaction).await?)
 }
 
 /// Decide how to record a run whose worker task panicked.
@@ -4298,20 +4411,6 @@ mod tests {
             cancel_requested_by: None,
         };
         let view: RestoreRunView = model.clone().into();
-        assert_eq!(view.source_backup_uuid, None, "no token, no link");
-
-        // REGRESSION (Greptile on #1295): backup routes take the backup's
-        // UUID, not the integer row id, so the view must expose the UUID.
-        model.resume_token = Some(serde_json::json!({
-            "s3_source_id": 4,
-            "backup_uuid": "0d4c9a59-7f2e-4f8a-9d0b-1f7f0a6b2c11",
-        }));
-        let view: RestoreRunView = model.clone().into();
-        assert_eq!(view.source_s3_source_id, Some(4));
-        assert_eq!(
-            view.source_backup_uuid.as_deref(),
-            Some("0d4c9a59-7f2e-4f8a-9d0b-1f7f0a6b2c11")
-        );
         assert!(view.cancellable);
         assert!(view.not_cancellable_reason.is_none());
 
@@ -4355,6 +4454,99 @@ mod tests {
         assert_eq!(v.status, "running");
         assert!(v.created_at.ends_with("+00:00") || v.created_at.ends_with('Z'));
         assert!(v.started_at.unwrap().contains('T'));
+    }
+
+    fn tracked_backup(id: i32) -> temps_entities::backups::Model {
+        temps_entities::backups::Model {
+            id,
+            name: "nightly".to_string(),
+            backup_id: format!("uuid-{id}"),
+            schedule_id: None,
+            schedule_run_id: None,
+            backup_type: "full".to_string(),
+            state: "completed".to_string(),
+            started_at: chrono::DateTime::parse_from_rfc3339("2026-10-01T02:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            finished_at: None,
+            size_bytes: None,
+            file_count: None,
+            s3_source_id: 3,
+            s3_location: format!("external_services/postgres/orders/{id}"),
+            error_message: None,
+            metadata: "{}".to_string(),
+            checksum: None,
+            compression_type: "gzip".to_string(),
+            created_by: 1,
+            expires_at: None,
+            tags: "[]".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_views_name_their_source_backup_in_one_query() {
+        let tracked = temps_entities::restore_runs::Model {
+            id: 1,
+            source_backup_id: 5,
+            ..crashed_run_row()
+        };
+        let deleted = temps_entities::restore_runs::Model {
+            id: 2,
+            source_backup_id: 6,
+            ..crashed_run_row()
+        };
+        let raw = temps_entities::restore_runs::Model {
+            id: 3,
+            source_backup_id: 0,
+            resume_token: Some(serde_json::json!({
+                "backup_location": "s3://bucket/base_000000010000000000000002",
+                "engine_hint": "postgres",
+                "s3_source_id": 4,
+            })),
+            ..crashed_run_row()
+        };
+        // One batched lookup for every tracked id; backup 6 no longer exists.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![tracked_backup(5)]])
+            .into_connection();
+
+        let views = views_with_source_backups(&db, vec![tracked, deleted, raw])
+            .await
+            .expect("views");
+
+        assert_eq!(
+            views[0].source_backup,
+            RestoreRunSourceBackup {
+                id: Some(5),
+                backup_id: Some("uuid-5".to_string()),
+                s3_source_id: Some(3),
+                location: Some("external_services/postgres/orders/5".to_string()),
+                taken_at: Some("2026-10-01T02:00:00Z".to_string()),
+            }
+        );
+        assert_eq!(views[1].source_backup.id, Some(6));
+        assert_eq!(views[1].source_backup.backup_id, None, "deleted backup");
+        assert_eq!(views[2].source_backup.id, None);
+        assert_eq!(views[2].source_backup.s3_source_id, Some(4));
+        assert_eq!(
+            views[2].source_backup.location.as_deref(),
+            Some("s3://bucket/base_000000010000000000000002")
+        );
+        assert_eq!(db.into_transaction_log().len(), 1, "a single backups query");
+    }
+
+    #[tokio::test]
+    async fn run_views_skip_the_backup_lookup_for_raw_location_restores() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let raw = temps_entities::restore_runs::Model {
+            source_backup_id: 0,
+            ..crashed_run_row()
+        };
+        let views = views_with_source_backups(&db, vec![raw])
+            .await
+            .expect("views");
+        assert_eq!(views[0].source_backup, RestoreRunSourceBackup::default());
+        assert!(db.into_transaction_log().is_empty());
     }
 
     // ---- MockDatabase-backed validation tests ---------------------------
@@ -5476,4 +5668,6 @@ mod tests {
         assert!(message.contains("stays active"), "{message}");
         assert!(message.contains("phase 'restore'"), "{message}");
     }
+
+    // ---- Cancellation at the pre-write safe point
 }

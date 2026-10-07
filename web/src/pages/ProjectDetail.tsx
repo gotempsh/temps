@@ -34,13 +34,13 @@ import { ProjectServices } from '@/components/project/ProjectServices'
 import { ProjectSettings } from '@/components/project/ProjectSettings'
 import { EnvironmentVariablePage } from '@/components/project/settings/EnvironmentVariablePage'
 import { EnvironmentVariablesSettings } from '@/components/project/settings/EnvironmentVariablesSettings'
-import { ProjectFeatureFlags } from '@/components/project/flags/ProjectFeatureFlags'
 import { DomainsSettings } from '@/components/project/settings/DomainsSettings'
+import { ChangeRepositoryPage } from '@/components/project/settings/GitSettings'
 import {
-  ChangeRepositoryPage,
-  GitSettings,
-} from '@/components/project/settings/GitSettings'
-import { BuildDeploySettings } from '@/components/project/settings/BuildDeploySettings'
+  LegacyProjectRouteRedirect,
+  RenamedProjectRouteRedirect,
+} from '@/components/project/LegacyProjectRouteRedirect'
+import { ProjectPageNotFound } from '@/components/project/ProjectPageNotFound'
 import { serviceTemplateDeployOverrides } from '@/lib/template-runtime-defaults'
 import { ProjectSpeedInsights } from '@/components/project/ProjectSpeedInsights'
 import { ProjectStorage } from '@/components/project/ProjectStorage'
@@ -78,13 +78,10 @@ import Traces from './Traces'
 import LogsList from './LogsList'
 import Metrics from './Metrics'
 import { ProjectTour } from '@/components/project/ProjectTour'
-import { ProjectSetup } from './ProjectSetup'
 import { ProjectAgentActivity } from './AiGateway'
-import { AutofixerPage } from '@/components/autofixer/AutofixerPage'
 import { AutofixRedirect } from '@/components/autofixer/AutofixRedirect'
 import { AgentDetailPage } from '@/components/agents/AgentDetailPage'
 import { AgentEditPage } from '@/components/agents/AgentEditPage'
-import { AutopilotPage } from '@/components/agents/AutopilotPage'
 import { AutopilotRunDetail } from '@/components/agents/AutopilotRunDetail'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useState } from 'react'
@@ -317,7 +314,7 @@ export function ProjectDetail() {
       { label: project?.slug || 'Project Details', href: projectPath },
       ...(isVariableRoute
         ? [
-            { label: 'Environment variables', href: variablesPath },
+            { label: 'Environment Variables', href: variablesPath },
             ...(breadcrumbVariableId
               ? [
                   {
@@ -480,12 +477,42 @@ export function ProjectDetail() {
                 element={<ProjectAnalytics project={project} />}
               />
               <Route
+                path="speed"
+                element={<ProjectSpeedInsights project={project} />}
+              />
+              <Route
+                path="revenue"
+                element={<ProjectRevenue project={project} />}
+              />
+              <Route
                 path="errors"
                 element={<ErrorTracking project={project} />}
               />
               <Route
                 path="errors/setup"
                 element={<ErrorTrackingSetup project={project} />}
+              />
+              <Route
+                path="errors/alert-rules"
+                element={<AlertRulesManagement projectId={project.id} />}
+              />
+              <Route
+                path="errors/alert-rules/new"
+                element={
+                  <AlertRuleForm
+                    projectId={project.id}
+                    projectName={project.name}
+                  />
+                }
+              />
+              <Route
+                path="errors/alert-rules/:ruleId/edit"
+                element={
+                  <AlertRuleForm
+                    projectId={project.id}
+                    projectName={project.name}
+                  />
+                }
               />
               <Route
                 path="errors/:errorGroupId"
@@ -496,6 +523,15 @@ export function ProjectDetail() {
                 element={<ErrorEventDetail project={project} />}
               />
               <Route path="traces/*" element={<Traces project={project} />} />
+              <Route
+                path="ai-gateway"
+                element={
+                  <ProjectAgentActivity
+                    projectId={project.id}
+                    projectSlug={project.slug}
+                  />
+                }
+              />
               <Route
                 path="telemetry-logs"
                 element={<LogsList project={project} />}
@@ -513,12 +549,18 @@ export function ProjectDetail() {
                 path="settings/telemetry"
                 element={<TelemetrySettings project={project} />}
               />
-              <Route
-                path="settings/*"
-                element={
-                  <GeneralSettings project={project} refetch={refetch} />
-                }
-              />
+              {/* General settings has its own route so links to it never
+                  depend on the fallback below, which stands in for the
+                  hosting-only settings pages a monitoring project lacks. */}
+              {['settings/general', 'settings/*'].map((path) => (
+                <Route
+                  key={path}
+                  path={path}
+                  element={
+                    <GeneralSettings project={project} refetch={refetch} />
+                  }
+                />
+              ))}
               <Route
                 path="*"
                 element={<AddProjectHosting project={project} />}
@@ -616,7 +658,12 @@ export function ProjectDetail() {
               />
               <Route
                 path="setup"
-                element={<ProjectSetup project={project} />}
+                element={
+                  <LegacyProjectRouteRedirect
+                    projectSlug={project.slug}
+                    route="setup"
+                  />
+                }
               />
               <Route
                 path="deployments"
@@ -643,7 +690,12 @@ export function ProjectDetail() {
               />
               <Route
                 path="flags"
-                element={<ProjectFeatureFlags project={project} />}
+                element={
+                  <LegacyProjectRouteRedirect
+                    projectSlug={project.slug}
+                    route="flags"
+                  />
+                }
               />
               <Route
                 path="domains"
@@ -651,12 +703,20 @@ export function ProjectDetail() {
               />
               <Route
                 path="git"
-                element={<GitSettings project={project} refetch={refetch} />}
+                element={
+                  <LegacyProjectRouteRedirect
+                    projectSlug={project.slug}
+                    route="git"
+                  />
+                }
               />
               <Route
                 path="build"
                 element={
-                  <BuildDeploySettings project={project} refetch={refetch} />
+                  <LegacyProjectRouteRedirect
+                    projectSlug={project.slug}
+                    route="build"
+                  />
                 }
               />
               <Route
@@ -724,7 +784,13 @@ export function ProjectDetail() {
               />
               <Route
                 path="logs/*"
-                element={<RequestLogs project={project} />}
+                element={
+                  <RenamedProjectRouteRedirect
+                    projectSlug={project.slug}
+                    from="logs"
+                    to="request-logs"
+                  />
+                }
               />
               <Route
                 path="request-logs/*"
@@ -769,7 +835,12 @@ export function ProjectDetail() {
               />
               <Route
                 path="agents"
-                element={<AutopilotPage project={project} />}
+                element={
+                  <LegacyProjectRouteRedirect
+                    projectSlug={project.slug}
+                    route="agents"
+                  />
+                }
               />
               <Route
                 path="agents/detail/:agentSlug"
@@ -785,7 +856,12 @@ export function ProjectDetail() {
               />
               <Route
                 path="autofixer"
-                element={<AutofixerPage project={project} />}
+                element={
+                  <LegacyProjectRouteRedirect
+                    projectSlug={project.slug}
+                    route="autofixer"
+                  />
+                }
               />
               <Route
                 path="errors"
@@ -801,11 +877,21 @@ export function ProjectDetail() {
               />
               <Route
                 path="errors/alert-rules/new"
-                element={<AlertRuleForm projectId={project.id} />}
+                element={
+                  <AlertRuleForm
+                    projectId={project.id}
+                    projectName={project.name}
+                  />
+                }
               />
               <Route
                 path="errors/alert-rules/:ruleId/edit"
-                element={<AlertRuleForm projectId={project.id} />}
+                element={
+                  <AlertRuleForm
+                    projectId={project.id}
+                    projectName={project.name}
+                  />
+                }
               />
               <Route
                 path="errors/:errorGroupId"
@@ -831,6 +917,10 @@ export function ProjectDetail() {
               <Route
                 path="environments/*"
                 element={<EnvironmentsTabsView project={project} />}
+              />
+              <Route
+                path="*"
+                element={<ProjectPageNotFound project={project} />}
               />
             </Routes>
           </ProjectSectionLayout>

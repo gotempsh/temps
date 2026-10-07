@@ -51,8 +51,7 @@ import { serviceCreateHref } from '@/lib/service-project-link'
 import type { ServiceLinkChange } from '@/lib/service-link-redeploy'
 import { ServiceLinkRedeployPrompt } from './ServiceLinkRedeployPrompt'
 import { projectServiceResourcePath } from '@/lib/database-provisioning'
-import { serviceBackupsHref } from '@/lib/service-backups-onboarding'
-import { restorePageHref } from '@/pages/service-restore/restore-state'
+import { serviceBackupsHref } from '@/lib/service-backup-setup'
 import { toast } from 'sonner'
 
 /**
@@ -277,7 +276,6 @@ function ServiceRow({
             ) : null}
             {isLinked ? (
               <>
-                <DropdownMenuSeparator />
                 <DropdownMenuItem
                   onSelect={() => navigate(serviceBackupsHref(service.id))}
                 >
@@ -285,7 +283,7 @@ function ServiceRow({
                   Backups
                 </DropdownMenuItem>
                 <DropdownMenuItem
-                  onSelect={() => navigate(restorePageHref(service.id))}
+                  onSelect={() => navigate(`/storage/${service.id}/restore`)}
                 >
                   <RotateCcw className="size-3.5" />
                   Restore…

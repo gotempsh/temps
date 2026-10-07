@@ -6,7 +6,9 @@ import {
   createNotificationProviderMutation,
   createSlackProviderMutation,
   createWebhookProviderMutation,
+  testNotificationProviderMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import type { NotificationProviderResponse } from '@/api/client/types.gen'
 import { Button, Callout, Status, Wizard, useUrlState } from '@temps-sdk/ds'
 import { Badge } from '@/components/ui/badge'
 
@@ -25,6 +27,7 @@ import {
   ProviderFormData,
   providerSchema,
 } from '@/components/monitoring/schemas'
+import { returnNavigation, safeReturnTo } from '@/lib/safe-return-to'
 import { cn } from '@/lib/utils'
 
 type Step = 'provider-type' | 'configuration' | 'complete'
@@ -88,21 +91,28 @@ const providerOptions: ProviderOption[] = [
 export function AddNotificationProvider() {
   const navigate = useNavigate()
   const { setBreadcrumbs } = useBreadcrumbs()
-  const { get, patch } = useUrlState<'step' | 'provider'>()
+  const { get, patch } = useUrlState<'step' | 'provider' | 'returnTo'>()
+  // Set when a task (e.g. an alert rule form) sent the user here to add a
+  // provider first; finishing or cancelling goes back to that task.
+  const returnTo = safeReturnTo(get('returnTo'))
   const selectedProvider =
     providerOptions.find(
       (option) => option.available && option.id === get('provider')
     )?.id ?? null
-  const [complete, setComplete] = useState(false)
+  const [createdProvider, setCreatedProvider] =
+    useState<NotificationProviderResponse | null>(null)
+  const complete = createdProvider !== null
   const currentStep: Step = complete
     ? 'complete'
     : selectedProvider && get('step') === 'configuration'
       ? 'configuration'
       : 'provider-type'
-  const setCurrentStep = (step: Step) => {
-    if (step === 'complete') setComplete(true)
-    else patch({ step })
-  }
+  const setCurrentStep = (step: Exclude<Step, 'complete'>) => patch({ step })
+  const onProviderCreated =
+    (message: string) => (provider: NotificationProviderResponse) => {
+      setCreatedProvider(provider)
+      toast.success(message)
+    }
 
   const headingRef = useRef<HTMLHeadingElement>(null)
   useEffect(() => {
@@ -161,10 +171,9 @@ export function AddNotificationProvider() {
     meta: {
       errorTitle: 'Failed to add email provider',
     },
-    onSuccess: () => {
-      setCurrentStep('complete')
-      toast.success('Email provider added with a route for all notifications.')
-    },
+    onSuccess: onProviderCreated(
+      'Email provider added with a route for all notifications.'
+    ),
   })
 
   const createSlackMutation = useMutation({
@@ -172,10 +181,9 @@ export function AddNotificationProvider() {
     meta: {
       errorTitle: 'Failed to add Slack provider',
     },
-    onSuccess: () => {
-      setCurrentStep('complete')
-      toast.success('Slack provider added with a route for all notifications.')
-    },
+    onSuccess: onProviderCreated(
+      'Slack provider added with a route for all notifications.'
+    ),
   })
 
   const createWebhookMutation = useMutation({
@@ -183,12 +191,9 @@ export function AddNotificationProvider() {
     meta: {
       errorTitle: 'Failed to add Webhook provider',
     },
-    onSuccess: () => {
-      setCurrentStep('complete')
-      toast.success(
-        'Webhook provider added with a route for all notifications.'
-      )
-    },
+    onSuccess: onProviderCreated(
+      'Webhook provider added with a route for all notifications.'
+    ),
   })
 
   // Cloudflare uses the generic notification-provider endpoint (provider_type
@@ -198,22 +203,24 @@ export function AddNotificationProvider() {
     meta: {
       errorTitle: 'Failed to add Cloudflare provider',
     },
-    onSuccess: () => {
-      setCurrentStep('complete')
-      toast.success(
-        'Cloudflare provider added with a route for all notifications.'
-      )
-    },
+    onSuccess: onProviderCreated(
+      'Cloudflare provider added with a route for all notifications.'
+    ),
   })
 
-  useEffect(() => {
-    if (currentStep !== 'complete') return
-    const timer = setTimeout(
-      () => navigate('/settings/notifications?tab=routes'),
-      2000
-    )
-    return () => clearTimeout(timer)
-  }, [currentStep, navigate])
+  const testMutation = useMutation({
+    ...testNotificationProviderMutation(),
+    // A failed test answers with an error status and the provider's reason,
+    // which the result callout below shows in place. Replacing the global
+    // error toast avoids a second, generic "An error occurred".
+    onError: () => {},
+  })
+  const sendTest = () => {
+    if (!createdProvider) return
+    testMutation.mutate({ path: { id: createdProvider.id } })
+  }
+  const leave = (fallback: string) =>
+    returnTo ? navigate(returnTo, returnNavigation()) : navigate(fallback)
 
   const handleProviderSelect = (provider: ProviderType) => {
     if (provider === 'coming-soon') return
@@ -314,7 +321,7 @@ export function AddNotificationProvider() {
     <Wizard
       fullWidth
       title="Add notification provider"
-      description="Choose a delivery method and configure where Temps sends notifications."
+      description="Choose a delivery method and configure where Temps sends notifications. Providers apply to all projects on this instance."
       currentStep={currentStep}
       steps={[
         { id: 'provider-type', label: 'Choose provider' },
@@ -336,18 +343,26 @@ export function AddNotificationProvider() {
               Add provider
             </Button>
           </>
+        ) : currentStep === 'complete' ? (
+          <>
+            <Button
+              variant="outline"
+              busy={testMutation.isPending}
+              busyLabel="Sending test…"
+              onClick={sendTest}
+            >
+              Send test notification
+            </Button>
+            <Button onClick={() => leave('/settings/notifications?tab=routes')}>
+              {returnTo ? 'Return to your task' : 'View notification routes'}
+            </Button>
+          </>
         ) : (
           <Button
             variant="outline"
-            onClick={() =>
-              navigate(
-                currentStep === 'complete'
-                  ? '/settings/notifications?tab=routes'
-                  : '/settings/notifications'
-              )
-            }
+            onClick={() => leave('/settings/notifications')}
           >
-            {currentStep === 'complete' ? 'View notification routes' : 'Cancel'}
+            Cancel
           </Button>
         )
       }
@@ -442,11 +457,52 @@ export function AddNotificationProvider() {
           </h2>
           <Status tone="ok" label="Ready to send notifications" />
           <p className="text-sm text-muted-foreground">
-            A route for all notifications was created. Opening notification
-            routes…
+            A route that sends every notification to{' '}
+            {createdProvider?.name ?? 'this provider'} was created. It applies
+            to all projects. Send a test to confirm messages arrive before you
+            rely on it.
           </p>
+          <ProviderTestResult
+            isSuccess={testMutation.isSuccess}
+            result={testMutation.data}
+            error={testMutation.error}
+          />
         </div>
       )}
     </Wizard>
   )
+}
+
+function ProviderTestResult({
+  isSuccess,
+  result,
+  error,
+}: {
+  isSuccess: boolean
+  result: { success: boolean; message?: string | null } | undefined
+  error: unknown
+}) {
+  if (isSuccess && result?.success) {
+    return <Status tone="ok" label="Test notification sent" />
+  }
+  if ((isSuccess && result && !result.success) || error) {
+    return (
+      <Callout tone="error" title="Test notification failed">
+        {testFailureMessage(result, error)}
+      </Callout>
+    )
+  }
+  return null
+}
+
+function testFailureMessage(
+  result: { message?: string | null } | undefined,
+  error: unknown
+): string {
+  if (result?.message) return result.message
+  if (error && typeof error === 'object' && 'message' in error) {
+    const message = (error as { message?: unknown }).message
+    if (typeof message === 'string' && message) return message
+  }
+  return 'The provider rejected the test notification. Check its configuration.'
 }

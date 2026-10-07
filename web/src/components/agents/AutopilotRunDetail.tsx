@@ -61,6 +61,7 @@ import {
   Send,
   Sparkles,
 } from 'lucide-react'
+import { settingsSectionHref } from '@/lib/project-settings-sections'
 
 const proseClasses =
   'prose prose-sm dark:prose-invert max-w-none prose-code:before:content-none prose-code:after:content-none prose-p:my-1.5 prose-headings:my-2 prose-ul:my-1.5 prose-ul:list-disc prose-ul:pl-5 prose-ol:my-1.5 prose-ol:list-decimal prose-ol:pl-5 prose-li:my-0.5 prose-li:marker:text-foreground/60 prose-hr:my-3 prose-hr:border-border prose-table:text-xs prose-th:px-2 prose-th:py-1 prose-td:px-2 prose-td:py-1'
@@ -1746,7 +1747,9 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
             asChild
             className="shrink-0 -ml-2 h-7 w-7"
           >
-            <Link to="../agents">
+            <Link
+              to={settingsSectionHref(project.slug, 'automation', 'agents')}
+            >
               <ArrowLeft className="h-4 w-4" />
             </Link>
           </Button>

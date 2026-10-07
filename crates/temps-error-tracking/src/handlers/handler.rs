@@ -329,14 +329,18 @@ impl From<ErrorTrackingError> for temps_core::problemdetails::Problem {
                     .with_title("Validation Error")
                     .with_detail(err.to_string())
             }
+            ErrorTrackingError::AlertRuleLimitReached {
+                project_id, limit, ..
+            } => temps_core::error_builder::ErrorBuilder::new(StatusCode::CONFLICT)
+                .type_("https://temps.sh/probs/alert-rule-limit-reached")
+                .title("Alert Rule Limit Reached")
+                .detail(err.to_string())
+                .value("project_id", project_id)
+                .value("limit", limit)
+                .build(),
             ErrorTrackingError::PayloadTooLarge { .. } => {
                 problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
                     .with_title("Payload Too Large")
-                    .with_detail(err.to_string())
-            }
-            ErrorTrackingError::AlertRuleLimitReached { .. } => {
-                problemdetails::new(StatusCode::CONFLICT)
-                    .with_title("Alert Rule Limit Reached")
                     .with_detail(err.to_string())
             }
             ErrorTrackingError::Database(_) | ErrorTrackingError::EmbeddingService(_) => {

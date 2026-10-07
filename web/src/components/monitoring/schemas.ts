@@ -36,9 +36,10 @@ export const routeAlertsSchema = z.object({
 
 export const notificationSettingsSchema = z.object({
   email: z.boolean(),
+  // Slack delivery goes through a Slack notification provider; this is only
+  // the stored preference flag; there is no webhook here to save.
   slack: z.object({
     enabled: z.boolean(),
-    webhook: z.string().url().optional().or(z.literal('')),
   }),
   batchNotifications: z.boolean(),
   minimumSeverity: z.enum(['critical', 'warning', 'info']),

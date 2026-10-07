@@ -11,6 +11,7 @@ import DashboardsRouter from './DashboardsRouter'
 import AlertsRouter from './AlertsRouter'
 import { ruleStatus, useAlertStatus } from '@/components/metrics/alert-status'
 import { alertSummary, StatusDot } from '@/components/metrics/alert-format'
+import { firingRuleLinks } from '@/components/metrics/firing-rule-links'
 import { Skeleton } from '@/components/ui/skeleton'
 
 interface MetricsProps {
@@ -169,7 +170,7 @@ function MetricsTopBar({ project }: { project: ProjectResponse }) {
       </div>
       {/* Firing rows surface only when something is actually wrong. */}
       {status.firing.length > 0 && (
-        <FiringRows firing={status.firing} base={base} />
+        <FiringRows firing={status.firing} base={base} projectId={project.id} />
       )}
     </div>
   )
@@ -223,29 +224,52 @@ function HealthDotInline({
 function FiringRows({
   firing,
   base,
+  projectId,
 }: {
   firing: ReturnType<typeof useAlertStatus>['firing']
   base: string
+  projectId: number
 }) {
   return (
     <ul className="divide-y divide-border overflow-hidden rounded-lg border border-border bg-card">
-      {firing.map((rule) => (
-        <li key={rule.id}>
-          <Link
-            to={`${base}/alerts/${rule.id}/edit`}
-            className="flex items-center gap-2.5 px-3 py-2 text-sm transition-colors hover:bg-muted/50"
+      {firing.map((rule) => {
+        const links = firingRuleLinks(rule, base, projectId)
+        return (
+          <li
+            key={rule.id}
+            className="flex flex-col gap-1.5 px-3 py-2 text-sm sm:flex-row sm:items-center sm:gap-2.5"
           >
-            <StatusDot level={ruleStatus(rule)} pulse />
-            <span className="flex min-w-0 flex-1 flex-col sm:flex-row sm:items-baseline sm:gap-2">
-              <span className="truncate font-medium">{rule.name}</span>
-              <span className="truncate font-mono text-xs text-muted-foreground">
-                {alertSummary(rule)}
+            {/* The row itself opens the chart of the metric that fired. */}
+            <Link
+              to={links.metric}
+              className="flex min-w-0 flex-1 items-center gap-2.5 rounded-sm hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <StatusDot level={ruleStatus(rule)} pulse />
+              <span className="flex min-w-0 flex-1 flex-col sm:flex-row sm:items-baseline sm:gap-2">
+                <span className="truncate font-medium">{rule.name}</span>
+                <span className="truncate font-mono text-xs text-muted-foreground">
+                  {alertSummary(rule)}
+                </span>
               </span>
+            </Link>
+            <span className="flex shrink-0 items-center gap-3 pl-5 text-xs sm:pl-0">
+              <Link
+                to={links.alarm}
+                className="text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+              >
+                {links.alarmLabel}
+              </Link>
+              <Link
+                to={links.rule}
+                className="text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+              >
+                Edit rule
+              </Link>
+              <ChevronRight className="hidden size-4 text-muted-foreground sm:block" />
             </span>
-            <ChevronRight className="size-4 shrink-0 text-muted-foreground" />
-          </Link>
-        </li>
-      ))}
+          </li>
+        )
+      })}
     </ul>
   )
 }

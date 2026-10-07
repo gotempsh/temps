@@ -15433,6 +15433,38 @@ export type NodeSshHostKeyResponse = {
     fingerprint: string;
 };
 
+/**
+ * Whether a notification of one severity would reach anyone, with the
+ * console page that fixes it when it would not.
+ */
+export type NotificationDeliveryCoverageResponse = {
+    /**
+     * Whether Temps Cloud also delivers notifications from this instance.
+     */
+    cloud_delivery: boolean;
+    /**
+     * Whether at least one destination would receive the notification.
+     */
+    configured: boolean;
+    /**
+     * Enabled providers those routes deliver to.
+     */
+    provider_ids: Array<number>;
+    /**
+     * Why nothing would be delivered, when `configured` is false.
+     */
+    reason?: string | null;
+    /**
+     * Enabled routes whose severity range contains `severity`.
+     */
+    route_ids: Array<number>;
+    /**
+     * Console path that fixes the gap, when `configured` is false.
+     */
+    setup_path?: string | null;
+    severity: string;
+};
+
 export type NotificationPreferencesResponse = {
     backup_failures_enabled: boolean;
     backup_successes_enabled: boolean;
@@ -15485,6 +15517,20 @@ export type NotificationRoutePage = {
     page: number;
     page_size: number;
     total: number;
+};
+
+export type NotificationRouteTestResult = {
+    deliveries: Array<RouteTestDelivery>;
+    /**
+     * A disabled route is still tested, but real notifications skip it.
+     */
+    route_enabled: boolean;
+    route_id: number;
+    route_name: string;
+    /**
+     * Severity of the sample notification: the lowest one the route matches.
+     */
+    severity: string;
 };
 
 export type NpmRelease = {
@@ -20477,6 +20523,35 @@ export type RestoreRequestMode = {
     to_new_service: boolean;
 };
 
+/**
+ * The backup a restore run reads.
+ */
+export type RestoreRunSourceBackup = {
+    /**
+     * The backup's UUID, which addresses it in the console and the
+     * `/backups/{id}` API. `None` for a raw-location restore, or when the
+     * tracked backup has since been deleted.
+     */
+    backup_id?: string | null;
+    /**
+     * `backups.id` of a tracked backup. `None` for a restore from a raw S3
+     * location (a backup this instance did not record).
+     */
+    id?: number | null;
+    /**
+     * Object key or `s3://` URL of the backup.
+     */
+    location?: string | null;
+    /**
+     * S3 source holding the backup.
+     */
+    s3_source_id?: number | null;
+    /**
+     * When the backup was taken (ISO 8601). `None` when unknown.
+     */
+    taken_at?: string | null;
+};
+
 export type RestoreRunView = {
     /**
      * When cancellation was requested, if it was.
@@ -20497,18 +20572,12 @@ export type RestoreRunView = {
     not_cancellable_reason?: string | null;
     phase: string;
     recovery_target?: unknown;
+    /**
+     * The backup this run restores from, so a client can show and link to
+     * it. Always present; its fields are `None` where they are unknown.
+     */
+    source_backup: RestoreRunSourceBackup;
     source_backup_id: number;
-    /**
-     * The backup's UUID (`backups.backup_id`), which is what backup routes
-     * take. Absent for raw-location restores and runs recorded before it
-     * was tracked.
-     */
-    source_backup_uuid?: string | null;
-    /**
-     * S3 source holding the backup being restored, so clients can link to
-     * it. Absent only for runs recorded before this was tracked.
-     */
-    source_s3_source_id?: number | null;
     source_service_id: number;
     started_at?: string | null;
     status: string;
@@ -20703,6 +20772,19 @@ export type RouteRole = {
     name: string;
     updated_at: number;
 };
+
+export type RouteTestDelivery = {
+    message?: string | null;
+    provider_id: number;
+    provider_name: string;
+    provider_type: string;
+    status: RouteTestDeliveryStatus;
+};
+
+/**
+ * Outcome of sending a test notification to one provider of a route.
+ */
+export type RouteTestDeliveryStatus = 'sent' | 'failed' | 'skipped_disabled';
 
 export type RouteUser = {
     created_at: number;
@@ -47195,6 +47277,49 @@ export type CreateNotificationRouteResponses = {
 
 export type CreateNotificationRouteResponse = CreateNotificationRouteResponses[keyof CreateNotificationRouteResponses];
 
+export type GetNotificationDeliveryCoverageData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Severity of the notification to check: debug, info, warning, error,
+         * critical or emergency.
+         */
+        severity: string;
+    };
+    url: '/notification-routes/coverage';
+};
+
+export type GetNotificationDeliveryCoverageErrors = {
+    /**
+     * Invalid severity
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetNotificationDeliveryCoverageError = GetNotificationDeliveryCoverageErrors[keyof GetNotificationDeliveryCoverageErrors];
+
+export type GetNotificationDeliveryCoverageResponses = {
+    /**
+     * Delivery coverage for the severity
+     */
+    200: NotificationDeliveryCoverageResponse;
+};
+
+export type GetNotificationDeliveryCoverageResponse = GetNotificationDeliveryCoverageResponses[keyof GetNotificationDeliveryCoverageResponses];
+
 export type DeleteNotificationRouteData = {
     body?: never;
     path: {
@@ -47298,6 +47423,48 @@ export type UpdateNotificationRouteResponses = {
 };
 
 export type UpdateNotificationRouteResponse = UpdateNotificationRouteResponses[keyof UpdateNotificationRouteResponses];
+
+export type TestNotificationRouteData = {
+    body?: never;
+    path: {
+        /**
+         * Route ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/notification-routes/{id}/test';
+};
+
+export type TestNotificationRouteErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Route not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type TestNotificationRouteError = TestNotificationRouteErrors[keyof TestNotificationRouteErrors];
+
+export type TestNotificationRouteResponses = {
+    /**
+     * Per-provider test results
+     */
+    200: NotificationRouteTestResult;
+};
+
+export type TestNotificationRouteResponse = TestNotificationRouteResponses[keyof TestNotificationRouteResponses];
 
 export type ListOperationsData = {
     body?: never;
@@ -63998,7 +64165,7 @@ export type CancelRestoreRunErrors = {
      */
     404: ProblemDetails;
     /**
-     * The run can no longer be stopped safely (`restore-not-cancellable`, with the run's `phase`): an in-place restore has started writing data, a new service is being registered, or the run already finished
+     * Conflict: the run already finished (`restore-not-active`, with `run_status`), or it can no longer be stopped safely (`restore-not-cancellable`, with `phase`): an in-place restore has started writing data, or a new service is being registered
      */
     409: ProblemDetails;
 };

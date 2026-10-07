@@ -22,6 +22,8 @@ import { usePluginsContext } from '@/contexts/PluginsContext'
 import { useCanViewAuditLogs } from '@/hooks/useAuditAccess'
 import { useFrecency } from '@/hooks/useFrecency'
 import { normalizeFrecency } from '@/lib/frecency'
+import { projectHasPage } from '@/lib/project-navigation'
+import { settingsSectionPath } from '@/lib/project-settings-sections'
 import {
   buildCommandSampleQueries,
   dedupeCommandDestinations,
@@ -299,6 +301,12 @@ const mainNavItems: NavigationItem[] = [
     keywords: ['metrics', 'resources', 'alerts', 'alarms', 'health'],
   },
   {
+    title: 'Delivery preferences',
+    url: '/monitoring/notifications',
+    icon: Gauge,
+    keywords: ['notification', 'preferences', 'severity', 'digest', 'email'],
+  },
+  {
     title: 'Proxy',
     url: '/proxy',
     icon: Activity,
@@ -506,11 +514,12 @@ const settingsNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'AI Workflows',
+    title: 'Workflows',
     url: '/ai-workflows',
     icon: Bot,
     keywords: [
       'ai',
+      'ai workflows',
       'workflows',
       'agents',
       'sandbox',
@@ -762,7 +771,7 @@ const accountNavItems: NavigationItem[] = [
 ]
 
 // Project-specific navigation items (will be prefixed with project slug)
-const projectNavItems: NavigationItem[] = [
+export const projectNavItems: NavigationItem[] = [
   {
     title: 'Project Overview',
     url: 'project',
@@ -803,6 +812,24 @@ const projectNavItems: NavigationItem[] = [
     url: 'analytics/visitors',
     icon: Users,
     keywords: ['users', 'visitors', 'traffic', 'analytics'],
+  },
+  {
+    title: 'Live Visitors',
+    url: 'analytics/live-visitors',
+    icon: Users,
+    keywords: ['live', 'realtime', 'online', 'active', 'now', 'analytics'],
+  },
+  {
+    title: 'Live Globe',
+    url: 'analytics/live',
+    icon: Globe,
+    keywords: ['live', 'globe', 'map', 'realtime', 'world', 'analytics'],
+  },
+  {
+    title: 'Journey',
+    url: 'analytics/journey',
+    icon: Activity,
+    keywords: ['journey', 'flow', 'paths', 'navigation', 'analytics'],
   },
   {
     title: 'Pages',
@@ -911,7 +938,7 @@ const projectNavItems: NavigationItem[] = [
   },
   {
     title: 'Feature Flags',
-    url: 'flags',
+    url: settingsSectionPath('delivery', 'feature-flags'),
     icon: Flag,
     keywords: ['flags', 'feature flags', 'toggles', 'rollout'],
   },
@@ -935,19 +962,25 @@ const projectNavItems: NavigationItem[] = [
   },
   {
     title: 'Secrets',
-    url: 'settings/secrets',
+    url: settingsSectionPath('variables', 'secrets'),
     icon: FileLock2,
     keywords: ['secrets', 'secret files', 'mounted secrets', '/run/secrets'],
   },
   {
+    title: 'Deployment Tokens',
+    url: settingsSectionPath('variables', 'deployment-tokens'),
+    icon: Key,
+    keywords: ['tokens', 'deployment tokens', 'TEMPS_API_TOKEN', 'api'],
+  },
+  {
     title: 'Git',
-    url: 'git',
+    url: settingsSectionPath('delivery', 'repository'),
     icon: GitBranch,
     keywords: ['git', 'repository', 'repo', 'source'],
   },
   {
     title: 'Build & Deploy',
-    url: 'build',
+    url: 'settings/delivery',
     icon: Settings,
     keywords: ['build', 'framework', 'compose', 'docker', 'root directory'],
   },
@@ -965,25 +998,25 @@ const projectNavItems: NavigationItem[] = [
   },
   {
     title: 'Cron Jobs',
-    url: 'settings/cron-jobs',
+    url: settingsSectionPath('automation', 'cron-jobs'),
     icon: Activity,
     keywords: ['cron', 'jobs', 'scheduled', 'tasks'],
   },
   {
     title: 'Webhooks',
-    url: 'settings/webhooks',
+    url: settingsSectionPath('integrations', 'webhooks'),
     icon: Workflow,
     keywords: ['webhooks', 'hooks', 'events', 'callbacks', 'integrations'],
   },
   {
     title: 'Project Skills',
-    url: 'settings/skills',
+    url: settingsSectionPath('integrations', 'skills'),
     icon: Wand2,
     keywords: ['skills', 'ai', 'agents', 'claude', 'instructions', 'project'],
   },
   {
     title: 'Project MCP Servers',
-    url: 'settings/mcp-servers',
+    url: settingsSectionPath('integrations', 'mcp-servers'),
     icon: Server,
     keywords: [
       'mcp',
@@ -1065,21 +1098,15 @@ const projectNavItems: NavigationItem[] = [
   },
   {
     title: 'Agents',
-    url: 'agents',
+    url: settingsSectionPath('automation', 'agents'),
     icon: Bot,
     keywords: ['agents', 'autopilot', 'ai', 'automation', 'workflows'],
   },
   {
     title: 'Autofixer',
-    url: 'autofixer',
+    url: settingsSectionPath('automation', 'autofixer'),
     icon: Wand2,
     keywords: ['autofix', 'autofixer', 'ai', 'errors', 'repair'],
-  },
-  {
-    title: 'Workspace',
-    url: 'workspace',
-    icon: SquareTerminal,
-    keywords: ['workspace', 'shell', 'terminal', 'exec'],
   },
   {
     title: 'Error Alert Rules',
@@ -1100,6 +1127,17 @@ const projectNavItems: NavigationItem[] = [
     keywords: ['logs', 'requests', 'http', 'traffic'],
   },
 ]
+
+/**
+ * The project pages `project` actually has: a monitoring-only (external)
+ * project registers no hosting pages, so offering them would land on
+ * "Add hosting" or, for settings, on the wrong page.
+ */
+export function projectNavItemsFor(project: {
+  source_type?: string | null
+}): NavigationItem[] {
+  return projectNavItems.filter((item) => projectHasPage(project, item.url))
+}
 
 export function CommandPalette() {
   const [open, setOpen] = useState(false)
@@ -1343,7 +1381,7 @@ export function CommandPalette() {
     // Add project-specific navigation if we're on a project page
     if (currentProjectSlug && currentProject) {
       const projectSpecificItems = [
-        ...projectNavItems,
+        ...projectNavItemsFor(currentProject),
         ...projectPluginNavItems,
       ].map((item) => ({
         ...item,
@@ -1409,17 +1447,19 @@ export function CommandPalette() {
       CROSS_PROJECT_PAGE_URLS.has(item.url)
     )
     return projects.flatMap((project) =>
-      pages.map((page) => ({
-        title: page.title,
-        projectName: project.name,
-        url: `/projects/${project.slug}/${page.url}`,
-        icon: page.icon,
-        // One field so a two-word query ("demo deploy") can match the project
-        // and the page at once.
-        searchText: `${project.name} ${project.slug} ${page.title} ${(
-          page.keywords ?? []
-        ).join(' ')}`,
-      }))
+      pages
+        .filter((page) => projectHasPage(project, page.url))
+        .map((page) => ({
+          title: page.title,
+          projectName: project.name,
+          url: `/projects/${project.slug}/${page.url}`,
+          icon: page.icon,
+          // One field so a two-word query ("demo deploy") can match the project
+          // and the page at once.
+          searchText: `${project.name} ${project.slug} ${page.title} ${(
+            page.keywords ?? []
+          ).join(' ')}`,
+        }))
     )
   }, [projects])
 
@@ -1456,10 +1496,12 @@ export function CommandPalette() {
   const browseResults = useMemo(() => {
     const projectNavigation =
       currentProjectSlug && currentProject
-        ? [...projectNavItems, ...projectPluginNavItems].map((item) => ({
-            ...item,
-            url: `/projects/${currentProjectSlug}/${item.url}`,
-          }))
+        ? [...projectNavItemsFor(currentProject), ...projectPluginNavItems].map(
+            (item) => ({
+              ...item,
+              url: `/projects/${currentProjectSlug}/${item.url}`,
+            })
+          )
         : []
 
     return {
@@ -1530,7 +1572,7 @@ export function CommandPalette() {
         project.id === currentProject?.id
           ? `Current project · ${project.slug}`
           : `Project · ${project.slug}`
-      const pages = projectNavItems.map((item) => {
+      const pages = projectNavItemsFor(project).map((item) => {
         const url = `/projects/${project.slug}/${item.url}`
         return destination(
           `project:${project.slug}:${item.url}`,
@@ -1859,10 +1901,12 @@ export function CommandPalette() {
     ]
     const projectNavigation =
       currentProjectSlug && currentProject
-        ? [...projectNavItems, ...projectPluginNavItems].map((item) => ({
-            ...item,
-            url: `/projects/${currentProjectSlug}/${item.url}`,
-          }))
+        ? [...projectNavItemsFor(currentProject), ...projectPluginNavItems].map(
+            (item) => ({
+              ...item,
+              url: `/projects/${currentProjectSlug}/${item.url}`,
+            })
+          )
         : []
     const navByUrl = buildAccessibleNavigationMap(
       [...allNavItems, ...projectNavigation],

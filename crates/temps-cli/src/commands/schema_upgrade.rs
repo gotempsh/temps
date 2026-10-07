@@ -7,41 +7,48 @@
 //!
 //! 1. **Schema guard** — refuse a database that a newer release migrated
 //!    ([`temps_database::SchemaGuardError::DatabaseNewerThanBinary`]).
-//! 2. **Pre-migration backup** — when an existing database has pending
-//!    migrations, dump it to `<data dir>/backups/pre-migration/` first. If the
-//!    dump fails, nothing is migrated unless the operator passed
-//!    `--skip-pre-migration-backup` for this one run.
+//! 2. **Pre-migration backup** — opt-in with `--pre-migration-backup`. When
+//!    an existing database has pending migrations, dump it to
+//!    `<data dir>/backups/pre-migration/` first; if the dump fails, nothing
+//!    is migrated. Without the flag an upgrade migrates straight away and
+//!    logs how to enable the backup.
 //!
-//! A fresh install and a restart with nothing pending skip the backup, so
-//! the only steady-state cost is the guard's two small queries.
+//! Either way, a pending upgrade first removes any `pg_dump` container left
+//! behind by an interrupted earlier backup: it still holds a lock on every
+//! table and would make the first migration time out waiting for it.
+//!
+//! A fresh install and a restart with nothing pending skip both, so the only
+//! steady-state cost is the guard's two small queries.
 
 use std::path::Path;
 
 use temps_backup::pre_migration::{
-    create_pre_migration_backup, pre_migration_backup_dir, PreMigrationBackup,
-    PreMigrationBackupError, PreMigrationBackupRequest,
+    create_pre_migration_backup, pre_migration_backup_dir,
+    remove_orphaned_pre_migration_backup_containers, PreMigrationBackup, PreMigrationBackupError,
+    PreMigrationBackupRequest,
 };
 use temps_database::{SchemaGuardError, SchemaStatus};
-use tracing::{info, warn};
+use tracing::info;
 
-/// The CLI flag that opts out of the backup, as shown in errors and logs.
-pub const SKIP_BACKUP_FLAG: &str = "--skip-pre-migration-backup";
+/// The CLI flag that opts in to the backup, as shown in errors and logs.
+pub const BACKUP_FLAG: &str = "--pre-migration-backup";
 
 /// Whether the pre-migration backup applies to this process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackupPolicy {
-    /// Take the backup when an upgrade is pending; refuse to migrate if it fails.
-    Required,
-    /// The operator passed [`SKIP_BACKUP_FLAG`] for this run.
-    SkippedByOperator,
+    /// The operator passed [`BACKUP_FLAG`]: take the backup when an upgrade
+    /// is pending and refuse to migrate if it fails.
+    Enabled,
+    /// The default: migrate without taking a backup.
+    Disabled,
 }
 
 impl BackupPolicy {
-    pub fn from_skip_flag(skip: bool) -> Self {
-        if skip {
-            BackupPolicy::SkippedByOperator
+    pub fn from_flag(enabled: bool) -> Self {
+        if enabled {
+            BackupPolicy::Enabled
         } else {
-            BackupPolicy::Required
+            BackupPolicy::Disabled
         }
     }
 }
@@ -51,8 +58,8 @@ impl BackupPolicy {
 enum BackupDecision {
     /// Nothing will be migrated on an existing database.
     NotNeeded,
-    /// Pending upgrade, but the policy waives the backup.
-    Waived,
+    /// Pending upgrade, but the backup was not requested.
+    NotRequested,
     /// Pending upgrade: take the backup before migrating.
     Take,
 }
@@ -60,9 +67,9 @@ enum BackupDecision {
 fn decide(status: &SchemaStatus, policy: BackupPolicy) -> BackupDecision {
     match (status, policy) {
         (SchemaStatus::Fresh | SchemaStatus::UpToDate { .. }, _) => BackupDecision::NotNeeded,
-        (SchemaStatus::PendingUpgrade { .. }, BackupPolicy::Required) => BackupDecision::Take,
-        (SchemaStatus::PendingUpgrade { .. }, BackupPolicy::SkippedByOperator) => {
-            BackupDecision::Waived
+        (SchemaStatus::PendingUpgrade { .. }, BackupPolicy::Enabled) => BackupDecision::Take,
+        (SchemaStatus::PendingUpgrade { .. }, BackupPolicy::Disabled) => {
+            BackupDecision::NotRequested
         }
     }
 }
@@ -76,7 +83,7 @@ pub enum SchemaUpgradeError {
     #[error(
         "Refusing to apply {pending} pending database migration(s) because the automatic \
          pre-migration backup failed: {source}. Nothing was changed. Fix the cause and start \
-         again, or take your own database backup and run once with {flag} (accepted by \
+         again, or take your own database backup and start without {flag} (accepted by \
          `temps serve` and `temps migrate`) to migrate without the automatic backup."
     )]
     BackupFailed {
@@ -109,16 +116,15 @@ pub async fn prepare_schema_upgrade(
     let pending = status.pending().len();
     let backup = match decide(&status, policy) {
         BackupDecision::NotNeeded => None,
-        BackupDecision::Waived => {
-            match policy {
-                BackupPolicy::SkippedByOperator => warn!(
-                    pending_migrations = pending,
-                    "Applying {pending} pending migration(s) WITHOUT the automatic \
-                     pre-migration backup ({SKIP_BACKUP_FLAG} was passed). Rolling back \
-                     to the previous release will need a backup you took yourself."
-                ),
-                BackupPolicy::Required => unreachable!("required backups cannot be waived"),
-            }
+        BackupDecision::NotRequested => {
+            remove_orphaned_pre_migration_backup_containers(data_dir).await;
+            info!(
+                pending_migrations = pending,
+                "Applying {pending} pending migration(s) without a pre-migration backup. \
+                 Start with {BACKUP_FLAG} to dump the database to {} first, so you can roll \
+                 back to the previous release.",
+                pre_migration_backup_dir(data_dir).display()
+            );
             None
         }
         BackupDecision::Take => {
@@ -141,7 +147,7 @@ pub async fn prepare_schema_upgrade(
             .await
             .map_err(|source| SchemaUpgradeError::BackupFailed {
                 pending,
-                flag: SKIP_BACKUP_FLAG,
+                flag: BACKUP_FLAG,
                 source,
             })?;
             info!(
@@ -176,7 +182,7 @@ mod tests {
 
     #[test]
     fn fresh_installs_and_plain_restarts_never_back_up() {
-        for policy in [BackupPolicy::Required, BackupPolicy::SkippedByOperator] {
+        for policy in [BackupPolicy::Enabled, BackupPolicy::Disabled] {
             assert_eq!(
                 decide(&SchemaStatus::Fresh, policy),
                 BackupDecision::NotNeeded
@@ -189,31 +195,28 @@ mod tests {
     }
 
     #[test]
-    fn pending_upgrades_back_up_unless_waived() {
+    fn pending_upgrades_back_up_only_when_enabled() {
         assert_eq!(
-            decide(&pending(), BackupPolicy::Required),
+            decide(&pending(), BackupPolicy::Enabled),
             BackupDecision::Take
         );
         assert_eq!(
-            decide(&pending(), BackupPolicy::SkippedByOperator),
-            BackupDecision::Waived
+            decide(&pending(), BackupPolicy::Disabled),
+            BackupDecision::NotRequested
         );
     }
 
     #[test]
-    fn skip_flag_maps_to_policy() {
-        assert_eq!(BackupPolicy::from_skip_flag(false), BackupPolicy::Required);
-        assert_eq!(
-            BackupPolicy::from_skip_flag(true),
-            BackupPolicy::SkippedByOperator
-        );
+    fn the_backup_is_off_unless_the_flag_is_passed() {
+        assert_eq!(BackupPolicy::from_flag(false), BackupPolicy::Disabled);
+        assert_eq!(BackupPolicy::from_flag(true), BackupPolicy::Enabled);
     }
 
     #[test]
     fn backup_failure_names_the_escape_hatch_and_the_cause() {
         let message = SchemaUpgradeError::BackupFailed {
             pending: 3,
-            flag: SKIP_BACKUP_FLAG,
+            flag: BACKUP_FLAG,
             source: PreMigrationBackupError::NoDumpTool {
                 server_major: 18,
                 host: "no pg_dump on PATH".to_string(),
@@ -226,7 +229,7 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("Nothing was changed"), "{message}");
-        assert!(message.contains(SKIP_BACKUP_FLAG), "{message}");
+        assert!(message.contains(BACKUP_FLAG), "{message}");
         assert!(message.contains("no pg_dump on PATH"), "{message}");
     }
 }

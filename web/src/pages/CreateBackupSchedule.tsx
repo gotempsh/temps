@@ -8,6 +8,10 @@
  *
  * Route: /backups/s3-sources/:id/schedules/new
  *
+ * `?service_id=<id>` opens the form set to back up only that database (the
+ * "Schedule backups" action on a database's page), and `?returnTo=` sends the
+ * operator back there when they save or cancel.
+ *
  * Replaces the modal-based "Create Backup Schedule" dialog that previously
  * lived inside S3SourceDetail. Using a routed page means the form is never
  * constrained to modal height on small screens.
@@ -33,6 +37,8 @@ import {
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { scheduleOptions } from '@/lib/schedule-options'
+import { returnToFromSearch } from '@/lib/safe-return-to'
+import { preselectedServiceId } from '@/lib/service-backup-setup'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { ArrowLeft } from 'lucide-react'
 import { useEffect, useState } from 'react'
@@ -43,7 +49,6 @@ import {
   useParams,
   useSearchParams,
 } from 'react-router'
-import { preselectedScheduleServiceId } from '@/lib/service-backups-onboarding'
 import { toast } from 'sonner'
 
 interface NewScheduleForm {
@@ -64,9 +69,10 @@ export function CreateBackupSchedule() {
   const sourceId = id ? parseInt(id, 10) : undefined
   const navigate = useNavigate()
   const { setBreadcrumbs } = useBreadcrumbs()
-  // Opened from a service's Backups card: start with just that service.
   const [searchParams] = useSearchParams()
-  const preselectedServiceId = preselectedScheduleServiceId(searchParams)
+  const preselectedService = preselectedServiceId(searchParams)
+  const returnTo =
+    returnToFromSearch(searchParams) ?? `/backups/s3-sources/${id}`
 
   // All hooks before any early return.
   const { data: source } = useQuery({
@@ -88,18 +94,19 @@ export function CreateBackupSchedule() {
   // ones created after this schedule. 'specific' means it only backs up the
   // services explicitly picked below. Default chosen to match what most
   // operators want: "back up everything, even when I add a new DB later."
+  //
+  // Opened for one database (`?service_id=`), the form starts as a schedule
+  // for just that database, without the control plane.
   const [backupMode, setBackupMode] = useState<'all' | 'specific'>(
-    preselectedServiceId !== undefined ? 'specific' : 'all'
+    preselectedService !== undefined ? 'specific' : 'all'
   )
   const [selectedServiceIds, setSelectedServiceIds] = useState<number[]>(
-    preselectedServiceId !== undefined ? [preselectedServiceId] : []
+    preselectedService !== undefined ? [preselectedService] : []
   )
   // Default on: most operators want the control plane covered. Operators
   // who only use Temps to orchestrate external DB backups can flip it off.
-  // A schedule opened for one service backs up just that service unless the
-  // operator ticks the control plane in too.
   const [includeControlPlane, setIncludeControlPlane] = useState(
-    preselectedServiceId === undefined
+    preselectedService === undefined
   )
 
   // The mutation's generated error type is `ProblemDetails`. Adding an
@@ -112,12 +119,7 @@ export function CreateBackupSchedule() {
     meta: { errorTitle: 'Failed to create backup schedule' },
     onSuccess: () => {
       toast.success('Backup schedule created successfully')
-      // Return to the service the operator came from.
-      navigate(
-        preselectedServiceId !== undefined
-          ? `/storage/${preselectedServiceId}`
-          : `/backups/s3-sources/${id}`
-      )
+      navigate(returnTo)
     },
   })
 
@@ -193,9 +195,11 @@ export function CreateBackupSchedule() {
     <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
       <div className="flex items-center gap-2">
         <Button variant="ghost" size="sm" asChild>
-          <Link to={`/backups/s3-sources/${id}`}>
+          <Link to={returnTo}>
             <ArrowLeft className="mr-2 h-4 w-4" />
-            Back to S3 source
+            {returnTo === `/backups/s3-sources/${id}`
+              ? 'Back to S3 source'
+              : 'Back'}
           </Link>
         </Button>
       </div>
@@ -434,7 +438,7 @@ export function CreateBackupSchedule() {
 
       <div className="flex justify-end gap-2">
         <Button variant="outline" asChild>
-          <Link to={`/backups/s3-sources/${id}`}>Cancel</Link>
+          <Link to={returnTo}>Cancel</Link>
         </Button>
         <Button onClick={handleSubmit} disabled={createMutation.isPending}>
           {createMutation.isPending ? 'Creating…' : 'Create schedule'}

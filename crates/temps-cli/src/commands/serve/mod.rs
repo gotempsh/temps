@@ -269,17 +269,21 @@ pub struct ServeCommand {
     #[arg(long)]
     pub disable_self_update: bool,
 
-    /// Apply pending database migrations on this start WITHOUT first taking
-    /// the automatic pre-migration backup.
+    /// Before applying pending database migrations, dump the database to
+    /// `<data dir>/backups/pre-migration/` so you can roll back to the
+    /// previous release, and refuse to migrate if that dump fails.
     ///
-    /// When this binary has migrations to apply to an existing database, it
-    /// normally dumps the database to `<data dir>/backups/pre-migration/`
-    /// first and refuses to migrate if that dump fails, because the dump is
-    /// what lets you roll back to the previous release. Pass this flag only
-    /// for the one start that needs it, after taking your own backup. It is
-    /// deliberately not an environment variable, so it cannot stay switched
-    /// on by accident.
-    #[arg(long)]
+    /// Off by default: an upgrade migrates straight away. A restart with
+    /// nothing to migrate never takes the backup, so this can stay in a
+    /// service unit permanently. Also forwarded to the `temps migrate` run
+    /// started by the console's "Update now".
+    #[arg(long, conflicts_with = "skip_pre_migration_backup")]
+    pub pre_migration_backup: bool,
+
+    /// No-op, kept so existing service units keep starting: the
+    /// pre-migration backup is now off unless `--pre-migration-backup` is
+    /// passed.
+    #[arg(long, hide = true)]
     pub skip_pre_migration_backup: bool,
 
     /// Screenshot provider to use: "local" (headless Chrome), "remote", or "noop" (disabled)
@@ -504,15 +508,13 @@ impl ServeCommand {
                     .map(|(instance, storage)| (instance.as_str(), storage.as_str())),
             ))?;
             rt.block_on(stateless::prepare_storage())?;
-            // Stateless mode does not prove that provider backups exist. Require
-            // the same backup unless the operator explicitly opts out.
+            // Stateless mode follows the same opt-in backup policy; its data
+            // dir may be temporary, so copy a dump to durable storage.
             rt.block_on(crate::commands::schema_upgrade::prepare_schema_upgrade(
                 db.as_ref(),
                 &self.database_url,
                 &serve_config.data_dir,
-                crate::commands::schema_upgrade::BackupPolicy::from_skip_flag(
-                    self.skip_pre_migration_backup,
-                ),
+                crate::commands::schema_upgrade::BackupPolicy::from_flag(self.pre_migration_backup),
             ))?;
             rt.block_on(upgrade_telemetry::run_migrations_reporting_upgrade(
                 db.as_ref(),
@@ -527,9 +529,7 @@ impl ServeCommand {
                 db.as_ref(),
                 &self.database_url,
                 &serve_config.data_dir,
-                crate::commands::schema_upgrade::BackupPolicy::from_skip_flag(
-                    self.skip_pre_migration_backup,
-                ),
+                crate::commands::schema_upgrade::BackupPolicy::from_flag(self.pre_migration_backup),
             ))?
         };
         if let Some((instance_id, storage_identity)) = storage_identity {
@@ -775,6 +775,7 @@ impl ServeCommand {
             self_update_caveat,
             update_status.clone(),
             self.database_url.clone(),
+            self.pre_migration_backup,
         ));
 
         // Connect to Docker once and share the handle between:
@@ -1569,7 +1570,7 @@ mod post_migration_tests {
             db,
             &database.database_url,
             &std::env::temp_dir(),
-            crate::commands::schema_upgrade::BackupPolicy::SkippedByOperator,
+            crate::commands::schema_upgrade::BackupPolicy::Disabled,
         )
         .await
         .expect_err("local startup must reject a stateless-bound database");
@@ -1605,7 +1606,7 @@ mod post_migration_tests {
             db,
             &database.database_url,
             &std::env::temp_dir(),
-            crate::commands::schema_upgrade::BackupPolicy::SkippedByOperator,
+            crate::commands::schema_upgrade::BackupPolicy::Disabled,
         )
         .await
         .expect("fresh local startup should apply migrations");

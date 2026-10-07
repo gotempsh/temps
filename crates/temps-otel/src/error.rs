@@ -84,10 +84,10 @@ pub enum OtelError {
     #[error("Metric alert rule {rule_id} not found")]
     MetricAlertNotFound { rule_id: i32 },
 
-    /// The project already holds the maximum number of metric alert rules.
-    /// See [`crate::services::metric_alert_service::MAX_METRIC_ALERT_RULES_PER_PROJECT`].
+    /// The project already holds the maximum number of API-created metric
+    /// alert rules. Maps to HTTP 409 Conflict.
     #[error(
-        "Project {project_id} already has {existing} metric alert rules; the limit is {limit} per project. Delete or reuse an existing rule before creating another."
+        "Project {project_id} already has {existing} metric alert rules; the limit is {limit} per project. Delete or reuse an existing rule"
     )]
     MetricAlertLimitReached {
         project_id: i32,

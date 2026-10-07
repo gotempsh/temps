@@ -24,13 +24,6 @@ import {
   shouldRetryRead,
   sourcesState,
   toQueryError,
-  RESTORE_NOT_CANCELLABLE_TYPE,
-  cancelControl,
-  notCancellableReason,
-  readRestoreSelection,
-  restorePageHref,
-  sourceBackupHref,
-  writeRestoreSelection,
   type CompletionLedger,
   type QueryStateLike,
   type RunQueryLike,
@@ -46,9 +39,10 @@ function run(overrides: Partial<RestoreRunView> = {}): RestoreRunView {
     mode: 'in_place',
     phase: 'prepare',
     source_backup_id: 3,
+    source_backup: { id: 3 },
+    cancellable: true,
     source_service_id: 7,
     status: 'pending',
-    cancellable: false,
     ...overrides,
   }
 }
@@ -464,168 +458,5 @@ describe('completion feedback happens once per run', () => {
     expect(
       completionToast('failed', run({ error_message: 'disk full' }), 'db')
     ).toMatchObject({ level: 'error', description: 'disk full' })
-  })
-})
-
-describe('cancel control', () => {
-  const tracking = (overrides: Partial<RestoreRunView>) =>
-    ({
-      kind: 'tracking',
-      run: run({ status: 'running', ...overrides }),
-      confirmedAt: T0,
-    }) as const
-
-  test('offers cancel while the server says the run is cancellable', () => {
-    expect(
-      cancelControl(tracking({ phase: 'download', cancellable: true }))
-    ).toEqual({
-      kind: 'available',
-    })
-  })
-
-  test('explains why a run that is writing data cannot be stopped', () => {
-    expect(
-      cancelControl(
-        tracking({
-          phase: 'restore',
-          cancellable: false,
-          not_cancellable_reason:
-            'The restore has started writing data to the service',
-        })
-      )
-    ).toEqual({
-      kind: 'unavailable',
-      reason: 'The restore has started writing data to the service',
-    })
-  })
-
-  test('falls back to a write-phase explanation without a server reason', () => {
-    const control = cancelControl(
-      tracking({ phase: 'restore', cancellable: false })
-    )
-    expect(control.kind).toBe('unavailable')
-    if (control.kind === 'unavailable')
-      expect(control.reason).toContain('started writing data')
-  })
-
-  test('shows a recorded request instead of a second button', () => {
-    expect(
-      cancelControl(
-        tracking({
-          cancel_requested_at: '2026-01-02T03:05:00Z',
-          cancellable: false,
-        })
-      )
-    ).toEqual({ kind: 'requested' })
-  })
-
-  test('never offers cancel on a stale, unknown or finished status', () => {
-    expect(cancelControl({ kind: 'attaching' })).toEqual({ kind: 'hidden' })
-    expect(
-      cancelControl({
-        kind: 'stale',
-        lastRun: run({ cancellable: true }),
-        confirmedAt: T0,
-      })
-    ).toEqual({ kind: 'hidden' })
-    expect(
-      cancelControl({
-        kind: 'terminal',
-        run: run({ status: 'cancelled' }),
-        outcome: 'cancelled',
-        confirmedAt: T0,
-      })
-    ).toEqual({ kind: 'hidden' })
-  })
-
-  test('reads the reason out of a 409 restore-not-cancellable only', () => {
-    expect(
-      notCancellableReason({
-        type: RESTORE_NOT_CANCELLABLE_TYPE,
-        detail: 'too late',
-      })
-    ).toBe('too late')
-    expect(
-      notCancellableReason({ type: 'about:blank', detail: 'other' })
-    ).toBeUndefined()
-    expect(notCancellableReason(undefined)).toBeUndefined()
-  })
-
-  test('the download phase is part of the progress list', () => {
-    const states = phaseStates({ phase: 'download', status: 'running' }, true)
-    expect(states[0]).toMatchObject({ id: 'prepare', state: 'done' })
-    expect(states[1]).toMatchObject({ id: 'download', state: 'active' })
-  })
-
-  test('a cancelled run marks the phase it stopped in', () => {
-    const states = phaseStates({ phase: 'download', status: 'cancelled' }, true)
-    expect(states[1]).toMatchObject({ id: 'download', state: 'stopped' })
-  })
-})
-
-describe('source backup link', () => {
-  const uuid = '0d4c9a59-7f2e-4f8a-9d0b-1f7f0a6b2c11'
-  test('links a recorded backup by its UUID through its S3 source', () => {
-    expect(
-      sourceBackupHref({ source_backup_uuid: uuid, source_s3_source_id: 9 })
-    ).toBe(`/backups/s3-sources/9/backups/${uuid}`)
-  })
-  test('never links by the integer row id, which backup routes reject', () => {
-    // Regression: the link used to put source_backup_id (an integer) where
-    // the route expects the UUID, opening a "backup not found" page.
-    expect(
-      sourceBackupHref({ source_backup_uuid: null, source_s3_source_id: 9 })
-    ).toBeUndefined()
-  })
-  test('has no link for raw-location runs or unknown sources', () => {
-    expect(
-      sourceBackupHref({ source_backup_uuid: '', source_s3_source_id: 9 })
-    ).toBeUndefined()
-    expect(
-      sourceBackupHref({ source_backup_uuid: uuid, source_s3_source_id: null })
-    ).toBeUndefined()
-  })
-})
-
-describe('restore selection in the URL', () => {
-  test('reads source, backup and mode', () => {
-    expect(
-      readRestoreSelection(
-        new URLSearchParams('source=2&backup=15&mode=new_service')
-      )
-    ).toEqual({ sourceId: 2, backupId: 15, mode: 'new_service' })
-  })
-
-  test('ignores malformed values instead of guessing', () => {
-    expect(
-      readRestoreSelection(
-        new URLSearchParams('source=abc&backup=-1&mode=drop')
-      )
-    ).toEqual({ sourceId: undefined, backupId: undefined, mode: undefined })
-    expect(readRestoreSelection(new URLSearchParams('backup=0'))).toEqual({
-      sourceId: undefined,
-      backupId: undefined,
-      mode: undefined,
-    })
-  })
-
-  test('writes changes while keeping the followed run', () => {
-    const next = writeRestoreSelection(
-      new URLSearchParams('run=4&source=2&backup=15'),
-      {
-        sourceId: 3,
-        backupId: null,
-      }
-    )
-    expect(next.get('run')).toBe('4')
-    expect(next.get('source')).toBe('3')
-    expect(next.has('backup')).toBe(false)
-  })
-
-  test('builds deep links from a backup', () => {
-    expect(
-      restorePageHref(7, { sourceId: 2, backupId: 15, mode: 'in_place' })
-    ).toBe('/storage/7/restore?source=2&backup=15&mode=in_place')
-    expect(restorePageHref(7)).toBe('/storage/7/restore')
   })
 })

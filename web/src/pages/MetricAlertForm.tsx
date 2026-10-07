@@ -95,8 +95,16 @@ import {
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
-import { Link, useNavigate, useParams } from 'react-router'
+import { Link, useLocation, useNavigate, useParams } from 'react-router'
 import { useGoBack } from '@/hooks/useGoBack'
+import { NotificationCoverageNotice } from '@/components/monitoring/NotificationCoverageNotice'
+import {
+  clearFormDraft,
+  mergeFormDraft,
+  readFormDraft,
+  saveFormDraft,
+} from '@/lib/form-draft'
+import { isReturnFromSetup } from '@/lib/safe-return-to'
 import { toast } from 'sonner'
 import { z } from 'zod'
 
@@ -224,8 +232,23 @@ function AlertFormBody({
   existing,
 }: AlertFormBodyProps) {
   const navigate = useNavigate()
-  const goBack = useGoBack(`/projects/${project.slug}/metrics/alerts`)
+  const location = useLocation()
+  const listPath = `/projects/${project.slug}/metrics/alerts`
+  const historyBack = useGoBack(listPath)
+  // After a detour to set up notifications, history holds the setup pages;
+  // leave for the alert list rather than stepping back into them.
+  const returnedFromSetup = isReturnFromSetup(location.state)
+  const goBack = () =>
+    returnedFromSetup ? navigate(listPath, { replace: true }) : historyBack()
   const queryClient = useQueryClient()
+  // Unsaved fields, new alert or edits to an existing one, survive a detour
+  // to add a notification provider (which returns here via `returnTo`). The
+  // key includes the alert ID so edits never land on a different alert.
+  const draftKey = `metric-alert:${project.id}:${isEditing ? id : 'new'}`
+  const [draft] = useState(() => readFormDraft(draftKey))
+  useEffect(() => {
+    clearFormDraft(draftKey)
+  }, [draftKey])
 
   const namesQuery = useQuery({
     ...listMetricNamesOptions({ path: { project_id: project.id } }),
@@ -246,46 +269,50 @@ function AlertFormBody({
       const cfg = existing.detection_config
       const isStatic = cfg.kind === 'static'
       const isAnomaly = cfg.kind === 'anomaly'
-      return {
-        name: existing.name,
-        metric_name: existing.metric_name,
-        aggregation: coerce(AGGREGATION_VALUES, existing.aggregation, 'avg'),
-        detection_kind: isAnomaly ? 'anomaly' : 'static',
-        comparator: coerce(
-          COMPARATOR_VALUES,
-          isStatic ? cfg.comparator : 'gt',
-          'gt'
-        ),
-        threshold: isStatic ? cfg.threshold : 0,
-        algorithm: coerce(
-          ALGORITHM_VALUES,
-          isAnomaly ? (cfg.algorithm ?? 'robust') : 'robust',
-          'robust'
-        ),
-        deviations: isAnomaly ? (cfg.deviations ?? 3) : 3,
-        direction: coerce(
-          DIRECTION_VALUES,
-          isAnomaly ? (cfg.direction ?? 'both') : 'both',
-          'both'
-        ),
-        seasonality: coerce(
-          SEASONALITY_VALUES,
-          isAnomaly ? (cfg.seasonality ?? 'none') : 'none',
-          'none'
-        ),
-        window_secs: existing.window_secs,
-        for_duration_secs: existing.for_duration_secs,
-        severity: coerce(SEVERITY_VALUES, existing.severity, 'warning'),
-        enabled: existing.enabled,
-        label_filters: tuplesToLabelFilters(existing.label_filters),
-        group_by: existing.group_by,
-        dynamic_alerts: existing.dynamic_alerts,
-        max_series: existing.max_series,
-        grouped_notification_threshold: existing.grouped_notification_threshold,
-      }
+      return mergeFormDraft<AlertFormData>(
+        {
+          name: existing.name,
+          metric_name: existing.metric_name,
+          aggregation: coerce(AGGREGATION_VALUES, existing.aggregation, 'avg'),
+          detection_kind: isAnomaly ? 'anomaly' : 'static',
+          comparator: coerce(
+            COMPARATOR_VALUES,
+            isStatic ? cfg.comparator : 'gt',
+            'gt'
+          ),
+          threshold: isStatic ? cfg.threshold : 0,
+          algorithm: coerce(
+            ALGORITHM_VALUES,
+            isAnomaly ? (cfg.algorithm ?? 'robust') : 'robust',
+            'robust'
+          ),
+          deviations: isAnomaly ? (cfg.deviations ?? 3) : 3,
+          direction: coerce(
+            DIRECTION_VALUES,
+            isAnomaly ? (cfg.direction ?? 'both') : 'both',
+            'both'
+          ),
+          seasonality: coerce(
+            SEASONALITY_VALUES,
+            isAnomaly ? (cfg.seasonality ?? 'none') : 'none',
+            'none'
+          ),
+          window_secs: existing.window_secs,
+          for_duration_secs: existing.for_duration_secs,
+          severity: coerce(SEVERITY_VALUES, existing.severity, 'warning'),
+          enabled: existing.enabled,
+          label_filters: tuplesToLabelFilters(existing.label_filters),
+          group_by: existing.group_by,
+          dynamic_alerts: existing.dynamic_alerts,
+          max_series: existing.max_series,
+          grouped_notification_threshold:
+            existing.grouped_notification_threshold,
+        },
+        draft
+      )
     }
-    return emptyDefaults()
-  }, [existing])
+    return mergeFormDraft(emptyDefaults(), draft)
+  }, [existing, draft])
 
   // `defaultValues` (mount-once), not `values`: this body is remounted via `key`
   // when the edited rule loads, so the form never resets a Select post-mount.
@@ -321,6 +348,7 @@ function AlertFormBody({
   const deviations = useWatch({ control: form.control, name: 'deviations' })
   const direction = useWatch({ control: form.control, name: 'direction' })
   const seasonality = useWatch({ control: form.control, name: 'seasonality' })
+  const watchedSeverity = useWatch({ control: form.control, name: 'severity' })
   const alarmsBasePath = '/monitoring/alarms'
 
   // "Scope" (label filters + break-down/per-series settings) is the least
@@ -435,11 +463,12 @@ function AlertFormBody({
     meta: { errorTitle: 'Failed to create alert rule' },
     onSuccess: () => {
       toast.success('Alert rule created')
+      clearFormDraft(draftKey)
       queryClient.invalidateQueries({
         predicate: (query) =>
           (query.queryKey[0] as Record<string, unknown>)?._id === 'listAlerts',
       })
-      navigate('..')
+      navigate(listPath, { replace: returnedFromSetup })
     },
   })
 
@@ -448,6 +477,7 @@ function AlertFormBody({
     meta: { errorTitle: 'Failed to update alert rule' },
     onSuccess: () => {
       toast.success('Alert rule updated')
+      clearFormDraft(draftKey)
       queryClient.invalidateQueries({
         predicate: (query) => {
           const key = (query.queryKey[0] as Record<string, unknown>)?._id
@@ -551,7 +581,10 @@ function AlertFormBody({
           <p className="text-sm text-muted-foreground">
             {isEditing
               ? 'Update the signal, threshold, and notification settings.'
-              : 'Fire a notification when a metric crosses a threshold.'}
+              : 'Fire a notification when a metric crosses a threshold.'}{' '}
+            Watches metrics from project{' '}
+            <span className="font-medium text-foreground">{project.name}</span>{' '}
+            only.
           </p>
         </div>
       </div>
@@ -653,6 +686,11 @@ function AlertFormBody({
           projectName={project.name}
         />
       )}
+
+      <NotificationCoverageNotice
+        severity={watchedSeverity}
+        onLeave={() => saveFormDraft(draftKey, form.getValues())}
+      />
 
       <Form {...form}>
         <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-6">
@@ -1331,8 +1369,8 @@ function AlertFormBody({
                     </Select>
                     <FormDescription>
                       Maps to the notification severity. Alerts are delivered
-                      through the notification channels configured for this
-                      project.
+                      through notification routes, which apply to all projects;
+                      routes match on this severity.
                     </FormDescription>
                     <FormMessage />
                   </FormItem>

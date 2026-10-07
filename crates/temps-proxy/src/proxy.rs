@@ -1003,6 +1003,10 @@ pub struct LoadBalancer {
     /// Per-project/environment concurrent-connection cap enforcement. See
     /// issue #646 and `crate::connection_limiter`.
     connection_limiter: Arc<crate::connection_limiter::ConnectionLimiter>,
+    /// Per-client-IP rate limits and rate-limit blacklists from the instance
+    /// and project security settings. See issue #1288 and
+    /// `crate::rate_limiter`.
+    rate_limiter: Arc<crate::rate_limiter::RateLimiter>,
     /// In-memory moka cache for sandbox preview lookups. Keyed by sandbox
     /// hex suffix; values are `PreviewSandboxLookup` (both `Protected` and
     /// `NotFound` are cached). TTL 30 s. See `preview_auth.rs` and WS6 in
@@ -1131,6 +1135,7 @@ impl LoadBalancer {
             static_object_store: None,
             preview_auth_limiter: Arc::new(PreviewAuthLimiter::new()),
             connection_limiter: Arc::new(crate::connection_limiter::ConnectionLimiter::new()),
+            rate_limiter: Arc::new(crate::rate_limiter::RateLimiter::new()),
             admin_gate: None,
             proxy_metrics: Arc::new(crate::metrics::ProxyMetrics::default()),
             upstream_failures: Default::default(),
@@ -5401,11 +5406,13 @@ impl ProxyHttp for LoadBalancer {
             // on environment id (the actual upstream-instance granularity); global
             // default and the project/environment DeploymentConfig override are
             // resolved the same way as the timeout settings above.
-            let connection_limits = self
+            // One TTL-cached settings read serves both the connection cap and
+            // the rate limits below (an in-memory read, not a DB round-trip).
+            let (connection_limits, instance_rate_limiting) = self
                 .config_service
                 .get_settings()
                 .await
-                .map(|settings| settings.connection_limits)
+                .map(|settings| (settings.connection_limits, settings.rate_limiting))
                 .unwrap_or_default();
             let project_config = project_ctx
                 .project
@@ -5552,6 +5559,80 @@ impl ProxyHttp for LoadBalancer {
                     }
                     .to_string();
                 return Ok(true);
+            }
+
+            // Per-client-IP rate limits and rate-limit blacklists (issue
+            // #1288). Runs after the IP restriction gate so a denied caller
+            // never consumes budget. An unresolvable client IP is not
+            // limited: there is nothing to attribute the request to, and the
+            // IP gate above already fails closed where a policy requires it.
+            if let Some(client_ip) = parsed_ip {
+                if let Some(resolved) = crate::rate_limiter::resolve_policy(
+                    &instance_rate_limiting,
+                    effective_config.security.as_ref(),
+                    project_ctx.environment.id,
+                ) {
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    match resolved.check(&self.rate_limiter, client_ip, now_secs) {
+                        crate::rate_limiter::RateLimitDecision::Allow => {}
+                        crate::rate_limiter::RateLimitDecision::Blacklisted => {
+                            self.proxy_metrics.record_rate_limited();
+                            warn!(
+                                project_id = project_ctx.project.id,
+                                environment_id = project_ctx.environment.id,
+                                ip = %client_ip,
+                                "Request denied by rate-limit blacklist"
+                            );
+                            // Same generic 403 as the IP restriction above.
+                            let mut response = ResponseHeader::build(StatusCode::FORBIDDEN, None)?;
+                            response.insert_header("Cache-Control", "no-store")?;
+                            response.insert_header("X-Request-ID", &ctx.request_id)?;
+                            response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                            session
+                                .write_response_header(Box::new(response), false)
+                                .await?;
+                            session
+                                .write_response_body(Some(Bytes::from_static(b"Forbidden\n")), true)
+                                .await?;
+                            ctx.routing_status = "rate_limit_blacklisted".to_string();
+                            return Ok(true);
+                        }
+                        crate::rate_limiter::RateLimitDecision::Limited {
+                            window,
+                            retry_after_secs,
+                        } => {
+                            self.proxy_metrics.record_rate_limited();
+                            debug!(
+                                project_id = project_ctx.project.id,
+                                environment_id = project_ctx.environment.id,
+                                ip = %client_ip,
+                                window = window.as_str(),
+                                scope = ?resolved.scope,
+                                "Request rejected by rate limit"
+                            );
+                            let mut response =
+                                ResponseHeader::build(StatusCode::TOO_MANY_REQUESTS, None)?;
+                            response.insert_header("Retry-After", retry_after_secs.to_string())?;
+                            response.insert_header("Cache-Control", "no-store")?;
+                            response.insert_header("X-Request-ID", &ctx.request_id)?;
+                            response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                            session
+                                .write_response_header(Box::new(response), false)
+                                .await?;
+                            session
+                                .write_response_body(
+                                    Some(Bytes::from_static(b"Too Many Requests\n")),
+                                    true,
+                                )
+                                .await?;
+                            ctx.routing_status = "rate_limited".to_string();
+                            return Ok(true);
+                        }
+                    }
+                }
             }
 
             // Check if this is a CAPTCHA endpoint - allow these to bypass attack mode

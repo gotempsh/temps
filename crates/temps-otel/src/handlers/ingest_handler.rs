@@ -112,16 +112,19 @@ impl From<OtelError> for Problem {
                     .with_title("Dashboard Not Found")
                     .with_detail(error.to_string())
             }
+            OtelError::MetricAlertLimitReached {
+                project_id, limit, ..
+            } => temps_core::error_builder::ErrorBuilder::new(StatusCode::CONFLICT)
+                .type_("https://temps.sh/probs/alert-rule-limit-reached")
+                .title("Alert Rule Limit Reached")
+                .detail(error.to_string())
+                .value("project_id", project_id)
+                .value("limit", limit)
+                .build(),
             OtelError::MetricAlertNotFound { .. } => {
                 warn!(error = %error, "OTel metric alert rule not found");
                 problemdetails::new(StatusCode::NOT_FOUND)
                     .with_title("Metric Alert Rule Not Found")
-                    .with_detail(error.to_string())
-            }
-            OtelError::MetricAlertLimitReached { .. } => {
-                warn!(error = %error, "OTel metric alert rule limit reached");
-                problemdetails::new(StatusCode::CONFLICT)
-                    .with_title("Alert Rule Limit Reached")
                     .with_detail(error.to_string())
             }
             OtelError::Storage { .. }

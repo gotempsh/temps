@@ -9,6 +9,7 @@ import {
   listRestoreRunsForService,
   startRestore,
   getRestoreRun,
+  cancelRestoreRun,
   listSourceBackups,
   getService,
 } from '../../api/sdk.gen.js'
@@ -430,6 +431,35 @@ async function showRunAction(options: RestoreRunShowOptions): Promise<void> {
   newline()
 }
 
+async function cancelRunAction(options: RestoreRunShowOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const runId = parseInt(options.id, 10)
+  if (!Number.isFinite(runId)) {
+    errorOutput(`Invalid run id: ${options.id}`)
+    process.exit(1)
+  }
+
+  // The server only cancels a run that has not started writing data; past
+  // that point it answers 409 with the phase the run is in.
+  const { data, error } = await cancelRestoreRun({ path: { id: runId } })
+  if (error) {
+    errorOutput(`Could not cancel restore run ${runId}: ${getErrorMessage(error)}`)
+    process.exit(1)
+  }
+  const run = data as RestoreRunView
+
+  if (options.json) {
+    jsonOut(run)
+    return
+  }
+  newline()
+  success(`Restore run ${run.id} cancelled before it wrote any data`)
+  if (run.error_message) info(run.error_message)
+  newline()
+}
+
 // ---- Helpers -------------------------------------------------------------
 
 /**
@@ -585,4 +615,13 @@ export function registerRestoreCommands(services: Command): void {
     .requiredOption('--id <id>', 'Restore run ID')
     .option('--json', 'Output in JSON format')
     .action(showRunAction)
+
+  services
+    .command('restore-cancel')
+    .description(
+      'Cancel a restore run that has not started writing data yet (refused once it has)',
+    )
+    .requiredOption('--id <id>', 'Restore run ID')
+    .option('--json', 'Output in JSON format')
+    .action(cancelRunAction)
 }

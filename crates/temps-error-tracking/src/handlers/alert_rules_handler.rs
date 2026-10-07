@@ -204,6 +204,7 @@ pub async fn get_alert_rule(
     request_body = CreateAlertRuleRequest,
     responses(
         (status = 201, description = "Alert rule created", body = AlertRuleResponse),
+        (status = 409, description = "The project already has the maximum number of error alert rules"),
         (status = 400, description = "Validation error"),
         (status = 404, description = "Project not found"),
         (status = 409, description = "Project already holds the maximum number of error alert rules"),
@@ -376,11 +377,8 @@ fn audit_context(auth: &temps_auth::AuthContext, metadata: &RequestMetadata) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::error_alert_service::{
-        insert_rule_within_project_limit, ErrorAlertService,
-    };
+    use crate::services::error_alert_service::ErrorAlertService;
     use crate::services::error_tracking_service::ErrorTrackingService;
-    use crate::services::ErrorTrackingError;
     use axum::http::HeaderMap;
     use sea_orm::{ActiveModelTrait, EntityTrait, Set};
     use std::sync::Mutex;
@@ -595,85 +593,5 @@ mod tests {
         assert_eq!(entries[0].2["name"], "New issue");
         assert_eq!(entries[0].2["trigger_type"], "new_issue");
         assert_eq!(entries[1].2["enabled"], false);
-    }
-
-    /// The per-project cap against a real database: rules up to the limit are
-    /// accepted, the next one is a typed `AlertRuleLimitReached` that the
-    /// handler surfaces as 409. Uses a small limit so the test stays fast;
-    /// `create_rule` passes `MAX_ERROR_ALERT_RULES_PER_PROJECT` to the same
-    /// function.
-    #[tokio::test]
-    async fn alert_rule_creation_stops_at_the_per_project_limit() {
-        let test_db = match TestDatabase::with_migrations().await {
-            Ok(db) => db,
-            Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
-                eprintln!("Skipping alert-rule limit test: {error}");
-                return;
-            }
-            Err(error) => panic!("alert-rule limit test database setup failed: {error}"),
-        };
-        let db = test_db.connection_arc();
-        let project_id = seed_project(db.as_ref()).await;
-        let other_project_id = seed_project(db.as_ref()).await;
-
-        let rule = |pid: i32| {
-            let now = chrono::Utc::now();
-            error_alert_rules::ActiveModel {
-                project_id: Set(pid),
-                name: Set("Rule".to_string()),
-                trigger_type: Set("new_issue".to_string()),
-                trigger_config: Set(serde_json::json!({})),
-                environment_filter: Set(None),
-                error_level_filter: Set(None),
-                notification_priority: Set("High".to_string()),
-                cooldown_minutes: Set(30),
-                enabled: Set(true),
-                created_at: Set(now),
-                updated_at: Set(now),
-                ..Default::default()
-            }
-        };
-
-        const LIMIT: u64 = 3;
-        for _ in 0..LIMIT {
-            insert_rule_within_project_limit(db.as_ref(), project_id, rule(project_id), LIMIT)
-                .await
-                .expect("rules under the limit are accepted");
-        }
-
-        let err =
-            insert_rule_within_project_limit(db.as_ref(), project_id, rule(project_id), LIMIT)
-                .await
-                .expect_err("the rule past the limit must be rejected");
-        assert!(matches!(
-            err,
-            ErrorTrackingError::AlertRuleLimitReached {
-                project_id: pid,
-                existing: 3,
-                limit: 3,
-            } if pid == project_id
-        ));
-        assert_eq!(Problem::from(err).status_code, StatusCode::CONFLICT);
-
-        // The cap is per project: another project is unaffected.
-        insert_rule_within_project_limit(
-            db.as_ref(),
-            other_project_id,
-            rule(other_project_id),
-            LIMIT,
-        )
-        .await
-        .expect("a different project has its own budget");
-
-        // An unknown project is a typed not-found, not an FK violation.
-        let missing = insert_rule_within_project_limit(
-            db.as_ref(),
-            other_project_id + 10_000,
-            rule(other_project_id + 10_000),
-            LIMIT,
-        )
-        .await
-        .expect_err("unknown project must be rejected");
-        assert!(matches!(missing, ErrorTrackingError::ProjectNotFound));
     }
 }

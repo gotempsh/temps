@@ -26,11 +26,11 @@ use temps_core::SensitiveAction;
 use tracing::{error, warn};
 use utoipa::{OpenApi, ToSchema};
 
-use crate::handlers::audit::{AuditContext, RestoreRunAudit, RestoreRunCancellationAudit};
+use crate::handlers::audit::{AuditContext, RestoreRunAudit, RestoreRunCancelledAudit};
 use crate::handlers::types::BackupAppState;
 use crate::services::{
-    PlanSourceBackup, PlanTarget, RestoreError, RestorePlan, RestoreRequestMode, RestoreRunView,
-    RestoreService,
+    PlanSourceBackup, PlanTarget, RestoreError, RestorePlan, RestoreRequestMode,
+    RestoreRunSourceBackup, RestoreRunView, RestoreService,
 };
 use temps_providers::externalsvc::{RecoveryTarget, RestoreCapabilities};
 
@@ -58,6 +58,14 @@ impl From<RestoreError> for Problem {
                     .with_title("Restore Already In Progress")
                     .with_detail(error.to_string())
                     .with_value("active_restore_run_id", restore_run_id)
+            }
+            RestoreError::RestoreNotActive { ref status, .. } => {
+                let status = status.clone();
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_type("https://temps.sh/probs/restore-not-active")
+                    .with_title("Restore Already Finished")
+                    .with_detail(error.to_string())
+                    .with_value("run_status", status)
             }
             RestoreError::RestoreNotCancellable { ref phase, .. } => {
                 let phase = phase.clone();
@@ -111,6 +119,7 @@ impl From<RestoreError> for Problem {
             RecoveryTarget,
             RestoreCapabilities,
             RestoreRunView,
+            RestoreRunSourceBackup,
             RestoreCapabilitiesResponse,
             RestorePlan,
             PlanTarget,
@@ -584,9 +593,27 @@ async fn get_restore_run(
         .get_restore_run(id)
         .await
         .map_err(Problem::from)?;
+    require_restore_run_read_access(&app_state, &auth, &run, "read a restore run").await?;
 
+    Ok(Json(run))
+}
+
+/// Authorize reading `run`: the caller must reach its target service, any
+/// service it created, and every service that produced its backup. A run
+/// over a raw S3 location or an ownerless (control-plane) backup is
+/// administrators-only. Shared by every endpoint that returns a run.
+async fn require_restore_run_read_access(
+    app_state: &BackupAppState,
+    auth: &temps_auth::AuthContext,
+    run: &RestoreRunView,
+    operation: &str,
+) -> Result<(), Problem> {
     if run.source_backup_id <= 0 {
-        require_ownerless_restore_admin(&app_state, &auth, "read a raw-location restore run")?;
+        require_ownerless_restore_admin(
+            app_state,
+            auth,
+            &format!("{operation} that reads a raw backup location"),
+        )?;
     }
 
     let mut related_service_ids = vec![run.source_service_id];
@@ -614,16 +641,16 @@ async fn get_restore_run(
         related_service_ids.extend(producer_service_ids);
     }
     require_services_access(
-        &app_state,
-        &auth,
+        app_state,
+        auth,
         &related_service_ids,
         Permission::BackupsRead,
         "restore run services",
-        "read restore run",
+        operation,
     )
     .await?;
 
-    Ok(Json(run))
+    Ok(())
 }
 
 #[utoipa::path(
@@ -636,7 +663,7 @@ async fn get_restore_run(
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "Restore run not found", body = ProblemDetails),
-        (status = 409, description = "The run can no longer be stopped safely (`restore-not-cancellable`, with the run's `phase`): an in-place restore has started writing data, a new service is being registered, or the run already finished", body = ProblemDetails),
+        (status = 409, description = "Conflict: the run already finished (`restore-not-active`, with `run_status`), or it can no longer be stopped safely (`restore-not-cancellable`, with `phase`): an in-place restore has started writing data, or a new service is being registered", body = ProblemDetails),
     ),
     security(("bearer_auth" = []))
 )]
@@ -656,6 +683,7 @@ async fn cancel_restore_run(
     if run.source_backup_id <= 0 {
         require_ownerless_restore_admin(&app_state, &auth, "cancel a raw-location restore run")?;
     }
+    require_restore_run_read_access(&app_state, &auth, &run, "cancel a restore run").await?;
 
     // Stopping a restore takes the same entitlement as starting one onto the
     // same service in the same mode.
@@ -690,7 +718,7 @@ async fn cancel_restore_run(
         .await
         .map_err(Problem::from)?;
 
-    let audit = RestoreRunCancellationAudit {
+    let audit = RestoreRunCancelledAudit {
         context: AuditContext {
             user_id: auth.user_id(),
             ip_address: Some(metadata.ip_address.clone()),
@@ -700,6 +728,7 @@ async fn cancel_restore_run(
         service_id: service.id,
         service_name: service.name,
         service_type: service.service_type,
+        source_backup_id: run.source_backup_id,
         mode: run.mode.clone(),
         phase: run.phase.clone(),
         target_service_name: run.target_service_name.clone(),
@@ -918,6 +947,26 @@ mod tests {
     fn status_for(err: RestoreError) -> StatusCode {
         let p: Problem = err.into();
         p.status_code
+    }
+
+    /// Cancelling a run that already finished is a conflict that names the
+    /// run's final status, which the console renders.
+    #[test]
+    fn cancelling_a_finished_run_maps_to_restore_not_active() {
+        let problem: Problem = RestoreError::RestoreNotActive {
+            restore_run_id: 42,
+            status: "completed".to_string(),
+        }
+        .into();
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert_eq!(
+            problem.body.get("type").and_then(|t| t.as_str()),
+            Some("https://temps.sh/probs/restore-not-active")
+        );
+        assert_eq!(
+            problem.body.get("run_status").and_then(|s| s.as_str()),
+            Some("completed")
+        );
     }
 
     #[test]

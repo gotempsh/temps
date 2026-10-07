@@ -25,6 +25,7 @@ import {
 } from 'lucide-react'
 import { useState } from 'react'
 import { useNavigate } from 'react-router'
+import { settingsSectionHref } from '@/lib/project-settings-sections'
 import { toast } from 'sonner'
 
 type SourceType =
@@ -247,9 +248,15 @@ export function DeploymentSourceCard({
             This is the current deployment source.
           </p>
         ) : selected === 'git' && !hasGitConfig ? (
-          // No repository configured yet — hand off to the Git settings page,
+          // No repository configured yet — hand off to the Repository section,
           // whose save configures the repo and flips the project to Git.
-          <Button onClick={() => navigate('../git')}>
+          <Button
+            onClick={() =>
+              navigate(
+                settingsSectionHref(project.slug, 'delivery', 'repository')
+              )
+            }
+          >
             Set up Git repository
             <ArrowRight className="ml-2 h-4 w-4" />
           </Button>

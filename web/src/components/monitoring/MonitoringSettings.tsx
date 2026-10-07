@@ -29,7 +29,7 @@ import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useQuery } from '@tanstack/react-query'
 import { useForm, useWatch } from 'react-hook-form'
-import { useNavigate, useParams } from 'react-router'
+import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 import {
   backupAlertsSchema,
@@ -53,6 +53,8 @@ import {
   monitoringSectionLabel,
 } from './monitoring-sections'
 import { PageHeader } from '@/components/layout/PageContainer'
+import { withReturnTo } from '@/lib/safe-return-to'
+import { notificationPreferencesUpdate } from './notification-preferences-payload'
 
 interface AlertComponentProps<T> {
   onSave: (data: T) => Promise<void>
@@ -475,6 +477,11 @@ function RouteAlerts({
   )
 }
 
+const SLACK_PROVIDER_SETUP_HREF = withReturnTo(
+  '/settings/notifications/new?provider=slack&step=configuration',
+  '/monitoring/notifications'
+)
+
 function NotificationSettings({
   onSave,
   defaultValues,
@@ -485,7 +492,6 @@ function NotificationSettings({
       email: defaultValues?.email,
       slack: {
         enabled: defaultValues?.slack?.enabled,
-        webhook: '',
       },
       batchNotifications: defaultValues?.batchNotifications,
       minimumSeverity: defaultValues?.minimumSeverity,
@@ -522,7 +528,7 @@ function NotificationSettings({
               control={form.control}
               name="slack.enabled"
               render={({ field }) => (
-                <FormItem className="space-y-4">
+                <FormItem className="space-y-2">
                   <div className="flex items-center justify-between">
                     <FormLabel>Slack Notifications</FormLabel>
                     <FormControl>
@@ -533,26 +539,16 @@ function NotificationSettings({
                     </FormControl>
                   </div>
 
-                  {field.value && (
-                    <div className="grid gap-2 pl-6">
-                      <FormField
-                        control={form.control}
-                        name="slack.webhook"
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>Webhook URL</FormLabel>
-                            <FormControl>
-                              <Input
-                                {...field}
-                                placeholder="https://hooks.slack.com/..."
-                              />
-                            </FormControl>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-                    </div>
-                  )}
+                  <FormDescription>
+                    Slack messages are delivered by a Slack notification
+                    provider, which applies to all projects.{' '}
+                    <Link
+                      to={SLACK_PROVIDER_SETUP_HREF}
+                      className="font-medium text-foreground underline underline-offset-4"
+                    >
+                      Add a Slack provider
+                    </Link>
+                  </FormDescription>
                 </FormItem>
               )}
             />
@@ -964,24 +960,14 @@ export function MonitoringSettings() {
   const handleNotificationSave = async (data: NotificationSettingsFormData) => {
     if (!preferences) return
 
-    const updatedPreferences: NotificationPreferencesResponse = {
-      ...preferences,
-      email_enabled: data.email,
-      slack_enabled: data.slack.enabled,
-      batch_similar_notifications: data.batchNotifications,
-      minimum_severity: data.minimumSeverity,
-    }
-
     await toast.promise(
       updatePreferences({
-        body: {
-          preferences: updatedPreferences,
-        },
+        body: notificationPreferencesUpdate(preferences, data),
       }),
       {
-        loading: 'Saving notification settings...',
-        success: 'Notification settings saved successfully',
-        error: 'Failed to save notification settings',
+        loading: 'Saving delivery preferences...',
+        success: 'Delivery preferences saved',
+        error: 'Failed to save delivery preferences',
       }
     )
   }
@@ -1082,7 +1068,6 @@ export function MonitoringSettings() {
       email: preferences.email_enabled,
       slack: {
         enabled: preferences.slack_enabled,
-        webhook: '',
       },
       batchNotifications: preferences.batch_similar_notifications,
       minimumSeverity: preferences.minimum_severity as
@@ -1145,7 +1130,10 @@ export function MonitoringSettings() {
       case 'notifications':
         return (
           <div className="max-w-5xl space-y-10">
-            <SettingsGroup title="Notification Preferences">
+            <SettingsGroup
+              title="Delivery preferences"
+              description="Instance-wide preferences for every project. Where notifications are sent is set by providers and routes in Settings → Notifications."
+            >
               <NotificationSettings
                 onSave={handleNotificationSave}
                 defaultValues={notificationDefaults}

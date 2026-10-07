@@ -137,6 +137,7 @@ import {
   repositoryConnectionPath,
   repositorySelectionPath,
 } from '@/lib/repository-connection-route'
+import { settingsSectionHref } from '@/lib/project-settings-sections'
 
 interface GitSettingsProps {
   project: ProjectResponse
@@ -715,7 +716,11 @@ function GitSettingsInline({
                 type="button"
                 size="sm"
                 variant="outline"
-                onClick={() => navigate(`/projects/${project.slug}/git`)}
+                onClick={() =>
+                  navigate(
+                    settingsSectionHref(project.slug, 'delivery', 'repository')
+                  )
+                }
               >
                 View Git settings
               </Button>
@@ -2773,7 +2778,8 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
     }
   }, [detectedPresetData, directory])
 
-  const back = () => navigate(`/projects/${project.slug}/git`)
+  const back = () =>
+    navigate(settingsSectionHref(project.slug, 'delivery', 'repository'))
   const connectionBasePath = repositoryConnectionBasePath(project.slug)
 
   const repoToConnect =
@@ -3175,7 +3181,7 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
   )
 }
 
-export function GitSettings(props: GitSettingsProps) {
+export function GitSettings(props: GitSettingsProps & { embedded?: boolean }) {
   return <GitSettingsInline {...props} view="git" />
 }
 

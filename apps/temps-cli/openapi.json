@@ -33482,6 +33482,60 @@
         ],
         "type": "object"
       },
+      "NotificationDeliveryCoverageResponse": {
+        "description": "Whether a notification of one severity would reach anyone, with the\nconsole page that fixes it when it would not.",
+        "properties": {
+          "cloud_delivery": {
+            "description": "Whether Temps Cloud also delivers notifications from this instance.",
+            "type": "boolean"
+          },
+          "configured": {
+            "description": "Whether at least one destination would receive the notification.",
+            "type": "boolean"
+          },
+          "provider_ids": {
+            "description": "Enabled providers those routes deliver to.",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "reason": {
+            "description": "Why nothing would be delivered, when `configured` is false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "route_ids": {
+            "description": "Enabled routes whose severity range contains `severity`.",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "setup_path": {
+            "description": "Console path that fixes the gap, when `configured` is false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "severity": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "severity",
+          "configured",
+          "route_ids",
+          "provider_ids",
+          "cloud_delivery"
+        ],
+        "type": "object"
+      },
       "NotificationPreferencesResponse": {
         "properties": {
           "backup_failures_enabled": {
@@ -33695,6 +33749,39 @@
           "total",
           "page",
           "page_size"
+        ],
+        "type": "object"
+      },
+      "NotificationRouteTestResult": {
+        "properties": {
+          "deliveries": {
+            "items": {
+              "$ref": "#/components/schemas/RouteTestDelivery"
+            },
+            "type": "array"
+          },
+          "route_enabled": {
+            "description": "A disabled route is still tested, but real notifications skip it.",
+            "type": "boolean"
+          },
+          "route_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "route_name": {
+            "type": "string"
+          },
+          "severity": {
+            "description": "Severity of the sample notification: the lowest one the route matches.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "route_id",
+          "route_name",
+          "route_enabled",
+          "severity",
+          "deliveries"
         ],
         "type": "object"
       },
@@ -43555,6 +43642,49 @@
           }
         ]
       },
+      "RestoreRunSourceBackup": {
+        "description": "The backup a restore run reads.",
+        "properties": {
+          "backup_id": {
+            "description": "The backup's UUID, which addresses it in the console and the\n`/backups/{id}` API. `None` for a raw-location restore, or when the\ntracked backup has since been deleted.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "description": "`backups.id` of a tracked backup. `None` for a restore from a raw S3\nlocation (a backup this instance did not record).",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "location": {
+            "description": "Object key or `s3://` URL of the backup.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "s3_source_id": {
+            "description": "S3 source holding the backup.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "taken_at": {
+            "description": "When the backup was taken (ISO 8601). `None` when unknown.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "RestoreRunView": {
         "properties": {
           "cancel_requested_at": {
@@ -43601,24 +43731,13 @@
             "type": "string"
           },
           "recovery_target": {},
+          "source_backup": {
+            "$ref": "#/components/schemas/RestoreRunSourceBackup",
+            "description": "The backup this run restores from, so a client can show and link to\nit. Always present; its fields are `None` where they are unknown."
+          },
           "source_backup_id": {
             "format": "int32",
             "type": "integer"
-          },
-          "source_backup_uuid": {
-            "description": "The backup's UUID (`backups.backup_id`), which is what backup routes\ntake. Absent for raw-location restores and runs recorded before it\nwas tracked.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "source_s3_source_id": {
-            "description": "S3 source holding the backup being restored, so clients can link to\nit. Absent only for runs recorded before this was tracked.",
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
           },
           "source_service_id": {
             "format": "int32",
@@ -43655,7 +43774,8 @@
           "status",
           "phase",
           "created_at",
-          "cancellable"
+          "cancellable",
+          "source_backup"
         ],
         "type": "object"
       },
@@ -44116,6 +44236,45 @@
           "updated_at"
         ],
         "type": "object"
+      },
+      "RouteTestDelivery": {
+        "properties": {
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "provider_name": {
+            "type": "string"
+          },
+          "provider_type": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/RouteTestDeliveryStatus"
+          }
+        },
+        "required": [
+          "provider_id",
+          "provider_name",
+          "provider_type",
+          "status"
+        ],
+        "type": "object"
+      },
+      "RouteTestDeliveryStatus": {
+        "description": "Outcome of sending a test notification to one provider of a route.",
+        "enum": [
+          "sent",
+          "failed",
+          "skipped_disabled"
+        ],
+        "type": "string"
       },
       "RouteUser": {
         "properties": {
@@ -91098,6 +91257,84 @@
         "x-maturity": "beta"
       }
     },
+    "/notification-routes/coverage": {
+      "get": {
+        "operationId": "get_notification_delivery_coverage",
+        "parameters": [
+          {
+            "description": "Severity of the notification to check: debug, info, warning, error,\ncritical or emergency.",
+            "in": "query",
+            "name": "severity",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationDeliveryCoverageResponse"
+                }
+              }
+            },
+            "description": "Delivery coverage for the severity"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid severity"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Check whether a notification of the given severity would be delivered",
+        "tags": [
+          "Notification Routes"
+        ],
+        "x-maturity": "beta"
+      }
+    },
     "/notification-routes/{id}": {
       "delete": {
         "operationId": "delete_notification_route",
@@ -91229,6 +91466,85 @@
             "bearer_auth": []
           }
         ],
+        "tags": [
+          "Notification Routes"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/notification-routes/{id}/test": {
+      "post": {
+        "operationId": "test_notification_route",
+        "parameters": [
+          {
+            "description": "Route ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationRouteTestResult"
+                }
+              }
+            },
+            "description": "Per-provider test results"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Route not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Send a test notification through a route to each of its providers",
         "tags": [
           "Notification Routes"
         ],
@@ -119344,7 +119660,7 @@
                 }
               }
             },
-            "description": "The run can no longer be stopped safely (`restore-not-cancellable`, with the run's `phase`): an in-place restore has started writing data, a new service is being registered, or the run already finished"
+            "description": "Conflict: the run already finished (`restore-not-active`, with `run_status`), or it can no longer be stopped safely (`restore-not-cancellable`, with `phase`): an in-place restore has started writing data, or a new service is being registered"
           }
         },
         "security": [

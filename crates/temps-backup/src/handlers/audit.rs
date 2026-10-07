@@ -120,22 +120,25 @@ pub struct RestoreRunAudit {
     pub cross_service_confirmed: bool,
 }
 
-/// A user asked to cancel a running restore. Recorded only when the
-/// cancellation was accepted; the run's final `cancelled` status (and what
-/// was cleaned up) is on the restore run itself.
+/// A restore run cancelled before it wrote to an existing service.
 #[derive(Debug, Clone, Serialize)]
-pub struct RestoreRunCancellationAudit {
+pub struct RestoreRunCancelledAudit {
     pub context: AuditContext,
     pub restore_run_id: i32,
-    /// The service the restore writes onto (or clones, for a new service).
+    /// The service the restore targeted (overwritten in place, or the
+    /// template for a new service).
     pub service_id: i32,
     pub service_name: String,
     pub service_type: String,
+    /// `0` for a restore from a raw S3 location.
+    pub source_backup_id: i32,
     pub mode: String,
-    /// Phase the run was in when cancellation was requested.
-    pub phase: String,
-    /// Name of the new service a new-service restore was creating.
+    /// Name of the service a new-service restore would have created.
     pub target_service_name: Option<String>,
+    /// Phase the run was in when the cancellation was accepted: `prepare` or
+    /// `download` for an in-place restore, up to `provision`/`recover` for one
+    /// creating a new service.
+    pub phase: String,
 }
 
 /// Security audit record for a PostgreSQL major-upgrade mutation.
@@ -515,7 +518,7 @@ impl AuditOperation for RestoreRunAudit {
     }
 }
 
-impl AuditOperation for RestoreRunCancellationAudit {
+impl AuditOperation for RestoreRunCancelledAudit {
     fn operation_type(&self) -> String {
         "EXTERNAL_SERVICE_RESTORE_RUN_CANCELLED".to_string()
     }

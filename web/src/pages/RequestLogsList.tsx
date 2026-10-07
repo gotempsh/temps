@@ -25,7 +25,7 @@ export default function RequestLogsList({
     // endpoint bound its lookup to the right chunks/partitions instead of
     // scanning the whole retention window.
     navigate(
-      `/projects/${projectResponse.slug}/logs/${encodeURIComponent(requestId)}?ts=${encodeURIComponent(timestamp)}`
+      `/projects/${projectResponse.slug}/request-logs/${encodeURIComponent(requestId)}?ts=${encodeURIComponent(timestamp)}`
     )
   }
 

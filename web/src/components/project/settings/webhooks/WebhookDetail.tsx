@@ -39,6 +39,7 @@ import {
 import { useState } from 'react'
 import { useNavigate, useParams } from 'react-router'
 import { DeliveryDetailDialog } from './DeliveryDetailDialog'
+import { settingsSectionHref } from '@/lib/project-settings-sections'
 
 interface WebhookDetailProps {
   project: ProjectResponse
@@ -117,7 +118,9 @@ export function WebhookDetail({ project }: WebhookDetailProps) {
             variant="ghost"
             size="icon"
             onClick={() =>
-              navigate(`/projects/${project.slug}/settings/webhooks`)
+              navigate(
+                settingsSectionHref(project.slug, 'integrations', 'webhooks')
+              )
             }
           >
             <ArrowLeft className="h-4 w-4" />
@@ -160,7 +163,9 @@ export function WebhookDetail({ project }: WebhookDetailProps) {
             variant="ghost"
             size="icon"
             onClick={() =>
-              navigate(`/projects/${project.slug}/settings/webhooks`)
+              navigate(
+                settingsSectionHref(project.slug, 'integrations', 'webhooks')
+              )
             }
           >
             <ArrowLeft className="h-4 w-4" />

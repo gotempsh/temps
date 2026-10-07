@@ -270,6 +270,8 @@ If certificates are issued but browsers do not trust them, check whether `LETSEN
 
 With on-demand TLS, the first HTTPS request to a new hostname fails while the certificate is issued in the background. Plain HTTP requests in the meantime get `TLS certificate provisioning in progress. Retry in a few seconds.`
 
+On-demand TLS is turned on and configured in the console under **Settings > On-demand TLS** (the **Certificates** page links there when no attempt has been recorded). The switch, zone and limits are read when Temps starts, so restart Temps after changing them; the per-deployment URL mode applies immediately. With the switch on, the page lists anything that still stops issuance: an external URL on a loopback address, no zone (none set and the external URL is not a `*.sslip.io` address), or no Let's Encrypt contact email.
+
 The CLI can help: `bunx @temps-sdk/cli domains status`, `domains renewal-attempts`, `domains dns-challenge`, and `domains http-debug`. See also [Domains and SSL](/docs/domains-ssl) and [Add a custom domain](/docs/add-a-custom-domain).
 
 ---
@@ -315,6 +317,8 @@ A restore runs on the server, not in your browser. Its page address carries the 
 | `Restore status could not be refreshed; the restore may still be running.` | The console could not read the run's status (network, server or permission problem). The restore itself is unaffected. Retry, or copy the run ID and check it later |
 | `interrupted` — `This restore was interrupted when Temps restarted during <phase> ...` | Temps restarted while the restore was running. On the next start it stops any restore helper container still writing to the database, then marks the run interrupted. Nothing is rolled back or replayed. The database may be partially restored: check its health and data, then start a new restore |
 | `409 Restore Already In Progress` — `Service <id> already has an active restore (run <run-id>)` | Only one in-place restore (or point-in-time restore in place) can run per database. Follow the named run instead of starting another |
+| `cancelled` — `Restore cancelled before any data was written ...` | Someone cancelled the restore while it was preparing. The database was not modified and no new service was created. Start a new restore when ready |
+| `409 Restore Can No Longer Be Cancelled` — `Restore run <id> can no longer be cancelled: it is in phase '<phase>' ...` | The restore had already started writing data, so stopping it would leave the database partially restored. It runs to completion; check the result when it finishes |
 
 If a run stays `running` after a restart, check the server log for `Restore run left active`. Temps keeps the run active when it cannot confirm that its helper containers have stopped, for example while Docker is still starting, and retries for about 30 minutes.
 

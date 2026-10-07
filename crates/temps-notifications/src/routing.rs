@@ -51,6 +51,49 @@ pub struct NotificationRoutePage {
     pub page_size: u64,
 }
 
+/// Which enabled routes and enabled providers a notification of one severity
+/// would reach.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct NotificationRouteCoverage {
+    pub severity: String,
+    /// Enabled routes whose severity range contains `severity`.
+    pub route_ids: Vec<i32>,
+    /// Enabled providers assigned to those routes.
+    pub provider_ids: Vec<i32>,
+    /// Whether any notification provider exists at all, enabled or not.
+    pub any_provider_configured: bool,
+}
+
+/// Outcome of sending a test notification to one provider of a route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteTestDeliveryStatus {
+    Sent,
+    Failed,
+    /// The provider is disabled, so real notifications skip it too.
+    SkippedDisabled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RouteTestDelivery {
+    pub provider_id: i32,
+    pub provider_name: String,
+    pub provider_type: String,
+    pub status: RouteTestDeliveryStatus,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct NotificationRouteTestResult {
+    pub route_id: i32,
+    pub route_name: String,
+    /// A disabled route is still tested, but real notifications skip it.
+    pub route_enabled: bool,
+    /// Severity of the sample notification: the lowest one the route matches.
+    pub severity: String,
+    pub deliveries: Vec<RouteTestDelivery>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum NotificationRouteError {
     #[error("Notification route name must not be empty")]
@@ -71,6 +114,10 @@ pub enum NotificationRouteError {
     NoProviders,
     #[error("Notification provider {provider_id} assigned to the route was not found")]
     ProviderNotFound { provider_id: i32 },
+    #[error(
+        "Severity '{value}' is invalid; expected one of: debug, info, warning, error, critical, emergency"
+    )]
+    InvalidSeverity { value: String },
     #[error("Notification route {route_id} was not found")]
     RouteNotFound { route_id: i32 },
     #[error("A notification route named '{name}' already exists")]
@@ -192,6 +239,15 @@ impl NotificationRoutingService {
         NotificationSeverity::from_str(value.trim())
             .map(|severity| severity.as_str().to_string())
             .ok_or(NotificationRouteError::InvalidMinimumSeverity { value })
+    }
+
+    /// Parses a severity query value (e.g. `?severity=warning`).
+    pub fn parse_severity(value: &str) -> Result<NotificationSeverity, NotificationRouteError> {
+        NotificationSeverity::from_str(value.trim()).ok_or_else(|| {
+            NotificationRouteError::InvalidSeverity {
+                value: value.to_string(),
+            }
+        })
     }
 
     fn normalize_max_severity(value: String) -> Result<String, NotificationRouteError> {
@@ -582,12 +638,15 @@ impl NotificationRoutingService {
         Ok(())
     }
 
-    pub async fn resolve_provider_models(
+    /// Enabled routes whose severity range contains `severity`, paired with
+    /// the enabled providers those routes deliver to.
+    async fn routed_providers(
         &self,
         severity: NotificationSeverity,
-    ) -> Result<Vec<notification_providers::Model>, NotificationRouteError> {
+    ) -> Result<(Vec<i32>, Vec<notification_providers::Model>), NotificationRouteError> {
         let routes = notification_routes::Entity::find()
             .filter(notification_routes::Column::Enabled.eq(true))
+            .order_by_asc(notification_routes::Column::Id)
             .all(self.db.as_ref())
             .await
             .map_err(|source| NotificationRouteError::Database {
@@ -623,9 +682,9 @@ impl NotificationRoutingService {
             Self::load_provider_ids(self.db.as_ref(), &matching_route_ids, None).await?;
         let provider_ids: HashSet<i32> = assignments.into_values().flatten().collect();
         if provider_ids.is_empty() {
-            return Ok(Vec::new());
+            return Ok((matching_route_ids, Vec::new()));
         }
-        notification_providers::Entity::find()
+        let providers = notification_providers::Entity::find()
             .filter(notification_providers::Column::Enabled.eq(true))
             .filter(notification_providers::Column::Id.is_in(provider_ids))
             .order_by_asc(notification_providers::Column::CreatedAt)
@@ -635,7 +694,67 @@ impl NotificationRoutingService {
                 route_id: None,
                 operation: "resolve providers for",
                 source,
-            })
+            })?;
+        Ok((matching_route_ids, providers))
+    }
+
+    pub async fn resolve_provider_models(
+        &self,
+        severity: NotificationSeverity,
+    ) -> Result<Vec<notification_providers::Model>, NotificationRouteError> {
+        self.routed_providers(severity)
+            .await
+            .map(|(_, providers)| providers)
+    }
+
+    /// Reports which routes and providers a notification at `severity` would
+    /// reach, so a form that creates something that notifies (an alert rule)
+    /// can warn before it is saved rather than after it silently fails.
+    pub async fn coverage(
+        &self,
+        severity: NotificationSeverity,
+    ) -> Result<NotificationRouteCoverage, NotificationRouteError> {
+        let (route_ids, providers) = self.routed_providers(severity).await?;
+        let any_provider_configured = notification_providers::Entity::find()
+            .filter(notification_providers::Column::ProviderType.ne("cloud"))
+            .count(self.db.as_ref())
+            .await
+            .map_err(|source| NotificationRouteError::Database {
+                route_id: None,
+                operation: "count providers for coverage of",
+                source,
+            })?
+            > 0;
+        Ok(NotificationRouteCoverage {
+            severity: severity.as_str().to_string(),
+            route_ids,
+            provider_ids: providers.into_iter().map(|provider| provider.id).collect(),
+            any_provider_configured,
+        })
+    }
+
+    /// The route plus every provider assigned to it (enabled or not), for
+    /// sending a test notification through exactly that route.
+    pub async fn route_with_providers(
+        &self,
+        route_id: i32,
+    ) -> Result<(NotificationRoute, Vec<notification_providers::Model>), NotificationRouteError>
+    {
+        let route = self.get(route_id).await?;
+        if route.provider_ids.is_empty() {
+            return Ok((route, Vec::new()));
+        }
+        let providers = notification_providers::Entity::find()
+            .filter(notification_providers::Column::Id.is_in(route.provider_ids.iter().copied()))
+            .order_by_asc(notification_providers::Column::Id)
+            .all(self.db.as_ref())
+            .await
+            .map_err(|source| NotificationRouteError::Database {
+                route_id: Some(route_id),
+                operation: "load providers for test of",
+                source,
+            })?;
+        Ok((route, providers))
     }
 
     pub async fn has_routable_provider(&self) -> Result<bool, NotificationRouteError> {
@@ -930,6 +1049,110 @@ mod tests {
             .cleanup_all_tables()
             .await
             .expect("routing test data should clean up");
+    }
+
+    #[tokio::test]
+    async fn coverage_reports_matching_routes_and_enabled_providers() {
+        let test_db = routing_test_database_or_skip!();
+        let service = NotificationRoutingService::new(test_db.connection_arc());
+
+        let empty = service
+            .coverage(NotificationSeverity::Warning)
+            .await
+            .expect("coverage with no providers should resolve");
+        assert!(empty.route_ids.is_empty());
+        assert!(empty.provider_ids.is_empty());
+        assert!(!empty.any_provider_configured);
+
+        let now = Utc::now();
+        let insert_provider =
+            |name: &'static str, enabled: bool| notification_providers::ActiveModel {
+                name: Set(name.to_string()),
+                provider_type: Set("slack".to_string()),
+                config: Set("test-config".to_string()),
+                enabled: Set(enabled),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            };
+        let on_call = insert_provider("On-call channel", true)
+            .insert(test_db.db.as_ref())
+            .await
+            .expect("on-call provider should insert");
+        let muted = insert_provider("Muted channel", false)
+            .insert(test_db.db.as_ref())
+            .await
+            .expect("muted provider should insert");
+        let critical_route = service
+            .create(CreateNotificationRoute {
+                name: "Critical only".to_string(),
+                enabled: true,
+                min_severity: "critical".to_string(),
+                max_severity: "emergency".to_string(),
+                provider_ids: vec![on_call.id],
+            })
+            .await
+            .expect("critical route should create");
+        let warning_route = service
+            .create(CreateNotificationRoute {
+                name: "Warnings to muted".to_string(),
+                enabled: true,
+                min_severity: "warning".to_string(),
+                max_severity: "error".to_string(),
+                provider_ids: vec![muted.id],
+            })
+            .await
+            .expect("warning route should create");
+
+        let warning = service
+            .coverage(NotificationSeverity::Warning)
+            .await
+            .expect("warning coverage should resolve");
+        assert_eq!(warning.route_ids, vec![warning_route.id]);
+        assert!(
+            warning.provider_ids.is_empty(),
+            "a route whose only provider is disabled delivers nothing"
+        );
+        assert!(warning.any_provider_configured);
+
+        let critical = service
+            .coverage(NotificationSeverity::Critical)
+            .await
+            .expect("critical coverage should resolve");
+        assert_eq!(critical.route_ids, vec![critical_route.id]);
+        assert_eq!(critical.provider_ids, vec![on_call.id]);
+
+        let (route, providers) = service
+            .route_with_providers(warning_route.id)
+            .await
+            .expect("route providers should load");
+        assert_eq!(route.id, warning_route.id);
+        assert_eq!(
+            providers.iter().map(|p| p.id).collect::<Vec<_>>(),
+            vec![muted.id],
+            "route tests must see disabled providers so they can be reported"
+        );
+        assert!(matches!(
+            service.route_with_providers(i32::MAX).await,
+            Err(NotificationRouteError::RouteNotFound { .. })
+        ));
+
+        test_db
+            .cleanup_all_tables()
+            .await
+            .expect("coverage test data should clean up");
+    }
+
+    #[test]
+    fn coverage_severity_parsing_rejects_unknown_values() {
+        assert_eq!(
+            NotificationRoutingService::parse_severity(" Warn ").expect("alias should parse"),
+            NotificationSeverity::Warning
+        );
+        assert!(matches!(
+            NotificationRoutingService::parse_severity("loud"),
+            Err(NotificationRouteError::InvalidSeverity { value }) if value == "loud"
+        ));
     }
 
     #[tokio::test]

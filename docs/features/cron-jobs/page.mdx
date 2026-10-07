@@ -472,7 +472,7 @@ cron:
 ### View Cron Jobs
 
 In the Temps dashboard:
-1. Go to **Project Settings** → **Cron Jobs**
+1. Go to **Project Settings** → **Automation** → **Cron jobs**
 2. See all configured cron jobs
 3. View execution history
 4. Check success/failure rates
@@ -503,18 +503,18 @@ temps logs --project my-app | grep "cron"
 
 ## Error Handling {{ anchor: true, id: 'error-handling' }}
 
-### Retries
+### What happens when a run fails
 
-Failed cron jobs are automatically retried:
-- **1st retry**: After 1 minute
-- **2nd retry**: After 5 minutes
-- **3rd retry**: After 15 minutes
+A run fails when your endpoint answers with a non-2xx status or cannot be reached. Temps then:
 
-After 3 failed attempts, the job is marked as failed.
+- records the run in the execution history with the status your endpoint returned (500 when it could not be reached) and the error;
+- raises a **Cron job failed** alarm under **Monitoring > Alarms**, delivered through your notification routes like any other alarm. The alarm names the cron, its schedule, the status, and its last successful run. Repeated failures in the same project are debounced for 5 minutes, so a cron failing every minute does not notify every minute.
+
+Failed runs are not retried; the cron runs again at its next scheduled time. Retry inside your handler if a step is safe to repeat.
 
 ### Handling Failures in Code
 
-Return appropriate status codes:
+Return a non-2xx status when the task fails, so the run is recorded as failed and raises the alarm:
 
 ```typescript
 // app/api/cron/task/route.ts
@@ -523,20 +523,11 @@ export async function GET(request: Request) {
     await performTask();
     return Response.json({ success: true }, { status: 200 });
   } catch (error) {
-    if (error instanceof TransientError) {
-      // Will be retried (5xx errors)
-      return Response.json({ error: error.message }, { status: 500 });
-    } else {
-      // Won't be retried (4xx errors)
-      return Response.json({ error: error.message }, { status: 400 });
-    }
+    // Any non-2xx status marks the run as failed and raises an alarm.
+    return Response.json({ error: error.message }, { status: 500 });
   }
 }
 ```
-
-<Note>
-**Retry Logic**: Only `5xx` server errors trigger retries. `4xx` client errors are not retried.
-</Note>
 
 ### Timeout
 

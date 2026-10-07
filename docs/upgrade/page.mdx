@@ -1,7 +1,7 @@
 export const metadata = {
   title: "Upgrading Temps",
   description:
-    "Upgrade a self-hosted Temps installation: back up, replace the binary, apply database migrations, verify, and roll back if needed. Covers the automatic pre-migration backup and the schema guard.",
+    "Upgrade a self-hosted Temps installation: back up, replace the binary, apply database migrations, verify, and roll back if needed. Covers the optional pre-migration backup and the schema guard.",
   alternates: {
     canonical: "/docs/upgrade",
   },
@@ -24,13 +24,13 @@ temps upgrade --check   # is a newer release available on your channel?
 
 Read the [release notes](https://github.com/gotempsh/temps/releases) for every version between yours and the target.
 
-### What Temps backs up for you
+### What Temps can back up for you
 
-When the new binary finds pending migrations on an existing database, it dumps the database **before applying any of them** to `<data dir>/backups/pre-migration/`. See [Automatic pre-migration backup](#automatic-pre-migration-backup) for what the dump contains. Nothing is backed up on a fresh install or on a normal restart with nothing to migrate.
+Start the new binary with `--pre-migration-backup` and, when it finds pending migrations on an existing database, it dumps the database **before applying any of them** to `<data dir>/backups/pre-migration/`. The backup is off by default. See [Pre-migration backup](#automatic-pre-migration-backup) for what the dump contains. Nothing is backed up on a fresh install or on a normal restart with nothing to migrate, so the flag can stay in your service unit.
 
 ### Stateless installations
 
-The same backup requirement applies to a stateless control plane. Its local data directory may be temporary: copy the pre-migration dump to durable storage before replacing the container. If your database provider supplies backups, verify that you can restore one taken immediately before the upgrade, then explicitly use `--skip-pre-migration-backup` for that run. Temps does not infer that provider backups exist.
+A stateless control plane follows the same rules. Its local data directory may be temporary: if you take the pre-migration backup, copy the dump to durable storage before replacing the container. If you rely on your database provider's backups instead, verify that you can restore one taken immediately before the upgrade.
 
 ### What you still back up yourself
 
@@ -70,7 +70,7 @@ temps upgrade --path /opt/temps/bin/temps
 
 ### From the console
 
-When an update is available, the console shows a banner with an **Update now** action. It downloads the new binary, runs `temps migrate` with it (including the pre-migration backup), and restarts. Start the server with `--disable-self-update` to forbid this path.
+When an update is available, the console shows a banner with an **Update now** action. It downloads the new binary, runs `temps migrate` with it (with the pre-migration backup when the server was started with `--pre-migration-backup`), and restarts. Start the server with `--disable-self-update` to forbid this path.
 
 ### Upgrade script (`deploy.sh` installs)
 
@@ -247,8 +247,9 @@ Pick one of the two:
 
 ```bash
 TEMPS_DATABASE_URL=postgresql://... temps migrate --dry-run   # show the plan, change nothing
-TEMPS_DATABASE_URL=postgresql://... temps migrate             # back up, then apply (asks first on a terminal)
+TEMPS_DATABASE_URL=postgresql://... temps migrate             # apply (asks first on a terminal)
 TEMPS_DATABASE_URL=postgresql://... temps migrate --yes       # no prompt
+TEMPS_DATABASE_URL=postgresql://... temps migrate --pre-migration-backup   # back up, then apply
 ```
 
 Pass `--data-dir` (or set `TEMPS_DATA_DIR`) if your data directory is not `~/.temps`; that is where the pre-migration backup goes.
@@ -256,17 +257,17 @@ Pass `--data-dir` (or set `TEMPS_DATA_DIR`) if your data directory is not `~/.te
 Each startup, in order:
 
 1. **Schema guard.** Temps compares the migrations recorded in the database with the ones it knows. If the database has migrations this binary does not know — it was migrated by a newer release — Temps refuses to start and changes nothing. See [Database schema is newer than this binary](#database-schema-is-newer-than-this-binary).
-2. **Pre-migration backup**, only if there are pending migrations on an existing database. See below.
+2. **Pre-migration backup**, only with `--pre-migration-backup` and only if there are pending migrations on an existing database. See below. Either way, a `pg_dump` container left running by an interrupted earlier backup of the same data directory is removed first: it holds a lock on every table and would make the first migration time out.
 3. **Migrations.** Each runs in its own transaction; a statement waiting more than 15 seconds for a lock fails fast, and the whole step is bounded at 10 minutes. If a migration fails, the server does not start and the database stays at the last migration that succeeded.
 4. **Maintenance** that does not block startup (large concurrent index builds, analytics backfills) runs in the background once the server is up.
 
 Migrations are idempotent: starting the same version again is a no-op.
 
-### Automatic pre-migration backup {{ anchor: true, id: 'automatic-pre-migration-backup' }}
+### Pre-migration backup {{ anchor: true, id: 'automatic-pre-migration-backup' }}
 
 | | |
 |---|---|
-| **When** | Pending migrations on a database that already has applied ones. Never on a fresh install or a restart with nothing to migrate. |
+| **When** | Only when `temps serve` or `temps migrate` is started with `--pre-migration-backup`, and only for pending migrations on a database that already has applied ones. Never on a fresh install or a restart with nothing to migrate. |
 | **Where** | `<data dir>/backups/pre-migration/` — `~/.temps/data/backups/pre-migration/` for `deploy.sh` installs. The directory is readable only by the Temps user. |
 | **Files** | `temps-pre-migration-<UTC time>-<new version>.dump` (a `pg_dump` custom-format archive, compressed) and a `.json` manifest with the release it came from (`previous_version`), the migrations about to run and the tables dumped without data. |
 | **Retention** | The newest 3 backups; older ones are deleted. |
@@ -275,15 +276,26 @@ Migrations are idempotent: starting the same version again is a no-op.
 
 The log line `Pre-migration database backup written to …` gives the exact path.
 
-**If the backup fails, nothing is migrated** and Temps exits with the reason (for example, no suitable `pg_dump` and no reachable Docker daemon). Fix the cause and start again. If you cannot, take your own backup and start **once** with the opt-out flag:
-
 ```bash
-temps serve --skip-pre-migration-backup ...     # or: temps migrate --skip-pre-migration-backup
+temps serve --pre-migration-backup ...     # or: temps migrate --pre-migration-backup
 ```
 
-The opt-out is a command-line flag on purpose — not an environment variable — so it cannot stay switched on for later upgrades. Remove it after that start.
+**If the backup fails, nothing is migrated** and Temps exits with the reason (for example, no suitable `pg_dump` and no reachable Docker daemon). Fix the cause and start again, or take your own backup and start without the flag.
 
-Stateless control planes have the same backup requirement. Their data directory may be temporary, so retain the dump in durable storage or explicitly skip it only after verifying a database-provider backup. See [Stateless installations](#stateless-installations).
+Stopping Temps while the dump runs (Ctrl+C, `systemctl stop`) can leave its `postgres` container running. The next start removes it before migrating, unless another process is backing up the same data directory at that moment. Each container is labelled with the backup directory it writes for, so containers of other installations on the same Docker host are never touched.
+
+To find it by hand, list the dump containers with the directory they belong to:
+
+```bash
+docker ps -a --filter label=sh.temps.kind=pre-migration-backup \
+  --format '{{.Names}}  {{.Status}}  {{.Label "sh.temps.pre-migration-backup-dir"}}'
+```
+
+With every Temps process that uses this data directory stopped, remove the one whose directory is yours: `docker rm -f <name>`. A container with an empty directory column was started by an older release; it may belong to another installation on the same host, so Temps leaves it running and logs its name. Remove it only if no other installation is upgrading.
+
+`--skip-pre-migration-backup` from earlier releases is still accepted and does nothing.
+
+Stateless control planes: their data directory may be temporary, so copy the dump to durable storage. See [Stateless installations](#stateless-installations).
 
 <Note>
 Rolling back with this backup restores the configuration as it was at upgrade time. Telemetry recorded before the upgrade (logs, traces, analytics) is not in it. If you need to keep telemetry across a rollback, take a full `pg_dump` or a volume snapshot before upgrading.
@@ -372,7 +384,7 @@ The example below is for a `deploy.sh` install (database container `temps-timesc
 
 5. **Start Temps** and [verify](#verify-the-upgrade). Once you are satisfied, drop the set-aside database: `docker exec temps-timescaledb psql -U temps -d postgres -c 'DROP DATABASE temps_before_rollback'`.
 
-If you upgraded with `--skip-pre-migration-backup`, restore the backup you took yourself in step 4 instead.
+If you upgraded without `--pre-migration-backup`, restore the backup you took yourself in step 4 instead.
 
 ---
 
@@ -435,7 +447,17 @@ Nothing was changed. Common causes:
 - **No usable `pg_dump`.** Install the client tools for your PostgreSQL major version (`postgresql-client-18`), or make the Docker daemon reachable so Temps can use a `postgres:18` container.
 - **The data directory is not writable** by the Temps user, or the disk is full.
 
-If you cannot fix it now, back up the database yourself and start once with `--skip-pre-migration-backup`.
+If you cannot fix it now, back up the database yourself and start without `--pre-migration-backup`.
+
+### Migration fails with `canceling statement due to lock timeout`
+
+Another session holds a lock on a table the migration changes, and the migration gave up after 15 seconds. Nothing past the last successful migration was applied. The usual holders are a `pg_dump` container left by an interrupted pre-migration backup (removed automatically on the next start, or by hand as described in [Pre-migration backup](#automatic-pre-migration-backup)) or another Temps process still connected to the database. List who is connected and stop them before starting again:
+
+```bash
+docker exec temps-timescaledb psql -U temps -d temps -c \
+  "SELECT pid, application_name, state, now() - xact_start AS in_transaction, left(query, 60) AS query
+     FROM pg_stat_activity WHERE datname = 'temps' AND pid <> pg_backend_pid()"
+```
 
 ### Migration errors
 

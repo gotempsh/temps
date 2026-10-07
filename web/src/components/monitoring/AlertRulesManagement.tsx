@@ -28,6 +28,7 @@ import {
 } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { Badge } from '@/components/ui/badge'
+import { Skeleton } from '@/components/ui/skeleton'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertTriangle,
@@ -36,7 +37,7 @@ import {
   ShieldAlert,
 } from 'lucide-react'
 import { useMemo, useState } from 'react'
-import { useNavigate } from 'react-router'
+import { Link, useNavigate } from 'react-router'
 import { toast } from 'sonner'
 
 const TRIGGER_TYPES = [
@@ -108,7 +109,9 @@ export function AlertRulesManagement({
   const selectedProject = projectList?.find(
     (project) => project.id === projectId
   )
-  const showProjectSelector = !fixedProjectId && (projectList?.length ?? 0) > 1
+  // Rules are per project, so outside a project the picker is always shown,
+  // even with a single project, to make that scope explicit.
+  const showProjectSelector = !fixedProjectId && (projectList?.length ?? 0) > 0
 
   const navigateToRule = (suffix: 'new' | `${number}/edit`) => {
     if (fixedProjectId) {
@@ -170,11 +173,7 @@ export function AlertRulesManagement({
   const hasRules = useMemo(() => rules && rules.length > 0, [rules])
 
   if (!fixedProjectId && projectsLoading) {
-    return (
-      <div className="flex items-center justify-center py-6">
-        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary" />
-      </div>
-    )
+    return <RulesSkeleton />
   }
 
   if (!fixedProjectId && !projectList?.length) {
@@ -182,7 +181,15 @@ export function AlertRulesManagement({
       <EmptyState
         icon={ShieldAlert}
         title="No projects found"
-        description="Create a project first to configure error alert rules."
+        description="Error alert rules belong to a project. Create one to configure them."
+        action={
+          <Button asChild>
+            <Link to="/projects/new">
+              <Plus className="h-4 w-4 mr-2" />
+              Create project
+            </Link>
+          </Button>
+        }
       />
     )
   }
@@ -194,16 +201,28 @@ export function AlertRulesManagement({
           <h3 className="text-lg font-medium">Error Alert Rules</h3>
           <p className="text-sm text-muted-foreground">
             Configure rules that trigger notifications when errors match certain
-            conditions.
+            conditions. Rules apply to one project
+            {selectedProject && !fixedProjectId ? (
+              <>
+                ; showing{' '}
+                <span className="font-medium text-foreground">
+                  {selectedProject.name}
+                </span>
+              </>
+            ) : null}
+            .
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
           {showProjectSelector && (
             <Select
               value={String(projectId)}
               onValueChange={(v) => setSelectedProjectId(Number(v))}
             >
-              <SelectTrigger className="w-[200px]" aria-label="Project">
+              <SelectTrigger
+                className="w-full sm:w-[200px]"
+                aria-label="Project"
+              >
                 <SelectValue placeholder="Select project" />
               </SelectTrigger>
               <SelectContent>
@@ -224,9 +243,7 @@ export function AlertRulesManagement({
       </div>
 
       {rulesLoading ? (
-        <div className="flex items-center justify-center py-6">
-          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary" />
-        </div>
+        <RulesGridSkeleton />
       ) : !hasRules ? (
         <EmptyState
           icon={AlertTriangle}
@@ -315,6 +332,31 @@ export function AlertRulesManagement({
           ))}
         </div>
       )}
+    </div>
+  )
+}
+
+function RulesGridSkeleton() {
+  return (
+    <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+      {[0, 1, 2].map((i) => (
+        <Skeleton key={i} className="h-32 w-full" />
+      ))}
+    </div>
+  )
+}
+
+function RulesSkeleton() {
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+        <div className="space-y-2">
+          <Skeleton className="h-6 w-40" />
+          <Skeleton className="h-4 w-72" />
+        </div>
+        <Skeleton className="h-9 w-[200px]" />
+      </div>
+      <RulesGridSkeleton />
     </div>
   )
 }

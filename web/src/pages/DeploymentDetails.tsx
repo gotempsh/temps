@@ -20,6 +20,7 @@ import { DeploymentContainerLogs } from '@/components/deployments/DeploymentCont
 import { DeploymentStages } from '@/components/deployments/DeploymentStages'
 import { RedeploymentModal } from '@/components/deployments/RedeploymentModal'
 import { RetainedFailedContainers } from '@/components/deployments/RetainedFailedContainers'
+import { RollbackToLastSuccessful } from '@/components/deployments/RollbackToLastSuccessful'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -547,6 +548,12 @@ function CancelledReason({
               </Button>
             )}
           </div>
+        )}
+        {deployment.status === 'failed' && (
+          <RollbackToLastSuccessful
+            deployment={deployment}
+            projectSlug={projectSlug}
+          />
         )}
         <div>
           {failure && (

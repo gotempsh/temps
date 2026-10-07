@@ -48,7 +48,7 @@ import { listBackupChildrenOptions } from '@/lib/backup-children'
 import { deleteBackup } from '@/lib/backup-cleanup'
 import { cancelBackup } from '@/lib/schedule-runs'
 import { cn } from '@/lib/utils'
-import { restorePageHref } from '@/pages/service-restore/restore-state'
+import { restoreBackupHref } from '@/pages/service-restore/restore-selection'
 import {
   Button,
   Callout,
@@ -122,20 +122,14 @@ function StatusIcon({ state }: { state: BackupState }) {
 }
 
 // Mirrors the record's own state — the Detail template's single verdict.
-const BACKUP_STATE_VERDICT: Record<
-  string,
-  { tone: StatusTone; label: string }
-> = {
+const BACKUP_STATE_VERDICT: Record<string, { tone: StatusTone; label: string }> = {
   completed: { tone: 'ok', label: 'Completed' },
   failed: { tone: 'error', label: 'Failed' },
   running: { tone: 'running', label: 'Running' },
   pending: { tone: 'idle', label: 'Pending' },
   cancelled: { tone: 'idle', label: 'Cancelled' },
 }
-function backupVerdict(state: BackupState): {
-  tone: StatusTone
-  label: string
-} {
+function backupVerdict(state: BackupState): { tone: StatusTone; label: string } {
   return BACKUP_STATE_VERDICT[state] ?? { tone: 'idle', label: state }
 }
 
@@ -199,9 +193,7 @@ function FieldRow({
         >
           {children}
         </div>
-        {copy ? (
-          <CopyAction value={copy} label={`Copy ${label.toLowerCase()}`} />
-        ) : null}
+        {copy ? <CopyAction value={copy} label={`Copy ${label.toLowerCase()}`} /> : null}
       </dd>
     </div>
   )
@@ -416,10 +408,7 @@ export function BackupDetail() {
     {
       label: backup.external_service ? 'Service' : 'S3 source',
       value: backup.external_service ? (
-        <Link
-          to={`/storage/${backup.external_service.id}`}
-          className="hover:underline"
-        >
+        <Link to={`/storage/${backup.external_service.id}`} className="hover:underline">
           {backup.external_service.name}
         </Link>
       ) : source ? (
@@ -433,10 +422,7 @@ export function BackupDetail() {
     {
       label: 'Created by',
       value: createdByUser ? (
-        <Link
-          to={`/settings/users/${createdByUser.id}`}
-          className="hover:underline"
-        >
+        <Link to={`/settings/users/${createdByUser.id}`} className="hover:underline">
           {createdByLabel}
         </Link>
       ) : (
@@ -488,16 +474,14 @@ export function BackupDetail() {
           <>
             {backAction}
             <CopyAction value={backup.s3_location}>Copy S3 path</CopyAction>
-            {/* Restore — a completed single-service backup opens the restore
-              page with this backup, its source and in-place mode already
-              chosen. The restore page still previews and confirms. */}
-            {state === 'completed' && backup.external_service ? (
+            {/* Restore — a completed backup of a database opens that
+              database's restore page with this backup already selected. */}
+            {state === 'completed' && backup.external_service && sourceId ? (
               <Button variant="outline" size="sm" className="gap-2" asChild>
                 <Link
-                  to={restorePageHref(backup.external_service.id, {
-                    sourceId: sourceId,
+                  to={restoreBackupHref(backup.external_service.id, {
+                    sourceId,
                     backupId: backup.id,
-                    mode: 'in_place',
                   })}
                 >
                   <RotateCcw className="h-4 w-4" />
@@ -540,9 +524,7 @@ export function BackupDetail() {
           <>
             <Card className="overflow-hidden shadow-none">
               <CardHeader className="border-b px-5 py-4">
-                <CardTitle className="text-base font-semibold">
-                  Overview
-                </CardTitle>
+                <CardTitle className="text-base font-semibold">Overview</CardTitle>
               </CardHeader>
               <CardContent className="p-0">
                 <div
@@ -571,9 +553,7 @@ export function BackupDetail() {
                   <Stat
                     icon={Clock}
                     label="Duration"
-                    value={
-                      durationMs !== null ? formatDuration(durationMs) : '—'
-                    }
+                    value={durationMs !== null ? formatDuration(durationMs) : '—'}
                     sub={
                       completedAt
                         ? `${fmtDateTime(startedAt)} → ${fmtDateTime(completedAt)}`
@@ -628,15 +608,9 @@ export function BackupDetail() {
               // the operator looking for a failure that never happened.
               <Callout
                 tone={state === 'pending' ? 'warning' : 'error'}
-                title={
-                  state === 'pending'
-                    ? 'Backup has not started'
-                    : 'Backup failed'
-                }
+                title={state === 'pending' ? 'Backup has not started' : 'Backup failed'}
               >
-                <span className="break-all font-mono text-xs">
-                  {backup.error_message}
-                </span>
+                <span className="break-all font-mono text-xs">{backup.error_message}</span>
               </Callout>
             ) : null}
 
@@ -647,8 +621,7 @@ export function BackupDetail() {
                     Services in this backup
                   </CardTitle>
                   <CardDescription>
-                    External services whose data was captured in this backup
-                    run.
+                    External services whose data was captured in this backup run.
                   </CardDescription>
                 </CardHeader>
                 <CardContent className="p-0">
@@ -667,9 +640,6 @@ export function BackupDetail() {
                           </TableHead>
                           <TableHead className="hidden lg:table-cell">
                             Error
-                          </TableHead>
-                          <TableHead className="text-right">
-                            <span className="sr-only">Actions</span>
                           </TableHead>
                         </TableRow>
                       </TableHeader>
@@ -691,8 +661,7 @@ export function BackupDetail() {
                           const parentFinalized =
                             state === 'failed' || state === 'cancelled'
                           const childStale =
-                            child.state === 'pending' ||
-                            child.state === 'running'
+                            child.state === 'pending' || child.state === 'running'
                           const effectiveState =
                             parentFinalized && childStale ? state : child.state
                           const effectiveError =
@@ -749,27 +718,8 @@ export function BackupDetail() {
                                     </Tooltip>
                                   </TooltipProvider>
                                 ) : (
-                                  <span className="text-muted-foreground">
-                                    —
-                                  </span>
+                                  <span className="text-muted-foreground">—</span>
                                 )}
-                              </TableCell>
-                              <TableCell className="text-right">
-                                {effectiveState === 'completed' ? (
-                                  <Button variant="ghost" size="sm" asChild>
-                                    <Link
-                                      to={restorePageHref(child.service_id, {
-                                        sourceId: sourceId,
-                                      })}
-                                      aria-label={`Restore ${child.service_name} from this source`}
-                                    >
-                                      <RotateCcw className="h-4 w-4 sm:mr-2" />
-                                      <span className="hidden sm:inline">
-                                        Restore…
-                                      </span>
-                                    </Link>
-                                  </Button>
-                                ) : null}
                               </TableCell>
                             </TableRow>
                           )
@@ -786,9 +736,7 @@ export function BackupDetail() {
           <>
             <Card className="overflow-hidden shadow-none">
               <CardHeader className="border-b px-5 py-4">
-                <CardTitle className="text-base font-semibold">
-                  Details
-                </CardTitle>
+                <CardTitle className="text-base font-semibold">Details</CardTitle>
                 <CardDescription>
                   Storage, provenance, and integrity metadata for this backup.
                 </CardDescription>
@@ -801,9 +749,7 @@ export function BackupDetail() {
                   <FieldRow label="Location" mono copy={backup.s3_location}>
                     {backup.s3_location}
                   </FieldRow>
-                  <FieldRow label="Started at">
-                    {fmtDateTime(startedAt)}
-                  </FieldRow>
+                  <FieldRow label="Started at">{fmtDateTime(startedAt)}</FieldRow>
                   {completedAt ? (
                     <FieldRow label="Finished at">
                       {fmtDateTime(completedAt)}
@@ -819,8 +765,7 @@ export function BackupDetail() {
                       </span>
                     </FieldRow>
                   ) : null}
-                  {typeof backup.attempts === 'number' &&
-                  backup.attempts > 1 ? (
+                  {typeof backup.attempts === 'number' && backup.attempts > 1 ? (
                     <FieldRow label="Attempt">
                       {backup.attempts} of {backup.max_attempts ?? '?'}
                     </FieldRow>
@@ -852,9 +797,7 @@ export function BackupDetail() {
             {backup.tags.length > 0 ? (
               <Card className="overflow-hidden shadow-none">
                 <CardHeader className="border-b px-5 py-4">
-                  <CardTitle className="text-base font-semibold">
-                    Tags
-                  </CardTitle>
+                  <CardTitle className="text-base font-semibold">Tags</CardTitle>
                   <CardDescription>
                     Labels attached to this backup.
                   </CardDescription>
