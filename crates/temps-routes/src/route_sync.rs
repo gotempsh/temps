@@ -146,6 +146,32 @@ pub struct AcmeChallengeResponse {
     pub key_authorization: String,
 }
 
+/// Projects and environments that store a rate-limit policy. Only the
+/// control-plane proxy enforces rate limits (#1288), so any such policy keeps
+/// public ingress on the control plane. Counts stored policies regardless of
+/// the security switch: over-counting only forgoes direct worker ingress,
+/// while under-counting would serve a limited project unlimited.
+async fn count_project_rate_limit_policies(db: &DatabaseConnection) -> Result<i64, sea_orm::DbErr> {
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+    let row = db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT \
+               (SELECT COUNT(*) FROM projects \
+                 WHERE deleted_at IS NULL \
+                   AND jsonb_typeof(deployment_config -> 'security' -> 'rateLimiting') = 'object') \
+             + (SELECT COUNT(*) FROM environments \
+                 WHERE deleted_at IS NULL \
+                   AND jsonb_typeof(deployment_config -> 'security' -> 'rateLimiting') = 'object') \
+             AS policies",
+        ))
+        .await?;
+    match row {
+        Some(row) => row.try_get::<i64>("", "policies"),
+        None => Ok(0),
+    }
+}
+
 #[derive(Debug, Error)]
 enum SnapshotBuildError {
     #[error("Failed to {operation} for node {node_id}: {source}")]
@@ -439,6 +465,13 @@ async fn build_snapshot(
                 operation: "inspect public-ingress IP policy",
                 source,
             })?;
+        let project_rate_limit_count = count_project_rate_limit_policies(state.db.as_ref())
+            .await
+            .map_err(|source| SnapshotBuildError::Database {
+            node_id: node.id,
+            operation: "inspect project rate-limit policies",
+            source,
+        })?;
         let custom_request_policy = !state.request_policy_gate.supports_worker_ingress();
         let registered_worker_addresses: std::collections::HashSet<std::net::IpAddr> =
             nodes::Entity::find()
@@ -457,6 +490,7 @@ async fn build_snapshot(
         let policy_requires_control_plane = app_settings.rate_limiting.enabled
             || app_settings.security_headers.enabled
             || ip_policy_count > 0
+            || project_rate_limit_count > 0
             || custom_request_policy;
         let public_route_count = state.peer_table.worker_public_route_count();
         let raw_public_routes = if policy_requires_control_plane {
@@ -487,6 +521,9 @@ async fn build_snapshot(
         }
         if app_settings.security_headers.enabled {
             unsupported_reasons.push("global security headers are enabled".to_string());
+        }
+        if project_rate_limit_count > 0 {
+            unsupported_reasons.push("project rate limits are configured".to_string());
         }
         if ip_policy_count > 0 {
             unsupported_reasons.push("IP access-control rules are configured".to_string());
@@ -826,6 +863,7 @@ mod tests {
         let (project, environment, deployment) = test_db
             .create_test_project_with_domain("worker-public.example.test")
             .await?;
+        let project_id = project.id;
         let node = test_node(true);
         nodes::ActiveModel::from(node.clone())
             .insert(test_db.db.as_ref())
@@ -906,6 +944,50 @@ mod tests {
                     reason == "a custom request-policy provider requires control-plane ingress"
                 }));
         }
+
+        // A project-level rate limit is only enforced by the control-plane
+        // proxy (#1288), so it must also keep public ingress there.
+        assert_eq!(
+            count_project_rate_limit_policies(test_db.db.as_ref()).await?,
+            0
+        );
+        {
+            use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+            test_db
+                .db
+                .execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "UPDATE projects SET deployment_config = jsonb_set(\
+                       COALESCE(deployment_config, '{}'::jsonb), '{security}', \
+                       '{\"enabled\": true, \"rateLimiting\": {\"maxRequestsPerMinute\": 2}}'::jsonb) \
+                     WHERE id = $1",
+                    [project_id.into()],
+                ))
+                .await?;
+        }
+        assert_eq!(
+            count_project_rate_limit_policies(test_db.db.as_ref()).await?,
+            1
+        );
+        let open_gate = Arc::new(temps_core::RequestPolicyGateSlot::new_default());
+        assert!(open_gate.set(Arc::new(temps_core::OpenRequestPolicyGate)));
+        let limited_snapshot = build_snapshot(
+            &RouteSyncAppState {
+                db: test_db.db.clone(),
+                peer_table: Arc::clone(&peer_table),
+                encryption_service: Arc::clone(&encryption_service),
+                request_policy_gate: open_gate,
+            },
+            &node,
+            1,
+        )
+        .await?;
+        assert!(limited_snapshot.public_ingress.routes.is_empty());
+        assert!(limited_snapshot
+            .public_ingress
+            .unsupported_reasons
+            .iter()
+            .any(|reason| reason == "project rate limits are configured"));
 
         test_db.cleanup().await?;
         Ok(())

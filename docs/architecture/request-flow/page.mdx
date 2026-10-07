@@ -212,7 +212,18 @@ graph TB
 - It requires HTTPS, because the client is identified by its TLS fingerprint (JA4). Plain HTTP requests get `426 Upgrade Required`.
 - A completed challenge is remembered per environment for that client.
 
-The only rate limits in the proxy apply to repeated failed attempts at preview and password-protected pages.
+### Rate limiting
+
+The proxy enforces per-client-IP request limits on project traffic, after the project's IP restrictions:
+
+- **Instance limits** (Settings > Rate Limiting) apply when enabled, counted per client IP across all project traffic.
+- **Project limits** (the project's Security settings, or an environment override) apply when that level's rate limiting switch is on. They replace the instance limits for that environment; a limit left empty inherits the instance value. Counted per client IP and environment.
+- A client IP or CIDR range on an active blacklist gets `403 Forbidden`. The instance blacklist still applies under a project policy. Whitelisted IPs are not counted.
+- A request over a limit gets `429 Too Many Requests` with a `Retry-After` header. Limits use fixed one-minute and one-hour windows, so a client can briefly reach up to twice a limit across a window boundary.
+- Console traffic is not limited. The `proxy.rate_limited` metric counts rejected requests.
+- Each proxy process counts on its own, so limits apply per node. When any rate limit is configured, public ingress stays on the control plane rather than going directly to worker nodes.
+
+Separately, repeated failed attempts at preview and password-protected pages are rate limited.
 
 ### Request Headers Added
 
