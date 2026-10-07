@@ -476,6 +476,68 @@ fn tokenize(source: &str) -> Vec<Token> {
     tokens
 }
 
+/// What one object literal is known to set a tracked key to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Slot {
+    Absent,
+    Literal(String),
+    Unknown(&'static str),
+}
+
+impl Slot {
+    /// A spread, computed key or later argument after a literal may replace
+    /// it, so the literal can no longer be trusted.
+    fn overridden(&mut self, reason: &'static str) {
+        if matches!(self, Slot::Literal(_)) {
+            *self = Slot::Unknown(reason);
+        }
+    }
+}
+
+/// One open `{`, `(` or `[` while scanning a Vite config.
+struct Frame {
+    opener: char,
+    /// For `{`: the key whose value this object is (`build` in `build: {`).
+    key: Option<String>,
+    /// For a `build` object: what its own `outDir` key resolves to.
+    out_dir: Slot,
+    /// What this object's (last) `build` key resolves `outDir` to.
+    build: Slot,
+}
+
+impl Frame {
+    fn new(opener: char, key: Option<String>) -> Self {
+        Self {
+            opener,
+            key,
+            out_dir: Slot::Absent,
+            build: Slot::Absent,
+        }
+    }
+
+    fn is_build_object(&self) -> bool {
+        self.opener == '{' && self.key.as_deref() == Some("build")
+    }
+}
+
+const SPREAD_OVERRIDE: &str =
+    "build.outDir may be replaced by a spread or computed key that follows it";
+
+/// Hand a closed frame's findings to its parent: a `build` object becomes the
+/// parent's `build` value (a later `build` key replaces an earlier one, as in
+/// JavaScript), and any object that had a `build` key reports it.
+fn close_frame(frame: Frame, parent: Option<&mut Frame>, results: &mut Vec<Slot>) {
+    if frame.is_build_object() {
+        match parent {
+            Some(parent) => parent.build = frame.out_dir.clone(),
+            None => results.push(frame.out_dir.clone()),
+        }
+    }
+    if frame.build != Slot::Absent {
+        results.push(frame.build);
+    }
+}
+
 /// Find `build: { outDir: '<literal>' }` in a Vite config.
 ///
 /// Only an `outDir` whose enclosing object is the value of a `build` key
@@ -485,54 +547,121 @@ fn tokenize(source: &str) -> Vec<Token> {
 /// (a call such as `resolve(__dirname, 'out')`, a concatenation, a template
 /// with interpolation, a variable) is reported as unresolvable rather than
 /// guessed.
+///
+/// Object semantics are respected where they could change the answer: a later
+/// duplicate key wins, while a spread (`...shared`) or computed key (`[k]:`)
+/// after the literal — in the `build` object, or after `build` in the object
+/// holding it — may replace it, so the result is unresolvable. The same holds
+/// for a config object passed as a non-final argument (`mergeConfig({..}, x)`)
+/// and for a `build` value that is not an object literal (`build: shared`).
+/// A spread *before* the literal is overridden by it and is harmless.
 fn parse_vite_out_dir(source: &str) -> OutDir {
     let tokens = tokenize(source);
-    // One entry per open `{`: the key whose value that object is, if any.
-    let mut objects: Vec<Option<String>> = Vec::new();
-    let mut found: Vec<String> = Vec::new();
-    let mut unresolvable = false;
+    let mut frames: Vec<Frame> = Vec::new();
+    let mut results: Vec<Slot> = Vec::new();
     let key_at = |index: usize| -> Option<String> {
         match tokens.get(index) {
             Some(Token::Word(word)) | Some(Token::Str(word)) => Some(word.clone()),
             _ => None,
         }
     };
+    let punct_at = |index: usize, expected: &[char]| -> bool {
+        matches!(tokens.get(index), Some(Token::Punct(c)) if expected.contains(c))
+    };
     for (index, token) in tokens.iter().enumerate() {
+        let in_object = frames.last().is_some_and(|frame| frame.opener == '{');
+        // The token begins an object member (key, spread or computed key).
+        let member_start = in_object && index > 0 && punct_at(index - 1, &['{', ',']);
         match token {
-            Token::Punct('{') => {
-                let key = (index >= 2 && tokens.get(index - 1) == Some(&Token::Punct(':')))
+            Token::Punct(open @ ('{' | '(' | '[')) => {
+                if *open == '[' && member_start {
+                    if let Some(frame) = frames.last_mut() {
+                        frame.out_dir.overridden(SPREAD_OVERRIDE);
+                        frame.build.overridden(SPREAD_OVERRIDE);
+                    }
+                }
+                let key = (*open == '{' && index >= 2 && punct_at(index - 1, &[':']))
                     .then(|| key_at(index - 2))
                     .flatten();
-                objects.push(key);
+                frames.push(Frame::new(*open, key));
             }
-            Token::Punct('}') => {
-                objects.pop();
-            }
-            Token::Word(_) | Token::Str(_)
-                if key_at(index).as_deref() == Some("outDir")
-                    && tokens.get(index + 1) == Some(&Token::Punct(':'))
-                    && objects.last().cloned().flatten().as_deref() == Some("build") =>
-            {
-                match (tokens.get(index + 2), tokens.get(index + 3)) {
-                    (Some(Token::Str(value)), Some(Token::Punct(',' | '}'))) => {
-                        found.push(value.clone())
+            Token::Punct('}' | ')' | ']') => {
+                if let Some(mut frame) = frames.pop() {
+                    // `mergeConfig({ build }, other)`: a later argument may
+                    // replace this object's `build`.
+                    let later_argument = frame.opener == '{'
+                        && frames.last().is_some_and(|parent| parent.opener == '(')
+                        && punct_at(index + 1, &[','])
+                        && !punct_at(index + 2, &[')']);
+                    if later_argument {
+                        frame
+                            .build
+                            .overridden("a later argument may replace the build options");
                     }
-                    _ => unresolvable = true,
+                    close_frame(frame, frames.last_mut(), &mut results);
                 }
             }
-            // `build: { outDir }` shorthand names a variable.
-            Token::Word(word)
-                if word == "outDir"
-                    && matches!(tokens.get(index + 1), Some(Token::Punct(',' | '}')))
-                    && objects.last().cloned().flatten().as_deref() == Some("build") =>
+            Token::Punct('.')
+                if member_start && punct_at(index + 1, &['.']) && punct_at(index + 2, &['.']) =>
             {
-                unresolvable = true;
+                if let Some(frame) = frames.last_mut() {
+                    frame.out_dir.overridden(SPREAD_OVERRIDE);
+                    frame.build.overridden(SPREAD_OVERRIDE);
+                }
+            }
+            Token::Word(_) | Token::Str(_) if member_start => {
+                let Some(frame) = frames.last_mut() else {
+                    continue;
+                };
+                let shorthand = matches!(token, Token::Word(_)) && punct_at(index + 1, &[',', '}']);
+                match key_at(index).as_deref() {
+                    Some("outDir") if frame.is_build_object() => {
+                        if punct_at(index + 1, &[':']) {
+                            frame.out_dir = match (tokens.get(index + 2), tokens.get(index + 3)) {
+                                (Some(Token::Str(value)), Some(Token::Punct(',' | '}'))) => {
+                                    Slot::Literal(value.clone())
+                                }
+                                _ => Slot::Unknown("build.outDir is not a plain string literal"),
+                            };
+                        } else if shorthand || punct_at(index + 1, &['(']) {
+                            // `{ outDir }` names a variable; `outDir() {}` is a method.
+                            frame.out_dir =
+                                Slot::Unknown("build.outDir is not a plain string literal");
+                        }
+                    }
+                    Some("build") => {
+                        if punct_at(index + 1, &[':']) {
+                            let plain_value = matches!(
+                                tokens.get(index + 2),
+                                Some(Token::Str(_)) | Some(Token::Punct('{'))
+                            ) || matches!(
+                                tokens.get(index + 2),
+                                Some(Token::Word(word)) if word == "true" || word == "false"
+                            );
+                            if !plain_value {
+                                frame.build = Slot::Unknown("build is not a plain object literal");
+                            }
+                        } else if shorthand {
+                            frame.build = Slot::Unknown("build is not a plain object literal");
+                        }
+                    }
+                    _ => {}
+                }
             }
             _ => {}
         }
     }
-    if unresolvable {
-        return OutDir::Unresolvable("build.outDir is not a plain string literal");
+    // Unbalanced source: still report whatever the open frames found.
+    while let Some(frame) = frames.pop() {
+        close_frame(frame, frames.last_mut(), &mut results);
+    }
+    let mut found: Vec<String> = Vec::new();
+    for slot in results {
+        match slot {
+            Slot::Absent => {}
+            Slot::Literal(value) => found.push(value),
+            Slot::Unknown(reason) => return OutDir::Unresolvable(reason),
+        }
     }
     found.sort();
     found.dedup();
@@ -929,6 +1058,108 @@ mod tests {
                 "export default (m) => m ? { build: { outDir: 'a' } } : { build: { outDir: 'a' } }"
             ),
             OutDir::Literal("a".into())
+        );
+    }
+
+    #[test]
+    fn out_dir_parser_plain_literal_still_resolves() {
+        assert_eq!(
+            parse_vite_out_dir("export default defineConfig({ build: { outDir: 'build' } })"),
+            OutDir::Literal("build".into())
+        );
+    }
+
+    #[test]
+    fn out_dir_spread_after_the_literal_in_build_is_unresolvable() {
+        for config in [
+            "const shared = { outDir: 'dist' }; export default { build: { outDir: 'build', ...shared } }",
+            "export default { build: { outDir: 'build', sourcemap: true, ...(prod ? a : b) } }",
+            "export default { build: { outDir: 'build', [key]: 'dist' } }",
+        ] {
+            assert!(
+                matches!(parse_vite_out_dir(config), OutDir::Unresolvable(_)),
+                "{config}"
+            );
+        }
+    }
+
+    #[test]
+    fn out_dir_spread_before_the_literal_keeps_the_literal() {
+        for config in [
+            "const shared = { outDir: 'dist' }; export default { build: { ...shared, outDir: 'build' } }",
+            "export default { build: { [key]: 'dist', outDir: 'build' } }",
+            "export default { ...base, build: { outDir: 'build' } }",
+            "export default { build: { outDir: 'build', rollupOptions: { input: [...pages] }, lib: f(...args) } }",
+        ] {
+            assert_eq!(
+                parse_vite_out_dir(config),
+                OutDir::Literal("build".into()),
+                "{config}"
+            );
+        }
+    }
+
+    #[test]
+    fn out_dir_duplicate_key_takes_the_last_literal() {
+        assert_eq!(
+            parse_vite_out_dir("export default { build: { outDir: 'first', outDir: 'second' } }"),
+            OutDir::Literal("second".into())
+        );
+        assert_eq!(
+            parse_vite_out_dir(
+                "export default { build: { outDir: 'first' }, build: { outDir: 'second' } }"
+            ),
+            OutDir::Literal("second".into())
+        );
+        assert_eq!(
+            parse_vite_out_dir("export default { build: { outDir: 'first' }, build: {} }"),
+            OutDir::Absent
+        );
+    }
+
+    #[test]
+    fn out_dir_build_replaced_at_config_level_is_unresolvable() {
+        for config in [
+            "const other = { build: { outDir: 'dist' } }; export default { build: { outDir: 'build' }, ...other }",
+            "export default defineConfig({ build: { outDir: 'build' }, ...other })",
+            "export default { build: { outDir: 'build' }, [key]: {} }",
+            "export default { build: shared }",
+            "export default { build }",
+            "export default { build: { outDir: 'build' }, build: shared }",
+            "export default mergeConfig({ build: { outDir: 'build' } }, override)",
+        ] {
+            assert!(
+                matches!(parse_vite_out_dir(config), OutDir::Unresolvable(_)),
+                "{config}"
+            );
+        }
+        // The last argument of `mergeConfig` wins, so its literal stands.
+        assert_eq!(
+            parse_vite_out_dir("export default mergeConfig(base, { build: { outDir: 'build' } })"),
+            OutDir::Literal("build".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn spread_after_out_dir_falls_back_to_dist_with_a_warning() {
+        let dir = app(&[
+            ("package.json", BUILDABLE),
+            (
+                "vite.config.ts",
+                "const shared = { outDir: 'dist' };\nexport default { build: { outDir: 'build', ...shared } }",
+            ),
+        ]);
+        let result = render(dir.path()).await;
+        assert!(
+            result.content.contains("/app/dist /usr/share/nginx/html"),
+            "{}",
+            result.content
+        );
+        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+        assert!(
+            result.warnings[0].contains("build.outDir"),
+            "{:?}",
+            result.warnings
         );
     }
 
