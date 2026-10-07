@@ -268,7 +268,7 @@ pub async fn create_pre_migration_backup(
     // cleanup, writing and retention so another process cannot unlink our dump.
     let _backup_lock = acquire_backup_lock(&dir)?;
     remove_incomplete_backups(&dir);
-    remove_orphaned_containers(&dir).await;
+    remove_orphaned_containers_locked(&dir).await;
 
     let server_version_num = read_server_version_num(request.db).await?;
     let server_major = server_major(server_version_num);
@@ -525,6 +525,135 @@ fn remove_incomplete_backups(dir: &Path) {
     }
 }
 
+/// Why the orphaned dump-container cleanup could not finish. Logged and
+/// never fatal: the migration still runs.
+#[derive(Debug, thiserror::Error)]
+pub enum OrphanCleanupError {
+    #[error(
+        "Could not connect to the Docker daemon to look for orphaned pre-migration backup \
+         containers of {dir}: {source}"
+    )]
+    Connect {
+        dir: String,
+        #[source]
+        source: bollard::errors::Error,
+    },
+
+    #[error("Could not list the pre-migration backup containers of {dir}: {source}")]
+    List {
+        dir: String,
+        #[source]
+        source: bollard::errors::Error,
+    },
+
+    #[error(
+        "Could not remove orphaned pre-migration backup container {container} of {dir}: {source}"
+    )]
+    Remove {
+        container: String,
+        dir: String,
+        #[source]
+        source: bollard::errors::Error,
+    },
+
+    #[error(
+        "Timed out after {timeout_secs}s looking for orphaned pre-migration backup containers \
+         of {dir}"
+    )]
+    Timeout { dir: String, timeout_secs: u64 },
+}
+
+/// A pre-migration dump container, as the orphan cleanup sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DumpContainer {
+    id: String,
+    name: String,
+    /// The [`backup_dir_identity`] it was started for; `None` for containers
+    /// from releases before the label existed.
+    owner_dir: Option<String>,
+    state: Option<String>,
+}
+
+/// The container operations the orphan cleanup needs, so it can be tested
+/// without a Docker daemon.
+#[async_trait::async_trait]
+trait DumpContainerRuntime: Send + Sync {
+    /// Every container labelled as a pre-migration dump, running or not.
+    async fn list_dump_containers(&self) -> Result<Vec<DumpContainer>, bollard::errors::Error>;
+    async fn force_remove(&self, id: &str) -> Result<(), bollard::errors::Error>;
+}
+
+#[async_trait::async_trait]
+impl DumpContainerRuntime for bollard::Docker {
+    async fn list_dump_containers(&self) -> Result<Vec<DumpContainer>, bollard::errors::Error> {
+        let filters = std::collections::HashMap::from([(
+            "label".to_string(),
+            vec![format!("{CONTAINER_KIND_LABEL}={CONTAINER_KIND}")],
+        )]);
+        let containers = self
+            .list_containers(Some(
+                bollard::query_parameters::ListContainersOptionsBuilder::new()
+                    .all(true)
+                    .filters(&filters)
+                    .build(),
+            ))
+            .await?;
+        Ok(containers
+            .into_iter()
+            .filter_map(|container| {
+                let id = container.id?;
+                let name = container
+                    .names
+                    .and_then(|names| names.into_iter().next())
+                    .map(|name| name.trim_start_matches('/').to_string())
+                    .unwrap_or_else(|| id.clone());
+                Some(DumpContainer {
+                    owner_dir: container
+                        .labels
+                        .and_then(|mut labels| labels.remove(CONTAINER_DIR_LABEL)),
+                    state: container.state.map(|state| state.to_string()),
+                    id,
+                    name,
+                })
+            })
+            .collect())
+    }
+
+    async fn force_remove(&self, id: &str) -> Result<(), bollard::errors::Error> {
+        self.remove_container(
+            id,
+            Some(
+                bollard::query_parameters::RemoveContainerOptionsBuilder::new()
+                    .force(true)
+                    .build(),
+            ),
+        )
+        .await
+    }
+}
+
+/// What one cleanup pass found.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct OrphanCleanupReport {
+    /// Containers of this directory that were removed.
+    removed: Vec<String>,
+    /// Containers of this directory that could not be removed.
+    failed: Vec<String>,
+    /// Unlabelled containers from older releases. They may belong to another
+    /// installation on the same daemon, so they are only reported.
+    unowned: Vec<String>,
+}
+
+/// The value of [`CONTAINER_DIR_LABEL`] for a backup directory: its
+/// canonical path, so a relative path or a symlink to the same directory
+/// matches the label an earlier start wrote.
+fn backup_dir_identity(dir: &Path) -> String {
+    std::fs::canonicalize(dir)
+        .unwrap_or_else(|_| dir.to_path_buf())
+        .display()
+        .to_string()
+}
+
 /// Remove `pg_dump` containers left running by an interrupted backup.
 ///
 /// Stopping Temps mid-backup (Ctrl+C, a supervisor kill) ends this process
@@ -534,15 +663,33 @@ fn remove_incomplete_backups(dir: &Path) {
 /// timeout`. Call this before migrating, whether or not a backup will be
 /// taken.
 ///
-/// Best effort and never fails: it does nothing when no backup was ever
-/// taken here, when another process holds the backup lock (its container is
-/// not an orphan), or when Docker is unreachable.
+/// Only containers labelled with this backup directory are removed. Best
+/// effort and never fails: it does nothing when no backup was ever taken
+/// here, when another process holds the backup lock (its container is not an
+/// orphan), or when Docker is unreachable.
 pub async fn remove_orphaned_pre_migration_backup_containers(data_dir: &Path) {
     let dir = pre_migration_backup_dir(data_dir);
     if !dir.is_dir() {
         return;
     }
-    let _backup_lock = match acquire_backup_lock(&dir) {
+    match bollard::Docker::connect_with_local_defaults() {
+        Ok(docker) => cleanup_unless_locked(&docker, &dir).await,
+        Err(source) => debug!(
+            "{}",
+            OrphanCleanupError::Connect {
+                dir: backup_dir_identity(&dir),
+                source,
+            }
+        ),
+    }
+}
+
+/// Run the cleanup for `dir` unless another process is backing it up.
+async fn cleanup_unless_locked(runtime: &dyn DumpContainerRuntime, dir: &Path) {
+    if !dir.is_dir() {
+        return;
+    }
+    let _backup_lock = match acquire_backup_lock(dir) {
         Ok(lock) => lock,
         Err(error) => {
             debug!(
@@ -552,97 +699,109 @@ pub async fn remove_orphaned_pre_migration_backup_containers(data_dir: &Path) {
             return;
         }
     };
-    remove_orphaned_containers(&dir).await;
+    log_cleanup(dir, remove_orphaned_containers(runtime, dir).await);
+}
+
+/// [`remove_orphaned_containers`] against the local Docker daemon, for a
+/// caller that already holds the backup lock.
+async fn remove_orphaned_containers_locked(dir: &Path) {
+    match bollard::Docker::connect_with_local_defaults() {
+        Ok(docker) => log_cleanup(dir, remove_orphaned_containers(&docker, dir).await),
+        Err(source) => debug!(
+            "{}",
+            OrphanCleanupError::Connect {
+                dir: backup_dir_identity(dir),
+                source,
+            }
+        ),
+    }
 }
 
 /// Only called while holding the backup lock, so no live backup of this
 /// directory owns a container.
-async fn remove_orphaned_containers(dir: &Path) {
-    let dir_label = dir.display().to_string();
-    match tokio::time::timeout(
-        ORPHAN_CLEANUP_TIMEOUT,
-        remove_orphaned_containers_inner(&dir_label),
-    )
+async fn remove_orphaned_containers(
+    runtime: &dyn DumpContainerRuntime,
+    dir: &Path,
+) -> Result<OrphanCleanupReport, OrphanCleanupError> {
+    let identity = backup_dir_identity(dir);
+    tokio::time::timeout(ORPHAN_CLEANUP_TIMEOUT, async {
+        let containers =
+            runtime
+                .list_dump_containers()
+                .await
+                .map_err(|source| OrphanCleanupError::List {
+                    dir: identity.clone(),
+                    source,
+                })?;
+        let mut report = OrphanCleanupReport::default();
+        for container in containers {
+            match container.owner_dir.as_deref() {
+                Some(owner) if owner == identity => {}
+                Some(_) => continue,
+                None => {
+                    report.unowned.push(container.name);
+                    continue;
+                }
+            }
+            match runtime.force_remove(&container.id).await {
+                Ok(()) => {
+                    warn!(
+                        container = %container.name,
+                        state = ?container.state,
+                        dir = %identity,
+                        "Removed a pre-migration backup container left behind by an \
+                         interrupted backup; its pg_dump would have blocked the migrations"
+                    );
+                    report.removed.push(container.name);
+                }
+                Err(source) => {
+                    let error = OrphanCleanupError::Remove {
+                        container: container.name.clone(),
+                        dir: identity.clone(),
+                        source,
+                    };
+                    warn!(
+                        container = %container.name,
+                        "{error}. If a migration fails with a lock timeout, stop every Temps \
+                         process using this data directory and run `docker rm -f {}`",
+                        container.name
+                    );
+                    report.failed.push(container.name);
+                }
+            }
+        }
+        Ok(report)
+    })
     .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(reason)) => debug!(
-            dir = %dir_label,
-            "Could not check for orphaned pre-migration backup containers: {reason}"
-        ),
-        Err(_) => warn!(
-            dir = %dir_label,
-            timeout_secs = ORPHAN_CLEANUP_TIMEOUT.as_secs(),
-            "Timed out removing orphaned pre-migration backup containers; if a migration \
-             fails with a lock timeout, remove them with `docker rm -f $(docker ps -aq \
-             --filter label={CONTAINER_KIND_LABEL}={CONTAINER_KIND})`"
-        ),
-    }
+    .map_err(|_| OrphanCleanupError::Timeout {
+        dir: identity.clone(),
+        timeout_secs: ORPHAN_CLEANUP_TIMEOUT.as_secs(),
+    })?
 }
 
-async fn remove_orphaned_containers_inner(dir_label: &str) -> Result<(), String> {
-    let docker = bollard::Docker::connect_with_local_defaults()
-        .map_err(|error| format!("cannot connect to the Docker daemon: {error}"))?;
-    let filters = std::collections::HashMap::from([(
-        "label".to_string(),
-        vec![format!("{CONTAINER_KIND_LABEL}={CONTAINER_KIND}")],
-    )]);
-    let containers = docker
-        .list_containers(Some(
-            bollard::query_parameters::ListContainersOptionsBuilder::new()
-                .all(true)
-                .filters(&filters)
-                .build(),
-        ))
-        .await
-        .map_err(|error| format!("listing containers failed: {error}"))?;
-    for container in containers {
-        let owner = container
-            .labels
-            .as_ref()
-            .and_then(|labels| labels.get(CONTAINER_DIR_LABEL));
-        if !is_orphan_of(owner.map(String::as_str), dir_label) {
-            continue;
+fn log_cleanup(dir: &Path, outcome: Result<OrphanCleanupReport, OrphanCleanupError>) {
+    let identity = backup_dir_identity(dir);
+    match outcome {
+        Ok(report) => {
+            if !report.unowned.is_empty() {
+                warn!(
+                    containers = ?report.unowned,
+                    "Found pre-migration backup containers from an older Temps release. They \
+                     carry no data-directory label, so they may belong to another installation \
+                     on this Docker host and were left running. If a migration fails with a lock \
+                     timeout and no other installation is upgrading, remove them with \
+                     `docker rm -f <name>`"
+                );
+            }
         }
-        let Some(id) = container.id else { continue };
-        let name = container
-            .names
-            .and_then(|names| names.into_iter().next())
-            .unwrap_or_else(|| id.clone());
-        match docker
-            .remove_container(
-                &id,
-                Some(
-                    bollard::query_parameters::RemoveContainerOptionsBuilder::new()
-                        .force(true)
-                        .build(),
-                ),
-            )
-            .await
-        {
-            Ok(()) => warn!(
-                container = %name,
-                state = ?container.state,
-                dir = %dir_label,
-                "Removed a pre-migration backup container left behind by an interrupted \
-                 backup; its pg_dump would have blocked the migrations"
-            ),
-            Err(error) => warn!(
-                container = %name,
-                dir = %dir_label,
-                "Could not remove an orphaned pre-migration backup container; if a migration \
-                 fails with a lock timeout, remove it with `docker rm -f {name}`: {error}"
-            ),
-        }
+        Err(error @ OrphanCleanupError::Timeout { .. }) => warn!(
+            dir = %identity,
+            "{error}. If a migration fails with a lock timeout, stop every Temps process using \
+             this data directory and remove the containers listed by `docker ps -a --filter \
+             label={CONTAINER_DIR_LABEL}={identity}`"
+        ),
+        Err(error) => debug!(dir = %identity, "{error}"),
     }
-    Ok(())
-}
-
-/// Whether a dump container belongs to this backup directory. Containers
-/// from before the directory label existed carry none and are claimed too:
-/// the only process that ever ran them is an interrupted backup.
-fn is_orphan_of(owner_dir: Option<&str>, dir: &str) -> bool {
-    owner_dir.is_none_or(|owner| owner == dir)
 }
 
 fn restrict_file_permissions(path: &Path) {
@@ -899,7 +1058,7 @@ async fn run_docker_pg_dump(
     let mut labels = std::collections::HashMap::new();
     labels.insert(CONTAINER_KIND_LABEL.to_string(), CONTAINER_KIND.to_string());
     if let Some(dir) = partial_path.parent() {
-        labels.insert(CONTAINER_DIR_LABEL.to_string(), dir.display().to_string());
+        labels.insert(CONTAINER_DIR_LABEL.to_string(), backup_dir_identity(dir));
     }
     let body = bollard::models::ContainerCreateBody {
         image: Some(image.to_string()),
@@ -1400,26 +1559,198 @@ mod tests {
         assert!(message.contains("postgres:18"), "{message}");
     }
 
-    #[test]
-    fn orphan_cleanup_only_claims_containers_of_this_directory() {
-        let dir = "/srv/temps/backups/pre-migration";
-        assert!(is_orphan_of(Some(dir), dir));
-        // Written before the directory label existed.
-        assert!(is_orphan_of(None, dir));
-        // Another installation sharing the Docker daemon.
-        assert!(!is_orphan_of(
-            Some("/home/other/.temps/backups/pre-migration"),
-            dir
-        ));
+    /// In-memory stand-in for the Docker daemon.
+    #[derive(Default)]
+    struct FakeRuntime {
+        containers: Vec<DumpContainer>,
+        list_error: bool,
+        /// Container ids whose removal fails.
+        failing: Vec<String>,
+        list_calls: std::sync::atomic::AtomicUsize,
+        removed: std::sync::Mutex<Vec<String>>,
+    }
+
+    fn server_error(message: &str) -> bollard::errors::Error {
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 500,
+            message: message.to_string(),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DumpContainerRuntime for FakeRuntime {
+        async fn list_dump_containers(&self) -> Result<Vec<DumpContainer>, bollard::errors::Error> {
+            self.list_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.list_error {
+                return Err(server_error("daemon unavailable"));
+            }
+            Ok(self.containers.clone())
+        }
+
+        async fn force_remove(&self, id: &str) -> Result<(), bollard::errors::Error> {
+            if self.failing.iter().any(|failing| failing == id) {
+                return Err(server_error("removal in progress"));
+            }
+            self.removed.lock().unwrap().push(id.to_string());
+            Ok(())
+        }
+    }
+
+    impl FakeRuntime {
+        fn removed(&self) -> Vec<String> {
+            self.removed.lock().unwrap().clone()
+        }
+        fn list_calls(&self) -> usize {
+            self.list_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    fn dump_container(id: &str, owner_dir: Option<&str>) -> DumpContainer {
+        DumpContainer {
+            id: id.to_string(),
+            name: format!("temps-pre-migration-backup-{id}"),
+            owner_dir: owner_dir.map(str::to_string),
+            state: Some("running".to_string()),
+        }
+    }
+
+    fn backup_dir() -> (tempfile::TempDir, PathBuf) {
+        let data_dir = tempfile::tempdir().expect("temp data dir");
+        let dir = pre_migration_backup_dir(data_dir.path());
+        std::fs::create_dir_all(&dir).expect("create backup dir");
+        (data_dir, dir)
+    }
+
+    #[tokio::test]
+    async fn orphan_cleanup_removes_only_this_directorys_containers() {
+        let (_data_dir, dir) = backup_dir();
+        let identity = backup_dir_identity(&dir);
+        let runtime = FakeRuntime {
+            containers: vec![
+                dump_container("ours", Some(&identity)),
+                dump_container(
+                    "other-install",
+                    Some("/home/other/.temps/backups/pre-migration"),
+                ),
+                dump_container("legacy", None),
+            ],
+            ..Default::default()
+        };
+
+        let report = remove_orphaned_containers(&runtime, &dir)
+            .await
+            .expect("cleanup succeeds");
+
+        assert_eq!(runtime.removed(), vec!["ours".to_string()]);
+        assert_eq!(
+            report,
+            OrphanCleanupReport {
+                removed: vec!["temps-pre-migration-backup-ours".to_string()],
+                failed: vec![],
+                unowned: vec!["temps-pre-migration-backup-legacy".to_string()],
+            },
+            "unlabelled containers may belong to another installation and must be left running"
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_cleanup_continues_past_a_failed_removal() {
+        let (_data_dir, dir) = backup_dir();
+        let identity = backup_dir_identity(&dir);
+        let runtime = FakeRuntime {
+            containers: vec![
+                dump_container("stuck", Some(&identity)),
+                dump_container("ours", Some(&identity)),
+            ],
+            failing: vec!["stuck".to_string()],
+            ..Default::default()
+        };
+
+        let report = remove_orphaned_containers(&runtime, &dir)
+            .await
+            .expect("a failed removal is reported, not fatal");
+
+        assert_eq!(runtime.removed(), vec!["ours".to_string()]);
+        assert_eq!(
+            report.failed,
+            vec!["temps-pre-migration-backup-stuck".to_string()]
+        );
+        assert_eq!(
+            report.removed,
+            vec!["temps-pre-migration-backup-ours".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_cleanup_reports_a_listing_failure_with_its_directory() {
+        let (_data_dir, dir) = backup_dir();
+        let runtime = FakeRuntime {
+            list_error: true,
+            ..Default::default()
+        };
+
+        let error = remove_orphaned_containers(&runtime, &dir)
+            .await
+            .expect_err("listing failed");
+
+        assert!(
+            matches!(&error, OrphanCleanupError::List { dir: reported, .. } if *reported == backup_dir_identity(&dir)),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("daemon unavailable"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn orphan_cleanup_leaves_a_live_backup_alone() {
+        let (_data_dir, dir) = backup_dir();
+        let runtime = FakeRuntime {
+            containers: vec![dump_container("live", Some(&backup_dir_identity(&dir)))],
+            ..Default::default()
+        };
+
+        // Another process is taking a backup of this directory right now.
+        let live_backup = acquire_backup_lock(&dir).expect("take the backup lock");
+        cleanup_unless_locked(&runtime, &dir).await;
+        assert_eq!(
+            runtime.list_calls(),
+            0,
+            "a held lock means the container is not an orphan"
+        );
+        assert!(runtime.removed().is_empty());
+
+        drop(live_backup);
+        cleanup_unless_locked(&runtime, &dir).await;
+        assert_eq!(runtime.removed(), vec!["live".to_string()]);
     }
 
     #[tokio::test]
     async fn orphan_cleanup_is_a_no_op_where_no_backup_was_ever_taken() {
-        let data_dir = std::env::temp_dir().join(format!("temps-orphans-{}", uuid::Uuid::new_v4()));
-        remove_orphaned_pre_migration_backup_containers(&data_dir).await;
+        let data_dir = tempfile::tempdir().expect("temp data dir");
+        let dir = pre_migration_backup_dir(data_dir.path());
+        let runtime = FakeRuntime::default();
+
+        cleanup_unless_locked(&runtime, &dir).await;
+        remove_orphaned_pre_migration_backup_containers(data_dir.path()).await;
+
+        assert_eq!(runtime.list_calls(), 0);
         assert!(
-            !pre_migration_backup_dir(&data_dir).exists(),
+            !dir.exists(),
             "the cleanup must not create the backup directory"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_data_dir_matches_the_label_of_its_target() {
+        let (data_dir, dir) = backup_dir();
+        let alias = data_dir.path().join("alias");
+        std::os::unix::fs::symlink(data_dir.path(), &alias).expect("symlink the data dir");
+
+        assert_eq!(
+            backup_dir_identity(&pre_migration_backup_dir(&alias)),
+            backup_dir_identity(&dir)
+        );
+        assert!(Path::new(&backup_dir_identity(&dir)).is_absolute());
     }
 }

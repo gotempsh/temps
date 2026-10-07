@@ -973,6 +973,24 @@ mod tests {
     }
 
     #[test]
+    fn the_update_child_arguments_parse() {
+        use crate::commands::serve::self_update::migrate_child_args;
+        let data_dir = std::path::Path::new("/srv/temps-data");
+        for backup in [None, Some(data_dir)] {
+            let args = migrate_child_args(backup);
+            assert_eq!(args[0], "migrate");
+            let rest: Vec<&str> = args[1..]
+                .iter()
+                .map(|arg| arg.to_str().expect("utf-8 argument"))
+                .collect();
+            let migrate = parse(&rest).expect("the update's migrate child arguments parse");
+            assert!(migrate.yes);
+            assert_eq!(migrate.pre_migration_backup, backup.is_some());
+            assert_eq!(migrate.data_dir.as_deref(), backup);
+        }
+    }
+
+    #[test]
     fn the_retired_skip_flag_is_still_accepted() {
         let skipped = parse(&["--skip-pre-migration-backup"]).expect("old scripts keep working");
         assert!(!skipped.pre_migration_backup);

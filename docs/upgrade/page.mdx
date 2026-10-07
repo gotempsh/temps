@@ -251,7 +251,7 @@ Pass `--data-dir` (or set `TEMPS_DATA_DIR`) if your data directory is not `~/.te
 Each startup, in order:
 
 1. **Schema guard.** Temps compares the migrations recorded in the database with the ones it knows. If the database has migrations this binary does not know — it was migrated by a newer release — Temps refuses to start and changes nothing. See [Database schema is newer than this binary](#database-schema-is-newer-than-this-binary).
-2. **Pre-migration backup**, only with `--pre-migration-backup` and only if there are pending migrations on an existing database. See below. Either way, a `pg_dump` container left running by an interrupted earlier backup is removed first: it holds a lock on every table and would make the first migration time out.
+2. **Pre-migration backup**, only with `--pre-migration-backup` and only if there are pending migrations on an existing database. See below. Either way, a `pg_dump` container left running by an interrupted earlier backup of the same data directory is removed first: it holds a lock on every table and would make the first migration time out.
 3. **Migrations.** Each runs in its own transaction; a statement waiting more than 15 seconds for a lock fails fast, and the whole step is bounded at 10 minutes. If a migration fails, the server does not start and the database stays at the last migration that succeeded.
 4. **Maintenance** that does not block startup (large concurrent index builds, analytics backfills) runs in the background once the server is up.
 
@@ -276,11 +276,16 @@ temps serve --pre-migration-backup ...     # or: temps migrate --pre-migration-b
 
 **If the backup fails, nothing is migrated** and Temps exits with the reason (for example, no suitable `pg_dump` and no reachable Docker daemon). Fix the cause and start again, or take your own backup and start without the flag.
 
-Stopping Temps while the dump runs (Ctrl+C, `systemctl stop`) can leave its `postgres` container running. The next start removes it before migrating. To remove it by hand:
+Stopping Temps while the dump runs (Ctrl+C, `systemctl stop`) can leave its `postgres` container running. The next start removes it before migrating, unless another process is backing up the same data directory at that moment. Each container is labelled with the backup directory it writes for, so containers of other installations on the same Docker host are never touched.
+
+To find it by hand, list the dump containers with the directory they belong to:
 
 ```bash
-docker rm -f $(docker ps -aq --filter label=sh.temps.kind=pre-migration-backup)
+docker ps -a --filter label=sh.temps.kind=pre-migration-backup \
+  --format '{{.Names}}  {{.Status}}  {{.Label "sh.temps.pre-migration-backup-dir"}}'
 ```
+
+With every Temps process that uses this data directory stopped, remove the one whose directory is yours: `docker rm -f <name>`. A container with an empty directory column was started by an older release; it may belong to another installation on the same host, so Temps leaves it running and logs its name. Remove it only if no other installation is upgrading.
 
 `--skip-pre-migration-backup` from earlier releases is still accepted and does nothing.
 
@@ -440,7 +445,7 @@ If you cannot fix it now, back up the database yourself and start without `--pre
 
 ### Migration fails with `canceling statement due to lock timeout`
 
-Another session holds a lock on a table the migration changes, and the migration gave up after 15 seconds. Nothing past the last successful migration was applied. The usual holders are a `pg_dump` container left by an interrupted pre-migration backup (removed automatically on the next start, or with `docker rm -f $(docker ps -aq --filter label=sh.temps.kind=pre-migration-backup)`) or another Temps process still connected to the database. List who is connected and stop them before starting again:
+Another session holds a lock on a table the migration changes, and the migration gave up after 15 seconds. Nothing past the last successful migration was applied. The usual holders are a `pg_dump` container left by an interrupted pre-migration backup (removed automatically on the next start, or by hand as described in [Pre-migration backup](#automatic-pre-migration-backup)) or another Temps process still connected to the database. List who is connected and stop them before starting again:
 
 ```bash
 docker exec temps-timescaledb psql -U temps -d temps -c \

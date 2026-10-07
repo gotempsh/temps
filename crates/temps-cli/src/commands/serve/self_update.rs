@@ -998,18 +998,8 @@ impl UpdateJob {
             migrations_total: self.state.read().ok().and_then(|s| s.migrations_total),
         };
 
-        let mut command = tokio::process::Command::new(&self.binary_path);
-        command
-            .arg("migrate")
-            .arg("--yes")
-            .arg("--progress-format=json");
-        if let Some(data_dir) = &self.pre_migration_backup {
-            command
-                .arg(crate::commands::schema_upgrade::BACKUP_FLAG)
-                .arg("--data-dir")
-                .arg(data_dir);
-        }
-        let mut child = command
+        let mut child = tokio::process::Command::new(&self.binary_path)
+            .args(migrate_child_args(self.pre_migration_backup.as_deref()))
             // Explicit env set: if the parent received the DB URL as a
             // `--database-url` flag it is not in the environment, so a naive
             // child spawn would fail clap's required-arg check.
@@ -1296,6 +1286,24 @@ fn preflight_staged_binary(staged_path: &Path) -> anyhow::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Arguments for the `temps migrate` child of an update. With
+/// `pre_migration_backup` (the data dir of a `temps serve
+/// --pre-migration-backup`), the child takes the backup into that same data
+/// dir.
+pub(crate) fn migrate_child_args(pre_migration_backup: Option<&Path>) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "migrate".into(),
+        "--yes".into(),
+        "--progress-format=json".into(),
+    ];
+    if let Some(data_dir) = pre_migration_backup {
+        args.push(crate::commands::schema_upgrade::BACKUP_FLAG.into());
+        args.push("--data-dir".into());
+        args.push(data_dir.as_os_str().to_owned());
+    }
+    args
 }
 
 /// Copy the current binary aside as `<binary>.bak`, returning where it went.
@@ -1851,6 +1859,25 @@ mod tests {
 
         drop(staged_path);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrate_child_takes_the_backup_only_when_serve_was_started_with_it() {
+        assert_eq!(
+            migrate_child_args(None),
+            vec!["migrate", "--yes", "--progress-format=json"]
+        );
+        assert_eq!(
+            migrate_child_args(Some(Path::new("/srv/temps-data"))),
+            vec![
+                "migrate",
+                "--yes",
+                "--progress-format=json",
+                "--pre-migration-backup",
+                "--data-dir",
+                "/srv/temps-data",
+            ]
+        );
     }
 
     #[test]
