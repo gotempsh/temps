@@ -564,17 +564,25 @@ describe('cancel control', () => {
 })
 
 describe('source backup link', () => {
-  test('links a recorded backup through its S3 source', () => {
+  const uuid = '0d4c9a59-7f2e-4f8a-9d0b-1f7f0a6b2c11'
+  test('links a recorded backup by its UUID through its S3 source', () => {
     expect(
-      sourceBackupHref({ source_backup_id: 3, source_s3_source_id: 9 })
-    ).toBe('/backups/s3-sources/9/backups/3')
+      sourceBackupHref({ source_backup_uuid: uuid, source_s3_source_id: 9 })
+    ).toBe(`/backups/s3-sources/9/backups/${uuid}`)
+  })
+  test('never links by the integer row id, which backup routes reject', () => {
+    // Regression: the link used to put source_backup_id (an integer) where
+    // the route expects the UUID, opening a "backup not found" page.
+    expect(
+      sourceBackupHref({ source_backup_uuid: null, source_s3_source_id: 9 })
+    ).toBeUndefined()
   })
   test('has no link for raw-location runs or unknown sources', () => {
     expect(
-      sourceBackupHref({ source_backup_id: 0, source_s3_source_id: 9 })
+      sourceBackupHref({ source_backup_uuid: '', source_s3_source_id: 9 })
     ).toBeUndefined()
     expect(
-      sourceBackupHref({ source_backup_id: 3, source_s3_source_id: null })
+      sourceBackupHref({ source_backup_uuid: uuid, source_s3_source_id: null })
     ).toBeUndefined()
   })
 })

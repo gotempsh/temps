@@ -20499,6 +20499,12 @@ export type RestoreRunView = {
     recovery_target?: unknown;
     source_backup_id: number;
     /**
+     * The backup's UUID (`backups.backup_id`), which is what backup routes
+     * take. Absent for raw-location restores and runs recorded before it
+     * was tracked.
+     */
+    source_backup_uuid?: string | null;
+    /**
      * S3 source holding the backup being restored, so clients can link to
      * it. Absent only for runs recorded before this was tracked.
      */

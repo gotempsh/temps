@@ -43605,6 +43605,13 @@
             "format": "int32",
             "type": "integer"
           },
+          "source_backup_uuid": {
+            "description": "The backup's UUID (`backups.backup_id`), which is what backup routes\ntake. Absent for raw-location restores and runs recorded before it\nwas tracked.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "source_s3_source_id": {
             "description": "S3 source holding the backup being restored, so clients can link to\nit. Absent only for runs recorded before this was tracked.",
             "format": "int32",

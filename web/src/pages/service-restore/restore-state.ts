@@ -608,13 +608,19 @@ export function notCancellableReason(error: unknown): string | undefined {
   return typeof problem.detail === 'string' ? problem.detail : undefined
 }
 
-/** Console path of the backup a run restores, when the run records it. */
+/**
+ * Console path of the backup a run restores, when the run records it.
+ *
+ * Backup routes take the backup's UUID (`backups.backup_id`), not the integer
+ * row id the run stores as `source_backup_id`; runs without the UUID (raw
+ * locations, older runs) get no link rather than a broken one.
+ */
 export function sourceBackupHref(
-  run: Pick<RestoreRunView, 'source_backup_id' | 'source_s3_source_id'>
+  run: Pick<RestoreRunView, 'source_backup_uuid' | 'source_s3_source_id'>
 ): string | undefined {
-  if (run.source_backup_id <= 0 || run.source_s3_source_id == null)
+  if (!run.source_backup_uuid || run.source_s3_source_id == null)
     return undefined
-  return `/backups/s3-sources/${run.source_s3_source_id}/backups/${run.source_backup_id}`
+  return `/backups/s3-sources/${run.source_s3_source_id}/backups/${encodeURIComponent(run.source_backup_uuid)}`
 }
 
 // ----- Restore form selection in the URL (#1282) -----------------------------
