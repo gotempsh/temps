@@ -161,6 +161,14 @@ impl ClickHouseOtelClient {
             .with_database(config.database)
             .with_user(config.user)
             .with_password(config.password)
+            // NOTE: these limits belong to THIS client only, and it is built for
+            // the backfill CLI. `ClickHouseOtelStorage::new` builds its own
+            // client with no settings at all, so storage reads run under
+            // whatever the server profile says (a profile's `max_memory_usage`
+            // is what actually bounded them, not the 8 GiB below). Reads that
+            // must be bounded set their own per-query limits — see
+            // `storage::global_traces::local_clickhouse`.
+            //
             // Per-query blast radius. Without these, one authenticated read of
             // a very large project (an unbounded `count_traces`, a wide window,
             // a pathological offset) can hold many GB and many minutes on a
@@ -1476,7 +1484,14 @@ impl OtelStorage for ClickHouseOtelStorage {
         &self,
         query: crate::storage::global_traces::GlobalTraceQuery,
     ) -> StorageResult<crate::storage::global_traces::GlobalTraceStream> {
-        super::global_traces::clickhouse(&self.ch, &query, None).await
+        // Same lock-free snapshot the project trace list filters with, so a
+        // faceted attribute uses its indexed slot column here too.
+        let facets = self
+            .facet_cache
+            .as_ref()
+            .map(|c| c.load_full())
+            .unwrap_or_default();
+        super::global_traces::clickhouse_local(&self.ch, &query, &facets).await
     }
     // ── Span write (ClickHouse — system of record) ──────────────────────────
 
