@@ -372,6 +372,10 @@ export function buildPlatformSettingsUpdateBody(
     // Same reasoning: omitting this would silently disable the MCP server on
     // every unrelated settings save.
     mcp_server: updated.mcp_server,
+    // The server preserves an omitted block (#1171), but the On-demand TLS
+    // page edits it through this builder, so it must be sent for a save
+    // there to take effect.
+    on_demand_tls: updated.on_demand_tls,
   }
   return body
 }

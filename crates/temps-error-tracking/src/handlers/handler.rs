@@ -329,6 +329,15 @@ impl From<ErrorTrackingError> for temps_core::problemdetails::Problem {
                     .with_title("Validation Error")
                     .with_detail(err.to_string())
             }
+            ErrorTrackingError::AlertRuleLimitReached {
+                project_id, limit, ..
+            } => temps_core::error_builder::ErrorBuilder::new(StatusCode::CONFLICT)
+                .type_("https://temps.sh/probs/alert-rule-limit-reached")
+                .title("Alert Rule Limit Reached")
+                .detail(err.to_string())
+                .value("project_id", project_id)
+                .value("limit", limit)
+                .build(),
             ErrorTrackingError::PayloadTooLarge { .. } => {
                 problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
                     .with_title("Payload Too Large")
@@ -369,6 +378,9 @@ impl axum::response::IntoResponse for ErrorTrackingError {
             ),
             ErrorTrackingError::ProjectNotFound => {
                 (StatusCode::NOT_FOUND, "Project not found".to_string())
+            }
+            ErrorTrackingError::AlertRuleLimitReached { .. } => {
+                (StatusCode::CONFLICT, self.to_string())
             }
             ErrorTrackingError::PayloadTooLarge {
                 field,

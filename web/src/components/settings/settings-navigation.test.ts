@@ -7,6 +7,7 @@ import {
   settingsNavigationGroups,
 } from './settings-navigation'
 import { WORKER_NODES_URL } from '@/lib/worker-nodes'
+import { ON_DEMAND_TLS_SETTINGS_PATH } from '@/lib/on-demand-tls'
 
 const labels = (groups: ReturnType<typeof mergeSettingsNavigationGroups>) =>
   groups.map((g) => g.label)
@@ -20,6 +21,14 @@ describe('settingsNavigationGroups', () => {
       g.items.map((i) => i.url)
     )
     expect(urls).not.toContain(WORKER_NODES_URL)
+  })
+
+  it('lists the on-demand TLS page the Certificates empty state links to', () => {
+    const item = settingsNavigationGroups
+      .flatMap((g) => g.items)
+      .find((i) => i.url === ON_DEMAND_TLS_SETTINGS_PATH)
+    expect(item?.title).toBe('On-demand TLS')
+    expect(item?.keywords).toContain('certificates')
   })
 })
 

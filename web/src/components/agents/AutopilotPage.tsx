@@ -56,6 +56,9 @@ import { AutopilotStatusBadge } from './AutopilotStatusBadge'
 
 type AgentRun = AgentRunResponse
 
+/** Where harness (AI CLI) credentials are added. */
+export const HARNESSES_PATH = '/agent-sandbox/providers'
+
 interface AutopilotPageProps {
   project: ProjectResponse
 }
@@ -475,15 +478,15 @@ export function AutopilotPage({ project }: AutopilotPageProps) {
                 </div>
                 <p className="text-xs text-muted-foreground">
                   Workflows need an AI CLI (Claude Code, Codex, or OpenCode) to
-                  run. Add credentials once in{' '}
-                  <Link to="/agent-sandbox" className="underline font-medium">
-                    Settings &gt; AI Workflows
+                  run. Add credentials once under{' '}
+                  <Link to={HARNESSES_PATH} className="underline font-medium">
+                    AI runtime settings &gt; Harnesses
                   </Link>
                   .
                 </p>
                 {!hasCredential && (
                   <Button size="sm" variant="outline" asChild>
-                    <Link to="/agent-sandbox">Configure AI provider</Link>
+                    <Link to={HARNESSES_PATH}>Configure AI provider</Link>
                   </Button>
                 )}
               </div>
@@ -569,9 +572,9 @@ prompt: |
                 {defaultProviderName} is not configured
               </p>
               <p className="text-sm opacity-90">
-                Add credentials in{' '}
-                <Link to="/agent-sandbox" className="underline font-medium">
-                  Settings &gt; AI Workflows
+                Add credentials under{' '}
+                <Link to={HARNESSES_PATH} className="underline font-medium">
+                  AI runtime settings &gt; Harnesses
                 </Link>
               </p>
             </div>

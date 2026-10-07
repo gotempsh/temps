@@ -116,6 +116,9 @@ pub const METRIC_SELF_P99: &str = "proxy.self_duration_p99_ms";
 /// The two cases covered here are the ones that produce hour-long sessions by
 /// design; the rest are bounded by the upstream read timeout.
 pub const METRIC_STREAMING_SESSIONS: &str = "proxy.streaming_sessions";
+/// Requests rejected by an instance or project rate limit, or by a
+/// rate-limit blacklist entry (issue #1288).
+pub const METRIC_RATE_LIMITED: &str = "proxy.rate_limited";
 pub const METRIC_STREAMING_DURATION_AVG: &str = "proxy.streaming_duration_avg_ms";
 
 /// Where a request was routed. The three variants are mutually exclusive and
@@ -188,6 +191,8 @@ pub struct ProxyMetrics {
     /// wall-clock lifetime. Reported separately from request latency.
     streaming_sessions: AtomicU64,
     streaming_sum_ms: AtomicU64,
+    /// Requests rejected by rate limiting (429) or a rate-limit blacklist (403).
+    rate_limited: AtomicU64,
 }
 
 /// Find the histogram bucket for a duration.
@@ -291,6 +296,11 @@ impl ProxyMetrics {
         }
     }
 
+    /// Count one request rejected by rate limiting. One relaxed atomic add.
+    pub fn record_rate_limited(&self) {
+        self.rate_limited.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Read a consistent-enough view of all counters.
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
@@ -311,6 +321,7 @@ impl ProxyMetrics {
             self_count: self.self_count.load(Ordering::Relaxed),
             streaming_sessions: self.streaming_sessions.load(Ordering::Relaxed),
             streaming_sum_ms: self.streaming_sum_ms.load(Ordering::Relaxed),
+            rate_limited: self.rate_limited.load(Ordering::Relaxed),
         }
     }
 }
@@ -331,6 +342,7 @@ pub struct MetricsSnapshot {
     self_count: u64,
     streaming_sessions: u64,
     streaming_sum_ms: u64,
+    rate_limited: u64,
 }
 
 impl MetricsSnapshot {
@@ -366,6 +378,7 @@ impl MetricsSnapshot {
                 .streaming_sessions
                 .saturating_sub(prev.streaming_sessions),
             streaming_sum_ms: self.streaming_sum_ms.saturating_sub(prev.streaming_sum_ms),
+            rate_limited: self.rate_limited.saturating_sub(prev.rate_limited),
         }
     }
 }
@@ -395,6 +408,7 @@ pub struct MetricsDelta {
     self_count: u64,
     streaming_sessions: u64,
     streaming_sum_ms: u64,
+    rate_limited: u64,
 }
 
 impl MetricsDelta {
@@ -464,6 +478,11 @@ impl MetricsDelta {
             ProxySample {
                 name: METRIC_STREAMING_SESSIONS,
                 value: self.streaming_sessions as f64,
+                is_counter: true,
+            },
+            ProxySample {
+                name: METRIC_RATE_LIMITED,
+                value: self.rate_limited as f64,
                 is_counter: true,
             },
         ];
@@ -694,8 +713,23 @@ mod tests {
     fn test_samples_idle_interval_emits_only_counters() {
         let delta = MetricsDelta::default();
         let samples = delta.samples();
-        assert_eq!(samples.len(), 10);
+        assert_eq!(samples.len(), 11);
         assert!(samples.iter().all(|s| s.is_counter && s.value == 0.0));
+    }
+
+    #[test]
+    fn test_rate_limited_requests_are_counted_per_interval() {
+        let m = ProxyMetrics::default();
+        let first = m.snapshot();
+        m.record_rate_limited();
+        m.record_rate_limited();
+        let delta = m.snapshot().delta_since(&first);
+        let rate_limited = delta
+            .samples()
+            .into_iter()
+            .find(|s| s.name == METRIC_RATE_LIMITED)
+            .map(|s| (s.value, s.is_counter));
+        assert_eq!(rate_limited, Some((2.0, true)));
     }
 
     /// Regression: a long-lived WebSocket/SSE session must not be booked as

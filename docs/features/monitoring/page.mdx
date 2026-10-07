@@ -237,7 +237,9 @@ When a metric alert rule fires, the Metrics page lists it above the charts. Clic
   <Property name="Set Up Alerts">
     Configure alerts for critical thresholds: - CPU > 90% for 5 minutes - Memory
     > 85% of allocation - Container restarts - Health check failures Alerts can
-    notify you via email, webhooks, or integrations.
+    notify you via email, webhooks, or integrations. Each project can create
+    up to 100 metric alert rules from the console or API; rules declared in
+    `.temps.yaml` are limited per file instead.
   </Property>
 
   <Property name="Compare Environments">

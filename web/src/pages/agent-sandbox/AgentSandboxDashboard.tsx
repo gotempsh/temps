@@ -74,7 +74,7 @@ function ToneIcon({ tone }: { tone: Tone }) {
 }
 
 export function AgentSandboxDashboard() {
-  usePageTitle('AI Workflows')
+  usePageTitle('AI runtime settings')
   const { data: catalog, isPending: catalogPending } = useQuery({
     ...aiProviderCatalogQueryOptions,
     staleTime: 60 * 1000,

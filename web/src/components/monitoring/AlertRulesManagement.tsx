@@ -37,7 +37,7 @@ import {
   ShieldAlert,
 } from 'lucide-react'
 import { useMemo, useState } from 'react'
-import { useNavigate } from 'react-router'
+import { Link, useNavigate } from 'react-router'
 import { toast } from 'sonner'
 
 const TRIGGER_TYPES = [
@@ -181,7 +181,15 @@ export function AlertRulesManagement({
       <EmptyState
         icon={ShieldAlert}
         title="No projects found"
-        description="Create a project first to configure error alert rules."
+        description="Error alert rules belong to a project. Create one to configure them."
+        action={
+          <Button asChild>
+            <Link to="/projects/new">
+              <Plus className="h-4 w-4 mr-2" />
+              Create project
+            </Link>
+          </Button>
+        }
       />
     )
   }

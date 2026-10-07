@@ -47068,6 +47068,10 @@ export type CreateAlertErrors = {
      */
     403: ProblemDetails;
     /**
+     * The project already has the maximum number of metric alert rules
+     */
+    409: ProblemDetails;
+    /**
      * Internal server error
      */
     500: ProblemDetails;
@@ -57015,6 +57019,10 @@ export type CreateAlertRuleErrors = {
      * Validation error
      */
     400: unknown;
+    /**
+     * The project already has the maximum number of error alert rules
+     */
+    409: unknown;
     /**
      * Internal server error
      */

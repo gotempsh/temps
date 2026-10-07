@@ -514,11 +514,12 @@ const settingsNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'AI Workflows',
+    title: 'Workflows',
     url: '/ai-workflows',
     icon: Bot,
     keywords: [
       'ai',
+      'ai workflows',
       'workflows',
       'agents',
       'sandbox',

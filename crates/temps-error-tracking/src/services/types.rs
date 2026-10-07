@@ -47,6 +47,17 @@ pub enum ErrorTrackingError {
     #[error("Project not found")]
     ProjectNotFound,
 
+    /// The project already has the maximum number of error alert rules.
+    /// Maps to HTTP 409 Conflict.
+    #[error(
+        "Project {project_id} already has {existing} error alert rules; the limit is {limit} per project. Delete or reuse an existing rule"
+    )]
+    AlertRuleLimitReached {
+        project_id: i32,
+        existing: u64,
+        limit: u64,
+    },
+
     /// Returned when an uploaded file or request body exceeds the allowed size.
     ///
     /// Maps to HTTP 413 Payload Too Large.
