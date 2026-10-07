@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import {
+  cancelRestoreRunMutation,
   planRestoreMutation,
   startRestoreMutation,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -80,6 +81,11 @@ import {
   useSearchParams,
 } from 'react-router'
 import { toast } from 'sonner'
+import {
+  VIEW_IN_OPERATIONS_ACTION,
+  announceOperation,
+} from '@/components/operations/operations-tray-store'
+import { invalidateOperations } from '@/lib/operations'
 import { RunTrackingPanel } from './service-restore/RunTrackingPanel'
 import {
   restoreCapabilitiesQuery,
@@ -96,8 +102,11 @@ import {
   completionToast,
   deriveRunTracking,
   markRunWatching,
+  notCancellableReason,
   observeRun,
   parseRunParam,
+  readRestoreSelection,
+  writeRestoreSelection,
   phaseLabel,
   pickActiveRun,
   restoreGate,
@@ -109,9 +118,11 @@ import {
   type AttachReason,
   type CompletionLedger,
   type QueryErrorKind,
+  type RestoreMode,
+  type RestoreSelection,
 } from './service-restore/restore-state'
 
-type Mode = 'in_place' | 'new_service' | 'pitr'
+type Mode = RestoreMode
 
 // Engine-family check — mirror of the backend `engines_compatible` helper in
 // crates/temps-backup/src/services/restore.rs. S3-compatible object stores
@@ -246,9 +257,11 @@ export function ServiceRestore() {
     const { ledger, notify } = observeRun(ledgerRef.current, runRow)
     ledgerRef.current = ledger
     if (!notify) return
+    // The operations tray lists this run too: refresh it with the outcome.
+    void invalidateOperations(queryClient)
     const message = completionToast(notify, runRow, service?.name)
     toast[message.level](message.title, { description: message.description })
-  }, [runRow, service?.name])
+  }, [runRow, service?.name, queryClient])
 
   const runView =
     effectiveRunId === null
@@ -264,14 +277,34 @@ export function ServiceRestore() {
       ? 'reattached'
       : attachReasonFromLocationState(location.state)
 
+  // ----- Selection ----------------------------------------------------------
+  // Source, backup and mode live in the URL (`?source=&backup=&mode=`) so a
+  // reload, the back button or a "Restore this backup" deep link keeps them.
+  // A raw S3-scan backup has no id to put there and stays in local state.
+  const selection = readRestoreSelection(searchParams)
+  const selectedSourceId = selection.sourceId
+  const mode: Mode = selection.mode ?? 'in_place'
+  const [scannedBackup, setScannedBackup] = useState<
+    SourceBackupEntry | undefined
+  >()
+  const updateSelection = useCallback(
+    (patch: { [K in keyof RestoreSelection]?: RestoreSelection[K] | null }) =>
+      setSearchParams((prev) => writeRestoreSelection(prev, patch), {
+        replace: true,
+      }),
+    [setSearchParams]
+  )
+  // Changing the source clears the backup in the same URL update: two
+  // updates in one tick would each start from the same previous URL.
+  const selectSource = (sourceId: number) => {
+    setScannedBackup(undefined)
+    updateSelection({ sourceId, backupId: null })
+  }
+  const setMode = (next: Mode) => updateSelection({ mode: next })
+
   // ----- Local state --------------------------------------------------------
   // Kept in this component, which stays mounted through load errors and
   // retries, so a retry never discards what the user already picked.
-  const [selectedSourceId, setSelectedSourceId] = useState<number | undefined>()
-  const [selectedBackup, setSelectedBackup] = useState<
-    SourceBackupEntry | undefined
-  >()
-  const [mode, setMode] = useState<Mode>('in_place')
   // `undefined` means the suggestion has not been edited. An explicit empty
   // string must stay empty so validation can reject a cleared name.
   const [newServiceName, setNewServiceName] = useState<string | undefined>()
@@ -314,6 +347,26 @@ export function ServiceRestore() {
     () => backupIndex?.backups ?? [],
     [backupIndex]
   )
+
+  const selectedBackupId = selection.backupId
+  const selectedBackup = useMemo<SourceBackupEntry | undefined>(
+    () =>
+      selectedBackupId !== undefined
+        ? allBackups.find(
+            (b) => b.source !== 's3_scan' && b.id === selectedBackupId
+          )
+        : scannedBackup,
+    [allBackups, selectedBackupId, scannedBackup]
+  )
+  const setSelectedBackup = (backup: SourceBackupEntry | undefined) => {
+    if (backup && backup.source !== 's3_scan' && backup.id > 0) {
+      setScannedBackup(undefined)
+      updateSelection({ backupId: backup.id })
+    } else {
+      setScannedBackup(backup)
+      updateSelection({ backupId: null })
+    }
+  }
 
   // Filter rule: the backup row's `engine` must be in the same engine family
   // as the target service. Today the only multi-engine family is the
@@ -391,7 +444,7 @@ export function ServiceRestore() {
       queryClient.setQueryData(restoreRunQuery(r.id).queryKey, r)
       setShowDestructiveConfirm(false)
       followRun(r.id)
-      toast.success('Restore started', {
+      announceOperation(queryClient, 'Restore started', {
         description: `Run ${r.id} (phase: ${phaseLabel(r.phase)}).`,
       })
     },
@@ -430,6 +483,37 @@ export function ServiceRestore() {
   const planMutation = useMutation({
     ...planRestoreMutation(),
     meta: { errorTitle: 'Failed to plan restore' },
+  })
+
+  // Cancelling is never retried automatically either: the server decides
+  // whether it is still safe, and a 409 explains why it no longer is.
+  const cancelMutation = useMutation({
+    ...cancelRestoreRunMutation(),
+    retry: false,
+    onSuccess: (run) => {
+      const r = run as RestoreRunView
+      queryClient.setQueryData(restoreRunQuery(r.id).queryKey, r)
+      void invalidateOperations(queryClient)
+      toast.info('Cancelling restore', {
+        description: `Run ${r.id} stops at its next check and cleans up what it staged.`,
+        action: VIEW_IN_OPERATIONS_ACTION,
+      })
+    },
+    onError: (error) => {
+      if (trackedRunId !== null) {
+        void queryClient.invalidateQueries({
+          queryKey: restoreRunQuery(trackedRunId).queryKey,
+        })
+      }
+      const problem = error as { detail?: string; message?: string }
+      toast.error('The restore could not be cancelled', {
+        description:
+          notCancellableReason(error) ??
+          problem.detail ??
+          problem.message ??
+          'Unknown error',
+      })
+    },
   })
 
   const isOrphan = selectedBackup?.source === 's3_scan'
@@ -679,6 +763,11 @@ export function ServiceRestore() {
           onBack={() => navigate(`/storage/${serviceId}`)}
           onStartNew={startNewRestore}
           onOpenRestored={(targetId) => navigate(`/storage/${targetId}`)}
+          onCancel={() => {
+            if (trackedRunId !== null)
+              cancelMutation.mutate({ path: { id: trackedRunId } })
+          }}
+          cancelling={cancelMutation.isPending}
         />
       </PageContainer>
     )
@@ -741,8 +830,7 @@ export function ServiceRestore() {
             <Select
               value={effectiveSourceId?.toString()}
               onValueChange={(v) => {
-                setSelectedSourceId(Number(v))
-                setSelectedBackup(undefined)
+                selectSource(Number(v))
                 setBackupsPage(1)
               }}
             >

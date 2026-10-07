@@ -8,6 +8,8 @@ import {
   getServiceOptions,
   getServicePreviewEnvironmentVariablesMaskedOptions,
   linkServiceToProjectMutation,
+  listRestoreRunsForServiceOptions,
+  listS3SourcesOptions,
   listServiceProjectsOptions,
   startServiceMutation,
   stopServiceMutation,
@@ -15,6 +17,15 @@ import {
 import { revealServiceParameter } from '@/api/client/sdk.gen'
 import { cn } from '@/lib/utils'
 import { listExternalServiceBackupsOptions } from '@/lib/external-service-backups'
+import {
+  CREATE_BACKUP_DESTINATION_HREF,
+  SERVICE_BACKUPS_ANCHOR,
+  activeRestoreRun,
+  backupsCardState,
+  restoreRunHref,
+  scheduleBackupsHref,
+} from '@/lib/service-backups-onboarding'
+import { phaseLabel } from '@/pages/service-restore/restore-state'
 import { ClusterHealthPanel } from '@/components/storage/ClusterHealthPanel'
 import { MonitoringCard } from '@/components/storage/MonitoringCard'
 import { EditServiceDialog } from '@/components/storage/EditServiceDialog'
@@ -104,6 +115,7 @@ import {
   Activity,
   ArrowLeft,
   ArrowUpCircle,
+  CalendarClock,
   CheckCircle2,
   ChevronDown,
   ChevronLeft,
@@ -335,12 +347,64 @@ export function ServiceDetail() {
     if (backupsPage > backupsTotalPages) {
       // The server total can shrink after a backup is removed while this page
       // is open; synchronize the requested page back into the valid range.
-      // eslint-disable-next-line react-hooks/set-state-in-effect
+
       setBackupsPage(backupsTotalPages)
     }
   }, [backupsPage, backupsTotalPages])
 
   const paginatedBackups = serviceBackups
+
+  // Backup destinations decide what the empty Backups card says: "no
+  // destination yet" needs a different next step than "no backup yet".
+  const backupDestinationsQuery = useQuery({
+    ...listS3SourcesOptions(),
+    enabled: serviceId !== undefined,
+  })
+  const backupDestinations = backupDestinationsQuery.data
+  const backupsCard = backupsCardState({
+    backupsLoading: isLoadingBackups,
+    backupCount: serviceBackups.length,
+    destinationsLoading: backupDestinationsQuery.isLoading,
+    destinations: backupDestinationsQuery.isError
+      ? undefined
+      : backupDestinations,
+  })
+  const scheduleHref =
+    serviceId !== undefined
+      ? scheduleBackupsHref(serviceId, backupDestinations)
+      : CREATE_BACKUP_DESTINATION_HREF
+
+  // A restore in flight on this service, so it is visible from here and not
+  // only from the restore page. Polls only while one is running.
+  const restoreRunsQuery = useQuery({
+    ...listRestoreRunsForServiceOptions({ path: { id: serviceId ?? 0 } }),
+    enabled: serviceId !== undefined,
+    refetchInterval: (query) =>
+      activeRestoreRun(query.state.data) ? 5000 : false,
+    refetchIntervalInBackground: false,
+  })
+  const runningRestore = activeRestoreRun(restoreRunsQuery.data)
+
+  // `/storage/{id}#backups` (the Databases page's "Backups" action) lands on
+  // the Backups card once it has rendered, and re-aligns once more because
+  // cards above it (health, monitoring) can grow when their data arrives.
+  const serviceLoaded = service !== undefined
+  const backupsRendered = backupsCard.kind !== 'loading'
+  useEffect(() => {
+    if (
+      !serviceLoaded ||
+      !backupsRendered ||
+      location.hash !== `#${SERVICE_BACKUPS_ANCHOR}`
+    )
+      return
+    const align = () =>
+      document
+        .getElementById(SERVICE_BACKUPS_ANCHOR)
+        ?.scrollIntoView({ block: 'start' })
+    align()
+    const realign = window.setTimeout(align, 800)
+    return () => window.clearTimeout(realign)
+  }, [serviceLoaded, backupsRendered, location.hash])
 
   const backupsPageWindow = useMemo(() => {
     const windowSize = Math.min(5, backupsTotalPages)
@@ -931,6 +995,22 @@ export function ServiceDetail() {
           <>
             {error ? <Callout tone="error">{error}</Callout> : null}
 
+            {runningRestore && serviceId !== undefined ? (
+              <Callout tone="info" title="A restore is running on this service">
+                <span>
+                  Run #{runningRestore.id} (
+                  {runningRestore.mode.replace('_', ' ')}) is in its{' '}
+                  {phaseLabel(runningRestore.phase).toLowerCase()} phase.{' '}
+                  <Link
+                    to={restoreRunHref(serviceId, runningRestore.id)}
+                    className="font-medium text-foreground underline underline-offset-2"
+                  >
+                    View progress
+                  </Link>
+                </span>
+              </Callout>
+            ) : null}
+
             {/*
               Health is the highest-signal block on this page, so it sits
               directly under the header.
@@ -1202,7 +1282,7 @@ export function ServiceDetail() {
             />
 
             {/* Backups Section */}
-            <Card>
+            <Card id={SERVICE_BACKUPS_ANCHOR} className="scroll-mt-20">
               <CardHeader>
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                   <div className="space-y-1.5 min-w-0">
@@ -1241,6 +1321,19 @@ export function ServiceDetail() {
                       variant="outline"
                       size="sm"
                       className="gap-2"
+                      asChild
+                    >
+                      <Link to={scheduleHref}>
+                        <CalendarClock className="h-4 w-4" />
+                        <span className="hidden sm:inline">
+                          Schedule backups
+                        </span>
+                      </Link>
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="gap-2"
                       onClick={() => setIsBackupDialogOpen(true)}
                     >
                       <HardDrive className="h-4 w-4" />
@@ -1251,17 +1344,59 @@ export function ServiceDetail() {
                 </div>
               </CardHeader>
               <CardContent>
-                {isLoadingBackups ? (
-                  <div className="flex items-center justify-center py-8">
-                    <Loader2 className="h-4 w-4 animate-spin mr-2" />
-                    <span className="text-sm text-muted-foreground">
-                      Loading backups...
-                    </span>
+                {backupsCard.kind === 'loading' ? (
+                  <div className="space-y-3 py-2" aria-label="Loading backups">
+                    {[0, 1, 2].map((row) => (
+                      <div key={row} className="flex items-center gap-3">
+                        <Skeleton className="h-4 w-4 rounded-full" />
+                        <Skeleton className="h-4 w-48" />
+                        <Skeleton className="ml-auto h-4 w-20" />
+                      </div>
+                    ))}
                   </div>
-                ) : serviceBackups.length === 0 ? (
-                  <div className="text-sm text-muted-foreground text-center py-8">
-                    No backups found for this service yet. Trigger one or
-                    configure a schedule from an S3 source.
+                ) : backupsCard.kind === 'no_destination' ? (
+                  <div className="space-y-3 py-4 text-sm">
+                    <p className="font-medium">
+                      No backup destination configured
+                    </p>
+                    <p className="text-muted-foreground">
+                      Backups are written to an S3-compatible destination (AWS
+                      S3, Cloudflare R2, MinIO, a Temps blob service…). Add one,
+                      then schedule nightly backups of this service or trigger
+                      one now.
+                    </p>
+                    <Button size="sm" asChild>
+                      <Link to={CREATE_BACKUP_DESTINATION_HREF}>
+                        <Plus className="h-4 w-4 mr-2" />
+                        Create destination
+                      </Link>
+                    </Button>
+                  </div>
+                ) : backupsCard.kind === 'empty' ? (
+                  <div className="space-y-3 py-4 text-sm">
+                    <p className="font-medium">
+                      No backups of this service yet
+                    </p>
+                    <p className="text-muted-foreground">
+                      Schedule backups so a copy is taken automatically (for
+                      example every night at 03:00), or trigger one now.
+                    </p>
+                    <div className="flex flex-wrap gap-2">
+                      <Button size="sm" asChild>
+                        <Link to={scheduleHref}>
+                          <CalendarClock className="h-4 w-4 mr-2" />
+                          Schedule backups
+                        </Link>
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => setIsBackupDialogOpen(true)}
+                      >
+                        <HardDrive className="h-4 w-4 mr-2" />
+                        Trigger backup
+                      </Button>
+                    </div>
                   </div>
                 ) : (
                   <ul role="list" className="divide-y divide-border">

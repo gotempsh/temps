@@ -3,6 +3,16 @@
 
 import type { RestoreRunView } from '@/api/client/types.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader } from '@/components/ui/card'
@@ -20,15 +30,19 @@ import {
   Database,
   Info,
   Loader2,
+  Lock,
   RefreshCw,
   RotateCcw,
+  Square,
   XCircle,
 } from 'lucide-react'
 import { useState } from 'react'
 import { Link } from 'react-router'
 import {
   PHASES,
+  cancelControl,
   interruptedFallbackMessage,
+  sourceBackupHref,
   phaseStates,
   runTrackingProblemCopy,
   type AttachReason,
@@ -49,6 +63,9 @@ export interface RunTrackingPanelProps {
   onBack: () => void
   onStartNew: () => void
   onOpenRestored: (serviceId: number) => void
+  /** Ask the server to stop the run. Only offered while it is safe. */
+  onCancel: () => void
+  cancelling: boolean
   formatTime?: TimeFormatter
 }
 
@@ -62,11 +79,16 @@ export function RunTrackingPanel({
   onBack,
   onStartNew,
   onOpenRestored,
+  onCancel,
+  cancelling,
   formatTime = formatConfirmedTime,
 }: RunTrackingPanelProps) {
   const [checkedAfterInterrupt, setCheckedAfterInterrupt] = useState(false)
+  const [confirmCancel, setConfirmCancel] = useState(false)
   const run = runFromView(view)
   const terminal = view.kind === 'terminal'
+  const cancel = cancelControl(view)
+  const backupHref = run ? sourceBackupHref(run) : undefined
 
   return (
     <div className="space-y-4">
@@ -90,6 +112,25 @@ export function RunTrackingPanel({
                 mode <code>{run.mode}</code>
               </span>
             ) : null}
+            {run && run.source_backup_id > 0 ? (
+              <span className="text-sm text-muted-foreground">
+                from{' '}
+                {backupHref ? (
+                  <Link
+                    to={backupHref}
+                    className="underline underline-offset-2"
+                  >
+                    backup #{run.source_backup_id}
+                  </Link>
+                ) : (
+                  <>backup #{run.source_backup_id}</>
+                )}
+              </span>
+            ) : run ? (
+              <span className="text-sm text-muted-foreground">
+                from a raw backup location
+              </span>
+            ) : null}
             {typeof runId === 'number' ? (
               <span className="inline-flex items-center gap-1 text-sm text-muted-foreground">
                 run #{runId}
@@ -110,6 +151,7 @@ export function RunTrackingPanel({
             formatTime={formatTime}
           />
           <PhaseList view={view} />
+          <CancelNotice control={cancel} />
           <RunOutcome view={view} />
         </CardContent>
       </Card>
@@ -178,6 +220,20 @@ export function RunTrackingPanel({
               Back to restore setup
             </Button>
           ) : null}
+          {cancel.kind === 'available' ? (
+            <Button
+              variant="outline"
+              onClick={() => setConfirmCancel(true)}
+              disabled={cancelling}
+            >
+              {cancelling ? (
+                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+              ) : (
+                <Square className="h-4 w-4 mr-2" />
+              )}
+              Cancel restore
+            </Button>
+          ) : null}
         </div>
         {!terminal && view.kind !== 'not_found' ? (
           <p className="text-sm text-muted-foreground">
@@ -186,8 +242,80 @@ export function RunTrackingPanel({
           </p>
         ) : null}
       </div>
+
+      <AlertDialog
+        open={confirmCancel && cancel.kind === 'available'}
+        onOpenChange={setConfirmCancel}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Cancel this restore?</AlertDialogTitle>
+            <AlertDialogDescription>
+              {cancelDescription(run)}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Keep restoring</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                setConfirmCancel(false)
+                onCancel()
+              }}
+            >
+              Cancel restore
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
+}
+
+/** What cancelling does for this run, in the confirmation dialog. */
+function cancelDescription(run: RestoreRunView | undefined): string {
+  const destructive =
+    run?.mode === 'in_place' ||
+    (run?.mode === 'pitr' && !run.target_service_name)
+  return destructive
+    ? 'The restore stops before it writes anything: the database keeps its current data and the partial download is deleted.'
+    : `The restore stops and the partially created service${
+        run?.target_service_name ? ` "${run.target_service_name}"` : ''
+      } is removed, so nothing is left behind.`
+}
+
+function CancelNotice({
+  control,
+}: {
+  control: ReturnType<typeof cancelControl>
+}) {
+  switch (control.kind) {
+    case 'hidden':
+    case 'available':
+      return null
+    case 'requested':
+      return (
+        <Alert>
+          <Loader2 className="h-4 w-4 animate-spin" />
+          <AlertTitle>Cancelling</AlertTitle>
+          <AlertDescription>
+            Cancellation was requested. The restore stops at its next check and
+            cleans up what it staged.
+          </AlertDescription>
+        </Alert>
+      )
+    case 'unavailable':
+      return (
+        <p className="flex items-start gap-2 text-sm text-muted-foreground">
+          <Lock className="mt-0.5 h-4 w-4 shrink-0" />
+          <span>
+            <span className="font-medium text-foreground">
+              This restore can no longer be cancelled.
+            </span>{' '}
+            {control.reason}
+          </span>
+        </p>
+      )
+  }
 }
 
 function runFromView(view: RunTrackingView): RestoreRunView | undefined {

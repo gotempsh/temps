@@ -39,9 +39,11 @@ import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   ChevronRight,
   Database,
+  HardDrive,
   Link2,
   Link2Off,
   MoreHorizontal,
+  RotateCcw,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link, useNavigate } from 'react-router'
@@ -49,6 +51,8 @@ import { serviceCreateHref } from '@/lib/service-project-link'
 import type { ServiceLinkChange } from '@/lib/service-link-redeploy'
 import { ServiceLinkRedeployPrompt } from './ServiceLinkRedeployPrompt'
 import { projectServiceResourcePath } from '@/lib/database-provisioning'
+import { serviceBackupsHref } from '@/lib/service-backups-onboarding'
+import { restorePageHref } from '@/pages/service-restore/restore-state'
 import { toast } from 'sonner'
 
 /**
@@ -270,6 +274,23 @@ function ServiceRow({
               >
                 Browse data
               </DropdownMenuItem>
+            ) : null}
+            {isLinked ? (
+              <>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  onSelect={() => navigate(serviceBackupsHref(service.id))}
+                >
+                  <HardDrive className="size-3.5" />
+                  Backups
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onSelect={() => navigate(restorePageHref(service.id))}
+                >
+                  <RotateCcw className="size-3.5" />
+                  Restore…
+                </DropdownMenuItem>
+              </>
             ) : null}
             <DropdownMenuSeparator />
             {isLinked ? (

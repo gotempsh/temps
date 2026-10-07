@@ -66,6 +66,7 @@ function runRow(overrides: Partial<RestoreRunView> = {}): RestoreRunView {
     source_backup_id: 4,
     source_service_id: SERVICE_ID,
     status: 'running',
+    cancellable: false,
     ...overrides,
   }
 }

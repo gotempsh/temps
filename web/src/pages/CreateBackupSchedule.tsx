@@ -36,7 +36,14 @@ import { scheduleOptions } from '@/lib/schedule-options'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { ArrowLeft } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { Link, Navigate, useNavigate, useParams } from 'react-router'
+import {
+  Link,
+  Navigate,
+  useNavigate,
+  useParams,
+  useSearchParams,
+} from 'react-router'
+import { preselectedScheduleServiceId } from '@/lib/service-backups-onboarding'
 import { toast } from 'sonner'
 
 interface NewScheduleForm {
@@ -57,6 +64,9 @@ export function CreateBackupSchedule() {
   const sourceId = id ? parseInt(id, 10) : undefined
   const navigate = useNavigate()
   const { setBreadcrumbs } = useBreadcrumbs()
+  // Opened from a service's Backups card: start with just that service.
+  const [searchParams] = useSearchParams()
+  const preselectedServiceId = preselectedScheduleServiceId(searchParams)
 
   // All hooks before any early return.
   const { data: source } = useQuery({
@@ -78,11 +88,19 @@ export function CreateBackupSchedule() {
   // ones created after this schedule. 'specific' means it only backs up the
   // services explicitly picked below. Default chosen to match what most
   // operators want: "back up everything, even when I add a new DB later."
-  const [backupMode, setBackupMode] = useState<'all' | 'specific'>('all')
-  const [selectedServiceIds, setSelectedServiceIds] = useState<number[]>([])
+  const [backupMode, setBackupMode] = useState<'all' | 'specific'>(
+    preselectedServiceId !== undefined ? 'specific' : 'all'
+  )
+  const [selectedServiceIds, setSelectedServiceIds] = useState<number[]>(
+    preselectedServiceId !== undefined ? [preselectedServiceId] : []
+  )
   // Default on: most operators want the control plane covered. Operators
   // who only use Temps to orchestrate external DB backups can flip it off.
-  const [includeControlPlane, setIncludeControlPlane] = useState(true)
+  // A schedule opened for one service backs up just that service unless the
+  // operator ticks the control plane in too.
+  const [includeControlPlane, setIncludeControlPlane] = useState(
+    preselectedServiceId === undefined
+  )
 
   // The mutation's generated error type is `ProblemDetails`. Adding an
   // explicit `onError: (err: unknown) => ...` widens that and breaks the
@@ -94,7 +112,12 @@ export function CreateBackupSchedule() {
     meta: { errorTitle: 'Failed to create backup schedule' },
     onSuccess: () => {
       toast.success('Backup schedule created successfully')
-      navigate(`/backups/s3-sources/${id}`)
+      // Return to the service the operator came from.
+      navigate(
+        preselectedServiceId !== undefined
+          ? `/storage/${preselectedServiceId}`
+          : `/backups/s3-sources/${id}`
+      )
     },
   })
 
