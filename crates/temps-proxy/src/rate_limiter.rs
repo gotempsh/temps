@@ -32,7 +32,9 @@
 //! exempt another's clients. The cost lands only at saturation: clients that
 //! share a bucket share its budget, so they can be limited early (degrade
 //! toward stricter, never toward unlimited). Overflow admissions are counted
-//! in [`RateLimiter::overflow_admissions`].
+//! in [`RateLimiter::overflow_admissions`]. A client that gets its own entry
+//! once space frees up starts from its overflow bucket's live counts, so
+//! moving out of overflow never resets a budget mid-window.
 
 use dashmap::DashMap;
 use std::collections::hash_map::RandomState;
@@ -120,6 +122,17 @@ impl RateLimitScope {
 struct ClientWindows {
     minute: AtomicU64,
     hour: AtomicU64,
+}
+
+impl ClientWindows {
+    /// A new entry that starts from `bucket`'s counts. Cells from an expired
+    /// window behave as zero, so this only carries over live counts.
+    fn seeded_from(bucket: &ClientWindows) -> Self {
+        Self {
+            minute: AtomicU64::new(bucket.minute.load(Ordering::Relaxed)),
+            hour: AtomicU64::new(bucket.hour.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 fn pack(window: u32, count: u32) -> u64 {
@@ -246,14 +259,26 @@ impl RateLimiter {
             }
             None if self.clients.len() >= self.capacity => {
                 self.overflow_admissions.fetch_add(1, Ordering::Relaxed);
-                let bucket = self.overflow_hasher.hash_one(key) as usize % self.overflow.len();
-                Self::take(&self.overflow[bucket], policy, now_secs)
+                Self::take(self.overflow_bucket(key), policy, now_secs)
             }
             None => {
-                let windows = Arc::clone(self.clients.entry(key).or_default().value());
+                // A client may have been counted in its overflow bucket while
+                // the table was full. Start its entry from that bucket so
+                // getting tracked again never hands it a fresh budget.
+                let bucket = self.overflow_bucket(key);
+                let windows = Arc::clone(
+                    self.clients
+                        .entry(key)
+                        .or_insert_with(|| Arc::new(ClientWindows::seeded_from(bucket)))
+                        .value(),
+                );
                 Self::take(&windows, policy, now_secs)
             }
         }
+    }
+
+    fn overflow_bucket(&self, key: (i64, IpAddr)) -> &ClientWindows {
+        &self.overflow[self.overflow_hasher.hash_one(key) as usize % self.overflow.len()]
     }
 
     fn take(
@@ -590,6 +615,41 @@ mod tests {
             limiter.check(env_a, ip("198.51.100.7"), &p, T0 + 60),
             RateLimitDecision::Allow
         );
+    }
+
+    #[test]
+    fn leaving_overflow_keeps_the_hourly_budget_used() {
+        let limiter = RateLimiter::with_capacity(1);
+        let p = policy(0, 5);
+        let scope = RateLimitScope::Instance;
+        let client = ip("198.51.100.7");
+        // A minute-only entry fills the table; the client is counted in overflow.
+        limiter.check(scope, ip("192.0.2.1"), &policy(1, 0), T0);
+        for _ in 0..3 {
+            assert_eq!(
+                limiter.check(scope, client, &p, T0),
+                RateLimitDecision::Allow
+            );
+        }
+        assert_eq!(limiter.tracked_clients(), 1);
+
+        // Two minutes later the sweep frees the slot and the client gets its
+        // own entry, still inside the same hour: only 2 of 5 remain.
+        let later = T0 + 120;
+        for _ in 0..2 {
+            assert_eq!(
+                limiter.check(scope, client, &p, later),
+                RateLimitDecision::Allow
+            );
+        }
+        assert_eq!(limiter.tracked_clients(), 1, "the client is tracked now");
+        assert!(matches!(
+            limiter.check(scope, client, &p, later),
+            RateLimitDecision::Limited {
+                window: RateLimitWindow::Hour,
+                ..
+            }
+        ));
     }
 
     #[test]
