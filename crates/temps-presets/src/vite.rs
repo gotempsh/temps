@@ -544,6 +544,9 @@ struct Frame {
     config_body: bool,
     /// A block whose current statement is a `return`.
     returning: bool,
+    /// A config call in an alternative position (`c ? defineConfig({..}) :
+    /// defineConfig({..})`): the group its config argument belongs to.
+    alt_group: Option<usize>,
     /// For a config object: it has at least one member.
     has_members: bool,
     /// For a config object: one of its keys is a Vite top-level option.
@@ -568,6 +571,7 @@ impl Frame {
             function_body: false,
             config_body: false,
             returning: false,
+            alt_group: None,
             has_members: false,
             vite_key: false,
             opaque_members: false,
@@ -758,11 +762,15 @@ fn return_group(frames: &[Frame]) -> Option<usize> {
 }
 
 /// The group of a ternary arm `? {` / `: {`: the config call or parenthesis
-/// that holds the ternary (`defineConfig(() => c ? {..} : {..})`), or the
-/// config function when the ternary is what it returns. A ternary anywhere
-/// else (inside a helper function, at top level) is not a config alternative.
-fn ternary_group(frames: &[Frame]) -> Option<usize> {
-    let holder = frames.last()?;
+/// that holds the ternary (`defineConfig(() => c ? {..} : {..})`), the config
+/// function when the ternary is what it returns, or the top-level export when
+/// the ternary is exported directly (`export default c ? {..} : {..}`,
+/// `top_level_export`). A ternary anywhere else (inside a helper function, in
+/// another top-level statement) is not a config alternative.
+fn ternary_group(frames: &[Frame], top_level_export: bool) -> Option<usize> {
+    let Some(holder) = frames.last() else {
+        return top_level_export.then_some(0);
+    };
     let inside_helper = frames
         .iter()
         .any(|frame| frame.kind == FrameKind::Block && frame.function_body && !frame.config_body);
@@ -824,6 +832,9 @@ fn parse_vite_out_dir(source: &str) -> OutDir {
     let mut frames: Vec<Frame> = Vec::new();
     let mut results: Vec<(Slot, Option<usize>)> = Vec::new();
     let mut next_frame_id = 1;
+    // The current top-level statement is the config export
+    // (`export default ...` / `module.exports = ...`).
+    let mut top_level_export = false;
     let mut paren_open: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     let key_at = |index: usize| -> Option<String> {
         match tokens.get(index) {
@@ -837,6 +848,26 @@ fn parse_vite_out_dir(source: &str) -> OutDir {
     for (index, token) in tokens.iter().enumerate() {
         let prev = index.checked_sub(1).and_then(|i| tokens.get(i));
         let config_scope = frames.last().is_none_or(|frame| frame.config_scope);
+        if frames.is_empty() {
+            match token {
+                Token::Word(word) if word == "default" => {
+                    top_level_export = matches!(prev, Some(Token::Word(w)) if w == "export");
+                }
+                Token::Punct('=') if matches!(prev, Some(Token::Word(w)) if w == "exports") => {
+                    top_level_export = true;
+                }
+                Token::Punct(';') => top_level_export = false,
+                Token::Word(word)
+                    if matches!(
+                        word.as_str(),
+                        "const" | "let" | "var" | "function" | "import" | "class" | "export"
+                    ) =>
+                {
+                    top_level_export = false;
+                }
+                _ => {}
+            }
+        }
         // The token begins a member (key, spread or computed key) of the
         // config object or of its `build` object.
         let tracked_member = frames.last().is_some_and(Frame::tracked)
@@ -857,9 +888,17 @@ fn parse_vite_out_dir(source: &str) -> OutDir {
                         .last()
                         .is_some_and(|frame| frame.kind == FrameKind::Object);
                     let group = match prev {
+                        // The argument of a config call that is itself an
+                        // alternative takes that call's group.
+                        Some(Token::Punct('(')) => frames
+                            .last()
+                            .filter(|frame| frame.kind == FrameKind::Paren)
+                            .and_then(|frame| frame.alt_group),
                         Some(Token::Word(word)) if word == "return" => return_group(&frames),
-                        Some(Token::Punct('?')) => ternary_group(&frames),
-                        Some(Token::Punct(':')) if !parent_is_object => ternary_group(&frames),
+                        Some(Token::Punct('?')) => ternary_group(&frames, top_level_export),
+                        Some(Token::Punct(':')) if !parent_is_object => {
+                            ternary_group(&frames, top_level_export)
+                        }
                         _ => None,
                     };
                     Frame::object(
@@ -890,7 +929,24 @@ fn parse_vite_out_dir(source: &str) -> OutDir {
             }
             Token::Punct('(') => {
                 let frame = if paren_keeps_config_scope(&tokens, index) {
-                    Frame::new(FrameKind::Paren, config_scope)
+                    let mut paren = Frame::new(FrameKind::Paren, config_scope);
+                    // `? defineConfig(` / `: defineConfig(` / `return defineConfig(`
+                    let callee_is_word =
+                        index >= 2 && matches!(tokens.get(index - 1), Some(Token::Word(_)));
+                    if callee_is_word {
+                        let parent_is_object = frames
+                            .last()
+                            .is_some_and(|frame| frame.kind == FrameKind::Object);
+                        paren.alt_group = match tokens.get(index - 2) {
+                            Some(Token::Word(word)) if word == "return" => return_group(&frames),
+                            Some(Token::Punct('?')) => ternary_group(&frames, top_level_export),
+                            Some(Token::Punct(':')) if !parent_is_object => {
+                                ternary_group(&frames, top_level_export)
+                            }
+                            _ => None,
+                        };
+                    }
+                    paren
                 } else {
                     Frame::new(FrameKind::Opaque, false)
                 };
@@ -1555,6 +1611,13 @@ mod tests {
             "export default defineConfig(async ({ mode }) => { const env = loadEnv(mode, process.cwd()); return mode === 'x' ? {} : { build: { outDir: 'build' } } })",
             "export default function ({ mode }) { if (mode === 'x') { return { plugins: [] } } return { build: { outDir: 'build' } } }",
             "module.exports = (env) => { if (env.x) { return {} } return { build: { outDir: 'build' } } }",
+            // REGRESSION (Greptile on #1295): a ternary exported directly is
+            // the config, so its default arm takes part in the comparison.
+            "export default process.env.NODE_ENV === 'production' ? {} : { build: { outDir: 'build' } }",
+            "export default process.env.CI ? { build: { outDir: 'build' } } : { plugins: [] };",
+            "module.exports = process.env.CI ? {} : { build: { outDir: 'build' } }",
+            "export default (process.env.CI ? {} : { build: { outDir: 'build' } })",
+            "export default process.env.CI ? defineConfig({}) : defineConfig({ build: { outDir: 'build' } })",
         ] {
             assert!(
                 matches!(parse_vite_out_dir(config), OutDir::Unresolvable(_)),
@@ -1586,6 +1649,8 @@ mod tests {
             "export default defineConfig(() => { function base() { return { plugins: [] } } return { build: { outDir: 'build' } } })",
             "export default defineConfig(() => { const pick = (c) => c ? {} : { server: {} }; return { build: { outDir: 'build' } } })",
             "function defaults() { return {} }\nexport default defineConfig(({ mode }) => mode === 'x' ? { build: { outDir: 'build' } } : { build: { outDir: 'build' } })",
+            "const pick = process.env.CI ? {} : { server: {} };\nexport default { build: { outDir: 'build' } }",
+            "export default { build: { outDir: 'build' } }\nconst unused = process.env.CI ? {} : { plugins: [] }",
             "const pkg = { name: 'app' }; export default { build: { outDir: 'build' } }",
             "function helper() { return { name: 'p', apply: 'build' } }\nexport default { build: { outDir: 'build' } }",
             "const shared = { plugins: [] }; export default { ...shared, build: { outDir: 'build' } }",
