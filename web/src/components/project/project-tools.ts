@@ -140,7 +140,7 @@ export const projectToolGroups: ProjectToolGroup[] = [
     items: [
       { title: 'Feature Flags', url: 'flags', icon: Flag },
       {
-        title: 'AI Workflows',
+        title: 'Workflows',
         url: 'agents',
         icon: Workflow,
         featureKey: 'ai-agents-workflows',

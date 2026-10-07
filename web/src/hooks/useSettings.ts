@@ -17,12 +17,13 @@ export type {
   ScreenshotSettings as Screenshots,
 } from '@/api/client/types.gen'
 
-export function useSettings() {
+export function useSettings(options: { enabled?: boolean } = {}) {
   return useQuery({
     queryKey: ['platform-settings'],
     queryFn: getPlatformSettings,
     staleTime: 5 * 60 * 1000, // 5 minutes
     retry: 1,
+    enabled: options.enabled ?? true,
   })
 }
 
