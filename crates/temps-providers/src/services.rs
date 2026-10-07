@@ -325,6 +325,88 @@ fn select_control_plane_member_address(
     })
 }
 
+/// Which cluster member a `pg_stat_replication` row on the primary
+/// describes, by nodename.
+///
+/// pg_auto_failover names each standby's walreceiver
+/// `pgautofailover_standby_<nodeid>`, which identifies the member exactly.
+/// The standby's `client_addr` is only a fallback, and only when exactly one
+/// member registered that host: members sharing a worker report the same
+/// `nodehost`, and NAT can rewrite the source address entirely.
+///
+/// `members` holds `(nodeid, nodename, nodehost)` from the monitor.
+fn replication_row_member(
+    application_name: &str,
+    client_host: Option<&str>,
+    members: &[(i64, String, String)],
+) -> Option<String> {
+    let by_application_name = application_name
+        .strip_prefix("pgautofailover_standby_")
+        .and_then(|id| id.parse::<i64>().ok())
+        .and_then(|id| members.iter().find(|(node_id, _, _)| *node_id == id));
+    if let Some((_, name, _)) = by_application_name {
+        return Some(name.clone());
+    }
+
+    let host = client_host?;
+    let mut same_host = members.iter().filter(|(_, _, nodehost)| nodehost == host);
+    match (same_host.next(), same_host.next()) {
+        (Some((_, name, _)), None) => Some(name.clone()),
+        _ => None,
+    }
+}
+
+/// First host port of the cluster port range.
+const CLUSTER_PORT_RANGE_START: u16 = 6000;
+/// Host ports reserved per cluster: the monitor at the block's base, data
+/// members at `base + ordinal`.
+const CLUSTER_PORT_BLOCK_SIZE: u16 = 10;
+
+/// The historical block for `service_id`, `6000 + service_id * 10`, when the
+/// whole block fits in the TCP port range (service ids up to 5952). Kept so
+/// every existing cluster keeps exactly the ports it has.
+fn legacy_cluster_port_base(service_id: i32) -> Option<u16> {
+    let base = u32::try_from(service_id)
+        .ok()?
+        .checked_mul(u32::from(CLUSTER_PORT_BLOCK_SIZE))?
+        .checked_add(u32::from(CLUSTER_PORT_RANGE_START))?;
+    let last = base.checked_add(u32::from(CLUSTER_PORT_BLOCK_SIZE) - 1)?;
+    (last <= u32::from(u16::MAX))
+        .then_some(base)
+        .and_then(|b| u16::try_from(b).ok())
+}
+
+/// Choose the port block for a new cluster.
+///
+/// `6000 + service_id * 10` used to be computed in `u16`, which overflowed
+/// once ids reached 5954 (a panic in debug builds, and in release a wrapped
+/// port that could land on another cluster's block). The historical block is
+/// still used whenever it fits and is free; past that, the first 10-port
+/// block that no other cluster member holds. `used_ports` are the host ports
+/// of every *other* cluster's members.
+fn select_cluster_port_base(service_id: i32, used_ports: &BTreeSet<u16>) -> Option<u16> {
+    let block_is_free = |base: u16| {
+        let last = base.saturating_add(CLUSTER_PORT_BLOCK_SIZE - 1);
+        used_ports.range(base..=last).next().is_none()
+    };
+    if let Some(base) = legacy_cluster_port_base(service_id).filter(|b| block_is_free(*b)) {
+        return Some(base);
+    }
+    let last_base = u16::MAX - (CLUSTER_PORT_BLOCK_SIZE - 1);
+    (CLUSTER_PORT_RANGE_START..=last_base)
+        .step_by(usize::from(CLUSTER_PORT_BLOCK_SIZE))
+        .find(|base| block_is_free(*base))
+}
+
+/// Host port of the member with `ordinal` in the block starting at `base`,
+/// or `None` when the ordinal does not fit in the cluster's block.
+fn cluster_member_port(base: u16, ordinal: i32) -> Option<u16> {
+    u16::try_from(ordinal)
+        .ok()
+        .filter(|o| *o < CLUSTER_PORT_BLOCK_SIZE)
+        .and_then(|o| base.checked_add(o))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServiceExecutionRoute {
     Local,
@@ -553,6 +635,11 @@ pub enum ExternalServiceError {
         port: u16,
         address: String,
     },
+
+    /// A cluster's members cannot be given host ports: either its 10-port
+    /// block is full, or no free block is left in the cluster port range.
+    #[error("Cannot assign host ports for cluster service {service_id}: {reason}")]
+    ClusterPortsUnavailable { service_id: i32, reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1782,6 +1869,39 @@ impl ExternalServiceManager {
             );
         }
         Ok(address.ip)
+    }
+
+    /// Pick the host-port block for a new cluster's members, avoiding every
+    /// port another cluster's members already hold. See
+    /// [`select_cluster_port_base`].
+    async fn allocate_cluster_port_base(
+        &self,
+        service_id: i32,
+    ) -> Result<u16, ExternalServiceError> {
+        let used: BTreeSet<u16> = service_members::Entity::find()
+            .select_only()
+            .column(service_members::Column::Port)
+            .filter(service_members::Column::ServiceId.ne(service_id))
+            .filter(service_members::Column::Port.is_not_null())
+            .into_tuple::<Option<i32>>()
+            .all(self.db.as_ref())
+            .await?
+            .into_iter()
+            .flatten()
+            .filter_map(|port| u16::try_from(port).ok())
+            .collect();
+
+        select_cluster_port_base(service_id, &used).ok_or_else(|| {
+            ExternalServiceError::ClusterPortsUnavailable {
+                service_id,
+                reason: format!(
+                    "every {}-port block from {} to {} is held by another cluster's members",
+                    CLUSTER_PORT_BLOCK_SIZE,
+                    CLUSTER_PORT_RANGE_START,
+                    u16::MAX
+                ),
+            }
+        })
     }
 
     /// Whether a cluster member placement mixes the control plane
@@ -4529,7 +4649,8 @@ impl ExternalServiceManager {
                         health::int4, \
                         EXTRACT(EPOCH FROM (now() - reporttime))::int8 AS sec_since_report, \
                         candidatepriority::int4, \
-                        replicationquorum::bool \
+                        replicationquorum::bool, \
+                        nodeid::int8 \
                  FROM pgautofailover.node",
                 &[],
             ),
@@ -4568,6 +4689,8 @@ impl ExternalServiceManager {
         let mut by_name: std::collections::HashMap<String, ClusterMemberHealth> =
             std::collections::HashMap::new();
         let mut primary_member_name: Option<String> = None;
+        // (nodeid, nodename, nodehost) — keys for the pg_stat_replication join.
+        let mut replication_keys: Vec<(i64, String, String)> = Vec::new();
         for row in &nodes_rows {
             let nodename: String = row.get(0);
             let nodehost: String = row.get(1);
@@ -4578,6 +4701,8 @@ impl ExternalServiceManager {
             let seconds_since_report: i64 = row.get(6);
             let candidate_priority: i32 = row.get(7);
             let replication_quorum: bool = row.get(8);
+            let node_id: i64 = row.get(9);
+            replication_keys.push((node_id, nodename.clone(), nodehost.clone()));
 
             // Only treat a node as primary for the pg_stat_replication
             // join if pg_auto_failover *currently* believes it's primary
@@ -4616,11 +4741,11 @@ impl ExternalServiceManager {
         // has hba access against the monitor's `pg_auto_failover` DB, not
         // the data nodes' `postgres` DB.
         //
-        // The join key is `client_addr`, not `application_name`:
-        // pg_auto_failover sets application_name to
-        // `pgautofailover_standby_<nodeid>`, which doesn't match our
-        // friendly `node-1`/`node-2` names. `client_addr` matches
-        // `pgautofailover.node.nodehost`, which we already have.
+        // The join key is `application_name`: pg_auto_failover names each
+        // standby's walreceiver `pgautofailover_standby_<nodeid>`, and the
+        // monitor rows carry `nodeid`. `client_addr` is only a fallback — it
+        // is ambiguous when members share a host and rewritten by NAT (see
+        // `replication_row_member`).
         // SECURITY: the monitor decides which persisted member is primary, but
         // never where credentials are sent. Resolve the selected nodename back
         // to the member row and its provisioned node address/port. A forged
@@ -4676,30 +4801,25 @@ impl ExternalServiceManager {
                         primary_client.query(
                             "SELECT host(client_addr)::text AS client_host, \
                                     sync_state::text, \
-                                    EXTRACT(EPOCH FROM replay_lag)::float8 * 1000.0 AS replay_lag_ms \
-                             FROM pg_stat_replication \
-                             WHERE client_addr IS NOT NULL",
+                                    EXTRACT(EPOCH FROM replay_lag)::float8 * 1000.0 AS replay_lag_ms, \
+                                    application_name::text \
+                             FROM pg_stat_replication",
                             &[],
                         ),
                     )
                     .await
                     {
-                        // Build a host->member-name lookup from the monitor
-                        // rows we already have. pg_auto_failover's
-                        // `nodehost` matches `pg_stat_replication.client_addr`
-                        // for the standby connection.
-                        let mut name_by_host: std::collections::HashMap<String, String> =
-                            std::collections::HashMap::new();
-                        for member in by_name.values() {
-                            name_by_host
-                                .insert(member.nodehost.clone(), member.nodename.clone());
-                        }
                         for row in &rep_rows {
-                            let client_host: String = row.get(0);
+                            let client_host: Option<String> = row.get(0);
                             let sync_state: String = row.get(1);
                             let replay_ms: Option<f64> = row.try_get(2).ok();
-                            if let Some(member_name) = name_by_host.get(&client_host) {
-                                if let Some(member) = by_name.get_mut(member_name) {
+                            let application_name: String = row.get(3);
+                            if let Some(member_name) = replication_row_member(
+                                &application_name,
+                                client_host.as_deref(),
+                                &replication_keys,
+                            ) {
+                                if let Some(member) = by_name.get_mut(&member_name) {
                                     member.sync_state = Some(sync_state);
                                     member.replay_lag_ms = replay_ms.map(|v| v as i64);
                                 }
@@ -5720,6 +5840,50 @@ echo "[restore] Pre-seed complete"
         }
     }
 
+    /// Connect to an HA PostgreSQL cluster's current primary as its
+    /// application user.
+    ///
+    /// The primary is the one pg_auto_failover elected, resolved back to its
+    /// stored member endpoint (see [`Self::get_cluster_primary_address`]), and
+    /// is dialled through the private-only TLS ladder: TLS is required, and an
+    /// unverified certificate or cleartext is only ever accepted on a private
+    /// address. Used by the metrics scraper, whose stored `host`/`port` for a
+    /// cluster point at no member.
+    pub async fn connect_cluster_primary_client(
+        &self,
+        service_id: i32,
+    ) -> Result<tokio_postgres::Client, ExternalServiceError> {
+        let (host, port) = self.get_cluster_primary_address(service_id).await?.ok_or(
+            ExternalServiceError::ParameterValidationFailed {
+                service_id,
+                reason: format!("Service {service_id} is not a cluster; it has no primary member"),
+            },
+        )?;
+        let params = self.get_service_parameters(service_id).await?;
+        let param = |key: &str, default: &str| {
+            params
+                .get(key)
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+                .unwrap_or(default)
+                .to_string()
+        };
+        let user = param("username", "postgres");
+        let password = param("password", "");
+        let database = param("database", "postgres");
+
+        temps_query_postgres::connect_with_private_tls_ladder(
+            &host, port, &user, &password, &database,
+        )
+        .await
+        .map_err(|error| ExternalServiceError::InternalError {
+            reason: format!(
+                "Failed to connect to the primary of cluster {} at {}:{} (database '{}'): {}",
+                service_id, host, port, database, error
+            ),
+        })
+    }
+
     /// Build runtime environment variables for a cluster service.
     ///
     /// For cluster topology, the standard `ExternalService::get_runtime_env_vars()` returns
@@ -5944,7 +6108,11 @@ echo "[restore] Pre-seed complete"
                     .clone()
                     .unwrap_or_else(|| n.container_name.clone());
                 let port = n.port.unwrap_or(5432);
-                format!("{}:{}", host, port)
+                format!(
+                    "{}:{}",
+                    crate::externalsvc::postgres_cluster::uri_host(&host),
+                    port
+                )
             })
             .collect();
 
@@ -6891,16 +7059,29 @@ echo "[restore] Pre-seed complete"
 
         // Assign unique host ports for each cluster member to avoid conflicts
         // with other services (e.g., the platform's own TimescaleDB on 5432).
-        // Base port is derived from service_id to keep ports stable across restarts.
-        // Range: 6000 + (service_id * 10) + ordinal, giving 10 ports per cluster.
-        let base_port = 6000u16 + (service_id as u16 * 10);
+        // Each cluster owns a 10-port block: the monitor at its base, data
+        // nodes at base + ordinal. See `select_cluster_port_base`.
+        let base_port = self.allocate_cluster_port_base(service_id).await?;
+        if let Some(spec) = member_specs
+            .iter()
+            .find(|spec| cluster_member_port(base_port, spec.ordinal).is_none())
+        {
+            return Err(ExternalServiceError::ClusterPortsUnavailable {
+                service_id,
+                reason: format!(
+                    "member ordinal {} is outside the cluster's {}-port block starting at {}; a \
+                     cluster has at most {} members",
+                    spec.ordinal, CLUSTER_PORT_BLOCK_SIZE, base_port, CLUSTER_PORT_BLOCK_SIZE
+                ),
+            });
+        }
         // Monitor gets base_port, data nodes get base_port + 1, +2, etc.
         let monitor_port = base_port;
         info!(
             "Cluster '{}' port assignment: monitor={}, data nodes start at {}",
             pg_cluster_name,
             monitor_port,
-            base_port + 1
+            base_port.saturating_add(1)
         );
 
         // Track successfully created members for rollback on failure
@@ -6950,7 +7131,8 @@ echo "[restore] Pre-seed complete"
                 let member_port = if is_role_monitor(&spec.role) {
                     monitor_port
                 } else {
-                    base_port + spec.ordinal as u16
+                    // Validated against the block before any member was built.
+                    cluster_member_port(base_port, spec.ordinal).unwrap_or(monitor_port)
                 };
 
                 let (container_id, host_port, compute_ip) = if let Some(node_id) = spec.node_id {
@@ -8002,10 +8184,14 @@ echo "[restore] Pre-seed complete"
             };
         let monitor_port = monitor
             .port
+            .and_then(|port| u16::try_from(port).ok())
             .ok_or(ExternalServiceError::InitializationFailed {
                 id: service_id,
-                reason: "Monitor has no host port recorded".to_string(),
-            })? as u16;
+                reason: format!(
+                    "Monitor '{}' has no valid host port recorded ({:?})",
+                    monitor.container_name, monitor.port
+                ),
+            })?;
 
         // Reuse the lowest free ordinal (≥ 1 — 0 is reserved for the
         // monitor) so that delete-then-add gives the operator back the
@@ -8112,8 +8298,18 @@ echo "[restore] Pre-seed complete"
             });
         }
 
-        let base_port = 6000u16 + (service_id as u16 * 10);
-        let member_port = base_port + spec.ordinal as u16;
+        // The monitor sits at the base of the cluster's port block, so the
+        // block is read from it rather than recomputed from the service id.
+        let member_port = cluster_member_port(monitor_port, spec.ordinal).ok_or(
+            ExternalServiceError::ClusterPortsUnavailable {
+                service_id,
+                reason: format!(
+                    "member ordinal {} does not fit in the cluster's {}-port block starting at \
+                     {}; a cluster has at most {} members",
+                    spec.ordinal, CLUSTER_PORT_BLOCK_SIZE, monitor_port, CLUSTER_PORT_BLOCK_SIZE
+                ),
+            },
+        )?;
 
         let member_params = pg_cluster.build_member_params(
             &spec,
@@ -13101,6 +13297,24 @@ impl temps_core::SandboxRuntimeCredentialsProvider for ExternalServiceManager {
     }
 }
 
+/// Lets the metrics scraper reach HA clusters: `temps-metrics` cannot depend
+/// on this crate, so the capability is injected at startup.
+#[async_trait::async_trait]
+impl temps_metrics::ClusterPrimaryConnector for ExternalServiceManager {
+    async fn connect_cluster_primary(
+        &self,
+        service_id: i32,
+    ) -> Result<tokio_postgres::Client, temps_metrics::MetricsError> {
+        self.connect_cluster_primary_client(service_id)
+            .await
+            .map_err(|e| temps_metrics::MetricsError::CollectorConnectionFailed {
+                source_id: service_id,
+                engine: "postgres".to_string(),
+                reason: e.to_string(),
+            })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -18078,6 +18292,20 @@ mod tests {
         assert!(port_bindings_publish_on(Some(&bindings), 6090, address));
     }
 
+    /// Docker takes the bare IPv6 address for a binding; only URIs bracket it.
+    #[test]
+    fn cross_host_binding_keeps_an_ipv6_address_bare() {
+        let address: std::net::IpAddr = "fd00::10".parse().unwrap();
+        let (_, bindings) = cluster_member_port_config(6090, Some(address));
+        let hosts: Vec<Option<&str>> = bindings
+            .get("6090/tcp")
+            .and_then(Option::as_ref)
+            .map(|entries| entries.iter().map(|b| b.host_ip.as_deref()).collect())
+            .unwrap_or_default();
+        assert_eq!(hosts, vec![Some("127.0.0.1"), Some("fd00::10")]);
+        assert!(port_bindings_publish_on(Some(&bindings), 6090, address));
+    }
+
     #[test]
     fn port_bindings_publish_on_requires_matching_address_and_port() {
         let address: std::net::IpAddr = "10.52.0.10".parse().unwrap();
@@ -18313,6 +18541,117 @@ mod tests {
         assert!(
             matches!(err, ExternalServiceError::ControlPlaneAddressRequired { ref name, .. } if name == "ha-pg"),
             "{err:?}"
+        );
+    }
+
+    /// Existing clusters keep exactly the ports they have today.
+    #[test]
+    fn cluster_port_base_keeps_the_historical_block_while_it_fits() {
+        assert_eq!(legacy_cluster_port_base(0), Some(6000));
+        assert_eq!(legacy_cluster_port_base(3), Some(6030));
+        assert_eq!(legacy_cluster_port_base(9), Some(6090));
+        // 65520..=65529 is the last whole block.
+        assert_eq!(legacy_cluster_port_base(5952), Some(65520));
+        assert_eq!(legacy_cluster_port_base(5953), None);
+        assert_eq!(legacy_cluster_port_base(-1), None);
+
+        let none_used = BTreeSet::new();
+        assert_eq!(select_cluster_port_base(9, &none_used), Some(6090));
+    }
+
+    /// Regression: `6000u16 + (service_id as u16 * 10)` overflowed from
+    /// service id 5954 (a panic in debug builds, a wrapped port that could
+    /// collide with another cluster in release).
+    #[test]
+    fn cluster_port_base_past_the_formula_takes_the_first_free_block() {
+        let used: BTreeSet<u16> = [6000, 6001, 6002, 6015].into_iter().collect();
+        for service_id in [5953, 5954, 6000, 70_000, i32::MAX] {
+            // 6000..=6009 and 6010..=6019 hold members; 6020 is the first
+            // whole free block.
+            assert_eq!(
+                select_cluster_port_base(service_id, &used),
+                Some(6020),
+                "service {service_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn cluster_port_base_avoids_a_historical_block_taken_by_another_cluster() {
+        // Service 3's historical block is held by a cluster that was placed
+        // there because its own id had no block.
+        let used: BTreeSet<u16> = [6030, 6031].into_iter().collect();
+        assert_eq!(select_cluster_port_base(3, &used), Some(6000));
+    }
+
+    #[test]
+    fn cluster_port_base_is_none_when_every_block_is_held() {
+        let used: BTreeSet<u16> = (CLUSTER_PORT_RANGE_START..=u16::MAX)
+            .step_by(usize::from(CLUSTER_PORT_BLOCK_SIZE))
+            .collect();
+        assert_eq!(select_cluster_port_base(7000, &used), None);
+        assert_eq!(select_cluster_port_base(1, &used), None);
+    }
+
+    #[test]
+    fn cluster_member_port_stays_inside_the_block() {
+        assert_eq!(cluster_member_port(6030, 0), Some(6030));
+        assert_eq!(cluster_member_port(6030, 9), Some(6039));
+        assert_eq!(
+            cluster_member_port(6030, 10),
+            None,
+            "would spill into the next cluster"
+        );
+        assert_eq!(cluster_member_port(6030, -1), None);
+        assert_eq!(cluster_member_port(65520, 9), Some(65529));
+    }
+
+    fn replication_keys() -> Vec<(i64, String, String)> {
+        // Two data members on the same worker share a nodehost.
+        vec![
+            (1, "postgres-ha-pg-1".to_string(), "10.52.0.21".to_string()),
+            (2, "postgres-ha-pg-2".to_string(), "10.52.0.21".to_string()),
+            (3, "postgres-ha-pg-3".to_string(), "10.52.0.22".to_string()),
+        ]
+    }
+
+    /// Regression: replication state was joined by `client_addr`, so members
+    /// sharing a worker (or behind NAT) never showed sync state or lag.
+    #[test]
+    fn replication_row_matches_standby_by_application_name() {
+        let keys = replication_keys();
+        // The standby's source address is the worker's Docker gateway, which
+        // matches no member at all.
+        assert_eq!(
+            replication_row_member("pgautofailover_standby_2", Some("10.99.0.1"), &keys),
+            Some("postgres-ha-pg-2".to_string())
+        );
+        // Co-located members are told apart by node id, not by host.
+        assert_eq!(
+            replication_row_member("pgautofailover_standby_1", Some("10.52.0.21"), &keys),
+            Some("postgres-ha-pg-1".to_string())
+        );
+    }
+
+    #[test]
+    fn replication_row_falls_back_to_a_unique_client_address_only() {
+        let keys = replication_keys();
+        assert_eq!(
+            replication_row_member("walreceiver", Some("10.52.0.22"), &keys),
+            Some("postgres-ha-pg-3".to_string())
+        );
+        // Ambiguous: two members registered this host.
+        assert_eq!(
+            replication_row_member("walreceiver", Some("10.52.0.21"), &keys),
+            None
+        );
+        assert_eq!(
+            replication_row_member("pgautofailover_standby_9", None, &keys),
+            None
+        );
+        assert_eq!(
+            replication_row_member("pgautofailover_standby_x", None, &keys),
+            None
         );
     }
 
@@ -18993,11 +19332,17 @@ mod cross_host_cluster_docker_tests {
                     None::<bollard::query_parameters::InspectNetworkOptions>,
                 )
                 .await
-                .ok()?
-                .ipam
+                .ok()
+                .and_then(|info| info.ipam)
                 .and_then(|ipam| ipam.config)
                 .and_then(|configs| configs.into_iter().find_map(|c| c.gateway))
-                .and_then(|gateway| gateway.parse().ok())?;
+                .and_then(|gateway| gateway.parse().ok());
+            let Some(address) = address else {
+                // The guard does not exist yet; remove the bridge here.
+                eprintln!("Test bridge {network} has no IPv4 gateway, skipping");
+                let _ = docker.remove_network(&network).await;
+                return None;
+            };
 
             let db = Arc::new(
                 sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
@@ -19052,8 +19397,11 @@ mod cross_host_cluster_docker_tests {
                 .unwrap_or_else(|e| panic!("start worker member {name}: {e}"));
         }
 
+        /// Run `script` in `container`; `(-1, reason)` when the container
+        /// cannot run it (e.g. it is restarting), never a panic, so callers
+        /// can poll and still clean up.
         async fn sh(&self, container: &str, script: &str) -> (i64, String) {
-            let exec = self
+            let exec = match self
                 .docker
                 .create_exec(
                     container,
@@ -19069,7 +19417,10 @@ mod cross_host_cluster_docker_tests {
                     },
                 )
                 .await
-                .unwrap_or_else(|e| panic!("create exec in {container}: {e}"));
+            {
+                Ok(exec) => exec,
+                Err(e) => return (-1, format!("create exec in {container}: {e}")),
+            };
             let mut out = String::new();
             if let Ok(StartExecResults::Attached { mut output, .. }) =
                 self.docker.start_exec(&exec.id, None).await
@@ -19118,31 +19469,54 @@ mod cross_host_cluster_docker_tests {
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
         }
+    }
 
-        async fn cleanup(&self) {
-            for name in &self.containers {
-                let _ = self
-                    .docker
-                    .remove_container(
-                        name,
-                        Some(RemoveContainerOptions {
-                            force: true,
-                            v: true,
-                            ..Default::default()
-                        }),
-                    )
-                    .await;
-            }
-            for volume in &self.volumes {
-                let _ = self
-                    .docker
-                    .remove_volume(
-                        volume,
-                        None::<bollard::query_parameters::RemoveVolumeOptions>,
-                    )
-                    .await;
-            }
-            let _ = self.docker.remove_network(&self.network).await;
+    /// Removes everything the test created on every exit path — including a
+    /// panicking assertion, a timed-out wait or a failed create/start — so a
+    /// failing test never leaves containers, volumes or its bridge behind.
+    /// Cleanup is async, so it runs on a dedicated thread with its own
+    /// runtime: `drop` may be called from inside the test's runtime.
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            let containers = std::mem::take(&mut self.containers);
+            let volumes = std::mem::take(&mut self.volumes);
+            let network = std::mem::take(&mut self.network);
+            let docker = self.docker.clone();
+            let cleanup = std::thread::spawn(move || {
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    eprintln!("could not build a runtime to clean up {containers:?}");
+                    return;
+                };
+                runtime.block_on(async move {
+                    for name in &containers {
+                        let _ = docker
+                            .remove_container(
+                                name,
+                                Some(RemoveContainerOptions {
+                                    force: true,
+                                    v: true,
+                                    ..Default::default()
+                                }),
+                            )
+                            .await;
+                    }
+                    for volume in &volumes {
+                        let _ = docker
+                            .remove_volume(
+                                volume,
+                                None::<bollard::query_parameters::RemoveVolumeOptions>,
+                            )
+                            .await;
+                    }
+                    if !network.is_empty() {
+                        let _ = docker.remove_network(&network).await;
+                    }
+                });
+            });
+            let _ = cleanup.join();
         }
     }
 
@@ -19218,7 +19592,6 @@ mod cross_host_cluster_docker_tests {
             .create_local_cluster_member(&monitor, &monitor_params, Some(address))
             .await;
         if let Err(e) = created {
-            h.cleanup().await;
             panic!("creating the control-plane monitor failed: {e}");
         }
         h.wait_until_monitor_accepts(&monitor, base_port).await;
@@ -19251,7 +19624,6 @@ mod cross_host_cluster_docker_tests {
             }
             tokio::time::sleep(Duration::from_secs(3)).await;
         };
-        h.cleanup().await;
         match registered {
             Ok(nodes) => eprintln!("monitor sees: {nodes}"),
             Err(nodes) => panic!(
@@ -19259,6 +19631,107 @@ mod cross_host_cluster_docker_tests {
                  {address}:{base_port}; monitor reports: {nodes:?}"
             ),
         }
+    }
+
+    /// Regression: after an unclean stop (host reboot, Docker daemon restart)
+    /// the member's stale pidfile survived in `/tmp`, the restarted PID 1 saw
+    /// "already running with PID 1" and the member crash-looped forever.
+    #[tokio::test]
+    async fn monitor_comes_back_after_an_unclean_restart() {
+        let Some(mut h) = Harness::new().await else {
+            return;
+        };
+        let address = h.address;
+        let base_port = test_base_port();
+        let (cluster, config, auth, monitor_spec, _) = cluster_parts(address);
+        let monitor_params = cluster.build_member_params(
+            &monitor_spec,
+            &config,
+            &address.to_string(),
+            base_port,
+            base_port,
+            Default::default(),
+            &auth,
+        );
+        let monitor = monitor_params.container_name.clone();
+        h.containers.push(monitor.clone());
+        h.volumes.push(format!("{monitor}_data"));
+        if let Err(e) = h
+            .manager
+            .create_local_cluster_member(&monitor, &monitor_params, None)
+            .await
+        {
+            panic!("creating the control-plane monitor failed: {e}");
+        }
+        h.wait_until_monitor_accepts(&monitor, base_port).await;
+        // Postgres already accepts connections while `pg_autoctl create
+        // monitor` runs as a child; its pidfile then names a PID that is gone
+        // after a restart, which pg_autoctl rightly treats as stale. The
+        // failure needs the steady state: `pg_autoctl run` as PID 1, whose
+        // pidfile says `1` — the restarted process's own PID.
+        let start = Instant::now();
+        loop {
+            let (code, _) = h
+                .sh(
+                    &monitor,
+                    "tr '\\0' ' ' < /proc/1/cmdline | grep -q 'pg_autoctl run' && \
+                     grep -qx 1 /tmp/pg_autoctl/var/lib/postgresql/monitor/pg_autoctl.pid",
+                )
+                .await;
+            if code == 0 {
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(120) {
+                panic!("{monitor} never reached `pg_autoctl run` as PID 1");
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+
+        // SIGKILL leaves pg_autoctl's pidfile behind, exactly as a crash does.
+        let killed = h
+            .docker
+            .kill_container(
+                &monitor,
+                None::<bollard::query_parameters::KillContainerOptions>,
+            )
+            .await;
+        let started = h
+            .docker
+            .start_container(&monitor, None::<StartContainerOptions>)
+            .await;
+        if killed.is_err() || started.is_err() {
+            panic!("could not kill/start {monitor}: {killed:?} {started:?}");
+        }
+
+        let start = Instant::now();
+        let recovered = loop {
+            let running = h
+                .docker
+                .inspect_container(&monitor, None)
+                .await
+                .ok()
+                .and_then(|i| i.state)
+                .and_then(|s| s.running)
+                .unwrap_or(false);
+            let ready =
+                h.sh(
+                    &monitor,
+                    &format!("gosu postgres pg_isready -q -p {base_port}"),
+                )
+                .await
+                .0 == 0;
+            if running && ready {
+                break true;
+            }
+            if start.elapsed() > Duration::from_secs(90) {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        };
+        assert!(
+            recovered,
+            "the monitor must accept connections again after an unclean restart"
+        );
     }
 
     /// The pre-fix publishing (loopback only) is what made the reported
@@ -19289,7 +19762,6 @@ mod cross_host_cluster_docker_tests {
             .create_local_cluster_member(&monitor, &monitor_params, None)
             .await
         {
-            h.cleanup().await;
             panic!("creating the control-plane monitor failed: {e}");
         }
         h.wait_until_monitor_accepts(&monitor, base_port).await;
@@ -19305,7 +19777,6 @@ mod cross_host_cluster_docker_tests {
             |host: String| format!("timeout 5 bash -c 'exec 3<>/dev/tcp/{host}/{base_port}'");
         let (via_loopback, _) = h.sh(&probe, &connect("127.0.0.1".to_string())).await;
         let (via_address, _) = h.sh(&probe, &connect(address.to_string())).await;
-        h.cleanup().await;
 
         assert_eq!(via_loopback, 0, "the monitor itself must be up on loopback");
         assert_ne!(

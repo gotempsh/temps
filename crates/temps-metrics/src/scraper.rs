@@ -50,7 +50,27 @@ use crate::collector::postgres::PostgresCollector;
 use crate::collector::redis::RedisCollector;
 use crate::collector::s3::S3Collector;
 use crate::collector::{Collector, CollectorConfig};
+use crate::error::MetricsError;
 use crate::store::{MetricKind, MetricPoint, MetricsStore, SourceKind};
+
+/// Opens a connection to the current primary of an HA (cluster-topology)
+/// PostgreSQL service.
+///
+/// A cluster has no single host/port in its stored config: the primary is
+/// whichever data member pg_auto_failover elected, possibly on another node,
+/// and it changes on failover. Resolving it needs the cluster's monitor and
+/// member records, which live in the providers layer, so the scraper takes
+/// this as an injected capability rather than depending on that crate.
+#[async_trait::async_trait]
+pub trait ClusterPrimaryConnector: Send + Sync {
+    /// Connect to `service_id`'s current primary. The returned client's
+    /// connection driver must already be running and stop when the client is
+    /// dropped.
+    async fn connect_cluster_primary(
+        &self,
+        service_id: i32,
+    ) -> Result<tokio_postgres::Client, MetricsError>;
+}
 
 /// Minimum scrape interval enforced at runtime regardless of configuration.
 const MIN_INTERVAL_SECS: u64 = 10;
@@ -88,6 +108,10 @@ pub struct MetricsScraper {
     /// Services currently being scraped. Uses std::sync::Mutex (not tokio) so
     /// a Drop guard can release the slot even if the scrape task panics.
     in_flight: Arc<StdMutex<HashSet<i32>>>,
+    /// Reaches the primary of HA PostgreSQL clusters. Without it, cluster
+    /// services are skipped (with a warning) rather than scraped at an
+    /// address no member listens on.
+    cluster_primary: Option<Arc<dyn ClusterPrimaryConnector>>,
 }
 
 impl MetricsScraper {
@@ -114,7 +138,18 @@ impl MetricsScraper {
             encryption_service,
             last_scalar_values: Arc::new(RwLock::new(HashMap::new())),
             in_flight: Arc::new(StdMutex::new(HashSet::new())),
+            cluster_primary: None,
         }
+    }
+
+    /// Scrape HA PostgreSQL clusters through `connector`, which resolves and
+    /// dials each cluster's current primary.
+    pub fn with_cluster_primary_connector(
+        mut self,
+        connector: Arc<dyn ClusterPrimaryConnector>,
+    ) -> Self {
+        self.cluster_primary = Some(connector);
+        self
     }
 
     /// Run the scrape loop forever.  Spawn this on a background task.
@@ -194,6 +229,7 @@ impl MetricsScraper {
             }
 
             let encryption = Arc::clone(&self.encryption_service);
+            let cluster_primary = self.cluster_primary.clone();
             let last_values = Arc::clone(&self.last_scalar_values);
             let in_flight = Arc::clone(&self.in_flight);
             let permit = Arc::clone(&sem)
@@ -227,6 +263,19 @@ impl MetricsScraper {
                 };
 
                 let result = async {
+                    if service.topology == "cluster" {
+                        let raw_points = scrape_cluster(
+                            &service,
+                            cluster_primary.as_deref(),
+                            Duration::from_secs(COLLECTOR_TIMEOUT_SECS),
+                        )
+                        .await;
+                        if raw_points.is_empty() {
+                            return Err(());
+                        }
+                        return Ok(apply_delta(&last_values, service_id, raw_points).await);
+                    }
+
                     // Build a connection string from the encrypted service config.
                     let connection_string = build_connection_string(&service, &encryption)
                         .map_err(|e| {
@@ -301,6 +350,59 @@ impl MetricsScraper {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Scrape an HA (cluster-topology) service at its current primary.
+///
+/// The stored `host`/`port` of a cluster describe no listening member, so the
+/// standalone connection-string path can never reach one. Only PostgreSQL
+/// clusters exist today; any other cluster engine is skipped.
+async fn scrape_cluster(
+    service: &external_services::Model,
+    connector: Option<&dyn ClusterPrimaryConnector>,
+    timeout: Duration,
+) -> Vec<MetricPoint> {
+    let service_id = service.id;
+    if !service.service_type.eq_ignore_ascii_case("postgres") {
+        debug!(
+            service_id,
+            service_type = service.service_type,
+            "MetricsScraper: no cluster collector for service type, skipping"
+        );
+        return vec![];
+    }
+    let Some(connector) = connector else {
+        warn!(
+            service_id,
+            "MetricsScraper: cannot scrape HA cluster: no cluster primary connector is registered"
+        );
+        return vec![];
+    };
+
+    let client = match tokio::time::timeout(timeout, connector.connect_cluster_primary(service_id))
+        .await
+    {
+        Ok(Ok(client)) => client,
+        Ok(Err(e)) => {
+            warn!(service_id, error = %e, "MetricsScraper: cluster primary unavailable; skipping scrape");
+            return vec![];
+        }
+        Err(_elapsed) => {
+            warn!(
+                service_id,
+                timeout_secs = timeout.as_secs(),
+                "MetricsScraper: connecting to the cluster primary timed out; skipping scrape"
+            );
+            return vec![];
+        }
+    };
+
+    let config = CollectorConfig::new(service_id, SourceKind::Database, String::new())
+        .with_timeout(timeout)
+        .with_node_id_opt(service.node_id);
+    PostgresCollector::new()
+        .collect_from_client(&client, &config)
+        .await
+}
 
 /// Collect metrics from a concrete [`Collector`] implementation with a
 /// per-task timeout.  On timeout or error: log warning, return empty vec.
@@ -626,6 +728,144 @@ impl CollectorConfigExt for CollectorConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── scrape_cluster ─────────────────────────────────────────────────────
+
+    fn cluster_service(id: i32, service_type: &str) -> external_services::Model {
+        external_services::Model {
+            id,
+            name: "ha-pg".to_string(),
+            service_type: service_type.to_string(),
+            version: Some("18".to_string()),
+            status: "running".to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            slug: Some("ha-pg".to_string()),
+            config: None,
+            node_id: None,
+            topology: "cluster".to_string(),
+            error_message: None,
+            health_status: None,
+            last_health_check_at: None,
+            last_health_error: None,
+            consecutive_health_failures: 0,
+            health_metadata: None,
+            metrics_enabled: true,
+            default_backup_provisioned: false,
+            ai_data_access: false,
+            container_name: None,
+            created_by_user_id: None,
+            continuous_archive_s3_source_id: None,
+            continuous_archive_pinned_at: None,
+        }
+    }
+
+    /// Records which services it was asked to reach, and fails or hangs.
+    struct FakeConnector {
+        calls: StdMutex<Vec<i32>>,
+        hang: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ClusterPrimaryConnector for FakeConnector {
+        async fn connect_cluster_primary(
+            &self,
+            service_id: i32,
+        ) -> Result<tokio_postgres::Client, MetricsError> {
+            if let Ok(mut calls) = self.calls.lock() {
+                calls.push(service_id);
+            }
+            if self.hang {
+                std::future::pending::<()>().await;
+            }
+            Err(MetricsError::CollectorConnectionFailed {
+                source_id: service_id,
+                engine: "postgres".to_string(),
+                reason: "no healthy primary".to_string(),
+            })
+        }
+    }
+
+    fn connector(hang: bool) -> FakeConnector {
+        FakeConnector {
+            calls: StdMutex::new(Vec::new()),
+            hang,
+        }
+    }
+
+    fn calls(connector: &FakeConnector) -> Vec<i32> {
+        connector
+            .calls
+            .lock()
+            .map(|c| c.clone())
+            .unwrap_or_default()
+    }
+
+    /// Regression: HA cluster metrics were always empty because the scraper
+    /// dialled the cluster's stored host/port, where no member listens. A
+    /// cluster must be reached through the primary connector instead.
+    #[tokio::test]
+    async fn postgres_cluster_is_scraped_through_its_primary_connector() {
+        let fake = connector(false);
+        let points = scrape_cluster(
+            &cluster_service(41, "postgres"),
+            Some(&fake),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(
+            calls(&fake),
+            vec![41],
+            "the connector must be asked for service 41"
+        );
+        assert!(
+            points.is_empty(),
+            "an unavailable primary yields an empty batch, not an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_primary_connect_is_bounded_by_the_timeout() {
+        let fake = connector(true);
+        let started = std::time::Instant::now();
+        let points = scrape_cluster(
+            &cluster_service(42, "postgres"),
+            Some(&fake),
+            Duration::from_millis(50),
+        )
+        .await;
+
+        assert!(points.is_empty());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a hung connector must not stall the scrape cycle"
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_without_connector_or_postgres_engine_is_skipped() {
+        let points = scrape_cluster(
+            &cluster_service(43, "postgres"),
+            None,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(points.is_empty());
+
+        let fake = connector(false);
+        let points = scrape_cluster(
+            &cluster_service(44, "redis"),
+            Some(&fake),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(points.is_empty());
+        assert!(
+            calls(&fake).is_empty(),
+            "only PostgreSQL clusters are dialled"
+        );
+    }
 
     // ── urlencoded ─────────────────────────────────────────────────────────
 

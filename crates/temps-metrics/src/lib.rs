@@ -16,7 +16,7 @@ pub use collector::s3::S3Collector;
 pub use collector::{Collector, CollectorConfig};
 pub use error::MetricsError;
 pub use node_sampler::NodeMetricsSampler;
-pub use scraper::MetricsScraper;
+pub use scraper::{ClusterPrimaryConnector, MetricsScraper};
 pub use store::clickhouse::{ChMetricRow, ClickHouseMetricsConfig, ClickhouseMetricsStore};
 pub use store::clickhouse_migrations;
 pub use store::timescale::{validate_metric_name, TimescaleMetricsStore};

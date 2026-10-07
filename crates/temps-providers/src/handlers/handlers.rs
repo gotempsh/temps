@@ -98,20 +98,54 @@ pub(crate) fn external_service_problem(
 }
 
 /// A cluster placement the current configuration cannot serve: members on
-/// worker nodes could not reach members on the control plane. A 409 with the
-/// remedy in `detail`, never a 500 — nothing failed, the operator has a
-/// configuration step to take first.
+/// worker nodes could not reach members on the control plane, or the
+/// cluster's members cannot be given host ports. A 409 with the remedy in
+/// `detail`, never a 500 — nothing failed, the operator has a configuration
+/// step to take first.
 fn cluster_placement_problem(error: &crate::services::ExternalServiceError) -> Option<Problem> {
     use crate::services::ExternalServiceError as E;
-    match error {
-        E::ControlPlaneAddressRequired { .. } | E::ControlPlaneMemberUnreachable { .. } => Some(
-            conflict()
-                .title("Cluster Placement Not Reachable")
-                .detail(error.to_string())
-                .build(),
-        ),
-        _ => None,
-    }
+    // Every variant is listed, no catch-all: a new variant must be classified
+    // here before it compiles, instead of silently falling through to a
+    // handler's generic 500.
+    let title = match error {
+        E::ControlPlaneAddressRequired { .. } | E::ControlPlaneMemberUnreachable { .. } => {
+            "Cluster Placement Not Reachable"
+        }
+        E::ClusterPortsUnavailable { .. } => "Cluster Ports Unavailable",
+        // Not placement conditions: each handler classifies these itself
+        // (and `worker_node_required` owns the two "no daemon" variants).
+        E::ServiceNotFound { .. }
+        | E::ServiceNotFoundByName { .. }
+        | E::ServiceNotFoundBySlug { .. }
+        | E::InitializationFailed { .. }
+        | E::UpgradeRejected { .. }
+        | E::EncryptionFailed { .. }
+        | E::DecryptionFailed { .. }
+        | E::InvalidServiceType { .. }
+        | E::ServiceNotLinkedToProject { .. }
+        | E::ServiceClaimDenied { .. }
+        | E::InvalidDatabaseProvisioning { .. }
+        | E::ProjectNotFound { .. }
+        | E::EnvironmentNotFound { .. }
+        | E::DatabaseError { .. }
+        | E::ArchiveSourceDesynced { .. }
+        | E::ParameterValidationFailed { .. }
+        | E::StartFailed { .. }
+        | E::UpgradeInProgress { .. }
+        | E::StopFailed { .. }
+        | E::DeletionFailed { .. }
+        | E::ServiceHasLinkedProjects { .. }
+        | E::EnvironmentVariableNotFound { .. }
+        | E::ParameterNotFound { .. }
+        | E::ParameterNotSensitive { .. }
+        | E::EncryptedVariableAccessDenied { .. }
+        | E::DockerError { .. }
+        | E::DuplicateServiceType { .. }
+        | E::InternalError { .. }
+        | E::DockerUnavailable(_)
+        | E::LocalWorkloadsDisabled { .. } => return None,
+    };
+    Some(conflict().title(title).detail(error.to_string()).build())
 }
 
 /// Get available service types
@@ -833,7 +867,8 @@ fn service_create_failure_code(
         | E::InvalidServiceType { .. }
         | E::InvalidDatabaseProvisioning { .. }
         | E::ControlPlaneAddressRequired { .. }
-        | E::ControlPlaneMemberUnreachable { .. } => OperationFailureCode::InvalidConfiguration,
+        | E::ControlPlaneMemberUnreachable { .. }
+        | E::ClusterPortsUnavailable { .. } => OperationFailureCode::InvalidConfiguration,
         E::DuplicateServiceType { .. } => OperationFailureCode::Conflict,
         E::ProjectNotFound { .. } | E::EnvironmentNotFound { .. } => OperationFailureCode::NotFound,
         E::DatabaseError { .. } => OperationFailureCode::Database,
@@ -4085,9 +4120,15 @@ mod tests {
             address: "10.52.0.10".to_string(),
         };
 
+        let no_ports = E::ClusterPortsUnavailable {
+            service_id: 6001,
+            reason: "member ordinal 10 is outside the cluster's 10-port block".to_string(),
+        };
+
         for (error, remedy) in [
             (&no_address, "--private-address"),
             (&loopback_only, "recreate it"),
+            (&no_ports, "10-port block"),
         ] {
             let problem = external_service_problem(error, "Failed to do a thing".to_string());
             assert_eq!(problem.status_code, StatusCode::CONFLICT, "{error}");
@@ -4096,7 +4137,10 @@ mod tests {
                 .get("detail")
                 .and_then(|v| v.as_str())
                 .expect("detail is always set");
-            assert!(detail.contains("ha-pg"), "{detail}");
+            assert!(
+                detail.contains("ha-pg") || detail.contains("6001"),
+                "the error must name the cluster: {detail}"
+            );
             assert!(detail.contains(remedy), "{detail}");
             assert_eq!(
                 service_create_failure_code(error),
