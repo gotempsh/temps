@@ -26,6 +26,7 @@ import {
   listRepositoriesByConnectionOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { useDebounce } from '@/hooks/useDebounce'
+import { gitInstallationPollingOptions } from '@/lib/git-installation-polling'
 import GithubIcon from '@/icons/Github'
 import GitlabIcon from '@/icons/Gitlab'
 
@@ -39,12 +40,11 @@ function providerTab(type: string | undefined) {
 /** Real connected accounts and server-side repository search, shared by all builds. */
 export function ConnectedRepository() {
   const [params, setParams] = useSearchParams()
+  const providers = useQuery(listGitProvidersOptions())
   const connections = useQuery({
     ...listConnectionsOptions({ query: { per_page: 100 } }),
-    refetchInterval: (query) =>
-      query.state.data?.connections.some((c) => c.syncing) ? 2000 : false,
+    ...gitInstallationPollingOptions(providers.data),
   })
-  const providers = useQuery(listGitProvidersOptions())
   const available = connections.data?.connections ?? []
   const providerFor = (id: number) =>
     providerTab(providers.data?.find((p) => p.id === id)?.provider_type)

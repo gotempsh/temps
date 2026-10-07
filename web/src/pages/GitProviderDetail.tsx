@@ -74,6 +74,7 @@ import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 import { isGitHubApp, isGitLabOAuth } from '@/lib/provider'
+import { gitInstallationPollingOptions } from '@/lib/git-installation-polling'
 import {
   authMethodDisplayName,
   providerDisplayName,
@@ -116,15 +117,7 @@ export default function GitProviderDetail() {
     retry: false,
     enabled: !!provider,
     select: (data) => data || [],
-    // Poll every 2s while any connection under this provider is syncing so
-    // the running repo count + "Syncing" badge advance live. Polling stops
-    // automatically once no connection reports `syncing=true`, keeping idle
-    // tabs quiet.
-    refetchInterval: (query) => {
-      const anySyncing = query.state.data?.some((c) => c.syncing)
-      return anySyncing ? 2000 : false
-    },
-    refetchIntervalInBackground: false,
+    ...gitInstallationPollingOptions(provider ? [provider] : undefined),
   })
 
   // Connection state shows up in two places: this provider-scoped list and the
