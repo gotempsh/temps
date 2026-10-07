@@ -14,6 +14,7 @@ import {
   markRunWatching,
   observeRun,
   parseRunParam,
+  phaseLabel,
   phaseStates,
   pickActiveRun,
   restoreGate,
@@ -458,5 +459,29 @@ describe('completion feedback happens once per run', () => {
     expect(
       completionToast('failed', run({ error_message: 'disk full' }), 'db')
     ).toMatchObject({ level: 'error', description: 'disk full' })
+  })
+})
+
+describe('download phase', () => {
+  // REGRESSION (Greptile on #1295): the server moves staged restores into
+  // `download`; without it in PHASES every step showed as pending.
+  test('a running download marks preparation done and download active', () => {
+    const states = phaseStates({ phase: 'download', status: 'running' }, true)
+    expect(states.find((s) => s.id === 'prepare')?.state).toBe('done')
+    expect(states.find((s) => s.id === 'download')?.state).toBe('active')
+    expect(states.find((s) => s.id === 'restore')?.state).toBe('pending')
+  })
+
+  test('a download cancelled mid-way shows where it stopped', () => {
+    const states = phaseStates(
+      { phase: 'download', status: 'cancelled' },
+      false
+    )
+    expect(states.find((s) => s.id === 'prepare')?.state).toBe('done')
+    expect(states.find((s) => s.id === 'download')?.state).toBe('stopped')
+  })
+
+  test('download has a readable label', () => {
+    expect(phaseLabel('download')).toBe('Download backup')
   })
 })
