@@ -44,7 +44,12 @@ import { useGoBack } from '@/hooks/useGoBack'
 import { toast } from 'sonner'
 import { z } from 'zod'
 import { NotificationCoverageNotice } from '@/components/monitoring/NotificationCoverageNotice'
-import { clearFormDraft, readFormDraft, saveFormDraft } from '@/lib/form-draft'
+import {
+  clearFormDraft,
+  mergeFormDraft,
+  readFormDraft,
+  saveFormDraft,
+} from '@/lib/form-draft'
 import { errorRulePrioritySeverity } from '@/lib/notification-severity'
 import { isReturnFromSetup } from '@/lib/safe-return-to'
 
@@ -147,15 +152,14 @@ export function AlertRuleForm({ projectId, projectName }: AlertRuleFormProps) {
   const goBack = () =>
     returnedFromSetup ? navigate(listPath, { replace: true }) : historyBack()
   const isEditing = !!ruleId
-  // A new rule's unsaved fields survive a detour to add a notification
-  // provider (which returns here via `returnTo`).
-  const draftKey = `error-alert-rule:${projectId}:new`
-  const [draft] = useState(() =>
-    isEditing ? null : alertRuleSchema.safeParse(readFormDraft(draftKey))
-  )
+  // Unsaved fields, new rule or edits to an existing one, survive a detour to
+  // add a notification provider (which returns here via `returnTo`). The key
+  // includes the rule ID so edits never land on a different rule.
+  const draftKey = `error-alert-rule:${projectId}:${ruleId ?? 'new'}`
+  const [draft] = useState(() => readFormDraft(draftKey))
   useEffect(() => {
-    if (!isEditing) clearFormDraft(draftKey)
-  }, [draftKey, isEditing])
+    clearFormDraft(draftKey)
+  }, [draftKey])
 
   const { data: existingRule, isLoading: ruleLoading } = useQuery({
     ...getAlertRuleOptions({
@@ -170,23 +174,28 @@ export function AlertRuleForm({ projectId, projectName }: AlertRuleFormProps) {
         string,
         unknown
       >
-      return {
-        name: existingRule.name,
-        trigger_type: existingRule.trigger_type,
-        trigger_config: {
-          count: (config.count as number) ?? undefined,
-          window_minutes: (config.window_minutes as number) ?? undefined,
-          threshold: (config.threshold as number) ?? undefined,
+      return mergeFormDraft<AlertRuleFormData>(
+        {
+          name: existingRule.name,
+          trigger_type: existingRule.trigger_type,
+          trigger_config: {
+            count: (config.count as number) ?? undefined,
+            window_minutes: (config.window_minutes as number) ?? undefined,
+            threshold: (config.threshold as number) ?? undefined,
+          },
+          cooldown_minutes: existingRule.cooldown_minutes,
+          notification_priority: existingRule.notification_priority,
+          environment_filter: existingRule.environment_filter ?? null,
+          error_level_filter: existingRule.error_level_filter ?? null,
+          enabled: existingRule.enabled,
         },
-        cooldown_minutes: existingRule.cooldown_minutes,
-        notification_priority: existingRule.notification_priority,
-        environment_filter: existingRule.environment_filter ?? null,
-        error_level_filter: existingRule.error_level_filter ?? null,
-        enabled: existingRule.enabled,
-      }
+        draft
+      )
     }
-    return draft?.success ? draft.data : NEW_RULE_DEFAULTS
-  }, [existingRule, draft])
+    // Editing: wait for the saved rule, then lay the draft over it.
+    if (isEditing) return NEW_RULE_DEFAULTS
+    return mergeFormDraft(NEW_RULE_DEFAULTS, draft)
+  }, [existingRule, draft, isEditing])
 
   const form = useForm<AlertRuleFormData>({
     resolver: zodResolver(alertRuleSchema),
@@ -222,6 +231,7 @@ export function AlertRuleForm({ projectId, projectName }: AlertRuleFormProps) {
     meta: { errorTitle: 'Failed to update alert rule' },
     onSuccess: () => {
       toast.success('Alert rule updated')
+      clearFormDraft(draftKey)
       queryClient.invalidateQueries({
         predicate: (query) =>
           (query.queryKey[0] as Record<string, unknown>)?._id ===
@@ -325,11 +335,7 @@ export function AlertRuleForm({ projectId, projectName }: AlertRuleFormProps) {
         <CardContent className="space-y-6">
           <NotificationCoverageNotice
             severity={errorRulePrioritySeverity(watchedPriority)}
-            onLeave={
-              isEditing
-                ? undefined
-                : () => saveFormDraft(draftKey, form.getValues())
-            }
+            onLeave={() => saveFormDraft(draftKey, form.getValues())}
           />
           <Form {...form}>
             <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-6">

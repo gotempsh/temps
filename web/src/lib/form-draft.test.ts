@@ -2,7 +2,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { beforeEach, describe, expect, test } from 'bun:test'
-import { clearFormDraft, readFormDraft, saveFormDraft } from './form-draft'
+import {
+  clearFormDraft,
+  mergeFormDraft,
+  readFormDraft,
+  saveFormDraft,
+} from './form-draft'
 
 class MemoryStorage {
   private values = new Map<string, string>()
@@ -45,5 +50,63 @@ describe('form drafts', () => {
     })
     expect(() => saveFormDraft('x', 1)).not.toThrow()
     expect(readFormDraft('x')).toBeNull()
+  })
+})
+
+describe('mergeFormDraft', () => {
+  const base = {
+    name: '',
+    trigger_type: 'new_issue',
+    trigger_config: {} as { count?: number; window_minutes?: number },
+    cooldown_minutes: 60,
+    environment_filter: null as number | null,
+    label_filters: [] as { key: string; value: string }[],
+    enabled: true,
+  }
+
+  test('keeps an unfinished draft that the submit schema would reject', () => {
+    const merged = mergeFormDraft(base, {
+      name: '',
+      trigger_type: 'frequency',
+      trigger_config: { count: 10, window_minutes: 5 },
+      cooldown_minutes: 15,
+      environment_filter: 3,
+      label_filters: [{ key: 'route', value: '/checkout' }],
+      enabled: false,
+    })
+    expect(merged).toEqual({
+      name: '',
+      trigger_type: 'frequency',
+      trigger_config: { count: 10, window_minutes: 5 },
+      cooldown_minutes: 15,
+      environment_filter: 3,
+      label_filters: [{ key: 'route', value: '/checkout' }],
+      enabled: false,
+    })
+  })
+
+  test('lays edits over a loaded rule and keeps fields the draft lacks', () => {
+    const loaded = { ...base, name: 'Checkout errors', cooldown_minutes: 30 }
+    expect(mergeFormDraft(loaded, { cooldown_minutes: 5 })).toEqual({
+      ...loaded,
+      cooldown_minutes: 5,
+    })
+  })
+
+  test('ignores fields whose shape does not match the starting value', () => {
+    const merged = mergeFormDraft(base, {
+      cooldown_minutes: '15',
+      enabled: 'yes',
+      label_filters: 'route=/checkout',
+      trigger_config: [1, 2],
+      unexpected: { nested: true },
+    })
+    expect(merged).toEqual(base)
+  })
+
+  test('returns the starting values when there is no usable draft', () => {
+    expect(mergeFormDraft(base, null)).toBe(base)
+    expect(mergeFormDraft(base, 'draft')).toBe(base)
+    expect(mergeFormDraft(base, [base])).toBe(base)
   })
 })
