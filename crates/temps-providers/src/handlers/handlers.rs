@@ -99,9 +99,9 @@ pub(crate) fn external_service_problem(
 
 /// A cluster placement the current configuration cannot serve: members on
 /// worker nodes could not reach members on the control plane, or the
-/// cluster's members cannot be given host ports. A 409 with the remedy in
-/// `detail`, never a 500 — nothing failed, the operator has a configuration
-/// step to take first.
+/// cluster's members cannot be given host ports — a 409 with the remedy in
+/// `detail`. A member list larger than a cluster can hold is a 400. Never a
+/// 500: nothing failed, the operator has a configuration step to take first.
 fn cluster_placement_problem(error: &crate::services::ExternalServiceError) -> Option<Problem> {
     use crate::services::ExternalServiceError as E;
     // Every variant is listed, no catch-all: a new variant must be classified
@@ -112,6 +112,15 @@ fn cluster_placement_problem(error: &crate::services::ExternalServiceError) -> O
             "Cluster Placement Not Reachable"
         }
         E::ClusterPortsUnavailable { .. } => "Cluster Ports Unavailable",
+        // The request itself is invalid, not in conflict with any state.
+        E::ClusterMemberLimitExceeded { .. } => {
+            return Some(
+                bad_request()
+                    .title("Too Many Cluster Members")
+                    .detail(error.to_string())
+                    .build(),
+            )
+        }
         // Not placement conditions: each handler classifies these itself
         // (and `worker_node_required` owns the two "no daemon" variants).
         E::ServiceNotFound { .. }
@@ -868,7 +877,8 @@ fn service_create_failure_code(
         | E::InvalidDatabaseProvisioning { .. }
         | E::ControlPlaneAddressRequired { .. }
         | E::ControlPlaneMemberUnreachable { .. }
-        | E::ClusterPortsUnavailable { .. } => OperationFailureCode::InvalidConfiguration,
+        | E::ClusterPortsUnavailable { .. }
+        | E::ClusterMemberLimitExceeded { .. } => OperationFailureCode::InvalidConfiguration,
         E::DuplicateServiceType { .. } => OperationFailureCode::Conflict,
         E::ProjectNotFound { .. } | E::EnvironmentNotFound { .. } => OperationFailureCode::NotFound,
         E::DatabaseError { .. } => OperationFailureCode::Database,
@@ -4147,6 +4157,32 @@ mod tests {
                 OperationFailureCode::InvalidConfiguration
             );
         }
+    }
+
+    /// Too many members is a bad request on every endpoint (create, retry),
+    /// never a generic 500.
+    #[test]
+    fn too_many_cluster_members_is_a_bad_request() {
+        let error = crate::services::ExternalServiceError::ClusterMemberLimitExceeded {
+            name: "ha-pg".to_string(),
+            requested: 11,
+            max: 10,
+        };
+        let problem = external_service_problem(&error, "Failed to retry cluster".to_string());
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .expect("detail is always set");
+        assert!(
+            detail.contains("ha-pg") && detail.contains("at most 10"),
+            "{detail}"
+        );
+        assert_eq!(
+            service_create_failure_code(&error),
+            OperationFailureCode::InvalidConfiguration
+        );
     }
 
     /// Everything else keeps the caller's context and its 500.

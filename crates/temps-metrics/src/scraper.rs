@@ -69,8 +69,20 @@ pub trait ClusterPrimaryConnector: Send + Sync {
     async fn connect_cluster_primary(
         &self,
         service_id: i32,
-    ) -> Result<tokio_postgres::Client, MetricsError>;
+    ) -> Result<ClusterPrimaryConnection, MetricsError>;
 }
+
+/// A connection to an HA cluster's current primary.
+pub struct ClusterPrimaryConnection {
+    pub client: tokio_postgres::Client,
+    /// Stable identity of the member that is primary (its container name).
+    /// Cumulative counters are per server: when this changes, the previous
+    /// primary's readings are no baseline for the new one's.
+    pub member: String,
+}
+
+/// Last primary seen per cluster service, keyed by service ID.
+type ClusterPrimaries = Arc<StdMutex<HashMap<i32, String>>>;
 
 /// Minimum scrape interval enforced at runtime regardless of configuration.
 const MIN_INTERVAL_SECS: u64 = 10;
@@ -112,6 +124,8 @@ pub struct MetricsScraper {
     /// services are skipped (with a warning) rather than scraped at an
     /// address no member listens on.
     cluster_primary: Option<Arc<dyn ClusterPrimaryConnector>>,
+    /// Which member supplied each cluster's counter baselines.
+    cluster_primaries: ClusterPrimaries,
 }
 
 impl MetricsScraper {
@@ -139,6 +153,7 @@ impl MetricsScraper {
             last_scalar_values: Arc::new(RwLock::new(HashMap::new())),
             in_flight: Arc::new(StdMutex::new(HashSet::new())),
             cluster_primary: None,
+            cluster_primaries: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -230,6 +245,7 @@ impl MetricsScraper {
 
             let encryption = Arc::clone(&self.encryption_service);
             let cluster_primary = self.cluster_primary.clone();
+            let cluster_primaries = Arc::clone(&self.cluster_primaries);
             let last_values = Arc::clone(&self.last_scalar_values);
             let in_flight = Arc::clone(&self.in_flight);
             let permit = Arc::clone(&sem)
@@ -264,12 +280,21 @@ impl MetricsScraper {
 
                 let result = async {
                     if service.topology == "cluster" {
-                        let raw_points = scrape_cluster(
+                        let Some((member, raw_points)) = scrape_cluster(
                             &service,
                             cluster_primary.as_deref(),
                             Duration::from_secs(COLLECTOR_TIMEOUT_SECS),
                         )
-                        .await;
+                        .await
+                        else {
+                            return Err(());
+                        };
+                        // After a failover the new primary's counters are a
+                        // different server's: start a fresh baseline rather
+                        // than diffing them against the old primary's.
+                        if primary_changed(&cluster_primaries, service_id, &member) {
+                            reset_baselines(&last_values, service_id).await;
+                        }
                         if raw_points.is_empty() {
                             return Err(());
                         }
@@ -344,6 +369,9 @@ impl MetricsScraper {
             let mut guard = self.last_scalar_values.write().await;
             guard.retain(|(sid, _, _), _| active_ids.contains(sid));
         }
+        if let Ok(mut primaries) = self.cluster_primaries.lock() {
+            primaries.retain(|sid, _| active_ids.contains(sid));
+        }
 
         Ok(())
     }
@@ -356,11 +384,14 @@ impl MetricsScraper {
 /// The stored `host`/`port` of a cluster describe no listening member, so the
 /// standalone connection-string path can never reach one. Only PostgreSQL
 /// clusters exist today; any other cluster engine is skipped.
+///
+/// Returns the member that answered along with its points, or `None` when no
+/// primary could be scraped.
 async fn scrape_cluster(
     service: &external_services::Model,
     connector: Option<&dyn ClusterPrimaryConnector>,
     timeout: Duration,
-) -> Vec<MetricPoint> {
+) -> Option<(String, Vec<MetricPoint>)> {
     let service_id = service.id;
     if !service.service_type.eq_ignore_ascii_case("postgres") {
         debug!(
@@ -368,23 +399,23 @@ async fn scrape_cluster(
             service_type = service.service_type,
             "MetricsScraper: no cluster collector for service type, skipping"
         );
-        return vec![];
+        return None;
     }
     let Some(connector) = connector else {
         warn!(
             service_id,
             "MetricsScraper: cannot scrape HA cluster: no cluster primary connector is registered"
         );
-        return vec![];
+        return None;
     };
 
-    let client = match tokio::time::timeout(timeout, connector.connect_cluster_primary(service_id))
+    let primary = match tokio::time::timeout(timeout, connector.connect_cluster_primary(service_id))
         .await
     {
-        Ok(Ok(client)) => client,
+        Ok(Ok(primary)) => primary,
         Ok(Err(e)) => {
             warn!(service_id, error = %e, "MetricsScraper: cluster primary unavailable; skipping scrape");
-            return vec![];
+            return None;
         }
         Err(_elapsed) => {
             warn!(
@@ -392,16 +423,44 @@ async fn scrape_cluster(
                 timeout_secs = timeout.as_secs(),
                 "MetricsScraper: connecting to the cluster primary timed out; skipping scrape"
             );
-            return vec![];
+            return None;
         }
     };
 
     let config = CollectorConfig::new(service_id, SourceKind::Database, String::new())
         .with_timeout(timeout)
         .with_node_id_opt(service.node_id);
-    PostgresCollector::new()
-        .collect_from_client(&client, &config)
+    let points = PostgresCollector::new()
+        .collect_from_client(&primary.client, &config)
+        .await;
+    Some((primary.member, points))
+}
+
+/// Record `member` as `service_id`'s primary; `true` when it differs from the
+/// member that supplied the service's current counter baselines (including
+/// the first time a primary is seen).
+fn primary_changed(primaries: &ClusterPrimaries, service_id: i32, member: &str) -> bool {
+    let Ok(mut primaries) = primaries.lock() else {
+        // A poisoned lock: treat as a change, which only costs one skipped
+        // counter interval — never a false spike.
+        return true;
+    };
+    match primaries.get(&service_id) {
+        Some(previous) if previous == member => false,
+        _ => {
+            primaries.insert(service_id, member.to_string());
+            true
+        }
+    }
+}
+
+/// Drop every counter baseline of `service_id`, so its next scrape records
+/// fresh baselines instead of deltas.
+async fn reset_baselines(last_values: &CounterBaselines, service_id: i32) {
+    last_values
+        .write()
         .await
+        .retain(|(sid, _, _), _| *sid != service_id);
 }
 
 /// Collect metrics from a concrete [`Collector`] implementation with a
@@ -771,7 +830,7 @@ mod tests {
         async fn connect_cluster_primary(
             &self,
             service_id: i32,
-        ) -> Result<tokio_postgres::Client, MetricsError> {
+        ) -> Result<ClusterPrimaryConnection, MetricsError> {
             if let Ok(mut calls) = self.calls.lock() {
                 calls.push(service_id);
             }
@@ -820,8 +879,8 @@ mod tests {
             "the connector must be asked for service 41"
         );
         assert!(
-            points.is_empty(),
-            "an unavailable primary yields an empty batch, not an error"
+            points.is_none(),
+            "an unavailable primary yields nothing to write, not an error"
         );
     }
 
@@ -836,7 +895,7 @@ mod tests {
         )
         .await;
 
-        assert!(points.is_empty());
+        assert!(points.is_none());
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "a hung connector must not stall the scrape cycle"
@@ -851,7 +910,7 @@ mod tests {
             Duration::from_secs(1),
         )
         .await;
-        assert!(points.is_empty());
+        assert!(points.is_none());
 
         let fake = connector(false);
         let points = scrape_cluster(
@@ -860,13 +919,78 @@ mod tests {
             Duration::from_secs(1),
         )
         .await;
-        assert!(points.is_empty());
+        assert!(points.is_none());
         assert!(
             calls(&fake).is_empty(),
             "only PostgreSQL clusters are dialled"
         );
     }
 
+    fn commits(value: f64) -> MetricPoint {
+        MetricPoint {
+            time: chrono::Utc::now(),
+            source_kind: SourceKind::Database,
+            source_id: 7,
+            name: "pg.commits_total".to_string(),
+            value,
+            kind: MetricKind::Counter,
+            engine: Some("postgres".to_string()),
+            environment: None,
+            node_id: None,
+            labels: HashMap::new(),
+        }
+    }
+
+    /// Regression: after a failover the new primary's independent counters
+    /// were diffed against the old primary's baseline. 100,000 commits on the
+    /// old primary then 20,000 on the new one recorded 20,000 commits in one
+    /// interval (counter-reset handling) that never happened.
+    #[tokio::test]
+    async fn failover_starts_a_fresh_counter_baseline() {
+        let baselines: CounterBaselines = Arc::new(RwLock::new(HashMap::new()));
+        let primaries: ClusterPrimaries = Arc::new(StdMutex::new(HashMap::new()));
+
+        // Two scrapes on the first primary: baseline, then a real delta.
+        assert!(primary_changed(&primaries, 7, "ha-pg-1"));
+        reset_baselines(&baselines, 7).await;
+        assert!(apply_delta(&baselines, 7, vec![commits(100_000.0)])
+            .await
+            .is_empty());
+        assert!(!primary_changed(&primaries, 7, "ha-pg-1"));
+        let delta = apply_delta(&baselines, 7, vec![commits(100_050.0)]).await;
+        assert_eq!(delta.first().map(|p| p.value), Some(50.0));
+
+        // Failover: the new primary's counters start a fresh baseline.
+        assert!(primary_changed(&primaries, 7, "ha-pg-2"));
+        reset_baselines(&baselines, 7).await;
+        let after_failover = apply_delta(&baselines, 7, vec![commits(20_000.0)]).await;
+        assert!(
+            after_failover.is_empty(),
+            "no delta may be recorded across a change of primary, got {:?}",
+            after_failover.iter().map(|p| p.value).collect::<Vec<_>>()
+        );
+        let next = apply_delta(&baselines, 7, vec![commits(20_010.0)]).await;
+        assert_eq!(next.first().map(|p| p.value), Some(10.0));
+    }
+
+    #[tokio::test]
+    async fn resetting_one_cluster_keeps_other_services_baselines() {
+        let baselines: CounterBaselines = Arc::new(RwLock::new(HashMap::new()));
+        apply_delta(&baselines, 7, vec![commits(1.0)]).await;
+        let mut other = commits(5.0);
+        other.source_id = 8;
+        apply_delta(&baselines, 8, vec![other]).await;
+
+        reset_baselines(&baselines, 7).await;
+
+        let keys: Vec<i32> = baselines
+            .read()
+            .await
+            .keys()
+            .map(|(sid, _, _)| *sid)
+            .collect();
+        assert_eq!(keys, vec![8]);
+    }
     // ── urlencoded ─────────────────────────────────────────────────────────
 
     #[test]

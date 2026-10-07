@@ -398,6 +398,55 @@ fn select_cluster_port_base(service_id: i32, used_ports: &BTreeSet<u16>) -> Opti
         .find(|base| block_is_free(*base))
 }
 
+/// Host port of a member: the monitor holds the block's base, data members
+/// `base + ordinal`.
+fn cluster_member_host_port(base: u16, ordinal: i32, is_monitor: bool) -> Option<u16> {
+    if is_monitor {
+        Some(base)
+    } else {
+        cluster_member_port(base, ordinal)
+    }
+}
+
+/// `pg_advisory_xact_lock` key serializing cluster port-block reservation
+/// ("TEMPSPRT"), so two concurrent creations cannot pick the same block.
+const CLUSTER_PORT_LOCK_KEY: i64 = 0x5445_4D50_5350_5254;
+
+/// Host ports held by members of every cluster other than `service_id`.
+async fn used_cluster_ports<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    service_id: i32,
+) -> Result<BTreeSet<u16>, ExternalServiceError> {
+    Ok(service_members::Entity::find()
+        .select_only()
+        .column(service_members::Column::Port)
+        .filter(service_members::Column::ServiceId.ne(service_id))
+        .filter(service_members::Column::Port.is_not_null())
+        .into_tuple::<Option<i32>>()
+        .all(conn)
+        .await?
+        .into_iter()
+        .flatten()
+        .filter_map(|port| u16::try_from(port).ok())
+        .collect())
+}
+
+/// Reject a member list that cannot fit in one cluster port block.
+///
+/// Checked before anything is saved: inside the background initialization
+/// it surfaced as a cluster that was accepted and then failed, and a retry
+/// with the stored member list failed the same way.
+fn validate_cluster_member_count(name: &str, requested: usize) -> Result<(), ExternalServiceError> {
+    if requested > usize::from(CLUSTER_PORT_BLOCK_SIZE) {
+        return Err(ExternalServiceError::ClusterMemberLimitExceeded {
+            name: name.to_string(),
+            requested,
+            max: CLUSTER_PORT_BLOCK_SIZE,
+        });
+    }
+    Ok(())
+}
+
 /// Host port of the member with `ordinal` in the block starting at `base`,
 /// or `None` when the ordinal does not fit in the cluster's block.
 fn cluster_member_port(base: u16, ordinal: i32) -> Option<u16> {
@@ -640,6 +689,17 @@ pub enum ExternalServiceError {
     /// block is full, or no free block is left in the cluster port range.
     #[error("Cannot assign host ports for cluster service {service_id}: {reason}")]
     ClusterPortsUnavailable { service_id: i32, reason: String },
+
+    /// More members were requested than a cluster's port block can hold.
+    #[error(
+        "Cluster '{name}' requests {requested} members, but a cluster has at most {max} \
+         (one host port each in its {max}-port block)"
+    )]
+    ClusterMemberLimitExceeded {
+        name: String,
+        requested: usize,
+        max: u16,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1871,39 +1931,6 @@ impl ExternalServiceManager {
         Ok(address.ip)
     }
 
-    /// Pick the host-port block for a new cluster's members, avoiding every
-    /// port another cluster's members already hold. See
-    /// [`select_cluster_port_base`].
-    async fn allocate_cluster_port_base(
-        &self,
-        service_id: i32,
-    ) -> Result<u16, ExternalServiceError> {
-        let used: BTreeSet<u16> = service_members::Entity::find()
-            .select_only()
-            .column(service_members::Column::Port)
-            .filter(service_members::Column::ServiceId.ne(service_id))
-            .filter(service_members::Column::Port.is_not_null())
-            .into_tuple::<Option<i32>>()
-            .all(self.db.as_ref())
-            .await?
-            .into_iter()
-            .flatten()
-            .filter_map(|port| u16::try_from(port).ok())
-            .collect();
-
-        select_cluster_port_base(service_id, &used).ok_or_else(|| {
-            ExternalServiceError::ClusterPortsUnavailable {
-                service_id,
-                reason: format!(
-                    "every {}-port block from {} to {} is held by another cluster's members",
-                    CLUSTER_PORT_BLOCK_SIZE,
-                    CLUSTER_PORT_RANGE_START,
-                    u16::MAX
-                ),
-            }
-        })
-    }
-
     /// Whether a cluster member placement mixes the control plane
     /// (`node_id` `None`, or the control-plane pseudo-node) with worker
     /// nodes — the only topology in which control-plane members must be
@@ -2627,6 +2654,9 @@ impl ExternalServiceManager {
         // control-plane address the workers can reach. Cluster creation runs
         // in the background, so check it here, before any row exists, and
         // answer the request with the remedy instead of a half-built cluster.
+        if request.topology == "cluster" {
+            validate_cluster_member_count(&request.name, request.members.len())?;
+        }
         if request.topology == "cluster"
             && Self::cluster_spans_control_plane_and_workers(&request.members)
         {
@@ -5811,6 +5841,18 @@ echo "[restore] Pre-seed complete"
         &self,
         service_id: i32,
     ) -> Result<Option<(String, u16)>, ExternalServiceError> {
+        Ok(self
+            .get_cluster_primary_endpoint(service_id)
+            .await?
+            .map(|(_, host, port)| (host, port)))
+    }
+
+    /// [`Self::get_cluster_primary_address`] plus the primary member's
+    /// container name, which identifies the server across failovers.
+    async fn get_cluster_primary_endpoint(
+        &self,
+        service_id: i32,
+    ) -> Result<Option<(String, String, u16)>, ExternalServiceError> {
         let service = self.get_service(service_id).await?;
         if service.topology != "cluster" {
             return Ok(None);
@@ -5829,7 +5871,7 @@ echo "[restore] Pre-seed complete"
         if let Some(primary) = primary {
             self.stored_member_endpoint(service_id, primary)
                 .await
-                .map(Some)
+                .map(|(host, port)| Some((primary.container_name.clone(), host, port)))
         } else {
             Err(ExternalServiceError::InternalError {
                 reason: format!(
@@ -5849,11 +5891,13 @@ echo "[restore] Pre-seed complete"
     /// unverified certificate or cleartext is only ever accepted on a private
     /// address. Used by the metrics scraper, whose stored `host`/`port` for a
     /// cluster point at no member.
+    ///
+    /// Returns the client and the primary member's container name.
     pub async fn connect_cluster_primary_client(
         &self,
         service_id: i32,
-    ) -> Result<tokio_postgres::Client, ExternalServiceError> {
-        let (host, port) = self.get_cluster_primary_address(service_id).await?.ok_or(
+    ) -> Result<(tokio_postgres::Client, String), ExternalServiceError> {
+        let (member, host, port) = self.get_cluster_primary_endpoint(service_id).await?.ok_or(
             ExternalServiceError::ParameterValidationFailed {
                 service_id,
                 reason: format!("Service {service_id} is not a cluster; it has no primary member"),
@@ -5872,16 +5916,17 @@ echo "[restore] Pre-seed complete"
         let password = param("password", "");
         let database = param("database", "postgres");
 
-        temps_query_postgres::connect_with_private_tls_ladder(
+        let client = temps_query_postgres::connect_with_private_tls_ladder(
             &host, port, &user, &password, &database,
         )
         .await
         .map_err(|error| ExternalServiceError::InternalError {
             reason: format!(
-                "Failed to connect to the primary of cluster {} at {}:{} (database '{}'): {}",
-                service_id, host, port, database, error
+                "Failed to connect to the primary of cluster {} ({}) at {}:{} (database '{}'): {}",
+                service_id, member, host, port, database, error
             ),
-        })
+        })?;
+        Ok((client, member))
     }
 
     /// Build runtime environment variables for a cluster service.
@@ -7012,8 +7057,9 @@ echo "[restore] Pre-seed complete"
         //
         // Writing them up front makes the requested topology durable from the
         // start, so every later failure is retryable. Rows are `pending` until
-        // their container exists.
-        let pre_created =
+        // their container exists. The same transaction reserves the cluster's
+        // host-port block: each row is written with its port.
+        let (pre_created, base_port) =
             precreate_cluster_members(self.db.as_ref(), service_id, &member_results, &member_specs)
                 .await?;
 
@@ -7057,24 +7103,9 @@ echo "[restore] Pre-seed complete"
             .and_then(|m| m.hostname.as_deref())
             .unwrap_or(&monitor_container_fallback);
 
-        // Assign unique host ports for each cluster member to avoid conflicts
-        // with other services (e.g., the platform's own TimescaleDB on 5432).
-        // Each cluster owns a 10-port block: the monitor at its base, data
-        // nodes at base + ordinal. See `select_cluster_port_base`.
-        let base_port = self.allocate_cluster_port_base(service_id).await?;
-        if let Some(spec) = member_specs
-            .iter()
-            .find(|spec| cluster_member_port(base_port, spec.ordinal).is_none())
-        {
-            return Err(ExternalServiceError::ClusterPortsUnavailable {
-                service_id,
-                reason: format!(
-                    "member ordinal {} is outside the cluster's {}-port block starting at {}; a \
-                     cluster has at most {} members",
-                    spec.ordinal, CLUSTER_PORT_BLOCK_SIZE, base_port, CLUSTER_PORT_BLOCK_SIZE
-                ),
-            });
-        }
+        // Each cluster owns a 10-port block, reserved with its member rows
+        // above: the monitor at its base, data nodes at base + ordinal. See
+        // `select_cluster_port_base`.
         // Monitor gets base_port, data nodes get base_port + 1, +2, etc.
         let monitor_port = base_port;
         info!(
@@ -7128,12 +7159,10 @@ echo "[restore] Pre-seed complete"
                 };
 
                 // Assign port: monitor gets base_port, data nodes get base + ordinal
-                let member_port = if is_role_monitor(&spec.role) {
-                    monitor_port
-                } else {
-                    // Validated against the block before any member was built.
-                    cluster_member_port(base_port, spec.ordinal).unwrap_or(monitor_port)
-                };
+                // Reserved (and validated against the block) with the rows.
+                let member_port =
+                    cluster_member_host_port(base_port, spec.ordinal, is_role_monitor(&spec.role))
+                        .unwrap_or(monitor_port);
 
                 let (container_id, host_port, compute_ip) = if let Some(node_id) = spec.node_id {
                     // Remote: dispatch to agent
@@ -7804,6 +7833,9 @@ echo "[restore] Pre-seed complete"
         } else {
             member_requests.to_vec()
         };
+        // Before tearing anything down: a member list that cannot fit would
+        // only fail again after the leftover members were removed.
+        validate_cluster_member_count(&service.name, effective_members.len())?;
 
         for member in &leftover_members {
             // Try to remove the container (ignore errors — it may not exist)
@@ -13222,16 +13254,67 @@ fn compute_stats_sample(
 
 /// Persist the complete intended topology as one transaction so a database
 /// failure cannot leave a retry with only a prefix of the requested members.
+///
+/// The same transaction reserves the cluster's host-port block. Selecting a
+/// block only reads other clusters' ports, so two concurrent creations could
+/// otherwise pick the same one and the second would fail binding it. The
+/// advisory lock serializes selection, and writing each row's port before
+/// commit makes the block visible to the next creation. Returns the rows by
+/// ordinal and the block's base port.
 async fn precreate_cluster_members(
     db: &DatabaseConnection,
     service_id: i32,
     member_results: &[ClusterMemberResult],
     member_specs: &[ClusterMemberSpec],
-) -> Result<HashMap<i32, service_members::Model>, ExternalServiceError> {
+) -> Result<(HashMap<i32, service_members::Model>, u16), ExternalServiceError> {
+    use sea_orm::ConnectionTrait;
+
     let transaction = db.begin().await?;
+    transaction
+        .execute(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SELECT pg_advisory_xact_lock({CLUSTER_PORT_LOCK_KEY})"),
+        ))
+        .await?;
+    let used = used_cluster_ports(&transaction, service_id).await?;
+    let base_port = select_cluster_port_base(service_id, &used).ok_or_else(|| {
+        ExternalServiceError::ClusterPortsUnavailable {
+            service_id,
+            reason: format!(
+                "every {}-port block from {} to {} is held by another cluster's members",
+                CLUSTER_PORT_BLOCK_SIZE,
+                CLUSTER_PORT_RANGE_START,
+                u16::MAX
+            ),
+        }
+    })?;
     let mut pre_created = HashMap::new();
+    let mut assigned: BTreeSet<u16> = BTreeSet::new();
 
     for (result, spec) in member_results.iter().zip(member_specs.iter()) {
+        let port =
+            cluster_member_host_port(base_port, result.ordinal, is_role_monitor(&result.role))
+                .ok_or_else(|| ExternalServiceError::ClusterPortsUnavailable {
+                    service_id,
+                    reason: format!(
+                    "member ordinal {} is outside the cluster's {}-port block starting at {}; a \
+                     cluster has at most {} members",
+                    result.ordinal, CLUSTER_PORT_BLOCK_SIZE, base_port, CLUSTER_PORT_BLOCK_SIZE
+                ),
+                })?;
+        // The monitor holds the block's base, which is also ordinal 0's
+        // data-member port: a member list that does not start with the
+        // monitor would give two members one host port.
+        if !assigned.insert(port) {
+            return Err(ExternalServiceError::ClusterPortsUnavailable {
+                service_id,
+                reason: format!(
+                    "member '{}' (ordinal {}) would share host port {} with another member; \
+                     list the monitor first",
+                    result.container_name, result.ordinal, port
+                ),
+            });
+        }
         let stored_role = if is_role_monitor(&result.role) {
             "monitor".to_string()
         } else {
@@ -13245,7 +13328,7 @@ async fn precreate_cluster_members(
             container_id: Set(None),
             container_name: Set(result.container_name.clone()),
             hostname: Set(spec.hostname.clone()),
-            port: Set(None),
+            port: Set(Some(i32::from(port))),
             status: Set("pending".to_string()),
             ordinal: Set(result.ordinal),
             config: Set(None),
@@ -13258,7 +13341,7 @@ async fn precreate_cluster_members(
     }
 
     transaction.commit().await?;
-    Ok(pre_created)
+    Ok((pre_created, base_port))
 }
 
 #[async_trait::async_trait]
@@ -13304,9 +13387,10 @@ impl temps_metrics::ClusterPrimaryConnector for ExternalServiceManager {
     async fn connect_cluster_primary(
         &self,
         service_id: i32,
-    ) -> Result<tokio_postgres::Client, temps_metrics::MetricsError> {
+    ) -> Result<temps_metrics::ClusterPrimaryConnection, temps_metrics::MetricsError> {
         self.connect_cluster_primary_client(service_id)
             .await
+            .map(|(client, member)| temps_metrics::ClusterPrimaryConnection { client, member })
             .map_err(|e| temps_metrics::MetricsError::CollectorConnectionFailed {
                 source_id: service_id,
                 engine: "postgres".to_string(),
@@ -14391,6 +14475,13 @@ mod tests {
     #[tokio::test]
     async fn test_precreated_cluster_topology_is_one_transaction() {
         let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            // pg_advisory_xact_lock
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            // No other cluster holds a port.
+            .append_query_results([Vec::<std::collections::BTreeMap<&str, sea_orm::Value>>::new()])
             .append_query_results([
                 vec![service_member_model(1, 0, "monitor")],
                 vec![service_member_model(2, 1, "replica")],
@@ -14415,23 +14506,172 @@ mod tests {
             },
         ];
 
-        let created = precreate_cluster_members(&db, 7, &results, &specs)
+        let (created, base_port) = precreate_cluster_members(&db, 7, &results, &specs)
             .await
             .expect("the full topology should commit");
         assert_eq!(created.len(), 2);
+        assert_eq!(base_port, 6070, "service 7 keeps its historical block");
 
         let log = db.into_transaction_log();
         assert_eq!(
             log.len(),
             1,
-            "all member inserts must commit as one transaction"
+            "the port reservation and all member inserts must commit as one transaction"
         );
-        let insert_count = log[0]
-            .statements()
+        let statements = log[0].statements();
+        let lock = statements
+            .iter()
+            .position(|statement| statement.sql.contains("pg_advisory_xact_lock"))
+            .expect("block selection must be serialized by an advisory lock");
+        let first_insert = statements
+            .iter()
+            .position(|statement| statement.sql.starts_with("INSERT INTO \"service_members\""))
+            .expect("members are inserted");
+        assert!(
+            lock < first_insert,
+            "the lock must be held before any row is written"
+        );
+        let inserts: Vec<String> = statements
             .iter()
             .filter(|statement| statement.sql.starts_with("INSERT INTO \"service_members\""))
-            .count();
-        assert_eq!(insert_count, 2);
+            .map(|statement| format!("{:?}", statement.values))
+            .collect();
+        assert_eq!(inserts.len(), 2);
+        // The reserved ports are written with the rows, before commit, so a
+        // concurrent creation sees the block as taken.
+        assert!(inserts[0].contains("Int(Some(6070))"), "{}", inserts[0]);
+        assert!(inserts[1].contains("Int(Some(6071))"), "{}", inserts[1]);
+    }
+
+    /// Regression: the port block was chosen without being reserved, and
+    /// ports were only saved after the members started, so two clusters
+    /// created at the same time could pick the same block and the second
+    /// failed binding it. Exercised against real PostgreSQL so the advisory
+    /// lock and row visibility are the real ones.
+    #[tokio::test]
+    async fn concurrent_cluster_creations_reserve_distinct_port_blocks() {
+        use sea_orm::IntoActiveModel;
+        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                println!("Skipping port reservation test: {error}");
+                return;
+            }
+            Err(error) => panic!("port reservation test database setup failed: {error}"),
+        };
+        let db = test_db.connection_arc();
+
+        // Past the historical formula, both ids fall back to "first free
+        // block" — exactly where two creations could collide.
+        for id in [6001, 6002] {
+            let mut service = encrypted_service_model(id, serde_json::json!({}));
+            service.name = format!("ha-pg-{id}");
+            service.slug = Some(format!("ha-pg-{id}"));
+            service.topology = "cluster".to_string();
+            let mut active = service.into_active_model();
+            active.id = Set(id);
+            active
+                .insert(db.as_ref())
+                .await
+                .expect("insert cluster service");
+        }
+
+        let topology = |prefix: &str| {
+            let results: Vec<ClusterMemberResult> = ["monitor", "replica", "replica"]
+                .iter()
+                .enumerate()
+                .map(|(i, role)| ClusterMemberResult {
+                    ordinal: i as i32,
+                    role: role.to_string(),
+                    container_id: String::new(),
+                    container_name: format!("{prefix}-{i}"),
+                    port: None,
+                    status: "pending".to_string(),
+                })
+                .collect();
+            let specs: Vec<ClusterMemberSpec> = results
+                .iter()
+                .map(|r| ClusterMemberSpec {
+                    role: r.role.clone(),
+                    node_id: None,
+                    ordinal: r.ordinal,
+                    hostname: None,
+                })
+                .collect();
+            (results, specs)
+        };
+        let (results_a, specs_a) = topology("postgres-ha-pg-6001");
+        let (results_b, specs_b) = topology("postgres-ha-pg-6002");
+
+        let (a, b) = tokio::join!(
+            precreate_cluster_members(db.as_ref(), 6001, &results_a, &specs_a),
+            precreate_cluster_members(db.as_ref(), 6002, &results_b, &specs_b),
+        );
+        let (_, base_a) = a.expect("first creation reserves a block");
+        let (_, base_b) = b.expect("second creation reserves a block");
+
+        assert_ne!(base_a, base_b, "concurrent clusters must not share a block");
+        assert!(
+            base_a.abs_diff(base_b) >= CLUSTER_PORT_BLOCK_SIZE,
+            "blocks {base_a} and {base_b} overlap"
+        );
+        let stored: Vec<Option<i32>> = service_members::Entity::find()
+            .order_by_asc(service_members::Column::Port)
+            .all(db.as_ref())
+            .await
+            .expect("read members")
+            .into_iter()
+            .map(|m| m.port)
+            .collect();
+        assert_eq!(stored.len(), 6);
+        assert!(
+            stored.iter().all(Option::is_some),
+            "ports are reserved with the rows: {stored:?}"
+        );
+        let unique: BTreeSet<Option<i32>> = stored.iter().copied().collect();
+        assert_eq!(unique.len(), 6, "no two members share a port: {stored:?}");
+    }
+
+    /// A member list that does not start with the monitor would give a data
+    /// member the monitor's port; refuse before writing anything.
+    #[tokio::test]
+    async fn precreate_refuses_members_sharing_a_host_port() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .append_query_results([Vec::<std::collections::BTreeMap<&str, sea_orm::Value>>::new()])
+            .append_query_results([vec![service_member_model(1, 0, "replica")]])
+            .into_connection();
+        let results = [
+            cluster_member_result(0, "replica"),
+            cluster_member_result(1, "monitor"),
+        ];
+        let specs = [
+            ClusterMemberSpec {
+                role: "replica".to_string(),
+                node_id: None,
+                ordinal: 0,
+                hostname: None,
+            },
+            ClusterMemberSpec {
+                role: "monitor".to_string(),
+                node_id: None,
+                ordinal: 1,
+                hostname: None,
+            },
+        ];
+
+        let err = precreate_cluster_members(&db, 7, &results, &specs)
+            .await
+            .expect_err("two members cannot share port 6070");
+        assert!(
+            matches!(&err, ExternalServiceError::ClusterPortsUnavailable { service_id: 7, reason } if reason.contains("6070")),
+            "{err:?}"
+        );
     }
 
     fn test_s3_credentials() -> crate::S3Credentials {
@@ -18652,6 +18892,63 @@ mod tests {
         assert_eq!(
             replication_row_member("pgautofailover_standby_x", None, &keys),
             None
+        );
+    }
+
+    #[test]
+    fn cluster_member_count_is_bounded_by_the_port_block() {
+        assert!(validate_cluster_member_count("ha-pg", 3).is_ok());
+        assert!(validate_cluster_member_count("ha-pg", 10).is_ok());
+        let err = validate_cluster_member_count("ha-pg", 11).unwrap_err();
+        assert!(matches!(
+            &err,
+            ExternalServiceError::ClusterMemberLimitExceeded { name, requested: 11, max: 10 }
+                if name == "ha-pg"
+        ));
+        assert!(err.to_string().contains("at most 10"), "{err}");
+    }
+
+    /// Regression: the ten-member limit was only enforced inside the
+    /// background initialization, so an eleven-member request was accepted
+    /// and became a failed service. It must be refused before any row exists.
+    #[tokio::test]
+    async fn create_cluster_with_too_many_members_writes_nothing() {
+        // No mocked results at all: any read or write would fail with a
+        // database error instead of the validation error.
+        let manager = mock_service_manager_with_db(Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        ));
+        let members = std::iter::once(ClusterMemberRequest {
+            role: "monitor".to_string(),
+            node_id: None,
+        })
+        .chain((0..10).map(|_| ClusterMemberRequest {
+            role: "replica".to_string(),
+            node_id: None,
+        }))
+        .collect();
+
+        let err = manager
+            .create_service_with_creator(
+                CreateExternalServiceRequest {
+                    name: "ha-pg".to_string(),
+                    service_type: ServiceType::Postgres,
+                    version: None,
+                    parameters: HashMap::new(),
+                    node_id: None,
+                    topology: "cluster".to_string(),
+                    members,
+                },
+                Some(1),
+            )
+            .await
+            .expect_err("eleven members must be refused");
+        assert!(
+            matches!(
+                err,
+                ExternalServiceError::ClusterMemberLimitExceeded { requested: 11, .. }
+            ),
+            "{err:?}"
         );
     }
 
