@@ -258,6 +258,21 @@ pub fn monitor_connection_string(
     conn
 }
 
+/// `host` as it must appear in a `postgresql://` URI authority: an IPv6
+/// literal is bracketed (RFC 3986), anything else is unchanged.
+///
+/// Cluster members advertise bare addresses (pg_autoctl `--hostname`, Docker
+/// port bindings and libpq `host=` all take `fd00::10` as is), but in a URI
+/// `user@fd00::10:6030` is unparseable: a data member given that monitor URI
+/// could never register.
+pub(crate) fn uri_host(host: &str) -> std::borrow::Cow<'_, str> {
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        std::borrow::Cow::Owned(format!("[{host}]"))
+    } else {
+        std::borrow::Cow::Borrowed(host)
+    }
+}
+
 fn generate_cluster_secret() -> String {
     use rand::{distr::Alphanumeric, RngExt};
     rand::rng()
@@ -459,6 +474,18 @@ const NODE_APP_AUTH_SNIPPET: &str = r#"(
   exit 0
 ) &"#;
 
+/// Removes pg_autoctl's pidfile left behind by an unclean stop.
+///
+/// pg_autoctl writes it under `/tmp/pg_autoctl/<PGDATA path>/pg_autoctl.pid`
+/// (e.g. `/tmp/pg_autoctl/var/lib/postgresql/monitor/pg_autoctl.pid`), and
+/// the container's `/tmp` survives a restart. The previous
+/// `rm -f /tmp/pg_autoctl/*.pid /tmp/pg_autoctl/*/*.pid` only reached two
+/// levels, so after a host reboot or Docker daemon restart the new PID 1 found
+/// "an instance already running with PID 1" — itself — and the member
+/// crash-looped forever. Runs before `pg_autoctl run`, when nothing can own it.
+const STALE_PIDFILE_CLEANUP: &str =
+    "find /tmp/pg_autoctl -type f -name '*.pid' -delete 2>/dev/null || true";
+
 /// One phase of the in-place SCRAM upgrade of a running cluster.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthUpgradeStep {
@@ -564,7 +591,9 @@ impl PostgresClusterService {
             "MONITOR_URI".to_string(),
             format!(
                 "postgresql://autoctl_node:{}@{}:{}/pg_auto_failover",
-                auth.autoctl_node_password, monitor_hostname, monitor_port
+                auth.autoctl_node_password,
+                uri_host(monitor_hostname),
+                monitor_port
             ),
         );
         env.insert("POSTGRES_USER".to_string(), config.username.clone());
@@ -680,7 +709,7 @@ fi"#
                 MONITOR_ENFORCE_SNIPPET,
                 MONITOR_PREPARE_SNIPPET,
                 "fi",
-                "rm -f /tmp/pg_autoctl/*.pid /tmp/pg_autoctl/*/*.pid",
+                STALE_PIDFILE_CLEANUP,
                 "exec gosu postgres pg_autoctl run --pgdata \"$PGDATA\"",
             ]
             .join("\n"),
@@ -845,7 +874,7 @@ fi"#
                 NODE_PREPARE_SNIPPET,
                 NODE_ENFORCE_SNIPPET,
                 NODE_APP_AUTH_SNIPPET,
-                "rm -f /tmp/pg_autoctl/*.pid /tmp/pg_autoctl/*/*.pid",
+                STALE_PIDFILE_CLEANUP,
                 "exec gosu postgres pg_autoctl run --pgdata \"$PGDATA\"",
             ]
             .join("\n"),
@@ -1130,7 +1159,7 @@ impl ExternalService for PostgresClusterService {
             // or pre-DNS deployments.
             let hosts: Vec<String> = data_nodes
                 .iter()
-                .map(|n| format!("{}:{}", n.hostname, n.port))
+                .map(|n| format!("{}:{}", uri_host(&n.hostname), n.port))
                 .collect();
             format!(
                 "postgresql://{}:{}@{}/{}?target_session_attrs=read-write",
@@ -1636,6 +1665,63 @@ exit 0
         }
     }
 
+    /// Regression: after an unclean restart a member found its own stale
+    /// pidfile ("already running with PID 1") and crash-looped, because the
+    /// cleanup glob stopped two levels below where pg_autoctl writes it.
+    #[test]
+    fn stale_pidfile_cleanup_reaches_pg_autoctls_nested_pidfile() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let runtime = root.path().join("pg_autoctl");
+        let nested = runtime.join("var/lib/postgresql/monitor");
+        std::fs::create_dir_all(&nested).expect("create pidfile dir");
+        let pidfile = nested.join("pg_autoctl.pid");
+        let unrelated = nested.join("pg_autoctl.state");
+        std::fs::write(&pidfile, "1\n").expect("write pidfile");
+        std::fs::write(&unrelated, "keep").expect("write state");
+
+        let script =
+            STALE_PIDFILE_CLEANUP.replace("/tmp/pg_autoctl", &runtime.display().to_string());
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .status()
+            .expect("run cleanup");
+
+        assert!(status.success());
+        assert!(!pidfile.exists(), "the nested pidfile must be removed");
+        assert!(unrelated.exists(), "only pidfiles are removed");
+
+        // A first boot has no runtime dir at all; that must not fail the
+        // `set -e` monitor script.
+        let missing = STALE_PIDFILE_CLEANUP.replace(
+            "/tmp/pg_autoctl",
+            &root.path().join("absent").display().to_string(),
+        );
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("set -e\n{missing}"))
+            .status()
+            .expect("run cleanup");
+        assert!(status.success());
+    }
+
+    #[test]
+    fn member_commands_clear_stale_pidfiles_before_running() {
+        let docker = Docker::connect_with_local_defaults().unwrap();
+        let svc = PostgresClusterService::new("ha-pg".to_string(), Arc::new(docker));
+        for script in [&svc.monitor_command()[2], &svc.node_command()[2]] {
+            let cleanup = script
+                .find(STALE_PIDFILE_CLEANUP)
+                .expect("the start script must clear stale pidfiles");
+            let run = script.find("pg_autoctl run").expect("runs pg_autoctl");
+            assert!(
+                cleanup < run,
+                "cleanup must happen before pg_autoctl starts"
+            );
+            assert!(!script.contains("/tmp/pg_autoctl/*/*.pid"));
+        }
+    }
+
     #[test]
     fn test_monitor_command_contains_ssl() {
         let docker = Docker::connect_with_defaults()
@@ -2008,6 +2094,101 @@ host app_db app_user 10.0.0.0/8 md5
             !params.environment.contains_key("REPLICATION_PASSWORD"),
             "the monitor never needs the replication secret"
         );
+    }
+
+    #[test]
+    fn uri_host_brackets_only_ipv6_literals() {
+        assert_eq!(uri_host("fd00::10"), "[fd00::10]");
+        assert_eq!(uri_host("::1"), "[::1]");
+        assert_eq!(uri_host("10.52.0.10"), "10.52.0.10");
+        assert_eq!(uri_host("postgres-ha-pg-monitor"), "postgres-ha-pg-monitor");
+        assert_eq!(
+            uri_host("ha-pg-1.ha-pg.temps.local"),
+            "ha-pg-1.ha-pg.temps.local"
+        );
+        // Already bracketed is not a bare literal: left alone, not doubled.
+        assert_eq!(uri_host("[fd00::10]"), "[fd00::10]");
+    }
+
+    /// Regression: a control plane whose private address is IPv6 put it
+    /// bare into the data members' monitor URI
+    /// (`...@fd00::10:6030/pg_auto_failover`), which libpq cannot parse, so
+    /// worker data members could never register.
+    #[test]
+    fn ipv6_monitor_address_yields_a_parseable_monitor_uri() {
+        use std::str::FromStr;
+
+        let docker = Docker::connect_with_defaults()
+            .unwrap_or_else(|_| Docker::connect_with_local_defaults().unwrap());
+        let service = PostgresClusterService::new("ha-pg".to_string(), Arc::new(docker));
+        let config: PostgresClusterConfig =
+            serde_json::from_value(serde_json::json!({ "password": "secret" })).unwrap();
+        let spec = ClusterMemberSpec {
+            role: "replica".to_string(),
+            node_id: Some(2),
+            ordinal: 1,
+            hostname: Some("fd00::21".to_string()),
+        };
+
+        let params = service.build_member_params(
+            &spec,
+            &config,
+            "fd00::10",
+            6030,
+            6031,
+            crate::externalsvc::ServiceResourceLimits::default(),
+            &test_auth(),
+        );
+
+        let uri = params.environment.get("MONITOR_URI").unwrap();
+        assert!(uri.contains("@[fd00::10]:6030/pg_auto_failover"), "{uri}");
+        let parsed = tokio_postgres::Config::from_str(uri).expect("monitor URI must parse");
+        assert_eq!(
+            parsed.get_hosts(),
+            &[tokio_postgres::config::Host::Tcp("fd00::10".to_string())]
+        );
+        assert_eq!(parsed.get_ports(), &[6030]);
+        // pg_autoctl's `--hostname` takes the bare address.
+        assert_eq!(params.environment.get("NODE_HOSTNAME").unwrap(), "fd00::21");
+    }
+
+    #[test]
+    fn ipv6_members_yield_a_parseable_cluster_connection_string() {
+        use std::str::FromStr;
+
+        let docker = Docker::connect_with_defaults()
+            .unwrap_or_else(|_| Docker::connect_with_local_defaults().unwrap());
+        let service = PostgresClusterService::new("ha-pg".to_string(), Arc::new(docker));
+        let member = |hostname: &str, port: i32| ClusterMemberInfo {
+            role: "replica".to_string(),
+            hostname: hostname.to_string(),
+            port,
+            status: "running".to_string(),
+        };
+        let config = ServiceConfig {
+            name: "ha-pg".to_string(),
+            service_type: ServiceType::Postgres,
+            version: None,
+            parameters: serde_json::json!({ "password": "secret" }),
+        };
+
+        let url = service
+            .cluster_connection_string(
+                &[member("fd00::21", 6031), member("10.52.0.22", 6032)],
+                &config,
+            )
+            .unwrap();
+
+        assert!(url.contains("@[fd00::21]:6031,10.52.0.22:6032/"), "{url}");
+        let parsed = tokio_postgres::Config::from_str(&url).expect("cluster URL must parse");
+        assert_eq!(
+            parsed.get_hosts(),
+            &[
+                tokio_postgres::config::Host::Tcp("fd00::21".to_string()),
+                tokio_postgres::config::Host::Tcp("10.52.0.22".to_string()),
+            ]
+        );
+        assert_eq!(parsed.get_ports(), &[6031, 6032]);
     }
 
     #[test]

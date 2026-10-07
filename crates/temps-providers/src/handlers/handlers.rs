@@ -92,7 +92,69 @@ pub(crate) fn external_service_problem(
     error: &crate::services::ExternalServiceError,
     detail: String,
 ) -> Problem {
-    worker_node_required(error).unwrap_or_else(|| internal_server_error().detail(detail).build())
+    worker_node_required(error)
+        .or_else(|| cluster_placement_problem(error))
+        .unwrap_or_else(|| internal_server_error().detail(detail).build())
+}
+
+/// A cluster placement the current configuration cannot serve: members on
+/// worker nodes could not reach members on the control plane, or the
+/// cluster's members cannot be given host ports — a 409 with the remedy in
+/// `detail`. A member list larger than a cluster can hold is a 400. Never a
+/// 500: nothing failed, the operator has a configuration step to take first.
+fn cluster_placement_problem(error: &crate::services::ExternalServiceError) -> Option<Problem> {
+    use crate::services::ExternalServiceError as E;
+    // Every variant is listed, no catch-all: a new variant must be classified
+    // here before it compiles, instead of silently falling through to a
+    // handler's generic 500.
+    let title = match error {
+        E::ControlPlaneAddressRequired { .. } | E::ControlPlaneMemberUnreachable { .. } => {
+            "Cluster Placement Not Reachable"
+        }
+        E::ClusterPortsUnavailable { .. } => "Cluster Ports Unavailable",
+        // The request itself is invalid, not in conflict with any state.
+        E::ClusterMemberLimitExceeded { .. } => {
+            return Some(
+                bad_request()
+                    .title("Too Many Cluster Members")
+                    .detail(error.to_string())
+                    .build(),
+            )
+        }
+        // Not placement conditions: each handler classifies these itself
+        // (and `worker_node_required` owns the two "no daemon" variants).
+        E::ServiceNotFound { .. }
+        | E::ServiceNotFoundByName { .. }
+        | E::ServiceNotFoundBySlug { .. }
+        | E::InitializationFailed { .. }
+        | E::UpgradeRejected { .. }
+        | E::EncryptionFailed { .. }
+        | E::DecryptionFailed { .. }
+        | E::InvalidServiceType { .. }
+        | E::ServiceNotLinkedToProject { .. }
+        | E::ServiceClaimDenied { .. }
+        | E::InvalidDatabaseProvisioning { .. }
+        | E::ProjectNotFound { .. }
+        | E::EnvironmentNotFound { .. }
+        | E::DatabaseError { .. }
+        | E::ArchiveSourceDesynced { .. }
+        | E::ParameterValidationFailed { .. }
+        | E::StartFailed { .. }
+        | E::UpgradeInProgress { .. }
+        | E::StopFailed { .. }
+        | E::DeletionFailed { .. }
+        | E::ServiceHasLinkedProjects { .. }
+        | E::EnvironmentVariableNotFound { .. }
+        | E::ParameterNotFound { .. }
+        | E::ParameterNotSensitive { .. }
+        | E::EncryptedVariableAccessDenied { .. }
+        | E::DockerError { .. }
+        | E::DuplicateServiceType { .. }
+        | E::InternalError { .. }
+        | E::DockerUnavailable(_)
+        | E::LocalWorkloadsDisabled { .. } => return None,
+    };
+    Some(conflict().title(title).detail(error.to_string()).build())
 }
 
 /// Get available service types
@@ -812,7 +874,11 @@ fn service_create_failure_code(
         }
         E::ParameterValidationFailed { .. }
         | E::InvalidServiceType { .. }
-        | E::InvalidDatabaseProvisioning { .. } => OperationFailureCode::InvalidConfiguration,
+        | E::InvalidDatabaseProvisioning { .. }
+        | E::ControlPlaneAddressRequired { .. }
+        | E::ControlPlaneMemberUnreachable { .. }
+        | E::ClusterPortsUnavailable { .. }
+        | E::ClusterMemberLimitExceeded { .. } => OperationFailureCode::InvalidConfiguration,
         E::DuplicateServiceType { .. } => OperationFailureCode::Conflict,
         E::ProjectNotFound { .. } | E::EnvironmentNotFound { .. } => OperationFailureCode::NotFound,
         E::DatabaseError { .. } => OperationFailureCode::Database,
@@ -4043,6 +4109,80 @@ mod tests {
             let shared = upgrade_error_problem(error).expect("shared mapping classifies it");
             assert_eq!(shared.body.get("detail"), problem.body.get("detail"));
         }
+    }
+
+    /// A cluster whose worker members could not reach its control-plane
+    /// members is a configuration conflict with a remedy — a 409 carrying the
+    /// cluster name and the fix, through every handler's generic path, and
+    /// classified as invalid configuration for telemetry.
+    #[test]
+    fn unreachable_cluster_placement_is_an_actionable_conflict() {
+        use crate::services::ExternalServiceError as E;
+
+        let no_address = E::ControlPlaneAddressRequired {
+            name: "ha-pg".to_string(),
+            reason: "no control-plane private address is configured".to_string(),
+        };
+        let loopback_only = E::ControlPlaneMemberUnreachable {
+            name: "ha-pg".to_string(),
+            container_name: "postgres-ha-pg-monitor".to_string(),
+            port: 6090,
+            address: "10.52.0.10".to_string(),
+        };
+
+        let no_ports = E::ClusterPortsUnavailable {
+            service_id: 6001,
+            reason: "member ordinal 10 is outside the cluster's 10-port block".to_string(),
+        };
+
+        for (error, remedy) in [
+            (&no_address, "--private-address"),
+            (&loopback_only, "recreate it"),
+            (&no_ports, "10-port block"),
+        ] {
+            let problem = external_service_problem(error, "Failed to do a thing".to_string());
+            assert_eq!(problem.status_code, StatusCode::CONFLICT, "{error}");
+            let detail = problem
+                .body
+                .get("detail")
+                .and_then(|v| v.as_str())
+                .expect("detail is always set");
+            assert!(
+                detail.contains("ha-pg") || detail.contains("6001"),
+                "the error must name the cluster: {detail}"
+            );
+            assert!(detail.contains(remedy), "{detail}");
+            assert_eq!(
+                service_create_failure_code(error),
+                OperationFailureCode::InvalidConfiguration
+            );
+        }
+    }
+
+    /// Too many members is a bad request on every endpoint (create, retry),
+    /// never a generic 500.
+    #[test]
+    fn too_many_cluster_members_is_a_bad_request() {
+        let error = crate::services::ExternalServiceError::ClusterMemberLimitExceeded {
+            name: "ha-pg".to_string(),
+            requested: 11,
+            max: 10,
+        };
+        let problem = external_service_problem(&error, "Failed to retry cluster".to_string());
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .expect("detail is always set");
+        assert!(
+            detail.contains("ha-pg") && detail.contains("at most 10"),
+            "{detail}"
+        );
+        assert_eq!(
+            service_create_failure_code(&error),
+            OperationFailureCode::InvalidConfiguration
+        );
     }
 
     /// Everything else keeps the caller's context and its 500.
