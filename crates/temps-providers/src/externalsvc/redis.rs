@@ -1521,13 +1521,26 @@ impl RedisService {
     ///    enabled; the manifest-based directory is required.
     /// 4. Re-enables the restart policy (always) regardless of outcome.
     /// 5. Starts the container and waits for the healthcheck.
+    ///
+    /// `gate` lets a cancelled restore stop while the snapshot downloads:
+    /// the download checks it between chunks, and it is checked again after
+    /// decompression, before the container is stopped or written.
     async fn restore_from_legacy(
         &self,
         s3_client: &aws_sdk_s3::Client,
         backup_location: &str,
         s3_source: &temps_entities::s3_sources::Model,
+        gate: &dyn super::RestoreGate,
     ) -> Result<()> {
         info!("Restoring Redis from rdb.gz backup: {}", backup_location);
+        let cancelled = || {
+            anyhow::Error::new(super::RestoreCancelled {
+                target: self.get_container_name(),
+            })
+        };
+        if gate.is_cancelled() {
+            return Err(cancelled());
+        }
 
         // ── 1. Stream the .rdb.gz from S3 and gunzip it on the host ─────────
         //
@@ -1551,7 +1564,7 @@ impl RedisService {
             &s3_source.bucket_name,
             backup_location,
             &gz_host_path,
-            &super::NoopRestoreGate,
+            gate,
         )
         .await?;
         super::restore_staging::gunzip_file(
@@ -1561,6 +1574,11 @@ impl RedisService {
         )
         .await?;
         let _ = tokio::fs::remove_file(&gz_host_path).await;
+        // Last check before the container is stopped and its data replaced;
+        // the temp dir (and what was staged in it) is removed on return.
+        if gate.is_cancelled() {
+            return Err(cancelled());
+        }
 
         // ── 3. Resolve the target container name ─────────────────────────────
         let container_name = self
@@ -2796,8 +2814,15 @@ impl ExternalService for RedisService {
                 .await
         } else {
             // Legacy backup: fall back to old tar-based approach
-            self.restore_from_legacy(s3_client, backup_location, s3_source)
-                .await
+            // This entry point has no cancellation: the orchestrator closes the
+            // gate before calling a Redis in-place restore.
+            self.restore_from_legacy(
+                s3_client,
+                backup_location,
+                s3_source,
+                &super::NoopRestoreGate,
+            )
+            .await
         }
     }
 
@@ -2908,7 +2933,7 @@ impl ExternalService for RedisService {
 
         if backup_location_kind == RedisBackupLocationKind::RdbGzip {
             if let Err(error) = new_service
-                .restore_from_legacy(ctx.s3_client, ctx.backup_location, ctx.s3_source)
+                .restore_from_legacy(ctx.s3_client, ctx.backup_location, ctx.s3_source, ctx.gate)
                 .await
             {
                 let _ = self
@@ -3393,6 +3418,84 @@ mod tests {
         assert!(
             !error.contains(marker),
             "container output must stay in operator logs, not user-facing errors: {error}"
+        );
+    }
+
+    /// A gate whose cancellation is already recorded.
+    struct CancelledGate;
+
+    #[async_trait::async_trait]
+    impl crate::externalsvc::RestoreGate for CancelledGate {
+        fn is_cancelled(&self) -> bool {
+            true
+        }
+        async fn begin_target_writes(
+            &self,
+        ) -> std::result::Result<(), crate::externalsvc::RestoreCancelled> {
+            Err(crate::externalsvc::RestoreCancelled {
+                target: "redis-copy".into(),
+            })
+        }
+    }
+
+    /// REGRESSION (Greptile on #1295): a cancelled restore of a `.rdb.gz`
+    /// backup must stop before downloading the snapshot or touching the
+    /// container. The restore's own gate reaches the download, which also
+    /// checks it between chunks.
+    #[tokio::test]
+    async fn cancelled_rdb_restore_stops_before_downloading() {
+        // Never contacted: the restore must stop before any Docker call.
+        let docker = Arc::new(
+            Docker::connect_with_http("http://127.0.0.1:9", 1, bollard::API_DEFAULT_VERSION)
+                .expect("lazy Docker client"),
+        );
+        let service = RedisService::new("copy".to_string(), docker);
+        // No endpoint is reachable: a request would fail with a network
+        // error instead of the cancellation this asserts.
+        let s3_client = aws_sdk_s3::Client::from_conf(
+            aws_sdk_s3::Config::builder()
+                .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                .region(aws_sdk_s3::config::Region::new("us-east-1"))
+                .endpoint_url("http://127.0.0.1:9")
+                .build(),
+        );
+        let now = chrono::Utc::now();
+        let s3_source = temps_entities::s3_sources::Model {
+            id: 1,
+            backing_service_id: None,
+            name: "source-1".to_string(),
+            bucket_name: "backups".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: None,
+            bucket_path: String::new(),
+            access_key_id: "ciphertext".to_string(),
+            secret_key: "ciphertext".to_string(),
+            session_token: None,
+            credentials_expire_at: None,
+            force_path_style: Some(true),
+            is_default: false,
+            managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let error = service
+            .restore_from_legacy(
+                &s3_client,
+                "external_services/redis/cache/backup.rdb.gz",
+                &s3_source,
+                &CancelledGate,
+            )
+            .await
+            .expect_err("a cancelled restore must not proceed");
+
+        assert!(
+            error
+                .downcast_ref::<crate::externalsvc::RestoreCancelled>()
+                .is_some(),
+            "expected a cancellation, got: {error}"
         );
     }
 
@@ -4689,7 +4792,12 @@ mod tests {
             assert!(changed.contains("OK"), "{changed}");
 
             service
-                .restore_from_legacy(&minio.s3_client, key, &minio.s3_source)
+                .restore_from_legacy(
+                    &minio.s3_client,
+                    key,
+                    &minio.s3_source,
+                    &crate::externalsvc::NoopRestoreGate,
+                )
                 .await
                 .expect("rdb.gz restore");
 
