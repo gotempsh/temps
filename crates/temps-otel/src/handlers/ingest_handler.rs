@@ -118,6 +118,12 @@ impl From<OtelError> for Problem {
                     .with_title("Metric Alert Rule Not Found")
                     .with_detail(error.to_string())
             }
+            OtelError::MetricAlertLimitReached { .. } => {
+                warn!(error = %error, "OTel metric alert rule limit reached");
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Alert Rule Limit Reached")
+                    .with_detail(error.to_string())
+            }
             OtelError::Storage { .. }
             | OtelError::Database(_)
             | OtelError::S3 { .. }
@@ -1419,6 +1425,27 @@ mod tests {
             .get("detail")
             .and_then(|v| v.as_str())
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn metric_alert_limit_maps_to_conflict_with_actionable_detail() {
+        let err = OtelError::MetricAlertLimitReached {
+            project_id: 7,
+            existing: 200,
+            limit: 200,
+        };
+        let problem: Problem = err.into();
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        let detail = problem_detail(&problem);
+        assert!(
+            detail.contains("Project 7"),
+            "detail names the project: {detail}"
+        );
+        assert!(
+            detail.contains("200 metric alert rules"),
+            "detail: {detail}"
+        );
+        assert!(detail.contains("limit is 200"), "detail: {detail}");
     }
 
     /// Internal-error variants must never echo their underlying message (DB

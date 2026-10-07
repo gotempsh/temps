@@ -17,8 +17,8 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use sea_orm::ActiveValue::Set;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction,
+    DbBackend, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Statement, TransactionTrait,
 };
 
 use temps_entities::metric_alert_rules::{ActiveModel, Column, Entity, Model};
@@ -27,6 +27,17 @@ use crate::detectors::DetectionConfig;
 use crate::error::OtelError;
 
 pub const MAX_LABEL_FILTERS: usize = 10;
+
+/// Maximum number of metric alert rules a single project may hold.
+///
+/// The [`MetricAlertEvaluator`](crate::services::metric_alert_evaluator)
+/// issues at least one aggregation query against OTel storage per enabled
+/// rule every 30s cycle (dynamic rules fan out further, up to `max_series`
+/// series each), so an unbounded rule count lets a single project with
+/// `OtelWrite` turn the evaluator into a resource-exhaustion vector against
+/// the shared storage backend. 200 is far above any realistic hand-written
+/// set while keeping one project's worst case bounded.
+pub const MAX_METRIC_ALERT_RULES_PER_PROJECT: u64 = 200;
 const MAX_LABEL_VALUE_LEN: usize = 500;
 
 /// Max `group_by` keys (ADR-026 Phase 3). More than two is unreadable in the
@@ -240,6 +251,63 @@ fn validate_rule(
     Ok(())
 }
 
+/// Lock the `projects` row for `project_id` inside `txn`.
+///
+/// `FOR NO KEY UPDATE` serializes concurrent rule creations for the same
+/// project (they all take this lock) without blocking inserts into tables that
+/// reference `projects` by foreign key — those take `FOR KEY SHARE`, which
+/// `FOR NO KEY UPDATE` does not conflict with, so OTel/error ingest for the
+/// project is never stalled by a rule being created.
+///
+/// Returns `false` when the project does not exist.
+async fn lock_project_row(txn: &DatabaseTransaction, project_id: i32) -> Result<bool, OtelError> {
+    let row = txn
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT id FROM projects WHERE id = $1 FOR NO KEY UPDATE",
+            [project_id.into()],
+        ))
+        .await?;
+    Ok(row.is_some())
+}
+
+/// Insert `rule` for `project_id` unless the project already holds `limit`
+/// metric alert rules.
+///
+/// The project row is locked for the duration of the count + insert (see
+/// [`lock_project_row`]), so concurrent creations for the same project
+/// serialize and cannot overshoot the limit. The transaction rolls back on
+/// every early return (dropping it uncommitted).
+async fn insert_rule_within_project_limit(
+    db: &DatabaseConnection,
+    project_id: i32,
+    rule: ActiveModel,
+    limit: u64,
+) -> Result<Model, OtelError> {
+    let txn = db.begin().await?;
+    if !lock_project_row(&txn, project_id).await? {
+        txn.rollback().await?;
+        return Err(OtelError::ProjectNotFound { project_id });
+    }
+
+    let existing = Entity::find()
+        .filter(Column::ProjectId.eq(project_id))
+        .count(&txn)
+        .await?;
+    if existing >= limit {
+        txn.rollback().await?;
+        return Err(OtelError::MetricAlertLimitReached {
+            project_id,
+            existing,
+            limit,
+        });
+    }
+
+    let model = rule.insert(&txn).await?;
+    txn.commit().await?;
+    Ok(model)
+}
+
 /// Service managing CRUD over `metric_alert_rules`, plus evaluator support.
 pub struct MetricAlertService {
     db: Arc<DatabaseConnection>,
@@ -305,7 +373,7 @@ impl MetricAlertService {
             grouped_notification_threshold,
         )?;
 
-        let model = ActiveModel {
+        let active = ActiveModel {
             project_id: Set(project_id),
             name: Set(name.trim().to_string()),
             metric_name: Set(metric_name.trim().to_string()),
@@ -322,10 +390,14 @@ impl MetricAlertService {
             max_series: Set(max_series),
             grouped_notification_threshold: Set(grouped_notification_threshold),
             ..Default::default()
-        }
-        .insert(self.db.as_ref())
-        .await?;
-        Ok(model)
+        };
+        insert_rule_within_project_limit(
+            self.db.as_ref(),
+            project_id,
+            active,
+            MAX_METRIC_ALERT_RULES_PER_PROJECT,
+        )
+        .await
     }
 
     /// Fetch a single rule by id, SCOPED to `project_id`.
@@ -558,6 +630,23 @@ mod tests {
         m
     }
 
+    /// Row returned by the `SELECT id FROM projects ... FOR NO KEY UPDATE`
+    /// project lock taken before every create.
+    fn project_lock_row(project_id: i32) -> BTreeMap<String, Value> {
+        let mut m = BTreeMap::new();
+        m.insert("id".to_string(), Value::Int(Some(project_id)));
+        m
+    }
+
+    /// Mock database primed for one successful `create`: the project lock
+    /// row, the per-project rule count (`existing`), then the inserted row.
+    fn mock_db_ready_for_create(existing: i64) -> MockDatabase {
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![project_lock_row(7)]])
+            .append_query_results(vec![vec![count_row(existing)]])
+            .append_query_results(vec![vec![sample_model(1)]])
+    }
+
     fn sample_model(id: i32) -> Model {
         let now: DBDateTime = chrono::Utc::now();
         Model {
@@ -592,9 +681,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_success() {
-        let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results(vec![vec![sample_model(1)]])
-            .into_connection();
+        let db = mock_db_ready_for_create(0).into_connection();
         let service = MetricAlertService::new(Arc::new(db));
 
         let result = service
@@ -621,6 +708,95 @@ mod tests {
         assert_eq!(model.id, 1);
         assert_eq!(model.project_id, 7);
         assert_eq!(model.detection_kind, "static");
+    }
+
+    /// Arguments for a valid static rule on project 7, for limit tests.
+    async fn create_valid_rule(service: &MetricAlertService) -> Result<Model, OtelError> {
+        service
+            .create(
+                7,
+                "High latency".to_string(),
+                "http.server.duration".to_string(),
+                "p95".to_string(),
+                static_cfg(),
+                300,
+                120,
+                "warning".to_string(),
+                true,
+                vec![],
+                vec![],
+                false,
+                20,
+                5,
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn create_just_under_the_per_project_limit_succeeds() {
+        let existing = MAX_METRIC_ALERT_RULES_PER_PROJECT as i64 - 1;
+        let db = mock_db_ready_for_create(existing).into_connection();
+        let service = MetricAlertService::new(Arc::new(db));
+
+        let model = create_valid_rule(&service)
+            .await
+            .expect("one below the limit must still be accepted");
+        assert_eq!(model.id, 1);
+    }
+
+    #[tokio::test]
+    async fn create_at_the_per_project_limit_is_rejected_without_inserting() {
+        let limit = MAX_METRIC_ALERT_RULES_PER_PROJECT;
+        // Only the lock row and the count are primed: if the service tried
+        // to insert anyway the mock would run out of results and error with
+        // a different variant.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![project_lock_row(7)]])
+            .append_query_results(vec![vec![count_row(limit as i64)]])
+            .into_connection();
+
+        let rule = ActiveModel {
+            project_id: Set(7),
+            ..Default::default()
+        };
+        let err = insert_rule_within_project_limit(&db, 7, rule, limit)
+            .await
+            .expect_err("a project at the limit must not get another rule");
+        match err {
+            OtelError::MetricAlertLimitReached {
+                project_id,
+                existing,
+                limit: reported,
+            } => {
+                assert_eq!(project_id, 7);
+                assert_eq!(existing, limit);
+                assert_eq!(reported, limit);
+            }
+            other => panic!("expected MetricAlertLimitReached, got {other:?}"),
+        }
+
+        let log = format!("{:?}", db.into_transaction_log());
+        assert!(
+            log.contains("FOR NO KEY UPDATE"),
+            "count must run under the project row lock: {log}"
+        );
+        assert!(
+            !log.contains("INSERT INTO"),
+            "no insert may be issued at the limit: {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_for_missing_project_returns_project_not_found() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<BTreeMap<String, Value>>::new()])
+            .into_connection();
+        let service = MetricAlertService::new(Arc::new(db));
+
+        let err = create_valid_rule(&service)
+            .await
+            .expect_err("unknown project must be rejected");
+        assert!(matches!(err, OtelError::ProjectNotFound { project_id: 7 }));
     }
 
     #[tokio::test]
@@ -936,9 +1112,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_label_filters_valid_passes_validation() {
-        let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results(vec![vec![sample_model(1)]])
-            .into_connection();
+        let db = mock_db_ready_for_create(0).into_connection();
         let service = MetricAlertService::new(Arc::new(db));
 
         let result = service
@@ -1070,9 +1244,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dynamic_alerts_with_anomaly_accepted() {
-        let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results(vec![vec![sample_model(1)]])
-            .into_connection();
+        let db = mock_db_ready_for_create(0).into_connection();
         let service = MetricAlertService::new(Arc::new(db));
 
         // Robust anomaly + dynamic (per-series) alerting is now supported: each
@@ -1134,9 +1306,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dynamic_static_valid_passes() {
-        let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results(vec![vec![sample_model(1)]])
-            .into_connection();
+        let db = mock_db_ready_for_create(0).into_connection();
         let service = MetricAlertService::new(Arc::new(db));
 
         let result = service
@@ -1162,9 +1332,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_grouped_notification_threshold_valid_passes() {
-        let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results(vec![vec![sample_model(1)]])
-            .into_connection();
+        let db = mock_db_ready_for_create(0).into_connection();
         let service = MetricAlertService::new(Arc::new(db));
 
         // In-range custom threshold (1..=1000) is accepted.

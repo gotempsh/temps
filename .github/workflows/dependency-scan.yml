@@ -92,28 +92,62 @@ jobs:
       # - RUSTSEC-2025-0134 (rustls-pemfile): used directly across several
       #   crates; migrating to rustls-pki-types' PemObject API is tracked
       #   separately, not a drop-in version bump.
-      # - RUSTSEC-2024-0436 (paste): transitive via clickhouse ->
-      #   higher-kinded-types -> polonius-the-crab -> paste. Proc-macro only
-      #   (compile-time codegen, not linked into the binary); clickhouse
-      #   the pinned ClickHouse dependency still includes it.
-      # - RUSTSEC-2026-0173 (proc-macro-error2): transitive via sea-orm ->
-      #   sea-orm-macros -> sea-bae -> proc-macro-error2. Proc-macro only;
-      #   sea-orm 1.1.20 is the pinned major, 2.0 is a breaking migration.
-      # - RUSTSEC-2024-0388 (derivative): transitive via pingora-core ->
-      #   derivative. Proc-macro only; the pinned Pingora dependency includes it.
+      # - RUSTSEC-2024-0436 (paste): proc-macro only (compile-time codegen,
+      #   not linked into the binary). Cargo.lock dependents:
+      #   * rav1e <- ravif <- image (default `avif` feature) <- temps-auth
+      #     (direct `image` dep, and via qrcode for MFA QR codes). This is
+      #     the only path in the default build -- temps-auth is depended on
+      #     by nearly every service crate.
+      #   * tokenizers (and macro_rules_attribute <- tokenizers) <-
+      #     temps-embeddings, only behind its optional `huggingface`/`all`
+      #     feature, which no workspace crate enables (in Cargo.lock but not
+      #     compiled by default).
+      # - RUSTSEC-2026-0173 (proc-macro-error2): proc-macro only. Paths:
+      #   * sea-orm -> sea-orm-macros -> sea-bae -> proc-macro-error2
+      #     (default build); sea-orm 1.1.20 is the pinned major, 2.0 is a
+      #     breaking migration.
+      #   * validator -> validator_derive -> proc-macro-error2, via
+      #     temps-import-types' optional `validation` feature, which no
+      #     workspace crate enables (in Cargo.lock only).
+      # - RUSTSEC-2024-0388 (derivative): transitive via pingora-core and
+      #   pingora-load-balancing -> derivative (temps-proxy, temps-edge).
+      #   Proc-macro only; the pinned Pingora 0.9 dependency includes it.
       #
       # The three below are vulnerability/unsoundness advisories (not "unmaintained"
       # notices), blocked on upstream fixes with no non-forking workaround.
       # Full reachability analysis for each lives in the root Cargo.toml
       # under "Dependency Overrides - Security Fixes" -- re-verify that
       # analysis before removing/renewing these on advisory-db updates:
-      # - RUSTSEC-2023-0071 (rsa 0.9.10 via jsonwebtoken <- octocrab, and
-      #   direct in temps-dns/gcp.rs; rsa 0.10.0-rc via russh <-
-      #   temps-deployments for SSH node enrollment, where RSA is only used
-      #   for host-key/user-key signatures and verification -- no RSA
-      #   decryption path exists in SSH2): Marvin Attack is a chosen-ciphertext
-      #   *decryption* oracle attack; temps has zero RSA decryption, only
-      #   RSA signing (GitHub App JWTs, GCP DNS service-account JWTs). The
+      # - RUSTSEC-2023-0071 (rsa, Marvin Attack). Locked paths and how each
+      #   uses RSA:
+      #   rsa 0.9.10:
+      #   * jsonwebtoken 10 <- octocrab (temps-git, temps-deployments) and
+      #     jsonwebtoken 11 direct in temps-git: GitHub App JWT RS256
+      #     *signing* (temps-git github.rs, github_provider.rs,
+      #     git_provider_manager.rs).
+      #   * direct in temps-dns (providers/gcp.rs sign_rs256): GCP Cloud DNS
+      #     service-account JWT *signing*.
+      #   * openidconnect <- temps-auth: OIDC id_token signature
+      #     *verification* (public-key op).
+      #   * direct in temps-email-tracking (sns.rs verify_pkcs1v15): AWS SNS
+      #     message signature *verification* only (public key from the SNS
+      #     signing cert).
+      #   * sqlx-mysql <- sqlx (built because the workspace sqlx enables the
+      #     `mysql` feature): caching_sha2/sha256_password auth on non-TLS
+      #     connections RSA-OAEP *encrypts* the password to the server's
+      #     public key -- encryption, never decryption.
+      #   * dev-dependency only: temps-deployments (cert_validator.rs test
+      #     module generates throwaway RSA keys) and the
+      #     examples/google-indexing-plugin test module (keygen); that
+      #     example also signs RS256 JWTs via jsonwebtoken 11.
+      #   rsa 0.10.0-rc.18: russh/ssh-key <- temps-deployments for SSH node
+      #   enrollment, where RSA is only used for host-key/user-key signatures
+      #   and verification -- no RSA decryption path exists in SSH2.
+      #   Marvin Attack is a chosen-ciphertext *decryption* oracle attack;
+      #   no workspace code calls RSA decryption (no Pkcs1v15Encrypt/Oaep
+      #   decrypt on any input; every `.decrypt(` in the workspace is the
+      #   AES-GCM EncryptionService/CookieCrypto). Uses are signing,
+      #   verification, client-side encryption, and test keygen. The
       #   signing timing side-channel has not been independently assessed;
       #   network latency alone does not prove it unobservable. This exception
       #   requires maintainer risk review. No fixed `rsa` release exists upstream

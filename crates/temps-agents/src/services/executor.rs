@@ -193,9 +193,14 @@ pub struct AgentExecutor {
 /// that in-tree sandbox tooling calls with `TEMPS_API_TOKEN`, derived from
 /// what a run is configured to use:
 ///
-/// - Model, MCP-tool and git traffic go through bridge-scoped relays
-///   (`/api/ai/sandbox-models`, `/api/ai/sandbox-tools`,
-///   `/api/git/sandbox-relay`) that authenticate per run without this token.
+/// - Model and MCP-tool traffic go through bridge-scoped relays
+///   (`/api/ai/sandbox-models`, `/api/ai/sandbox-tools`) that authenticate
+///   per run without this token.
+/// - Git does not use this token either, but it does not go through a relay
+///   yet: every provider's `git_relay_base_url` refuses (the Docker sidecar
+///   fails closed until it has capability authentication), so
+///   `prepare_sandbox_workspace` still seeds the connection's provider token
+///   into `~/.git-credentials` and the `gh`/`glab` config.
 /// - The workflow-memory script installed in every sandbox is the only
 ///   consumer of `TEMPS_API_TOKEN`, and its HTTP API has no in-tree
 ///   implementation (see `temps-memory`), so it needs no permission.

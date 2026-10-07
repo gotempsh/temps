@@ -334,6 +334,11 @@ impl From<ErrorTrackingError> for temps_core::problemdetails::Problem {
                     .with_title("Payload Too Large")
                     .with_detail(err.to_string())
             }
+            ErrorTrackingError::AlertRuleLimitReached { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Alert Rule Limit Reached")
+                    .with_detail(err.to_string())
+            }
             ErrorTrackingError::Database(_) | ErrorTrackingError::EmbeddingService(_) => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
@@ -369,6 +374,9 @@ impl axum::response::IntoResponse for ErrorTrackingError {
             ),
             ErrorTrackingError::ProjectNotFound => {
                 (StatusCode::NOT_FOUND, "Project not found".to_string())
+            }
+            ErrorTrackingError::AlertRuleLimitReached { .. } => {
+                (StatusCode::CONFLICT, self.to_string())
             }
             ErrorTrackingError::PayloadTooLarge {
                 field,

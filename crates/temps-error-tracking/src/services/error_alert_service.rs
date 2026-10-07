@@ -3,8 +3,9 @@
 
 use chrono::{Duration, Utc};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, FromQueryResult,
-    PaginatorTrait, QueryFilter, QueryOrder, Set,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction,
+    DbBackend, EntityTrait, FromQueryResult, PaginatorTrait, QueryFilter, QueryOrder, Set,
+    Statement, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -12,6 +13,75 @@ use temps_entities::{error_alert_fires, error_alert_rules, error_events, error_g
 use tracing::{error, info, warn};
 
 use super::types::ErrorTrackingError;
+
+/// Maximum number of error alert rules a single project may hold.
+///
+/// Every ingested error event is evaluated against all of its project's
+/// enabled rules (frequency and user-count triggers each issue a query per
+/// matching rule), so an unbounded rule count turns the ingest path into a
+/// resource-exhaustion vector against the shared database pool. 200 is two
+/// orders of magnitude above the two built-in defaults and any realistic
+/// hand-written set.
+pub const MAX_ERROR_ALERT_RULES_PER_PROJECT: u64 = 200;
+
+/// Lock the `projects` row for `project_id` inside `txn`.
+///
+/// `FOR NO KEY UPDATE` serializes concurrent rule creations for the same
+/// project (they all take this lock) without blocking inserts into tables that
+/// reference `projects` by foreign key -- those take `FOR KEY SHARE`, which
+/// `FOR NO KEY UPDATE` does not conflict with, so error ingest for the project
+/// is never stalled by a rule being created.
+///
+/// Returns `false` when the project does not exist.
+async fn lock_project_row(
+    txn: &DatabaseTransaction,
+    project_id: i32,
+) -> Result<bool, ErrorTrackingError> {
+    let row = txn
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT id FROM projects WHERE id = $1 FOR NO KEY UPDATE",
+            [project_id.into()],
+        ))
+        .await?;
+    Ok(row.is_some())
+}
+
+/// Insert `rule` for `project_id` unless the project already holds `limit`
+/// error alert rules.
+///
+/// The project row is locked for the duration of the count + insert (see
+/// [`lock_project_row`]), so concurrent creations for the same project
+/// serialize and cannot overshoot the limit.
+pub(crate) async fn insert_rule_within_project_limit(
+    db: &DatabaseConnection,
+    project_id: i32,
+    rule: error_alert_rules::ActiveModel,
+    limit: u64,
+) -> Result<error_alert_rules::Model, ErrorTrackingError> {
+    let txn = db.begin().await?;
+    if !lock_project_row(&txn, project_id).await? {
+        txn.rollback().await?;
+        return Err(ErrorTrackingError::ProjectNotFound);
+    }
+
+    let existing = error_alert_rules::Entity::find()
+        .filter(error_alert_rules::Column::ProjectId.eq(project_id))
+        .count(&txn)
+        .await?;
+    if existing >= limit {
+        txn.rollback().await?;
+        return Err(ErrorTrackingError::AlertRuleLimitReached {
+            project_id,
+            existing,
+            limit,
+        });
+    }
+
+    let inserted = rule.insert(&txn).await?;
+    txn.commit().await?;
+    Ok(inserted)
+}
 
 /// Trigger types that can fire an error alert
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -340,8 +410,13 @@ impl ErrorAlertService {
             ..Default::default()
         };
 
-        let result = rule.insert(self.db.as_ref()).await?;
-        Ok(result)
+        insert_rule_within_project_limit(
+            self.db.as_ref(),
+            project_id,
+            rule,
+            MAX_ERROR_ALERT_RULES_PER_PROJECT,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -763,5 +838,147 @@ mod tests {
         let json = serde_json::json!({"statuses": ["resolved", "assigned"]});
         let config: StatusChangeConfig = serde_json::from_value(json).unwrap();
         assert_eq!(config.statuses, vec!["resolved", "assigned"]);
+    }
+
+    // === Per-project alert rule limit ===
+
+    use sea_orm::{DatabaseBackend, MockDatabase, Value};
+    use std::collections::BTreeMap;
+
+    /// Row returned by the `SELECT id FROM projects ... FOR NO KEY UPDATE` lock.
+    fn project_lock_row(project_id: i32) -> BTreeMap<String, Value> {
+        BTreeMap::from([("id".to_string(), Value::Int(Some(project_id)))])
+    }
+
+    /// `COUNT(*) AS num_items` row read by `PaginatorTrait::count`.
+    fn count_row(n: u64) -> BTreeMap<String, Value> {
+        BTreeMap::from([("num_items".to_string(), Value::BigInt(Some(n as i64)))])
+    }
+
+    fn sample_rule(id: i32, project_id: i32) -> error_alert_rules::Model {
+        let now = Utc::now();
+        error_alert_rules::Model {
+            id,
+            project_id,
+            name: "New issue detected".to_string(),
+            trigger_type: "new_issue".to_string(),
+            trigger_config: serde_json::json!({}),
+            environment_filter: None,
+            error_level_filter: None,
+            notification_priority: "High".to_string(),
+            cooldown_minutes: 30,
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    async fn create_new_issue_rule(
+        service: &ErrorAlertService,
+        project_id: i32,
+    ) -> Result<error_alert_rules::Model, ErrorTrackingError> {
+        service
+            .create_rule(
+                project_id,
+                "New issue detected".to_string(),
+                "new_issue".to_string(),
+                serde_json::json!({}),
+                None,
+                None,
+                "High".to_string(),
+                30,
+                true,
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn create_rule_just_under_the_per_project_limit_succeeds() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![project_lock_row(3)]])
+            .append_query_results(vec![vec![count_row(MAX_ERROR_ALERT_RULES_PER_PROJECT - 1)]])
+            .append_query_results(vec![vec![sample_rule(11, 3)]])
+            .into_connection();
+        let service = ErrorAlertService::new(Arc::new(db));
+
+        let rule = create_new_issue_rule(&service, 3)
+            .await
+            .expect("one below the limit must still be accepted");
+        assert_eq!(rule.id, 11);
+        assert_eq!(rule.project_id, 3);
+    }
+
+    #[tokio::test]
+    async fn create_rule_at_the_per_project_limit_is_rejected_without_inserting() {
+        let limit = MAX_ERROR_ALERT_RULES_PER_PROJECT;
+        // Only the lock row and the count are primed: an insert attempt would
+        // exhaust the mock and surface as a Database error instead.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![project_lock_row(3)]])
+            .append_query_results(vec![vec![count_row(limit)]])
+            .into_connection();
+
+        let rule = error_alert_rules::ActiveModel {
+            project_id: Set(3),
+            ..Default::default()
+        };
+        let err = insert_rule_within_project_limit(&db, 3, rule, limit)
+            .await
+            .expect_err("a project at the limit must not get another rule");
+        match err {
+            ErrorTrackingError::AlertRuleLimitReached {
+                project_id,
+                existing,
+                limit: reported,
+            } => {
+                assert_eq!(project_id, 3);
+                assert_eq!(existing, limit);
+                assert_eq!(reported, limit);
+            }
+            other => panic!("expected AlertRuleLimitReached, got {other:?}"),
+        }
+
+        let log = format!("{:?}", db.into_transaction_log());
+        assert!(
+            log.contains("FOR NO KEY UPDATE"),
+            "count must run under the project row lock: {log}"
+        );
+        assert!(
+            !log.contains("INSERT INTO"),
+            "no insert may be issued at the limit: {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_rule_for_missing_project_returns_project_not_found() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<BTreeMap<String, Value>>::new()])
+            .into_connection();
+        let service = ErrorAlertService::new(Arc::new(db));
+
+        let err = create_new_issue_rule(&service, 404)
+            .await
+            .expect_err("unknown project must be rejected");
+        assert!(matches!(err, ErrorTrackingError::ProjectNotFound));
+    }
+
+    #[test]
+    fn alert_rule_limit_maps_to_conflict_with_actionable_detail() {
+        let problem =
+            temps_core::problemdetails::Problem::from(ErrorTrackingError::AlertRuleLimitReached {
+                project_id: 3,
+                existing: 200,
+                limit: 200,
+            });
+        assert_eq!(problem.status_code, axum::http::StatusCode::CONFLICT);
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(detail.contains("Project 3"), "detail: {detail}");
+        assert!(detail.contains("200 error alert rules"), "detail: {detail}");
+        assert!(detail.contains("limit is 200"), "detail: {detail}");
     }
 }
