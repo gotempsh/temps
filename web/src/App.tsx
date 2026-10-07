@@ -332,6 +332,11 @@ const RequestTimeoutsPage = lazy(() =>
     default: m.RequestTimeoutsPage,
   }))
 )
+const OnDemandTlsPage = lazy(() =>
+  import('./pages/settings/OnDemandTlsPage').then((m) => ({
+    default: m.OnDemandTlsPage,
+  }))
+)
 const DiskMonitoringPage = lazy(() =>
   import('./pages/settings/DiskMonitoringPage').then((m) => ({
     default: m.DiskMonitoringPage,
@@ -761,6 +766,10 @@ const FullAppRoutes = () => {
                       <Route
                         path="request-timeouts"
                         element={<RequestTimeoutsPage />}
+                      />
+                      <Route
+                        path="on-demand-tls"
+                        element={<OnDemandTlsPage />}
                       />
                       <Route
                         path="metrics-monitoring"

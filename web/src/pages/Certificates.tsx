@@ -4,6 +4,7 @@
 import { useQuery } from '@tanstack/react-query'
 import { ShieldCheck } from 'lucide-react'
 import { useEffect, useState } from 'react'
+import { Link } from 'react-router'
 
 import { Badge } from '@/components/ui/badge'
 import { Card } from '@/components/ui/card'
@@ -28,12 +29,17 @@ import {
 import { Button } from '@/components/ui/button'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { useSettings } from '@/hooks/useSettings'
 import { formatLocalDateTime } from '@/lib/date'
 import {
   errorCategoryLabel,
   listOnDemandCertsOptions,
   type OnDemandCertRow,
 } from '@/lib/on-demand-certs'
+import {
+  certificatesEmptyStateCopy,
+  onDemandTlsState,
+} from '@/lib/on-demand-tls'
 
 const PAGE_SIZE = 20
 
@@ -108,6 +114,14 @@ export function Certificates() {
   const certs = data?.certs ?? []
   const showEmptyState = !isLoading && certs.length === 0
 
+  // Only read when the empty state needs it. A user with DomainsRead but not
+  // SettingsRead gets a 403 here; the copy then stays neutral rather than
+  // claiming on-demand TLS is off.
+  const settingsQuery = useSettings({ enabled: showEmptyState })
+  const emptyCopy = certificatesEmptyStateCopy(
+    onDemandTlsState(settingsQuery.data, settingsQuery.isError)
+  )
+
   return (
     <div className="space-y-4">
       {/* Page header */}
@@ -160,8 +174,17 @@ export function Certificates() {
                   <TableCell colSpan={4} className="p-0">
                     <EmptyState
                       icon={ShieldCheck}
-                      title="No certificate attempts yet"
-                      description="On-demand TLS attempts appear here once a hostname is routed through the proxy and requires HTTPS. Enable on-demand TLS in settings to start issuing certificates automatically."
+                      title={emptyCopy.title}
+                      description={emptyCopy.description}
+                      action={
+                        emptyCopy.action ? (
+                          <Button variant="outline" size="sm" asChild>
+                            <Link to={emptyCopy.action.href}>
+                              {emptyCopy.action.label}
+                            </Link>
+                          </Button>
+                        ) : undefined
+                      }
                     />
                   </TableCell>
                 </TableRow>

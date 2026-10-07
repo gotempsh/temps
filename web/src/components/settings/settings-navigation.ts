@@ -14,6 +14,7 @@ import {
   HardDrive,
   Key,
   KeyRound,
+  LockKeyhole,
   Monitor,
   Puzzle,
   RadioTower,
@@ -124,6 +125,12 @@ export const settingsNavigationGroups: SettingsNavigationGroup[] = [
     label: 'Security',
     items: [
       { title: 'Security', url: '/settings/security', icon: Shield },
+      {
+        title: 'On-demand TLS',
+        url: '/settings/on-demand-tls',
+        icon: LockKeyhole,
+        keywords: ['certificates', 'https', 'ssl', "let's encrypt", 'acme'],
+      },
       { title: 'Rate Limiting', url: '/settings/rate-limiting', icon: Monitor },
       {
         title: 'Disk Monitoring',

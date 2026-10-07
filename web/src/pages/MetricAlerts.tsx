@@ -35,6 +35,7 @@ import {
   MoreVertical,
   Pencil,
   Plus,
+  RefreshCw,
   Trash2,
 } from 'lucide-react'
 import { useState } from 'react'
@@ -126,7 +127,27 @@ export default function MetricAlerts({ project }: MetricAlertsProps) {
           <EmptyState
             icon={Bell}
             title="Failed to load alerts"
-            description="Something went wrong fetching your alert rules. Try refreshing the page."
+            description={
+              alertsQuery.error instanceof Error && alertsQuery.error.message
+                ? `Could not fetch alert rules for ${project.name}: ${alertsQuery.error.message}`
+                : `Could not fetch alert rules for ${project.name}.`
+            }
+            action={
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => alertsQuery.refetch()}
+                disabled={alertsQuery.isFetching}
+                className="gap-1.5"
+              >
+                <RefreshCw
+                  className={
+                    alertsQuery.isFetching ? 'size-4 animate-spin' : 'size-4'
+                  }
+                />
+                Retry
+              </Button>
+            }
           />
         </div>
       ) : alerts.length === 0 ? (

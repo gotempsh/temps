@@ -3,7 +3,7 @@
 
 import { Link } from 'react-router'
 import { useQuery } from '@tanstack/react-query'
-import { ArrowRight, Bot, Gauge, Workflow } from 'lucide-react'
+import { ArrowRight, Bot, Gauge, Plus, Workflow } from 'lucide-react'
 
 import {
   Card,
@@ -18,13 +18,13 @@ import { EmptyState } from '@/components/ui/empty-state'
 import { getProjectsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { usePageTitle } from '@/hooks/usePageTitle'
 
-// AI Workflows (autofixer/agent runs) are configured per project, unlike
+// Workflows (autofixer/agent runs) are configured per project, unlike
 // the other AI tabs (Providers/Usage/Chats/Skills/MCP Servers) which are
 // instance-wide. This page is the overview that ties them together: it
 // lists projects with a direct link into each one's Workflows tab, plus a
-// link to the infra-health dashboard at /agent-sandbox.
+// link to the AI runtime settings hub at /agent-sandbox.
 export function AiWorkflowsOverview() {
-  usePageTitle('AI Workflows')
+  usePageTitle('Workflows')
 
   const { data, isPending } = useQuery({
     ...getProjectsOptions({ query: { page: 1, per_page: 50 } }),
@@ -35,9 +35,7 @@ export function AiWorkflowsOverview() {
     <div className="w-full space-y-4 px-4 py-4 sm:space-y-6 sm:px-6 sm:py-6 lg:px-8">
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight">
-            AI Workflows
-          </h1>
+          <h1 className="text-2xl font-semibold tracking-tight">Workflows</h1>
           <p className="text-sm text-muted-foreground">
             Autofixer and agent runs, configured per project.
           </p>
@@ -45,7 +43,7 @@ export function AiWorkflowsOverview() {
         <Button variant="outline" asChild>
           <Link to="/agent-sandbox">
             <Gauge className="mr-1.5 size-4" />
-            Infra status
+            AI runtime settings
           </Link>
         </Button>
       </div>
@@ -60,7 +58,15 @@ export function AiWorkflowsOverview() {
         <EmptyState
           icon={Workflow}
           title="No projects yet"
-          description="Workflows run inside a project. Create a project first, then open its Workflows tab to configure an agent."
+          description="Workflows run inside a project. Create one, then open its Workflows tab to configure an agent."
+          action={
+            <Button asChild>
+              <Link to="/projects/new">
+                <Plus className="mr-1.5 size-4" />
+                Create project
+              </Link>
+            </Button>
+          }
         />
       ) : (
         <Card>
