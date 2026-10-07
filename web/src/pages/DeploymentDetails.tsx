@@ -97,6 +97,7 @@ import {
 import { useEffect, useState, type ReactNode } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
+import { announceOperation } from '@/components/operations/operations-tray-store'
 
 type BadgeVariant =
   'default' | 'secondary' | 'destructive' | 'success' | 'warning' | 'outline'
@@ -1092,6 +1093,7 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
     },
     onSuccess: () => {
       setIsRedeployModalOpen(false)
+      announceOperation(queryClient, 'Redeploy started')
     },
   })
 
@@ -1104,6 +1106,7 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
     },
     onSuccess: () => {
       setIsRedeployModalOpen(false)
+      announceOperation(queryClient, 'Redeploy started')
     },
   })
 
@@ -1114,6 +1117,7 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
     },
     onSuccess: () => {
       setIsRedeployModalOpen(false)
+      announceOperation(queryClient, 'Redeploy started')
     },
   })
 
@@ -1163,7 +1167,7 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
       errorTitle: 'Failed to rollback deployment',
     },
     onSuccess: () => {
-      toast.success('Deployment rollback initiated successfully')
+      announceOperation(queryClient, 'Deployment rollback initiated')
       navigate(`/projects/${project.slug}/deployments?autoRefresh=true`)
     },
   })

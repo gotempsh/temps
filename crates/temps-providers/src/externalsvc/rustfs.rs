@@ -492,7 +492,7 @@ impl RustfsService {
     /// plugin checking for a duplicate left by the pre-#495 naming split, for
     /// one — can ask instead of re-deriving `rustfs-{name}` themselves.
     pub fn get_container_name(&self) -> String {
-        format!("rustfs-{}", self.name)
+        rustfs_container_name(&self.name)
     }
 
     /// Host ports this service's container already publishes, when it is
@@ -1055,8 +1055,29 @@ impl RustfsService {
     }
 }
 
+/// Container name of a service named `name`. The single derivation shared by
+/// the engine and anything that must find its container without an instance.
+pub(crate) fn rustfs_container_name(name: &str) -> String {
+    format!("rustfs-{}", name)
+}
+
+/// Data and log volumes of a RustFS service named `name`.
+pub(crate) fn rustfs_volume_names(name: &str) -> [String; 2] {
+    [
+        format!("rustfs_{}_data", name),
+        format!("rustfs_{}_logs", name),
+    ]
+}
+
 #[async_trait]
 impl ExternalService for RustfsService {
+    fn docker_resource_names(&self) -> Option<super::DockerResourceNames> {
+        Some(super::DockerResourceNames {
+            containers: vec![rustfs_container_name(&self.name)],
+            volumes: rustfs_volume_names(&self.name).to_vec(),
+        })
+    }
+
     /// Restart the RustFS container so that the `metrics_ingest_key` stored in
     /// `service_config` takes effect as OTLP env vars.
     async fn apply_ingest_key(&self, service_config: ServiceConfig) -> Result<()> {
@@ -1354,8 +1375,7 @@ impl ExternalService for RustfsService {
             .map_err(|e| anyhow::anyhow!("Failed to remove RustFS container: {}", e))?;
 
         // Remove volumes
-        let data_volume_name = format!("rustfs_{}_data", self.name);
-        let logs_volume_name = format!("rustfs_{}_logs", self.name);
+        let [data_volume_name, logs_volume_name] = rustfs_volume_names(&self.name);
 
         let _ = self
             .docker

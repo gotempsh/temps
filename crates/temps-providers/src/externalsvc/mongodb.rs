@@ -440,7 +440,7 @@ impl MongodbService {
     }
 
     fn get_container_name(&self) -> String {
-        format!("temps-mongodb-{}", self.name)
+        mongodb_container_name(&self.name)
     }
 
     /// The container this service actually runs in: the imported container's
@@ -1395,6 +1395,7 @@ impl MongodbService {
             &s3_source.bucket_name,
             backup_location,
             &staged,
+            &super::NoopRestoreGate,
         )
         .await?;
         info!("Downloaded backup, size: {} bytes", size);
@@ -2285,8 +2286,26 @@ impl MongodbService {
     }
 }
 
+/// Container name of a service named `name`. The single derivation shared by
+/// the engine and anything that must find its container without an instance.
+pub(crate) fn mongodb_container_name(name: &str) -> String {
+    format!("temps-mongodb-{}", name)
+}
+
+/// Data volumes of a service named `name`, as `remove()` deletes them.
+pub(crate) fn mongodb_volume_names(name: &str) -> [String; 1] {
+    [format!("temps-mongodb-{}-data", name)]
+}
+
 #[async_trait]
 impl ExternalService for MongodbService {
+    fn docker_resource_names(&self) -> Option<super::DockerResourceNames> {
+        Some(super::DockerResourceNames {
+            containers: vec![mongodb_container_name(&self.name)],
+            volumes: mongodb_volume_names(&self.name).to_vec(),
+        })
+    }
+
     fn get_effective_address(&self, service_config: ServiceConfig) -> Result<(String, String)> {
         self.get_effective_address_for_environment(
             service_config,
@@ -2644,7 +2663,7 @@ impl ExternalService for MongodbService {
             .map_err(|e| anyhow::anyhow!("Failed to remove MongoDB container: {}", e))?;
 
         // Remove the volume
-        let volume_name = format!("temps-mongodb-{}-data", self.name);
+        let [volume_name] = mongodb_volume_names(&self.name);
         let _ = self
             .docker
             .remove_volume(
@@ -3074,6 +3093,13 @@ impl ExternalService for MongodbService {
     /// captured in the backup, which is what every meaningful restore scenario
     /// (including our e2e test's "post-backup documents must be absent after
     /// restore") requires.
+    /// Sidecar archive restores stage the archive on the host and pass the
+    /// gate before mongorestore runs. Legacy WAL-G (`s3://`) restores do not,
+    /// so the orchestrator gates those before calling in.
+    fn defers_target_writes(&self, backup_location: &str) -> bool {
+        !backup_location.starts_with("s3://")
+    }
+
     async fn restore_in_place(&self, ctx: super::RestoreContext<'_>) -> Result<()> {
         // WAL-G backups (created by the old gotempsh/mongodb-walg path) store
         // the whole backup set under an "s3://" prefix; they have their own
@@ -3115,6 +3141,7 @@ impl ExternalService for MongodbService {
             &ctx.s3_source.bucket_name,
             ctx.backup_location,
             &host_archive_path,
+            ctx.gate,
         )
         .await?;
 
@@ -3123,6 +3150,10 @@ impl ExternalService for MongodbService {
             archive_size,
             host_archive_path.display()
         );
+
+        // Last safe point: the archive is staged on the host and mongorestore
+        // has not run. `restore_dir` removes the archive when it drops.
+        ctx.gate.begin_target_writes().await?;
 
         // ── Run mongorestore sidecar ────────────────────────────────────────
         let result = self
@@ -3246,6 +3277,7 @@ impl ExternalService for MongodbService {
             &ctx.s3_source.bucket_name,
             ctx.backup_location,
             &host_archive_path,
+            ctx.gate,
         )
         .await?;
         info!(

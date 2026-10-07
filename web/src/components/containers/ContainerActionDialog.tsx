@@ -17,6 +17,10 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
+import {
+  trackLocalOperation,
+  VIEW_IN_OPERATIONS_ACTION,
+} from '@/components/operations/operations-tray-store'
 
 interface ContainerActionDialogProps {
   projectId: string
@@ -74,7 +78,25 @@ export function ContainerActionDialog({
       }
       throw new Error(`Invalid action: ${action}`)
     },
-    onSuccess: (_, { action, containerId }) => {
+    // A restart has no persisted record, so it is shown in the operations
+    // tray as a client-only entry while the request is in flight and removed
+    // when it settles. It does not survive a refresh.
+    onMutate: ({ action, containerId }) => {
+      if (action !== 'restart') return undefined
+      return {
+        untrack: trackLocalOperation({
+          title: 'Restarting container',
+          context: containerId.slice(0, 12),
+        }),
+        toastId: toast.loading('Restarting container...', {
+          action: VIEW_IN_OPERATIONS_ACTION,
+        }),
+      }
+    },
+    onSettled: (_data, _error, _variables, context) => {
+      context?.untrack()
+    },
+    onSuccess: (_, { action, containerId }, context) => {
       // Invalidate the containers list
       queryClient.invalidateQueries({
         queryKey: listContainersOptions({
@@ -97,10 +119,13 @@ export function ContainerActionDialog({
       })
 
       const actionLabel = action.charAt(0).toUpperCase() + action.slice(1)
-      toast.success(`Container ${actionLabel.toLowerCase()}ed successfully`)
+      toast.success(`Container ${actionLabel.toLowerCase()}ed successfully`, {
+        id: context?.toastId,
+      })
       onSuccess?.()
     },
-    onError: (error: any, { action }) => {
+    onError: (error: any, { action }, context) => {
+      if (context) toast.dismiss(context.toastId)
       toast.error(
         `Failed to ${action} container: ${error?.message || 'Unknown error'}`
       )

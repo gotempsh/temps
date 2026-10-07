@@ -528,6 +528,7 @@ async fn authorize_storage_service_scopes(
         get_project_template,
         list_project_template_tags,
         create_project_from_template,
+        super::operations::list_operations,
     ),
     components(
         schemas(
@@ -563,12 +564,19 @@ async fn authorize_storage_service_scopes(
             super::templates::CreateProjectFromTemplateRequest,
             super::templates::EnvVarInput,
             super::templates::CreateProjectFromTemplateResponse,
+            super::operations::ListOperationsQuery,
+            super::operations::OperationsListResponse,
+            crate::services::operations::OperationEntry,
+            crate::services::operations::OperationKind,
+            crate::services::operations::OperationStatus,
+            crate::services::operations::OperationStatusFilter,
         )
     ),
     tags(
         (name = "Projects", description = "Project management endpoints"),
         (name = "Presets", description = "Available deployment presets"),
-        (name = "Templates", description = "Project template endpoints")
+        (name = "Templates", description = "Project template endpoints"),
+        (name = "Operations", description = "Recent and in-flight operations across projects")
     ),
     nest(
         (path = "/projects", api = super::custom_domains::CustomDomainsApiDoc)
@@ -1127,13 +1135,23 @@ pub(super) async fn resolve_hidden_projects(
     state: &Arc<AppState>,
     auth: &temps_auth::context::AuthContext,
 ) -> Result<Vec<i32>, Problem> {
+    hidden_project_ids_for_caller(state.project_access_checker.as_ref(), auth).await
+}
+
+/// [`resolve_hidden_projects`] for handlers that hold the optional checker
+/// directly rather than the projects `AppState`. Same rules, same fail-closed
+/// behaviour.
+pub(crate) async fn hidden_project_ids_for_caller(
+    project_access_checker: Option<&Arc<dyn temps_core::ProjectAccessChecker>>,
+    auth: &temps_auth::context::AuthContext,
+) -> Result<Vec<i32>, Problem> {
     if auth.is_deployment_token()
         || auth.is_admin()
         || auth.has_role(&temps_auth::permissions::Role::PlatformAdmin)
     {
         return Ok(Vec::new());
     }
-    let Some(checker) = state.project_access_checker.as_ref() else {
+    let Some(checker) = project_access_checker else {
         return Ok(Vec::new());
     };
     // Fail closed, matching `project_permission_guard!`. Unreachable today

@@ -5,15 +5,17 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     routing::post,
-    Json, Router,
+    Extension, Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_auth::{permission_guard, project_access_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
+use temps_core::RequestMetadata;
 use tracing::error;
 use utoipa::{OpenApi, ToSchema};
 
+use crate::handlers::audit::{AuditContext, DsnCreatedAudit, DsnRegeneratedAudit, DsnRevokedAudit};
 use crate::sentry::{DSNService, ProjectDSN, SentryIngesterError};
 
 #[derive(OpenApi)]
@@ -158,6 +160,7 @@ async fn create_dsn(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<DSNAppState>>,
     Path(project_id): Path<i32>,
+    Extension(metadata): Extension<RequestMetadata>,
     Json(request): Json<CreateDSNRequest>,
 ) -> Result<(StatusCode, Json<ProjectDSNResponse>), Problem> {
     permission_guard!(auth, ErrorTrackingCreate);
@@ -184,6 +187,8 @@ async fn create_dsn(
         )
         .await?;
 
+    record_dsn_created(&state, audit_context(&auth, &metadata), &dsn).await;
+
     Ok((StatusCode::CREATED, Json(dsn.into())))
 }
 
@@ -207,6 +212,7 @@ async fn get_or_create_dsn(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<DSNAppState>>,
     Path(project_id): Path<i32>,
+    Extension(metadata): Extension<RequestMetadata>,
     Json(request): Json<GetOrCreateDSNRequest>,
 ) -> Result<Json<ProjectDSNResponse>, Problem> {
     permission_guard!(auth, ErrorTrackingCreate);
@@ -222,15 +228,20 @@ async fn get_or_create_dsn(
             .map_err(|e| SentryIngesterError::Validation(format!("Config error: {}", e)))?,
     };
 
-    let dsn = state
+    let (dsn, created) = state
         .dsn_service
-        .get_or_create_project_dsn(
+        .get_or_create_project_dsn_reporting_creation(
             project_id,
             request.environment_id,
             request.deployment_id,
             &base_url,
         )
         .await?;
+
+    // Returning an existing DSN is a read; only minting one is audited.
+    if created {
+        record_dsn_created(&state, audit_context(&auth, &metadata), &dsn).await;
+    }
 
     Ok(Json(dsn.into()))
 }
@@ -293,6 +304,7 @@ async fn regenerate_dsn(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<DSNAppState>>,
     Path((project_id, dsn_id)): Path<(i32, i32)>,
+    Extension(metadata): Extension<RequestMetadata>,
     Json(request): Json<RegenerateDSNRequest>,
 ) -> Result<Json<ProjectDSNResponse>, Problem> {
     permission_guard!(auth, ErrorTrackingWrite);
@@ -312,6 +324,20 @@ async fn regenerate_dsn(
         .dsn_service
         .regenerate_project_dsn(dsn_id, project_id, &base_url)
         .await?;
+
+    let audit = DsnRegeneratedAudit {
+        context: audit_context(&auth, &metadata),
+        project_id,
+        dsn_id: dsn.id,
+        environment_id: dsn.environment_id,
+        deployment_id: dsn.deployment_id,
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!(
+            project_id,
+            dsn_id, "Failed to create DSN regeneration audit log: {}", e
+        );
+    }
 
     Ok(Json(dsn.into()))
 }
@@ -336,13 +362,55 @@ async fn revoke_dsn(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<DSNAppState>>,
     Path((project_id, dsn_id)): Path<(i32, i32)>,
+    Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<StatusCode, Problem> {
     permission_guard!(auth, ErrorTrackingWrite);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     state.dsn_service.revoke_dsn(dsn_id, project_id).await?;
 
+    let audit = DsnRevokedAudit {
+        context: audit_context(&auth, &metadata),
+        project_id,
+        dsn_id,
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!(
+            project_id,
+            dsn_id, "Failed to create DSN revocation audit log: {}", e
+        );
+    }
+
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn audit_context(auth: &temps_auth::AuthContext, metadata: &RequestMetadata) -> AuditContext {
+    AuditContext {
+        user_id: auth.user_id(),
+        ip_address: Some(metadata.ip_address.clone()),
+        user_agent: metadata.user_agent.clone(),
+    }
+}
+
+/// Audit the minting of a DSN. Records ids and scope only, never the key.
+/// An audit failure is logged and does not fail the request.
+async fn record_dsn_created(state: &DSNAppState, context: AuditContext, dsn: &ProjectDSN) {
+    let audit = DsnCreatedAudit {
+        context,
+        project_id: dsn.project_id,
+        dsn_id: dsn.id,
+        environment_id: dsn.environment_id,
+        deployment_id: dsn.deployment_id,
+        name: dsn.name.clone(),
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!(
+            project_id = dsn.project_id,
+            dsn_id = dsn.id,
+            "Failed to create DSN creation audit log: {}",
+            e
+        );
+    }
 }
 
 #[cfg(test)]
@@ -420,6 +488,230 @@ mod tests {
         RequireAuth(AuthContext::new_session(test_user(1), role))
     }
 
+    fn metadata() -> RequestMetadata {
+        RequestMetadata {
+            ip_address: "203.0.113.9".to_string(),
+            user_agent: "audit-test".to_string(),
+            headers: axum::http::HeaderMap::new(),
+            visitor_id_cookie: None,
+            session_id_cookie: None,
+            base_url: "https://temps.test".to_string(),
+            scheme: "https".to_string(),
+            host: "temps.test".to_string(),
+            is_secure: true,
+        }
+    }
+
+    /// Audit logger that records every operation it receives.
+    #[derive(Default)]
+    struct RecordingAuditLogger {
+        entries: std::sync::Mutex<Vec<(String, Option<i32>, serde_json::Value)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl temps_core::AuditLogger for RecordingAuditLogger {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn temps_core::audit::AuditOperation,
+        ) -> anyhow::Result<()> {
+            let payload: serde_json::Value = serde_json::from_str(&operation.serialize()?)?;
+            self.entries
+                .lock()
+                .map_err(|_| anyhow::anyhow!("recording audit logger lock poisoned"))?
+                .push((operation.operation_type(), operation.user_id(), payload));
+            Ok(())
+        }
+    }
+
+    impl RecordingAuditLogger {
+        fn ops(&self) -> Vec<String> {
+            self.entries
+                .lock()
+                .expect("lock")
+                .iter()
+                .map(|(op, _, _)| op.clone())
+                .collect()
+        }
+    }
+
+    /// Covers the whole DSN credential lifecycle against a real database:
+    /// create, get-or-create (audited only when it mints), regenerate, and
+    /// revoke each emit exactly one audit event carrying ids and never the
+    /// key; a failed operation emits nothing.
+    #[tokio::test]
+    async fn dsn_lifecycle_emits_audit_events_without_the_key() {
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                eprintln!("Skipping DSN audit test: {error}");
+                return;
+            }
+            Err(error) => panic!("DSN audit test database setup failed: {error}"),
+        };
+        let db = test_db.connection_arc();
+        let now = Utc::now();
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("DSN Audit Project".to_string()),
+            repo_name: Set("repo".to_string()),
+            repo_owner: Set("owner".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            slug: Set(format!("dsn-audit-{}", uuid::Uuid::new_v4())),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert project");
+        let project_id = project.id;
+
+        let recorder = Arc::new(RecordingAuditLogger::default());
+        let server_config = Arc::new(
+            temps_config::ServerConfig::new(
+                "127.0.0.1:3000".to_string(),
+                "postgres://test:test@localhost/test".to_string(),
+                None,
+                None,
+            )
+            .expect("failed to build test ServerConfig"),
+        );
+        let state = Arc::new(DSNAppState {
+            dsn_service: Arc::new(DSNService::new(db.clone())),
+            audit_service: recorder.clone(),
+            config_service: Arc::new(temps_config::ConfigService::new(server_config, db.clone())),
+            project_access_checker: None,
+        });
+        let base_url = Some("https://temps.test".to_string());
+
+        // create
+        let (status, Json(created)) = create_dsn(
+            user_auth(Role::Admin),
+            State(state.clone()),
+            Path(project_id),
+            Extension(metadata()),
+            Json(CreateDSNRequest {
+                environment_id: None,
+                deployment_id: None,
+                name: Some("CI DSN".to_string()),
+                base_url: base_url.clone(),
+            }),
+        )
+        .await
+        .expect("create succeeds");
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(recorder.ops(), ["DSN_CREATED"]);
+
+        // get-or-create returns the existing (env=None, deployment=None) DSN:
+        // a read, so no new audit event.
+        let Json(existing) = get_or_create_dsn(
+            user_auth(Role::Admin),
+            State(state.clone()),
+            Path(project_id),
+            Extension(metadata()),
+            Json(GetOrCreateDSNRequest {
+                environment_id: None,
+                deployment_id: None,
+                base_url: base_url.clone(),
+            }),
+        )
+        .await
+        .expect("get-or-create succeeds");
+        assert_eq!(existing.id, created.id);
+        assert_eq!(
+            recorder.ops(),
+            ["DSN_CREATED"],
+            "returning an existing DSN is not audited"
+        );
+
+        // regenerate
+        let Json(rotated) = regenerate_dsn(
+            user_auth(Role::Admin),
+            State(state.clone()),
+            Path((project_id, created.id)),
+            Extension(metadata()),
+            Json(RegenerateDSNRequest {
+                base_url: base_url.clone(),
+            }),
+        )
+        .await
+        .expect("regenerate succeeds");
+        assert_ne!(rotated.public_key, created.public_key);
+
+        // revoke
+        let status = revoke_dsn(
+            user_auth(Role::Admin),
+            State(state.clone()),
+            Path((project_id, created.id)),
+            Extension(metadata()),
+        )
+        .await
+        .expect("revoke succeeds");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // get-or-create after revocation mints a fresh DSN: audited.
+        let Json(minted) = get_or_create_dsn(
+            user_auth(Role::Admin),
+            State(state.clone()),
+            Path(project_id),
+            Extension(metadata()),
+            Json(GetOrCreateDSNRequest {
+                environment_id: None,
+                deployment_id: None,
+                base_url,
+            }),
+        )
+        .await
+        .expect("get-or-create after revoke succeeds");
+        assert_ne!(minted.id, created.id);
+
+        // Revoking a DSN of another project fails and is not audited.
+        let missing = revoke_dsn(
+            user_auth(Role::Admin),
+            State(state.clone()),
+            Path((project_id + 10_000, created.id)),
+            Extension(metadata()),
+        )
+        .await;
+        assert!(missing.is_err(), "cross-project revoke must fail");
+
+        let entries = recorder.entries.lock().expect("lock");
+        let ops: Vec<&str> = entries.iter().map(|(op, _, _)| op.as_str()).collect();
+        assert_eq!(
+            ops,
+            [
+                "DSN_CREATED",
+                "DSN_REGENERATED",
+                "DSN_REVOKED",
+                "DSN_CREATED"
+            ]
+        );
+        for (op, user_id, payload) in entries.iter() {
+            assert_eq!(*user_id, Some(1), "{op} records the acting user");
+            assert_eq!(
+                payload["project_id"], project_id,
+                "{op} records the project"
+            );
+            assert!(payload["dsn_id"].is_i64(), "{op} records the DSN id");
+            assert_eq!(payload["context"]["ip_address"], "203.0.113.9");
+            let raw = payload.to_string();
+            for key in [&created.public_key, &rotated.public_key, &minted.public_key] {
+                assert!(!raw.contains(key.as_str()), "{op} audit leaked a DSN key");
+            }
+            assert!(payload.get("public_key").is_none());
+            assert!(payload.get("dsn").is_none());
+        }
+        assert_eq!(entries[0].2["dsn_id"], created.id);
+        assert_eq!(entries[0].2["name"], "CI DSN");
+        assert_eq!(entries[1].2["dsn_id"], created.id);
+        assert_eq!(entries[2].2["dsn_id"], created.id);
+        assert_eq!(entries[3].2["dsn_id"], minted.id);
+    }
+
     #[tokio::test]
     async fn list_dsns_rejects_reader_without_error_tracking_permission() {
         // `Role::ApiReader` holds no ErrorTracking* permissions, so this must
@@ -436,6 +728,7 @@ mod tests {
             user_auth(Role::ApiReader),
             State(test_state()),
             Path((1, 1)),
+            Extension(metadata()),
         )
         .await
         .expect_err("an ApiReader must not be able to revoke a DSN");
@@ -448,6 +741,7 @@ mod tests {
             user_auth(Role::ApiReader),
             State(test_state()),
             Path((1, 1)),
+            Extension(metadata()),
             Json(RegenerateDSNRequest { base_url: None }),
         )
         .await
@@ -461,6 +755,7 @@ mod tests {
             user_auth(Role::ApiReader),
             State(test_state()),
             Path(1),
+            Extension(metadata()),
             Json(CreateDSNRequest {
                 environment_id: None,
                 deployment_id: None,

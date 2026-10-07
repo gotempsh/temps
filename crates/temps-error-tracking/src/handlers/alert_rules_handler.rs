@@ -1,18 +1,22 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use super::audit::{
+    AuditContext, ErrorAlertRuleCreatedAudit, ErrorAlertRuleDeletedAudit,
+    ErrorAlertRuleUpdatedAudit,
+};
 use super::types::AppState;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::Json,
     routing::get,
-    Router,
+    Extension, Router,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
-use temps_core::problemdetails::Problem;
+use temps_core::{problemdetails::Problem, RequestMetadata};
 use temps_entities::error_alert_rules;
 use utoipa::{OpenApi, ToSchema};
 
@@ -202,6 +206,8 @@ pub async fn get_alert_rule(
         (status = 201, description = "Alert rule created", body = AlertRuleResponse),
         (status = 409, description = "The project already has the maximum number of error alert rules"),
         (status = 400, description = "Validation error"),
+        (status = 404, description = "Project not found"),
+        (status = 409, description = "Project already holds the maximum number of error alert rules"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -213,6 +219,7 @@ pub async fn create_alert_rule(
     State(state): State<Arc<AppState>>,
     RequireAuth(auth): RequireAuth,
     Path(project_id): Path<i32>,
+    Extension(metadata): Extension<RequestMetadata>,
     Json(request): Json<CreateAlertRuleRequest>,
 ) -> Result<(StatusCode, Json<AlertRuleResponse>), Problem> {
     permission_guard!(auth, ErrorTrackingCreate);
@@ -232,6 +239,23 @@ pub async fn create_alert_rule(
             request.enabled,
         )
         .await?;
+
+    let audit = ErrorAlertRuleCreatedAudit {
+        context: audit_context(&auth, &metadata),
+        project_id,
+        rule_id: rule.id,
+        name: rule.name.clone(),
+        trigger_type: rule.trigger_type.clone(),
+        enabled: rule.enabled,
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        tracing::error!(
+            project_id,
+            rule_id = rule.id,
+            "Failed to create error alert rule creation audit log: {}",
+            e
+        );
+    }
 
     Ok((StatusCode::CREATED, Json(AlertRuleResponse::from(rule))))
 }
@@ -257,6 +281,7 @@ pub async fn update_alert_rule(
     State(state): State<Arc<AppState>>,
     RequireAuth(auth): RequireAuth,
     Path((project_id, rule_id)): Path<(i32, i32)>,
+    Extension(metadata): Extension<RequestMetadata>,
     Json(request): Json<UpdateAlertRuleRequest>,
 ) -> Result<Json<AlertRuleResponse>, Problem> {
     permission_guard!(auth, ErrorTrackingWrite);
@@ -277,6 +302,23 @@ pub async fn update_alert_rule(
             request.enabled,
         )
         .await?;
+
+    let audit = ErrorAlertRuleUpdatedAudit {
+        context: audit_context(&auth, &metadata),
+        project_id,
+        rule_id: rule.id,
+        name: rule.name.clone(),
+        trigger_type: rule.trigger_type.clone(),
+        enabled: rule.enabled,
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        tracing::error!(
+            project_id,
+            rule_id,
+            "Failed to create error alert rule update audit log: {}",
+            e
+        );
+    }
 
     Ok(Json(AlertRuleResponse::from(rule)))
 }
@@ -300,11 +342,256 @@ pub async fn delete_alert_rule(
     State(state): State<Arc<AppState>>,
     RequireAuth(auth): RequireAuth,
     Path((project_id, rule_id)): Path<(i32, i32)>,
+    Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<StatusCode, Problem> {
     permission_guard!(auth, ErrorTrackingWrite);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
     state.alert_service.delete_rule(rule_id, project_id).await?;
 
+    let audit = ErrorAlertRuleDeletedAudit {
+        context: audit_context(&auth, &metadata),
+        project_id,
+        rule_id,
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        tracing::error!(
+            project_id,
+            rule_id,
+            "Failed to create error alert rule deletion audit log: {}",
+            e
+        );
+    }
+
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn audit_context(auth: &temps_auth::AuthContext, metadata: &RequestMetadata) -> AuditContext {
+    AuditContext {
+        user_id: auth.user_id(),
+        ip_address: Some(metadata.ip_address.clone()),
+        user_agent: metadata.user_agent.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::error_alert_service::ErrorAlertService;
+    use crate::services::error_tracking_service::ErrorTrackingService;
+    use axum::http::HeaderMap;
+    use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+    use std::sync::Mutex;
+    use temps_auth::{AuthContext, Role};
+    use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+    use temps_entities::{projects, users};
+
+    /// Audit logger that records every operation it receives.
+    #[derive(Default)]
+    struct RecordingAuditLogger {
+        entries: Mutex<Vec<(String, Option<i32>, serde_json::Value)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl temps_core::AuditLogger for RecordingAuditLogger {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn temps_core::AuditOperation,
+        ) -> Result<(), anyhow::Error> {
+            let payload: serde_json::Value = serde_json::from_str(&operation.serialize()?)?;
+            self.entries
+                .lock()
+                .map_err(|_| anyhow::anyhow!("recording audit logger lock poisoned"))?
+                .push((operation.operation_type(), operation.user_id(), payload));
+            Ok(())
+        }
+    }
+
+    fn test_user(id: i32) -> users::Model {
+        let now = chrono::Utc::now();
+        users::Model {
+            id,
+            name: "Test User".to_string(),
+            email: "test@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn metadata() -> RequestMetadata {
+        RequestMetadata {
+            ip_address: "203.0.113.9".to_string(),
+            user_agent: "audit-test".to_string(),
+            headers: HeaderMap::new(),
+            visitor_id_cookie: None,
+            session_id_cookie: None,
+            base_url: "https://temps.test".to_string(),
+            scheme: "https".to_string(),
+            host: "temps.test".to_string(),
+            is_secure: true,
+        }
+    }
+
+    async fn seed_project(db: &sea_orm::DatabaseConnection) -> i32 {
+        let now = chrono::Utc::now();
+        projects::ActiveModel {
+            name: Set("Alert Audit Project".to_string()),
+            repo_name: Set("repo".to_string()),
+            repo_owner: Set("owner".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            slug: Set(format!("alert-audit-{}", uuid::Uuid::new_v4())),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("insert project")
+        .id
+    }
+
+    fn create_request(name: &str) -> CreateAlertRuleRequest {
+        CreateAlertRuleRequest {
+            name: name.to_string(),
+            trigger_type: "new_issue".to_string(),
+            trigger_config: default_trigger_config(),
+            environment_filter: None,
+            error_level_filter: None,
+            notification_priority: default_priority(),
+            cooldown_minutes: default_cooldown(),
+            enabled: default_enabled(),
+        }
+    }
+
+    #[tokio::test]
+    async fn alert_rule_create_update_delete_emit_audit_events_only_on_success() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                eprintln!("Skipping alert-rule audit test: {error}");
+                return;
+            }
+            Err(error) => panic!("alert-rule audit test database setup failed: {error}"),
+        };
+        let db = test_db.connection_arc();
+        let project_id = seed_project(db.as_ref()).await;
+
+        let recorder = Arc::new(RecordingAuditLogger::default());
+        let state = Arc::new(AppState {
+            error_tracking_service: Arc::new(ErrorTrackingService::new(db.clone())),
+            alert_service: Arc::new(ErrorAlertService::new(db.clone())),
+            audit_service: recorder.clone(),
+            project_access_checker: None,
+        });
+        let auth = AuthContext::new_session(test_user(5), Role::Admin);
+
+        // Create (runs the real per-project lock + count against Postgres).
+        let (status, Json(rule)) = create_alert_rule(
+            State(state.clone()),
+            RequireAuth(auth.clone()),
+            Path(project_id),
+            Extension(metadata()),
+            Json(create_request("New issue")),
+        )
+        .await
+        .expect("create succeeds");
+        assert_eq!(status, StatusCode::CREATED);
+
+        // A validation failure writes nothing and audits nothing.
+        let mut invalid = create_request("Bad");
+        invalid.trigger_type = "not-a-trigger".to_string();
+        let rejected = create_alert_rule(
+            State(state.clone()),
+            RequireAuth(auth.clone()),
+            Path(project_id),
+            Extension(metadata()),
+            Json(invalid),
+        )
+        .await;
+        assert!(rejected.is_err(), "invalid trigger type must be rejected");
+
+        // Update.
+        let Json(updated) = update_alert_rule(
+            State(state.clone()),
+            RequireAuth(auth.clone()),
+            Path((project_id, rule.id)),
+            Extension(metadata()),
+            Json(UpdateAlertRuleRequest {
+                name: None,
+                trigger_type: None,
+                trigger_config: None,
+                environment_filter: None,
+                error_level_filter: None,
+                notification_priority: None,
+                cooldown_minutes: None,
+                enabled: Some(false),
+            }),
+        )
+        .await
+        .expect("update succeeds");
+        assert!(!updated.enabled);
+
+        // Delete.
+        let status = delete_alert_rule(
+            State(state.clone()),
+            RequireAuth(auth.clone()),
+            Path((project_id, rule.id)),
+            Extension(metadata()),
+        )
+        .await
+        .expect("delete succeeds");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(
+            temps_entities::error_alert_rules::Entity::find_by_id(rule.id)
+                .one(db.as_ref())
+                .await
+                .expect("query")
+                .is_none()
+        );
+
+        // Deleting it again fails and is not audited.
+        let missing = delete_alert_rule(
+            State(state),
+            RequireAuth(auth),
+            Path((project_id, rule.id)),
+            Extension(metadata()),
+        )
+        .await;
+        assert!(missing.is_err(), "second delete must fail");
+
+        let entries = recorder.entries.lock().expect("lock");
+        let ops: Vec<&str> = entries.iter().map(|(op, _, _)| op.as_str()).collect();
+        assert_eq!(
+            ops,
+            [
+                "ERROR_ALERT_RULE_CREATED",
+                "ERROR_ALERT_RULE_UPDATED",
+                "ERROR_ALERT_RULE_DELETED"
+            ]
+        );
+        for (op, user_id, payload) in entries.iter() {
+            assert_eq!(*user_id, Some(5), "{op} records the acting user");
+            assert_eq!(payload["project_id"], project_id);
+            assert_eq!(payload["rule_id"], rule.id);
+            assert_eq!(payload["context"]["ip_address"], "203.0.113.9");
+        }
+        assert_eq!(entries[0].2["name"], "New issue");
+        assert_eq!(entries[0].2["trigger_type"], "new_issue");
+        assert_eq!(entries[1].2["enabled"], false);
+    }
 }

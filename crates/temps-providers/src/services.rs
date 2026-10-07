@@ -1859,6 +1859,16 @@ impl ExternalServiceManager {
             report.stopped.extend(fenced.stopped);
             report.removed.extend(fenced.removed);
         }
+        // A download the engine staged inside the service itself (not a
+        // helper container) must be confirmed stopped too.
+        instance
+            .stop_staged_restore()
+            .await
+            .map_err(|e| RestoreFenceError::Stop {
+                target_container: instance.get_docker_container_name(),
+                helper: "staged restore download".to_string(),
+                reason: e.to_string(),
+            })?;
         Ok(Some(report))
     }
 
@@ -1989,6 +1999,74 @@ impl ExternalServiceManager {
         service_type: ServiceType,
     ) -> Result<Box<dyn ExternalService>, ExternalServiceError> {
         self.create_service_instance(name, service_type)
+    }
+
+    /// Containers and volumes that already exist under the names a service
+    /// called `service_name` would own (see
+    /// [`ExternalService::docker_resource_names`]).
+    ///
+    /// A restore into a new service calls this before provisioning: if
+    /// anything is already there, it belongs to someone else (a leftover of an
+    /// earlier failed run, or another process), and tearing the new service
+    /// down on cancellation would delete it. Returns one `"container NAME"` /
+    /// `"volume NAME"` entry per object found; an engine that cannot report
+    /// its names is an error, never an empty list.
+    pub async fn existing_docker_resources(
+        &self,
+        service_name: &str,
+        service_type: ServiceType,
+    ) -> Result<Vec<String>, ExternalServiceError> {
+        let instance = self.get_service_instance(service_name.to_string(), service_type)?;
+        let names = instance.docker_resource_names().ok_or_else(|| {
+            ExternalServiceError::InternalError {
+                reason: format!(
+                    "service type '{}' does not report the Docker resources it owns, so \
+                     existing containers or volumes for '{}' cannot be checked",
+                    service_type, service_name
+                ),
+            }
+        })?;
+        let docker = self.require_docker()?;
+        let mut existing = Vec::new();
+        for container in &names.containers {
+            match docker
+                .inspect_container(
+                    container,
+                    None::<bollard::query_parameters::InspectContainerOptions>,
+                )
+                .await
+            {
+                Ok(_) => existing.push(format!("container {}", container)),
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => {}
+                Err(e) => {
+                    return Err(ExternalServiceError::InternalError {
+                        reason: format!(
+                            "could not inspect container '{}' for service '{}': {}",
+                            container, service_name, e
+                        ),
+                    })
+                }
+            }
+        }
+        for volume in &names.volumes {
+            match docker.inspect_volume(volume).await {
+                Ok(_) => existing.push(format!("volume {}", volume)),
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => {}
+                Err(e) => {
+                    return Err(ExternalServiceError::InternalError {
+                        reason: format!(
+                            "could not inspect volume '{}' for service '{}': {}",
+                            volume, service_name, e
+                        ),
+                    })
+                }
+            }
+        }
+        Ok(existing)
     }
 
     #[allow(deprecated)]

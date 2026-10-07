@@ -120,7 +120,7 @@ pub struct RestoreRunAudit {
     pub cross_service_confirmed: bool,
 }
 
-/// A restore run cancelled before it wrote any data.
+/// A restore run cancelled before it wrote to an existing service.
 #[derive(Debug, Clone, Serialize)]
 pub struct RestoreRunCancelledAudit {
     pub context: AuditContext,
@@ -135,7 +135,9 @@ pub struct RestoreRunCancelledAudit {
     pub mode: String,
     /// Name of the service a new-service restore would have created.
     pub target_service_name: Option<String>,
-    /// Phase the run was stopped in. Always the pre-write safe point.
+    /// Phase the run was in when the cancellation was accepted: `prepare` or
+    /// `download` for an in-place restore, up to `provision`/`recover` for one
+    /// creating a new service.
     pub phase: String,
 }
 

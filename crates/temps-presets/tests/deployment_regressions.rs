@@ -405,6 +405,47 @@ async fn nested_vite_image_builds_real_bundle_importing_sibling() {
     }
 }
 
+/// The generic `sample-vite-custom-outdir` fixture writes its bundle to
+/// `build/` (vite.config.ts) and ships an `.npmrc`: the generated image must
+/// install with that config and serve the custom output directory.
+#[tokio::test]
+async fn sample_vite_custom_out_dir_image_serves_the_bundle() {
+    let Some(mut resources) = Resources::new() else {
+        return;
+    };
+    let source =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample-vite-custom-outdir");
+    let repo = tempfile::tempdir().unwrap();
+    for entry in std::fs::read_dir(&source).unwrap().flatten() {
+        std::fs::copy(entry.path(), repo.path().join(entry.file_name())).unwrap();
+    }
+    let rendered = Vite
+        .dockerfile(DockerfileConfig::new(repo.path(), repo.path(), "fixture"))
+        .await;
+    assert!(
+        rendered.plan_failure.is_none(),
+        "{:?}",
+        rendered.plan_failure
+    );
+    let image = resources.build(repo.path(), &rendered.content, "vite-outdir");
+    let container = format!("{}-vite-outdir-export", resources.builder);
+    resources.containers.push(container.clone());
+    docker(&["create", "--name", &container, &image]);
+    let output = tempfile::tempdir().unwrap();
+    docker(&[
+        "cp",
+        &format!("{container}:/usr/share/nginx/html/."),
+        output.path().to_str().unwrap(),
+    ]);
+    assert!(output.path().join("index.html").is_file());
+    assert!(std::fs::read_dir(output.path().join("assets"))
+        .unwrap()
+        .flatten()
+        .any(|entry| std::fs::read_to_string(entry.path())
+            .unwrap_or_default()
+            .contains("sample-vite-outdir-ok")));
+}
+
 #[tokio::test]
 async fn locked_rails_framework_route_builds_from_cold_and_warm_cache() {
     let Some(mut resources) = Resources::new() else {

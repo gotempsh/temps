@@ -81,6 +81,11 @@ import {
   useSearchParams,
 } from 'react-router'
 import { toast } from 'sonner'
+import {
+  VIEW_IN_OPERATIONS_ACTION,
+  announceOperation,
+} from '@/components/operations/operations-tray-store'
+import { invalidateOperations } from '@/lib/operations'
 import { RunTrackingPanel } from './service-restore/RunTrackingPanel'
 import {
   restoreCapabilitiesQuery,
@@ -255,9 +260,11 @@ export function ServiceRestore() {
     const { ledger, notify } = observeRun(ledgerRef.current, runRow)
     ledgerRef.current = ledger
     if (!notify) return
+    // The operations tray lists this run too: refresh it with the outcome.
+    void invalidateOperations(queryClient)
     const message = completionToast(notify, runRow, service?.name)
     toast[message.level](message.title, { description: message.description })
-  }, [runRow, service?.name])
+  }, [runRow, service?.name, queryClient])
 
   const runView =
     effectiveRunId === null
@@ -438,7 +445,7 @@ export function ServiceRestore() {
       queryClient.setQueryData(restoreRunQuery(r.id).queryKey, r)
       setShowDestructiveConfirm(false)
       followRun(r.id)
-      toast.success('Restore started', {
+      announceOperation(queryClient, 'Restore started', {
         description: `Run ${r.id} (phase: ${phaseLabel(r.phase)}).`,
       })
     },
@@ -483,6 +490,11 @@ export function ServiceRestore() {
       queryClient.setQueryData(restoreRunQuery(run.id).queryKey, run)
       void queryClient.invalidateQueries({
         queryKey: serviceRestoreRunsQuery(serviceId).queryKey,
+      })
+      void invalidateOperations(queryClient)
+      toast.info('Cancelling restore', {
+        description: `Run ${run.id} stops at its next check and removes anything it staged.`,
+        action: VIEW_IN_OPERATIONS_ACTION,
       })
     },
     onError: (error) => {

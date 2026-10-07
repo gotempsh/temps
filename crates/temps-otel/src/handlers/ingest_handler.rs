@@ -1430,6 +1430,27 @@ mod tests {
             .unwrap_or_default()
     }
 
+    #[test]
+    fn metric_alert_limit_maps_to_conflict_with_actionable_detail() {
+        let err = OtelError::MetricAlertLimitReached {
+            project_id: 7,
+            existing: 200,
+            limit: 200,
+        };
+        let problem: Problem = err.into();
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        let detail = problem_detail(&problem);
+        assert!(
+            detail.contains("Project 7"),
+            "detail names the project: {detail}"
+        );
+        assert!(
+            detail.contains("200 metric alert rules"),
+            "detail: {detail}"
+        );
+        assert!(detail.contains("limit is 200"), "detail: {detail}");
+    }
+
     /// Internal-error variants must never echo their underlying message (DB
     /// error text, file paths, S3 reasons) into the HTTP response — only the
     /// generic detail, with the real error logged server-side instead. See

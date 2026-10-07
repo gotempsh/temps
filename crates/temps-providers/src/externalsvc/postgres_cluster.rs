@@ -415,6 +415,65 @@ if [ -f "$HBA" ]; then
   gosu postgres pg_ctl reload -D "$PGDATA" >/dev/null 2>&1 || true
 fi"#;
 
+/// Data node: create/update the configured application superuser and its
+/// database. Written through a quoted heredoc and run by psql with the
+/// variables `app_user`, `app_password` and `app_db`; values are quoted by
+/// psql (`:'var'`) and `format()` (`%I` / `%L`), never spliced as text, so
+/// any user-chosen password is safe. `password_encryption` is pinned so
+/// the stored password is always a SCRAM verifier.
+const APP_USER_SQL: &str = r#"SET password_encryption = 'scram-sha-256';
+SELECT format('CREATE ROLE %I LOGIN SUPERUSER', :'app_user')
+WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'app_user')\gexec
+SELECT format('ALTER ROLE %I WITH LOGIN SUPERUSER PASSWORD %L', :'app_user', :'app_password')\gexec
+SELECT format('CREATE DATABASE %I OWNER %I', :'app_db', :'app_user')
+WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'app_db')\gexec"#;
+
+/// Data node, application auth: choose the method of the application
+/// catch-all rules (`host`/`hostssl all all 0.0.0.0/0` and `::/0`).
+///
+/// A `scram-sha-256` rule refuses a role whose stored password is an MD5
+/// hash, while an `md5` rule accepts both MD5 and SCRAM verifiers (it then
+/// performs SCRAM). Without the plaintext a stored MD5 hash cannot be
+/// rehashed, so the rules are only switched to `scram-sha-256` once no
+/// login role stores an MD5 hash; otherwise they are kept (or put back) at
+/// `md5` and the reason is logged. pg_auto_failover writes
+/// `password_encryption = '<--auth method>'`, so roles on SCRAM-native
+/// members are SCRAM; MD5 hashes only appear from restored dumps or
+/// explicit `password_encryption = md5`.
+///
+/// Must run after [`NODE_ENFORCE_SNIPPET`]: both rewrite `pg_hba.conf`.
+/// Expects `PGDATA` and `NODE_PORT`. Starts a background job that always
+/// exits 0 (a member whose Postgres never answers keeps its current rules).
+const NODE_APP_AUTH_SNIPPET: &str = r#"(
+  HBA="$PGDATA/pg_hba.conf"
+  APP_RULE='^([[:space:]]*host(ssl)?[[:space:]]+all[[:space:]]+all[[:space:]]+(0\.0\.0\.0/0|::/0)[[:space:]]+)(md5|scram-sha-256)([[:space:]]|$)'
+  for _ in $(seq 1 300); do
+    MD5_ROLES=$(gosu postgres psql -X -At -p "$NODE_PORT" -d postgres -c "SELECT count(*) FROM pg_authid WHERE rolcanlogin AND rolpassword LIKE 'md5%'" 2>/dev/null || true)
+    case "$MD5_ROLES" in
+      ''|*[!0-9]*) sleep 1; continue ;;
+    esac
+    if [ "$MD5_ROLES" = 0 ]; then
+      APP_AUTH=scram-sha-256
+    else
+      APP_AUTH=md5
+      echo "temps: keeping md5 for the application pg_hba rules on port $NODE_PORT: $MD5_ROLES login role(s) store an MD5 password hash, which scram-sha-256 would refuse; reset those passwords with password_encryption = scram-sha-256 and restart this member to switch" >&2
+    fi
+    if [ -f "$HBA" ]; then
+      APP_HBA=$(mktemp "$PGDATA/.temps-hba-app.XXXXXX")
+      sed -E "s#${APP_RULE}#\\1${APP_AUTH}\\5#" "$HBA" > "$APP_HBA"
+      if ! cmp -s "$HBA" "$APP_HBA"; then
+        cat "$APP_HBA" > "$HBA"
+        gosu postgres pg_ctl reload -D "$PGDATA" >/dev/null 2>&1 || true
+        echo "temps: application pg_hba rules on port $NODE_PORT now use $APP_AUTH" >&2
+      fi
+      rm -f "$APP_HBA"
+    fi
+    exit 0
+  done
+  echo "temps: application pg_hba rules left unchanged: PostgreSQL on port $NODE_PORT did not accept local connections" >&2
+  exit 0
+) &"#;
+
 /// Removes pg_autoctl's pidfile left behind by an unclean stop.
 ///
 /// pg_autoctl writes it under `/tmp/pg_autoctl/<PGDATA path>/pg_autoctl.pid`
@@ -435,7 +494,9 @@ pub enum AuthUpgradeStep {
     /// On every data node: `.pgpass`, pg_autoctl config, monitor URI and
     /// (on the primary) the replicator password (rules unchanged).
     NodePrepare,
-    /// On every data node: switch replicator rules to SCRAM.
+    /// On every data node: switch replicator rules to SCRAM, and the
+    /// application catch-all rules too once no login role stores an MD5
+    /// hash (see [`NODE_APP_AUTH_SNIPPET`]).
     NodeEnforce,
     /// On the monitor: switch `autoctl_node` rules to SCRAM.
     MonitorEnforce,
@@ -587,6 +648,14 @@ fi"#
             script.push(NODE_PGPASS_SNIPPET.to_string());
         }
         script.push(body.to_string());
+        if step == AuthUpgradeStep::NodeEnforce {
+            // Runs after the infrastructure rewrite (never concurrently with
+            // it) and is waited for so the step returns converged. The job
+            // always exits 0: keeping `md5` is a logged decision, not a
+            // failure of the infrastructure upgrade.
+            script.push(NODE_APP_AUTH_SNIPPET.to_string());
+            script.push("wait $!".to_string());
+        }
         if matches!(
             step,
             AuthUpgradeStep::MonitorPrepare | AuthUpgradeStep::NodePrepare
@@ -703,21 +772,31 @@ fi"#
                 // gets "no pg_hba.conf entry for host X, user Y" until
                 // we open it explicitly.
                 //
-                // We add ONE catch-all md5 rule rather than a per-user
+                // We add ONE catch-all SCRAM rule rather than a per-user
                 // entry so future roles work without a code change.
                 // Auth is still password-protected; the rule just
                 // says "if the role exists and the password matches,
                 // let it in from anywhere on the network the cluster
-                // already trusts".
+                // already trusts". pg_autoctl's `--auth scram-sha-256`
+                // sets `password_encryption = 'scram-sha-256'`, and the
+                // app user below is explicitly hashed with SCRAM.
+                // NODE_APP_AUTH_SNIPPET puts the rules back to md5 if a
+                // login role stores an MD5 hash (e.g. a standby cloned
+                // from a legacy primary, or a restored dump).
+                //
+                // Non-TLS `host` rules stay: linked apps receive a
+                // POSTGRES_URL without `sslmode`, and drivers whose
+                // default is no TLS (node-postgres, JDBC) would be
+                // refused by `hostnossl ... reject`.
                 //
                 // Order matters in pg_hba — the replicator rules above
                 // this block and pg_auto_failover's auto-generated
                 // monitor health-check rule match first.
-                "      if ! grep -q '^host all all 0\\.0\\.0\\.0/0 md5' \"$HBA\" 2>/dev/null; then",
-                "        echo 'hostssl all all 0.0.0.0/0 md5' >> \"$HBA\"",
-                "        echo 'hostssl all all ::/0 md5' >> \"$HBA\"",
-                "        echo 'host all all 0.0.0.0/0 md5' >> \"$HBA\"",
-                "        echo 'host all all ::/0 md5' >> \"$HBA\"",
+                "      if ! grep -Eq '^host all all 0\\.0\\.0\\.0/0 (md5|scram-sha-256)' \"$HBA\" 2>/dev/null; then",
+                "        echo 'hostssl all all 0.0.0.0/0 scram-sha-256' >> \"$HBA\"",
+                "        echo 'hostssl all all ::/0 scram-sha-256' >> \"$HBA\"",
+                "        echo 'host all all 0.0.0.0/0 scram-sha-256' >> \"$HBA\"",
+                "        echo 'host all all ::/0 scram-sha-256' >> \"$HBA\"",
                 "        gosu postgres pg_ctl reload -D \"$PGDATA\" 2>/dev/null || true",
                 "      fi",
                 "      break",
@@ -738,10 +817,24 @@ fi"#
                 // patcher finishes. So this is its own loop that retries
                 // every 2s until the ALTER succeeds, then exits.
                 //
-                // The script writes the SQL to a tempfile rather than
-                // -c'ing it inline so embedded $$ and quotes don't need
-                // round-trip escaping through the bash heredoc. We
-                // chmod the file 644 so `gosu postgres psql` (which
+                // The SQL is a fixed, quoted heredoc (`<<'SQL_EOF'`): the
+                // shell expands nothing in it. The user, password and
+                // database travel as psql variables and are quoted by
+                // psql (`:'var'`) and by `format()` (`%I` identifier,
+                // `%L` literal), so a password containing `'`, `$`,
+                // backticks or backslashes can neither break nor extend
+                // the SQL. (Splicing `${POSTGRES_PASSWORD}` into
+                // `PASSWORD '...'` let a `'` in a user-chosen password
+                // inject SQL running as superuser.)
+                //
+                // `password_encryption` is pinned for the session so the
+                // app user always stores a SCRAM verifier, which the
+                // `scram-sha-256` catch-all rule above requires.
+                //
+                // A standby is read-only and receives the role from the
+                // primary through replication, so it skips the ALTER.
+                //
+                // We chmod the file 644 so `gosu postgres psql` (which
                 // drops to the postgres user) can read it — without
                 // this it lives as 600 root:root, every retry hits
                 // EACCES, the loop times out and the password never
@@ -749,24 +842,19 @@ fi"#
                 // caller including Browse Data.
                 "(",
                 "  SQL_FILE=$(mktemp /tmp/temps-app-user-XXXX.sql)",
-                "  cat > \"$SQL_FILE\" <<SQL_EOF",
-                "DO \\$\\$",
-                "BEGIN",
-                "  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${POSTGRES_USER}') THEN",
-                "    CREATE ROLE \"${POSTGRES_USER}\" LOGIN SUPERUSER PASSWORD '${POSTGRES_PASSWORD}';",
-                "  ELSE",
-                "    ALTER ROLE \"${POSTGRES_USER}\" WITH LOGIN SUPERUSER PASSWORD '${POSTGRES_PASSWORD}';",
-                "  END IF;",
-                "END",
-                "\\$\\$;",
-                "SELECT 'CREATE DATABASE \"${POSTGRES_DB}\" OWNER \"${POSTGRES_USER}\"'",
-                "WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = '${POSTGRES_DB}')\\gexec",
+                "  cat > \"$SQL_FILE\" <<'SQL_EOF'",
+                APP_USER_SQL,
                 "SQL_EOF",
                 "  chmod 644 \"$SQL_FILE\"",
                 "  for _ in $(seq 1 60); do",
-                "    if gosu postgres psql -p \"$NODE_PORT\" -d postgres -v ON_ERROR_STOP=1 -f \"$SQL_FILE\" >/dev/null 2>&1; then",
-                "      rm -f \"$SQL_FILE\"",
-                "      exit 0",
+                "    IN_RECOVERY=$(gosu postgres psql -X -At -p \"$NODE_PORT\" -d postgres -c 'SELECT pg_is_in_recovery()' 2>/dev/null || true)",
+                "    if [ \"$IN_RECOVERY\" = t ]; then",
+                "      break",
+                "    fi",
+                "    if [ \"$IN_RECOVERY\" = f ] && gosu postgres psql -X -q -p \"$NODE_PORT\" -d postgres -v ON_ERROR_STOP=1 \\",
+                "      -v app_user=\"$POSTGRES_USER\" -v app_password=\"$POSTGRES_PASSWORD\" -v app_db=\"$POSTGRES_DB\" \\",
+                "      -f \"$SQL_FILE\" >/dev/null 2>&1; then",
+                "      break",
                 "    fi",
                 "    sleep 2",
                 "  done",
@@ -785,6 +873,7 @@ fi"#
                 "fi",
                 NODE_PREPARE_SNIPPET,
                 NODE_ENFORCE_SNIPPET,
+                NODE_APP_AUTH_SNIPPET,
                 STALE_PIDFILE_CLEANUP,
                 "exec gosu postgres pg_autoctl run --pgdata \"$PGDATA\"",
             ]
@@ -1680,6 +1769,281 @@ exit 0
         );
         assert!(script.contains("ALTER ROLE pgautofailover_replicator PASSWORD :'pw'"));
         assert_no_trust_for_infrastructure_roles(script);
+    }
+
+    /// Service whose command generators never contact Docker.
+    fn offline_service() -> PostgresClusterService {
+        let docker =
+            Docker::connect_with_http("http://127.0.0.1:1", 120, bollard::API_DEFAULT_VERSION)
+                .unwrap();
+        PostgresClusterService::new("test".into(), Arc::new(docker))
+    }
+
+    /// The `pg_hba` lines a script appends for the application catch-all.
+    fn app_catch_all_rules(script: &str) -> Vec<String> {
+        script
+            .lines()
+            .filter(|l| l.contains("echo '") && l.contains(" all all "))
+            .map(|l| l.trim().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn node_command_app_catch_all_uses_scram_not_md5() {
+        let script = offline_service().node_command()[2].clone();
+        let rules = app_catch_all_rules(&script);
+        assert_eq!(
+            rules,
+            [
+                "echo 'hostssl all all 0.0.0.0/0 scram-sha-256' >> \"$HBA\"",
+                "echo 'hostssl all all ::/0 scram-sha-256' >> \"$HBA\"",
+                "echo 'host all all 0.0.0.0/0 scram-sha-256' >> \"$HBA\"",
+                "echo 'host all all ::/0 scram-sha-256' >> \"$HBA\"",
+            ]
+        );
+        // An existing catch-all of either method (a legacy md5 volume, or
+        // a pg_hba.conf cloned from the primary) is not duplicated.
+        assert!(script
+            .contains("grep -Eq '^host all all 0\\.0\\.0\\.0/0 (md5|scram-sha-256)' \"$HBA\""));
+        // Linked apps receive a POSTGRES_URL without `sslmode`, so non-TLS
+        // application connections must keep working.
+        assert!(!script.contains("hostnossl all all"), "{script}");
+    }
+
+    #[test]
+    fn node_command_decides_app_auth_after_infrastructure_rewrite() {
+        let script = offline_service().node_command()[2].clone();
+        let enforce = script
+            .find(NODE_ENFORCE_SNIPPET)
+            .expect("infrastructure enforce runs");
+        let app_auth = script
+            .find(NODE_APP_AUTH_SNIPPET)
+            .expect("application auth decision runs");
+        assert!(
+            enforce < app_auth,
+            "both rewrite pg_hba.conf; they must not run concurrently"
+        );
+        assert!(app_auth < script.find("exec gosu postgres pg_autoctl run").unwrap());
+        // The decision is based on stored hashes, never on assumptions.
+        assert!(NODE_APP_AUTH_SNIPPET
+            .contains("FROM pg_authid WHERE rolcanlogin AND rolpassword LIKE 'md5%'"));
+    }
+
+    #[test]
+    fn auth_upgrade_node_enforce_applies_app_auth_decision_and_waits() {
+        let node =
+            PostgresClusterService::auth_upgrade_command(AuthUpgradeStep::NodeEnforce)[2].clone();
+        let enforce = node.find(NODE_ENFORCE_SNIPPET).expect("enforce body");
+        let app_auth = node.find(NODE_APP_AUTH_SNIPPET).expect("app auth decision");
+        assert!(enforce < app_auth);
+        assert!(node.trim_end().ends_with("wait $!"), "{node}");
+        for step in [
+            AuthUpgradeStep::MonitorPrepare,
+            AuthUpgradeStep::NodePrepare,
+            AuthUpgradeStep::MonitorEnforce,
+        ] {
+            let script = PostgresClusterService::auth_upgrade_command(step)[2].clone();
+            assert!(
+                !script.contains("rolpassword LIKE 'md5%'"),
+                "{step:?} must not touch application auth"
+            );
+        }
+    }
+
+    /// Run [`NODE_APP_AUTH_SNIPPET`] against a temporary `pg_hba.conf`
+    /// with `gosu` stubbed: `psql` reports `md5_roles`, `pg_ctl` is
+    /// recorded. Returns `(pg_hba.conf, stderr, reloaded)`, or `None` when
+    /// bash is unavailable.
+    #[cfg(unix)]
+    fn run_app_auth_snippet(hba: &str, md5_roles: &str) -> Option<(String, String, bool)> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let gosu = bin.join("gosu");
+        std::fs::write(
+            &gosu,
+            r#"#!/bin/sh
+shift
+case "$1" in
+  psql) printf '%s\n' "$MD5_ROLES_STUB" ;;
+  pg_ctl) printf 'reload\n' >> "$COMMAND_LOG" ;;
+esac
+exit 0
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(gosu, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pgdata = dir.path().join("pgdata");
+        std::fs::create_dir(&pgdata).unwrap();
+        std::fs::write(pgdata.join("pg_hba.conf"), hba).unwrap();
+        let log = dir.path().join("commands");
+        std::fs::write(&log, "").unwrap();
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!("{NODE_APP_AUTH_SNIPPET}\nwait $!"))
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("PGDATA", &pgdata)
+            .env("NODE_PORT", "5432")
+            .env("MD5_ROLES_STUB", md5_roles)
+            .env("COMMAND_LOG", &log)
+            .output()
+            .ok()?;
+        assert!(output.status.success(), "snippet failed: {output:?}");
+        let leftovers: Vec<_> = std::fs::read_dir(&pgdata)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "pg_hba.conf")
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
+        Some((
+            std::fs::read_to_string(pgdata.join("pg_hba.conf")).unwrap(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            std::fs::read_to_string(&log).unwrap().contains("reload"),
+        ))
+    }
+
+    const LEGACY_NODE_HBA: &str = "\
+local   all             all                                     trust
+hostnossl all pgautofailover_replicator 0.0.0.0/0 reject # Temps infrastructure authentication
+hostssl all pgautofailover_replicator 0.0.0.0/0 scram-sha-256 # Temps infrastructure authentication
+hostssl all all 0.0.0.0/0 md5
+hostssl all all ::/0 md5
+host all all 0.0.0.0/0 md5
+host all all ::/0 md5
+hostssl all \"pgautofailover_monitor\" 172.26.0.2/32 trust # Auto-generated by pg_auto_failover
+host app_db app_user 10.0.0.0/8 md5
+";
+
+    #[cfg(unix)]
+    #[test]
+    fn app_auth_switches_catch_all_to_scram_when_no_md5_hashes_exist() {
+        let Some((hba, stderr, reloaded)) = run_app_auth_snippet(LEGACY_NODE_HBA, "0") else {
+            eprintln!("bash unavailable; skipping");
+            return;
+        };
+        let expected = LEGACY_NODE_HBA
+            .replace("all all 0.0.0.0/0 md5", "all all 0.0.0.0/0 scram-sha-256")
+            .replace("all all ::/0 md5", "all all ::/0 scram-sha-256");
+        // Only the four catch-all lines change: initdb's local trust, the
+        // infrastructure guards, pg_auto_failover's monitor rule and a
+        // narrower operator rule are untouched.
+        assert_eq!(hba, expected, "stderr: {stderr}");
+        assert!(hba.contains("host app_db app_user 10.0.0.0/8 md5"));
+        assert!(reloaded);
+        assert!(stderr.contains("now use scram-sha-256"), "{stderr}");
+
+        // Converged: a second run changes nothing and does not reload.
+        let (again, _, reloaded) = run_app_auth_snippet(&expected, "0").unwrap();
+        assert_eq!(again, expected);
+        assert!(!reloaded);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_auth_keeps_md5_and_explains_when_md5_hashes_exist() {
+        let Some((hba, stderr, reloaded)) = run_app_auth_snippet(LEGACY_NODE_HBA, "2") else {
+            eprintln!("bash unavailable; skipping");
+            return;
+        };
+        assert_eq!(hba, LEGACY_NODE_HBA);
+        assert!(!reloaded);
+        assert!(
+            stderr.contains("keeping md5")
+                && stderr.contains("2 login role(s) store an MD5 password hash"),
+            "{stderr}"
+        );
+
+        // A SCRAM catch-all (new member cloned from a primary that still has
+        // MD5-hashed roles) is put back to md5 so those roles can log in.
+        let scram =
+            LEGACY_NODE_HBA.replace("all all 0.0.0.0/0 md5", "all all 0.0.0.0/0 scram-sha-256");
+        let (restored, _, reloaded) = run_app_auth_snippet(&scram, "1").unwrap();
+        assert_eq!(restored, LEGACY_NODE_HBA);
+        assert!(reloaded);
+    }
+
+    /// The app-user SQL heredoc is quoted: nothing in it is expanded by
+    /// the shell, and the credentials only reach psql as variables.
+    #[test]
+    fn node_app_user_sql_never_splices_credentials() {
+        let script = offline_service().node_command()[2].clone();
+        assert!(script.contains("cat > \"$SQL_FILE\" <<'SQL_EOF'"));
+        assert!(!script.contains("<<SQL_EOF"));
+        for spliced in ["${POSTGRES_PASSWORD}", "${POSTGRES_USER}", "${POSTGRES_DB}"] {
+            assert!(!script.contains(spliced), "{spliced} spliced into SQL");
+        }
+        assert!(script.contains(
+            "-v app_user=\"$POSTGRES_USER\" -v app_password=\"$POSTGRES_PASSWORD\" -v app_db=\"$POSTGRES_DB\""
+        ));
+        // Values are quoted by psql and format(), never by hand.
+        assert!(APP_USER_SQL.contains(
+            "format('ALTER ROLE %I WITH LOGIN SUPERUSER PASSWORD %L', :'app_user', :'app_password')"
+        ));
+        assert!(
+            APP_USER_SQL.contains("format('CREATE DATABASE %I OWNER %I', :'app_db', :'app_user')")
+        );
+        // The stored password is a SCRAM verifier whatever the server default.
+        let pin = APP_USER_SQL
+            .find("SET password_encryption = 'scram-sha-256';")
+            .expect("password_encryption pinned");
+        assert!(pin < APP_USER_SQL.find("PASSWORD %L").unwrap());
+        // psql variables are not interpolated inside dollar-quoted bodies,
+        // so the statement must not be wrapped in a DO block.
+        assert!(!APP_USER_SQL.contains("$$"));
+    }
+
+    /// Run the generated heredoc with hostile credentials in the
+    /// environment: the SQL file must be byte-for-byte [`APP_USER_SQL`].
+    #[test]
+    fn node_app_user_heredoc_is_not_expanded_by_the_shell() {
+        let script = offline_service().node_command()[2].clone();
+        let start = script
+            .find("  cat > \"$SQL_FILE\" <<'SQL_EOF'")
+            .expect("heredoc present");
+        let end = script[start..]
+            .find("\nSQL_EOF")
+            .expect("heredoc terminated")
+            + start;
+        let heredoc = format!("{}\nSQL_EOF\ncat \"$SQL_FILE\"", &script[start..end]);
+        let marker = std::env::temp_dir().join(format!("temps-heredoc-{}", uuid::Uuid::new_v4()));
+        let Ok(output) = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "SQL_FILE=$(mktemp)\n{heredoc}\nrm -f \"$SQL_FILE\""
+            ))
+            .env("POSTGRES_USER", "app\"user")
+            .env(
+                "POSTGRES_PASSWORD",
+                format!(
+                    "pa'ss$(touch {m})`touch {m}`\\'; DROP ROLE x; --",
+                    m = marker.display()
+                ),
+            )
+            .env("POSTGRES_DB", "db'name")
+            .output()
+        else {
+            eprintln!("bash unavailable; skipping");
+            return;
+        };
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim_end(),
+            APP_USER_SQL
+        );
+        assert!(!marker.exists(), "password was executed by the shell");
+    }
+
+    #[test]
+    fn standby_skips_app_user_alter() {
+        let script = offline_service().node_command()[2].clone();
+        let probe = script
+            .find("-c 'SELECT pg_is_in_recovery()'")
+            .expect("recovery probe");
+        let alter = script.find("-f \"$SQL_FILE\"").expect("SQL applied");
+        assert!(probe < alter);
+        assert!(script.contains("if [ \"$IN_RECOVERY\" = f ] && gosu postgres psql"));
     }
 
     #[test]

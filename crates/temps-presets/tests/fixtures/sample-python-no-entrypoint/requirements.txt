@@ -1,0 +1,5 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Dependencies but no entry point, Procfile or WSGI/ASGI module: autopack
+# detects Python and cannot work out how to start it.
+requests==2.32.3

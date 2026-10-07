@@ -92,9 +92,14 @@ jobs:
   # read -- see the note at the top of this file), ask GitHub whether
   # rust-tests.yml already succeeded for this exact SHA, waiting for an
   # in-flight run (e.g. the `main` push that `scripts/release.sh` sends next
-  # to the tag). Builds start in parallel; only the jobs that make anything
-  # public (alias promotion, the GitHub Release and the server image after
-  # it) wait for this gate.
+  # to the tag). Only the jobs that push nothing (`build-web-assets` and
+  # `prepare-sandbox-context`) run alongside this gate. Every job that
+  # pushes to a registry waits for it -- the daemon, sandbox and
+  # preview-gateway image jobs list it directly -- and so, transitively, does
+  # everything downstream: the platform binary builds need the verified
+  # runtime-image manifest, which needs those images, so no binary is
+  # compiled until the gate passes. Alias promotion and the GitHub Release
+  # also list it explicitly, and the server image follows the release.
   #
   # Emergency bypass: a maintainer (workflow_dispatch needs write access)
   # dispatches this workflow at the tag with
@@ -827,9 +832,9 @@ jobs:
 
           ### Quick Install (Recommended)
 
-          **macOS, Linux, and WSL:**
+          **macOS, Linux, and WSL** (installs exactly this release):
           ```bash
-          curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/install.sh | bash
+          curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/install.sh | bash -s -- ${{ github.ref_name }}
           ```
 
           ### Homebrew (macOS and Linux)
@@ -934,6 +939,21 @@ jobs:
           gh attestation verify temps-linux-amd64.tar.gz --repo ${{ github.repository }}
           ```
           EOF
+          # Image tags drop the tag's leading `v`, which the quoted heredoc
+          # above cannot compute.
+          image="ghcr.io/${{ github.repository_owner }}/temps:${GITHUB_REF_NAME#v}"
+          {
+            echo ""
+            echo "### Server image"
+            echo "The multi-arch \`$image\` image is cosign-signed by digest and carries a"
+            echo "Sigstore-signed build provenance attestation:"
+            echo '```bash'
+            echo "gh attestation verify oci://$image --repo ${{ github.repository }}"
+            echo "cosign verify $image \\"
+            echo "  --certificate-identity \"https://github.com/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}\" \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
+            echo '```'
+          } >> release/release-notes.md
 
           echo "Release notes created:"
           cat release/release-notes.md
@@ -943,6 +963,7 @@ jobs:
           DRY_RUN: ${{ inputs.dry_run }}
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
+          IS_PRERELEASE: ${{ steps.channel.outputs.is_prerelease }}
         run: |
           # workflow_dispatch dry-runs must not mint a real Release object
           # under the dispatched branch name — everything above this step
@@ -955,12 +976,24 @@ jobs:
 
           echo "Creating release $RELEASE_TAG..."
 
-          if [[ "${{ steps.channel.outputs.is_prerelease }}" == "true" ]]; then
+          if [[ "$IS_PRERELEASE" == "true" ]]; then
             PRERELEASE_FLAG="--prerelease"
             echo "This is a pre-release"
           else
-            PRERELEASE_FLAG="--latest"
             echo "This is a stable release"
+            # GitHub's "Latest" release is what the installer's default
+            # stable channel downloads (GET /releases/latest). Only the
+            # highest stable version may hold it: a backport such as v0.0.9
+            # cut after v0.1.0 is published, but must not become Latest and
+            # downgrade new installs. See .github/scripts/release_latest.py.
+            # Prereleases never compete for Latest; excluding them keeps the
+            # daily nightlies from pushing old stable releases off the list.
+            existing_tags=$(gh release list --repo "$GITHUB_REPOSITORY" \
+              --exclude-drafts --exclude-pre-releases --limit 1000 \
+              --json tagName --jq '.[].tagName')
+            make_latest=$(printf '%s\n' "$existing_tags" |
+              python3 .github/scripts/release_latest.py "$RELEASE_TAG")
+            PRERELEASE_FLAG="--latest=$make_latest"
           fi
 
           release_assets=(
@@ -986,13 +1019,13 @@ jobs:
             gh release edit "$RELEASE_TAG" \
               --title "$RELEASE_TAG" \
               --notes-file release/release-notes.md \
-              $PRERELEASE_FLAG
+              "$PRERELEASE_FLAG"
             gh release upload "$RELEASE_TAG" --clobber "${release_assets[@]}"
           else
             gh release create "$RELEASE_TAG" \
               --title "$RELEASE_TAG" \
               --notes-file release/release-notes.md \
-              $PRERELEASE_FLAG \
+              "$PRERELEASE_FLAG" \
               "${release_assets[@]}"
           fi
 
@@ -1116,8 +1149,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      # Push the cosign signature and the attestation to the registry.
       packages: write
+      # Keyless signing (cosign and actions/attest share the OIDC token).
       id-token: write
+      # Persist the image's build provenance attestation on GitHub.
+      attestations: write
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -1172,6 +1209,65 @@ jobs:
           IMAGE_VERSION: ${{ steps.version.outputs.version }}
           IMAGE_CHANNEL: ${{ needs.create-release.outputs.channel_tag }}
         run: bash .github/scripts/sign-release-image.sh
+
+      # GitHub artifact attestation (SLSA build provenance, keyless Sigstore)
+      # for the multi-arch index, in addition to the cosign signature above
+      # and BuildKit's per-platform SBOM/provenance. Resolved from the
+      # registry the same way sign-release-image.sh does it, so the subject
+      # is exactly what `docker pull` fetches. The channel ref is attested
+      # separately only when its index digest differs from the version's.
+      # Verify with
+      #   gh attestation verify oci://ghcr.io/gotempsh/temps:<version> --repo gotempsh/temps
+      - name: Resolve published image digests
+        id: image
+        if: inputs.dry_run != true
+        env:
+          IMAGE_REPOSITORY: ghcr.io/${{ github.repository_owner }}/temps
+          IMAGE_VERSION: ${{ steps.version.outputs.version }}
+          IMAGE_CHANNEL: ${{ needs.create-release.outputs.channel_tag }}
+        run: |
+          resolve() {
+            local reference="$1" digest
+            digest=$(docker buildx imagetools inspect "$reference" --format '{{.Manifest.Digest}}')
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::Cannot resolve published image digest for $reference (got '$digest')" >&2
+              return 1
+            fi
+            printf '%s' "$digest"
+          }
+          digest=$(resolve "$IMAGE_REPOSITORY:$IMAGE_VERSION")
+          channel_digest=""
+          if [[ -n "$IMAGE_CHANNEL" ]]; then
+            channel_digest=$(resolve "$IMAGE_REPOSITORY:$IMAGE_CHANNEL")
+            if [[ "$channel_digest" == "$digest" ]]; then channel_digest=""; fi
+          fi
+          echo "Version $IMAGE_VERSION: $digest"
+          echo "Channel ${IMAGE_CHANNEL:-<none>}: ${channel_digest:-same index as the version}"
+          {
+            echo "digest=$digest"
+            echo "channel_digest=$channel_digest"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Attest build provenance for the server image
+        if: inputs.dry_run != true
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ github.repository_owner }}/temps
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
+          # Storage records need the extra `artifact-metadata: write`
+          # permission and only enrich the org's "Linked Artifacts" page;
+          # verification does not depend on them.
+          create-storage-record: false
+
+      - name: Attest build provenance for the channel image
+        if: inputs.dry_run != true && steps.image.outputs.channel_digest != ''
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ github.repository_owner }}/temps
+          subject-digest: ${{ steps.image.outputs.channel_digest }}
+          push-to-registry: true
+          create-storage-record: false
 
   # ─────────────────────────────────────────────────────────────────────────
   # Sandbox images and preview gateway

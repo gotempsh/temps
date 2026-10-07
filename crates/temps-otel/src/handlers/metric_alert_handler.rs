@@ -376,6 +376,8 @@ pub async fn list_alerts(
         (status = 409, description = "The project already has the maximum number of metric alert rules", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 404, description = "Project not found", body = ProblemDetails),
+        (status = 409, description = "Project already holds the maximum number of metric alert rules", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails),
     ),
     security(("bearer_auth" = []))

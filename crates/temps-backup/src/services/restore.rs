@@ -78,19 +78,46 @@ pub enum RestoreError {
     RestoreNotActive { restore_run_id: i32, status: String },
 
     #[error(
-        "Restore run {restore_run_id} can no longer be cancelled: it is in phase '{phase}' and \
-         has started writing data. Stopping it now would leave the target partially restored, \
-         so it will run to completion. Wait for it to finish, then check the result."
-    )]
-    RestoreNotCancellable { restore_run_id: i32, phase: String },
-
-    #[error("Restore run {restore_run_id} was cancelled before it wrote any data")]
-    Cancelled { restore_run_id: i32 },
-
-    #[error(
         "Restore run {restore_run_id} worker stopped unexpectedly during phase '{phase}': {reason}"
     )]
     WorkerCrashed {
+        restore_run_id: i32,
+        phase: String,
+        reason: String,
+    },
+
+    /// Signal from a guarded phase move: a cancellation was recorded before
+    /// the worker could leave `phase`. The worker turns it into
+    /// [`RestoreError::Cancelled`] once it knows what, if anything, it has to
+    /// clean up.
+    #[error("Restore run {restore_run_id} was cancelled during phase '{phase}'")]
+    RestoreCancelled { restore_run_id: i32, phase: String },
+
+    /// Terminal outcome of a cancelled run; `message` says what was left
+    /// behind and is stored on the run.
+    #[error("{message}")]
+    Cancelled {
+        restore_run_id: i32,
+        phase: String,
+        message: String,
+    },
+
+    /// A cancelled run staged its backup with a process that could not be
+    /// confirmed stopped. The run is kept active, holding the service, so no
+    /// other restore reuses the scratch data while it may still be written.
+    #[error(
+        "Restore run {restore_run_id} was cancelled, but its staged download in {target} could \
+         not be confirmed stopped ({reason}). The run stays active so no other restore uses the \
+         service until the download is confirmed gone; the next server start retries the check."
+    )]
+    StagedRestoreStillRunning {
+        restore_run_id: i32,
+        target: String,
+        reason: String,
+    },
+
+    #[error("Restore run {restore_run_id} cannot be cancelled in phase '{phase}': {reason}")]
+    RestoreNotCancellable {
         restore_run_id: i32,
         phase: String,
         reason: String,
@@ -283,6 +310,20 @@ impl RestoreRequestMode {
         )
     }
 
+    /// Name of the service this run creates, for modes that create one.
+    pub fn new_service_name(&self) -> Option<&str> {
+        match self {
+            RestoreRequestMode::InPlace => None,
+            RestoreRequestMode::NewService { name, .. } => Some(name),
+            RestoreRequestMode::Pitr {
+                to_new_service: true,
+                new_service_name,
+                ..
+            } => new_service_name.as_deref(),
+            RestoreRequestMode::Pitr { .. } => None,
+        }
+    }
+
     fn as_str(&self) -> &'static str {
         match self {
             RestoreRequestMode::InPlace => "in_place",
@@ -307,6 +348,12 @@ pub struct RestoreRunView {
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
     pub created_at: String,
+    /// When cancellation was requested, if it was.
+    pub cancel_requested_at: Option<String>,
+    /// Whether `POST /restore-runs/{id}/cancel` would be accepted now.
+    pub cancellable: bool,
+    /// Why the run cannot be cancelled now; `None` when `cancellable`.
+    pub not_cancellable_reason: Option<String>,
     /// The backup this run restores from, so a client can show and link to
     /// it. Always present; its fields are `None` where they are unknown.
     pub source_backup: RestoreRunSourceBackup,
@@ -386,9 +433,13 @@ pub struct BackupProducerServices {
 
 impl From<temps_entities::restore_runs::Model> for RestoreRunView {
     fn from(m: temps_entities::restore_runs::Model) -> Self {
+        let not_cancellable_reason = super::restore_cancel::not_cancellable_reason(&m);
         let source_backup = RestoreRunSourceBackup::from_run(&m);
         Self {
             source_backup,
+            cancel_requested_at: m.cancel_requested_at.map(|d| d.to_rfc3339()),
+            cancellable: not_cancellable_reason.is_none(),
+            not_cancellable_reason,
             id: m.id,
             source_backup_id: m.source_backup_id,
             source_service_id: m.source_service_id,
@@ -472,6 +523,8 @@ pub struct RestoreService {
     /// Anonymous product telemetry. No-op unless wired with
     /// [`Self::with_telemetry`].
     telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
+    /// Cancellation signals for the restore workers this service spawned.
+    cancellations: super::restore_cancel::RestoreCancellations,
 }
 
 impl RestoreService {
@@ -485,6 +538,7 @@ impl RestoreService {
             external_service_manager,
             encryption_service,
             telemetry: Arc::new(temps_core::telemetry::NoopTelemetryReporter),
+            cancellations: super::restore_cancel::RestoreCancellations::default(),
         }
     }
 
@@ -538,13 +592,7 @@ impl RestoreService {
                         .one(self.db.as_ref())
                         .await?
                         .ok_or(RestoreError::BackupNotFound { backup_id: *id })?;
-                    let engine = serde_json::from_str::<serde_json::Value>(&backup.metadata)
-                        .ok()
-                        .and_then(|v| {
-                            v.get("service_type")
-                                .and_then(|t| t.as_str())
-                                .map(String::from)
-                        });
+                    let engine = self.resolve_backup_engine(&backup).await?;
                     (
                         Some(backup.clone()),
                         backup.s3_location.clone(),
@@ -560,7 +608,7 @@ impl RestoreService {
                 } => (
                     None,
                     location.clone(),
-                    Some(engine.clone()),
+                    ResolvedBackupEngine::Known(engine.clone()),
                     *s3_source_id,
                     None,
                 ),
@@ -577,20 +625,27 @@ impl RestoreService {
             }
         }
 
-        // Engine compat.
-        let engine_from_backup = backup_engine_hint.clone();
-        if let Some(engine) = &engine_from_backup {
-            if !engines_compatible(engine, &target.service_type) {
-                errors.push(format!(
-                    "Engine mismatch: backup is '{}' but target '{}' is '{}'.",
-                    engine, target.name, target.service_type
-                ));
+        // Engine compat — the same resolution `start_restore` enforces.
+        match &backup_engine_hint {
+            ResolvedBackupEngine::Known(engine) => {
+                if !engines_compatible(engine, &target.service_type) {
+                    errors.push(format!(
+                        "Engine mismatch: backup is '{}' but target '{}' is '{}'.",
+                        engine, target.name, target.service_type
+                    ));
+                }
             }
-        } else {
-            warnings.push(
+            ResolvedBackupEngine::Unknown { has_producer: true } => errors.push(
+                "Cannot determine which engine produced this backup (no service_type in its \
+                 metadata and its producing service is gone), so it cannot be restored safely."
+                    .into(),
+            ),
+            ResolvedBackupEngine::Unknown {
+                has_producer: false,
+            } => warnings.push(
                 "Could not determine the backup's engine from metadata — proceeding as if it matches the target."
                     .into(),
-            );
+            ),
         }
 
         // Classify backup format. For missing locations (pre-fix DB rows),
@@ -1041,25 +1096,26 @@ impl RestoreService {
                     .await?
                     .ok_or(RestoreError::BackupNotFound { backup_id: *id })?;
 
-                // Try to infer the engine from the external_service_backups
-                // link OR from the metadata blob. This is advisory — used
-                // only for engine-compat checking.
-                let engine = if let Some(es_backup) =
-                    temps_entities::external_service_backups::Entity::find()
-                        .filter(temps_entities::external_service_backups::Column::BackupId.eq(*id))
-                        .one(self.db.as_ref())
-                        .await?
-                {
-                    let svc = self.load_service(es_backup.service_id).await.ok();
-                    svc.map(|s| s.service_type)
-                } else {
-                    serde_json::from_str::<serde_json::Value>(&backup.metadata)
-                        .ok()
-                        .and_then(|v| {
-                            v.get("service_type")
-                                .and_then(|t| t.as_str())
-                                .map(String::from)
-                        })
+                // Fail closed: a backup some service produced must have a
+                // known engine, otherwise the compatibility check below
+                // would be skipped. Only producer-less (control-plane)
+                // backups, which are administrators-only, may proceed
+                // without one.
+                let engine = match self.resolve_backup_engine(&backup).await? {
+                    ResolvedBackupEngine::Known(engine) => Some(engine),
+                    ResolvedBackupEngine::Unknown {
+                        has_producer: false,
+                    } => None,
+                    ResolvedBackupEngine::Unknown { has_producer: true } => {
+                        return Err(RestoreError::Validation {
+                            message: format!(
+                                "Cannot determine which engine produced backup {}: its metadata \
+                                 has no service_type and its producing service is gone. \
+                                 Refusing to restore it without an engine compatibility check.",
+                                backup.id
+                            ),
+                        });
+                    }
                 };
                 (
                     Some(backup.id),
@@ -1230,6 +1286,8 @@ impl RestoreService {
             created_by: Set(user_id),
             created_at: NotSet,
             updated_at: NotSet,
+            cancel_requested_at: Set(None),
+            cancel_requested_by: Set(None),
         };
         let run = insert_restore_run(
             self.db.as_ref(),
@@ -1246,13 +1304,65 @@ impl RestoreService {
         let mgr = self.external_service_manager.clone();
         let enc = self.encryption_service.clone();
         let telemetry = self.telemetry.clone();
+        // Registered before the worker starts so a cancellation that arrives
+        // immediately still reaches it.
+        let registration = self.cancellations.register(run_id);
         tokio::spawn(async move {
-            if let Err(e) = run_restore_worker(db, mgr, enc, telemetry, run_id, mode).await {
+            if let Err(e) =
+                run_restore_worker(db, mgr, enc, telemetry, run_id, mode, registration).await
+            {
                 error!("Restore run {} failed: {}", run_id, e);
             }
         });
 
         Ok(run.into())
+    }
+
+    /// Ask a running restore to stop.
+    ///
+    /// Accepted only while stopping is safe (see `restore_cancel`): the
+    /// cancellation is recorded with a conditional update, and the worker is
+    /// then woken. Repeating a request that was already recorded is not an
+    /// error — the current run is returned. Anything else is
+    /// [`RestoreError::RestoreNotCancellable`] with the reason the console
+    /// shows the operator.
+    pub async fn cancel_restore_run(
+        &self,
+        restore_run_id: i32,
+        user_id: i32,
+    ) -> Result<RestoreRunView, RestoreError> {
+        let run = load_run_for_update(&self.db, restore_run_id).await?;
+        if super::restore_cancel::record_cancellation(self.db.as_ref(), &run, user_id).await? {
+            let signalled = self.cancellations.signal(restore_run_id);
+            info!(
+                "Cancellation of restore run {} recorded by user {} in phase '{}' (worker signalled: {})",
+                restore_run_id, user_id, run.phase, signalled
+            );
+            return self.get_restore_run(restore_run_id).await;
+        }
+
+        // The conditional update lost: re-read to explain why with the
+        // state that actually won.
+        let current = load_run_for_update(&self.db, restore_run_id).await?;
+        if current.cancel_requested_at.is_some()
+            && ACTIVE_RESTORE_STATUSES.contains(&current.status.as_str())
+        {
+            return Ok(current.into());
+        }
+        if !ACTIVE_RESTORE_STATUSES.contains(&current.status.as_str()) {
+            return Err(RestoreError::RestoreNotActive {
+                restore_run_id,
+                status: current.status,
+            });
+        }
+        let reason = super::restore_cancel::not_cancellable_reason(&current).unwrap_or_else(|| {
+            "The restore changed state while the request was processed; try again.".to_string()
+        });
+        Err(RestoreError::RestoreNotCancellable {
+            restore_run_id,
+            phase: current.phase,
+            reason,
+        })
     }
 
     /// Fetch a single restore run by id.
@@ -1266,20 +1376,6 @@ impl RestoreService {
             .into_iter()
             .next()
             .ok_or(RestoreError::RestoreRunNotFound { restore_run_id: id })
-    }
-
-    /// Cancel a restore run that has not yet started writing data.
-    ///
-    /// A restore can only stop safely before its destructive step: once the
-    /// engine is replacing data, stopping it would leave the target partially
-    /// restored. The run's `prepare` phase is that safe point. Cancellation
-    /// and the worker's move into the `restore` phase are both conditional
-    /// updates on `phase = 'prepare'` (see [`enter_restore_phase`]), so exactly
-    /// one of them wins: either the run is cancelled and its worker stops
-    /// without touching the target, or the restore proceeds and the request is
-    /// refused with [`RestoreError::RestoreNotCancellable`].
-    pub async fn cancel_restore_run(&self, run_id: i32) -> Result<RestoreRunView, RestoreError> {
-        cancel_run_at_safe_point(self.db.as_ref(), run_id).await
     }
 
     /// List restore runs for a given source service, newest first.
@@ -1381,6 +1477,27 @@ impl RestoreService {
         })
     }
 
+    /// Which engine produced a recorded backup, from (in order) its metadata,
+    /// the engine snapshot on its producer link, or the producing service's
+    /// current type. Shared by `plan_restore` and `start_restore` so the
+    /// preview and the enforcement can never disagree.
+    async fn resolve_backup_engine(
+        &self,
+        backup: &temps_entities::backups::Model,
+    ) -> Result<ResolvedBackupEngine, RestoreError> {
+        use temps_entities::external_service_backups::{Column, Entity};
+        let producers = Entity::find()
+            .filter(Column::BackupId.eq(backup.id))
+            .find_also_related(temps_entities::external_services::Entity)
+            .all(self.db.as_ref())
+            .await?;
+        let producer_engines: Vec<(Option<String>, Option<String>)> = producers
+            .into_iter()
+            .map(|(link, service)| (link.service_type_snapshot, service.map(|s| s.service_type)))
+            .collect();
+        Ok(pick_backup_engine(&backup.metadata, &producer_engines))
+    }
+
     async fn load_service(
         &self,
         id: i32,
@@ -1390,6 +1507,52 @@ impl RestoreService {
             .await?
             .ok_or(RestoreError::ServiceNotFound { service_id: id })
     }
+}
+
+/// Engine of a backup as far as Temps can tell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResolvedBackupEngine {
+    Known(String),
+    /// No engine recorded anywhere. `has_producer` is whether any service is
+    /// recorded as having produced the backup: when one is, the engine must
+    /// be known before restoring it.
+    Unknown {
+        has_producer: bool,
+    },
+}
+
+/// Pick a backup's engine from its metadata JSON, else from its producer
+/// links as `(engine snapshot on the link, producing service's current type)`.
+fn pick_backup_engine(
+    metadata: &str,
+    producers: &[(Option<String>, Option<String>)],
+) -> ResolvedBackupEngine {
+    let non_empty = |value: &Option<String>| {
+        value
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    let from_metadata = serde_json::from_str::<serde_json::Value>(metadata)
+        .ok()
+        .and_then(|v| {
+            v.get("service_type")
+                .and_then(|t| t.as_str())
+                .map(String::from)
+        })
+        .filter(|v| !v.trim().is_empty());
+    from_metadata
+        .or_else(|| {
+            producers
+                .iter()
+                .find_map(|(snapshot, _)| non_empty(snapshot))
+        })
+        .or_else(|| producers.iter().find_map(|(_, current)| non_empty(current)))
+        .map(ResolvedBackupEngine::Known)
+        .unwrap_or(ResolvedBackupEngine::Unknown {
+            has_producer: !producers.is_empty(),
+        })
 }
 
 /// Views of `runs` with their source backups resolved in one query.
@@ -1598,15 +1761,62 @@ async fn run_restore_worker(
     telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
     run_id: i32,
     mode: RestoreRequestMode,
+    registration: super::restore_cancel::RegisteredRestore,
 ) -> Result<(), RestoreError> {
     let started = std::time::Instant::now();
     let mode_label = mode.as_str();
+    let destructive = mode.is_destructive();
     // The restore runs in its own task so a panic inside an engine surfaces
     // here as a `JoinError` instead of unwinding past the terminal-state
     // write below and leaving the run `running` with no owner.
     let fence = super::restore_reconcile::ManagerRestoreFence::new(mgr.clone());
-    let inner = tokio::spawn(run_restore_inner(db.clone(), mgr, enc, run_id, mode));
+    let inner = tokio::spawn(run_restore_inner(
+        db.clone(),
+        mgr,
+        enc,
+        run_id,
+        mode,
+        registration.token(),
+    ));
     let result = match inner.await {
+        // A cancellation that won a guarded phase move before anything was
+        // written: nothing to clean up.
+        Ok(Err(RestoreError::RestoreCancelled {
+            restore_run_id,
+            phase,
+        })) => Err(RestoreError::Cancelled {
+            restore_run_id,
+            message: super::restore_cancel::cancelled_message(
+                &phase,
+                destructive,
+                &super::restore_cancel::CancelCleanup::TargetUntouched,
+            ),
+            phase,
+        }),
+        // A cancelled download that could not be confirmed stopped: retry
+        // the confirmation, and only release the service once it holds.
+        Ok(Err(still_running @ RestoreError::StagedRestoreStillRunning { .. })) => {
+            match confirm_staged_restore_stopped(&db, run_id, &fence).await {
+                Ok(phase) => Err(RestoreError::Cancelled {
+                    restore_run_id: run_id,
+                    message: super::restore_cancel::cancelled_message(
+                        &phase,
+                        destructive,
+                        &super::restore_cancel::CancelCleanup::TargetUntouched,
+                    ),
+                    phase,
+                }),
+                Err(e) => {
+                    error!("{} Last confirmation attempt: {}", still_running, e);
+                    telemetry.report(restore_outcome_event(
+                        mode_label,
+                        started.elapsed(),
+                        Err(still_running.to_string()),
+                    ));
+                    return Err(still_running);
+                }
+            }
+        }
         Ok(result) => result,
         Err(join_error) => {
             match settle_crashed_run(&db, run_id, &fence, join_error.to_string()).await {
@@ -1630,26 +1840,26 @@ async fn run_restore_worker(
     };
     let elapsed = started.elapsed();
 
-    // A cancelled run's terminal state was written by the cancellation
-    // itself, before the worker reached its first write. It is neither a
-    // success nor a failure, so no outcome is recorded or reported.
-    if let Err(RestoreError::Cancelled { .. }) = &result {
-        info!(
-            restore_run_id = run_id,
-            "Restore run stopped at its safe point after being cancelled; the target was not modified"
-        );
-        return Ok(());
-    }
-
+    // The worker is done with its cancellation token.
+    drop(registration);
     let persisted = persist_terminal_state(&db, run_id, &result, TERMINAL_WRITE_RETRY).await;
     match (&result, &persisted) {
         (Ok(_), Ok(())) => info!("Restore run {} completed successfully", run_id),
+        (Err(RestoreError::Cancelled { message, .. }), Ok(())) => {
+            info!("Restore run {} cancelled: {}", run_id, message)
+        }
         (Err(e), Ok(())) => error!("Restore run {} failed: {}", run_id, e),
         (_, Err(e)) => error!(
             "Restore run {} finished but its terminal state could not be recorded: {}. \
              It stays active until the next restart reconciles it as interrupted.",
             run_id, e
         ),
+    }
+
+    // A cancellation is the operator's decision, not a restore failure, so
+    // it is not reported as one.
+    if matches!(result, Err(RestoreError::Cancelled { .. })) && persisted.is_ok() {
+        return Ok(());
     }
 
     // Reported only once the run's final state is persisted: a restore whose
@@ -1686,13 +1896,9 @@ async fn run_restore_inner(
     enc: Arc<temps_core::EncryptionService>,
     run_id: i32,
     mode: RestoreRequestMode,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<Option<i32>, RestoreError> {
     let run = load_run_for_update(&db, run_id).await?;
-    if run.status == CANCELLED_STATUS {
-        return Err(RestoreError::Cancelled {
-            restore_run_id: run_id,
-        });
-    }
 
     // Resolve backup identity. `source_backup_id == 0` is the sentinel
     // for orphan-backup restores, where everything we need lives in
@@ -2090,9 +2296,58 @@ async fn run_restore_inner(
         }
     }
 
-    // Safe point: nothing has been written yet. A cancellation recorded
-    // during preparation wins here and the target is never touched.
-    enter_restore_phase(&db, run_id).await?;
+    // Leave `prepare`. Every move out of a cancellable phase is conditional
+    // on no cancellation having been recorded (see `restore_cancel`).
+    let destructive = mode.is_destructive();
+    let write_phase = match &mode {
+        RestoreRequestMode::Pitr { .. } => "recover",
+        _ => "restore",
+    };
+    let gate_target = match &mode {
+        RestoreRequestMode::NewService { name, .. } => name.clone(),
+        RestoreRequestMode::Pitr {
+            to_new_service: true,
+            new_service_name: Some(name),
+            ..
+        } => name.clone(),
+        _ => target_service.name.clone(),
+    };
+    let gate = super::restore_cancel::WorkerGate::new(
+        db.as_ref(),
+        run_id,
+        cancel.clone(),
+        destructive,
+        write_phase,
+        gate_target,
+    );
+    let is_postgres_cluster =
+        target_service.topology == "cluster" && target_service.service_type == "postgres";
+    if destructive {
+        if !is_postgres_cluster && instance.defers_target_writes(&backup_model.s3_location) {
+            // The engine stages the backup first and passes the gate before
+            // its first write, so the download stays cancellable.
+            super::restore_cancel::enter_phase_unless_cancelled(db.as_ref(), run_id, "download")
+                .await?;
+        } else {
+            // The engine writes as it reads: the last safe point is now.
+            gate.enter_write_phase().await?;
+        }
+    } else {
+        if let Some(new_name) = mode.new_service_name() {
+            // Cancelling tears the new service down by its derived container
+            // and volume names, so this run must own those names outright.
+            super::restore_cancel::ensure_new_service_name_unclaimed(
+                db.as_ref(),
+                &super::restore_cancel::ManagerServiceTeardown::new(mgr.clone()),
+                run_id,
+                new_name,
+                service_type,
+            )
+            .await?;
+        }
+        super::restore_cancel::enter_phase_unless_cancelled(db.as_ref(), run_id, "provision")
+            .await?;
+    }
 
     let ctx = RestoreContext {
         s3_client: &s3_client,
@@ -2103,6 +2358,7 @@ async fn run_restore_inner(
         source_service: &target_service,
         source_config: source_config.clone(),
         pool: db.as_ref(),
+        gate: &gate,
     };
 
     let new_service_parameters = match mode {
@@ -2113,24 +2369,29 @@ async fn run_restore_inner(
             // around it. The trait-level restore_from_s3 doesn't have
             // access to service_members or the agent protocol so it
             // can't handle clusters — same carve-out as backup.
-            if target_service.topology == "cluster" && target_service.service_type == "postgres" {
-                let target_user_data = selected_walg_target_user_data(&backup_model)?;
-                mgr.restore_postgres_cluster(
-                    &target_service,
-                    &backup_model.s3_location,
-                    &s3_credentials,
-                    target_user_data.as_deref(),
-                )
-                .await
-                .map_err(|e| RestoreError::ExternalService {
-                    reason: format!("cluster in-place restore failed: {}", e),
-                })?;
+            let result = if is_postgres_cluster {
+                match selected_walg_target_user_data(&backup_model) {
+                    Ok(target_user_data) => mgr
+                        .restore_postgres_cluster(
+                            &target_service,
+                            &backup_model.s3_location,
+                            &s3_credentials,
+                            target_user_data.as_deref(),
+                        )
+                        .await
+                        .map_err(|e| RestoreError::ExternalService {
+                            reason: format!("cluster in-place restore failed: {}", e),
+                        }),
+                    Err(e) => Err(e),
+                }
             } else {
-                instance.restore_in_place(ctx).await.map_err(|e| {
-                    RestoreError::ExternalService {
-                        reason: format!("in-place restore failed: {}", e),
-                    }
-                })?;
+                instance
+                    .restore_in_place(ctx)
+                    .await
+                    .map_err(|e| engine_error(run_id, e, "in-place restore failed"))
+            };
+            if let Err(e) = result {
+                return Err(settle_destructive_failure(&db, run_id, &gate, e).await);
             }
             None
         }
@@ -2138,14 +2399,27 @@ async fn run_restore_inner(
             name,
             parameter_overrides,
         } => {
-            update_phase(&db, run_id, "provision").await?;
-            let result = instance
-                .restore_to_new_service(ctx, name.clone(), parameter_overrides)
-                .await
-                .map_err(|e| RestoreError::ExternalService {
-                    reason: format!("new-service restore failed: {}", e),
-                })?;
-            Some((name, result))
+            // Everything this writes lands in a service the run is creating.
+            // A cancellation lets the provision stop at its next check (the
+            // gate) rather than dropping it mid-call: a dropped Docker request
+            // can still create a container or volume after teardown looked.
+            // Only once the engine has returned is the service torn down.
+            let fence = super::restore_reconcile::ManagerRestoreFence::new(mgr.clone());
+            let provisioned = await_new_service_provision(
+                instance.restore_to_new_service(ctx, name.clone(), parameter_overrides),
+                &cancel,
+                &fence,
+                &new_service_fence_target(&name, service_type),
+                NEW_SERVICE_CANCEL_FENCE_INTERVAL,
+            )
+            .await;
+            if cancel.is_cancelled() {
+                return Err(cancel_new_service(&db, &mgr, run_id, &name, service_type).await);
+            }
+            match provisioned {
+                Ok(result) => Some((name, result)),
+                Err(e) => return Err(engine_error(run_id, e, "new-service restore failed")),
+            }
         }
         RestoreRequestMode::Pitr {
             to_new_service,
@@ -2153,30 +2427,85 @@ async fn run_restore_inner(
             target,
         } => {
             if to_new_service {
-                update_phase(&db, run_id, "provision").await?;
-            }
-            update_phase(&db, run_id, "recover").await?;
-            let maybe_result = instance
-                .restore_pitr(ctx, target, to_new_service, new_service_name.clone())
-                .await
-                .map_err(|e| RestoreError::ExternalService {
-                    reason: format!("PITR failed: {}", e),
-                })?;
-            match (to_new_service, maybe_result, new_service_name) {
-                (true, Some(r), Some(name)) => Some((name, r)),
-                (true, _, _) => {
-                    return Err(RestoreError::Internal {
-                        reason: "PITR to_new_service did not return a new service result".into(),
-                    })
+                let name = new_service_name
+                    .clone()
+                    .ok_or_else(|| RestoreError::Internal {
+                        reason: format!(
+                            "PITR restore run {} to a new service has no new service name",
+                            run_id
+                        ),
+                    })?;
+                // As for a new-service restore: let the recovery return
+                // before tearing down what it created.
+                let fence = super::restore_reconcile::ManagerRestoreFence::new(mgr.clone());
+                let recovered = await_new_service_provision(
+                    instance.restore_pitr(ctx, target, true, new_service_name.clone()),
+                    &cancel,
+                    &fence,
+                    &new_service_fence_target(&name, service_type),
+                    NEW_SERVICE_CANCEL_FENCE_INTERVAL,
+                )
+                .await;
+                if cancel.is_cancelled() {
+                    return Err(cancel_new_service(&db, &mgr, run_id, &name, service_type).await);
                 }
-                _ => None,
+                match recovered {
+                    Ok(Some(result)) => Some((name, result)),
+                    Ok(None) => {
+                        return Err(RestoreError::Internal {
+                            reason: "PITR to_new_service did not return a new service result"
+                                .into(),
+                        })
+                    }
+                    Err(e) => return Err(engine_error(run_id, e, "PITR failed")),
+                }
+            } else {
+                if let Err(e) = instance
+                    .restore_pitr(ctx, target, false, None)
+                    .await
+                    .map_err(|e| engine_error(run_id, e, "PITR failed"))
+                {
+                    return Err(settle_destructive_failure(&db, run_id, &gate, e).await);
+                }
+                None
             }
         }
     };
 
     // The destructive step is done. Failing the run now because a progress
     // write failed would report a restore that happened as one that did not.
-    if let Err(e) = update_phase(&db, run_id, "verify").await {
+    if let Some((new_name, _)) = &new_service_parameters {
+        // Registering the new service is the point of no return for a
+        // new-service restore: a cancellation recorded before it still wins
+        // and removes what was provisioned.
+        match super::restore_cancel::enter_phase_unless_cancelled_retrying(
+            db.as_ref(),
+            run_id,
+            "verify",
+            &REGISTRATION_GATE_RETRY.config(),
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(RestoreError::RestoreCancelled { .. }) => {
+                return Err(cancel_new_service(&db, &mgr, run_id, new_name, service_type).await)
+            }
+            Err(e) => {
+                // Without the guarded move the worker cannot tell whether a
+                // cancellation was accepted meanwhile, so it must not
+                // register the service. Remove what it provisioned instead.
+                let cleanup = teardown_new_service(&db, &mgr, run_id, new_name, service_type).await;
+                return Err(RestoreError::ExternalService {
+                    reason: format!(
+                        "{} The new service '{}' was not registered. {}",
+                        e,
+                        new_name,
+                        super::restore_cancel::cleanup_note(false, &cleanup)
+                    ),
+                });
+            }
+        }
+    } else if let Err(e) = update_phase(&db, run_id, "verify").await {
         warn!(
             "Restore run {} could not record its 'verify' phase; continuing: {}",
             run_id, e
@@ -2222,6 +2551,164 @@ async fn run_restore_inner(
     };
 
     Ok(target_service_id)
+}
+
+/// How often a cancelled new-service restore re-stops its helpers while the
+/// engine winds down.
+const NEW_SERVICE_CANCEL_FENCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
+fn new_service_fence_target(
+    name: &str,
+    service_type: ServiceType,
+) -> super::restore_reconcile::FenceTarget {
+    super::restore_reconcile::FenceTarget {
+        service_name: name.to_string(),
+        service_type: service_type.to_string(),
+        imported_container: None,
+    }
+}
+
+/// Await an engine call that provisions a new service, staying responsive to
+/// cancellation without abandoning it.
+///
+/// The call is never dropped mid-flight: a dropped Docker request can still
+/// create a container or volume after teardown has looked. Not every engine
+/// checks the restore gate, though (a Redis WAL-G helper can run for an
+/// hour), so once `cancel` fires the new service's restore helpers and staged
+/// downloads are stopped every `interval` until the engine returns, which
+/// makes it fail fast instead of finishing a restore that will be torn down.
+async fn await_new_service_provision<T>(
+    provision: impl std::future::Future<Output = T>,
+    cancel: &tokio_util::sync::CancellationToken,
+    fence: &dyn super::restore_reconcile::RestoreHelperFence,
+    target: &super::restore_reconcile::FenceTarget,
+    interval: std::time::Duration,
+) -> T {
+    tokio::pin!(provision);
+    tokio::select! {
+        biased;
+        output = &mut provision => return output,
+        _ = cancel.cancelled() => {}
+    }
+    let mut ticks = tokio::time::interval(interval);
+    loop {
+        tokio::select! {
+            biased;
+            output = &mut provision => return output,
+            _ = ticks.tick() => {
+                if let Err(e) = fence.fence(target).await {
+                    warn!(
+                        "Cancelled restore into '{}' could not stop its restore helpers yet: {}",
+                        target.service_name, e
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Map an engine error to a [`RestoreError`], keeping the one outcome the
+/// worker must act on rather than report: a staged download that could not be
+/// confirmed stopped.
+fn engine_error(run_id: i32, error: anyhow::Error, context: &str) -> RestoreError {
+    match error.downcast_ref::<temps_providers::externalsvc::StagedRestoreStillRunning>() {
+        Some(still_running) => RestoreError::StagedRestoreStillRunning {
+            restore_run_id: run_id,
+            target: still_running.target.clone(),
+            reason: still_running.reason.clone(),
+        },
+        None => RestoreError::ExternalService {
+            reason: format!("{}: {}", context, error),
+        },
+    }
+}
+
+/// Outcome of a destructive engine call that returned an error.
+///
+/// If the run was cancelled and the engine never passed the gate, the error is
+/// the engine stopping on request: the target was not written, so the run is
+/// recorded as cancelled. Otherwise it is a real failure.
+async fn settle_destructive_failure(
+    db: &DatabaseConnection,
+    run_id: i32,
+    gate: &super::restore_cancel::WorkerGate<'_, DatabaseConnection>,
+    error: RestoreError,
+) -> RestoreError {
+    if !gate.signalled()
+        || gate.writes_started()
+        || matches!(error, RestoreError::StagedRestoreStillRunning { .. })
+    {
+        return error;
+    }
+    let phase = load_run_for_update(db, run_id)
+        .await
+        .map(|run| run.phase)
+        .unwrap_or_else(|_| "download".to_string());
+    RestoreError::Cancelled {
+        restore_run_id: run_id,
+        message: super::restore_cancel::cancelled_message(
+            &phase,
+            true,
+            &super::restore_cancel::CancelCleanup::TargetUntouched,
+        ),
+        phase,
+    }
+}
+
+/// Fence any helper still writing into a half-created new service, then
+/// remove its container and volume. Safe because the run checked that it owns
+/// every name the service derives (see `ensure_new_service_name_unclaimed`).
+async fn teardown_new_service(
+    db: &DatabaseConnection,
+    mgr: &Arc<ExternalServiceManager>,
+    run_id: i32,
+    new_name: &str,
+    service_type: ServiceType,
+) -> super::restore_cancel::CancelCleanup {
+    use super::restore_reconcile::RestoreHelperFence;
+
+    let fence = super::restore_reconcile::ManagerRestoreFence::new(mgr.clone());
+    let fence_target = super::restore_reconcile::FenceTarget {
+        service_name: new_name.to_string(),
+        service_type: service_type.to_string(),
+        imported_container: None,
+    };
+    if let Err(e) = fence.fence(&fence_target).await {
+        warn!(
+            "Restore run {} stopping: could not stop restore helpers for '{}': {}",
+            run_id, new_name, e
+        );
+    }
+    let manager = super::restore_cancel::ManagerServiceTeardown::new(mgr.clone());
+    super::restore_cancel::teardown_cancelled_new_service(
+        db,
+        &manager,
+        &manager,
+        new_name,
+        service_type,
+    )
+    .await
+}
+
+/// Stop a cancelled new-service restore: fence any helper still writing into
+/// the half-created service, then remove its container and volume.
+async fn cancel_new_service(
+    db: &DatabaseConnection,
+    mgr: &Arc<ExternalServiceManager>,
+    run_id: i32,
+    new_name: &str,
+    service_type: ServiceType,
+) -> RestoreError {
+    let cleanup = teardown_new_service(db, mgr, run_id, new_name, service_type).await;
+    let phase = load_run_for_update(db, run_id)
+        .await
+        .map(|run| run.phase)
+        .unwrap_or_else(|_| "provision".to_string());
+    RestoreError::Cancelled {
+        restore_run_id: run_id,
+        message: super::restore_cancel::cancelled_message(&phase, false, &cleanup),
+        phase,
+    }
 }
 
 /// Rewrite the target service's encrypted `config.password` (and, when the
@@ -2433,6 +2920,49 @@ async fn settle_crashed_run(
     }
 }
 
+/// Confirm that a cancelled run's staged download has stopped, retrying for
+/// about a minute (Docker may be briefly unavailable). Uses the same fence the
+/// startup reconciliation does, which also runs the engine's
+/// [`temps_providers::externalsvc::ExternalService::stop_staged_restore`].
+/// Returns the run's phase once confirmed.
+async fn confirm_staged_restore_stopped(
+    db: &DatabaseConnection,
+    run_id: i32,
+    fence: &dyn super::restore_reconcile::RestoreHelperFence,
+) -> Result<String, RestoreError> {
+    let run = load_run_for_update(db, run_id).await?;
+    let service = temps_entities::external_services::Entity::find_by_id(run.source_service_id)
+        .one(db)
+        .await?;
+    STAGED_STOP_RETRY
+        .config()
+        .retry(|| async {
+            super::restore_reconcile::fence_run_helpers(&run, service.as_ref(), fence)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|reason| RestoreError::Internal { reason })?;
+    Ok(run.phase)
+}
+
+/// Retry policy for confirming a cancelled download stopped before the run
+/// releases its service.
+const STAGED_STOP_RETRY: TerminalWriteRetry = TerminalWriteRetry {
+    attempts: 5,
+    base_delay: std::time::Duration::from_secs(2),
+    max_delay: std::time::Duration::from_secs(20),
+};
+
+/// Retry policy for the guarded move that precedes registering a new service.
+/// Short: the run is holding a provisioned container while it waits.
+const REGISTRATION_GATE_RETRY: TerminalWriteRetry = TerminalWriteRetry {
+    attempts: 5,
+    base_delay: std::time::Duration::from_millis(500),
+    max_delay: std::time::Duration::from_secs(5),
+};
+
 /// Retry policy for the worker's final status write. A restore that ran to
 /// an outcome must not be left `running` because of a database blip, so the
 /// write is retried for roughly five minutes before giving up to the next
@@ -2448,6 +2978,14 @@ struct TerminalWriteRetry {
     attempts: u32,
     base_delay: std::time::Duration,
     max_delay: std::time::Duration,
+}
+
+impl TerminalWriteRetry {
+    fn config(&self) -> temps_core::retry::RetryConfig {
+        temps_core::retry::RetryConfig::new(self.attempts)
+            .with_base_delay(self.base_delay)
+            .with_max_delay(self.max_delay)
+    }
 }
 
 /// Record a run's terminal outcome. Only an active (`pending`/`running`) row
@@ -2472,6 +3010,11 @@ async fn persist_terminal_state(
             .col_expr(Column::Phase, Expr::value("completed"))
             .col_expr(Column::TargetServiceId, Expr::value(*target_service_id))
             .col_expr(Column::ErrorMessage, Expr::value(Option::<String>::None)),
+        // A cancelled run keeps the phase it stopped in, like an interrupted
+        // one, so the console can say where it stopped.
+        Err(RestoreError::Cancelled { message, .. }) => update
+            .col_expr(Column::Status, Expr::value("cancelled"))
+            .col_expr(Column::ErrorMessage, Expr::value(Some(message.clone()))),
         Err(e) => update
             .col_expr(Column::Status, Expr::value("failed"))
             .col_expr(Column::Phase, Expr::value("failed"))
@@ -2511,134 +3054,6 @@ async fn persist_terminal_state(
 
 /// Statuses that mean a worker still owns the run.
 pub(crate) const ACTIVE_RESTORE_STATUSES: [&str; 2] = ["pending", "running"];
-
-/// Terminal status for a run cancelled at its safe point.
-pub const CANCELLED_STATUS: &str = "cancelled";
-
-/// The phase a run is in until it starts writing data. It is the only phase
-/// in which a run can be cancelled.
-pub const CANCELLABLE_PHASE: &str = "prepare";
-
-/// The message stored on a cancelled run.
-fn cancelled_message(run: &temps_entities::restore_runs::Model) -> String {
-    match run.target_service_name.as_deref() {
-        Some(new_name) if !new_name.trim().is_empty() => format!(
-            "Restore cancelled before any data was written. The source database was not \
-             modified and the new service '{}' was not created.",
-            new_name
-        ),
-        _ => "Restore cancelled before any data was written. The database was not modified."
-            .to_string(),
-    }
-}
-
-/// Mark `run_id` cancelled if, and only if, it is still active and has not
-/// left its `prepare` phase. Refusals name why: the run is already terminal,
-/// or it has passed the safe point.
-async fn cancel_run_at_safe_point(
-    db: &DatabaseConnection,
-    run_id: i32,
-) -> Result<RestoreRunView, RestoreError> {
-    use sea_orm::sea_query::Expr;
-    use temps_entities::restore_runs::{Column, Entity};
-
-    let run = load_run_for_update(db, run_id).await?;
-    refuse_unless_cancellable(&run)?;
-
-    let now = Utc::now();
-    let outcome = Entity::update_many()
-        .col_expr(Column::Status, Expr::value(CANCELLED_STATUS))
-        .col_expr(
-            Column::ErrorMessage,
-            Expr::value(Some(cancelled_message(&run))),
-        )
-        .col_expr(Column::FinishedAt, Expr::value(now))
-        .col_expr(Column::UpdatedAt, Expr::value(now))
-        .filter(Column::Id.eq(run_id))
-        .filter(Column::Status.is_in(ACTIVE_RESTORE_STATUSES))
-        .filter(Column::Phase.eq(CANCELLABLE_PHASE))
-        .exec(db)
-        .await?;
-
-    let current = load_run_for_update(db, run_id).await?;
-    if outcome.rows_affected == 0 {
-        // The worker moved past the safe point (or finished) between the
-        // read above and the update: report what it is doing now.
-        refuse_unless_cancellable(&current)?;
-        return Err(RestoreError::Internal {
-            reason: format!(
-                "Restore run {} looked cancellable but the cancellation did not apply \
-                 (status '{}', phase '{}')",
-                run_id, current.status, current.phase
-            ),
-        });
-    }
-    info!(
-        restore_run_id = run_id,
-        service_id = current.source_service_id,
-        "Restore run cancelled before it wrote any data"
-    );
-    views_with_source_backups(db, vec![current])
-        .await?
-        .into_iter()
-        .next()
-        .ok_or(RestoreError::RestoreRunNotFound {
-            restore_run_id: run_id,
-        })
-}
-
-/// `Ok` when `run` can still be cancelled; otherwise the refusal to return.
-fn refuse_unless_cancellable(
-    run: &temps_entities::restore_runs::Model,
-) -> Result<(), RestoreError> {
-    if !ACTIVE_RESTORE_STATUSES.contains(&run.status.as_str()) {
-        return Err(RestoreError::RestoreNotActive {
-            restore_run_id: run.id,
-            status: run.status.clone(),
-        });
-    }
-    if run.phase != CANCELLABLE_PHASE {
-        return Err(RestoreError::RestoreNotCancellable {
-            restore_run_id: run.id,
-            phase: run.phase.clone(),
-        });
-    }
-    Ok(())
-}
-
-/// Move `run_id` from `prepare` to `restore`: the worker's last safe point.
-/// Conditional on the run still being active and in `prepare`, so it cannot
-/// race a cancellation. Returns [`RestoreError::Cancelled`] when the run was
-/// cancelled first.
-async fn enter_restore_phase(db: &DatabaseConnection, run_id: i32) -> Result<(), RestoreError> {
-    use sea_orm::sea_query::Expr;
-    use temps_entities::restore_runs::{Column, Entity};
-
-    let outcome = Entity::update_many()
-        .col_expr(Column::Phase, Expr::value("restore"))
-        .col_expr(Column::UpdatedAt, Expr::value(Utc::now()))
-        .filter(Column::Id.eq(run_id))
-        .filter(Column::Status.is_in(ACTIVE_RESTORE_STATUSES))
-        .filter(Column::Phase.eq(CANCELLABLE_PHASE))
-        .exec(db)
-        .await?;
-    if outcome.rows_affected > 0 {
-        return Ok(());
-    }
-    let run = load_run_for_update(db, run_id).await?;
-    if run.status == CANCELLED_STATUS {
-        return Err(RestoreError::Cancelled {
-            restore_run_id: run_id,
-        });
-    }
-    Err(RestoreError::Internal {
-        reason: format!(
-            "Restore run {} could not enter its restore phase: expected an active run in \
-             phase '{}', found status '{}' in phase '{}'",
-            run_id, CANCELLABLE_PHASE, run.status, run.phase
-        ),
-    })
-}
 
 /// The active destructive restore (in-place, or PITR in place) on `service_id`,
 /// if any. At most one can exist.
@@ -4074,6 +4489,195 @@ mod tests {
     }
 
     #[test]
+    fn backup_engine_prefers_metadata_then_snapshot_then_current_service() {
+        let some = |v: &str| Some(v.to_string());
+        assert_eq!(
+            pick_backup_engine(
+                r#"{"service_type":"postgres"}"#,
+                &[(some("redis"), some("redis"))]
+            ),
+            ResolvedBackupEngine::Known("postgres".into())
+        );
+        // Producer service deleted: the snapshot on the link still knows.
+        assert_eq!(
+            pick_backup_engine("{}", &[(some("mongodb"), None)]),
+            ResolvedBackupEngine::Known("mongodb".into())
+        );
+        assert_eq!(
+            pick_backup_engine("not json", &[(None, some("mariadb"))]),
+            ResolvedBackupEngine::Known("mariadb".into())
+        );
+    }
+
+    #[test]
+    fn backup_engine_unknown_is_fail_closed_only_when_a_producer_exists() {
+        assert_eq!(
+            pick_backup_engine(r#"{"service_type":"  "}"#, &[(None, None)]),
+            ResolvedBackupEngine::Unknown { has_producer: true }
+        );
+        assert_eq!(
+            pick_backup_engine(r#"{"engine":"control_plane"}"#, &[]),
+            ResolvedBackupEngine::Unknown {
+                has_producer: false
+            }
+        );
+    }
+
+    #[test]
+    fn engine_compatibility_allows_only_the_same_family() {
+        assert!(engines_compatible("Postgres", "postgres"));
+        assert!(engines_compatible("rustfs", "s3"));
+        assert!(engines_compatible("minio", "blob"));
+        assert!(!engines_compatible("postgres", "redis"));
+        assert!(!engines_compatible("mongodb", "mariadb"));
+        assert!(!engines_compatible("s3", "postgres"));
+    }
+
+    /// Fence that records calls and, on its first call, lets the stand-in
+    /// engine finish (as stopping a real engine's helper would).
+    struct ReleasingFence {
+        calls: std::sync::atomic::AtomicUsize,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl super::super::restore_reconcile::RestoreHelperFence for ReleasingFence {
+        async fn fence(
+            &self,
+            _target: &super::super::restore_reconcile::FenceTarget,
+        ) -> Result<
+            temps_providers::externalsvc::restore_helper::RestoreFenceReport,
+            temps_providers::externalsvc::restore_helper::RestoreFenceError,
+        > {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.release.notify_one();
+            Ok(Default::default())
+        }
+    }
+
+    /// REGRESSION (Greptile on #1295): an engine that never checks the gate
+    /// (a Redis WAL-G helper can run for an hour) must still stop promptly
+    /// once cancelled: its helpers are stopped while the call is awaited, and
+    /// the call itself is never dropped.
+    #[tokio::test]
+    async fn cancelled_provision_stops_helpers_and_is_still_awaited() {
+        let fence = ReleasingFence {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            release: tokio::sync::Notify::new(),
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let finished = std::sync::atomic::AtomicBool::new(false);
+        // Stand-in engine: ignores cancellation, only returns once its
+        // helper is stopped.
+        let provision = async {
+            fence.release.notified().await;
+            finished.store(true, std::sync::atomic::Ordering::SeqCst);
+            "helper stopped"
+        };
+        cancel.cancel();
+        let output = await_new_service_provision(
+            provision,
+            &cancel,
+            &fence,
+            &new_service_fence_target("copy", ServiceType::Redis),
+            std::time::Duration::from_millis(10),
+        )
+        .await;
+        assert_eq!(output, "helper stopped");
+        assert!(
+            finished.load(std::sync::atomic::Ordering::SeqCst),
+            "the call ran to completion"
+        );
+        assert!(fence.calls.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn uncancelled_provision_never_touches_helpers() {
+        let fence = ReleasingFence {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            release: tokio::sync::Notify::new(),
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let output = await_new_service_provision(
+            async { 42 },
+            &cancel,
+            &fence,
+            &new_service_fence_target("copy", ServiceType::Redis),
+            std::time::Duration::from_secs(3),
+        )
+        .await;
+        assert_eq!(output, 42);
+        assert_eq!(fence.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// REGRESSION (Greptile on #1295): a download that could not be
+    /// confirmed stopped must reach the worker as its own outcome (which
+    /// keeps the run active), never as a plain failure or a cancellation.
+    #[test]
+    fn engine_error_keeps_an_unconfirmed_stop_typed() {
+        let still_running =
+            anyhow::Error::new(temps_providers::externalsvc::StagedRestoreStillRunning {
+                target: "postgres-orders".into(),
+                reason: "docker unreachable".into(),
+            });
+        match engine_error(7, still_running, "in-place restore failed") {
+            RestoreError::StagedRestoreStillRunning {
+                restore_run_id,
+                target,
+                reason,
+            } => {
+                assert_eq!(restore_run_id, 7);
+                assert_eq!(target, "postgres-orders");
+                assert_eq!(reason, "docker unreachable");
+            }
+            other => panic!("expected StagedRestoreStillRunning, got {other:?}"),
+        }
+        assert!(matches!(
+            engine_error(7, anyhow::anyhow!("disk full"), "in-place restore failed"),
+            RestoreError::ExternalService { ref reason } if reason == "in-place restore failed: disk full"
+        ));
+    }
+
+    #[test]
+    fn view_reports_cancellability_from_the_stored_run() {
+        let now = chrono::Utc::now();
+        let mut model = temps_entities::restore_runs::Model {
+            id: 9,
+            source_backup_id: 1,
+            source_service_id: 2,
+            target_service_id: None,
+            target_service_name: None,
+            mode: "in_place".into(),
+            status: "running".into(),
+            phase: "download".into(),
+            recovery_target: None,
+            parameter_overrides: serde_json::json!({}),
+            resume_token: None,
+            log_id: "abc".into(),
+            error_message: None,
+            attempt: 1,
+            started_at: Some(now),
+            finished_at: None,
+            created_by: 1,
+            created_at: now,
+            updated_at: now,
+            cancel_requested_at: None,
+            cancel_requested_by: None,
+        };
+        let view: RestoreRunView = model.clone().into();
+        assert!(view.cancellable);
+        assert!(view.not_cancellable_reason.is_none());
+
+        model.phase = "restore".into();
+        let view: RestoreRunView = model.into();
+        assert!(!view.cancellable);
+        assert!(view
+            .not_cancellable_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("started writing data")));
+    }
+
+    #[test]
     fn view_from_model_formats_dates_as_iso8601() {
         let now = chrono::Utc::now();
         let model = temps_entities::restore_runs::Model {
@@ -4096,6 +4700,8 @@ mod tests {
             created_by: 1,
             created_at: now,
             updated_at: now,
+            cancel_requested_at: None,
+            cancel_requested_by: None,
         };
         let v: RestoreRunView = model.into();
         assert_eq!(v.id, 42);
@@ -4912,6 +5518,8 @@ mod tests {
             created_by: Set(user_id),
             created_at: NotSet,
             updated_at: NotSet,
+            cancel_requested_at: Set(None),
+            cancel_requested_by: Set(None),
         }
     }
 
@@ -5236,6 +5844,8 @@ mod tests {
             created_by: 1,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            cancel_requested_at: None,
+            cancel_requested_by: None,
         }
     }
 
@@ -5314,356 +5924,4 @@ mod tests {
     }
 
     // ---- Cancellation at the pre-write safe point
-
-    fn run_in(status: &str, phase: &str) -> temps_entities::restore_runs::Model {
-        temps_entities::restore_runs::Model {
-            status: status.to_string(),
-            phase: phase.to_string(),
-            ..crashed_run_row()
-        }
-    }
-
-    #[test]
-    fn only_an_active_run_still_preparing_is_cancellable() {
-        assert!(refuse_unless_cancellable(&run_in("running", "prepare")).is_ok());
-        assert!(refuse_unless_cancellable(&run_in("pending", "prepare")).is_ok());
-
-        for phase in ["restore", "provision", "recover", "verify"] {
-            let err = refuse_unless_cancellable(&run_in("running", phase))
-                .expect_err("a run writing data must not be cancellable");
-            assert!(
-                matches!(
-                    &err,
-                    RestoreError::RestoreNotCancellable { restore_run_id: 11, phase: p } if p == phase
-                ),
-                "{err:?}"
-            );
-        }
-        for status in ["completed", "failed", "cancelled", "interrupted"] {
-            let err = refuse_unless_cancellable(&run_in(status, "prepare"))
-                .expect_err("a finished run has nothing to cancel");
-            assert!(
-                matches!(
-                    &err,
-                    RestoreError::RestoreNotActive { restore_run_id: 11, status: s } if s == status
-                ),
-                "{err:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn cancelled_message_says_nothing_was_modified() {
-        let in_place = cancelled_message(&run_in("running", "prepare"));
-        assert!(
-            in_place.contains("before any data was written"),
-            "{in_place}"
-        );
-        assert!(in_place.contains("was not modified"), "{in_place}");
-
-        let new_service = cancelled_message(&temps_entities::restore_runs::Model {
-            target_service_name: Some("orders-copy".to_string()),
-            ..run_in("running", "prepare")
-        });
-        assert!(
-            new_service.contains("'orders-copy' was not created"),
-            "{new_service}"
-        );
-    }
-
-    #[test]
-    fn cancellation_errors_name_the_run_and_phase() {
-        let message = RestoreError::RestoreNotCancellable {
-            restore_run_id: 42,
-            phase: "restore".to_string(),
-        }
-        .to_string();
-        assert!(message.contains("Restore run 42"), "{message}");
-        assert!(message.contains("phase 'restore'"), "{message}");
-        assert!(message.contains("partially restored"), "{message}");
-
-        let message = RestoreError::RestoreNotActive {
-            restore_run_id: 42,
-            status: "completed".to_string(),
-        }
-        .to_string();
-        assert!(
-            message.contains("Restore run 42 is already completed"),
-            "{message}"
-        );
-    }
-
-    #[tokio::test]
-    async fn cancel_returns_not_found_for_a_missing_run() {
-        let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results::<temps_entities::restore_runs::Model, _, _>(vec![vec![]])
-            .into_connection();
-        let err = cancel_run_at_safe_point(&db, 404)
-            .await
-            .expect_err("missing run");
-        assert!(
-            matches!(
-                err,
-                RestoreError::RestoreRunNotFound {
-                    restore_run_id: 404
-                }
-            ),
-            "{err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn cancel_marks_a_preparing_run_cancelled() {
-        let cancelled = temps_entities::restore_runs::Model {
-            error_message: Some("cancelled".to_string()),
-            finished_at: Some(Utc::now()),
-            ..run_in("cancelled", "prepare")
-        };
-        let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results(vec![vec![run_in("running", "prepare")]])
-            .append_exec_results(vec![sea_orm::MockExecResult {
-                last_insert_id: 0,
-                rows_affected: 1,
-            }])
-            .append_query_results(vec![vec![cancelled]])
-            .append_query_results::<temps_entities::backups::Model, _, _>(vec![vec![]])
-            .into_connection();
-
-        let view = cancel_run_at_safe_point(&db, 11)
-            .await
-            .expect("a preparing run is cancellable");
-        assert_eq!(view.status, "cancelled");
-        assert_eq!(view.phase, "prepare");
-        assert!(view.finished_at.is_some());
-    }
-
-    #[tokio::test]
-    async fn cancel_that_loses_the_race_reports_the_phase_the_worker_reached() {
-        // Read as preparing, but the worker entered `restore` before the
-        // conditional update ran: the update matches nothing.
-        let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results(vec![vec![run_in("running", "prepare")]])
-            .append_exec_results(vec![sea_orm::MockExecResult {
-                last_insert_id: 0,
-                rows_affected: 0,
-            }])
-            .append_query_results(vec![vec![run_in("running", "restore")]])
-            .into_connection();
-
-        let err = cancel_run_at_safe_point(&db, 11)
-            .await
-            .expect_err("the restore already started writing");
-        assert!(
-            matches!(
-                &err,
-                RestoreError::RestoreNotCancellable { phase, .. } if phase == "restore"
-            ),
-            "{err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn worker_stops_at_its_safe_point_when_cancelled_first() {
-        let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_exec_results(vec![sea_orm::MockExecResult {
-                last_insert_id: 0,
-                rows_affected: 0,
-            }])
-            .append_query_results(vec![vec![run_in("cancelled", "prepare")]])
-            .into_connection();
-        let err = enter_restore_phase(&db, 11)
-            .await
-            .expect_err("a cancelled run must not start writing");
-        assert!(
-            matches!(err, RestoreError::Cancelled { restore_run_id: 11 }),
-            "{err:?}"
-        );
-
-        let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_exec_results(vec![sea_orm::MockExecResult {
-                last_insert_id: 0,
-                rows_affected: 1,
-            }])
-            .into_connection();
-        enter_restore_phase(&db, 11)
-            .await
-            .expect("an uncancelled run proceeds");
-    }
-
-    #[tokio::test]
-    async fn worker_refuses_to_write_when_the_run_left_prepare_unexpectedly() {
-        // Reconciled as interrupted by another process: neither cancelled
-        // nor ours to continue.
-        let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_exec_results(vec![sea_orm::MockExecResult {
-                last_insert_id: 0,
-                rows_affected: 0,
-            }])
-            .append_query_results(vec![vec![run_in("interrupted", "prepare")]])
-            .into_connection();
-        let err = enter_restore_phase(&db, 11)
-            .await
-            .expect_err("an inactive run must not start writing");
-        let message = err.to_string();
-        assert!(matches!(err, RestoreError::Internal { .. }), "{message}");
-        assert!(message.contains("status 'interrupted'"), "{message}");
-    }
-
-    #[tokio::test]
-    async fn cancellation_and_the_restore_step_exclude_each_other() {
-        if Docker::connect_with_local_defaults().is_err() {
-            println!("Docker not available, skipping");
-            return;
-        }
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
-            Ok(db) => db,
-            Err(e) => {
-                println!("TestDatabase unavailable, skipping: {e}");
-                return;
-            }
-        };
-        let db = test_db.db.clone();
-
-        let user = temps_entities::users::ActiveModel {
-            name: Set("Cancel Tester".to_string()),
-            email: Set("cancel-tester@example.com".to_string()),
-            password_hash: Set(Some("hash".to_string())),
-            email_verified: Set(true),
-            ..Default::default()
-        }
-        .insert(db.as_ref())
-        .await
-        .expect("insert user");
-        let source = temps_entities::s3_sources::ActiveModel {
-            name: Set("cancel-source".to_string()),
-            bucket_name: Set("cancel-bucket".to_string()),
-            bucket_path: Set("/".to_string()),
-            access_key_id: Set(String::new()),
-            secret_key: Set(String::new()),
-            region: Set("us-east-1".to_string()),
-            force_path_style: Set(Some(true)),
-            is_default: Set(true),
-            ..Default::default()
-        }
-        .insert(db.as_ref())
-        .await
-        .expect("insert S3 source");
-        let service = temps_entities::external_services::ActiveModel {
-            name: Set("ledger".to_string()),
-            service_type: Set("postgres".to_string()),
-            status: Set("running".to_string()),
-            topology: Set("standalone".to_string()),
-            ..Default::default()
-        }
-        .insert(db.as_ref())
-        .await
-        .expect("insert service");
-        let backup = temps_entities::backups::ActiveModel {
-            id: NotSet,
-            name: Set("nightly".to_string()),
-            backup_id: Set(uuid::Uuid::new_v4().to_string()),
-            schedule_id: Set(None),
-            schedule_run_id: Set(None),
-            backup_type: Set("full".to_string()),
-            state: Set("completed".to_string()),
-            started_at: Set(Utc::now()),
-            finished_at: Set(Some(Utc::now())),
-            s3_source_id: Set(source.id),
-            s3_location: Set("external_services/postgres/ledger/1".to_string()),
-            compression_type: Set("gzip".to_string()),
-            created_by: Set(user.id),
-            tags: Set("[]".to_string()),
-            size_bytes: Set(None),
-            file_count: Set(None),
-            error_message: Set(None),
-            expires_at: Set(None),
-            checksum: Set(None),
-            metadata: Set("{}".to_string()),
-        }
-        .insert(db.as_ref())
-        .await
-        .expect("insert backup");
-        let insert = |db: Arc<sea_orm::DatabaseConnection>| async move {
-            insert_restore_run(
-                db.as_ref(),
-                new_run(service.id, backup.id, user.id, "in_place", None),
-                Some(backup.id),
-                service.id,
-                true,
-            )
-            .await
-        };
-
-        // Cancelled while preparing: the run is terminal, the service is
-        // released for a new restore, and the worker never starts writing.
-        let first = insert(db.clone()).await.expect("first restore accepted");
-        let view = cancel_run_at_safe_point(db.as_ref(), first.id)
-            .await
-            .expect("a preparing run is cancellable");
-        assert_eq!(view.status, CANCELLED_STATUS);
-        assert_eq!(view.phase, CANCELLABLE_PHASE);
-        assert!(view.finished_at.is_some());
-        let err = enter_restore_phase(db.as_ref(), first.id)
-            .await
-            .expect_err("the cancelled worker must stop at its safe point");
-        assert!(matches!(err, RestoreError::Cancelled { .. }), "{err:?}");
-        let stored = load_run_for_update(db.as_ref(), first.id)
-            .await
-            .expect("reload");
-        assert_eq!(stored.status, CANCELLED_STATUS);
-        assert_eq!(
-            stored.phase, CANCELLABLE_PHASE,
-            "the worker did not advance it"
-        );
-
-        // A cancelled run's outcome is never overwritten by a late worker.
-        persist_terminal_state(db.as_ref(), first.id, &Ok(None), TERMINAL_WRITE_RETRY)
-            .await
-            .expect("conditional write is a no-op");
-        assert_eq!(
-            load_run_for_update(db.as_ref(), first.id)
-                .await
-                .unwrap()
-                .status,
-            CANCELLED_STATUS
-        );
-
-        let err = cancel_run_at_safe_point(db.as_ref(), first.id)
-            .await
-            .expect_err("cancelling twice is refused");
-        assert!(
-            matches!(err, RestoreError::RestoreNotActive { .. }),
-            "{err:?}"
-        );
-
-        // Once the worker is past the safe point, cancellation is refused and
-        // the run keeps holding the service.
-        let second = insert(db.clone())
-            .await
-            .expect("the cancelled run released the service");
-        enter_restore_phase(db.as_ref(), second.id)
-            .await
-            .expect("an uncancelled run enters its restore phase");
-        let err = cancel_run_at_safe_point(db.as_ref(), second.id)
-            .await
-            .expect_err("a run writing data is not cancellable");
-        assert!(
-            matches!(&err, RestoreError::RestoreNotCancellable { phase, .. } if phase == "restore"),
-            "{err:?}"
-        );
-        assert_eq!(
-            load_run_for_update(db.as_ref(), second.id)
-                .await
-                .unwrap()
-                .status,
-            "running"
-        );
-        let err = insert(db.clone())
-            .await
-            .expect_err("the writing run still holds the service");
-        assert!(
-            matches!(err, RestoreError::RestoreAlreadyActive { .. }),
-            "{err:?}"
-        );
-    }
 }

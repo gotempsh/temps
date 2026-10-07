@@ -126,6 +126,99 @@ github_api_get() {
     [[ $api_status =~ ^[0-9]{3}$ ]] || api_status=000
 }
 
+# --- Release selection helpers -------------------------------------------
+#
+# These mirror the release picker in `temps upgrade`
+# (crates/temps-cli/src/commands/upgrade.rs: `normalize_release_tag`,
+# `version_sort_key` and `pick_installable_release_for_channel`), so the
+# installer and the CLI agree on which release a channel resolves to.
+
+# A release version tag: `vMAJOR.MINOR.PATCH` plus an optional `-prerelease`
+# made of dot-separated alphanumeric/dash identifiers. Anything else -- the
+# `test-v*` tags cut by the release-workflow smoke test, `latest`, path
+# fragments -- is not an installable version. The tag ends up in a download
+# URL, so keep this strict.
+release_tag_pattern='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+
+# Print the highest of the tags read from stdin (one per line) by semver
+# precedence: core version first, a release outranks its own prereleases,
+# then prerelease identifiers left to right -- numeric ones compare
+# numerically (rc.10 > rc.2) and rank below alphanumeric ones, and a longer
+# identifier list wins a shared prefix. Written in POSIX awk because
+# `sort -V` is GNU-only and has no prerelease semantics. Callers filter the
+# input through `release_tag_pattern` first.
+highest_semver_tag() {
+    awk '
+    function ident_cmp(a, b,   a_num, b_num) {
+        a_num = (a ~ /^[0-9]+$/)
+        b_num = (b ~ /^[0-9]+$/)
+        if (a_num && b_num) {
+            if (a + 0 < b + 0) return -1
+            if (a + 0 > b + 0) return 1
+            return 0
+        }
+        if (a_num) return -1
+        if (b_num) return 1
+        if ((a "") < (b "")) return -1
+        if ((a "") > (b "")) return 1
+        return 0
+    }
+    function version_cmp(x, y,   x_pre, y_pre, x_core, y_core, x_ids, y_ids, n, m, i, r) {
+        x_pre = ""
+        y_pre = ""
+        if (index(x, "-")) { x_pre = substr(x, index(x, "-") + 1); x = substr(x, 1, index(x, "-") - 1) }
+        if (index(y, "-")) { y_pre = substr(y, index(y, "-") + 1); y = substr(y, 1, index(y, "-") - 1) }
+        split(x, x_core, ".")
+        split(y, y_core, ".")
+        for (i = 1; i <= 3; i++) {
+            if (x_core[i] + 0 < y_core[i] + 0) return -1
+            if (x_core[i] + 0 > y_core[i] + 0) return 1
+        }
+        if (x_pre == "" && y_pre == "") return 0
+        if (x_pre == "") return 1
+        if (y_pre == "") return -1
+        n = split(x_pre, x_ids, ".")
+        m = split(y_pre, y_ids, ".")
+        for (i = 1; i <= n && i <= m; i++) {
+            r = ident_cmp(x_ids[i], y_ids[i])
+            if (r != 0) return r
+        }
+        if (n < m) return -1
+        if (n > m) return 1
+        return 0
+    }
+    NF {
+        version = $0
+        sub(/^v/, "", version)
+        if (best == "" || version_cmp(version, best_version) > 0) {
+            best = $0
+            best_version = version
+        }
+    }
+    END { if (best != "") print best }
+    '
+}
+
+# Print, one per line, the version tags of the releases in GitHub releases
+# JSON ($1) that ship an asset named $2 -- the same "can this host actually
+# install it?" check `temps upgrade` makes, so an asset-less release (a test
+# release, or one whose upload failed) is never picked.
+#
+# Read from each asset's `browser_download_url`
+# (`.../releases/download/<tag>/<asset>`) rather than pairing `tag_name`
+# with `assets[].name`: that pairing depends on key order and nesting, which
+# only a real JSON parser gets right. The URL carries both facts in one
+# string, works on minified and pretty-printed JSON alike, and cannot match
+# text inside a release body, where the quotes are escaped. Draft releases
+# download from `untagged-*` paths and fail the version pattern.
+release_tags_with_asset() {
+    local asset_pattern="${2//./\\.}"
+    printf '%s\n' "$1" |
+        grep -oE '"browser_download_url": *"[^"]*/releases/download/[^"/]+/'"$asset_pattern"'"' |
+        sed -E 's#.*/releases/download/([^"/]+)/[^"/]+"$#\1#' |
+        grep -E "$release_tag_pattern" || true
+}
+
 # Is the numeric core (MAJOR.MINOR.PATCH) of tag $1 lower than that of $2?
 # Prerelease suffixes are ignored: only a whole release line counts.
 core_version_lt() {
@@ -147,11 +240,11 @@ warn_if_stable_predates_beta() {
     local stable_tag="$1" beta_tag
     github_api_get "https://api.github.com/repos/gotempsh/temps/releases?per_page=100"
     [[ "$api_status" = "200" ]] || return 0
-    beta_tag=$(echo "$api_body" |
-               grep -oE '"tag_name": *"[^"]*"' |
-               sed -E 's/.*"([^"]+)"$/\1/' |
+    # Same selection as `--channel beta`, limited to the first page: this is
+    # only an advisory, so it must not cost the install more API calls.
+    beta_tag=$(release_tags_with_asset "$api_body" "temps-$target.tar.gz" |
                grep -v -- '-nightly\.' |
-               head -n 1 || true)
+               highest_semver_tag || true)
     if [[ -n "$beta_tag" ]] && core_version_lt "$stable_tag" "$beta_tag"; then
         warning "$stable_tag is the newest stable release, but it predates the current beta
 line (newest: $beta_tag). Temps is in beta, and most installs track the beta channel.
@@ -178,10 +271,11 @@ Available versions: https://github.com/gotempsh/temps/releases"
 
 # Channel selection. Mirrors `temps upgrade --channel`:
 #   stable (default) — track non-prerelease tags only
-#   beta             — track the newest tag, prerelease or not, EXCLUDING
+#   beta             — track the highest version, prerelease or not, EXCLUDING
 #                       nightly builds (a `-nightly.` tag never satisfies beta)
 #   nightly          — track only automated nightly builds (`-nightly.` tags),
 #                       cut once a day from `main` when it has new commits
+# Every channel skips releases without this platform's tarball.
 #
 # CLI-only by design: there is no env-var fallback. A user must pass
 # `--channel beta` or `--channel nightly` explicitly to opt into prereleases.
@@ -239,48 +333,64 @@ github_repo="$GITHUB/gotempsh/temps"
 
 exe_name=temps
 
+asset_name="temps-$target.tar.gz"
+
 if [[ ${#positional[@]} -eq 0 ]]; then
     info "Fetching latest release on channel: $channel"
 
-    # Channel resolution against GitHub Releases:
+    # Channel resolution against GitHub Releases. Every channel only ever
+    # resolves to a version-shaped tag (`release_tag_pattern`, so `test-v*`
+    # smoke-test releases are never candidates) that ships this platform's
+    # tarball (`release_tags_with_asset`), mirroring `temps upgrade`.
     #
-    # - stable: GET /releases/latest returns the most recent NON-prerelease
-    #   release. This is GitHub's contract — it's exactly what we want.
-    #   404 means there are zero stable releases yet; fall through to a
-    #   helpful error.
-    # - beta: /releases/latest skips betas, so we walk /releases
-    #   (newest-first) and take the first `tag_name` that is NOT a nightly
-    #   build (mirrors `temps upgrade`'s `UpgradeChannel::Beta`, which
-    #   excludes `-nightly.` tags so a deliberate beta opt-in never silently
-    #   resolves to an automated nightly).
-    # - nightly: same listing, but take the first `tag_name` that IS a
-    #   nightly build (contains `-nightly.`), minted by the "Nightly
-    #   Release" workflow.
+    # - stable: GET /releases/latest -- the release GitHub marks "Latest".
+    #   The release workflow only marks a stable tag Latest when it is the
+    #   highest stable version, so a backported patch on an older line never
+    #   becomes the default install. 404 means there are zero stable releases
+    #   yet; fall through to a helpful error.
+    # - beta: /releases/latest skips prereleases, so walk /releases and take
+    #   the highest version by semver that is NOT a nightly build (mirrors
+    #   `UpgradeChannel::Beta`, which excludes `-nightly.` tags so a
+    #   deliberate beta opt-in never silently resolves to an automated
+    #   nightly). A stable release is a valid beta-channel result when it is
+    #   the newest version.
+    # - nightly: same listing, highest version that IS a nightly build
+    #   (`-nightly.`), minted by the "Nightly Release" workflow.
     #
-    # Pagination: nightlies are cut once a day from `main`, so a gap of more
-    # than one page's worth of days between beta releases (or, in principle,
-    # between nightly releases) means the desired tag isn't on page 1. Walk
-    # up to 5 pages of 100 releases (500 releases of headroom) and stop as
-    # soon as a match is found or the API runs out of releases.
-    #
-    # Why "first tag_name" (no draft check):
-    #   We don't ship draft releases publicly — anything visible on the
-    #   API is intended to be installable. Filtering drafts inside a
-    #   shell script is brittle (tag_name and draft fields aren't in a
-    #   guaranteed order across responses; awk pairing them requires a
-    #   real JSON parser). The Rust CLI does check `draft` because it has
-    #   serde; the bash installer trusts that the API only returns
-    #   shipped releases.
+    # The listing is ordered by creation date, not version, so the highest
+    # version is computed over every page fetched rather than taken from the
+    # first match: a backfilled release must not shadow a newer one. Walk up
+    # to 5 pages of 100 releases (500 releases of headroom), stopping at the
+    # first short page.
     set +e
     temps_tag=""
     if [[ "$channel" = "stable" ]]; then
         github_api_get "https://api.github.com/repos/gotempsh/temps/releases/latest"
         case "$api_status" in
             200)
-                temps_tag=$(echo "$api_body" |
-                            grep '"tag_name":' |
+                # `grep -o` on the key itself, so minified JSON (one line, or
+                # `"tag_name":"x"` with no space) parses the same as
+                # pretty-printed JSON.
+                temps_tag=$(printf '%s\n' "$api_body" |
+                            grep -oE '"tag_name": *"[^"]*"' |
                             head -n 1 |
-                            sed -E 's/.*"([^"]+)".*/\1/' 2>/dev/null)
+                            sed -E 's/.*"([^"]*)"$/\1/')
+                if [[ -n "$temps_tag" && ! $temps_tag =~ $release_tag_pattern ]]; then
+                    error "The latest stable release has an unexpected tag '$temps_tag'.
+Pin a version instead:
+    curl -fsSL https://raw.githubusercontent.com/gotempsh/temps/main/scripts/install.sh | bash -s -- <version>
+
+Available versions: https://github.com/gotempsh/temps/releases"
+                fi
+                stable_installable=$(release_tags_with_asset "$api_body" "$asset_name")
+                if [[ -n "$temps_tag" ]] &&
+                   ! printf '%s\n' "$stable_installable" | grep -xF -- "$temps_tag" >/dev/null; then
+                    error "The latest stable release $temps_tag has no $asset_name asset, so it cannot be
+installed on this platform. Pin a version that ships one:
+    curl -fsSL https://raw.githubusercontent.com/gotempsh/temps/main/scripts/install.sh | bash -s -- <version>
+
+Available versions: https://github.com/gotempsh/temps/releases"
+                fi
                 ;;
             404)
                 # No stable release has been published yet. Do NOT fall back
@@ -304,31 +414,38 @@ Available versions: https://github.com/gotempsh/temps/releases"
                 ;;
         esac
     else
+        candidates=""
         page=1
-        while [[ -z "$temps_tag" && $page -le 5 ]]; do
+        while [[ $page -le 5 ]]; do
             github_api_get "https://api.github.com/repos/gotempsh/temps/releases?per_page=100&page=$page"
-            [[ "$api_status" = "200" ]] || github_api_error "$channel releases"
-            page_tags=$(echo "$api_body" |
-                        grep -oE '"tag_name": *"[^"]*"' |
-                        sed -E 's/.*"([^"]+)"$/\1/')
-            [[ -z "$page_tags" ]] && break
-
-            if [[ "$channel" = "nightly" ]]; then
-                # First tag_name that IS a nightly build.
-                temps_tag=$(echo "$page_tags" | grep -- '-nightly\.' | head -n 1)
-            else
-                # beta: first tag_name that is NOT a nightly build.
-                temps_tag=$(echo "$page_tags" | grep -v -- '-nightly\.' | head -n 1)
+            if [[ "$api_status" != "200" ]]; then
+                # Page 1 failing means we know nothing. A later page failing
+                # (typically the unauthenticated rate limit) still leaves the
+                # newest releases, which is where the answer almost always is.
+                if [[ $page -gt 1 && -n "$candidates" ]]; then
+                    warning "Could not read page $page of the release list (HTTP $api_status); choosing from the first $(( (page - 1) * 100 )) releases."
+                    break
+                fi
+                github_api_error "$channel releases"
             fi
-
+            candidates+=$(release_tags_with_asset "$api_body" "$asset_name")$'\n'
+            page_releases=$(printf '%s\n' "$api_body" | grep -oE '"tag_name": *"' | wc -l | tr -d ' ')
+            [[ $page_releases -lt 100 ]] && break
             page=$((page + 1))
         done
+
+        if [[ "$channel" = "nightly" ]]; then
+            temps_tag=$(printf '%s' "$candidates" | grep -- '-nightly\.' | highest_semver_tag)
+        else
+            temps_tag=$(printf '%s' "$candidates" | grep -v -- '-nightly\.' | highest_semver_tag)
+        fi
     fi
     set -e
 
     if [[ -z "$temps_tag" ]]; then
         echo ""
-        error "No releases found on channel '$channel'. Try a specific version:
+        error "No installable release found on channel '$channel' (a release must ship $asset_name).
+Try a specific version:
     curl -fsSL https://raw.githubusercontent.com/gotempsh/temps/main/scripts/install.sh | bash -s -- v0.1.0
 
 Or pick a different channel:
@@ -341,11 +458,21 @@ Available versions: https://github.com/gotempsh/temps/releases"
     if [[ "$channel" = "stable" ]]; then
         warn_if_stable_predates_beta "$temps_tag"
     fi
-    temps_uri=$github_repo/releases/download/$temps_tag/temps-$target.tar.gz
 else
-    # Explicit version pin — channel is irrelevant.
-    temps_uri=$github_repo/releases/download/${positional[0]}/temps-$target.tar.gz
+    # Explicit version pin -- channel is irrelevant. Accept `0.1.0` as well
+    # as `v0.1.0` (release tags always carry the `v`), and reject anything
+    # that is not version-shaped before it reaches a URL.
+    temps_tag="v${positional[0]#v}"
+    if [[ ! $temps_tag =~ $release_tag_pattern ]]; then
+        error "'${positional[0]}' is not a release version. Expected something like
+'v0.1.0', '0.1.0' or 'v0.1.0-rc.1'.
+
+Usage: install.sh [--channel stable|beta|nightly] [version]
+Available versions: https://github.com/gotempsh/temps/releases"
+    fi
+    info "Installing pinned version: $temps_tag"
 fi
+temps_uri=$github_repo/releases/download/$temps_tag/$asset_name
 
 install_env=TEMPS_INSTALL
 bin_env=\$$install_env/bin

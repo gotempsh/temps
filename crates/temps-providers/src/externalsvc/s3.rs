@@ -615,7 +615,7 @@ echo '[restore] complete'"#;
     }
 
     fn get_container_name(&self) -> String {
-        format!("minio-{}", self.name)
+        minio_container_name(&self.name)
     }
 
     /// The container this service actually runs in: the imported container's
@@ -1274,8 +1274,26 @@ impl S3Service {
     }
 }
 
+/// Container name of a service named `name`. The single derivation shared by
+/// the engine and anything that must find its container without an instance.
+pub(crate) fn minio_container_name(name: &str) -> String {
+    format!("minio-{}", name)
+}
+
+/// Data volumes of a service named `name`, as `remove()` deletes them.
+pub(crate) fn minio_volume_names(name: &str) -> [String; 1] {
+    [format!("minio_{}_data", name)]
+}
+
 #[async_trait]
 impl ExternalService for S3Service {
+    fn docker_resource_names(&self) -> Option<super::DockerResourceNames> {
+        Some(super::DockerResourceNames {
+            containers: vec![minio_container_name(&self.name)],
+            volumes: minio_volume_names(&self.name).to_vec(),
+        })
+    }
+
     fn get_local_address(&self, service_config: ServiceConfig) -> Result<String> {
         let config = self.get_s3_config(service_config)?;
         Ok(format!("localhost:{}", config.port))
@@ -1614,7 +1632,7 @@ impl ExternalService for S3Service {
         // Then remove container and volume
         let docker = &self.docker;
         let container_name = self.get_container_name();
-        let volume_name = format!("minio_{}_data", self.name);
+        let [volume_name] = minio_volume_names(&self.name);
 
         info!("Removing MinIO container and volume for {}", self.name);
 
@@ -4279,6 +4297,7 @@ mod tests {
             source_service: &external_service,
             source_config: s3_config.clone(),
             pool: &mock_db,
+            gate: &super::super::NoopRestoreGate,
         };
 
         let restore_result = s3_service

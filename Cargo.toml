@@ -533,21 +533,24 @@ debug = false
 #
 # 5. RUSTSEC-2023-0071: rsa 0.9.10 (MEDIUM severity)
 #    - Title: Marvin Attack: potential key recovery through timing sidechannels
-#    - Dependency paths:
-#        jsonwebtoken 10.4.0 <- octocrab      (GitHub App JWT signing;
-#          crates/temps-git/src/services/github.rs,
-#          crates/temps-git/src/services/git_provider_manager.rs)
-#        jsonwebtoken 10.4.0 <- openidconnect (OIDC id_token verification)
+#    - Dependency paths (keep in sync with the ignore justification in
+#      .github/workflows/dependency-scan.yml):
+#        jsonwebtoken 10 <- octocrab, and jsonwebtoken 11 direct in temps-git
+#          (GitHub App JWT RS256 signing)
+#        jsonwebtoken <- openidconnect <- temps-auth (OIDC id_token verification)
 #        rsa direct usage in crates/temps-dns/src/providers/gcp.rs
 #          (GCP Cloud DNS service-account JWT signing, sign_rs256())
+#        sqlx-mysql (client-side RSA-OAEP *encryption* of the password)
+#        temps-email-tracking (SNS message signature verification only)
+#        dev-only key generation in temps-deployments tests and
+#          examples/google-indexing-plugin
 #    - Status: no fixed version exists upstream (the rsa crate has no constant-time
 #      release yet). Tracked.
 #    - Assessment: the Marvin Attack is an adaptive chosen-ciphertext attack against
-#      RSA-PKCS#1v1.5 *decryption*. Temps has zero RSA decryption usage -- all three
-#      paths above are RSA *signing* only (OIDC verification is a separate,
-#      unaffected public-key op). Signing uses a non-constant-time modexp, which is
-#      a real but much narrower timing side-channel than Marvin's decryption
-#      oracle. Network latency is not a security boundary and does not prove
+#      RSA-PKCS#1v1.5 *decryption*. Temps has zero RSA decryption usage -- the paths
+#      above are signing, verification, client-side encryption and test keygen.
+#      Signing uses a non-constant-time modexp, which is a real but much
+#      narrower timing side-channel than Marvin's decryption oracle. Network latency is not a security boundary and does not prove
 #      signing timing unobservable. No exploitability measurement or independent
 #      review is recorded here; this remains a dependency exception requiring
 #      maintainer risk review, not a security assurance. russh also pulls

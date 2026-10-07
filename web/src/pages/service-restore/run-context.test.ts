@@ -9,6 +9,7 @@ import {
   RESTORE_NOT_CANCELLABLE_TYPE,
   cancelAvailability,
   cancelRefusal,
+  notCancellableReason,
   sourceBackupSummary,
 } from './run-context'
 import type { RunTrackingView } from './restore-state'
@@ -21,6 +22,7 @@ function run(overrides: Partial<RestoreRunView> = {}): RestoreRunView {
     mode: 'in_place',
     status: 'running',
     phase: 'prepare',
+    cancellable: true,
     created_at: '2026-10-01T00:00:00Z',
     source_backup: {
       id: 12,
@@ -42,11 +44,28 @@ describe('cancelAvailability', () => {
     expect(cancelAvailability(tracking(run()))).toBe('available')
   })
 
-  test('a run writing data is past its safe point', () => {
-    for (const phase of ['provision', 'restore', 'recover', 'verify']) {
-      expect(cancelAvailability(tracking(run({ phase })))).toBe(
-        'past_safe_point'
+  test('follows the server, not the phase: a download can still be cancelled', () => {
+    expect(
+      cancelAvailability(tracking(run({ phase: 'download', cancellable: true })))
+    ).toBe('available')
+    expect(
+      cancelAvailability(
+        tracking(
+          run({
+            target_service_name: 'orders-copy',
+            phase: 'provision',
+            cancellable: true,
+          })
+        )
       )
+    ).toBe('available')
+  })
+
+  test('a run the server will not stop is past its safe point', () => {
+    for (const phase of ['restore', 'recover', 'verify']) {
+      expect(
+        cancelAvailability(tracking(run({ phase, cancellable: false })))
+      ).toBe('past_safe_point')
     }
   })
 
@@ -74,6 +93,14 @@ describe('cancelRefusal', () => {
     expect(copy.description).toContain('partially restored')
   })
 
+  test('shows the server reason a run cannot be stopped', () => {
+    const copy = cancelRefusal({
+      type: RESTORE_NOT_CANCELLABLE_TYPE,
+      detail: 'The new service is being registered (phase \'verify\').',
+    })
+    expect(copy.description).toContain('being registered')
+  })
+
   test('passes the server detail through for a finished run', () => {
     const copy = cancelRefusal({
       type: RESTORE_NOT_ACTIVE_TYPE,
@@ -91,6 +118,17 @@ describe('cancelRefusal', () => {
       description: 'network down',
     })
     expect(cancelRefusal(undefined).level).toBe('error')
+  })
+})
+
+describe('notCancellableReason', () => {
+  test('uses the server reason, else explains the write phase', () => {
+    expect(
+      notCancellableReason({ not_cancellable_reason: 'Already requested.' })
+    ).toBe('Already requested.')
+    expect(notCancellableReason({ not_cancellable_reason: null })).toContain(
+      'partially restored'
+    )
   })
 })
 

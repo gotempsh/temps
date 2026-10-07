@@ -9,6 +9,7 @@ import { AiAssistantButton } from '@/components/ai/AiAssistantButton'
 import { BackupAlertsButton } from '@/components/dashboard/BackupAlertsButton'
 import { DropButton } from '@/components/dashboard/DropButton'
 import { FeatureMaturityBadge } from '@/components/feature-maturity/FeatureMaturityBadge'
+import { OperationsTray } from '@/components/operations/OperationsTray'
 import { ProjectAvatar } from '@/components/project/ProjectAvatar'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { featureKeyForPath } from '@/lib/feature-maturity'
@@ -229,10 +230,11 @@ export function Header() {
           {/* The "+" quick-actions menu and the theme toggle used to live here.
               Every entry it held is now in the command palette (⌘K), and
               appearance moved into the account menu — so the header keeps only
-              what you reach for mid-task: dropping files, the assistant, and
-              alerts. */}
+              what you reach for mid-task: dropping files, the assistant,
+              in-flight operations, and alerts. */}
           <DropButton />
           <AiAssistantButton />
+          <OperationsTray />
           <BackupAlertsButton />
         </div>
       </div>

@@ -13571,6 +13571,26 @@ export type ListOnDemandCertsResponse = {
     total: number;
 };
 
+/**
+ * Query parameters for `GET /operations`.
+ */
+export type ListOperationsQuery = {
+    kind?: OperationKind | null;
+    /**
+     * Page number, 1-based (default 1).
+     */
+    page?: number | null;
+    /**
+     * Items per page (default 20, max 100).
+     */
+    page_size?: number | null;
+    /**
+     * Only operations belonging to this project.
+     */
+    project_id?: number | null;
+    status?: OperationStatusFilter | null;
+};
+
 export type ListOrdersResponse = {
     orders: Array<AcmeOrderResponse>;
 };
@@ -15829,6 +15849,64 @@ export type OperatingSystemCount = {
     percentage: number;
 };
 
+/**
+ * One operation in the feed.
+ */
+export type OperationEntry = {
+    agent_run_id?: number | null;
+    backup_id?: number | null;
+    created_at: string;
+    deployment_id?: number | null;
+    environment_id?: number | null;
+    environment_name?: string | null;
+    /**
+     * Why the operation failed or was cancelled, when known.
+     */
+    failure_reason?: string | null;
+    finished_at?: string | null;
+    /**
+     * Stable unique id, `<source>:<row id>` (e.g. `deployment:123`).
+     */
+    id: string;
+    kind: OperationKind;
+    /**
+     * Console path of the resource's detail page.
+     */
+    link: string;
+    /**
+     * Source-specific phase, when the source records one (restores, autofix).
+     */
+    phase?: string | null;
+    /**
+     * Owning project. For restores and backups this is set only when the
+     * service is linked to exactly one project.
+     */
+    project_id?: number | null;
+    project_slug?: string | null;
+    restore_run_id?: number | null;
+    /**
+     * Storage service the operation acts on (the restore's source service,
+     * or the backed-up service).
+     */
+    service_id?: number | null;
+    service_name?: string | null;
+    started_at?: string | null;
+    status: OperationStatus;
+    /**
+     * Human-readable label, e.g. "Rollback to deployment #41".
+     */
+    title: string;
+    /**
+     * User who started it, when the source records one. Deployments do not.
+     */
+    triggered_by_user_id?: number | null;
+};
+
+/**
+ * What kind of operation an entry describes.
+ */
+export type OperationKind = 'deployment' | 'rollback' | 'promotion' | 'restore' | 'backup' | 'autofix';
+
 export type OperationResultResponse = {
     data?: unknown;
     executed_at: string;
@@ -15840,6 +15918,35 @@ export type OperationResultResponse = {
 export type OperationResultsResponse = {
     deployment_id: string;
     operations: Array<OperationResultResponse>;
+};
+
+/**
+ * Normalised lifecycle state of an operation.
+ */
+export type OperationStatus = 'queued' | 'running' | 'waiting' | 'succeeded' | 'failed' | 'cancelled';
+
+/**
+ * Which slice of the feed to return.
+ */
+export type OperationStatusFilter = 'running' | 'finished' | 'all';
+
+/**
+ * A page of the operations feed. Sorted by `created_at` descending (fixed).
+ */
+export type OperationsListResponse = {
+    operations: Array<OperationEntry>;
+    page: number;
+    page_size: number;
+    /**
+     * Queued, running and waiting operations matching the scope, `kind` and
+     * `project_id` filters — independent of the `status` filter, so the tray
+     * badge stays correct while browsing finished operations.
+     */
+    running_count: number;
+    /**
+     * Operations matching every filter.
+     */
+    total: number;
 };
 
 export type OriginTlsPolicy = 'existing_certificate';
@@ -20446,11 +20553,23 @@ export type RestoreRunSourceBackup = {
 };
 
 export type RestoreRunView = {
+    /**
+     * When cancellation was requested, if it was.
+     */
+    cancel_requested_at?: string | null;
+    /**
+     * Whether `POST /restore-runs/{id}/cancel` would be accepted now.
+     */
+    cancellable: boolean;
     created_at: string;
     error_message?: string | null;
     finished_at?: string | null;
     id: number;
     mode: string;
+    /**
+     * Why the run cannot be cancelled now; `None` when `cancellable`.
+     */
+    not_cancellable_reason?: string | null;
     phase: string;
     recovery_target?: unknown;
     /**
@@ -47347,6 +47466,65 @@ export type TestNotificationRouteResponses = {
 
 export type TestNotificationRouteResponse = TestNotificationRouteResponses[keyof TestNotificationRouteResponses];
 
+export type ListOperationsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Page number, 1-based (default 1).
+         */
+        page?: number;
+        /**
+         * Items per page (default 20, max 100).
+         */
+        page_size?: number;
+        /**
+         * `running` (queued, running, waiting), `finished` (succeeded, failed,
+         * cancelled) or `all` (default).
+         */
+        status?: OperationStatusFilter;
+        /**
+         * Only operations of this kind.
+         */
+        kind?: OperationKind;
+        /**
+         * Only operations belonging to this project.
+         */
+        project_id?: number;
+    };
+    url: '/operations';
+};
+
+export type ListOperationsErrors = {
+    /**
+     * Invalid query
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListOperationsError = ListOperationsErrors[keyof ListOperationsErrors];
+
+export type ListOperationsResponses = {
+    /**
+     * A page of operations
+     */
+    200: OperationsListResponse;
+};
+
+export type ListOperationsResponse = ListOperationsResponses[keyof ListOperationsResponses];
+
 export type ListOrdersData = {
     body?: never;
     path?: never;
@@ -47452,7 +47630,11 @@ export type CreateAlertErrors = {
      */
     403: ProblemDetails;
     /**
-     * The project already has the maximum number of metric alert rules
+     * Project not found
+     */
+    404: ProblemDetails;
+    /**
+     * Project already holds the maximum number of metric alert rules
      */
     409: ProblemDetails;
     /**
@@ -57366,7 +57548,11 @@ export type CreateAlertRuleErrors = {
      */
     400: unknown;
     /**
-     * The project already has the maximum number of error alert rules
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * Project already holds the maximum number of error alert rules
      */
     409: unknown;
     /**
@@ -63979,7 +64165,7 @@ export type CancelRestoreRunErrors = {
      */
     404: ProblemDetails;
     /**
-     * Conflict: the run already finished (`restore-not-active`, with `run_status`), or it has started writing data and can no longer be stopped safely (`restore-not-cancellable`, with `phase`). A run is only cancellable while its phase is `prepare`.
+     * Conflict: the run already finished (`restore-not-active`, with `run_status`), or it can no longer be stopped safely (`restore-not-cancellable`, with `phase`): an in-place restore has started writing data, or a new service is being registered
      */
     409: ProblemDetails;
 };
@@ -63988,9 +64174,9 @@ export type CancelRestoreRunError = CancelRestoreRunErrors[keyof CancelRestoreRu
 
 export type CancelRestoreRunResponses = {
     /**
-     * Restore run cancelled before it wrote any data. The returned run is `cancelled` and its target was not modified.
+     * Cancellation recorded (or already recorded); the run stops at its next check and ends as `cancelled`
      */
-    200: RestoreRunView;
+    202: RestoreRunView;
 };
 
 export type CancelRestoreRunResponse = CancelRestoreRunResponses[keyof CancelRestoreRunResponses];

@@ -25,16 +25,21 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post, put},
-    Json, Router,
+    Extension, Json, Router,
 };
 use chrono::Utc;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use temps_core::RequestMetadata;
 use temps_entities::{deployment_tokens, project_dsns, projects};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 use utoipa::{OpenApi, ToSchema};
 
+use crate::handlers::audit::{
+    SentryCliAuditContext, SentryCliCredential, SentryCliReleaseAction, SentryCliReleaseAudit,
+    SentryCliReleaseFileUploadedAudit,
+};
 use crate::services::source_map_service::SourceMapService;
 
 #[derive(OpenApi)]
@@ -63,6 +68,7 @@ pub struct SentryCompatApiDoc;
 pub struct SentryCompatAppState {
     pub source_map_service: Arc<SourceMapService>,
     pub db: Arc<DatabaseConnection>,
+    pub audit_service: Arc<dyn temps_core::AuditLogger>,
 }
 
 // --- Request/Response types ---
@@ -171,6 +177,47 @@ pub fn configure_sentry_compat_routes() -> Router<Arc<SentryCompatAppState>> {
 
 // --- Auth helper ---
 
+/// The project and credential a sentry-cli request authenticated as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BearerPrincipal {
+    project_id: i32,
+    credential: SentryCliCredential,
+}
+
+fn sentry_cli_audit_context(
+    principal: BearerPrincipal,
+    metadata: &RequestMetadata,
+) -> SentryCliAuditContext {
+    SentryCliAuditContext {
+        credential: principal.credential,
+        ip_address: Some(metadata.ip_address.clone()),
+        user_agent: metadata.user_agent.clone(),
+    }
+}
+
+/// Record a sentry-cli release create/finalize call. An audit failure is
+/// logged and does not fail the request (sentry-cli would abort the build).
+async fn record_release_audit(
+    state: &SentryCompatAppState,
+    principal: BearerPrincipal,
+    metadata: &RequestMetadata,
+    version: &str,
+    action: SentryCliReleaseAction,
+) {
+    let audit = SentryCliReleaseAudit {
+        context: sentry_cli_audit_context(principal, metadata),
+        project_id: principal.project_id,
+        version: version.to_string(),
+        action,
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!(
+            project_id = principal.project_id,
+            "Failed to create sentry-cli release audit log for release '{}': {}", version, e
+        );
+    }
+}
+
 /// Extract project_id from Bearer token authentication.
 ///
 /// sentry-cli sends `Authorization: Bearer <auth_token>`.
@@ -181,7 +228,7 @@ pub fn configure_sentry_compat_routes() -> Router<Arc<SentryCompatAppState>> {
 async fn authenticate_bearer(
     headers: &HeaderMap,
     db: &DatabaseConnection,
-) -> Result<i32, (StatusCode, String)> {
+) -> Result<BearerPrincipal, (StatusCode, String)> {
     let auth_header = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -226,7 +273,10 @@ async fn authenticate_bearer(
                 )
             })?;
 
-        return Ok(dt.project_id);
+        return Ok(BearerPrincipal {
+            project_id: dt.project_id,
+            credential: SentryCliCredential::DeploymentToken(dt.id),
+        });
     }
 
     // Otherwise try DSN public key lookup
@@ -243,7 +293,10 @@ async fn authenticate_bearer(
         })?
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid auth token".to_string()))?;
 
-    Ok(dsn.project_id)
+    Ok(BearerPrincipal {
+        project_id: dsn.project_id,
+        credential: SentryCliCredential::Dsn(dsn.id),
+    })
 }
 
 /// Resolve a project slug (or numeric ID) to a project_id.
@@ -311,15 +364,25 @@ async fn resolve_project_slug(
 async fn create_release(
     State(state): State<Arc<SentryCompatAppState>>,
     Path(_org_slug): Path<String>,
+    Extension(metadata): Extension<RequestMetadata>,
     headers: HeaderMap,
     Json(request): Json<SentryCreateReleaseRequest>,
 ) -> impl IntoResponse {
     // Authenticate
-    if let Err((status, msg)) = authenticate_bearer(&headers, state.db.as_ref()).await {
-        return (status, msg).into_response();
-    }
+    let principal = match authenticate_bearer(&headers, state.db.as_ref()).await {
+        Ok(principal) => principal,
+        Err((status, msg)) => return (status, msg).into_response(),
+    };
 
     debug!("sentry-cli: Create release '{}' (stub)", request.version);
+    record_release_audit(
+        &state,
+        principal,
+        &metadata,
+        &request.version,
+        SentryCliReleaseAction::Created,
+    )
+    .await;
 
     let now = Utc::now().to_rfc3339();
     let short_version = if request.version.len() > 12 {
@@ -371,18 +434,19 @@ async fn create_release(
 async fn create_project_release(
     State(state): State<Arc<SentryCompatAppState>>,
     Path((_org_slug, project_slug)): Path<(String, String)>,
+    Extension(metadata): Extension<RequestMetadata>,
     headers: HeaderMap,
     Json(request): Json<SentryCreateReleaseRequest>,
 ) -> impl IntoResponse {
     // Authenticate
-    let auth_project_id = match authenticate_bearer(&headers, state.db.as_ref()).await {
-        Ok(id) => id,
+    let principal = match authenticate_bearer(&headers, state.db.as_ref()).await {
+        Ok(principal) => principal,
         Err((status, msg)) => return (status, msg).into_response(),
     };
 
     // Validate project slug matches the authenticated token
     if let Err((status, msg)) =
-        resolve_project_slug(&project_slug, auth_project_id, state.db.as_ref()).await
+        resolve_project_slug(&project_slug, principal.project_id, state.db.as_ref()).await
     {
         return (status, msg).into_response();
     }
@@ -391,6 +455,14 @@ async fn create_project_release(
         "sentry-cli: Create project release '{}' for project '{}' (stub)",
         request.version, project_slug
     );
+    record_release_audit(
+        &state,
+        principal,
+        &metadata,
+        &request.version,
+        SentryCliReleaseAction::Created,
+    )
+    .await;
 
     let now = Utc::now().to_rfc3339();
     let short_version = if request.version.len() > 12 {
@@ -438,17 +510,18 @@ async fn create_project_release(
 async fn finalize_project_release(
     State(state): State<Arc<SentryCompatAppState>>,
     Path((_org_slug, project_slug, version)): Path<(String, String, String)>,
+    Extension(metadata): Extension<RequestMetadata>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     // Authenticate
-    let auth_project_id = match authenticate_bearer(&headers, state.db.as_ref()).await {
-        Ok(id) => id,
+    let principal = match authenticate_bearer(&headers, state.db.as_ref()).await {
+        Ok(principal) => principal,
         Err((status, msg)) => return (status, msg).into_response(),
     };
 
     // Validate project slug matches the authenticated token
     if let Err((status, msg)) =
-        resolve_project_slug(&project_slug, auth_project_id, state.db.as_ref()).await
+        resolve_project_slug(&project_slug, principal.project_id, state.db.as_ref()).await
     {
         return (status, msg).into_response();
     }
@@ -457,6 +530,14 @@ async fn finalize_project_release(
         "sentry-cli: Finalize release '{}' for project '{}' (stub)",
         version, project_slug
     );
+    record_release_audit(
+        &state,
+        principal,
+        &metadata,
+        &version,
+        SentryCliReleaseAction::Finalized,
+    )
+    .await;
 
     let now = Utc::now().to_rfc3339();
     let short_version = if version.len() > 12 {
@@ -506,18 +587,19 @@ async fn finalize_project_release(
 async fn upload_release_file(
     State(state): State<Arc<SentryCompatAppState>>,
     Path((_org_slug, project_slug, version)): Path<(String, String, String)>,
+    Extension(metadata): Extension<RequestMetadata>,
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
     // Authenticate
-    let auth_project_id = match authenticate_bearer(&headers, state.db.as_ref()).await {
-        Ok(id) => id,
+    let principal = match authenticate_bearer(&headers, state.db.as_ref()).await {
+        Ok(principal) => principal,
         Err((status, msg)) => return (status, msg).into_response(),
     };
 
     // Resolve project slug
     let project_id =
-        match resolve_project_slug(&project_slug, auth_project_id, state.db.as_ref()).await {
+        match resolve_project_slug(&project_slug, principal.project_id, state.db.as_ref()).await {
             Ok(id) => id,
             Err((status, msg)) => return (status, msg).into_response(),
         };
@@ -655,6 +737,24 @@ async fn upload_release_file(
                 info.file_path, version, project_id
             );
 
+            let audit = SentryCliReleaseFileUploadedAudit {
+                context: sentry_cli_audit_context(principal, &metadata),
+                project_id,
+                source_map_id: info.id,
+                version: version.clone(),
+                file_path: info.file_path.clone(),
+                dist: dist.clone(),
+                size_bytes: info.size_bytes,
+            };
+            if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+                error!(
+                    project_id,
+                    source_map_id = info.id,
+                    "Failed to create sentry-cli source map upload audit log: {}",
+                    e
+                );
+            }
+
             let response = SentryReleaseFileResponse {
                 id: info.id.to_string(),
                 name: info.file_path,
@@ -717,14 +817,14 @@ async fn list_release_files(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     // Authenticate
-    let auth_project_id = match authenticate_bearer(&headers, state.db.as_ref()).await {
-        Ok(id) => id,
+    let principal = match authenticate_bearer(&headers, state.db.as_ref()).await {
+        Ok(principal) => principal,
         Err((status, msg)) => return (status, msg).into_response(),
     };
 
     // Resolve project slug
     let project_id =
-        match resolve_project_slug(&project_slug, auth_project_id, state.db.as_ref()).await {
+        match resolve_project_slug(&project_slug, principal.project_id, state.db.as_ref()).await {
             Ok(id) => id,
             Err((status, msg)) => return (status, msg).into_response(),
         };

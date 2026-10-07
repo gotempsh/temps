@@ -4,8 +4,8 @@
 name: Upgrade Tests
 
 # Upgrade-from-previous-release test (scripts/test-upgrade-from-release.sh):
-# seed an installation with the latest published beta/stable release, upgrade
-# it in place with the candidate binary, and check that every seeded record is
+# seed an installation with a published release, upgrade it in place with the
+# candidate binary, and check that every seeded record is
 # intact, that a pre-migration backup was taken, that the schema guard refuses
 # a newer database, and that restoring the backup rolls back to the previous
 # release.
@@ -15,6 +15,17 @@ name: Upgrade Tests
 # - Nightly (and manual runs): upgrades to the newest published nightly
 #   build, so the release-to-release path is exercised even on days without
 #   a code change to the test itself.
+#
+# Which release it starts from (`previous-channel`, chosen by version, never
+# by publication date -- see .github/scripts/release_select.py):
+# - stable (default): the highest stable release, i.e. the path most
+#   operators take. Before the first stable release exists it falls back to
+#   the highest beta/RC, so the test still runs.
+# - beta: the highest `-beta.N`/`-rc.N` prerelease, for testing the path beta
+#   testers take (manual runs).
+# Only published, non-draft releases that ship `temps-linux-amd64.tar.gz`
+# are candidates, so `test-v*` smoke-test releases and asset-less releases
+# are never picked. `previous-version` overrides the choice with a tag.
 on:
   workflow_call:
     inputs:
@@ -23,15 +34,28 @@ on:
         required: false
         default: temps-binary-musl-fast
         type: string
+      previous-channel:
+        description: "Channel of the release to upgrade from: stable (falls back to beta before the first stable release) or beta"
+        required: false
+        default: stable
+        type: string
   schedule:
     # After nightly-release.yml (03:00 UTC) has had time to publish.
     - cron: "30 6 * * *"
   workflow_dispatch:
     inputs:
       previous-version:
-        description: "Release tag to upgrade from (default: newest non-nightly release)"
+        description: "Release tag to upgrade from (overrides previous-channel)"
         required: false
         type: string
+      previous-channel:
+        description: "Upgrade from the highest release on this channel (stable falls back to beta before the first stable release)"
+        required: false
+        default: stable
+        type: choice
+        options:
+          - stable
+          - beta
 
 permissions:
   contents: read
@@ -62,6 +86,9 @@ jobs:
       TEMPS_TELEMETRY: "0"
       GH_TOKEN: ${{ github.token }}
       PREVIOUS_VERSION: ${{ github.event.inputs.previous-version }}
+      # `inputs` covers workflow_call and workflow_dispatch; a scheduled run
+      # has neither and takes the stable default.
+      PREVIOUS_CHANNEL: ${{ inputs.previous-channel || 'stable' }}
 
     steps:
       - name: Checkout code
@@ -78,10 +105,11 @@ jobs:
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: |
           set -euo pipefail
-          tag=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 200 \
-            --exclude-drafts --json tagName,publishedAt \
-            --jq '[.[] | select(.tagName | test("-nightly\\."))] | sort_by(.publishedAt) | last | .tagName')
-          test -n "$tag" && test "$tag" != "null"
+          # Published, non-draft releases that ship the tarball, highest
+          # nightly by version.
+          tag=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select(.draft | not) | select(any(.assets[]; .name == "temps-linux-amd64.tar.gz")) | .tag_name' |
+            python3 .github/scripts/release_select.py --channel nightly)
           echo "Candidate: $tag"
           mkdir -p candidate
           gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
@@ -96,13 +124,19 @@ jobs:
           set -euo pipefail
           tag="${PREVIOUS_VERSION:-}"
           if [ -z "$tag" ]; then
-            # Newest published release that is not an automated nightly
-            # build: the version an operator is upgrading from.
-            tag=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 300 \
-              --exclude-drafts --json tagName,publishedAt \
-              --jq '[.[] | select(.tagName | test("-nightly\\.") | not)] | sort_by(.publishedAt) | last | .tagName')
+            case "$PREVIOUS_CHANNEL" in
+              stable) fallback=(--fallback beta) ;;
+              beta) fallback=() ;;
+              *)
+                echo "::error::previous-channel must be 'stable' or 'beta', got '$PREVIOUS_CHANNEL'"
+                exit 1
+                ;;
+            esac
+            tag=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              --jq '.[] | select(.draft | not) | select(any(.assets[]; .name == "temps-linux-amd64.tar.gz")) | .tag_name' |
+              python3 .github/scripts/release_select.py --channel "$PREVIOUS_CHANNEL" "${fallback[@]}")
           fi
-          test -n "$tag" && test "$tag" != "null"
+          test -n "$tag"
           echo "Previous release: $tag"
           mkdir -p previous
           gh release download "$tag" --repo "$GITHUB_REPOSITORY" \

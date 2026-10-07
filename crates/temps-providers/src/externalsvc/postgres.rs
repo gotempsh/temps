@@ -27,6 +27,12 @@ use crate::utils::ensure_network_exists;
 /// indefinitely.
 const BACKUP_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
 
+/// Where a WAL-G restore records the PID of its `backup-fetch`, so a
+/// cancelled restore can stop the fetch without relying on `pkill`.
+const WALG_FETCH_PID_FILE: &str = "/tmp/walg_fetch.pid";
+/// Scratch directory on the data volume a WAL-G restore fetches into.
+const WALG_RESTORE_TEMP: &str = "/var/lib/postgresql/restore_temp";
+
 use super::{
     ExternalService, HealthProbeResult, RuntimeEnvVar, ServiceConfig, ServiceResourceLimits,
     ServiceType,
@@ -569,7 +575,7 @@ impl PostgresService {
         Ok(postgres_config)
     }
     fn get_container_name(&self) -> String {
-        format!("postgres-{}", self.name)
+        postgres_container_name(&self.name)
     }
 
     /// The container this service actually runs in: the imported container's
@@ -880,6 +886,164 @@ impl PostgresService {
             .await?;
 
         info!("PostgreSQL container {} created and started", container.id);
+        Ok(())
+    }
+
+    /// Shell script that stops a running WAL-G `backup-fetch` (by the PID it
+    /// recorded), escalating to SIGKILL, and only then deletes what a
+    /// cancelled restore staged on the volume. Exits 0 once the fetch is
+    /// confirmed gone (or none was running) and 3 if it is still alive, in
+    /// which case nothing is deleted.
+    ///
+    /// A recorded PID is only signalled while it still belongs to a
+    /// `backup-fetch` process: the file can outlive the fetch (a crash, a
+    /// container restart) and its PID be reused by a PostgreSQL backend,
+    /// which must never be killed. The identity comes from
+    /// `/proc/<pid>/cmdline`, falling back to `ps` where `/proc` is absent.
+    fn walg_fetch_abort_script(restore_temp: &str) -> String {
+        Self::walg_fetch_abort_script_with(restore_temp, WALG_FETCH_PID_FILE)
+    }
+
+    /// The command that runs WAL-G `backup-fetch` into `restore_temp`.
+    ///
+    /// The fetch runs in the background of its shell so its PID can be
+    /// recorded: a cancelled restore stops it by PID (see `stop_walg_fetch`)
+    /// instead of depending on pkill being installed. The PID file is removed
+    /// as soon as the fetch exits (keeping its exit code), so it never names
+    /// a process that is not the fetch.
+    fn walg_fetch_command(restore_temp: &str, fetch_target: &str) -> String {
+        format!(
+            "mkdir -p {restore_temp} && rm -rf {restore_temp}/* && {{ wal-g backup-fetch {restore_temp} {fetch_target} > /tmp/walg_restore.log 2>&1 & echo $! > {WALG_FETCH_PID_FILE}; wait $!; rc=$?; rm -f {WALG_FETCH_PID_FILE}; exit $rc; }}"
+        )
+    }
+
+    fn walg_fetch_abort_script_with(restore_temp: &str, pid_file: &str) -> String {
+        format!(
+            "is_fetch() {{ if [ -r /proc/$1/cmdline ]; then tr '\\000' ' ' < /proc/$1/cmdline | grep -q backup-fetch; \
+             else ps -p \"$1\" -o args= 2>/dev/null | grep -q backup-fetch; fi; }}; \
+             if [ -f {pid_file} ]; then pid=$(cat {pid_file}); \
+             if [ -n \"$pid\" ] && is_fetch \"$pid\"; then kill \"$pid\" 2>/dev/null; \
+             i=0; while is_fetch \"$pid\" && [ $i -lt 10 ]; do sleep 1; i=$((i+1)); done; \
+             if is_fetch \"$pid\"; then kill -9 \"$pid\" 2>/dev/null; \
+             i=0; while is_fetch \"$pid\" && [ $i -lt 5 ]; do sleep 1; i=$((i+1)); done; fi; \
+             if is_fetch \"$pid\"; then echo \"wal-g backup-fetch (pid $pid) is still running\" >&2; exit 3; fi; fi; fi; \
+             rm -rf {restore_temp} /var/lib/postgresql/walg-restore.env {pid_file}",
+            pid_file = pid_file,
+            restore_temp = restore_temp,
+        )
+    }
+
+    /// Stop a WAL-G restore download in `container_name` and confirm it has
+    /// exited, then remove what it staged. `fetch_exec` is the Docker exec
+    /// that started the fetch, when known: it must also report not running.
+    ///
+    /// `Err` means the fetch may still be writing; callers must not release
+    /// the service. A container that does not exist or is not running has no
+    /// fetch left, which counts as stopped.
+    async fn stop_walg_fetch(
+        &self,
+        container_name: &str,
+        restore_temp: &str,
+        fetch_exec: Option<&str>,
+    ) -> std::result::Result<(), String> {
+        use bollard::errors::Error as DockerError;
+        use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
+
+        info!(
+            "Stopping WAL-G fetch and removing '{}' in container '{}'",
+            restore_temp, container_name
+        );
+        let gone = |e: &DockerError| {
+            matches!(
+                e,
+                DockerError::DockerResponseServerError {
+                    status_code: 404 | 409,
+                    ..
+                }
+            )
+        };
+        let script = Self::walg_fetch_abort_script(restore_temp);
+        let exec = match self
+            .docker
+            .create_exec(
+                container_name,
+                CreateExecOptions {
+                    cmd: Some(vec!["sh", "-c", script.as_str()]),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    user: Some("postgres"),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(exec) => exec,
+            // No container, or a stopped one: no process can be running in it.
+            Err(e) if gone(&e) => return Ok(()),
+            Err(e) => {
+                return Err(format!(
+                    "could not run the stop script in container '{}': {}",
+                    container_name, e
+                ))
+            }
+        };
+        match self
+            .docker
+            .start_exec(&exec.id, None::<StartExecOptions>)
+            .await
+        {
+            Ok(StartExecResults::Attached { mut output, .. }) => {
+                // Drain output so the script runs to completion first.
+                while output.next().await.is_some() {}
+            }
+            Ok(StartExecResults::Detached) => {}
+            Err(e) if gone(&e) => return Ok(()),
+            Err(e) => {
+                return Err(format!(
+                    "could not run the stop script in container '{}': {}",
+                    container_name, e
+                ))
+            }
+        }
+        let exit_code = self
+            .docker
+            .inspect_exec(&exec.id)
+            .await
+            .map_err(|e| {
+                format!(
+                    "could not read the stop script's result in container '{}': {}",
+                    container_name, e
+                )
+            })?
+            .exit_code;
+        if exit_code != Some(0) {
+            return Err(format!(
+                "the stop script in container '{}' exited with {:?}: the wal-g fetch is still running",
+                container_name, exit_code
+            ));
+        }
+        // The process is gone; the exec that launched it must agree.
+        if let Some(fetch_exec) = fetch_exec {
+            for _ in 0..50 {
+                match self.docker.inspect_exec(fetch_exec).await {
+                    Ok(inspect) if inspect.running == Some(true) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                    Ok(_) => return Ok(()),
+                    Err(e) if gone(&e) => return Ok(()),
+                    Err(e) => {
+                        return Err(format!(
+                            "could not confirm the wal-g fetch exec in container '{}' stopped: {}",
+                            container_name, e
+                        ))
+                    }
+                }
+            }
+            return Err(format!(
+                "the wal-g fetch exec in container '{}' still reports running 10s after it was killed",
+                container_name
+            ));
+        }
         Ok(())
     }
 
@@ -1915,6 +2079,7 @@ impl PostgresService {
         service_config: ServiceConfig,
         recovery_target: Option<&super::RecoveryTarget>,
         target_user_data: Option<&str>,
+        gate: &dyn super::RestoreGate,
     ) -> Result<()> {
         use bollard::exec::CreateExecOptions;
 
@@ -1969,15 +2134,13 @@ impl PostgresService {
         // in step 4 uses `volumes_from` to share the named volume, and it can only see
         // paths on that volume — not the original container's writable layer.
         info!("Fetching WAL-G backup to temporary directory on shared volume");
-        let restore_temp = "/var/lib/postgresql/restore_temp";
+        let restore_temp = WALG_RESTORE_TEMP;
         let fetch_target = if target_user_data.is_some() {
             "--target-user-data \"$WALG_FETCH_TARGET_USER_DATA\""
         } else {
             "LATEST"
         };
-        let fetch_cmd_str = format!(
-            "mkdir -p {restore_temp} && rm -rf {restore_temp}/* && wal-g backup-fetch {restore_temp} {fetch_target} > /tmp/walg_restore.log 2>&1"
-        );
+        let fetch_cmd_str = Self::walg_fetch_command(restore_temp, fetch_target);
         let fetch_cmd = vec!["sh", "-c", &fetch_cmd_str];
 
         let exec = self
@@ -2005,8 +2168,25 @@ impl PostgresService {
             )
             .await?;
 
-        // Poll for fetch completion
+        // Poll for fetch completion. Nothing outside `restore_temp` has been
+        // written yet, so a cancellation here stops the fetch and removes it.
         loop {
+            if gate.is_cancelled() {
+                if let Err(reason) = self
+                    .stop_walg_fetch(&container_name, restore_temp, Some(&exec.id))
+                    .await
+                {
+                    return Err(super::StagedRestoreStillRunning {
+                        target: container_name.clone(),
+                        reason,
+                    }
+                    .into());
+                }
+                return Err(super::RestoreCancelled {
+                    target: container_name.clone(),
+                }
+                .into());
+            }
             let inspect = self.docker.inspect_exec(&exec.id).await?;
             if let Some(running) = inspect.running {
                 if !running {
@@ -2135,6 +2315,25 @@ impl PostgresService {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+
+        // Last safe point. Everything so far lives in `restore_temp`; the
+        // next step stops the live server. A cancellation recorded before
+        // this call wins and the target is left exactly as it was.
+        if let Err(cancelled) = gate.begin_target_writes().await {
+            // The fetch already exited; only its staged files remain, and the
+            // next restore clears them before fetching, so a failed cleanup
+            // is logged rather than holding the service.
+            if let Err(reason) = self
+                .stop_walg_fetch(&container_name, restore_temp, None)
+                .await
+            {
+                warn!(
+                    "Cancelled restore of '{}' could not remove its staged files: {}",
+                    container_name, reason
+                );
+            }
+            return Err(cancelled.into());
         }
 
         // Step 3: Stop the container. This cleanly shuts down PostgreSQL (PID 1)
@@ -2299,6 +2498,7 @@ impl PostgresService {
         backup_location: &str,
         s3_source: &temps_entities::s3_sources::Model,
         service_config: ServiceConfig,
+        gate: &dyn super::RestoreGate,
     ) -> Result<()> {
         info!("Restoring from legacy backup format: {}", backup_location);
 
@@ -2324,6 +2524,7 @@ impl PostgresService {
             &s3_source.bucket_name,
             backup_location,
             &compressed_path,
+            gate,
         )
         .await?;
         super::restore_staging::gunzip_file(
@@ -2333,6 +2534,10 @@ impl PostgresService {
         )
         .await?;
         let _ = tokio::fs::remove_file(&compressed_path).await;
+
+        // Last safe point: the dump is staged on the host and nothing has
+        // been loaded yet. The staging dir is removed when it drops.
+        gate.begin_target_writes().await?;
 
         let container_name = self.get_live_container_name(&postgres_config);
 
@@ -2956,8 +3161,26 @@ impl PostgresService {
     }
 }
 
+/// Container name of a service named `name`. The single derivation shared by
+/// the engine and anything that must find its container without an instance.
+pub(crate) fn postgres_container_name(name: &str) -> String {
+    format!("postgres-{}", name)
+}
+
+/// Data volumes of a service named `name`, as `remove()` deletes them.
+pub(crate) fn postgres_volume_names(name: &str) -> [String; 1] {
+    [format!("postgres-{}_data", name)]
+}
+
 #[async_trait]
 impl ExternalService for PostgresService {
+    fn docker_resource_names(&self) -> Option<super::DockerResourceNames> {
+        Some(super::DockerResourceNames {
+            containers: vec![postgres_container_name(&self.name)],
+            volumes: postgres_volume_names(&self.name).to_vec(),
+        })
+    }
+
     fn get_local_address(&self, service_config: ServiceConfig) -> Result<String> {
         let config = self.get_postgres_config(service_config)?;
         Ok(format!("localhost:{}", config.port))
@@ -3580,7 +3803,7 @@ impl ExternalService for PostgresService {
 
         // Then remove container and volume if Docker is available
         let container_name = self.get_container_name();
-        let volume_name = format!("{}_data", container_name);
+        let [volume_name] = postgres_volume_names(&self.name);
 
         info!("Removing PostgreSQL container and volume for {}", self.name);
 
@@ -3706,13 +3929,44 @@ impl ExternalService for PostgresService {
         // Detect if this is a WAL-G backup (s3:// prefix) or a legacy backup (.sql.gz / .pgdump.gz)
         if backup_location.starts_with("s3://") {
             // WAL-G backup: use wal-g backup-fetch
-            self.restore_from_walg(s3_credentials, backup_location, service_config, None, None)
-                .await
+            self.restore_from_walg(
+                s3_credentials,
+                backup_location,
+                service_config,
+                None,
+                None,
+                &super::NoopRestoreGate,
+            )
+            .await
         } else {
             // Legacy backup: fall back to old psql/pg_restore approach
-            self.restore_from_legacy(s3_client, backup_location, s3_source, service_config)
-                .await
+            self.restore_from_legacy(
+                s3_client,
+                backup_location,
+                s3_source,
+                service_config,
+                &super::NoopRestoreGate,
+            )
+            .await
         }
+    }
+
+    /// Both restore paths stage the backup first — WAL-G fetches into
+    /// `restore_temp` while the server keeps running, a legacy dump is
+    /// downloaded to the host — and pass the gate before the first write.
+    fn defers_target_writes(&self, _backup_location: &str) -> bool {
+        true
+    }
+
+    async fn stop_staged_restore(&self) -> Result<()> {
+        self.stop_walg_fetch(&self.get_container_name(), WALG_RESTORE_TEMP, None)
+            .await
+            .map_err(|reason| {
+                anyhow::Error::new(super::StagedRestoreStillRunning {
+                    target: self.get_container_name(),
+                    reason,
+                })
+            })
     }
 
     async fn restore_in_place(&self, ctx: super::RestoreContext<'_>) -> Result<()> {
@@ -3724,6 +3978,7 @@ impl ExternalService for PostgresService {
                 ctx.source_config,
                 None,
                 target_user_data.as_deref(),
+                ctx.gate,
             )
             .await
         } else {
@@ -3732,6 +3987,7 @@ impl ExternalService for PostgresService {
                 ctx.backup_location,
                 ctx.s3_source,
                 ctx.source_config,
+                ctx.gate,
             )
             .await
         }
@@ -4128,6 +4384,7 @@ impl ExternalService for PostgresService {
                     new_service_config,
                     None,
                     target_user_data.as_deref(),
+                    ctx.gate,
                 )
                 .await?;
         } else {
@@ -4137,6 +4394,7 @@ impl ExternalService for PostgresService {
                     ctx.backup_location,
                     ctx.s3_source,
                     new_service_config,
+                    ctx.gate,
                 )
                 .await?;
         }
@@ -4231,6 +4489,7 @@ impl ExternalService for PostgresService {
                     new_service_config,
                     Some(&target),
                     target_user_data.as_deref(),
+                    ctx.gate,
                 )
                 .await?;
 
@@ -4268,6 +4527,7 @@ impl ExternalService for PostgresService {
                 ctx.source_config.clone(),
                 Some(&target),
                 target_user_data.as_deref(),
+                ctx.gate,
             )
             .await?;
             Ok(None)
@@ -4335,6 +4595,199 @@ impl PostgresService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn walg_fetch_abort_script_kills_the_recorded_fetch_and_removes_staged_data() {
+        let script = PostgresService::walg_fetch_abort_script("/var/lib/postgresql/restore_temp");
+
+        assert!(script.contains(&format!("pid=$(cat {})", WALG_FETCH_PID_FILE)));
+        assert!(script.contains("kill \"$pid\""));
+        assert!(
+            script.contains(
+                "rm -rf /var/lib/postgresql/restore_temp /var/lib/postgresql/walg-restore.env"
+            ),
+            "{script}"
+        );
+        // It must never touch the live data directory.
+        assert!(
+            !script.contains("PGDATA") && !script.contains("/data"),
+            "{script}"
+        );
+    }
+
+    /// Runs the real stop script against a local stand-in fetch, started the
+    /// way the restore starts WAL-G (`cmd & echo $! > pidfile; wait $!`, so
+    /// the wrapping shell reaps it): the fetch must be confirmed gone (exit
+    /// 0) and only then the staged data removed.
+    #[cfg(unix)]
+    fn run_abort_script(fetch_cmd: &str, tag: &str) -> (std::process::ExitStatus, bool) {
+        let dir = std::env::temp_dir().join(format!("walg-abort-{}-{}", tag, std::process::id()));
+        let staged = dir.join("restore_temp");
+        std::fs::create_dir_all(&staged).expect("create staged dir");
+        let pid_file = dir.join("walg_fetch.pid");
+        let mut wrapper = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "{} & echo $! > {}; wait $!",
+                fetch_cmd,
+                pid_file.display()
+            ))
+            .spawn()
+            .expect("spawn stand-in fetch");
+        for _ in 0..100 {
+            if std::fs::read_to_string(&pid_file).is_ok_and(|p| !p.trim().is_empty()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let script = PostgresService::walg_fetch_abort_script_with(
+            &staged.display().to_string(),
+            &pid_file.display().to_string(),
+        );
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .status()
+            .expect("run abort script");
+        let _ = wrapper.wait();
+        let staged_left = staged.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        (status, staged_left)
+    }
+
+    /// REGRESSION (Greptile on #1295): a cancelled download must be
+    /// confirmed stopped before the run is released.
+    #[cfg(unix)]
+    #[test]
+    fn abort_script_confirms_the_fetch_is_gone_before_deleting_staged_data() {
+        let (status, staged_left) = run_abort_script("sh -c 'sleep 60; :' backup-fetch", "term");
+        assert!(status.success(), "{status:?}");
+        assert!(
+            !staged_left,
+            "staged data must be removed once the fetch is gone"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn abort_script_escalates_to_sigkill_for_a_fetch_that_ignores_sigterm() {
+        let (status, staged_left) = run_abort_script(
+            "sh -c \"trap '' TERM; while :; do sleep 1; done\" backup-fetch",
+            "kill",
+        );
+        assert!(status.success(), "{status:?}");
+        assert!(!staged_left);
+    }
+
+    /// REGRESSION (Greptile on #1295): a PID file left behind may name a
+    /// process that is no longer the fetch (a reused PID, e.g. a PostgreSQL
+    /// backend). It must never be signalled; the stale file is just removed.
+    #[cfg(unix)]
+    #[test]
+    fn abort_script_never_signals_a_reused_pid() {
+        let dir = std::env::temp_dir().join(format!("walg-abort-stale-{}", std::process::id()));
+        let staged = dir.join("restore_temp");
+        std::fs::create_dir_all(&staged).expect("create staged dir");
+        let pid_file = dir.join("walg_fetch.pid");
+        let mut unrelated = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn unrelated process");
+        std::fs::write(&pid_file, unrelated.id().to_string()).expect("write stale pid");
+        let script = PostgresService::walg_fetch_abort_script_with(
+            &staged.display().to_string(),
+            &pid_file.display().to_string(),
+        );
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .status()
+            .expect("run abort script");
+        let still_alive = unrelated
+            .try_wait()
+            .expect("poll unrelated process")
+            .is_none();
+        let _ = unrelated.kill();
+        let _ = unrelated.wait();
+        let staged_left = staged.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(status.success(), "{status:?}");
+        assert!(
+            still_alive,
+            "an unrelated process with the recorded PID was killed"
+        );
+        assert!(!staged_left);
+    }
+
+    /// REGRESSION (Greptile on #1295): a finished fetch must not leave its
+    /// PID file behind for a later stop to act on.
+    #[test]
+    fn walg_fetch_removes_its_pid_file_when_it_exits() {
+        let command = PostgresService::walg_fetch_command(WALG_RESTORE_TEMP, "LATEST");
+        let wait = command.find("wait $!").expect("waits for the fetch");
+        let cleanup = command
+            .find(&format!("rm -f {}", WALG_FETCH_PID_FILE))
+            .expect("removes the pid file");
+        assert!(wait < cleanup, "{command}");
+        assert!(
+            command.ends_with("exit $rc; }"),
+            "keeps the fetch exit code: {command}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walg_fetch_command_runs_and_cleans_up_its_pid_file() {
+        // The real command with `wal-g` replaced by a stand-in that fails, run
+        // against a temp dir: the pid file is gone and the exit code kept.
+        let dir = std::env::temp_dir().join(format!("walg-fetch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let pid_file = dir.join("walg_fetch.pid");
+        let command =
+            PostgresService::walg_fetch_command(&dir.join("t").display().to_string(), "LATEST")
+                .replace("wal-g backup-fetch", "false")
+                .replace(
+                    "/tmp/walg_restore.log",
+                    &dir.join("log").display().to_string(),
+                )
+                .replace(WALG_FETCH_PID_FILE, &pid_file.display().to_string());
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .status()
+            .expect("run fetch command");
+        let pid_file_left = pid_file.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(status.code(), Some(1), "the fetch's exit code is kept");
+        assert!(
+            !pid_file_left,
+            "the pid file must be removed when the fetch exits"
+        );
+    }
+
+    #[test]
+    fn abort_script_refuses_to_delete_while_the_fetch_survives() {
+        let script = PostgresService::walg_fetch_abort_script("/var/lib/postgresql/restore_temp");
+        assert!(script.contains("kill -9"), "{script}");
+        // The deletion only runs after the liveness check that exits 3.
+        let survives = script.find("exit 3").expect("exit 3 when still alive");
+        let delete = script.find("rm -rf").expect("rm -rf");
+        assert!(survives < delete, "{script}");
+    }
+
+    #[test]
+    fn postgres_restores_defer_target_writes_to_the_gate() {
+        let docker = match bollard::Docker::connect_with_local_defaults() {
+            Ok(docker) => std::sync::Arc::new(docker),
+            Err(_) => {
+                println!("Docker client unavailable, skipping");
+                return;
+            }
+        };
+        let pg = PostgresService::new("gate-test".to_string(), docker);
+        assert!(pg.defers_target_writes("s3://bucket/walg"));
+        assert!(pg.defers_target_writes("external_services/postgres/x/backup.sql.gz"));
+    }
 
     fn backup_with_metadata(metadata: serde_json::Value) -> temps_entities::backups::Model {
         temps_entities::backups::Model {
@@ -6569,6 +7022,7 @@ mod tests {
             source_service: &source_service,
             source_config: cfg,
             pool: &mock_db,
+            gate: &crate::externalsvc::NoopRestoreGate,
         };
 
         let err = pg

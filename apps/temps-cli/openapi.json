@@ -29288,6 +29288,60 @@
         ],
         "type": "object"
       },
+      "ListOperationsQuery": {
+        "description": "Query parameters for `GET /operations`.",
+        "properties": {
+          "kind": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/OperationKind",
+                "description": "Only operations of this kind."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "page": {
+            "description": "Page number, 1-based (default 1).",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "page_size": {
+            "description": "Items per page (default 20, max 100).",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "project_id": {
+            "description": "Only operations belonging to this project.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "status": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/OperationStatusFilter",
+                "description": "`running` (queued, running, waiting), `finished` (succeeded, failed,\ncancelled) or `all` (default)."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
       "ListOrdersResponse": {
         "properties": {
           "orders": {
@@ -34334,6 +34388,159 @@
         ],
         "type": "object"
       },
+      "OperationEntry": {
+        "description": "One operation in the feed.",
+        "properties": {
+          "agent_run_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "backup_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "deployment_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "environment_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "failure_reason": {
+            "description": "Why the operation failed or was cancelled, when known.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "finished_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "description": "Stable unique id, `<source>:<row id>` (e.g. `deployment:123`).",
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/OperationKind"
+          },
+          "link": {
+            "description": "Console path of the resource's detail page.",
+            "type": "string"
+          },
+          "phase": {
+            "description": "Source-specific phase, when the source records one (restores, autofix).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_id": {
+            "description": "Owning project. For restores and backups this is set only when the\nservice is linked to exactly one project.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "project_slug": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "restore_run_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "service_id": {
+            "description": "Storage service the operation acts on (the restore's source service,\nor the backed-up service).",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "service_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "started_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/OperationStatus"
+          },
+          "title": {
+            "description": "Human-readable label, e.g. \"Rollback to deployment #41\".",
+            "type": "string"
+          },
+          "triggered_by_user_id": {
+            "description": "User who started it, when the source records one. Deployments do not.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "status",
+          "title",
+          "created_at",
+          "link"
+        ],
+        "type": "object"
+      },
+      "OperationKind": {
+        "description": "What kind of operation an entry describes.",
+        "enum": [
+          "deployment",
+          "rollback",
+          "promotion",
+          "restore",
+          "backup",
+          "autofix"
+        ],
+        "type": "string"
+      },
       "OperationResultResponse": {
         "properties": {
           "data": {},
@@ -34375,6 +34582,68 @@
         "required": [
           "deployment_id",
           "operations"
+        ],
+        "type": "object"
+      },
+      "OperationStatus": {
+        "description": "Normalised lifecycle state of an operation.",
+        "enum": [
+          "queued",
+          "running",
+          "waiting",
+          "succeeded",
+          "failed",
+          "cancelled"
+        ],
+        "type": "string"
+      },
+      "OperationStatusFilter": {
+        "description": "Which slice of the feed to return.",
+        "enum": [
+          "running",
+          "finished",
+          "all"
+        ],
+        "type": "string"
+      },
+      "OperationsListResponse": {
+        "description": "A page of the operations feed. Sorted by `created_at` descending (fixed).",
+        "properties": {
+          "operations": {
+            "items": {
+              "$ref": "#/components/schemas/OperationEntry"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "running_count": {
+            "description": "Queued, running and waiting operations matching the scope, `kind` and\n`project_id` filters — independent of the `status` filter, so the tray\nbadge stays correct while browsing finished operations.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "description": "Operations matching every filter.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "operations",
+          "total",
+          "page",
+          "page_size",
+          "running_count"
         ],
         "type": "object"
       },
@@ -43418,6 +43687,17 @@
       },
       "RestoreRunView": {
         "properties": {
+          "cancel_requested_at": {
+            "description": "When cancellation was requested, if it was.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cancellable": {
+            "description": "Whether `POST /restore-runs/{id}/cancel` would be accepted now.",
+            "type": "boolean"
+          },
           "created_at": {
             "type": "string"
           },
@@ -43439,6 +43719,13 @@
           },
           "mode": {
             "type": "string"
+          },
+          "not_cancellable_reason": {
+            "description": "Why the run cannot be cancelled now; `None` when `cancellable`.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "phase": {
             "type": "string"
@@ -43487,6 +43774,7 @@
           "status",
           "phase",
           "created_at",
+          "cancellable",
           "source_backup"
         ],
         "type": "object"
@@ -91263,6 +91551,128 @@
         "x-maturity": "beta"
       }
     },
+    "/operations": {
+      "get": {
+        "description": "Deployments, rollbacks, promotions, restores, backups and autofix runs the\ncaller can see, newest first (`created_at` DESC, fixed). Finished\noperations older than 7 days are omitted; operations still in flight are\nalways included. Redeploys are reported as `deployment` — no column\ndistinguishes them.",
+        "operationId": "list_operations",
+        "parameters": [
+          {
+            "description": "Page number, 1-based (default 1).",
+            "example": 1,
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Items per page (default 20, max 100).",
+            "example": 20,
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "`running` (queued, running, waiting), `finished` (succeeded, failed,\ncancelled) or `all` (default).",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/OperationStatusFilter"
+            }
+          },
+          {
+            "description": "Only operations of this kind.",
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/OperationKind"
+            }
+          },
+          {
+            "description": "Only operations belonging to this project.",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationsListResponse"
+                }
+              }
+            },
+            "description": "A page of operations"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid query"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List recent and in-flight operations",
+        "tags": [
+          "Operations"
+        ]
+      }
+    },
     "/orders": {
       "get": {
         "operationId": "list_orders",
@@ -91480,6 +91890,16 @@
             },
             "description": "Insufficient permissions"
           },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project not found"
+          },
           "409": {
             "content": {
               "application/json": {
@@ -91488,7 +91908,7 @@
                 }
               }
             },
-            "description": "The project already has the maximum number of metric alert rules"
+            "description": "Project already holds the maximum number of metric alert rules"
           },
           "500": {
             "content": {
@@ -108177,8 +108597,11 @@
           "400": {
             "description": "Validation error"
           },
+          "404": {
+            "description": "Project not found"
+          },
           "409": {
-            "description": "The project already has the maximum number of error alert rules"
+            "description": "Project already holds the maximum number of error alert rules"
           },
           "500": {
             "description": "Internal server error"
@@ -119189,7 +119612,7 @@
           }
         ],
         "responses": {
-          "200": {
+          "202": {
             "content": {
               "application/json": {
                 "schema": {
@@ -119197,7 +119620,7 @@
                 }
               }
             },
-            "description": "Restore run cancelled before it wrote any data. The returned run is `cancelled` and its target was not modified."
+            "description": "Cancellation recorded (or already recorded); the run stops at its next check and ends as `cancelled`"
           },
           "401": {
             "content": {
@@ -119237,7 +119660,7 @@
                 }
               }
             },
-            "description": "Conflict: the run already finished (`restore-not-active`, with `run_status`), or it has started writing data and can no longer be stopped safely (`restore-not-cancellable`, with `phase`). A run is only cancellable while its phase is `prepare`."
+            "description": "Conflict: the run already finished (`restore-not-active`, with `run_status`), or it can no longer be stopped safely (`restore-not-cancellable`, with `phase`): an in-place restore has started writing data, or a new service is being registered"
           }
         },
         "security": [
@@ -127077,6 +127500,10 @@
     {
       "description": "Project template endpoints",
       "name": "Templates"
+    },
+    {
+      "description": "Recent and in-flight operations across projects",
+      "name": "Operations"
     },
     {
       "description": "Custom domain management for projects",

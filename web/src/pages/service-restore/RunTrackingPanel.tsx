@@ -40,7 +40,11 @@ import {
   type TimeFormatter,
   formatConfirmedTime,
 } from './restore-state'
-import { cancelAvailability, sourceBackupSummary } from './run-context'
+import {
+  cancelAvailability,
+  notCancellableReason,
+  sourceBackupSummary,
+} from './run-context'
 
 export interface RunTrackingPanelProps {
   serviceId: number
@@ -202,13 +206,12 @@ export function RunTrackingPanel({
         </div>
         {cancel === 'available' ? (
           <p className="text-sm text-muted-foreground">
-            The restore is still preparing and has not changed any data, so it
-            can be cancelled safely.
+            The restore has not changed any existing data yet, so it can be
+            cancelled safely. A new database it was creating is removed.
           </p>
-        ) : cancel === 'past_safe_point' ? (
+        ) : cancel === 'past_safe_point' && view.kind === 'tracking' ? (
           <p className="text-sm text-muted-foreground">
-            This restore is writing data, so it can no longer be cancelled:
-            stopping it now would leave the database partially restored.
+            {notCancellableReason(view.run)}
           </p>
         ) : null}
         {!terminal && view.kind !== 'not_found' ? (

@@ -34,10 +34,10 @@ sequenceDiagram
 
 ### Enable Automatic Backups
 
-1. **Go to Project Settings** - Navigate to your project
-2. **Open Backups Tab** - Click on "Backups" in settings
-3. **Create Backup Schedule** - Set frequency and retention
-4. **Done** - Backups run automatically
+1. **Open the database** - From **Storage**, or from your project's **Databases** page (row menu → **Backups**).
+2. **Add a backup destination if you have none** - With no S3-compatible destination configured, the **Backups** card says so and links to **Create destination**.
+3. **Click "Schedule backups"** - The schedule form opens on your default destination with this database already selected. Pick a frequency and retention.
+4. **Done** - Backups run automatically and appear in the database's **Backups** card.
 
 ### Create Backup Now
 
@@ -146,6 +146,26 @@ temps backups storage configure \
 ```
 
 ## Restore from Backup
+
+### Restore from the console
+
+- **From a backup**: open the backup (from the database's **Backups** card or **Backups → source**) and click **Restore this backup**. The restore page opens with that backup, its source and in-place mode already selected.
+- **From a database**: use **Actions → Restore…** on the database page, or **Restore…** in the row menu on your project's **Databases** page.
+
+Your choices (source, backup and mode) are kept in the page address, so a reload or a shared link keeps them. Once a restore starts, the page follows the run: it shows which backup is being restored (with a link to it), each phase, and the outcome. While a restore runs, the database's own page shows a banner linking back to it.
+
+### Cancel a running restore
+
+A restore can be cancelled only while stopping it is safe:
+
+| Mode | Can be cancelled during | What cancelling does |
+|---|---|---|
+| In place / point-in-time in place | Preparing and **downloading** the backup | Stops before anything is written. The database keeps its current data and the partial download is deleted. |
+| New service / point-in-time to a new service | Preparing, downloading, provisioning and recovering | Stops and removes the partially created container and volume, so nothing is left behind. |
+
+The separate download phase applies to PostgreSQL (WAL-G and `pg_dump` backups, single-node) and MongoDB archive backups, which are fully staged before the database is touched. Other engines (Redis, MariaDB, object storage, PostgreSQL clusters) write while they read, so in place they can only be cancelled while the restore is still preparing.
+
+Once an in-place restore starts writing data (or a new service is being registered), **Cancel restore** is replaced by an explanation of why the run can no longer be stopped, and the API answers `409 restore-not-cancellable` for `POST /restore-runs/{id}/cancel`. Cancelled runs end with the status `cancelled`, keep the phase they stopped in, and are recorded in the audit log.
 
 ### List Backups
 

@@ -220,6 +220,139 @@ fn read_confined_control_file(
     Ok(Some(contents))
 }
 
+/// Install/build/output overrides from one configuration source.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct BuildOverrides {
+    install_command: Option<String>,
+    build_command: Option<String>,
+    output_dir: Option<String>,
+}
+
+impl BuildOverrides {
+    /// Overrides stored on the project's typed preset configuration.
+    fn from_stored(config: &StoredPresetConfig) -> Self {
+        let full =
+            |install: &Option<String>, build: &Option<String>, output: &Option<String>| Self {
+                install_command: install.clone(),
+                build_command: build.clone(),
+                output_dir: output.clone(),
+            };
+        let commands = |install: &Option<String>, build: &Option<String>| Self {
+            install_command: install.clone(),
+            build_command: build.clone(),
+            output_dir: None,
+        };
+        let build_only = |build: &Option<String>| Self {
+            build_command: build.clone(),
+            ..Self::default()
+        };
+        let overrides = match config {
+            StoredPresetConfig::NextJs(c) => {
+                full(&c.install_command, &c.build_command, &c.output_dir)
+            }
+            StoredPresetConfig::Vite(c) => {
+                full(&c.install_command, &c.build_command, &c.output_dir)
+            }
+            StoredPresetConfig::Astro(c) => {
+                full(&c.install_command, &c.build_command, &c.output_dir)
+            }
+            StoredPresetConfig::Nuxt(c) => {
+                full(&c.install_command, &c.build_command, &c.output_dir)
+            }
+            StoredPresetConfig::Remix(c) => commands(&c.install_command, &c.build_command),
+            StoredPresetConfig::SvelteKit(c) => {
+                full(&c.install_command, &c.build_command, &c.output_dir)
+            }
+            StoredPresetConfig::SolidStart(c) => commands(&c.install_command, &c.build_command),
+            StoredPresetConfig::Angular(c) => {
+                full(&c.install_command, &c.build_command, &c.output_dir)
+            }
+            StoredPresetConfig::Vue(c) => full(&c.install_command, &c.build_command, &c.output_dir),
+            StoredPresetConfig::React(c) => {
+                full(&c.install_command, &c.build_command, &c.output_dir)
+            }
+            StoredPresetConfig::Docusaurus(c) => {
+                full(&c.install_command, &c.build_command, &c.output_dir)
+            }
+            StoredPresetConfig::Rsbuild(c) => {
+                full(&c.install_command, &c.build_command, &c.output_dir)
+            }
+            StoredPresetConfig::NodeJs(c) => commands(&c.install_command, &c.build_command),
+            StoredPresetConfig::Rails(c) => build_only(&c.build_command),
+            StoredPresetConfig::Go(c) => build_only(&c.build_command),
+            StoredPresetConfig::Rust(c) => build_only(&c.build_command),
+            StoredPresetConfig::Java(c) => build_only(&c.build_command),
+            StoredPresetConfig::Laravel(c) => build_only(&c.build_command),
+            StoredPresetConfig::Python(_)
+            | StoredPresetConfig::FastApi(_)
+            | StoredPresetConfig::Flask(_)
+            | StoredPresetConfig::Django(_)
+            | StoredPresetConfig::Dockerfile(_)
+            | StoredPresetConfig::DockerCompose(_)
+            | StoredPresetConfig::Nixpacks(_)
+            | StoredPresetConfig::Static(_) => Self::default(),
+        };
+        overrides.without_blank_values()
+    }
+
+    /// Treat empty strings as unset, so clearing a field in the API restores
+    /// the detected default instead of rendering `RUN ` with no command.
+    fn without_blank_values(self) -> Self {
+        let keep = |value: Option<String>| value.filter(|value| !value.trim().is_empty());
+        Self {
+            install_command: keep(self.install_command),
+            build_command: keep(self.build_command),
+            output_dir: keep(self.output_dir),
+        }
+    }
+
+    /// Field-by-field fallback to `other` where `self` has no value.
+    fn or(self, other: Self) -> Self {
+        let this = self.without_blank_values();
+        Self {
+            install_command: this.install_command.or(other.install_command),
+            build_command: this.build_command.or(other.build_command),
+            output_dir: this.output_dir.or(other.output_dir),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.install_command.is_none() && self.build_command.is_none() && self.output_dir.is_none()
+    }
+
+    /// Each value is spliced into a single Dockerfile instruction; a newline
+    /// would start a new instruction. The output directory is also a COPY
+    /// source path inside the build stage, so it must stay relative.
+    fn validate(&self) -> Result<(), WorkflowError> {
+        for (field, value) in [
+            ("install command", &self.install_command),
+            ("build command", &self.build_command),
+            ("output directory", &self.output_dir),
+        ] {
+            if let Some(value) = value {
+                if value.chars().any(char::is_control) {
+                    return Err(WorkflowError::JobValidationFailed(format!(
+                        "Invalid configuration: build {field} {value:?} contains a newline or \
+                         control character; use a single-line value in the project's build \
+                         settings or .temps.yaml"
+                    )));
+                }
+            }
+        }
+        if let Some(output) = self.output_dir.as_deref() {
+            validate_relative_build_path(Path::new(output), "Build output directory").map_err(
+                |_| {
+                    WorkflowError::JobValidationFailed(format!(
+                        "Invalid configuration: build output directory '{output}' must be a \
+                         relative path inside the application (for example dist or build)"
+                    ))
+                },
+            )?;
+        }
+        Ok(())
+    }
+}
+
 /// Typed output from DownloadRepoJob
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepositoryOutput {
@@ -494,7 +627,17 @@ impl BuildImageJob {
     async fn log(&self, context: &WorkflowContext, message: String) -> Result<(), WorkflowError> {
         // Detect log level from message content/emojis
         let level = Self::detect_log_level(&message);
+        self.log_with_level(context, level, message).await
+    }
 
+    /// Like [`Self::log`], with an explicit level for messages whose wording
+    /// would mislead the keyword heuristic (a warning that quotes an error).
+    async fn log_with_level(
+        &self,
+        context: &WorkflowContext,
+        level: LogLevel,
+        message: String,
+    ) -> Result<(), WorkflowError> {
         // Write structured log to job-specific log file
         if let (Some(ref log_id), Some(ref log_service)) = (&self.log_id, &self.log_service) {
             log_service
@@ -541,91 +684,6 @@ impl BuildImageJob {
         } else {
             LogLevel::Info
         }
-    }
-
-    /// Generate Dockerfile from preset if it doesn't exist
-    /// Returns the build args from the preset (if any)
-    ///
-    /// # Arguments
-    /// * `context` - Workflow context for logging
-    /// * `build_context_dir` - The directory that will be used as Docker build context (where to generate/look for Dockerfile)
-    /// * `dockerfile_path` - Full path where Dockerfile should be generated
-    ///
-    /// Generate framework-specific nixpacks.toml configuration
-    ///
-    /// This method detects the Node.js framework being used (Astro, Vite, Next.js, etc.)
-    /// and generates an optimized nixpacks.toml with framework-specific start commands.
-    /// Only generates the file if:
-    ///
-    /// 1. package.json exists (Node.js project)
-    /// 2. No custom nixpacks.toml already exists
-    /// 3. Framework has specific configuration (not all frameworks need overrides)
-    async fn generate_framework_specific_nixpacks_config(
-        &self,
-        context: &WorkflowContext,
-        build_context_dir: &Path,
-    ) -> Result<(), WorkflowError> {
-        let nixpacks_toml_path = build_context_dir.join("nixpacks.toml");
-        let hidden_nixpacks_toml_path = build_context_dir.join(".nixpacks.toml");
-        let package_json_path = build_context_dir.join("package.json");
-
-        // Validate user-provided Nixpacks config before any host-side planner
-        // can follow it, then preserve it unchanged.
-        for config_path in [&nixpacks_toml_path, &hidden_nixpacks_toml_path] {
-            if read_confined_control_file(build_context_dir, config_path, 1024 * 1024)?.is_some() {
-                self.log(
-                    context,
-                    "Custom nixpacks.toml found, skipping framework detection".to_string(),
-                )
-                .await?;
-                return Ok(());
-            }
-        }
-
-        let Some(package_json) =
-            read_confined_control_file(build_context_dir, &package_json_path, 5 * 1024 * 1024)?
-        else {
-            return Ok(());
-        };
-
-        // Detect framework
-        let framework = temps_presets::detect_node_framework_from_package_json(&package_json);
-
-        self.log(
-            context,
-            format!("Detected Node.js framework: {}", framework.name()),
-        )
-        .await?;
-
-        // Generate nixpacks.toml if framework has specific configuration
-        if let Some(config) = framework.nixpacks_config() {
-            if let Ok(metadata) = fs::symlink_metadata(&nixpacks_toml_path) {
-                if metadata.file_type().is_symlink() || !metadata.is_file() {
-                    return Err(WorkflowError::JobValidationFailed(format!(
-                        "nixpacks config '{}' must be a regular non-symlink file",
-                        nixpacks_toml_path.display()
-                    )));
-                }
-            }
-            write_no_follow(&nixpacks_toml_path, config.as_bytes(), false)?;
-
-            self.log(
-                context,
-                format!(
-                    "Generated framework-specific nixpacks.toml for {}",
-                    framework.name()
-                ),
-            )
-            .await?;
-        } else {
-            self.log(
-                context,
-                format!("{} uses default nixpacks configuration", framework.name()),
-            )
-            .await?;
-        }
-
-        Ok(())
     }
 
     /// Load and parse .temps.yaml from the build context directory.
@@ -799,24 +857,55 @@ impl BuildImageJob {
         // Use repo name as project slug (sanitized: lowercase, hyphens to underscores)
         let project_slug = repo_output.repo_name.replace("-", "_").to_lowercase();
 
-        // Load .temps.yaml for build overrides (install_command, build_command, output_dir)
+        // Build overrides, most specific first: the repository's .temps.yaml,
+        // then the project's stored preset settings, then whatever the preset
+        // detects on its own (None here).
         let temps_config = self.load_temps_config(build_context_dir)?;
-        let build_overrides = temps_config.as_ref().and_then(|c| c.build.as_ref());
+        let repository_overrides = temps_config
+            .as_ref()
+            .and_then(|c| c.build.as_ref())
+            .map(|build| BuildOverrides {
+                install_command: build.install_command.clone(),
+                build_command: build.build_command.clone(),
+                output_dir: build.output_dir.clone(),
+            })
+            .unwrap_or_default();
+        let project_overrides = self
+            .preset_config
+            .as_ref()
+            .map(BuildOverrides::from_stored)
+            .unwrap_or_default();
+        let effective_overrides = repository_overrides.clone().or(project_overrides.clone());
+        effective_overrides.validate()?;
 
-        let install_cmd_owned = build_overrides.and_then(|b| b.install_command.clone());
-        let build_cmd_owned = build_overrides.and_then(|b| b.build_command.clone());
-        let output_dir_owned = build_overrides.and_then(|b| b.output_dir.clone());
-
-        if build_overrides.is_some() {
+        if !repository_overrides.is_empty() {
             self.log(
                 context,
                 format!(
                     "Found .temps.yaml build overrides: install={:?}, build={:?}, output_dir={:?}",
-                    install_cmd_owned, build_cmd_owned, output_dir_owned
+                    repository_overrides.install_command,
+                    repository_overrides.build_command,
+                    repository_overrides.output_dir
                 ),
             )
             .await?;
         }
+        if !project_overrides.is_empty() {
+            self.log(
+                context,
+                format!(
+                    "Project build settings: install={:?}, build={:?}, output_dir={:?} \
+                     (.temps.yaml values take precedence)",
+                    project_overrides.install_command,
+                    project_overrides.build_command,
+                    project_overrides.output_dir
+                ),
+            )
+            .await?;
+        }
+        let install_cmd_owned = effective_overrides.install_command;
+        let build_cmd_owned = effective_overrides.build_command;
+        let output_dir_owned = effective_overrides.output_dir;
 
         // Generate Dockerfile content with build args and .temps.yaml overrides
         // Workspace installs need the root lockfile and sibling packages.
@@ -832,6 +921,28 @@ impl BuildImageJob {
                 use_buildkit: true, // Enable BuildKit for faster builds and caching
             })
             .await;
+
+        // Non-fatal planning findings (e.g. nixpacks.toml settings autopack
+        // could not translate) belong in the deployment log, not only in the
+        // server's tracing output.
+        for warning in &dockerfile_with_args.warnings {
+            self.log_with_level(
+                context,
+                LogLevel::Warning,
+                format!("Build warning: {warning}"),
+            )
+            .await?;
+        }
+
+        // The preset already knows this build cannot succeed. Stop here with
+        // its explanation instead of running an image build that can only end
+        // in a generic failure minutes later.
+        if let Some(failure) = dockerfile_with_args.plan_failure.as_ref() {
+            let message = failure.to_string();
+            self.log_with_level(context, LogLevel::Error, format!("ERROR: {message}"))
+                .await?;
+            return Err(WorkflowError::JobExecutionFailed(message));
+        }
 
         // Route implicit Docker Hub base images (`FROM node:22-slim`) through
         // the operator's configured registry mirror/prefix, if any. Only
@@ -868,12 +979,6 @@ impl BuildImageJob {
             ),
         )
         .await?;
-
-        // If using nixpacks preset, detect framework and generate nixpacks.toml if needed
-        if preset_slug.starts_with("nixpacks") {
-            self.generate_framework_specific_nixpacks_config(context, build_context_dir)
-                .await?;
-        }
 
         // Return the preset build args so the caller can merge them
         Ok((dockerfile_with_args.build_args, preset_root))
@@ -2967,5 +3072,219 @@ mod tests {
             BuildImageJob::detect_log_level("Creating an optimized production build ..."),
             LogLevel::Info
         ));
+    }
+
+    /// Run a preset-generated build of `files` and return the job result, the
+    /// recording builder, the Dockerfile Temps generated (if any) and the
+    /// checkout directory.
+    async fn generated_build(
+        preset: StoredPreset,
+        preset_config: Option<StoredPresetConfig>,
+        files: &[(&str, &str)],
+    ) -> (
+        Result<ImageOutput, WorkflowError>,
+        Arc<RecordingImageBuilder>,
+        Option<String>,
+        tempfile::TempDir,
+    ) {
+        let builder = Arc::new(RecordingImageBuilder::default());
+        let job = BuildImageJobBuilder::new()
+            .job_id("build".into())
+            .download_job_id("download_repo".into())
+            .image_tag("app:latest".into())
+            .preset(preset)
+            .preset_config(preset_config)
+            .build(builder.clone())
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        for (path, contents) in files {
+            let target = dir.path().join(path);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, contents).unwrap();
+        }
+        let repo = RepositoryOutput {
+            repo_dir: dir.path().into(),
+            checkout_ref: "main".into(),
+            repo_owner: "owner".into(),
+            repo_name: "sample-app".into(),
+        };
+        let mut context = crate::test_utils::create_test_context("wf".into(), 1, 1, 1);
+        for (key, value) in [
+            ("repo_dir", dir.path().to_string_lossy().to_string()),
+            ("checkout_ref", "main".to_string()),
+            ("repo_owner", "owner".to_string()),
+            ("repo_name", "sample-app".to_string()),
+        ] {
+            context.set_output("download_repo", key, value).unwrap();
+        }
+        let result = job.build_image(&repo, &context).await;
+        let dockerfile = std::fs::read_to_string(dir.path().join("Dockerfile")).ok();
+        (result, builder, dockerfile, dir)
+    }
+
+    const VITE_PACKAGE: &str =
+        r#"{"scripts":{"build":"vite build"},"devDependencies":{"vite":"6"}}"#;
+
+    #[test]
+    fn build_overrides_prefer_repository_then_project_values() {
+        let repository = BuildOverrides {
+            install_command: Some("pnpm install".into()),
+            build_command: Some("  ".into()),
+            output_dir: None,
+        };
+        let project = BuildOverrides::from_stored(&StoredPresetConfig::Vite(
+            temps_entities::preset::ViteConfig {
+                install_command: Some("npm ci".into()),
+                build_command: Some("npm run build:prod".into()),
+                output_dir: Some("build".into()),
+            },
+        ));
+        let effective = repository.or(project);
+        assert_eq!(effective.install_command.as_deref(), Some("pnpm install"));
+        assert_eq!(
+            effective.build_command.as_deref(),
+            Some("npm run build:prod")
+        );
+        assert_eq!(effective.output_dir.as_deref(), Some("build"));
+        assert!(
+            BuildOverrides::from_stored(&StoredPresetConfig::Nixpacks(Default::default()))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn build_overrides_reject_multiline_values_and_escaping_output_dirs() {
+        for overrides in [
+            BuildOverrides {
+                build_command: Some("npm run build\nRUN curl attacker".into()),
+                ..Default::default()
+            },
+            BuildOverrides {
+                output_dir: Some("../outside".into()),
+                ..Default::default()
+            },
+            BuildOverrides {
+                output_dir: Some("/usr/share".into()),
+                ..Default::default()
+            },
+        ] {
+            let error = overrides.validate().unwrap_err().to_string();
+            assert!(error.contains("Invalid configuration"), "{error}");
+        }
+        assert!(BuildOverrides {
+            output_dir: Some("./build".into()),
+            ..Default::default()
+        }
+        .validate()
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn project_vite_output_dir_reaches_the_generated_dockerfile() {
+        let (result, builder, dockerfile, _dir) = generated_build(
+            StoredPreset::Vite,
+            Some(StoredPresetConfig::Vite(
+                temps_entities::preset::ViteConfig {
+                    output_dir: Some("build".into()),
+                    ..Default::default()
+                },
+            )),
+            &[("package.json", VITE_PACKAGE)],
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(builder.builds().len(), 1);
+        let dockerfile = dockerfile.unwrap();
+        assert!(
+            dockerfile.contains("COPY --from=builder /app/build /usr/share/nginx/html"),
+            "{dockerfile}"
+        );
+    }
+
+    #[tokio::test]
+    async fn temps_yaml_output_dir_beats_project_settings() {
+        let (result, _builder, dockerfile, _dir) = generated_build(
+            StoredPreset::Vite,
+            Some(StoredPresetConfig::Vite(
+                temps_entities::preset::ViteConfig {
+                    output_dir: Some("build".into()),
+                    ..Default::default()
+                },
+            )),
+            &[
+                ("package.json", VITE_PACKAGE),
+                (".temps.yaml", "build:\n  output_dir: out\n"),
+            ],
+        )
+        .await;
+        result.unwrap();
+        assert!(dockerfile
+            .unwrap()
+            .contains("/app/out /usr/share/nginx/html"));
+    }
+
+    #[tokio::test]
+    async fn vite_without_build_script_fails_before_building() {
+        let (result, builder, dockerfile, _dir) = generated_build(
+            StoredPreset::Vite,
+            None,
+            &[("package.json", r#"{"scripts":{"dev":"vite"}}"#)],
+        )
+        .await;
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("Missing script: build"), "{error}");
+        assert!(builder.builds().is_empty(), "image builder must not run");
+        assert!(dockerfile.is_none(), "no Dockerfile should be written");
+        let wrapped = format!(
+            "Job execution failed: Required job 'build_image' failed: {:?}",
+            Some(error)
+        );
+        assert_eq!(
+            crate::services::failure_classifier::classify_failure_reason(Some(&wrapped)).code,
+            crate::services::failure_classifier::DeploymentFailureCode::MissingBuildScript
+        );
+    }
+
+    #[tokio::test]
+    async fn unplannable_autopack_app_fails_before_building() {
+        let (result, builder, _dockerfile, _dir) =
+            generated_build(StoredPreset::Autopack, None, &[("notes.txt", "nothing")]).await;
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("could not plan this application"), "{error}");
+        assert!(builder.builds().is_empty(), "image builder must not run");
+        let wrapped = format!(
+            "Job execution failed: Required job 'build_image' failed: {:?}",
+            Some(error)
+        );
+        let classified =
+            crate::services::failure_classifier::classify_failure_reason(Some(&wrapped));
+        assert_eq!(
+            classified.code,
+            crate::services::failure_classifier::DeploymentFailureCode::InvalidConfiguration
+        );
+    }
+
+    #[tokio::test]
+    async fn nixpacks_builds_no_longer_write_a_framework_nixpacks_toml() {
+        let (result, builder, _dockerfile, dir) = generated_build(
+            StoredPreset::Nixpacks,
+            Some(StoredPresetConfig::Nixpacks(
+                temps_entities::preset::NixpacksConfig {
+                    nixpacks_config: None,
+                    providers: vec![temps_entities::preset::NixpacksProvider::Node],
+                },
+            )),
+            &[
+                ("package.json", r#"{"scripts":{"build":"vite build","start":"vite preview"},"devDependencies":{"vite":"6"}}"#),
+                ("index.html", "<div id=app></div>"),
+            ],
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(builder.builds().len(), 1);
+        assert!(
+            !dir.path().join("nixpacks.toml").exists(),
+            "a nixpacks.toml written after planning never influences the build"
+        );
     }
 }

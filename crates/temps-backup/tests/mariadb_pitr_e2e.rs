@@ -899,6 +899,7 @@ async fn run_pitr_flow(
         source_service: &service_model,
         source_config,
         pool,
+        gate: &temps_providers::externalsvc::NoopRestoreGate,
     };
 
     // Run the REAL restore (PITR to time T, into a new service).
@@ -1839,6 +1840,7 @@ async fn run_logical_dump_restore_flow(env: &E2eEnv) -> anyhow::Result<()> {
         source_service: &service_model,
         source_config,
         pool,
+        gate: &temps_providers::externalsvc::NoopRestoreGate,
     };
 
     // Register the container for reaping BEFORE the restore runs: the provider
