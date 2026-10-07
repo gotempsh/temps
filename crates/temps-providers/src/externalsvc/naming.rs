@@ -61,6 +61,40 @@ pub fn legacy_managed_instance_names(service_name: &str, service_type: ServiceTy
 mod tests {
     use super::*;
 
+    /// Pins the Docker names each engine derives from a service name. A
+    /// restore into a new service checks these for leftovers before it
+    /// provisions, and cancelling removes them: a silent rename here would
+    /// make that check miss real data and the teardown remove the wrong
+    /// objects.
+    #[test]
+    fn engine_docker_resource_names_are_stable() {
+        use super::super::{mariadb, mongodb, postgres, redis, rustfs, s3};
+        assert_eq!(postgres::postgres_container_name("copy"), "postgres-copy");
+        assert_eq!(
+            postgres::postgres_volume_names("copy"),
+            ["postgres-copy_data"]
+        );
+        assert_eq!(mariadb::mariadb_container_name("copy"), "mariadb-copy");
+        assert_eq!(mariadb::mariadb_volume_names("copy"), ["mariadb_data_copy"]);
+        assert_eq!(
+            mongodb::mongodb_container_name("copy"),
+            "temps-mongodb-copy"
+        );
+        assert_eq!(
+            mongodb::mongodb_volume_names("copy"),
+            ["temps-mongodb-copy-data"]
+        );
+        assert_eq!(s3::minio_container_name("copy"), "minio-copy");
+        assert_eq!(s3::minio_volume_names("copy"), ["minio_copy_data"]);
+        assert_eq!(redis::redis_container_name("copy"), "redis-copy");
+        assert_eq!(redis::redis_volume_names("copy"), ["redis_data_copy"]);
+        assert_eq!(rustfs::rustfs_container_name("copy"), "rustfs-copy");
+        assert_eq!(
+            rustfs::rustfs_volume_names("copy"),
+            ["rustfs_copy_data", "rustfs_copy_logs"]
+        );
+    }
+
     /// The regression this module exists for: the manager and the blob plugin
     /// must derive the same instance name, or `delete_service` removes a
     /// container nobody was using and leaves the one holding the data.

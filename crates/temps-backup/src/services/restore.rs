@@ -293,6 +293,20 @@ impl RestoreRequestMode {
         )
     }
 
+    /// Name of the service this run creates, for modes that create one.
+    pub fn new_service_name(&self) -> Option<&str> {
+        match self {
+            RestoreRequestMode::InPlace => None,
+            RestoreRequestMode::NewService { name, .. } => Some(name),
+            RestoreRequestMode::Pitr {
+                to_new_service: true,
+                new_service_name,
+                ..
+            } => new_service_name.as_deref(),
+            RestoreRequestMode::Pitr { .. } => None,
+        }
+    }
+
     fn as_str(&self) -> &'static str {
         match self {
             RestoreRequestMode::InPlace => "in_place",
@@ -309,6 +323,10 @@ pub struct RestoreRunView {
     /// S3 source holding the backup being restored, so clients can link to
     /// it. Absent only for runs recorded before this was tracked.
     pub source_s3_source_id: Option<i32>,
+    /// The backup's UUID (`backups.backup_id`), which is what backup routes
+    /// take. Absent for raw-location restores and runs recorded before it
+    /// was tracked.
+    pub source_backup_uuid: Option<String>,
     pub source_service_id: i32,
     pub target_service_id: Option<i32>,
     pub target_service_name: Option<String>,
@@ -355,8 +373,16 @@ impl From<temps_entities::restore_runs::Model> for RestoreRunView {
             .and_then(|token| token.get("s3_source_id"))
             .and_then(serde_json::Value::as_i64)
             .and_then(|id| i32::try_from(id).ok());
+        let source_backup_uuid = m
+            .resume_token
+            .as_ref()
+            .and_then(|token| token.get("backup_uuid"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|uuid| !uuid.is_empty())
+            .map(str::to_string);
         Self {
             source_s3_source_id,
+            source_backup_uuid,
             cancel_requested_at: m.cancel_requested_at.map(|d| d.to_rfc3339()),
             cancellable: not_cancellable_reason.is_none(),
             not_cancellable_reason,
@@ -1009,6 +1035,7 @@ impl RestoreService {
             backup_engine_hint,
             s3_source_id,
             backup_started_at,
+            backup_uuid,
         ) = match &selector {
             BackupSelector::Id(id) => {
                 let backup = temps_entities::backups::Entity::find_by_id(*id)
@@ -1043,6 +1070,7 @@ impl RestoreService {
                     engine,
                     backup.s3_source_id,
                     Some(backup.started_at),
+                    Some(backup.backup_id.clone()),
                 )
             }
             BackupSelector::Location {
@@ -1068,6 +1096,7 @@ impl RestoreService {
                     location.clone(),
                     Some(engine.clone()),
                     *s3_source_id,
+                    None,
                     None,
                 )
             }
@@ -1176,6 +1205,7 @@ impl RestoreService {
             "backup_location": backup_location,
             "engine_hint": backup_engine_hint,
             "s3_source_id": s3_source_id,
+            "backup_uuid": backup_uuid,
         });
 
         // Insert the run while holding the source row lock. Deletion uses the
@@ -2183,6 +2213,18 @@ async fn run_restore_inner(
             gate.enter_write_phase().await?;
         }
     } else {
+        if let Some(new_name) = mode.new_service_name() {
+            // Cancelling tears the new service down by its derived container
+            // and volume names, so this run must own those names outright.
+            super::restore_cancel::ensure_new_service_name_unclaimed(
+                db.as_ref(),
+                &super::restore_cancel::ManagerServiceTeardown::new(mgr.clone()),
+                run_id,
+                new_name,
+                service_type,
+            )
+            .await?;
+        }
         super::restore_cancel::enter_phase_unless_cancelled(db.as_ref(), run_id, "provision")
             .await?;
     }
@@ -2315,17 +2357,32 @@ async fn run_restore_inner(
         // Registering the new service is the point of no return for a
         // new-service restore: a cancellation recorded before it still wins
         // and removes what was provisioned.
-        match super::restore_cancel::enter_phase_unless_cancelled(db.as_ref(), run_id, "verify")
-            .await
+        match super::restore_cancel::enter_phase_unless_cancelled_retrying(
+            db.as_ref(),
+            run_id,
+            "verify",
+            &REGISTRATION_GATE_RETRY.config(),
+        )
+        .await
         {
             Ok(()) => {}
             Err(RestoreError::RestoreCancelled { .. }) => {
                 return Err(cancel_new_service(&db, &mgr, run_id, new_name, service_type).await)
             }
-            Err(e) => warn!(
-                "Restore run {} could not record its 'verify' phase; continuing: {}",
-                run_id, e
-            ),
+            Err(e) => {
+                // Without the guarded move the worker cannot tell whether a
+                // cancellation was accepted meanwhile, so it must not
+                // register the service. Remove what it provisioned instead.
+                let cleanup = teardown_new_service(&db, &mgr, run_id, new_name, service_type).await;
+                return Err(RestoreError::ExternalService {
+                    reason: format!(
+                        "{} The new service '{}' was not registered. {}",
+                        e,
+                        new_name,
+                        super::restore_cancel::cleanup_note(false, &cleanup)
+                    ),
+                });
+            }
         }
     } else if let Err(e) = update_phase(&db, run_id, "verify").await {
         warn!(
@@ -2404,15 +2461,16 @@ async fn settle_destructive_failure(
     }
 }
 
-/// Stop a cancelled new-service restore: fence any helper still writing into
-/// the half-created service, then remove its container and volume.
-async fn cancel_new_service(
+/// Fence any helper still writing into a half-created new service, then
+/// remove its container and volume. Safe because the run checked that it owns
+/// every name the service derives (see `ensure_new_service_name_unclaimed`).
+async fn teardown_new_service(
     db: &DatabaseConnection,
     mgr: &Arc<ExternalServiceManager>,
     run_id: i32,
     new_name: &str,
     service_type: ServiceType,
-) -> RestoreError {
+) -> super::restore_cancel::CancelCleanup {
     use super::restore_reconcile::RestoreHelperFence;
 
     let fence = super::restore_reconcile::ManagerRestoreFence::new(mgr.clone());
@@ -2423,17 +2481,29 @@ async fn cancel_new_service(
     };
     if let Err(e) = fence.fence(&fence_target).await {
         warn!(
-            "Restore run {} cancelled: could not stop restore helpers for '{}': {}",
+            "Restore run {} stopping: could not stop restore helpers for '{}': {}",
             run_id, new_name, e
         );
     }
-    let cleanup = super::restore_cancel::teardown_cancelled_new_service(
+    super::restore_cancel::teardown_cancelled_new_service(
         db,
         &super::restore_cancel::ManagerServiceTeardown::new(mgr.clone()),
         new_name,
         service_type,
     )
-    .await;
+    .await
+}
+
+/// Stop a cancelled new-service restore: fence any helper still writing into
+/// the half-created service, then remove its container and volume.
+async fn cancel_new_service(
+    db: &DatabaseConnection,
+    mgr: &Arc<ExternalServiceManager>,
+    run_id: i32,
+    new_name: &str,
+    service_type: ServiceType,
+) -> RestoreError {
+    let cleanup = teardown_new_service(db, mgr, run_id, new_name, service_type).await;
     let phase = load_run_for_update(db, run_id)
         .await
         .map(|run| run.phase)
@@ -2623,6 +2693,14 @@ async fn settle_crashed_run(
     }
 }
 
+/// Retry policy for the guarded move that precedes registering a new service.
+/// Short: the run is holding a provisioned container while it waits.
+const REGISTRATION_GATE_RETRY: TerminalWriteRetry = TerminalWriteRetry {
+    attempts: 5,
+    base_delay: std::time::Duration::from_millis(500),
+    max_delay: std::time::Duration::from_secs(5),
+};
+
 /// Retry policy for the worker's final status write. A restore that ran to
 /// an outcome must not be left `running` because of a database blip, so the
 /// write is retried for roughly five minutes before giving up to the next
@@ -2638,6 +2716,14 @@ struct TerminalWriteRetry {
     attempts: u32,
     base_delay: std::time::Duration,
     max_delay: std::time::Duration,
+}
+
+impl TerminalWriteRetry {
+    fn config(&self) -> temps_core::retry::RetryConfig {
+        temps_core::retry::RetryConfig::new(self.attempts)
+            .with_base_delay(self.base_delay)
+            .with_max_delay(self.max_delay)
+    }
 }
 
 /// Record a run's terminal outcome. Only an active (`pending`/`running`) row
@@ -4211,9 +4297,21 @@ mod tests {
             cancel_requested_at: None,
             cancel_requested_by: None,
         };
-        model.resume_token = Some(serde_json::json!({"s3_source_id": 4}));
+        let view: RestoreRunView = model.clone().into();
+        assert_eq!(view.source_backup_uuid, None, "no token, no link");
+
+        // REGRESSION (Greptile on #1295): backup routes take the backup's
+        // UUID, not the integer row id, so the view must expose the UUID.
+        model.resume_token = Some(serde_json::json!({
+            "s3_source_id": 4,
+            "backup_uuid": "0d4c9a59-7f2e-4f8a-9d0b-1f7f0a6b2c11",
+        }));
         let view: RestoreRunView = model.clone().into();
         assert_eq!(view.source_s3_source_id, Some(4));
+        assert_eq!(
+            view.source_backup_uuid.as_deref(),
+            Some("0d4c9a59-7f2e-4f8a-9d0b-1f7f0a6b2c11")
+        );
         assert!(view.cancellable);
         assert!(view.not_cancellable_reason.is_none());
 

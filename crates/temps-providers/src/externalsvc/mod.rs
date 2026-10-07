@@ -724,6 +724,26 @@ async fn validate_owned_container_port(
 /// file's length). When the engine can't compute size locally — for example
 /// WAL-G, which streams chunks straight to S3 — it returns `None` and the
 /// service-layer orchestrator falls back to listing the S3 prefix.
+/// Docker objects a managed service derives from its name: the containers it
+/// runs and the volumes holding its data. `remove()` deletes exactly these, so
+/// anything that must not delete foreign data (such as tearing down a
+/// cancelled restore) checks them first.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DockerResourceNames {
+    pub containers: Vec<String>,
+    pub volumes: Vec<String>,
+}
+
+impl DockerResourceNames {
+    /// Every container and volume name, containers first.
+    pub fn all(&self) -> impl Iterator<Item = &str> {
+        self.containers
+            .iter()
+            .chain(self.volumes.iter())
+            .map(String::as_str)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BackupOutcome {
     /// Where the backup landed (S3 URL or relative key, engine-specific).
@@ -1836,6 +1856,13 @@ pub trait ExternalService: Send + Sync {
 
     /// Remove the service and its data completely
     async fn remove(&self) -> Result<()>;
+
+    /// Docker container and volume names this service owns, derived from its
+    /// name. `None` when the engine does not report them, which callers must
+    /// treat as "unknown" and never as "nothing exists".
+    fn docker_resource_names(&self) -> Option<DockerResourceNames> {
+        None
+    }
 
     fn get_environment_variables(
         &self,

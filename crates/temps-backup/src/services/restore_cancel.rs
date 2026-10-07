@@ -108,26 +108,30 @@ pub fn not_cancellable_reason(run: &temps_entities::restore_runs::Model) -> Opti
 
 /// What the run's stored message says after a cancellation.
 pub fn cancelled_message(phase: &str, destructive: bool, cleanup: &CancelCleanup) -> String {
-    let mut message = format!("Restore cancelled during phase '{}'.", phase);
+    format!(
+        "Restore cancelled during phase '{}'. {}",
+        phase,
+        cleanup_note(destructive, cleanup)
+    )
+}
+
+/// One sentence saying what a stopped run left behind.
+pub fn cleanup_note(destructive: bool, cleanup: &CancelCleanup) -> String {
     match cleanup {
-        CancelCleanup::TargetUntouched => {
-            if destructive {
-                message.push_str(" The service's data was not modified.");
-            } else {
-                message.push_str(" No new service was created.");
-            }
+        CancelCleanup::TargetUntouched if destructive => {
+            "The service's data was not modified.".to_string()
         }
-        CancelCleanup::NewServiceRemoved { name } => message.push_str(&format!(
-            " The partially created service '{}' was removed; nothing was left behind.",
+        CancelCleanup::TargetUntouched => "No new service was created.".to_string(),
+        CancelCleanup::NewServiceRemoved { name } => format!(
+            "The partially created service '{}' was removed; nothing was left behind.",
             name
-        )),
-        CancelCleanup::NewServiceLeftBehind { name, reason } => message.push_str(&format!(
-            " The partially created service '{}' could not be removed ({}). \
+        ),
+        CancelCleanup::NewServiceLeftBehind { name, reason } => format!(
+            "The partially created service '{}' could not be removed ({}). \
              Remove its container and volume before reusing the name.",
             name, reason
-        )),
+        ),
     }
-    message
 }
 
 /// What a cancellation cleaned up.
@@ -266,6 +270,35 @@ pub async fn enter_phase_unless_cancelled<C: ConnectionTrait>(
     })
 }
 
+/// [`enter_phase_unless_cancelled`] that retries transient database errors.
+///
+/// Used where giving up is expensive: the move into `verify` decides whether
+/// a new-service restore registers its service, and a worker that cannot
+/// record it must not register (it cannot tell whether a cancellation was
+/// accepted meanwhile). A recorded cancellation or a run that is no longer
+/// active is returned at once; only database errors are retried.
+pub async fn enter_phase_unless_cancelled_retrying<C: ConnectionTrait>(
+    conn: &C,
+    run_id: i32,
+    phase: &str,
+    retry: &temps_core::retry::RetryConfig,
+) -> Result<(), RestoreError> {
+    retry
+        .retry(|| async {
+            match enter_phase_unless_cancelled(conn, run_id, phase).await {
+                Err(RestoreError::Database(e)) => Err(e),
+                settled => Ok(settled),
+            }
+        })
+        .await
+        .map_err(|e| RestoreError::Internal {
+            reason: format!(
+                "Restore run {} could not record its move into phase '{}' after retrying: {}",
+                run_id, phase, e
+            ),
+        })?
+}
+
 /// The [`RestoreGate`] a worker hands its engine.
 ///
 /// For a destructive restore, `begin_target_writes` performs the guarded move
@@ -391,6 +424,80 @@ impl UnpersistedServiceTeardown for ManagerServiceTeardown {
     }
 }
 
+/// Reports which of the Docker objects a new service would own already exist.
+#[async_trait]
+pub trait NewServiceResourceProbe: Send + Sync {
+    /// One `"container NAME"` / `"volume NAME"` entry per object found. An
+    /// error means existence could not be established.
+    async fn existing(&self, name: &str, service_type: ServiceType) -> Result<Vec<String>, String>;
+}
+
+#[async_trait]
+impl NewServiceResourceProbe for ManagerServiceTeardown {
+    async fn existing(&self, name: &str, service_type: ServiceType) -> Result<Vec<String>, String> {
+        self.manager
+            .existing_docker_resources(name, service_type)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Make sure everything a new-service restore will create under `name` is
+/// owned by run `run_id` alone, before anything is provisioned.
+///
+/// Engines derive container and volume names from the service name, and
+/// cancelling a new-service restore removes them by that name. That is only
+/// safe if none of them existed when the run started and no other active run
+/// is creating a service with the same name. Otherwise a cancellation (or a
+/// failed provision being cleaned up) would delete data this run never wrote,
+/// such as the volume an earlier failed restore left behind. Fails closed:
+/// if existence cannot be established, the restore does not start.
+pub async fn ensure_new_service_name_unclaimed<C: ConnectionTrait>(
+    conn: &C,
+    probe: &dyn NewServiceResourceProbe,
+    run_id: i32,
+    name: &str,
+    service_type: ServiceType,
+) -> Result<(), RestoreError> {
+    use temps_entities::restore_runs::{Column, Entity};
+    if let Some(other) = Entity::find()
+        .filter(Column::TargetServiceName.eq(name))
+        .filter(Column::Status.is_in(ACTIVE_RESTORE_STATUSES))
+        .filter(Column::Id.ne(run_id))
+        .one(conn)
+        .await?
+    {
+        return Err(RestoreError::Validation {
+            message: format!(
+                "Restore run {} cannot create service '{}': restore run {} is already creating \
+                 a service with that name. Wait for it to finish or choose another name.",
+                run_id, name, other.id
+            ),
+        });
+    }
+    let existing = probe.existing(name, service_type).await.map_err(|reason| {
+        RestoreError::ExternalService {
+            reason: format!(
+                "Restore run {} cannot confirm that no container or volume already uses the \
+                 name '{}', so it did not start: {}",
+                run_id, name, reason
+            ),
+        }
+    })?;
+    if !existing.is_empty() {
+        return Err(RestoreError::Validation {
+            message: format!(
+                "Restore run {} cannot create service '{}': {} already exist(s), probably left \
+                 over from an earlier failed restore. Remove it, or choose another name.",
+                run_id,
+                name,
+                existing.join(", ")
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Tear down the half-created service of a cancelled new-service restore.
 ///
 /// Refuses when a registered service already has the name: the engines derive
@@ -450,7 +557,7 @@ pub async fn teardown_cancelled_new_service<C: ConnectionTrait>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
+    use sea_orm::{DatabaseBackend, DatabaseConnection, MockDatabase, MockExecResult};
 
     fn run(
         mode: &str,
@@ -779,6 +886,156 @@ mod tests {
             "{cleanup:?}"
         );
         assert!(recorder.removed.lock().expect("lock").is_empty());
+    }
+
+    fn quick_retry() -> temps_core::retry::RetryConfig {
+        temps_core::retry::RetryConfig::new(3)
+            .with_base_delay(std::time::Duration::from_millis(1))
+            .with_max_delay(std::time::Duration::from_millis(2))
+    }
+
+    /// REGRESSION (Greptile on #1295): a temporary database error on the
+    /// move into `verify` is retried instead of letting the worker register
+    /// the service while a cancellation may already have been accepted.
+    #[tokio::test]
+    async fn guarded_move_retries_a_transient_database_error() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_errors([sea_orm::DbErr::Custom("connection reset".into())])
+            .append_exec_results([MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .into_connection();
+        enter_phase_unless_cancelled_retrying(&db, 7, "verify", &quick_retry())
+            .await
+            .expect("second attempt records the move");
+    }
+
+    #[tokio::test]
+    async fn guarded_move_gives_up_with_an_error_not_a_silent_success() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_errors([
+                sea_orm::DbErr::Custom("down".into()),
+                sea_orm::DbErr::Custom("down".into()),
+                sea_orm::DbErr::Custom("down".into()),
+            ])
+            .into_connection();
+        let err = enter_phase_unless_cancelled_retrying(&db, 7, "verify", &quick_retry())
+            .await
+            .expect_err("never recorded");
+        assert!(matches!(err, RestoreError::Internal { .. }), "{err}");
+        assert!(err.to_string().contains("run 7"), "{err}");
+        assert!(err.to_string().contains("'verify'"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn guarded_move_returns_a_recorded_cancellation_without_retrying() {
+        let mut cancelled = run("new_service", Some("copy"), "running", "provision");
+        cancelled.cancel_requested_at = Some(Utc::now());
+        // One exec and one query only: a retry would hit an empty mock and fail.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_results([MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }])
+            .append_query_results([vec![cancelled]])
+            .into_connection();
+        let err = enter_phase_unless_cancelled_retrying(&db, 7, "verify", &quick_retry())
+            .await
+            .expect_err("cancellation won");
+        assert!(
+            matches!(err, RestoreError::RestoreCancelled { ref phase, .. } if phase == "provision"),
+            "{err}"
+        );
+    }
+
+    struct FixedProbe(Result<Vec<String>, String>);
+
+    #[async_trait]
+    impl NewServiceResourceProbe for FixedProbe {
+        async fn existing(
+            &self,
+            _name: &str,
+            _service_type: ServiceType,
+        ) -> Result<Vec<String>, String> {
+            self.0.clone()
+        }
+    }
+
+    fn no_other_runs() -> DatabaseConnection {
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<temps_entities::restore_runs::Model>::new()])
+            .into_connection()
+    }
+
+    #[tokio::test]
+    async fn unclaimed_name_lets_the_restore_provision() {
+        let db = no_other_runs();
+        ensure_new_service_name_unclaimed(
+            &db,
+            &FixedProbe(Ok(vec![])),
+            7,
+            "copy",
+            ServiceType::Postgres,
+        )
+        .await
+        .expect("nothing exists under the name");
+    }
+
+    /// REGRESSION (Greptile on #1295): a volume left by an earlier failed
+    /// restore under the same name must stop the run before it provisions,
+    /// so a later cancellation can never remove that volume.
+    #[tokio::test]
+    async fn leftover_volume_under_the_name_stops_the_restore() {
+        let db = no_other_runs();
+        let err = ensure_new_service_name_unclaimed(
+            &db,
+            &FixedProbe(Ok(vec!["volume postgres-copy_data".into()])),
+            7,
+            "copy",
+            ServiceType::Postgres,
+        )
+        .await
+        .expect_err("leftover data must block the restore");
+        let message = err.to_string();
+        assert!(matches!(err, RestoreError::Validation { .. }), "{message}");
+        assert!(message.contains("volume postgres-copy_data"), "{message}");
+        assert!(message.contains("run 7"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn another_active_run_creating_the_same_name_stops_the_restore() {
+        let mut other = run("new_service", Some("copy"), "running", "provision");
+        other.id = 9;
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![other]])
+            .into_connection();
+        let err = ensure_new_service_name_unclaimed(
+            &db,
+            &FixedProbe(Ok(vec![])),
+            7,
+            "copy",
+            ServiceType::Postgres,
+        )
+        .await
+        .expect_err("a concurrent run owns the name");
+        assert!(err.to_string().contains("restore run 9"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn unknown_existence_fails_closed() {
+        let db = no_other_runs();
+        let err = ensure_new_service_name_unclaimed(
+            &db,
+            &FixedProbe(Err("docker unreachable".into())),
+            7,
+            "copy",
+            ServiceType::Postgres,
+        )
+        .await
+        .expect_err("cannot prove the name is free");
+        assert!(matches!(err, RestoreError::ExternalService { .. }), "{err}");
+        assert!(err.to_string().contains("docker unreachable"), "{err}");
     }
 
     #[tokio::test]

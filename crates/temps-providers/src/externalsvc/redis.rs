@@ -274,7 +274,7 @@ impl RedisService {
     /// callers reasoning about the container should ask rather than re-derive
     /// `redis-{name}` themselves. See `externalsvc::naming`.
     pub fn get_container_name(&self) -> String {
-        format!("redis-{}", self.name)
+        redis_container_name(&self.name)
     }
 
     /// The container this service actually runs in: the imported container's
@@ -2127,8 +2127,26 @@ impl RedisService {
     }
 }
 
+/// Container name of a service named `name`. The single derivation shared by
+/// the engine and anything that must find its container without an instance.
+pub(crate) fn redis_container_name(name: &str) -> String {
+    format!("redis-{}", name)
+}
+
+/// Data volumes of a service named `name`, as `remove()` deletes them.
+pub(crate) fn redis_volume_names(name: &str) -> [String; 1] {
+    [format!("redis_data_{}", name)]
+}
+
 #[async_trait]
 impl ExternalService for RedisService {
+    fn docker_resource_names(&self) -> Option<super::DockerResourceNames> {
+        Some(super::DockerResourceNames {
+            containers: vec![redis_container_name(&self.name)],
+            volumes: redis_volume_names(&self.name).to_vec(),
+        })
+    }
+
     fn get_effective_address(&self, service_config: ServiceConfig) -> Result<(String, String)> {
         self.get_effective_address_for_environment(
             service_config,
@@ -2523,7 +2541,7 @@ impl ExternalService for RedisService {
 
         // Then remove container and volume if Docker is available
         let container_name = self.get_container_name();
-        let volume_name = format!("redis_data_{}", self.name);
+        let [volume_name] = redis_volume_names(&self.name);
 
         info!("Removing Redis container and volume for {}", self.name);
 

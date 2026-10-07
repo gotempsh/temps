@@ -624,7 +624,7 @@ impl MariaDbService {
     }
 
     fn get_container_name(&self) -> String {
-        format!("mariadb-{}", self.name)
+        mariadb_container_name(&self.name)
     }
 
     /// The container this service actually runs in: the imported container's
@@ -3731,8 +3731,26 @@ impl MariaDbService {
     }
 }
 
+/// Container name of a service named `name`. The single derivation shared by
+/// the engine and anything that must find its container without an instance.
+pub(crate) fn mariadb_container_name(name: &str) -> String {
+    format!("mariadb-{}", name)
+}
+
+/// Data volumes of a service named `name`, as `remove()` deletes them.
+pub(crate) fn mariadb_volume_names(name: &str) -> [String; 1] {
+    [format!("mariadb_data_{}", name)]
+}
+
 #[async_trait]
 impl ExternalService for MariaDbService {
+    fn docker_resource_names(&self) -> Option<super::DockerResourceNames> {
+        Some(super::DockerResourceNames {
+            containers: vec![mariadb_container_name(&self.name)],
+            volumes: mariadb_volume_names(&self.name).to_vec(),
+        })
+    }
+
     async fn init(&self, config: ServiceConfig) -> Result<HashMap<String, String>> {
         info!(
             "Initializing MariaDB service (name={}, type={:?}, version={:?})",
@@ -3948,7 +3966,7 @@ impl ExternalService for MariaDbService {
         self.cleanup().await?;
 
         let container_name = self.get_container_name();
-        let volume_name = format!("mariadb_data_{}", self.name);
+        let [volume_name] = mariadb_volume_names(&self.name);
 
         let containers = self
             .docker

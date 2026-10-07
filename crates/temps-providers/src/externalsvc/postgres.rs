@@ -573,7 +573,7 @@ impl PostgresService {
         Ok(postgres_config)
     }
     fn get_container_name(&self) -> String {
-        format!("postgres-{}", self.name)
+        postgres_container_name(&self.name)
     }
 
     /// The container this service actually runs in: the imported container's
@@ -3052,8 +3052,26 @@ impl PostgresService {
     }
 }
 
+/// Container name of a service named `name`. The single derivation shared by
+/// the engine and anything that must find its container without an instance.
+pub(crate) fn postgres_container_name(name: &str) -> String {
+    format!("postgres-{}", name)
+}
+
+/// Data volumes of a service named `name`, as `remove()` deletes them.
+pub(crate) fn postgres_volume_names(name: &str) -> [String; 1] {
+    [format!("postgres-{}_data", name)]
+}
+
 #[async_trait]
 impl ExternalService for PostgresService {
+    fn docker_resource_names(&self) -> Option<super::DockerResourceNames> {
+        Some(super::DockerResourceNames {
+            containers: vec![postgres_container_name(&self.name)],
+            volumes: postgres_volume_names(&self.name).to_vec(),
+        })
+    }
+
     fn get_local_address(&self, service_config: ServiceConfig) -> Result<String> {
         let config = self.get_postgres_config(service_config)?;
         Ok(format!("localhost:{}", config.port))
@@ -3676,7 +3694,7 @@ impl ExternalService for PostgresService {
 
         // Then remove container and volume if Docker is available
         let container_name = self.get_container_name();
-        let volume_name = format!("{}_data", container_name);
+        let [volume_name] = postgres_volume_names(&self.name);
 
         info!("Removing PostgreSQL container and volume for {}", self.name);
 

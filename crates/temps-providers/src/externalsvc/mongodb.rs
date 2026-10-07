@@ -440,7 +440,7 @@ impl MongodbService {
     }
 
     fn get_container_name(&self) -> String {
-        format!("temps-mongodb-{}", self.name)
+        mongodb_container_name(&self.name)
     }
 
     /// The container this service actually runs in: the imported container's
@@ -2286,8 +2286,26 @@ impl MongodbService {
     }
 }
 
+/// Container name of a service named `name`. The single derivation shared by
+/// the engine and anything that must find its container without an instance.
+pub(crate) fn mongodb_container_name(name: &str) -> String {
+    format!("temps-mongodb-{}", name)
+}
+
+/// Data volumes of a service named `name`, as `remove()` deletes them.
+pub(crate) fn mongodb_volume_names(name: &str) -> [String; 1] {
+    [format!("temps-mongodb-{}-data", name)]
+}
+
 #[async_trait]
 impl ExternalService for MongodbService {
+    fn docker_resource_names(&self) -> Option<super::DockerResourceNames> {
+        Some(super::DockerResourceNames {
+            containers: vec![mongodb_container_name(&self.name)],
+            volumes: mongodb_volume_names(&self.name).to_vec(),
+        })
+    }
+
     fn get_effective_address(&self, service_config: ServiceConfig) -> Result<(String, String)> {
         self.get_effective_address_for_environment(
             service_config,
@@ -2645,7 +2663,7 @@ impl ExternalService for MongodbService {
             .map_err(|e| anyhow::anyhow!("Failed to remove MongoDB container: {}", e))?;
 
         // Remove the volume
-        let volume_name = format!("temps-mongodb-{}-data", self.name);
+        let [volume_name] = mongodb_volume_names(&self.name);
         let _ = self
             .docker
             .remove_volume(
