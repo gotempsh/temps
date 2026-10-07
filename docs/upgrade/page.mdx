@@ -84,9 +84,15 @@ The script backs up the encryption key to `~/.temps/backups/pre-upgrade-<timesta
 ### Install script, Homebrew, or manual download
 
 ```bash
-curl -fsSL https://temps.sh/install.sh | bash   # replaces ~/.temps/bin/temps
-brew update && brew upgrade temps               # Homebrew (macOS)
+curl -fsSL https://temps.sh/install.sh | bash                       # newest stable; replaces ~/.temps/bin/temps
+curl -fsSL https://temps.sh/install.sh | bash -s -- --channel beta  # highest beta/RC or stable release
+curl -fsSL https://temps.sh/install.sh | bash -s -- v1.1.0          # a specific release (`1.1.0` also works)
+brew update && brew upgrade temps                                   # Homebrew (macOS)
 ```
+
+The install script picks a channel the same way `temps upgrade` does: by
+version, not publication date, and only among releases that ship an archive
+for your platform.
 
 <CodeGroup>
 

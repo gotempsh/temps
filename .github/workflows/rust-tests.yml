@@ -123,8 +123,14 @@ jobs:
       - name: Test release binary signing
         run: python3 .github/scripts/test_sign_release_binaries.py
 
-      - name: Test installer release lookup errors
+      - name: Test installer release lookup and channel selection
         run: python3 .github/scripts/test_install_release_lookup.py
+
+      - name: Test which stable release is marked Latest
+        run: python3 .github/scripts/test_release_latest.py
+
+      - name: Test upgrade-test release selection
+        run: python3 .github/scripts/test_release_select.py
 
       - name: Test docs-only CI classification
         run: python3 .github/scripts/test-classify-ci-changes.py
