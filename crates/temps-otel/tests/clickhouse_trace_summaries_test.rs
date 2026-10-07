@@ -33,6 +33,13 @@
 //! duration is therefore covered explicitly — with the alias form ClickHouse
 //! rejects the statement outright (UNKNOWN_IDENTIFIER).
 //!
+//! The `global_page_first` module at the bottom covers the same two concerns for
+//! the global traces read (`global_traces::clickhouse`, local source): the
+//! page is selected from narrow columns and only then hydrated, so those tests
+//! pin dedup, totals, ordering, deep offsets, filters and scopes, plus a
+//! memory regression that fails if the read goes back to deduplicating the
+//! whole window.
+//!
 //! Docker-dependent, and per CLAUDE.md must never be `#[ignore]`d: it detects an
 //! unavailable Docker at runtime and returns.
 
@@ -989,4 +996,841 @@ async fn cloud_global_summaries_apply_offset_after_aggregation() {
     let page = global_traces::merge(vec![stream], &lifetime).await.unwrap();
     assert_eq!(page.total, 5_046);
     assert_eq!(page.data.len(), 100);
+}
+
+// ── Global traces: page-first reads ─────────────────────────────────────────
+//
+// `global_traces::clickhouse` (local source) selects the page from narrow
+// columns first and hydrates only the selected traces, instead of deduplicating
+// and aggregating every span in the window. The tests below pin the observable
+// contract of that shape — dedup, totals, ordering, deep offsets, filters,
+// scopes — and the memory bound that motivated it. Each owns its project IDs so
+// the shared container's other fixtures cannot leak in.
+
+mod global_page_first {
+    use super::*;
+    use temps_otel::storage::global_traces::{GlobalTracePage, GlobalTraceQuery, TraceReadScope};
+
+    const DUPLICATED: i32 = 811;
+    const DIVERGENT: i32 = 812;
+    const PAGED: i32 = 813;
+    const FILTERED: i32 = 814;
+    const WIDE_A: i32 = 815;
+    const WIDE_B: i32 = 816;
+    const RAW_SPANS: i32 = 817;
+    const LIFETIME: i32 = 818;
+    /// Outside every scope in the scopes test: must never contribute.
+    const DECOY: i32 = 819;
+    const BULK: i32 = 820;
+
+    fn window(projects: &[i32], hours: i64) -> GlobalTraceQuery {
+        let to = Utc::now() + Duration::minutes(1);
+        GlobalTraceQuery {
+            filter: TraceQuery {
+                start_time: Some(to - Duration::hours(hours)),
+                end_time: Some(to),
+                limit: Some(100),
+                ..Default::default()
+            },
+            scopes: projects
+                .iter()
+                .map(|&project_id| TraceReadScope {
+                    project_id,
+                    from: to - Duration::hours(hours),
+                    to,
+                    cloud: false,
+                    window_clamped_at: None,
+                })
+                .collect(),
+            summaries: true,
+            use_preaggregated_summaries: true,
+            lifetime_candidate_total: None,
+            source_offset: 0,
+        }
+    }
+
+    async fn page(h: &Harness, q: GlobalTraceQuery) -> GlobalTracePage {
+        h.storage
+            .global_trace_page(q)
+            .await
+            .expect("global trace page")
+    }
+
+    fn ids(page: &GlobalTracePage) -> Vec<String> {
+        page.data.iter().map(|r| r.trace_id.clone()).collect()
+    }
+
+    async fn insert_raw(
+        h: &Harness,
+        project: i32,
+        (trace, span_id): (&str, &str),
+        (name, status): (&str, &str),
+        version: u64,
+    ) {
+        let sql = format!(
+            "INSERT INTO spans (project_id, deployment_id, service_name, service_version, \
+             deployment_environment, trace_id, span_id, parent_span_id, name, kind, \
+             start_time, end_time, duration_ms, status_code, status_message, \
+             attributes, events, _version) \
+             SELECT {project}, 1, 'svc', '1.0.0', 'production', '{trace}', '{span_id}', '', \
+             '{name}', 'SERVER', now() - INTERVAL 5 MINUTE, \
+             now() - INTERVAL 5 MINUTE + INTERVAL 100 MILLISECOND, 100.0, '{status}', '', \
+             '{{}}', '[]', {version}"
+        );
+        h.probe
+            .query(&sql)
+            .execute()
+            .await
+            .expect("insert raw span");
+    }
+
+    async fn physical_rows(h: &Harness, project: i32) -> u64 {
+        #[derive(::clickhouse::Row, serde::Deserialize)]
+        struct Cnt {
+            cnt: u64,
+        }
+        h.probe
+            .query("SELECT count() AS cnt FROM spans WHERE project_id = ?")
+            .bind(project)
+            .fetch_one::<Cnt>()
+            .await
+            .expect("physical row count")
+            .cnt
+    }
+
+    /// A retried batch leaves duplicate physical rows; neither the page nor the
+    /// total may see them.
+    #[tokio::test]
+    async fn retried_batches_do_not_inflate_the_total_or_the_span_counts() {
+        let Some(h) = harness().await else { return };
+        let batch = || {
+            (0..30)
+                .flat_map(|t| {
+                    let trace = format!("dup-{t:03}");
+                    vec![
+                        span(
+                            DUPLICATED,
+                            &trace,
+                            "root",
+                            None,
+                            "GET /dup",
+                            "api",
+                            SpanStatusCode::Ok,
+                            t + 1,
+                            50.0,
+                            None,
+                            &[],
+                        ),
+                        span(
+                            DUPLICATED,
+                            &trace,
+                            "c1",
+                            Some("root"),
+                            "db",
+                            "api",
+                            SpanStatusCode::Error,
+                            t + 1,
+                            10.0,
+                            None,
+                            &[],
+                        ),
+                        span(
+                            DUPLICATED,
+                            &trace,
+                            "c2",
+                            Some("root"),
+                            "cache",
+                            "api",
+                            SpanStatusCode::Ok,
+                            t + 1,
+                            5.0,
+                            None,
+                            &[],
+                        ),
+                    ]
+                })
+                .collect::<Vec<_>>()
+        };
+        h.storage.store_spans(batch()).await.unwrap();
+        h.storage.store_spans(batch()).await.unwrap();
+        assert_eq!(
+            physical_rows(&h, DUPLICATED).await,
+            180,
+            "merges are stopped"
+        );
+
+        // Window mode (a filter that matches every span) and lifetime mode.
+        let mut filtered = window(&[DUPLICATED], 6);
+        filtered.filter.service_name = Some("api".into());
+        for q in [window(&[DUPLICATED], 6), filtered] {
+            let page = page(&h, q).await;
+            assert_eq!(page.total, 30, "distinct traces, not physical rows");
+            assert_eq!(page.data.len(), 30);
+            assert!(page.data.iter().all(|r| r.span_count == 3));
+            assert!(page.data.iter().all(|r| r.error_count == 1));
+            assert_eq!(page.data[0].trace_id, "dup-000", "newest first");
+        }
+    }
+
+    /// The winning copy decides every returned value, as `FINAL` would.
+    #[tokio::test]
+    async fn divergent_copies_resolve_to_the_highest_version() {
+        let Some(h) = harness().await else { return };
+        insert_raw(
+            &h,
+            DIVERGENT,
+            ("div-0001", "d001"),
+            ("GET /superseded", "ERROR"),
+            1_000,
+        )
+        .await;
+        insert_raw(
+            &h,
+            DIVERGENT,
+            ("div-0001", "d001"),
+            ("GET /live", "OK"),
+            2_000,
+        )
+        .await;
+        h.storage
+            .store_spans(vec![span(
+                DIVERGENT,
+                "div-0002",
+                "d002",
+                None,
+                "GET /other",
+                "api",
+                SpanStatusCode::Ok,
+                20,
+                10.0,
+                None,
+                &[],
+            )])
+            .await
+            .unwrap();
+        assert_eq!(physical_rows(&h, DIVERGENT).await, 3);
+
+        // Both shapes: lifetime values, and window values behind a filter.
+        let mut filtered = window(&[DIVERGENT], 2);
+        filtered.filter.service_name = Some("svc".into());
+        for q in [window(&[DIVERGENT], 2), filtered] {
+            let page = page(&h, q).await;
+            let live = page
+                .data
+                .iter()
+                .find(|r| r.trace_id == "div-0001")
+                .expect("trace with divergent copies");
+            assert_eq!(live.name, "GET /live", "the winning copy names the trace");
+            assert_eq!(live.span_count, 1, "two physical rows are one span");
+            assert_eq!(live.error_count, 0, "the superseded ERROR must not count");
+            assert_eq!(live.status, "OK");
+        }
+    }
+
+    /// Paging the whole window in every sort order yields each trace exactly
+    /// once, in order, with an exact total — including offsets past the first
+    /// stage-1 batch.
+    #[tokio::test]
+    async fn deep_offsets_walk_the_window_in_every_sort_order() {
+        let Some(h) = harness().await else { return };
+        let traces: Vec<(String, i64, f64)> = (0..250)
+            .map(|i| {
+                (
+                    format!("page-{i:03}"),
+                    i as i64 + 1,
+                    ((i * 37) % 251 + 1) as f64,
+                )
+            })
+            .collect();
+        h.storage
+            .store_spans(
+                traces
+                    .iter()
+                    .map(|(id, minutes, duration)| {
+                        span(
+                            PAGED,
+                            id,
+                            "root",
+                            None,
+                            "GET /p",
+                            "api",
+                            SpanStatusCode::Ok,
+                            *minutes,
+                            *duration,
+                            None,
+                            &[],
+                        )
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+
+        let mut by_start = traces.clone();
+        by_start.sort_by_key(|(_, minutes, _)| *minutes);
+        let mut by_duration = traces.clone();
+        by_duration.sort_by(|a, b| a.2.total_cmp(&b.2));
+        let reversed =
+            |v: &[(String, i64, f64)]| v.iter().rev().map(|t| t.0.clone()).collect::<Vec<_>>();
+        let forward = |v: &[(String, i64, f64)]| v.iter().map(|t| t.0.clone()).collect::<Vec<_>>();
+        let cases = [
+            (
+                TraceSortField::StartTime,
+                SortOrder::Desc,
+                forward(&by_start),
+            ),
+            (
+                TraceSortField::StartTime,
+                SortOrder::Asc,
+                reversed(&by_start),
+            ),
+            (
+                TraceSortField::Duration,
+                SortOrder::Asc,
+                forward(&by_duration),
+            ),
+            (
+                TraceSortField::Duration,
+                SortOrder::Desc,
+                reversed(&by_duration),
+            ),
+        ];
+        for (sort_by, sort_order, expected) in cases {
+            let mut seen = Vec::new();
+            for offset in [0, 100, 200, 300] {
+                let mut q = window(&[PAGED], 6);
+                q.filter.sort_by = sort_by;
+                q.filter.sort_order = sort_order;
+                q.filter.offset = Some(offset);
+                let page = page(&h, q).await;
+                assert_eq!(page.total, 250, "{sort_by:?} {sort_order:?} @ {offset}");
+                seen.extend(ids(&page));
+            }
+            assert_eq!(seen, expected, "{sort_by:?} {sort_order:?}");
+        }
+    }
+
+    /// Every span-level filter, one at a time, on a window whose traces differ
+    /// on each dimension. A multi-span trace checks that the counts only cover
+    /// the spans that matched.
+    #[tokio::test]
+    async fn every_filter_selects_the_same_traces_the_single_stage_query_did() {
+        let Some(h) = harness().await else { return };
+        h.storage
+            .store_spans(vec![
+                span(
+                    FILTERED,
+                    "flt-a",
+                    "a1",
+                    None,
+                    "GET /checkout",
+                    "web",
+                    SpanStatusCode::Ok,
+                    5,
+                    300.0,
+                    Some(1),
+                    &[("tier", "paid")],
+                ),
+                span(
+                    FILTERED,
+                    "flt-a",
+                    "a2",
+                    Some("a1"),
+                    "SELECT orders",
+                    "db",
+                    SpanStatusCode::Ok,
+                    5,
+                    40.0,
+                    Some(1),
+                    &[],
+                ),
+                span(
+                    FILTERED,
+                    "flt-b",
+                    "b1",
+                    None,
+                    "POST /login",
+                    "auth",
+                    SpanStatusCode::Error,
+                    10,
+                    80.0,
+                    Some(2),
+                    &[],
+                ),
+                span(
+                    FILTERED,
+                    "flt-c",
+                    "c1",
+                    None,
+                    "GET /health",
+                    "web",
+                    SpanStatusCode::Ok,
+                    20,
+                    5.0,
+                    Some(1),
+                    &[("tier", "free")],
+                ),
+            ])
+            .await
+            .unwrap();
+        let run = |apply: fn(&mut TraceQuery)| {
+            let mut q = window(&[FILTERED], 2);
+            apply(&mut q.filter);
+            page(&h, q)
+        };
+
+        let all = run(|_| {}).await;
+        assert_eq!(ids(&all), ["flt-a", "flt-b", "flt-c"]);
+        assert_eq!(all.total, 3);
+        assert_eq!(all.data[0].span_count, 2, "unfiltered: whole trace");
+
+        let db = run(|f| f.service_name = Some("db".into())).await;
+        assert_eq!((ids(&db), db.total), (vec!["flt-a".to_string()], 1));
+        assert_eq!(
+            db.data[0].span_count, 1,
+            "only the matching span is counted"
+        );
+        assert_eq!(db.data[0].name, "SELECT orders");
+
+        let login = run(|f| f.name_pattern = Some("login".into())).await;
+        assert_eq!((ids(&login), login.total), (vec!["flt-b".to_string()], 1));
+
+        let errors = run(|f| f.status = Some(SpanStatusCode::Error)).await;
+        assert_eq!((ids(&errors), errors.total), (vec!["flt-b".to_string()], 1));
+        let ok = run(|f| f.status = Some(SpanStatusCode::Ok)).await;
+        assert_eq!(
+            (ids(&ok), ok.total),
+            (vec!["flt-a".to_string(), "flt-c".to_string()], 2)
+        );
+        let unset = run(|f| f.status = Some(SpanStatusCode::Unset)).await;
+        assert_eq!((unset.data.len(), unset.total), (0, 0));
+
+        let slow = run(|f| f.min_duration_ms = Some(100.0)).await;
+        assert_eq!((ids(&slow), slow.total), (vec!["flt-a".to_string()], 1));
+        let slow_db = run(|f| {
+            f.min_duration_ms = Some(100.0);
+            f.service_name = Some("db".into());
+        })
+        .await;
+        assert_eq!(
+            (slow_db.data.len(), slow_db.total),
+            (0, 0),
+            "the db span is 40ms"
+        );
+
+        let deployment = run(|f| f.deployment_id = Some(2)).await;
+        assert_eq!(
+            (ids(&deployment), deployment.total),
+            (vec!["flt-b".to_string()], 1)
+        );
+
+        let free = run(|f| {
+            f.attributes = Some(BTreeMap::from([("tier".to_string(), "free".to_string())]))
+        })
+        .await;
+        assert_eq!((ids(&free), free.total), (vec!["flt-c".to_string()], 1));
+
+        let one = run(|f| f.trace_id = Some("flt-c".into())).await;
+        assert_eq!((ids(&one), one.total), (vec!["flt-c".to_string()], 1));
+    }
+
+    /// Each scope keeps its own window; the same trace ID in two projects is two
+    /// traces; a project outside the scope never contributes.
+    #[tokio::test]
+    async fn scopes_apply_their_own_windows_and_stay_separate_per_project() {
+        let Some(h) = harness().await else { return };
+        h.storage
+            .store_spans(vec![
+                span(
+                    WIDE_A,
+                    "shared",
+                    "r",
+                    None,
+                    "GET /a",
+                    "api",
+                    SpanStatusCode::Ok,
+                    30,
+                    10.0,
+                    None,
+                    &[],
+                ),
+                span(
+                    WIDE_B,
+                    "shared",
+                    "r",
+                    None,
+                    "GET /b",
+                    "api",
+                    SpanStatusCode::Ok,
+                    40,
+                    20.0,
+                    None,
+                    &[],
+                ),
+                span(
+                    WIDE_A,
+                    "old-a",
+                    "r",
+                    None,
+                    "GET /old",
+                    "api",
+                    SpanStatusCode::Ok,
+                    150,
+                    10.0,
+                    None,
+                    &[],
+                ),
+                span(
+                    WIDE_B,
+                    "old-b",
+                    "r",
+                    None,
+                    "GET /old",
+                    "api",
+                    SpanStatusCode::Ok,
+                    150,
+                    10.0,
+                    None,
+                    &[],
+                ),
+                span(
+                    DECOY,
+                    "shared",
+                    "r",
+                    None,
+                    "GET /hidden",
+                    "api",
+                    SpanStatusCode::Ok,
+                    30,
+                    10.0,
+                    None,
+                    &[],
+                ),
+            ])
+            .await
+            .unwrap();
+
+        let mut q = window(&[WIDE_A, WIDE_B], 6);
+        // WIDE_A only sees the last hour; WIDE_B sees three.
+        q.scopes[0].from = q.scopes[0].to - Duration::hours(1);
+        q.scopes[1].from = q.scopes[1].to - Duration::hours(3);
+        let page = page(&h, q).await;
+        let seen: Vec<(i32, String)> = page
+            .data
+            .iter()
+            .map(|r| (r.project_id, r.trace_id.clone()))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (WIDE_A, "shared".to_string()),
+                (WIDE_B, "shared".to_string()),
+                (WIDE_B, "old-b".to_string()),
+            ]
+        );
+        assert_eq!(page.total, 3);
+        assert_eq!(page.data[0].name, "GET /a");
+        assert_eq!(page.data[1].name, "GET /b");
+    }
+
+    /// Unfiltered reads under the candidate cap report whole-trace values; the
+    /// moment a filter narrows the question, only matching in-window spans count.
+    #[tokio::test]
+    async fn lifetime_values_cover_the_whole_trace_and_window_values_do_not() {
+        let Some(h) = harness().await else { return };
+        h.storage
+            .store_spans(vec![
+                span(
+                    LIFETIME,
+                    "life-1",
+                    "root",
+                    None,
+                    "GET /life",
+                    "api",
+                    SpanStatusCode::Ok,
+                    5,
+                    100.0,
+                    None,
+                    &[],
+                ),
+                span(
+                    LIFETIME,
+                    "life-1",
+                    "late",
+                    Some("root"),
+                    "background",
+                    "worker",
+                    SpanStatusCode::Error,
+                    120,
+                    900.0,
+                    None,
+                    &[],
+                ),
+            ])
+            .await
+            .unwrap();
+        let q = || {
+            let mut q = window(&[LIFETIME], 1);
+            q.scopes[0].from = q.scopes[0].to - Duration::hours(1);
+            q
+        };
+
+        let lifetime = page(&h, q()).await;
+        assert_eq!(lifetime.total, 1);
+        let t = &lifetime.data[0];
+        assert_eq!((t.span_count, t.error_count), (2, 1));
+        assert_eq!(t.status, "ERROR");
+        assert_eq!(t.duration, 900.0, "longest span of the whole trace");
+        assert_eq!(t.name, "GET /life", "the root names the trace");
+        assert!(t.start_ms < (Utc::now() - Duration::minutes(100)).timestamp_millis());
+
+        let mut filtered = q();
+        filtered.filter.service_name = Some("api".into());
+        let window_only = page(&h, filtered).await;
+        let t = &window_only.data[0];
+        assert_eq!((t.span_count, t.error_count), (1, 0));
+        assert_eq!(t.duration, 100.0);
+
+        let mut outside = q();
+        outside.filter.service_name = Some("worker".into());
+        let none = page(&h, outside).await;
+        assert_eq!(
+            (none.total, none.data.len()),
+            (0, 0),
+            "its only worker span is outside the window"
+        );
+    }
+
+    /// The raw-span listing shares the machinery: dedup, filters, sort, total.
+    #[tokio::test]
+    async fn raw_span_pages_dedup_filter_and_count_distinct_spans() {
+        let Some(h) = harness().await else { return };
+        let batch = || {
+            (0..12)
+                .map(|i| {
+                    span(
+                        RAW_SPANS,
+                        &format!("raw-{i:02}"),
+                        &format!("s{i:02}"),
+                        None,
+                        "GET /raw",
+                        "api",
+                        if i % 4 == 0 {
+                            SpanStatusCode::Error
+                        } else {
+                            SpanStatusCode::Ok
+                        },
+                        i + 1,
+                        (i + 1) as f64 * 10.0,
+                        None,
+                        &[("k", "v")],
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        h.storage.store_spans(batch()).await.unwrap();
+        h.storage.store_spans(batch()).await.unwrap();
+        assert_eq!(physical_rows(&h, RAW_SPANS).await, 24);
+
+        let mut q = window(&[RAW_SPANS], 2);
+        q.summaries = false;
+        q.filter.limit = Some(5);
+        q.filter.offset = Some(5);
+        let second = page(&h, q.clone()).await;
+        assert_eq!(second.total, 12, "distinct spans, not physical rows");
+        let span_ids: Vec<_> = second.data.iter().map(|r| r.span_id.clone()).collect();
+        assert_eq!(span_ids, ["s05", "s06", "s07", "s08", "s09"]);
+        assert_eq!(
+            second.data[0].attributes, r#"{"k":"v"}"#,
+            "wide columns are hydrated"
+        );
+
+        q.filter.offset = Some(0);
+        q.filter.status = Some(SpanStatusCode::Error);
+        q.filter.min_duration_ms = Some(50.0);
+        let errors = page(&h, q).await;
+        assert_eq!(errors.total, 2, "s04 (50ms) and s08 (90ms) are slow errors");
+        assert_eq!(
+            errors
+                .data
+                .iter()
+                .map(|r| r.span_id.as_str())
+                .collect::<Vec<_>>(),
+            ["s04", "s08"]
+        );
+    }
+
+    /// The single-stage query the page-first read replaced: dedup and aggregate
+    /// every span in the window, wide columns included, then cut the page.
+    /// Kept verbatim (binds inlined) so the next test can show that the data it
+    /// seeds is big enough to break that shape under the same memory cap.
+    fn legacy_single_stage_page(project: i32, from_ms: i64, to_ms: i64) -> String {
+        let pick = |field: &str| {
+            format!(
+                "argMax(raw.{field}, tuple(raw.parent_span_id = '', raw.duration, raw.span_id))"
+            )
+        };
+        format!(
+            "WITH raw AS (SELECT project_id AS project_id, trace_id, span_id, \
+             COALESCE(parent_span_id, '') AS parent_span_id, name, service_name, \
+             COALESCE(deployment_environment, '') AS environment, kind AS kind, \
+             upper(status_code) AS status, toUnixTimestamp64Milli(start_time) AS start_ms, \
+             duration_ms AS duration, attributes AS attributes, events AS events, \
+             status_message AS status_message FROM spans \
+             WHERE ((project_id = {project} AND toUnixTimestamp64Milli(start_time) >= {from_ms} \
+             AND toUnixTimestamp64Milli(start_time) <= {to_ms})) \
+             ORDER BY _version DESC LIMIT 1 BY project_id, trace_id, span_id), \
+             grouped AS (SELECT project_id, trace_id, '' AS span_id, '' AS parent_span_id, \
+             {} AS name, {} AS service_name, {} AS environment, {} AS kind, \
+             CASE WHEN countIf(raw.status = 'ERROR') > 0 THEN 'ERROR' ELSE {} END AS status, \
+             MIN(raw.start_ms) AS start_ms, MAX(raw.duration) AS duration, \
+             toInt64(count()) AS span_count, toInt64(countIf(raw.status = 'ERROR')) AS error_count, \
+             '{{}}' AS attributes, '[]' AS events, '' AS status_message \
+             FROM raw GROUP BY project_id, trace_id) \
+             SELECT * FROM grouped ORDER BY start_ms DESC, project_id, trace_id, span_id LIMIT 20",
+            pick("name"),
+            pick("service_name"),
+            pick("environment"),
+            pick("kind"),
+            pick("status"),
+        )
+    }
+
+    #[derive(::clickhouse::Row, serde::Deserialize, Debug)]
+    struct Logged {
+        memory_usage: u64,
+        read_rows: u64,
+        query_duration_ms: u64,
+        projections: Vec<String>,
+    }
+
+    /// What ClickHouse recorded for the statements that mention `project`.
+    async fn logged(h: &Harness, project: i32) -> Vec<Logged> {
+        h.probe
+            .query("SYSTEM FLUSH LOGS")
+            .execute()
+            .await
+            .expect("flush logs");
+        h.probe
+            .query(
+                "SELECT memory_usage, read_rows, query_duration_ms, projections \
+                 FROM system.query_log \
+                 WHERE type = 'QueryFinish' AND current_database = ? \
+                   AND positionCaseInsensitive(query, ?) > 0 \
+                   AND query NOT LIKE '%system.query_log%' \
+                   AND query NOT LIKE 'INSERT%' \
+                 ORDER BY event_time_microseconds",
+            )
+            .bind(DB)
+            .bind(format!("project_id = {project} AND"))
+            .fetch_all::<Logged>()
+            .await
+            .expect("read query_log")
+    }
+
+    /// Peak memory of a global page must follow the page, not the window.
+    ///
+    /// 600k wide spans (120k traces) land in one project's current window. The
+    /// legacy shape cannot finish inside 128 MiB — the `LIMIT BY` and the
+    /// sort hold every deduped span, `attributes` and `events` included — while
+    /// the page-first read finishes well inside it, from the projection, reading
+    /// roughly one row per span in the window rather than the table.
+    #[tokio::test]
+    async fn window_size_does_not_drive_query_memory() {
+        let Some(h) = harness().await else { return };
+        // One trace in four starts inside the queried hour (600k spans); the
+        // rest start 70-120 minutes ago. They share every part, as they would
+        // in a merged table, so no part or partition can be skipped on time
+        // alone — only a read ordered by start_time can avoid the other 1.8M.
+        const SPANS: u64 = 600_000;
+        const TABLE_SPANS: u64 = 2_400_000;
+        h.probe
+            .query(&format!(
+                "INSERT INTO spans (project_id, deployment_id, service_name, service_version, \
+                 deployment_environment, trace_id, span_id, parent_span_id, name, kind, \
+                 start_time, end_time, duration_ms, status_code, status_message, \
+                 attributes, events, _version) \
+                 SELECT {BULK}, toInt32(t % 7), concat('svc-', toString(t % 20)), '1.0.0', 'production', \
+                   lower(hex(sipHash128(t))), lower(hex(sipHash64(t, k))), \
+                   if(k = 0, '', lower(hex(sipHash64(t, k - 1)))), \
+                   concat('GET /route/', toString((t * 7 + k) % 200)), 'SERVER', \
+                   now64(3) - toIntervalSecond(if(t % 4 = 0, t % 1800, 4200 + t % 3000)), \
+                   now64(3) - toIntervalSecond(if(t % 4 = 0, t % 1800, 4200 + t % 3000)) \
+                     + toIntervalMillisecond(10), \
+                   toFloat64(sipHash64(t, k) % 5000) / 10 + k, \
+                   if(sipHash64(t, k, 1) % 50 = 0, 'ERROR', 'OK'), '', \
+                   concat('{{\"http.url\":\"https://example.test/route/', toString(t % 200), '&q=', \
+                          lower(hex(sipHash64(t, k, 2))), lower(hex(sipHash64(t, k, 4))), \
+                          '\",\"http.user_agent\":\"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36\",\
+                          \"db.statement\":\"SELECT * FROM orders WHERE id = ', toString(t), '\"}}'), \
+                   concat('[{{\"name\":\"log\",\"attributes\":{{\"message\":\"processed ', \
+                          lower(hex(sipHash64(t, k, 3))), lower(hex(sipHash64(t, k, 5))), '\"}}}}]'), \
+                   toUInt64(toUnixTimestamp64Milli(now64())) \
+                 FROM (SELECT intDiv(number, 5) AS t, number % 5 AS k FROM numbers({TABLE_SPANS}))"
+            ))
+            .execute()
+            .await
+            .expect("seed bulk spans");
+
+        let mut q = window(&[BULK], 1);
+        q.filter.limit = Some(20);
+        let started = std::time::Instant::now();
+        let page = page(&h, q.clone()).await;
+        let elapsed = started.elapsed();
+        assert_eq!(
+            page.total,
+            SPANS / 5,
+            "only traces with a span in the window count"
+        );
+        assert_eq!(page.data.len(), 20);
+        assert!(page.data.iter().all(|r| r.span_count == 5));
+        let starts: Vec<_> = page.data.iter().map(|r| r.start_ms).collect();
+        assert!(
+            starts.windows(2).all(|w| w[0] >= w[1]),
+            "newest first: {starts:?}"
+        );
+
+        let new_queries = logged(&h, BULK).await;
+        println!("page-first: {elapsed:?} {new_queries:#?}");
+        assert_eq!(
+            new_queries.len(),
+            2,
+            "one total and one page statement, nothing else"
+        );
+        for query in &new_queries {
+            println!(
+                "  {} ms, {} rows, {} MiB peak",
+                query.query_duration_ms,
+                query.read_rows,
+                query.memory_usage >> 20
+            );
+            assert!(
+                query.memory_usage < 96 << 20,
+                "peak memory must not follow the window: {query:?}"
+            );
+            assert!(
+                query.read_rows < TABLE_SPANS / 2,
+                "reads the window (plus a few granules for the page), not the project: {query:?}"
+            );
+            assert!(
+                query.projections.iter().any(|p| p.ends_with("proj_recent")),
+                "narrow reads must be served by proj_recent: {query:?}"
+            );
+        }
+
+        // Under the same cap the single-stage shape does not finish.
+        let from = q.scopes[0].from.timestamp_millis();
+        let to = q.scopes[0].to.timestamp_millis();
+        let legacy = h
+            .probe
+            .query(&legacy_single_stage_page(BULK, from, to))
+            .with_setting("max_memory_usage", (128u64 << 20).to_string())
+            .fetch_all::<temps_otel::storage::global_traces::GlobalTraceRow>()
+            .await;
+        let error = legacy.expect_err("the legacy shape must exceed 128 MiB on this window");
+        assert!(
+            error.to_string().contains("MEMORY_LIMIT_EXCEEDED"),
+            "unexpected failure: {error}"
+        );
+    }
 }
