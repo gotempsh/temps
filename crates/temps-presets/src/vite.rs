@@ -417,13 +417,24 @@ enum Token {
 
 /// Tokenize JS/TS source, skipping whitespace and comments. Strings are read
 /// with their escapes so a `//` inside a URL is not mistaken for a comment.
-fn tokenize(source: &str) -> Vec<Token> {
+/// Alongside each token, whether a line break precedes it, so statement
+/// boundaries that rely on automatic semicolon insertion can be found.
+fn tokenize(source: &str) -> (Vec<Token>, Vec<bool>) {
     let chars: Vec<char> = source.chars().collect();
     let mut tokens = Vec::new();
+    let mut line_breaks = Vec::new();
+    let mut line_break = false;
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
+        if tokens.len() > line_breaks.len() {
+            line_breaks.push(line_break);
+            line_break = false;
+        }
         if c.is_whitespace() {
+            if c == '\n' {
+                line_break = true;
+            }
             i += 1;
         } else if c == '/' && chars.get(i + 1) == Some(&'/') {
             while i < chars.len() && chars[i] != '\n' {
@@ -432,6 +443,9 @@ fn tokenize(source: &str) -> Vec<Token> {
         } else if c == '/' && chars.get(i + 1) == Some(&'*') {
             i += 2;
             while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
+                if chars[i] == '\n' {
+                    line_break = true;
+                }
                 i += 1;
             }
             i += 2;
@@ -476,7 +490,10 @@ fn tokenize(source: &str) -> Vec<Token> {
             i += 1;
         }
     }
-    tokens
+    if tokens.len() > line_breaks.len() {
+        line_breaks.push(line_break);
+    }
+    (tokens, line_breaks)
 }
 
 /// What one object literal is known to set a tracked key to.
@@ -828,7 +845,7 @@ fn close_frame(frame: Frame, parent: Option<&mut Frame>, results: &mut Vec<(Slot
 /// object literal (`build: shared`). A spread *before* the literal is
 /// overridden by it and is harmless.
 fn parse_vite_out_dir(source: &str) -> OutDir {
-    let tokens = tokenize(source);
+    let (tokens, line_breaks) = tokenize(source);
     let mut frames: Vec<Frame> = Vec::new();
     let mut results: Vec<(Slot, Option<usize>)> = Vec::new();
     let mut next_frame_id = 1;
@@ -849,6 +866,28 @@ fn parse_vite_out_dir(source: &str) -> OutDir {
         let prev = index.checked_sub(1).and_then(|i| tokens.get(i));
         let config_scope = frames.last().is_none_or(|frame| frame.config_scope);
         if frames.is_empty() {
+            // Automatic semicolon insertion: a line that starts a new
+            // statement (a name or string after an expression that could have
+            // ended) ends the export, even without `;`. A line starting with
+            // `?`, `:`, `.`, `(`, `[` or an operator continues it, as in a
+            // ternary split over lines.
+            let ends_expression = matches!(
+                prev,
+                Some(Token::Word(_))
+                    | Some(Token::Str(_))
+                    | Some(Token::Template)
+                    | Some(Token::Punct(')' | ']' | '}'))
+            ) && !matches!(prev, Some(Token::Word(w)) if w == "default" || w == "export");
+            let starts_statement = matches!(
+                token,
+                Token::Word(_) | Token::Str(_) | Token::Template
+            ) && !matches!(token, Token::Word(w) if matches!(w.as_str(), "in" | "instanceof" | "as" | "satisfies"));
+            if line_breaks.get(index).copied().unwrap_or(false)
+                && ends_expression
+                && starts_statement
+            {
+                top_level_export = false;
+            }
             match token {
                 Token::Word(word) if word == "default" => {
                     top_level_export = matches!(prev, Some(Token::Word(w)) if w == "export");
@@ -1617,6 +1656,9 @@ mod tests {
             "export default process.env.CI ? { build: { outDir: 'build' } } : { plugins: [] };",
             "module.exports = process.env.CI ? {} : { build: { outDir: 'build' } }",
             "export default (process.env.CI ? {} : { build: { outDir: 'build' } })",
+            // A ternary split over lines (Prettier's style) is one statement.
+            "export default process.env.CI\n  ? {}\n  : { build: { outDir: 'build' } }",
+            "module.exports =\n  process.env.CI\n    ? { plugins: [] }\n    : { build: { outDir: 'build' } }",
             "export default process.env.CI ? defineConfig({}) : defineConfig({ build: { outDir: 'build' } })",
         ] {
             assert!(
@@ -1651,6 +1693,11 @@ mod tests {
             "function defaults() { return {} }\nexport default defineConfig(({ mode }) => mode === 'x' ? { build: { outDir: 'build' } } : { build: { outDir: 'build' } })",
             "const pick = process.env.CI ? {} : { server: {} };\nexport default { build: { outDir: 'build' } }",
             "export default { build: { outDir: 'build' } }\nconst unused = process.env.CI ? {} : { plugins: [] }",
+            // REGRESSION (Greptile on #1295): a semicolon-free export ends at
+            // the line break JavaScript turns into a semicolon.
+            "export default c ? { build: { outDir: 'build' } } : { build: { outDir: 'build' } }\nglobalThis.extraConfig = c ? {} : { plugins: [] }",
+            "module.exports = c ? { build: { outDir: 'build' } } : { build: { outDir: 'build' } }\nwindow.x = c ? {} : { server: {} }",
+            "export default c ? { build: { outDir: 'build' } } : { build: { outDir: 'build' } } /* end\n */ foo = c ? {} : { plugins: [] }",
             "const pkg = { name: 'app' }; export default { build: { outDir: 'build' } }",
             "function helper() { return { name: 'p', apply: 'build' } }\nexport default { build: { outDir: 'build' } }",
             "const shared = { plugins: [] }; export default { ...shared, build: { outDir: 'build' } }",
