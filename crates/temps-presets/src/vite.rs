@@ -494,67 +494,144 @@ impl Slot {
     }
 }
 
+/// What an open `{`, `(` or `[` is, as far as finding the config goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameKind {
+    /// An object literal.
+    Object,
+    /// A statement block or function body.
+    Block,
+    /// A parenthesised expression, or a call that may receive the config
+    /// itself (`defineConfig(...)`, `mergeConfig(...)`, `export default wrap(...)`).
+    Paren,
+    /// An array literal, computed key, or the arguments of any other call.
+    Opaque,
+}
+
 /// One open `{`, `(` or `[` while scanning a Vite config.
 struct Frame {
-    opener: char,
-    /// For `{`: the key whose value this object is (`build` in `build: {`).
-    key: Option<String>,
-    /// For a `build` object: what its own `outDir` key resolves to.
+    kind: FrameKind,
+    /// An object literal opened directly inside this frame would be a Vite
+    /// config (it is not nested in another object, array or plugin call).
+    config_scope: bool,
+    /// This object literal is a candidate Vite config.
+    config: bool,
+    /// This object literal is the `build` value of a candidate Vite config.
+    config_build: bool,
+    /// For the config's `build` object: what its own `outDir` key resolves to.
     out_dir: Slot,
-    /// What this object's (last) `build` key resolves `outDir` to.
+    /// For a config object: what its (last) `build` key resolves `outDir` to.
     build: Slot,
 }
 
 impl Frame {
-    fn new(opener: char, key: Option<String>) -> Self {
+    fn new(kind: FrameKind, config_scope: bool) -> Self {
         Self {
-            opener,
-            key,
+            kind,
+            config_scope,
+            config: false,
+            config_build: false,
             out_dir: Slot::Absent,
             build: Slot::Absent,
         }
     }
 
-    fn is_build_object(&self) -> bool {
-        self.opener == '{' && self.key.as_deref() == Some("build")
+    /// An object literal; `in_config_scope` is the parent's `config_scope`.
+    fn object(in_config_scope: bool, config_build: bool) -> Self {
+        Self {
+            config: in_config_scope,
+            config_build,
+            ..Self::new(FrameKind::Object, false)
+        }
+    }
+
+    /// Whether members of this object can change the resolved `build.outDir`.
+    fn tracked(&self) -> bool {
+        self.config || self.config_build
     }
 }
 
 const SPREAD_OVERRIDE: &str =
     "build.outDir may be replaced by a spread or computed key that follows it";
 
-/// Hand a closed frame's findings to its parent: a `build` object becomes the
-/// parent's `build` value (a later `build` key replaces an earlier one, as in
-/// JavaScript), and any object that had a `build` key reports it.
-fn close_frame(frame: Frame, parent: Option<&mut Frame>, results: &mut Vec<Slot>) {
-    if frame.is_build_object() {
-        match parent {
-            Some(parent) => parent.build = frame.out_dir.clone(),
-            None => results.push(frame.out_dir.clone()),
-        }
+/// Words after which `{` starts an object literal rather than a block.
+const OBJECT_AFTER: &[&str] = &[
+    "return", "default", "yield", "await", "typeof", "void", "case", "throw", "in", "of", "delete",
+];
+
+/// Words after which `(` groups an expression or a parameter list rather than
+/// calling a function.
+const GROUPING_AFTER: &[&str] = &[
+    "return", "default", "yield", "await", "typeof", "void", "case", "throw", "in", "of", "delete",
+    "async", "if", "while", "for", "switch", "catch", "function",
+];
+
+/// Whether a `{` preceded by `prev` opens an object literal (as opposed to a
+/// function body, `if`/`else` block or other statement block).
+fn opens_object(prev: Option<&Token>) -> bool {
+    match prev {
+        Some(Token::Punct(c)) => matches!(c, '(' | ',' | '=' | ':' | '?' | '[' | '|' | '&' | '!'),
+        Some(Token::Word(word)) => OBJECT_AFTER.contains(&word.as_str()),
+        _ => false,
     }
-    if frame.build != Slot::Absent {
+}
+
+/// Whether the `(` at `index` keeps the config scope of its parent: a plain
+/// grouping/parameter paren, or a call that receives the config itself. Any
+/// other call (`somePlugin({ build })`) takes options that are not Vite's.
+fn paren_keeps_config_scope(tokens: &[Token], index: usize) -> bool {
+    let before = |offset: usize| index.checked_sub(offset).and_then(|i| tokens.get(i));
+    match before(1) {
+        Some(Token::Word(word)) if GROUPING_AFTER.contains(&word.as_str()) => true,
+        Some(Token::Word(callee)) => {
+            let exported = matches!(before(2), Some(Token::Word(w)) if w == "default")
+                || (matches!(before(2), Some(Token::Punct('=')))
+                    && matches!(before(3), Some(Token::Word(w)) if w == "exports"));
+            exported || callee.to_ascii_lowercase().contains("config")
+        }
+        Some(Token::Punct(')' | ']')) | Some(Token::Str(_)) | Some(Token::Template) => false,
+        _ => true,
+    }
+}
+
+/// Hand a closed frame's findings on: the config's `build` object becomes the
+/// config's `build` value (a later `build` key replaces an earlier one, as in
+/// JavaScript), and a config object that had a `build` key reports it.
+fn close_frame(frame: Frame, parent: Option<&mut Frame>, results: &mut Vec<Slot>) {
+    if frame.config_build {
+        match parent {
+            Some(parent) => parent.build = frame.out_dir,
+            None => results.push(frame.out_dir),
+        }
+    } else if frame.config && frame.build != Slot::Absent {
         results.push(frame.build);
     }
 }
 
 /// Find `build: { outDir: '<literal>' }` in a Vite config.
 ///
-/// Only an `outDir` whose enclosing object is the value of a `build` key
-/// counts — plugins commonly take their own `outDir` option (e.g. a type
-/// declaration plugin) that has nothing to do with the bundle. The value must
-/// be a plain string literal immediately followed by `,` or `}`; anything else
-/// (a call such as `resolve(__dirname, 'out')`, a concatenation, a template
-/// with interpolation, a variable) is reported as unresolvable rather than
-/// guessed.
+/// Only the `build` key of a config object counts: an object literal that is
+/// not nested in another object, array or plugin call — the argument of
+/// `defineConfig(...)`/`mergeConfig(...)`, `export default {...}`,
+/// `module.exports = {...}`, or an object returned from a config function
+/// (every branch of a ternary or `if` included). A `build` key anywhere else —
+/// plugin options (`plugins: [somePlugin({ build })]`), `worker`, `ssr`,
+/// `test`, `environments` — is not Vite's build settings and is ignored, as is
+/// any `outDir` outside the config's own `build` object (a type declaration
+/// plugin's `outDir`, `build.rollupOptions.output.dir`, `build.lib`). The
+/// value must be a plain string literal immediately followed by `,` or `}`;
+/// anything else (a call such as `resolve(__dirname, 'out')`, a
+/// concatenation, a template with interpolation, a variable) is reported as
+/// unresolvable rather than guessed.
 ///
 /// Object semantics are respected where they could change the answer: a later
 /// duplicate key wins, while a spread (`...shared`) or computed key (`[k]:`)
-/// after the literal — in the `build` object, or after `build` in the object
-/// holding it — may replace it, so the result is unresolvable. The same holds
-/// for a config object passed as a non-final argument (`mergeConfig({..}, x)`)
-/// and for a `build` value that is not an object literal (`build: shared`).
-/// A spread *before* the literal is overridden by it and is harmless.
+/// after the literal — in the config's `build` object, or after `build` in the
+/// config object — may replace it, so the result is unresolvable. The same
+/// holds for a config object passed as a non-final argument
+/// (`mergeConfig({..}, x)`) and for a config `build` value that is not an
+/// object literal (`build: shared`). A spread *before* the literal is
+/// overridden by it and is harmless.
 fn parse_vite_out_dir(source: &str) -> OutDir {
     let tokens = tokenize(source);
     let mut frames: Vec<Frame> = Vec::new();
@@ -569,28 +646,54 @@ fn parse_vite_out_dir(source: &str) -> OutDir {
         matches!(tokens.get(index), Some(Token::Punct(c)) if expected.contains(c))
     };
     for (index, token) in tokens.iter().enumerate() {
-        let in_object = frames.last().is_some_and(|frame| frame.opener == '{');
-        // The token begins an object member (key, spread or computed key).
-        let member_start = in_object && index > 0 && punct_at(index - 1, &['{', ',']);
+        let prev = index.checked_sub(1).and_then(|i| tokens.get(i));
+        let config_scope = frames.last().is_none_or(|frame| frame.config_scope);
+        // The token begins a member (key, spread or computed key) of the
+        // config object or of its `build` object.
+        let tracked_member = frames.last().is_some_and(Frame::tracked)
+            && index > 0
+            && punct_at(index - 1, &['{', ',']);
         match token {
-            Token::Punct(open @ ('{' | '(' | '[')) => {
-                if *open == '[' && member_start {
+            Token::Punct('{') => {
+                let frame = if opens_object(prev) {
+                    let key = (index >= 2 && punct_at(index - 1, &[':']))
+                        .then(|| key_at(index - 2))
+                        .flatten();
+                    let parent_is_config = frames.last().is_some_and(|frame| frame.config);
+                    Frame::object(
+                        config_scope,
+                        parent_is_config && key.as_deref() == Some("build"),
+                    )
+                } else {
+                    Frame::new(FrameKind::Block, config_scope)
+                };
+                frames.push(frame);
+            }
+            Token::Punct('(') => {
+                let frame = if paren_keeps_config_scope(&tokens, index) {
+                    Frame::new(FrameKind::Paren, config_scope)
+                } else {
+                    Frame::new(FrameKind::Opaque, false)
+                };
+                frames.push(frame);
+            }
+            Token::Punct('[') => {
+                if tracked_member {
                     if let Some(frame) = frames.last_mut() {
                         frame.out_dir.overridden(SPREAD_OVERRIDE);
                         frame.build.overridden(SPREAD_OVERRIDE);
                     }
                 }
-                let key = (*open == '{' && index >= 2 && punct_at(index - 1, &[':']))
-                    .then(|| key_at(index - 2))
-                    .flatten();
-                frames.push(Frame::new(*open, key));
+                frames.push(Frame::new(FrameKind::Opaque, false));
             }
             Token::Punct('}' | ')' | ']') => {
                 if let Some(mut frame) = frames.pop() {
                     // `mergeConfig({ build }, other)`: a later argument may
-                    // replace this object's `build`.
-                    let later_argument = frame.opener == '{'
-                        && frames.last().is_some_and(|parent| parent.opener == '(')
+                    // replace this config's `build`.
+                    let later_argument = frame.config
+                        && frames
+                            .last()
+                            .is_some_and(|parent| parent.kind == FrameKind::Paren)
                         && punct_at(index + 1, &[','])
                         && !punct_at(index + 2, &[')']);
                     if later_argument {
@@ -602,20 +705,20 @@ fn parse_vite_out_dir(source: &str) -> OutDir {
                 }
             }
             Token::Punct('.')
-                if member_start && punct_at(index + 1, &['.']) && punct_at(index + 2, &['.']) =>
+                if tracked_member && punct_at(index + 1, &['.']) && punct_at(index + 2, &['.']) =>
             {
                 if let Some(frame) = frames.last_mut() {
                     frame.out_dir.overridden(SPREAD_OVERRIDE);
                     frame.build.overridden(SPREAD_OVERRIDE);
                 }
             }
-            Token::Word(_) | Token::Str(_) if member_start => {
+            Token::Word(_) | Token::Str(_) if tracked_member => {
                 let Some(frame) = frames.last_mut() else {
                     continue;
                 };
                 let shorthand = matches!(token, Token::Word(_)) && punct_at(index + 1, &[',', '}']);
                 match key_at(index).as_deref() {
-                    Some("outDir") if frame.is_build_object() => {
+                    Some("outDir") if frame.config_build => {
                         if punct_at(index + 1, &[':']) {
                             frame.out_dir = match (tokens.get(index + 2), tokens.get(index + 3)) {
                                 (Some(Token::Str(value)), Some(Token::Punct(',' | '}'))) => {
@@ -629,7 +732,7 @@ fn parse_vite_out_dir(source: &str) -> OutDir {
                                 Slot::Unknown("build.outDir is not a plain string literal");
                         }
                     }
-                    Some("build") => {
+                    Some("build") if frame.config => {
                         if punct_at(index + 1, &[':']) {
                             let plain_value = matches!(
                                 tokens.get(index + 2),
@@ -1138,6 +1241,117 @@ mod tests {
             parse_vite_out_dir("export default mergeConfig(base, { build: { outDir: 'build' } })"),
             OutDir::Literal("build".into())
         );
+    }
+
+    #[test]
+    fn out_dir_plugin_build_options_are_not_vite_settings() {
+        // A plugin's own `build` option must not make the config unreadable.
+        for config in [
+            "export default { build: { outDir: 'build' }, plugins: [somePlugin({ build: buildOptions })] }",
+            "export default { plugins: [somePlugin({ build: buildOptions })], build: { outDir: 'build' } }",
+            "export default defineConfig({ build: { outDir: 'build' }, plugins: [somePlugin({ build: { outDir: 'other', ...rest } })] })",
+            "export default { build: { outDir: 'build' }, plugins: [{ name: 'p', config: () => ({ build: shared }) }] }",
+            "const plugin = somePlugin({ build: buildOptions });\nexport default { plugins: [plugin], build: { outDir: 'build' } }",
+            "export default withWrapper({ build: { outDir: 'build' }, plugins: [p({ build })] })",
+        ] {
+            assert_eq!(
+                parse_vite_out_dir(config),
+                OutDir::Literal("build".into()),
+                "{config}"
+            );
+        }
+        // A plugin's `build.outDir` alone leaves Vite's default in place.
+        for config in [
+            "export default { plugins: [somePlugin({ build: { outDir: 'x' } })] }",
+            "export default defineConfig({ plugins: [somePlugin({ build: { outDir: 'x' } })] })",
+            "const plugin = somePlugin({ build: { outDir: 'x' } });\nexport default { plugins: [plugin] }",
+        ] {
+            assert_eq!(parse_vite_out_dir(config), OutDir::Absent, "{config}");
+        }
+    }
+
+    #[test]
+    fn out_dir_build_nested_below_the_config_is_ignored() {
+        for nested in [
+            "worker: { build: shared }",
+            "worker: { build: { outDir: 'worker' } }",
+            "ssr: { build: { outDir: 'ssr' } }",
+            "server: { build }",
+            "resolve: { build: x }",
+            "test: { build: { outDir: 'coverage' } }",
+            "environments: { ssr: { build: { outDir: 'ssr' } } }",
+        ] {
+            let with_build = format!("export default {{ {nested}, build: {{ outDir: 'build' }} }}");
+            assert_eq!(
+                parse_vite_out_dir(&with_build),
+                OutDir::Literal("build".into()),
+                "{with_build}"
+            );
+            let without_build = format!("export default defineConfig({{ {nested} }})");
+            assert_eq!(
+                parse_vite_out_dir(&without_build),
+                OutDir::Absent,
+                "{without_build}"
+            );
+        }
+    }
+
+    #[test]
+    fn out_dir_outside_the_config_build_object_is_ignored() {
+        for config in [
+            "export default { outDir: 'x' }",
+            "export default { build: { rollupOptions: { output: { dir: 'y', outDir: 'z' } } } }",
+            "export default { build: { lib: { outDir: 'z' }, rollupOptions: { ...shared } } }",
+        ] {
+            assert_eq!(parse_vite_out_dir(config), OutDir::Absent, "{config}");
+        }
+    }
+
+    #[test]
+    fn out_dir_config_returned_from_a_function_counts() {
+        assert_eq!(
+            parse_vite_out_dir(
+                "export default defineConfig(async ({ mode }) => {\n  const env = loadEnv(mode, process.cwd(), '');\n  return { plugins: [p({ build: env })], build: { outDir: 'out' } };\n})"
+            ),
+            OutDir::Literal("out".into())
+        );
+        assert_eq!(
+            parse_vite_out_dir(
+                "export default defineConfig(({ mode }) => {\n  if (mode === 'a') {\n    return { build: { outDir: 'out' } };\n  }\n  return { build: { outDir: 'out' } };\n})"
+            ),
+            OutDir::Literal("out".into())
+        );
+        assert!(matches!(
+            parse_vite_out_dir(
+                "export default defineConfig(({ mode }) => {\n  if (mode === 'a') {\n    return { build: { outDir: 'a' } };\n  }\n  return { build: { outDir: 'b' } };\n})"
+            ),
+            OutDir::Unresolvable(_)
+        ));
+        assert!(matches!(
+            parse_vite_out_dir(
+                "export default function config() { return { build: { outDir: 'build' }, ...extra } }"
+            ),
+            OutDir::Unresolvable(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn plugin_build_option_does_not_change_the_nginx_stage() {
+        for (config, expected) in [
+            (
+                "export default { build: { outDir: 'build' }, plugins: [somePlugin({ build: buildOptions })] }",
+                "/app/build /usr/share/nginx/html",
+            ),
+            (
+                "export default { plugins: [somePlugin({ build: { outDir: 'x' } })] }",
+                "/app/dist /usr/share/nginx/html",
+            ),
+        ] {
+            let dir = app(&[("package.json", BUILDABLE), ("vite.config.ts", config)]);
+            let result = render(dir.path()).await;
+            assert!(result.content.contains(expected), "{config}: {}", result.content);
+            assert!(result.warnings.is_empty(), "{config}: {:?}", result.warnings);
+        }
     }
 
     #[tokio::test]
