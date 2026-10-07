@@ -894,17 +894,39 @@ impl PostgresService {
     /// cancelled restore staged on the volume. Exits 0 once the fetch is
     /// confirmed gone (or none was running) and 3 if it is still alive, in
     /// which case nothing is deleted.
+    ///
+    /// A recorded PID is only signalled while it still belongs to a
+    /// `backup-fetch` process: the file can outlive the fetch (a crash, a
+    /// container restart) and its PID be reused by a PostgreSQL backend,
+    /// which must never be killed. The identity comes from
+    /// `/proc/<pid>/cmdline`, falling back to `ps` where `/proc` is absent.
     fn walg_fetch_abort_script(restore_temp: &str) -> String {
         Self::walg_fetch_abort_script_with(restore_temp, WALG_FETCH_PID_FILE)
     }
 
+    /// The command that runs WAL-G `backup-fetch` into `restore_temp`.
+    ///
+    /// The fetch runs in the background of its shell so its PID can be
+    /// recorded: a cancelled restore stops it by PID (see `stop_walg_fetch`)
+    /// instead of depending on pkill being installed. The PID file is removed
+    /// as soon as the fetch exits (keeping its exit code), so it never names
+    /// a process that is not the fetch.
+    fn walg_fetch_command(restore_temp: &str, fetch_target: &str) -> String {
+        format!(
+            "mkdir -p {restore_temp} && rm -rf {restore_temp}/* && {{ wal-g backup-fetch {restore_temp} {fetch_target} > /tmp/walg_restore.log 2>&1 & echo $! > {WALG_FETCH_PID_FILE}; wait $!; rc=$?; rm -f {WALG_FETCH_PID_FILE}; exit $rc; }}"
+        )
+    }
+
     fn walg_fetch_abort_script_with(restore_temp: &str, pid_file: &str) -> String {
         format!(
-            "if [ -f {pid_file} ]; then pid=$(cat {pid_file}); kill \"$pid\" 2>/dev/null; \
-             i=0; while kill -0 \"$pid\" 2>/dev/null && [ $i -lt 10 ]; do sleep 1; i=$((i+1)); done; \
-             if kill -0 \"$pid\" 2>/dev/null; then kill -9 \"$pid\" 2>/dev/null; \
-             i=0; while kill -0 \"$pid\" 2>/dev/null && [ $i -lt 5 ]; do sleep 1; i=$((i+1)); done; fi; \
-             if kill -0 \"$pid\" 2>/dev/null; then echo \"wal-g backup-fetch (pid $pid) is still running\" >&2; exit 3; fi; fi; \
+            "is_fetch() {{ if [ -r /proc/$1/cmdline ]; then tr '\\000' ' ' < /proc/$1/cmdline | grep -q backup-fetch; \
+             else ps -p \"$1\" -o args= 2>/dev/null | grep -q backup-fetch; fi; }}; \
+             if [ -f {pid_file} ]; then pid=$(cat {pid_file}); \
+             if [ -n \"$pid\" ] && is_fetch \"$pid\"; then kill \"$pid\" 2>/dev/null; \
+             i=0; while is_fetch \"$pid\" && [ $i -lt 10 ]; do sleep 1; i=$((i+1)); done; \
+             if is_fetch \"$pid\"; then kill -9 \"$pid\" 2>/dev/null; \
+             i=0; while is_fetch \"$pid\" && [ $i -lt 5 ]; do sleep 1; i=$((i+1)); done; fi; \
+             if is_fetch \"$pid\"; then echo \"wal-g backup-fetch (pid $pid) is still running\" >&2; exit 3; fi; fi; fi; \
              rm -rf {restore_temp} /var/lib/postgresql/walg-restore.env {pid_file}",
             pid_file = pid_file,
             restore_temp = restore_temp,
@@ -2118,12 +2140,7 @@ impl PostgresService {
         } else {
             "LATEST"
         };
-        // The fetch runs in the background of its shell so its PID can be
-        // recorded: a cancelled restore kills it by PID (see
-        // `stop_walg_fetch`) instead of depending on pkill being installed.
-        let fetch_cmd_str = format!(
-            "mkdir -p {restore_temp} && rm -rf {restore_temp}/* && {{ wal-g backup-fetch {restore_temp} {fetch_target} > /tmp/walg_restore.log 2>&1 & echo $! > {WALG_FETCH_PID_FILE}; wait $!; }}"
-        );
+        let fetch_cmd_str = Self::walg_fetch_command(restore_temp, fetch_target);
         let fetch_cmd = vec!["sh", "-c", &fetch_cmd_str];
 
         let exec = self
@@ -4643,7 +4660,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn abort_script_confirms_the_fetch_is_gone_before_deleting_staged_data() {
-        let (status, staged_left) = run_abort_script("sleep 60", "term");
+        let (status, staged_left) = run_abort_script("sh -c 'sleep 60; :' backup-fetch", "term");
         assert!(status.success(), "{status:?}");
         assert!(
             !staged_left,
@@ -4654,10 +4671,98 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn abort_script_escalates_to_sigkill_for_a_fetch_that_ignores_sigterm() {
-        let (status, staged_left) =
-            run_abort_script("sh -c \"trap '' TERM; while :; do sleep 1; done\"", "kill");
+        let (status, staged_left) = run_abort_script(
+            "sh -c \"trap '' TERM; while :; do sleep 1; done\" backup-fetch",
+            "kill",
+        );
         assert!(status.success(), "{status:?}");
         assert!(!staged_left);
+    }
+
+    /// REGRESSION (Greptile on #1295): a PID file left behind may name a
+    /// process that is no longer the fetch (a reused PID, e.g. a PostgreSQL
+    /// backend). It must never be signalled; the stale file is just removed.
+    #[cfg(unix)]
+    #[test]
+    fn abort_script_never_signals_a_reused_pid() {
+        let dir = std::env::temp_dir().join(format!("walg-abort-stale-{}", std::process::id()));
+        let staged = dir.join("restore_temp");
+        std::fs::create_dir_all(&staged).expect("create staged dir");
+        let pid_file = dir.join("walg_fetch.pid");
+        let mut unrelated = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn unrelated process");
+        std::fs::write(&pid_file, unrelated.id().to_string()).expect("write stale pid");
+        let script = PostgresService::walg_fetch_abort_script_with(
+            &staged.display().to_string(),
+            &pid_file.display().to_string(),
+        );
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .status()
+            .expect("run abort script");
+        let still_alive = unrelated
+            .try_wait()
+            .expect("poll unrelated process")
+            .is_none();
+        let _ = unrelated.kill();
+        let _ = unrelated.wait();
+        let staged_left = staged.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(status.success(), "{status:?}");
+        assert!(
+            still_alive,
+            "an unrelated process with the recorded PID was killed"
+        );
+        assert!(!staged_left);
+    }
+
+    /// REGRESSION (Greptile on #1295): a finished fetch must not leave its
+    /// PID file behind for a later stop to act on.
+    #[test]
+    fn walg_fetch_removes_its_pid_file_when_it_exits() {
+        let command = PostgresService::walg_fetch_command(WALG_RESTORE_TEMP, "LATEST");
+        let wait = command.find("wait $!").expect("waits for the fetch");
+        let cleanup = command
+            .find(&format!("rm -f {}", WALG_FETCH_PID_FILE))
+            .expect("removes the pid file");
+        assert!(wait < cleanup, "{command}");
+        assert!(
+            command.ends_with("exit $rc; }"),
+            "keeps the fetch exit code: {command}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walg_fetch_command_runs_and_cleans_up_its_pid_file() {
+        // The real command with `wal-g` replaced by a stand-in that fails, run
+        // against a temp dir: the pid file is gone and the exit code kept.
+        let dir = std::env::temp_dir().join(format!("walg-fetch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let pid_file = dir.join("walg_fetch.pid");
+        let command =
+            PostgresService::walg_fetch_command(&dir.join("t").display().to_string(), "LATEST")
+                .replace("wal-g backup-fetch", "false")
+                .replace(
+                    "/tmp/walg_restore.log",
+                    &dir.join("log").display().to_string(),
+                )
+                .replace(WALG_FETCH_PID_FILE, &pid_file.display().to_string());
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .status()
+            .expect("run fetch command");
+        let pid_file_left = pid_file.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(status.code(), Some(1), "the fetch's exit code is kept");
+        assert!(
+            !pid_file_left,
+            "the pid file must be removed when the fetch exits"
+        );
     }
 
     #[test]

@@ -2404,9 +2404,15 @@ async fn run_restore_inner(
             // gate) rather than dropping it mid-call: a dropped Docker request
             // can still create a container or volume after teardown looked.
             // Only once the engine has returned is the service torn down.
-            let provisioned = instance
-                .restore_to_new_service(ctx, name.clone(), parameter_overrides)
-                .await;
+            let fence = super::restore_reconcile::ManagerRestoreFence::new(mgr.clone());
+            let provisioned = await_new_service_provision(
+                instance.restore_to_new_service(ctx, name.clone(), parameter_overrides),
+                &cancel,
+                &fence,
+                &new_service_fence_target(&name, service_type),
+                NEW_SERVICE_CANCEL_FENCE_INTERVAL,
+            )
+            .await;
             if cancel.is_cancelled() {
                 return Err(cancel_new_service(&db, &mgr, run_id, &name, service_type).await);
             }
@@ -2431,9 +2437,15 @@ async fn run_restore_inner(
                     })?;
                 // As for a new-service restore: let the recovery return
                 // before tearing down what it created.
-                let recovered = instance
-                    .restore_pitr(ctx, target, true, new_service_name.clone())
-                    .await;
+                let fence = super::restore_reconcile::ManagerRestoreFence::new(mgr.clone());
+                let recovered = await_new_service_provision(
+                    instance.restore_pitr(ctx, target, true, new_service_name.clone()),
+                    &cancel,
+                    &fence,
+                    &new_service_fence_target(&name, service_type),
+                    NEW_SERVICE_CANCEL_FENCE_INTERVAL,
+                )
+                .await;
                 if cancel.is_cancelled() {
                     return Err(cancel_new_service(&db, &mgr, run_id, &name, service_type).await);
                 }
@@ -2539,6 +2551,60 @@ async fn run_restore_inner(
     };
 
     Ok(target_service_id)
+}
+
+/// How often a cancelled new-service restore re-stops its helpers while the
+/// engine winds down.
+const NEW_SERVICE_CANCEL_FENCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
+fn new_service_fence_target(
+    name: &str,
+    service_type: ServiceType,
+) -> super::restore_reconcile::FenceTarget {
+    super::restore_reconcile::FenceTarget {
+        service_name: name.to_string(),
+        service_type: service_type.to_string(),
+        imported_container: None,
+    }
+}
+
+/// Await an engine call that provisions a new service, staying responsive to
+/// cancellation without abandoning it.
+///
+/// The call is never dropped mid-flight: a dropped Docker request can still
+/// create a container or volume after teardown has looked. Not every engine
+/// checks the restore gate, though (a Redis WAL-G helper can run for an
+/// hour), so once `cancel` fires the new service's restore helpers and staged
+/// downloads are stopped every `interval` until the engine returns, which
+/// makes it fail fast instead of finishing a restore that will be torn down.
+async fn await_new_service_provision<T>(
+    provision: impl std::future::Future<Output = T>,
+    cancel: &tokio_util::sync::CancellationToken,
+    fence: &dyn super::restore_reconcile::RestoreHelperFence,
+    target: &super::restore_reconcile::FenceTarget,
+    interval: std::time::Duration,
+) -> T {
+    tokio::pin!(provision);
+    tokio::select! {
+        biased;
+        output = &mut provision => return output,
+        _ = cancel.cancelled() => {}
+    }
+    let mut ticks = tokio::time::interval(interval);
+    loop {
+        tokio::select! {
+            biased;
+            output = &mut provision => return output,
+            _ = ticks.tick() => {
+                if let Err(e) = fence.fence(target).await {
+                    warn!(
+                        "Cancelled restore into '{}' could not stop its restore helpers yet: {}",
+                        target.service_name, e
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Map an engine error to a [`RestoreError`], keeping the one outcome the
@@ -4465,6 +4531,83 @@ mod tests {
         assert!(!engines_compatible("postgres", "redis"));
         assert!(!engines_compatible("mongodb", "mariadb"));
         assert!(!engines_compatible("s3", "postgres"));
+    }
+
+    /// Fence that records calls and, on its first call, lets the stand-in
+    /// engine finish (as stopping a real engine's helper would).
+    struct ReleasingFence {
+        calls: std::sync::atomic::AtomicUsize,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl super::super::restore_reconcile::RestoreHelperFence for ReleasingFence {
+        async fn fence(
+            &self,
+            _target: &super::super::restore_reconcile::FenceTarget,
+        ) -> Result<
+            temps_providers::externalsvc::restore_helper::RestoreFenceReport,
+            temps_providers::externalsvc::restore_helper::RestoreFenceError,
+        > {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.release.notify_one();
+            Ok(Default::default())
+        }
+    }
+
+    /// REGRESSION (Greptile on #1295): an engine that never checks the gate
+    /// (a Redis WAL-G helper can run for an hour) must still stop promptly
+    /// once cancelled: its helpers are stopped while the call is awaited, and
+    /// the call itself is never dropped.
+    #[tokio::test]
+    async fn cancelled_provision_stops_helpers_and_is_still_awaited() {
+        let fence = ReleasingFence {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            release: tokio::sync::Notify::new(),
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let finished = std::sync::atomic::AtomicBool::new(false);
+        // Stand-in engine: ignores cancellation, only returns once its
+        // helper is stopped.
+        let provision = async {
+            fence.release.notified().await;
+            finished.store(true, std::sync::atomic::Ordering::SeqCst);
+            "helper stopped"
+        };
+        cancel.cancel();
+        let output = await_new_service_provision(
+            provision,
+            &cancel,
+            &fence,
+            &new_service_fence_target("copy", ServiceType::Redis),
+            std::time::Duration::from_millis(10),
+        )
+        .await;
+        assert_eq!(output, "helper stopped");
+        assert!(
+            finished.load(std::sync::atomic::Ordering::SeqCst),
+            "the call ran to completion"
+        );
+        assert!(fence.calls.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn uncancelled_provision_never_touches_helpers() {
+        let fence = ReleasingFence {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            release: tokio::sync::Notify::new(),
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let output = await_new_service_provision(
+            async { 42 },
+            &cancel,
+            &fence,
+            &new_service_fence_target("copy", ServiceType::Redis),
+            std::time::Duration::from_secs(3),
+        )
+        .await;
+        assert_eq!(output, 42);
+        assert_eq!(fence.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     /// REGRESSION (Greptile on #1295): a download that could not be
