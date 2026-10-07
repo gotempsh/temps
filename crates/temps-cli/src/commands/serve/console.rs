@@ -4079,12 +4079,20 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                     // can retrieve it for HTTP query endpoints.
                     service_context.register_service(metrics_store.clone());
 
-                    let scraper = Arc::new(MetricsScraper::new(
-                        db.clone(),
-                        metrics_store.clone(),
-                        cfg_svc,
-                        enc_svc,
-                    ));
+                    let mut scraper =
+                        MetricsScraper::new(db.clone(), metrics_store.clone(), cfg_svc, enc_svc);
+                    // HA clusters are scraped at their elected primary, which
+                    // only the providers layer can resolve.
+                    match service_context.get_service::<temps_providers::ExternalServiceManager>() {
+                        Some(manager) => {
+                            scraper = scraper.with_cluster_primary_connector(manager);
+                        }
+                        None => warn!(
+                            "ExternalServiceManager not available - HA cluster database metrics \
+                             will not be collected"
+                        ),
+                    }
+                    let scraper = Arc::new(scraper);
 
                     tokio::spawn(async move {
                         scraper.start().await;

@@ -189,6 +189,35 @@ fn exec_failure_message(
     ))
 }
 
+/// Make sure the Docker network a managed-service container is asked to join
+/// exists before the container is created.
+///
+/// The deployer creates the Temps app network on a worker's first
+/// deployment, so a worker that had never run one had no such network, and
+/// the first managed service (or HA cluster member) placed on it failed with
+/// "network ... not found". Only `app_network` is created here; any other
+/// name is left to Docker, which reports it as before. Returns the app
+/// network's name when the container joins it, so the caller can apply the
+/// cloud-metadata egress block the deployer applies to it.
+async fn ensure_service_network<'a>(
+    docker: &bollard::Docker,
+    requested: Option<&'a str>,
+    app_network: &str,
+) -> Result<Option<&'a str>, String> {
+    let Some(name) = requested.filter(|name| *name == app_network) else {
+        return Ok(None);
+    };
+    let outcome = temps_core::docker_network::ensure_bridge_network(docker, name)
+        .await
+        .map_err(|e| {
+            format!("Failed to create Docker network '{name}' for the service container: {e}")
+        })?;
+    if outcome != temps_core::docker_network::NetworkEnsured::Existing {
+        tracing::info!(network = name, outcome = ?outcome, "Created the Temps app network for a managed service");
+    }
+    Ok(Some(name))
+}
+
 fn error_response(status: StatusCode, message: String) -> impl IntoResponse {
     (
         status,
@@ -348,6 +377,35 @@ pub async fn create_service(
             dns = ?dns,
             "Wiring temps DNS into container resolv.conf"
         );
+    }
+
+    match ensure_service_network(
+        docker,
+        request.network.as_deref(),
+        temps_core::NETWORK_NAME.as_str(),
+    )
+    .await
+    {
+        Ok(Some(app_network)) => {
+            // Same guard the deployer applies to the app network on every
+            // deploy; best-effort, never fails the service.
+            if let Err(error) =
+                temps_deployer::metadata_egress::apply_metadata_egress_block(docker, app_network)
+                    .await
+            {
+                tracing::warn!(
+                    network = app_network,
+                    error = %error,
+                    "Cloud-metadata egress block is incomplete; ensure nftables is installed and \
+                     the agent has CAP_NET_ADMIN"
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(message) => {
+            tracing::error!(service = %container_name, "{}", message);
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, message).into_response();
+        }
     }
 
     let mut host_config = bollard::models::HostConfig {
@@ -2316,5 +2374,97 @@ mod service_port_binding_tests {
         assert_eq!(auto_assign.host_ip.as_deref(), Some("10.100.0.2"));
         assert_ne!(auto_assign.host_ip.as_deref(), Some("0.0.0.0"));
         assert_eq!(auto_assign.host_port, None);
+    }
+}
+
+#[cfg(test)]
+mod service_network_tests {
+    use super::ensure_service_network;
+
+    async fn docker() -> Option<bollard::Docker> {
+        let docker = match bollard::Docker::connect_with_local_defaults() {
+            Ok(docker) => docker,
+            Err(e) => {
+                println!("Docker not available, skipping: {e}");
+                return None;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker daemon not responding, skipping");
+            return None;
+        }
+        Some(docker)
+    }
+
+    async fn network_exists(docker: &bollard::Docker, name: &str) -> bool {
+        docker
+            .inspect_network(
+                name,
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await
+            .is_ok()
+    }
+
+    fn unique(prefix: &str) -> String {
+        format!(
+            "{prefix}-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        )
+    }
+
+    /// Regression: an HA cluster member placed on a worker that had never
+    /// run a deployment failed with "network temps-app-network not found",
+    /// because only the deployer ever created the app network.
+    #[tokio::test]
+    async fn creates_the_app_network_on_a_fresh_worker() {
+        let Some(docker) = docker().await else {
+            return;
+        };
+        let app_network = unique("temps-agent-net-it");
+        assert!(!network_exists(&docker, &app_network).await);
+
+        let first = ensure_service_network(&docker, Some(&app_network), &app_network).await;
+        let created = network_exists(&docker, &app_network).await;
+        // Idempotent: a second service on the same worker finds it in place.
+        let second = ensure_service_network(&docker, Some(&app_network), &app_network).await;
+        let _ = docker.remove_network(&app_network).await;
+
+        assert_eq!(first, Ok(Some(app_network.as_str())));
+        assert!(
+            created,
+            "the app network must exist after the first service"
+        );
+        assert_eq!(second, Ok(Some(app_network.as_str())));
+    }
+
+    /// Only the Temps app network is ever created; any other requested name
+    /// is left to Docker, and no network at all is a no-op.
+    #[tokio::test]
+    async fn never_creates_other_networks() {
+        let Some(docker) = docker().await else {
+            return;
+        };
+        let app_network = unique("temps-agent-net-it");
+        let other = unique("temps-agent-other-it");
+
+        let result = ensure_service_network(&docker, Some(&other), &app_network).await;
+        let other_created = network_exists(&docker, &other).await;
+        let none = ensure_service_network(&docker, None, &app_network).await;
+        let app_created = network_exists(&docker, &app_network).await;
+        if other_created {
+            let _ = docker.remove_network(&other).await;
+        }
+        if app_created {
+            let _ = docker.remove_network(&app_network).await;
+        }
+
+        assert_eq!(result, Ok(None));
+        assert!(
+            !other_created,
+            "a network other than the app network must not be created"
+        );
+        assert_eq!(none, Ok(None));
+        assert!(!app_created, "no requested network must create nothing");
     }
 }
