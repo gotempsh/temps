@@ -92,7 +92,26 @@ pub(crate) fn external_service_problem(
     error: &crate::services::ExternalServiceError,
     detail: String,
 ) -> Problem {
-    worker_node_required(error).unwrap_or_else(|| internal_server_error().detail(detail).build())
+    worker_node_required(error)
+        .or_else(|| cluster_placement_problem(error))
+        .unwrap_or_else(|| internal_server_error().detail(detail).build())
+}
+
+/// A cluster placement the current configuration cannot serve: members on
+/// worker nodes could not reach members on the control plane. A 409 with the
+/// remedy in `detail`, never a 500 — nothing failed, the operator has a
+/// configuration step to take first.
+fn cluster_placement_problem(error: &crate::services::ExternalServiceError) -> Option<Problem> {
+    use crate::services::ExternalServiceError as E;
+    match error {
+        E::ControlPlaneAddressRequired { .. } | E::ControlPlaneMemberUnreachable { .. } => Some(
+            conflict()
+                .title("Cluster Placement Not Reachable")
+                .detail(error.to_string())
+                .build(),
+        ),
+        _ => None,
+    }
 }
 
 /// Get available service types
@@ -812,7 +831,9 @@ fn service_create_failure_code(
         }
         E::ParameterValidationFailed { .. }
         | E::InvalidServiceType { .. }
-        | E::InvalidDatabaseProvisioning { .. } => OperationFailureCode::InvalidConfiguration,
+        | E::InvalidDatabaseProvisioning { .. }
+        | E::ControlPlaneAddressRequired { .. }
+        | E::ControlPlaneMemberUnreachable { .. } => OperationFailureCode::InvalidConfiguration,
         E::DuplicateServiceType { .. } => OperationFailureCode::Conflict,
         E::ProjectNotFound { .. } | E::EnvironmentNotFound { .. } => OperationFailureCode::NotFound,
         E::DatabaseError { .. } => OperationFailureCode::Database,
@@ -4042,6 +4063,45 @@ mod tests {
             // The shared upgrade/start/stop mapping must agree with it.
             let shared = upgrade_error_problem(error).expect("shared mapping classifies it");
             assert_eq!(shared.body.get("detail"), problem.body.get("detail"));
+        }
+    }
+
+    /// A cluster whose worker members could not reach its control-plane
+    /// members is a configuration conflict with a remedy — a 409 carrying the
+    /// cluster name and the fix, through every handler's generic path, and
+    /// classified as invalid configuration for telemetry.
+    #[test]
+    fn unreachable_cluster_placement_is_an_actionable_conflict() {
+        use crate::services::ExternalServiceError as E;
+
+        let no_address = E::ControlPlaneAddressRequired {
+            name: "ha-pg".to_string(),
+            reason: "no control-plane private address is configured".to_string(),
+        };
+        let loopback_only = E::ControlPlaneMemberUnreachable {
+            name: "ha-pg".to_string(),
+            container_name: "postgres-ha-pg-monitor".to_string(),
+            port: 6090,
+            address: "10.52.0.10".to_string(),
+        };
+
+        for (error, remedy) in [
+            (&no_address, "--private-address"),
+            (&loopback_only, "recreate it"),
+        ] {
+            let problem = external_service_problem(error, "Failed to do a thing".to_string());
+            assert_eq!(problem.status_code, StatusCode::CONFLICT, "{error}");
+            let detail = problem
+                .body
+                .get("detail")
+                .and_then(|v| v.as_str())
+                .expect("detail is always set");
+            assert!(detail.contains("ha-pg"), "{detail}");
+            assert!(detail.contains(remedy), "{detail}");
+            assert_eq!(
+                service_create_failure_code(error),
+                OperationFailureCode::InvalidConfiguration
+            );
         }
     }
 

@@ -260,6 +260,71 @@ fn select_member_dns_endpoint(
     underlay_endpoint
 }
 
+/// The address a control-plane cluster member advertises to, and publishes
+/// its port on for, members running on worker nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ControlPlaneMemberAddress {
+    ip: std::net::IpAddr,
+    /// `false` when the operator's private address is publicly routable and no
+    /// WireGuard mesh is on, so the member's port is published on a public
+    /// interface (the same trade-off a direct-mode worker makes).
+    private: bool,
+}
+
+/// Choose the control plane's cross-host address for cluster members.
+///
+/// Mirrors `nodes::Model::data_address` for workers: the operator's
+/// `multi_node.private_address` when it is private, the control plane's
+/// WireGuard mesh address when the private address is public and the mesh is
+/// on, otherwise the configured address as-is. Never guesses: an address
+/// derived from the default route is usually the public interface on a VPC
+/// host, and publishing a database there is both unreachable over the VPC
+/// and exposed to the internet.
+fn select_control_plane_member_address(
+    private_address: Option<&str>,
+    mesh_address: Option<std::net::IpAddr>,
+) -> Result<ControlPlaneMemberAddress, String> {
+    let configured = private_address.map(str::trim).filter(|a| !a.is_empty());
+    let Some(raw) = configured else {
+        return mesh_address
+            .map(|ip| ControlPlaneMemberAddress { ip, private: true })
+            .ok_or_else(|| "no control-plane private address is configured".to_string());
+    };
+
+    let ip = raw
+        .parse::<std::net::IpAddr>()
+        .or_else(|_| raw.parse::<std::net::SocketAddr>().map(|s| s.ip()))
+        .map_err(|e| {
+            format!(
+                "the configured control-plane private address '{raw}' is not an IP address: {e}"
+            )
+        })?;
+    let unusable = ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || match ip {
+            std::net::IpAddr::V4(v4) => v4.is_link_local() || v4.is_broadcast(),
+            std::net::IpAddr::V6(v6) => v6.is_unicast_link_local(),
+        };
+    if unusable {
+        return Err(format!(
+            "the configured control-plane private address '{raw}' cannot be reached from \
+             another host (loopback, link-local, multicast, broadcast or unspecified)"
+        ));
+    }
+
+    if temps_core::node_address::is_private_node_address(raw) {
+        return Ok(ControlPlaneMemberAddress { ip, private: true });
+    }
+    Ok(match mesh_address {
+        Some(mesh) => ControlPlaneMemberAddress {
+            ip: mesh,
+            private: true,
+        },
+        None => ControlPlaneMemberAddress { ip, private: false },
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServiceExecutionRoute {
     Local,
@@ -460,6 +525,34 @@ pub enum ExternalServiceError {
          plane with `--profile full`"
     )]
     LocalWorkloadsDisabled { name: String },
+
+    /// A cluster spans the control plane and worker nodes, but the control
+    /// plane has no address its workers can reach. Members on the control
+    /// plane would advertise an address nothing on a worker can connect to,
+    /// so data nodes could never register with a control-plane monitor.
+    #[error(
+        "Cluster '{name}' has members on both the control plane and worker nodes, but the \
+         control plane has no address the workers can reach: {reason}. Start the control plane \
+         with `temps serve --private-address <IP>` using its address on the network the workers \
+         share, or place every member on worker nodes"
+    )]
+    ControlPlaneAddressRequired { name: String, reason: String },
+
+    /// A worker member was requested for a cluster whose existing
+    /// control-plane member only publishes its port on loopback.
+    #[error(
+        "Cannot add a worker-node member to cluster '{name}': its control-plane member \
+         '{container_name}' publishes port {port} only on loopback, not on the control plane's \
+         address {address}, so a member on a worker could never reach it. The cluster was \
+         created with every member on the control plane (or by an earlier release); recreate it \
+         with the members placed where they should run"
+    )]
+    ControlPlaneMemberUnreachable {
+        name: String,
+        container_name: String,
+        port: u16,
+        address: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1126,6 +1219,9 @@ struct AddMemberPlan {
     member_fqdn: String,
     member_port: u16,
     member_params: crate::externalsvc::postgres_cluster::ClusterMemberCreateParams,
+    /// Where a control-plane member publishes its port for worker members,
+    /// in addition to loopback. `None` while the cluster is single-host.
+    control_plane_address: Option<std::net::IpAddr>,
 }
 
 /// Phases of the async `add_cluster_member` task. The strings here are
@@ -1638,21 +1734,65 @@ impl ExternalServiceManager {
         Ok(self.docker.require()?)
     }
 
-    /// Determine the local machine's private IP address for inter-node communication.
+    /// The address control-plane members of a cluster that also has worker
+    /// members advertise to those workers, and publish their ports on.
     ///
-    /// Uses a UDP socket to determine which interface would be used to reach
-    /// a public address (without actually sending any data). This gives us the
-    /// correct source IP for the machine's default route.
-    fn get_local_private_ip() -> Result<String, String> {
-        let socket = std::net::UdpSocket::bind("0.0.0.0:0")
-            .map_err(|e| format!("Failed to bind UDP socket: {}", e))?;
-        socket
-            .connect("8.8.8.8:80")
-            .map_err(|e| format!("Failed to connect UDP socket: {}", e))?;
-        let local_addr = socket
-            .local_addr()
-            .map_err(|e| format!("Failed to get local address: {}", e))?;
-        Ok(local_addr.ip().to_string())
+    /// Read from the operator's configuration (`multi_node.private_address`,
+    /// set by `temps serve --private-address`, or the control plane's mesh
+    /// address) — the same address deployments already give workers to reach
+    /// the control plane. This used to be guessed from the default route,
+    /// which on a VPC host is the public interface, and the member's port was
+    /// only published on loopback anyway, so worker data nodes could never
+    /// reach a control-plane monitor and the cluster stayed at zero
+    /// registered data nodes.
+    async fn control_plane_member_address(
+        &self,
+        cluster_name: &str,
+    ) -> Result<std::net::IpAddr, ExternalServiceError> {
+        let private_address = settings::Entity::find_by_id(1)
+            .one(self.db.as_ref())
+            .await?
+            .and_then(|row| {
+                temps_core::AppSettings::from_json(row.data)
+                    .multi_node
+                    .private_address
+            });
+        let mesh_address = temps_entities::network_config::Entity::find_by_id(1)
+            .one(self.db.as_ref())
+            .await?
+            .filter(|cfg| cfg.wireguard_enabled)
+            .map(|cfg| {
+                std::net::IpAddr::V4(temps_network::mesh::control_plane_mesh_address(
+                    temps_network::mesh::reserved_mesh_pool(&cfg.wireguard_cidr),
+                ))
+            });
+
+        let address = select_control_plane_member_address(private_address.as_deref(), mesh_address)
+            .map_err(|reason| ExternalServiceError::ControlPlaneAddressRequired {
+                name: cluster_name.to_string(),
+                reason,
+            })?;
+        if !address.private {
+            warn!(
+                cluster = cluster_name,
+                address = %address.ip,
+                "Control-plane cluster members will publish their ports on a publicly routable \
+                 address; enable the WireGuard mesh or use a private address to keep them off \
+                 the internet"
+            );
+        }
+        Ok(address.ip)
+    }
+
+    /// Whether a cluster member placement mixes the control plane
+    /// (`node_id` `None`, or the control-plane pseudo-node) with worker
+    /// nodes — the only topology in which control-plane members must be
+    /// reachable from another host.
+    fn cluster_spans_control_plane_and_workers(members: &[ClusterMemberRequest]) -> bool {
+        let is_local = |m: &ClusterMemberRequest| {
+            matches!(m.node_id, None | Some(Self::CONTROL_PLANE_NODE_ID))
+        };
+        members.iter().any(is_local) && members.iter().any(|m| !is_local(m))
     }
 
     pub async fn get_local_address(
@@ -2361,6 +2501,16 @@ impl ExternalServiceManager {
             return Err(ExternalServiceError::LocalWorkloadsDisabled {
                 name: request.name.clone(),
             });
+        }
+
+        // A cluster spanning the control plane and workers needs a
+        // control-plane address the workers can reach. Cluster creation runs
+        // in the background, so check it here, before any row exists, and
+        // answer the request with the remedy instead of a half-built cluster.
+        if request.topology == "cluster"
+            && Self::cluster_spans_control_plane_and_workers(&request.members)
+        {
+            self.control_plane_member_address(&request.name).await?;
         }
 
         let service_slug = Self::generate_slug(&request.name);
@@ -4210,9 +4360,14 @@ impl ExternalServiceManager {
 
         if rows.is_empty() {
             // Monitor reachable but no data nodes registered — cluster is
-            // half-built. Treat as Down so it's visibly broken.
+            // half-built. Treat as Down so it's visibly broken, and say where
+            // to look: the monitor is fine, the data members never reached it.
+            let data_members = members.iter().filter(|m| !is_role_monitor(&m.role)).count();
             return ClusterProbeResult::down(format!(
-                "Monitor at {monitor_host}:{monitor_port} reports zero data nodes"
+                "Monitor at {monitor_host}:{monitor_port} reports zero data nodes: none of the \
+                 cluster's {data_members} data member(s) has registered with it. Data members \
+                 register by connecting to the monitor, so check their container logs for \
+                 pg_autoctl connection errors"
             ));
         }
 
@@ -6619,21 +6774,16 @@ echo "[restore] Pre-seed complete"
         // When the cluster spans multiple nodes (has any remote members),
         // local members must advertise a routable IP instead of a Docker
         // container name — remote workers cannot resolve container names
-        // from another host's Docker network.
+        // from another host's Docker network — and must publish their port
+        // on that IP, not only on loopback.
         let has_remote_members = member_requests.iter().any(|m| m.node_id.is_some());
-        let local_private_ip: Option<String> = if has_remote_members {
-            Some(Self::get_local_private_ip().map_err(|e| {
-                ExternalServiceError::InitializationFailed {
-                    id: service_id,
-                    reason: format!(
-                        "Cluster has remote members but could not determine local private IP: {}",
-                        e
-                    ),
-                }
-            })?)
-        } else {
-            None
-        };
+        let control_plane_address: Option<std::net::IpAddr> =
+            if Self::cluster_spans_control_plane_and_workers(member_requests) {
+                Some(self.control_plane_member_address(&service.name).await?)
+            } else {
+                None
+            };
+        let local_private_ip = control_plane_address.map(|ip| ip.to_string());
 
         let mut member_specs = Vec::new();
         for (i, member) in member_requests.iter().enumerate() {
@@ -6891,15 +7041,21 @@ echo "[restore] Pre-seed complete"
                     };
 
                     // Pull image, create and start container locally
-                    self.create_local_cluster_member(&result.container_name, &member_params)
-                        .await
-                        .map_err(|e| ExternalServiceError::InitializationFailed {
+                    self.create_local_cluster_member(
+                        &result.container_name,
+                        &member_params,
+                        control_plane_address,
+                    )
+                    .await
+                    .map_err(|e| {
+                        ExternalServiceError::InitializationFailed {
                             id: service_id,
                             reason: format!(
                                 "Failed to create local cluster member '{}': {}",
                                 result.container_name, e
                             ),
-                        })?
+                        }
+                    })?
                 };
 
                 // Track this member for potential rollback
@@ -7835,8 +7991,10 @@ echo "[restore] Pre-seed complete"
                         })?;
                     node.data_address().to_string()
                 }
-                MonitorReachability::LocalControlPlane => Self::get_local_private_ip()
-                    .unwrap_or_else(|_| format!("postgres-{}-monitor", service.name)),
+                MonitorReachability::LocalControlPlane => self
+                    .control_plane_member_address(&service.name)
+                    .await?
+                    .to_string(),
                 MonitorReachability::SameHost => monitor
                     .hostname
                     .clone()
@@ -7865,18 +8023,41 @@ echo "[restore] Pre-seed complete"
 
         let has_any_remote =
             existing_members.iter().any(|m| m.node_id.is_some()) || node_id.is_some();
-        let local_private_ip: Option<String> = if has_any_remote && node_id.is_none() {
-            Some(Self::get_local_private_ip().map_err(|e| {
-                ExternalServiceError::InitializationFailed {
-                    id: service_id,
-                    reason: format!(
-                        "Cluster has remote members but could not determine local private IP: {}",
-                        e
-                    ),
-                }
-            })?)
+        let has_any_local =
+            existing_members.iter().any(|m| m.node_id.is_none()) || node_id.is_none();
+        let control_plane_address: Option<std::net::IpAddr> = if has_any_remote && has_any_local {
+            Some(self.control_plane_member_address(&service.name).await?)
         } else {
             None
+        };
+
+        // A worker member must be able to reach every control-plane member
+        // (the monitor to register, a local primary to replicate from). A
+        // control-plane member created while the cluster was single-host —
+        // or by a release that only ever published on loopback — is not
+        // reachable from a worker, and adding one would just produce a member
+        // that never registers. Refuse up front with the reason.
+        if let (Some(address), Some(_)) = (control_plane_address, node_id) {
+            for local in existing_members.iter().filter(|m| m.node_id.is_none()) {
+                let Some(port) = local.port.and_then(|p| u16::try_from(p).ok()) else {
+                    continue;
+                };
+                if !self
+                    .local_member_published_on(&local.container_name, port, address)
+                    .await?
+                {
+                    return Err(ExternalServiceError::ControlPlaneMemberUnreachable {
+                        name: service.name.clone(),
+                        container_name: local.container_name.clone(),
+                        port,
+                        address: address.to_string(),
+                    });
+                }
+            }
+        }
+        let local_private_ip: Option<String> = match node_id {
+            None => control_plane_address.map(|ip| ip.to_string()),
+            Some(_) => None,
         };
 
         let hostname: Option<String> = if let Some(nid) = node_id {
@@ -7957,6 +8138,7 @@ echo "[restore] Pre-seed complete"
             member_fqdn,
             member_port,
             member_params,
+            control_plane_address: node_id.is_none().then_some(control_plane_address).flatten(),
         })
     }
 
@@ -8026,15 +8208,19 @@ echo "[restore] Pre-seed complete"
                         ),
                     })
             } else {
-                self.create_local_cluster_member(&plan.container_name, &plan.member_params)
-                    .await
-                    .map_err(|e| ExternalServiceError::InitializationFailed {
-                        id: service_id,
-                        reason: format!(
-                            "Failed to create local cluster member '{}': {}",
-                            plan.container_name, e
-                        ),
-                    })
+                self.create_local_cluster_member(
+                    &plan.container_name,
+                    &plan.member_params,
+                    plan.control_plane_address,
+                )
+                .await
+                .map_err(|e| ExternalServiceError::InitializationFailed {
+                    id: service_id,
+                    reason: format!(
+                        "Failed to create local cluster member '{}': {}",
+                        plan.container_name, e
+                    ),
+                })
             };
 
         let (container_id, host_port, compute_ip) = match create_outcome {
@@ -8815,9 +9001,12 @@ echo "[restore] Pre-seed complete"
     /// isn't attached. Returns `(node.private_address, host_port)`
     /// because that's the address+port docker-proxy listens on for the
     /// container. Returns `None` if we can't determine either piece.
+    ///
+    /// Worker members only: a control-plane member is resolved from its
+    /// application-network address by `resolve_member_dns_endpoint`.
     async fn resolve_member_underlay(
         &self,
-        node_id: Option<i32>,
+        node_id: i32,
         host_port: Option<i32>,
         container_port: u16,
     ) -> Option<(String, i32)> {
@@ -8826,18 +9015,12 @@ echo "[restore] Pre-seed complete"
         // overlay IP.
         let port = host_port.unwrap_or(container_port as i32);
 
-        let ip = if let Some(nid) = node_id {
-            nodes::Entity::find_by_id(nid)
-                .one(self.db.as_ref())
-                .await
-                .ok()
-                .flatten()
-                .map(|n| n.data_address().to_string())
-        } else {
-            // Local member (control plane). Use the same probe the
-            // initialize_cluster path uses to learn this node's IP.
-            Self::get_local_private_ip().ok()
-        }?;
+        let ip = nodes::Entity::find_by_id(node_id)
+            .one(self.db.as_ref())
+            .await
+            .ok()
+            .flatten()
+            .map(|n| n.data_address().to_string())?;
 
         Some((ip, port))
     }
@@ -8878,9 +9061,9 @@ echo "[restore] Pre-seed complete"
             }
         }
 
-        if node_id.is_some() {
+        if let Some(remote_node_id) = node_id {
             let underlay = self
-                .resolve_member_underlay(node_id, host_port, container_port)
+                .resolve_member_underlay(remote_node_id, host_port, container_port)
                 .await;
             return select_member_dns_endpoint(node_id, None, None, underlay, container_port);
         }
@@ -8922,6 +9105,37 @@ echo "[restore] Pre-seed complete"
                 None
             }
         }
+    }
+
+    /// Whether a control-plane cluster member's container publishes `port`
+    /// on `address`, i.e. whether a member on a worker node can reach it.
+    async fn local_member_published_on(
+        &self,
+        container_name: &str,
+        port: u16,
+        address: std::net::IpAddr,
+    ) -> Result<bool, ExternalServiceError> {
+        use bollard::query_parameters::InspectContainerOptions;
+
+        let docker = self.require_docker()?;
+        let info = docker
+            .inspect_container(container_name, None::<InspectContainerOptions>)
+            .await
+            .map_err(|e| ExternalServiceError::DockerError {
+                id: 0,
+                reason: format!(
+                    "Failed to inspect control-plane cluster member '{}' to check whether port \
+                     {} is published on {}: {}",
+                    container_name, port, address, e
+                ),
+            })?;
+        Ok(port_bindings_publish_on(
+            info.host_config
+                .as_ref()
+                .and_then(|hc| hc.port_bindings.as_ref()),
+            port,
+            address,
+        ))
     }
 
     /// Look up the gateway IP of the multi-host overlay docker network
@@ -8986,10 +9200,15 @@ echo "[restore] Pre-seed complete"
     ///   (`temps-overlay`), or `None` on single-host clusters where the
     ///   overlay isn't attached. Read by the caller into
     ///   `service_members.compute_ip` and the DNS registry (ADR-011).
+    ///
+    /// `control_plane_address` is set when the cluster also has members on
+    /// worker nodes: the member's port is then published on that address as
+    /// well as on loopback, so those members can reach it.
     async fn create_local_cluster_member(
         &self,
         container_name: &str,
         params: &crate::externalsvc::postgres_cluster::ClusterMemberCreateParams,
+        control_plane_address: Option<std::net::IpAddr>,
     ) -> Result<(String, Option<i32>, Option<String>), ExternalServiceError> {
         use bollard::models::*;
         use bollard::query_parameters::*;
@@ -9028,7 +9247,16 @@ echo "[restore] Pre-seed complete"
         // Port bindings: map the container port to the same host port.
         // Each cluster member uses a unique port assigned by the manager so
         // there are no conflicts even when multiple members run on the same host.
-        let (exposed_ports, port_bindings) = cluster_member_port_config(params.container_port);
+        let (exposed_ports, port_bindings) =
+            cluster_member_port_config(params.container_port, control_plane_address);
+        if let Some(address) = control_plane_address {
+            info!(
+                container = container_name,
+                port = params.container_port,
+                address = %address,
+                "Publishing control-plane cluster member for worker members"
+            );
+        }
 
         // Wire the per-host Hickory resolver into the container's
         // resolv.conf so it can resolve `*.temps.local` natively
@@ -12517,16 +12745,51 @@ echo "[restore] Pre-seed complete"
 
 /// Build the two matching pieces Docker requires to publish a cluster
 /// member's dynamically assigned port.
+///
+/// Always published on loopback (the control plane's own probes use it).
+/// When the cluster also has members on worker nodes, the port is published
+/// on `control_plane_address` too: those members dial it to register with a
+/// control-plane monitor and to replicate from a control-plane primary, and a
+/// loopback-only binding refuses every one of those connections.
 fn cluster_member_port_config(
     container_port: u16,
+    control_plane_address: Option<std::net::IpAddr>,
 ) -> (
     Vec<String>,
     HashMap<String, Option<Vec<bollard::models::PortBinding>>>,
 ) {
     let container_port_key = format!("{container_port}/tcp");
-    let port_bindings =
+    let mut port_bindings =
         crate::utils::local_port_binding(&container_port_key, &container_port.to_string());
+    if let Some(address) = control_plane_address {
+        if let Some(Some(bindings)) = port_bindings.get_mut(&container_port_key) {
+            bindings.push(bollard::models::PortBinding {
+                host_ip: Some(address.to_string()),
+                host_port: Some(container_port.to_string()),
+            });
+        }
+    }
     (vec![container_port_key], port_bindings)
+}
+
+/// Whether a container's port bindings publish `port` on `address`.
+fn port_bindings_publish_on(
+    bindings: Option<&HashMap<String, Option<Vec<bollard::models::PortBinding>>>>,
+    port: u16,
+    address: std::net::IpAddr,
+) -> bool {
+    let wanted_port = port.to_string();
+    let Some(bindings) = bindings else {
+        return false;
+    };
+    bindings.values().flatten().flatten().any(|binding| {
+        binding.host_port.as_deref() == Some(wanted_port.as_str())
+            && binding
+                .host_ip
+                .as_deref()
+                .and_then(|ip| ip.parse::<std::net::IpAddr>().ok())
+                == Some(address)
+    })
 }
 
 /// Map our `ServiceResourceLimits` onto a bollard `ContainerUpdateBody`.
@@ -17761,7 +18024,7 @@ mod tests {
 
     #[test]
     fn cluster_member_dynamic_port_is_exposed_and_bound_to_loopback() {
-        let (exposed_ports, bindings) = cluster_member_port_config(6040);
+        let (exposed_ports, bindings) = cluster_member_port_config(6040, None);
 
         assert_eq!(exposed_ports, vec!["6040/tcp"]);
         let binding = bindings
@@ -17771,6 +18034,322 @@ mod tests {
             .expect("the exposed dynamic port must have a matching host binding");
         assert_eq!(binding.host_ip.as_deref(), Some("127.0.0.1"));
         assert_eq!(binding.host_port.as_deref(), Some("6040"));
+        assert_eq!(
+            bindings
+                .get("6040/tcp")
+                .and_then(Option::as_ref)
+                .map(Vec::len),
+            Some(1),
+            "a single-host cluster member must stay on loopback only"
+        );
+    }
+
+    /// Regression: a control-plane monitor in a cluster whose data nodes run
+    /// on workers was published on 127.0.0.1 only, so the workers' data
+    /// nodes could never connect to it and the monitor reported zero data
+    /// nodes forever.
+    #[test]
+    fn cross_host_cluster_member_is_also_published_on_control_plane_address() {
+        let address: std::net::IpAddr = "10.52.0.10".parse().unwrap();
+        let (exposed_ports, bindings) = cluster_member_port_config(6090, Some(address));
+
+        assert_eq!(exposed_ports, vec!["6090/tcp"]);
+        let entries = bindings
+            .get("6090/tcp")
+            .and_then(Option::as_ref)
+            .expect("the exposed port must have host bindings");
+        let hosts: Vec<(Option<&str>, Option<&str>)> = entries
+            .iter()
+            .map(|b| (b.host_ip.as_deref(), b.host_port.as_deref()))
+            .collect();
+        assert_eq!(
+            hosts,
+            vec![
+                (Some("127.0.0.1"), Some("6090")),
+                (Some("10.52.0.10"), Some("6090")),
+            ]
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|b| b.host_ip.as_deref() != Some("0.0.0.0") && b.host_ip.is_some()),
+            "a cluster member must never be published on every interface"
+        );
+        assert!(port_bindings_publish_on(Some(&bindings), 6090, address));
+    }
+
+    #[test]
+    fn port_bindings_publish_on_requires_matching_address_and_port() {
+        let address: std::net::IpAddr = "10.52.0.10".parse().unwrap();
+        let (_, loopback_only) = cluster_member_port_config(6090, None);
+        let (_, cross_host) = cluster_member_port_config(6090, Some(address));
+
+        assert!(!port_bindings_publish_on(
+            Some(&loopback_only),
+            6090,
+            address
+        ));
+        assert!(!port_bindings_publish_on(Some(&cross_host), 6091, address));
+        assert!(!port_bindings_publish_on(
+            Some(&cross_host),
+            6090,
+            "10.52.0.11".parse().unwrap()
+        ));
+        assert!(!port_bindings_publish_on(None, 6090, address));
+        assert!(port_bindings_publish_on(Some(&cross_host), 6090, address));
+    }
+
+    #[test]
+    fn control_plane_member_address_uses_configured_private_address() {
+        let selected = select_control_plane_member_address(Some(" 10.52.0.10 "), None).unwrap();
+        assert_eq!(
+            selected.ip,
+            "10.52.0.10".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert!(selected.private);
+
+        // `ip:port` is accepted the same way node registration accepts it.
+        let selected = select_control_plane_member_address(Some("10.52.0.10:3100"), None).unwrap();
+        assert_eq!(
+            selected.ip,
+            "10.52.0.10".parse::<std::net::IpAddr>().unwrap()
+        );
+
+        // A private address wins over the mesh, exactly like a worker's
+        // `data_address`.
+        let mesh: std::net::IpAddr = "10.201.0.1".parse().unwrap();
+        let selected = select_control_plane_member_address(Some("10.52.0.10"), Some(mesh)).unwrap();
+        assert_eq!(
+            selected.ip,
+            "10.52.0.10".parse::<std::net::IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn control_plane_member_address_prefers_mesh_over_public_address() {
+        let mesh: std::net::IpAddr = "10.201.0.1".parse().unwrap();
+        let selected =
+            select_control_plane_member_address(Some("203.0.113.10"), Some(mesh)).unwrap();
+        assert_eq!(selected.ip, mesh);
+        assert!(selected.private);
+
+        let selected = select_control_plane_member_address(None, Some(mesh)).unwrap();
+        assert_eq!(selected.ip, mesh);
+
+        // Public and no mesh: honoured (as for a direct-mode worker), but
+        // flagged so the caller warns.
+        let selected = select_control_plane_member_address(Some("203.0.113.10"), None).unwrap();
+        assert_eq!(
+            selected.ip,
+            "203.0.113.10".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert!(!selected.private);
+    }
+
+    #[test]
+    fn control_plane_member_address_never_guesses() {
+        let missing = select_control_plane_member_address(None, None).unwrap_err();
+        assert!(
+            missing.contains("no control-plane private address"),
+            "{missing}"
+        );
+        let blank = select_control_plane_member_address(Some("  "), None).unwrap_err();
+        assert!(
+            blank.contains("no control-plane private address"),
+            "{blank}"
+        );
+
+        for unusable in ["127.0.0.1", "0.0.0.0", "169.254.1.2", "::1", "224.0.0.1"] {
+            let err = select_control_plane_member_address(Some(unusable), None).unwrap_err();
+            assert!(err.contains(unusable), "{unusable}: {err}");
+            assert!(err.contains("cannot be reached"), "{unusable}: {err}");
+        }
+
+        let garbage = select_control_plane_member_address(Some("cp.internal"), None).unwrap_err();
+        assert!(
+            garbage.contains("'cp.internal' is not an IP address"),
+            "{garbage}"
+        );
+    }
+
+    fn multi_node_settings_row(private_address: Option<&str>) -> settings::Model {
+        settings::Model {
+            id: 1,
+            data: serde_json::json!({ "multi_node": { "private_address": private_address } }),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn network_config_row(wireguard_enabled: bool) -> temps_entities::network_config::Model {
+        temps_entities::network_config::Model {
+            id: 1,
+            compute_pool_cidr: "172.20.0.0/16".to_string(),
+            subnet_prefix_len: 24,
+            transport: "vxlan".to_string(),
+            vxlan_vni: 4242,
+            vxlan_port: 4789,
+            underlay_mtu: 1500,
+            control_plane_compute_cidr: None,
+            control_plane_underlay_address: None,
+            control_plane_overlay_ready: false,
+            control_plane_setup_generation: 0,
+            wireguard_enabled,
+            wireguard_cidr: "10.201.0.0/16".to_string(),
+            wireguard_port: 51820,
+            control_plane_wg_public_key: None,
+            control_plane_wg_endpoint: None,
+            node_api_port: None,
+            mesh_hub_node_id: None,
+            mesh_hub_control_plane: false,
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn control_plane_member_address_reads_operator_private_address() {
+        let manager = mock_service_manager_with_db(Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![multi_node_settings_row(Some("10.52.0.10"))]])
+                .append_query_results([vec![network_config_row(false)]])
+                .into_connection(),
+        ));
+
+        let ip = manager
+            .control_plane_member_address("ha-pg")
+            .await
+            .expect("a configured private address must be used");
+        assert_eq!(ip, "10.52.0.10".parse::<std::net::IpAddr>().unwrap());
+    }
+
+    #[tokio::test]
+    async fn control_plane_member_address_falls_back_to_mesh_address() {
+        let manager = mock_service_manager_with_db(Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![multi_node_settings_row(None)]])
+                .append_query_results([vec![network_config_row(true)]])
+                .into_connection(),
+        ));
+
+        let ip = manager
+            .control_plane_member_address("ha-pg")
+            .await
+            .expect("the control plane's mesh address is reachable from workers");
+        assert_eq!(ip, "10.201.0.1".parse::<std::net::IpAddr>().unwrap());
+    }
+
+    #[tokio::test]
+    async fn control_plane_member_address_unconfigured_is_a_typed_error() {
+        let manager = mock_service_manager_with_db(Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([Vec::<settings::Model>::new()])
+                .append_query_results([vec![network_config_row(false)]])
+                .into_connection(),
+        ));
+
+        let err = manager
+            .control_plane_member_address("ha-pg")
+            .await
+            .expect_err("an unconfigured control plane must not guess an address");
+        match &err {
+            ExternalServiceError::ControlPlaneAddressRequired { name, reason } => {
+                assert_eq!(name, "ha-pg");
+                assert!(
+                    reason.contains("no control-plane private address"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected ControlPlaneAddressRequired, got {other:?}"),
+        }
+        let message = err.to_string();
+        assert!(message.contains("Cluster 'ha-pg'"), "{message}");
+        assert!(message.contains("--private-address"), "{message}");
+    }
+
+    /// The console's default HA layout (monitor on the control plane, data
+    /// members on workers) is refused before any row is written when the
+    /// control plane has no reachable address — instead of creating a
+    /// cluster whose data nodes can never register.
+    #[tokio::test]
+    async fn create_mixed_cluster_without_control_plane_address_writes_nothing() {
+        let manager = mock_service_manager_with_db(Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([Vec::<settings::Model>::new()])
+                .append_query_results([Vec::<temps_entities::network_config::Model>::new()])
+                .into_connection(),
+        ));
+
+        let err = manager
+            .create_service_with_creator(
+                CreateExternalServiceRequest {
+                    name: "ha-pg".to_string(),
+                    service_type: ServiceType::Postgres,
+                    version: None,
+                    parameters: HashMap::new(),
+                    node_id: None,
+                    topology: "cluster".to_string(),
+                    members: vec![
+                        ClusterMemberRequest {
+                            role: "monitor".to_string(),
+                            node_id: None,
+                        },
+                        ClusterMemberRequest {
+                            role: "replica".to_string(),
+                            node_id: Some(3),
+                        },
+                        ClusterMemberRequest {
+                            role: "replica".to_string(),
+                            node_id: Some(4),
+                        },
+                    ],
+                },
+                Some(1),
+            )
+            .await
+            .expect_err("the cluster must be refused");
+        // The mock holds only the two configuration reads: had creation gone
+        // on to write the service row, it would have failed on the exhausted
+        // mock with a database error instead of this one.
+        assert!(
+            matches!(err, ExternalServiceError::ControlPlaneAddressRequired { ref name, .. } if name == "ha-pg"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn only_mixed_placement_spans_control_plane_and_workers() {
+        let member = |node_id: Option<i32>| ClusterMemberRequest {
+            role: "replica".to_string(),
+            node_id,
+        };
+        type M = ExternalServiceManager;
+
+        assert!(!M::cluster_spans_control_plane_and_workers(&[
+            member(None),
+            member(None),
+            member(None)
+        ]));
+        assert!(!M::cluster_spans_control_plane_and_workers(&[
+            member(Some(3)),
+            member(Some(4)),
+            member(Some(5))
+        ]));
+        // The console's default: monitor on the control plane, one data
+        // member per worker.
+        assert!(M::cluster_spans_control_plane_and_workers(&[
+            member(None),
+            member(Some(3)),
+            member(Some(4))
+        ]));
+        // The node list's control-plane pseudo-node is the control plane.
+        assert!(!M::cluster_spans_control_plane_and_workers(&[
+            member(Some(M::CONTROL_PLANE_NODE_ID)),
+            member(None)
+        ]));
+        assert!(M::cluster_spans_control_plane_and_workers(&[
+            member(Some(M::CONTROL_PLANE_NODE_ID)),
+            member(Some(3))
+        ]));
     }
 
     #[test]
@@ -18338,6 +18917,400 @@ mod tests {
         assert!(
             manager.local_workloads_enabled(),
             "full profile must report local_workloads_enabled = true"
+        );
+    }
+}
+
+/// Docker-backed regression for a reported HA cluster stuck at "Monitor ...
+/// reports zero data nodes": the console's default layout puts the
+/// pg_auto_failover monitor on the control plane and the data members on
+/// workers, and the monitor was only published on loopback, so no worker
+/// could ever reach it to register.
+///
+/// The control-plane monitor is created by the real
+/// `create_local_cluster_member`. The "worker" data member runs in the Docker
+/// host's network namespace, where — like a container on another machine —
+/// the monitor's container name means nothing and its only route to the
+/// monitor is the control plane's private address. That address is the
+/// gateway of a test bridge: an IP that lives on the Docker host and is not
+/// loopback, which is exactly what `--private-address` is on a real host.
+///
+/// Run: `cargo test --lib -p temps-providers --features docker-tests -- cross_host_cluster_docker`
+#[cfg(all(test, feature = "docker-tests"))]
+mod cross_host_cluster_docker_tests {
+    use super::*;
+    use crate::externalsvc::postgres_cluster::{
+        ClusterAuthSecrets, PostgresClusterConfig, PostgresClusterService, DEFAULT_CLUSTER_IMAGE,
+    };
+    use crate::externalsvc::ClusterMemberSpec;
+    use bollard::exec::{CreateExecOptions, StartExecResults};
+    use bollard::models::{ContainerCreateBody, HostConfig, NetworkCreateRequest};
+    use bollard::query_parameters::{
+        CreateContainerOptionsBuilder, RemoveContainerOptions, StartContainerOptions,
+    };
+    use futures::StreamExt;
+    use std::time::{Duration, Instant};
+
+    struct Harness {
+        docker: Arc<Docker>,
+        manager: ExternalServiceManager,
+        /// Bridge whose gateway stands in for the control plane's private
+        /// address.
+        network: String,
+        address: std::net::IpAddr,
+        containers: Vec<String>,
+        volumes: Vec<String>,
+    }
+
+    impl Harness {
+        async fn new() -> Option<Self> {
+            let docker = match Docker::connect_with_local_defaults() {
+                Ok(docker) => Arc::new(docker),
+                Err(e) => {
+                    eprintln!("Docker not available, skipping: {e}");
+                    return None;
+                }
+            };
+            if docker.ping().await.is_err() {
+                eprintln!("Docker daemon not responding, skipping");
+                return None;
+            }
+            let network = format!(
+                "temps-xhost-it-{}",
+                &uuid::Uuid::new_v4().simple().to_string()[..12]
+            );
+            docker
+                .create_network(NetworkCreateRequest {
+                    name: network.clone(),
+                    driver: Some("bridge".to_string()),
+                    ..Default::default()
+                })
+                .await
+                .ok()?;
+            let address = docker
+                .inspect_network(
+                    &network,
+                    None::<bollard::query_parameters::InspectNetworkOptions>,
+                )
+                .await
+                .ok()?
+                .ipam
+                .and_then(|ipam| ipam.config)
+                .and_then(|configs| configs.into_iter().find_map(|c| c.gateway))
+                .and_then(|gateway| gateway.parse().ok())?;
+
+            let db = Arc::new(
+                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+            );
+            let manager = ExternalServiceManager::new(
+                db.clone(),
+                Arc::new(EncryptionService::new_from_password(
+                    "cross-host-cluster-test",
+                )),
+                docker.clone(),
+                Arc::new(temps_dns::DnsRegistry::new(db)),
+            );
+            Some(Self {
+                docker,
+                manager,
+                network,
+                address,
+                containers: Vec::new(),
+                volumes: Vec::new(),
+            })
+        }
+
+        /// Run a data member the way a worker would: outside the control
+        /// plane's Docker networks, reaching the monitor only by address.
+        async fn run_worker_member(
+            &mut self,
+            name: &str,
+            env: &HashMap<String, String>,
+            cmd: Vec<String>,
+        ) {
+            let body = ContainerCreateBody {
+                image: Some(DEFAULT_CLUSTER_IMAGE.to_string()),
+                cmd: Some(cmd),
+                env: Some(env.iter().map(|(k, v)| format!("{k}={v}")).collect()),
+                host_config: Some(HostConfig {
+                    network_mode: Some("host".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            self.containers.push(name.to_string());
+            self.docker
+                .create_container(
+                    Some(CreateContainerOptionsBuilder::new().name(name).build()),
+                    body,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("create worker member {name}: {e}"));
+            self.docker
+                .start_container(name, None::<StartContainerOptions>)
+                .await
+                .unwrap_or_else(|e| panic!("start worker member {name}: {e}"));
+        }
+
+        async fn sh(&self, container: &str, script: &str) -> (i64, String) {
+            let exec = self
+                .docker
+                .create_exec(
+                    container,
+                    CreateExecOptions {
+                        cmd: Some(vec![
+                            "bash".to_string(),
+                            "-c".to_string(),
+                            script.to_string(),
+                        ]),
+                        attach_stdout: Some(true),
+                        attach_stderr: Some(true),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap_or_else(|e| panic!("create exec in {container}: {e}"));
+            let mut out = String::new();
+            if let Ok(StartExecResults::Attached { mut output, .. }) =
+                self.docker.start_exec(&exec.id, None).await
+            {
+                while let Some(Ok(chunk)) = output.next().await {
+                    out.push_str(&chunk.to_string());
+                }
+            }
+            let code = self
+                .docker
+                .inspect_exec(&exec.id)
+                .await
+                .ok()
+                .and_then(|i| i.exit_code)
+                .unwrap_or(-1);
+            (code, out)
+        }
+
+        /// What the health probe reads: the data nodes registered with the
+        /// monitor.
+        async fn registered_nodes(&self, monitor: &str, port: u16) -> String {
+            self.sh(
+                monitor,
+                &format!(
+                    "gosu postgres psql -X -At -p {port} -d pg_auto_failover \
+                     -c 'SELECT nodename, reportedstate FROM pgautofailover.node'"
+                ),
+            )
+            .await
+            .1
+        }
+
+        async fn wait_until_monitor_accepts(&self, monitor: &str, port: u16) {
+            let start = Instant::now();
+            loop {
+                let (code, _) = self
+                    .sh(monitor, &format!("gosu postgres pg_isready -q -p {port}"))
+                    .await;
+                if code == 0 {
+                    return;
+                }
+                assert!(
+                    start.elapsed() < Duration::from_secs(120),
+                    "monitor {monitor} never accepted connections on {port}"
+                );
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+
+        async fn cleanup(&self) {
+            for name in &self.containers {
+                let _ = self
+                    .docker
+                    .remove_container(
+                        name,
+                        Some(RemoveContainerOptions {
+                            force: true,
+                            v: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+            }
+            for volume in &self.volumes {
+                let _ = self
+                    .docker
+                    .remove_volume(
+                        volume,
+                        None::<bollard::query_parameters::RemoveVolumeOptions>,
+                    )
+                    .await;
+            }
+            let _ = self.docker.remove_network(&self.network).await;
+        }
+    }
+
+    /// A port block nothing else on the Docker host is likely to hold; the
+    /// worker member binds directly in the host's network namespace.
+    fn test_base_port() -> u16 {
+        let entropy = uuid::Uuid::new_v4().as_u128();
+        30000 + u16::try_from(entropy % 2000).unwrap_or(0) * 10
+    }
+
+    fn cluster_parts(
+        address: std::net::IpAddr,
+    ) -> (
+        PostgresClusterService,
+        PostgresClusterConfig,
+        ClusterAuthSecrets,
+        ClusterMemberSpec,
+        ClusterMemberSpec,
+    ) {
+        let name = format!("ha-pg-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let config: PostgresClusterConfig = serde_json::from_value(serde_json::json!({
+            "password": "cross-host-test-password"
+        }))
+        .unwrap();
+        let monitor = ClusterMemberSpec {
+            role: "monitor".to_string(),
+            node_id: None,
+            ordinal: 0,
+            hostname: Some(address.to_string()),
+        };
+        let worker_node = ClusterMemberSpec {
+            role: "replica".to_string(),
+            node_id: Some(1),
+            ordinal: 1,
+            hostname: Some(address.to_string()),
+        };
+        (
+            PostgresClusterService::new(name, docker),
+            config,
+            ClusterAuthSecrets::generate(),
+            monitor,
+            worker_node,
+        )
+    }
+
+    #[tokio::test]
+    async fn worker_data_node_registers_with_control_plane_monitor() {
+        let Some(mut h) = Harness::new().await else {
+            return;
+        };
+        let address = h.address;
+        let base_port = test_base_port();
+        let (cluster, config, auth, monitor_spec, node_spec) = cluster_parts(address);
+        let address_str = address.to_string();
+
+        let monitor_params = cluster.build_member_params(
+            &monitor_spec,
+            &config,
+            &address_str,
+            base_port,
+            base_port,
+            Default::default(),
+            &auth,
+        );
+        let monitor = monitor_params.container_name.clone();
+        h.containers.push(monitor.clone());
+        h.volumes.push(format!("{monitor}_data"));
+        // The control-plane member, created exactly as `initialize_cluster`
+        // now creates it for a cluster that also has worker members.
+        let created = h
+            .manager
+            .create_local_cluster_member(&monitor, &monitor_params, Some(address))
+            .await;
+        if let Err(e) = created {
+            h.cleanup().await;
+            panic!("creating the control-plane monitor failed: {e}");
+        }
+        h.wait_until_monitor_accepts(&monitor, base_port).await;
+
+        let node_params = cluster.build_member_params(
+            &node_spec,
+            &config,
+            &address_str,
+            base_port,
+            base_port + 1,
+            Default::default(),
+            &auth,
+        );
+        let node = node_params.container_name.clone();
+        h.run_worker_member(
+            &node,
+            &node_params.environment,
+            node_params.command.clone().unwrap_or_default(),
+        )
+        .await;
+
+        let start = Instant::now();
+        let registered = loop {
+            let nodes = h.registered_nodes(&monitor, base_port).await;
+            if nodes.lines().any(|line| line.starts_with(&node)) {
+                break Ok(nodes);
+            }
+            if start.elapsed() > Duration::from_secs(180) {
+                break Err(nodes);
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        };
+        h.cleanup().await;
+        match registered {
+            Ok(nodes) => eprintln!("monitor sees: {nodes}"),
+            Err(nodes) => panic!(
+                "the worker data member never registered with the control-plane monitor at \
+                 {address}:{base_port}; monitor reports: {nodes:?}"
+            ),
+        }
+    }
+
+    /// The pre-fix publishing (loopback only) is what made the reported
+    /// cluster unrecoverable: the monitor is up, but nothing outside the
+    /// control plane's loopback can connect to it.
+    #[tokio::test]
+    async fn loopback_only_monitor_is_unreachable_from_a_worker() {
+        let Some(mut h) = Harness::new().await else {
+            return;
+        };
+        let address = h.address;
+        let base_port = test_base_port();
+        let (cluster, config, auth, monitor_spec, _) = cluster_parts(address);
+        let monitor_params = cluster.build_member_params(
+            &monitor_spec,
+            &config,
+            &address.to_string(),
+            base_port,
+            base_port,
+            Default::default(),
+            &auth,
+        );
+        let monitor = monitor_params.container_name.clone();
+        h.containers.push(monitor.clone());
+        h.volumes.push(format!("{monitor}_data"));
+        if let Err(e) = h
+            .manager
+            .create_local_cluster_member(&monitor, &monitor_params, None)
+            .await
+        {
+            h.cleanup().await;
+            panic!("creating the control-plane monitor failed: {e}");
+        }
+        h.wait_until_monitor_accepts(&monitor, base_port).await;
+
+        let probe = format!("{monitor}-probe");
+        h.run_worker_member(
+            &probe,
+            &HashMap::new(),
+            vec!["sleep".to_string(), "300".to_string()],
+        )
+        .await;
+        let connect =
+            |host: String| format!("timeout 5 bash -c 'exec 3<>/dev/tcp/{host}/{base_port}'");
+        let (via_loopback, _) = h.sh(&probe, &connect("127.0.0.1".to_string())).await;
+        let (via_address, _) = h.sh(&probe, &connect(address.to_string())).await;
+        h.cleanup().await;
+
+        assert_eq!(via_loopback, 0, "the monitor itself must be up on loopback");
+        assert_ne!(
+            via_address, 0,
+            "a loopback-only monitor must not be reachable on {address}:{base_port}"
         );
     }
 }
