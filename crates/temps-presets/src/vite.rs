@@ -439,12 +439,15 @@ fn tokenize(source: &str) -> Vec<Token> {
             let quote = c;
             let mut value = String::new();
             let mut interpolated = false;
+            // An escape (`'\x64ist'`, `'\u0062uild'`) means the runtime value
+            // differs from the source text; rather than decode JavaScript
+            // escapes, treat the string as non-literal so its value is never
+            // guessed.
+            let mut escaped = false;
             i += 1;
             while i < chars.len() && chars[i] != quote {
                 if chars[i] == '\\' {
-                    if let Some(next) = chars.get(i + 1) {
-                        value.push(*next);
-                    }
+                    escaped = true;
                     i += 2;
                     continue;
                 }
@@ -455,7 +458,7 @@ fn tokenize(source: &str) -> Vec<Token> {
                 i += 1;
             }
             i += 1;
-            tokens.push(if interpolated {
+            tokens.push(if interpolated || escaped {
                 Token::Template
             } else {
                 Token::Str(value)
@@ -522,6 +525,17 @@ struct Frame {
     out_dir: Slot,
     /// For a config object: what its (last) `build` key resolves `outDir` to.
     build: Slot,
+    /// For a config object: it is not assigned to a variable, so it can be
+    /// one of the configs Vite actually uses (an export, a `defineConfig`
+    /// argument, a returned or ternary branch).
+    branch: bool,
+    /// For a config object: it has at least one member.
+    has_members: bool,
+    /// For a config object: one of its keys is a Vite top-level option.
+    vite_key: bool,
+    /// For a config object: it has a spread or computed key, so it may bring
+    /// in a `build` this parser cannot see.
+    opaque_members: bool,
 }
 
 impl Frame {
@@ -533,16 +547,33 @@ impl Frame {
             config_build: false,
             out_dir: Slot::Absent,
             build: Slot::Absent,
+            branch: false,
+            has_members: false,
+            vite_key: false,
+            opaque_members: false,
         }
     }
 
-    /// An object literal; `in_config_scope` is the parent's `config_scope`.
-    fn object(in_config_scope: bool, config_build: bool) -> Self {
+    /// An object literal; `in_config_scope` is the parent's `config_scope`,
+    /// `branch` whether it is not assigned to a variable.
+    fn object(in_config_scope: bool, config_build: bool, branch: bool) -> Self {
         Self {
             config: in_config_scope,
             config_build,
+            branch,
             ..Self::new(FrameKind::Object, false)
         }
+    }
+
+    /// A config candidate with no `build` key that is recognisably a Vite
+    /// config (empty, or using a Vite option), so `vite build` would write to
+    /// the default directory if it were the branch taken.
+    fn default_dir_branch(&self) -> bool {
+        self.config
+            && self.branch
+            && self.build == Slot::Absent
+            && !self.opaque_members
+            && (!self.has_members || self.vite_key)
     }
 
     /// Whether members of this object can change the resolved `build.outDir`.
@@ -550,6 +581,38 @@ impl Frame {
         self.config || self.config_build
     }
 }
+
+/// Top-level Vite config options. A build-less object using one of them is a
+/// config branch that leaves `build.outDir` at its default.
+const VITE_CONFIG_KEYS: &[&str] = &[
+    "root",
+    "base",
+    "mode",
+    "define",
+    "plugins",
+    "build",
+    "publicDir",
+    "cacheDir",
+    "resolve",
+    "css",
+    "json",
+    "esbuild",
+    "assetsInclude",
+    "logLevel",
+    "clearScreen",
+    "envDir",
+    "envPrefix",
+    "appType",
+    "server",
+    "preview",
+    "optimizeDeps",
+    "ssr",
+    "worker",
+    "experimental",
+    "test",
+    "environments",
+    "builder",
+];
 
 const SPREAD_OVERRIDE: &str =
     "build.outDir may be replaced by a spread or computed key that follows it";
@@ -605,6 +668,11 @@ fn close_frame(frame: Frame, parent: Option<&mut Frame>, results: &mut Vec<Slot>
         }
     } else if frame.config && frame.build != Slot::Absent {
         results.push(frame.build);
+    } else if frame.default_dir_branch() {
+        // A branch without `build` (`cond ? { build } : {}`) builds into the
+        // default directory; it must take part in the comparison, or a
+        // disagreeing branch would be trusted.
+        results.push(Slot::Absent);
     }
 }
 
@@ -663,6 +731,7 @@ fn parse_vite_out_dir(source: &str) -> OutDir {
                     Frame::object(
                         config_scope,
                         parent_is_config && key.as_deref() == Some("build"),
+                        !matches!(prev, Some(Token::Punct('='))),
                     )
                 } else {
                     Frame::new(FrameKind::Block, config_scope)
@@ -682,12 +751,22 @@ fn parse_vite_out_dir(source: &str) -> OutDir {
                     if let Some(frame) = frames.last_mut() {
                         frame.out_dir.overridden(SPREAD_OVERRIDE);
                         frame.build.overridden(SPREAD_OVERRIDE);
+                        frame.opaque_members = true;
+                        frame.has_members = true;
                     }
                 }
                 frames.push(Frame::new(FrameKind::Opaque, false));
             }
             Token::Punct('}' | ')' | ']') => {
                 if let Some(mut frame) = frames.pop() {
+                    // `({ mode }) =>` and `{ a } = x` destructure; they are
+                    // patterns, not config branches.
+                    if frame.kind == FrameKind::Object
+                        && (punct_at(index + 1, &['='])
+                            || (punct_at(index + 1, &[')']) && punct_at(index + 2, &['='])))
+                    {
+                        frame.branch = false;
+                    }
                     // `mergeConfig({ build }, other)`: a later argument may
                     // replace this config's `build`.
                     let later_argument = frame.config
@@ -710,12 +789,20 @@ fn parse_vite_out_dir(source: &str) -> OutDir {
                 if let Some(frame) = frames.last_mut() {
                     frame.out_dir.overridden(SPREAD_OVERRIDE);
                     frame.build.overridden(SPREAD_OVERRIDE);
+                    frame.opaque_members = true;
+                    frame.has_members = true;
                 }
             }
             Token::Word(_) | Token::Str(_) if tracked_member => {
                 let Some(frame) = frames.last_mut() else {
                     continue;
                 };
+                if frame.config {
+                    frame.has_members = true;
+                    if key_at(index).is_some_and(|key| VITE_CONFIG_KEYS.contains(&key.as_str())) {
+                        frame.vite_key = true;
+                    }
+                }
                 let shorthand = matches!(token, Token::Word(_)) && punct_at(index + 1, &[',', '}']);
                 match key_at(index).as_deref() {
                     Some("outDir") if frame.config_build => {
@@ -759,15 +846,23 @@ fn parse_vite_out_dir(source: &str) -> OutDir {
         close_frame(frame, frames.last_mut(), &mut results);
     }
     let mut found: Vec<String> = Vec::new();
+    // A config branch that leaves `outDir` unset builds into the default
+    // directory, which disagrees with any branch that sets it.
+    let mut default_branch = false;
     for slot in results {
         match slot {
-            Slot::Absent => {}
+            Slot::Absent => default_branch = true,
             Slot::Literal(value) => found.push(value),
             Slot::Unknown(reason) => return OutDir::Unresolvable(reason),
         }
     }
     found.sort();
     found.dedup();
+    if default_branch && !found.is_empty() {
+        return OutDir::Unresolvable(
+            "build.outDir differs between config branches: one leaves it at the default",
+        );
+    }
     match found.as_slice() {
         [] => OutDir::Absent,
         [value] => match safe_relative_dir(value) {
@@ -1240,6 +1335,73 @@ mod tests {
         assert_eq!(
             parse_vite_out_dir("export default mergeConfig(base, { build: { outDir: 'build' } })"),
             OutDir::Literal("build".into())
+        );
+    }
+
+    /// REGRESSION (Greptile on #1295): an escaped string's runtime value
+    /// differs from its source text, so it must not be trusted as a path.
+    #[test]
+    fn out_dir_with_escapes_is_unresolvable() {
+        for config in [
+            r"export default { build: { outDir: '\x64ist' } }",
+            r"export default { build: { outDir: 'b\u0075ild' } }",
+            r"export default { build: { outDir: 'my\'dir' } }",
+        ] {
+            assert!(
+                matches!(parse_vite_out_dir(config), OutDir::Unresolvable(_)),
+                "{config}"
+            );
+        }
+        // An escape elsewhere in the file does not matter.
+        assert_eq!(
+            parse_vite_out_dir(r"const s = 'a\nb'; export default { build: { outDir: 'build' } }"),
+            OutDir::Literal("build".into())
+        );
+    }
+
+    /// REGRESSION (Greptile on #1295): a config branch without `build`
+    /// builds into the default directory, so it disagrees with a branch that
+    /// sets `outDir` and the result must be unresolvable.
+    #[test]
+    fn out_dir_branch_without_build_takes_part_in_the_comparison() {
+        for config in [
+            "export default defineConfig(({ command }) => command === 'serve' ? { build: { outDir: 'build' } } : {})",
+            "export default defineConfig(({ command }) => command === 'build' ? {} : { build: { outDir: 'build' } })",
+            "export default defineConfig(({ mode }) => mode === 'x' ? { build: { outDir: 'build' } } : { plugins: [react()] })",
+            "export default defineConfig(({ mode }) => { if (mode === 'x') { return { server: { port: 1 } } } return { build: { outDir: 'build' } } })",
+        ] {
+            assert!(
+                matches!(parse_vite_out_dir(config), OutDir::Unresolvable(_)),
+                "{config}"
+            );
+        }
+        // Branches that agree still resolve.
+        assert_eq!(
+            parse_vite_out_dir(
+                "export default defineConfig(({ mode }) => mode === 'x' ? { build: { outDir: 'build' } } : { build: { outDir: 'build' } })"
+            ),
+            OutDir::Literal("build".into())
+        );
+    }
+
+    /// Objects that are not config branches never count as one.
+    #[test]
+    fn non_config_objects_do_not_count_as_default_branches() {
+        for config in [
+            "const pkg = { name: 'app' }; export default { build: { outDir: 'build' } }",
+            "function helper() { return { name: 'p', apply: 'build' } }\nexport default { build: { outDir: 'build' } }",
+            "const shared = { plugins: [] }; export default { ...shared, build: { outDir: 'build' } }",
+            "export default defineConfig(({ mode }) => mode === 'x' ? { build: { outDir: 'build' } } : { ...base, build: { outDir: 'build' } })",
+        ] {
+            assert_eq!(
+                parse_vite_out_dir(config),
+                OutDir::Literal("build".into()),
+                "{config}"
+            );
+        }
+        assert_eq!(
+            parse_vite_out_dir("export default defineConfig({ plugins: [react()] })"),
+            OutDir::Absent
         );
     }
 
