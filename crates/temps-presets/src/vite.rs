@@ -419,10 +419,14 @@ enum Token {
 /// with their escapes so a `//` inside a URL is not mistaken for a comment.
 /// Alongside each token, whether a line break precedes it, so statement
 /// boundaries that rely on automatic semicolon insertion can be found.
-fn tokenize(source: &str) -> (Vec<Token>, Vec<bool>) {
+fn tokenize(source: &str) -> (Vec<Token>, Vec<bool>, Vec<bool>) {
     let chars: Vec<char> = source.chars().collect();
     let mut tokens = Vec::new();
     let mut line_breaks = Vec::new();
+    // Per token: a backtick template literal (with or without `${}`), which
+    // at the start of a line continues the previous expression as a tagged
+    // template instead of starting a new statement.
+    let mut backticks = Vec::new();
     let mut line_break = false;
     let mut i = 0;
     while i < chars.len() {
@@ -472,6 +476,8 @@ fn tokenize(source: &str) -> (Vec<Token>, Vec<bool>) {
                 i += 1;
             }
             i += 1;
+            backticks.resize(tokens.len(), false);
+            backticks.push(quote == '`');
             tokens.push(if interpolated || escaped {
                 Token::Template
             } else {
@@ -493,7 +499,8 @@ fn tokenize(source: &str) -> (Vec<Token>, Vec<bool>) {
     if tokens.len() > line_breaks.len() {
         line_breaks.push(line_break);
     }
-    (tokens, line_breaks)
+    backticks.resize(tokens.len(), false);
+    (tokens, line_breaks, backticks)
 }
 
 /// What one object literal is known to set a tracked key to.
@@ -710,7 +717,6 @@ const NEEDS_OPERAND: &[&str] = &[
     "yield",
     "in",
     "instanceof",
-    "of",
     "as",
     "satisfies",
     "keyof",
@@ -870,7 +876,7 @@ fn close_frame(frame: Frame, parent: Option<&mut Frame>, results: &mut Vec<(Slot
 /// object literal (`build: shared`). A spread *before* the literal is
 /// overridden by it and is harmless.
 fn parse_vite_out_dir(source: &str) -> OutDir {
-    let (tokens, line_breaks) = tokenize(source);
+    let (tokens, line_breaks, backticks) = tokenize(source);
     let mut frames: Vec<Frame> = Vec::new();
     let mut results: Vec<(Slot, Option<usize>)> = Vec::new();
     let mut next_frame_id = 1;
@@ -892,21 +898,33 @@ fn parse_vite_out_dir(source: &str) -> OutDir {
         let config_scope = frames.last().is_none_or(|frame| frame.config_scope);
         if frames.is_empty() {
             // Automatic semicolon insertion: a line that starts a new
-            // statement (a name or string after an expression that could have
-            // ended) ends the export, even without `;`. A line starting with
-            // `?`, `:`, `.`, `(`, `[` or an operator continues it, as in a
-            // ternary split over lines.
-            let ends_expression = matches!(
-                prev,
-                Some(Token::Word(_))
-                    | Some(Token::Str(_))
-                    | Some(Token::Template)
-                    | Some(Token::Punct(')' | ']' | '}'))
-            ) && !matches!(prev, Some(Token::Word(w)) if NEEDS_OPERAND.contains(&w.as_str()));
-            let starts_statement = matches!(
-                token,
-                Token::Word(_) | Token::Str(_) | Token::Template
-            ) && !matches!(token, Token::Word(w) if matches!(w.as_str(), "in" | "instanceof" | "as" | "satisfies"));
+            // statement after an expression that could have ended ends the
+            // export, even without `;`. A line starting with `?`, `:`, `.`,
+            // `(`, `[`, a template literal or a binary operator continues
+            // it, as in a ternary split over lines.
+            let before_prev = index.checked_sub(2).and_then(|i| tokens.get(i));
+            let after = tokens.get(index + 1);
+            // A keyword after `.`/`?.` is a property name (`presets.new`).
+            let property_name = matches!(before_prev, Some(Token::Punct('.')));
+            let ends_expression = match prev {
+                Some(Token::Word(word)) => property_name || !NEEDS_OPERAND.contains(&word.as_str()),
+                Some(Token::Str(_)) | Some(Token::Template) => true,
+                Some(Token::Punct(')' | ']' | '}')) => true,
+                // Postfix `x++` / `x--`.
+                Some(Token::Punct(c @ ('+' | '-'))) => {
+                    matches!(before_prev, Some(Token::Punct(b)) if b == c)
+                }
+                _ => false,
+            };
+            let starts_statement = match token {
+                Token::Word(word) => {
+                    !matches!(word.as_str(), "in" | "instanceof" | "as" | "satisfies")
+                }
+                Token::Str(_) | Token::Template => !backticks.get(index).copied().unwrap_or(false),
+                // Prefix `++x` / `--x` always starts a new statement.
+                Token::Punct(c @ ('+' | '-')) => matches!(after, Some(Token::Punct(a)) if a == c),
+                _ => false,
+            };
             if line_breaks.get(index).copied().unwrap_or(false)
                 && ends_expression
                 && starts_statement
@@ -1689,6 +1707,9 @@ mod tests {
             "export default typeof\n  window === 'undefined' ? {} : { build: { outDir: 'build' } }",
             "export default await\n  isCi() ? {} : { build: { outDir: 'build' } }",
             "export default void 0, typeof\n  process === 'object' ? { plugins: [] } : { build: { outDir: 'build' } }",
+            // A template literal starting a line continues the expression
+            // (a tagged template), so the export goes on.
+            "export default c ? {} : tag\n`x` ? { plugins: [] } : { build: { outDir: 'build' } }",
             "export default process.env.CI ? defineConfig({}) : defineConfig({ build: { outDir: 'build' } })",
         ] {
             assert!(
@@ -1728,6 +1749,13 @@ mod tests {
             "export default c ? { build: { outDir: 'build' } } : { build: { outDir: 'build' } }\nglobalThis.extraConfig = c ? {} : { plugins: [] }",
             "module.exports = c ? { build: { outDir: 'build' } } : { build: { outDir: 'build' } }\nwindow.x = c ? {} : { server: {} }",
             "export default c ? { build: { outDir: 'build' } } : { build: { outDir: 'build' } } /* end\n */ foo = c ? {} : { plugins: [] }",
+            // REGRESSION (Greptile on #1295): a keyword after `.` is a
+            // property name and ends the expression like any other name.
+            "export default true ? { build: { outDir: 'build' } } : presets.new\nglobalThis.extraConfig = true ? {} : { plugins: [] }",
+            "export default c ? { build: { outDir: 'build' } } : opts?.typeof\nwindow.x = c ? {} : { plugins: [] }",
+            "export default c ? { build: { outDir: 'build' } } : { build: { outDir: 'build' } }\n'use strict'\nconst y = c ? {} : { plugins: [] }",
+            "export default c ? { build: { outDir: 'build' } } : { build: { outDir: 'build' } }\n++counter\nfoo = c ? {} : { plugins: [] }",
+            "export default c ? { build: { outDir: 'build' } } : count++\nfoo = c ? {} : { plugins: [] }",
             "const pkg = { name: 'app' }; export default { build: { outDir: 'build' } }",
             "function helper() { return { name: 'p', apply: 'build' } }\nexport default { build: { outDir: 'build' } }",
             "const shared = { plugins: [] }; export default { ...shared, build: { outDir: 'build' } }",
