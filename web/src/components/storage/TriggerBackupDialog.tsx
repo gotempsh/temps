@@ -30,11 +30,11 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { useMutation, useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { announceOperation } from '@/components/operations/operations-tray-store'
 import { HardDrive, Loader2, Star } from 'lucide-react'
 import { useEffect } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
-import { toast } from 'sonner'
 import {
   DestinationsLoadError,
   DestinationsRefreshWarning,
@@ -123,13 +123,14 @@ export function TriggerBackupDialog({
     form.setValue('s3_source_id', preferred.id)
   }, [open, s3Sources, defaultSource, form])
 
+  const queryClient = useQueryClient()
   const runBackupMutation = useMutation({
     ...runExternalServiceBackupMutation(),
     meta: {
       errorTitle: 'Failed to trigger backup',
     },
     onSuccess: () => {
-      toast.success('Backup started successfully', {
+      announceOperation(queryClient, 'Backup started successfully', {
         description: `A backup of ${serviceName} has been triggered.`,
       })
       form.reset()

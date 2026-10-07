@@ -1,0 +1,352 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+/**
+ * Presentational content of the header operations tray. Holds no data
+ * fetching so every state (loading, error, empty, populated, local entries)
+ * renders deterministically from props.
+ */
+import type { OperationEntry } from '@/api/client/types.gen'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { Separator } from '@/components/ui/separator'
+import { Skeleton } from '@/components/ui/skeleton'
+import {
+  formatRelativeShort,
+  groupOperations,
+  LOCAL_OPERATION_ICON,
+  OPERATION_KIND_ICON,
+  OPERATION_KIND_LABEL,
+  OPERATION_STATUS_LABEL,
+  operationContext,
+  operationStatusVariant,
+  operationTimestamp,
+} from '@/lib/operations'
+import { cn } from '@/lib/utils'
+import { AlertCircle, ChevronRight } from 'lucide-react'
+import { Link } from 'react-router'
+import type { LocalOperation } from './operations-tray-store'
+
+export const OPERATIONS_EMPTY_MESSAGE =
+  'Nothing running. Deployments, rollbacks, restores, backups and autofix runs you start appear here.'
+
+export interface OperationsTrayPanelProps {
+  operations: readonly OperationEntry[]
+  localOperations: readonly LocalOperation[]
+  runningCount: number
+  isPending: boolean
+  isError: boolean
+  errorMessage?: string | null
+  onRetry: () => void
+  /** Called when a row is followed, so the popover can close. */
+  onNavigate: () => void
+  /** Epoch milliseconds used for relative times. */
+  now: number
+}
+
+export function OperationsTrayPanel({
+  operations,
+  localOperations,
+  runningCount,
+  isPending,
+  isError,
+  errorMessage,
+  onRetry,
+  onNavigate,
+  now,
+}: OperationsTrayPanelProps) {
+  const inFlight = runningCount + localOperations.length
+  return (
+    <div>
+      <div className="flex items-center justify-between px-3 py-2.5">
+        <p className="text-sm font-medium">Operations</p>
+        {inFlight > 0 && (
+          <p className="text-xs text-muted-foreground tabular-nums">
+            {inFlight} running
+          </p>
+        )}
+      </div>
+      <Separator />
+      <div className="max-h-[420px] overflow-y-auto">
+        {localOperations.length > 0 && (
+          <ul role="list" className="divide-y divide-border border-b">
+            {localOperations.map((operation) => (
+              <li key={operation.id}>
+                <LocalOperationRow operation={operation} now={now} />
+              </li>
+            ))}
+          </ul>
+        )}
+        <OperationsTrayBody
+          operations={operations}
+          hasLocal={localOperations.length > 0}
+          isPending={isPending}
+          isError={isError}
+          errorMessage={errorMessage}
+          onRetry={onRetry}
+          onNavigate={onNavigate}
+          now={now}
+        />
+      </div>
+    </div>
+  )
+}
+
+function OperationsTrayBody({
+  operations,
+  hasLocal,
+  isPending,
+  isError,
+  errorMessage,
+  onRetry,
+  onNavigate,
+  now,
+}: {
+  operations: readonly OperationEntry[]
+  hasLocal: boolean
+  isPending: boolean
+  isError: boolean
+  errorMessage?: string | null
+  onRetry: () => void
+  onNavigate: () => void
+  now: number
+}) {
+  if (isPending) return <OperationsTraySkeleton />
+  if (isError) {
+    return <OperationsTrayError message={errorMessage} onRetry={onRetry} />
+  }
+  if (operations.length === 0) {
+    return hasLocal ? null : <OperationsTrayEmpty />
+  }
+  const { active, finished } = groupOperations(operations)
+  return (
+    <>
+      <OperationGroup
+        label="In progress"
+        showLabel={finished.length > 0}
+        operations={active}
+        onNavigate={onNavigate}
+        now={now}
+      />
+      <OperationGroup
+        label="Recent"
+        showLabel={active.length > 0}
+        operations={finished}
+        onNavigate={onNavigate}
+        now={now}
+      />
+    </>
+  )
+}
+
+function OperationGroup({
+  label,
+  showLabel,
+  operations,
+  onNavigate,
+  now,
+}: {
+  label: string
+  showLabel: boolean
+  operations: readonly OperationEntry[]
+  onNavigate: () => void
+  now: number
+}) {
+  if (operations.length === 0) return null
+  return (
+    <section aria-label={label}>
+      {showLabel && (
+        <p className="px-3 pb-1 pt-2.5 text-xs font-medium text-muted-foreground">
+          {label}
+        </p>
+      )}
+      <ul role="list" className="divide-y divide-border">
+        {operations.map((operation) => (
+          <li key={operation.id}>
+            <OperationRow
+              operation={operation}
+              onNavigate={onNavigate}
+              now={now}
+            />
+          </li>
+        ))}
+      </ul>
+    </section>
+  )
+}
+
+function OperationRow({
+  operation,
+  onNavigate,
+  now,
+}: {
+  operation: OperationEntry
+  onNavigate: () => void
+  now: number
+}) {
+  const Icon = OPERATION_KIND_ICON[operation.kind]
+  const context = operationContext(operation)
+  const showReason =
+    (operation.status === 'failed' || operation.status === 'cancelled') &&
+    !!operation.failure_reason
+  return (
+    <Link
+      to={operation.link}
+      onClick={onNavigate}
+      className="flex items-start gap-3 px-3 py-3 transition-colors hover:bg-accent focus-visible:bg-accent focus-visible:outline-none"
+    >
+      <span
+        className="mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-full bg-muted text-muted-foreground"
+        aria-hidden="true"
+      >
+        <Icon className="size-3.5" />
+      </span>
+      <div className="min-w-0 flex-1">
+        <div className="flex items-baseline justify-between gap-2">
+          <p className="truncate text-sm font-medium">
+            <span className="sr-only">
+              {OPERATION_KIND_LABEL[operation.kind]}:{' '}
+            </span>
+            {operation.title}
+          </p>
+          <p className="shrink-0 text-xs text-muted-foreground tabular-nums">
+            {formatRelativeShort(operationTimestamp(operation), now)}
+          </p>
+        </div>
+        <div className="mt-1 flex min-w-0 items-center gap-2">
+          <Badge
+            variant={operationStatusVariant(operation.status)}
+            className="shrink-0 px-1.5 py-0 text-[11px] font-medium"
+          >
+            {OPERATION_STATUS_LABEL[operation.status]}
+          </Badge>
+          {context && (
+            <span className="truncate text-xs text-muted-foreground">
+              {context}
+            </span>
+          )}
+        </div>
+        {showReason && (
+          <p
+            className={cn(
+              'mt-1 line-clamp-2 text-xs',
+              // A cancellation is the operator's choice, not an error.
+              operation.status === 'failed'
+                ? 'text-destructive'
+                : 'text-muted-foreground'
+            )}
+          >
+            {operation.failure_reason}
+          </p>
+        )}
+      </div>
+      <ChevronRight
+        className="mt-1 size-4 shrink-0 text-muted-foreground"
+        aria-hidden="true"
+      />
+    </Link>
+  )
+}
+
+function LocalOperationRow({
+  operation,
+  now,
+}: {
+  operation: LocalOperation
+  now: number
+}) {
+  const Icon = LOCAL_OPERATION_ICON
+  return (
+    <div className="flex items-start gap-3 px-3 py-3">
+      <span
+        className="mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-full bg-muted text-muted-foreground"
+        aria-hidden="true"
+      >
+        <Icon className="size-3.5 animate-spin" />
+      </span>
+      <div className="min-w-0 flex-1">
+        <div className="flex items-baseline justify-between gap-2">
+          <p className="truncate text-sm font-medium">{operation.title}</p>
+          <p className="shrink-0 text-xs text-muted-foreground tabular-nums">
+            {formatRelativeShort(
+              new Date(operation.startedAt).toISOString(),
+              now
+            )}
+          </p>
+        </div>
+        <div className="mt-1 flex min-w-0 items-center gap-2">
+          <Badge
+            variant="secondary"
+            className="shrink-0 px-1.5 py-0 text-[11px] font-medium"
+          >
+            Running
+          </Badge>
+          {operation.context && (
+            <span className="truncate text-xs text-muted-foreground">
+              {operation.context}
+            </span>
+          )}
+        </div>
+        <p className="mt-1 text-xs text-muted-foreground">
+          This tab only — not kept after a refresh.
+        </p>
+      </div>
+    </div>
+  )
+}
+
+export function OperationsTraySkeleton() {
+  return (
+    <div aria-busy="true" aria-label="Loading operations">
+      {[0, 1, 2].map((index) => (
+        <div
+          key={index}
+          className={cn(
+            'flex items-start gap-3 px-3 py-3',
+            index > 0 && 'border-t'
+          )}
+        >
+          <Skeleton className="size-6 shrink-0 rounded-full" />
+          <div className="min-w-0 flex-1 space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <Skeleton className="h-4 w-40" />
+              <Skeleton className="h-3 w-10" />
+            </div>
+            <Skeleton className="h-3 w-28" />
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function OperationsTrayError({
+  message,
+  onRetry,
+}: {
+  message?: string | null
+  onRetry: () => void
+}) {
+  return (
+    <div className="flex flex-col items-center gap-2 px-3 py-6 text-center">
+      <AlertCircle className="size-4 text-destructive" aria-hidden="true" />
+      <p className="text-sm font-medium">Couldn&apos;t load operations</p>
+      {message && (
+        <p className="line-clamp-3 text-xs text-muted-foreground">{message}</p>
+      )}
+      <Button variant="outline" size="sm" onClick={onRetry}>
+        Retry
+      </Button>
+    </div>
+  )
+}
+
+function OperationsTrayEmpty() {
+  return (
+    <div className="px-3 py-8 text-center">
+      <p className="text-sm text-muted-foreground">
+        {OPERATIONS_EMPTY_MESSAGE}
+      </p>
+    </div>
+  )
+}

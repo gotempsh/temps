@@ -46,7 +46,8 @@ import {
   getExpiredTokenMessage,
   isExpiredTokenError,
 } from '@/utils/errorHandling'
-import { useMutation, useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { announceOperation } from '@/components/operations/operations-tray-store'
 import { useState, useCallback, useEffect, useRef } from 'react'
 import { Link, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
@@ -74,6 +75,7 @@ import {
 const ITEMS_PER_PAGE = 10
 
 export function ProjectDeployments({ project }: { project: ProjectResponse }) {
+  const queryClient = useQueryClient()
   const [isRedeployModalOpen, setIsRedeployModalOpen] = useState(false)
   const [selectedDeployment, setSelectedDeployment] = useState<number | null>(
     null
@@ -191,7 +193,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
       errorTitle: 'Failed to trigger deployment',
     },
     onSuccess: () => {
-      toast.success('Deployment triggered successfully')
+      announceOperation(queryClient, 'Deployment triggered')
       setIsRedeployModalOpen(false)
 
       // Clear any existing interval
@@ -226,7 +228,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
       errorTitle: 'Failed to redeploy image',
     },
     onSuccess: () => {
-      toast.success('Deployment triggered successfully')
+      announceOperation(queryClient, 'Deployment triggered')
       setIsRedeployModalOpen(false)
       refetch()
     },
@@ -238,7 +240,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
       errorTitle: 'Failed to redeploy static files',
     },
     onSuccess: () => {
-      toast.success('Deployment triggered successfully')
+      announceOperation(queryClient, 'Deployment triggered')
       setIsRedeployModalOpen(false)
       refetch()
     },
@@ -274,7 +276,6 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
       errorTitle: 'Failed to rollback deployment',
     },
     onSuccess: () => {
-      toast.success('Deployment rollback initiated successfully')
       refetch()
     },
     onError: (error: any) => {
@@ -451,17 +452,23 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
   }
 
   const handleRollbackDeployment = async (deploymentId: number) => {
-    toast.promise(
-      rollbackDeployment.mutateAsync({
+    // One toast for the whole lifecycle: loading, then replaced by the
+    // success toast (with the tray action) or dismissed in favour of the
+    // mutation's own error toast.
+    const toastId = toast.loading('Rolling back deployment...')
+    rollbackDeployment.mutate(
+      {
         path: {
           project_id: project.id,
           deployment_id: deploymentId,
         },
-      }),
+      },
       {
-        loading: 'Rolling back deployment...',
-        success: 'Deployment rollback initiated successfully',
-        error: 'Failed to rollback deployment',
+        onSuccess: () =>
+          announceOperation(queryClient, 'Deployment rollback initiated', {
+            id: toastId,
+          }),
+        onError: () => toast.dismiss(toastId),
       }
     )
   }
@@ -488,7 +495,6 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
       errorTitle: 'Failed to promote deployment',
     },
     onSuccess: () => {
-      toast.success('Deployment promoted successfully')
       setPromoteDeploymentId(null)
       setPromoteTargetEnv('')
       refetch()
@@ -506,8 +512,9 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
 
   const handlePromoteDeployment = async () => {
     if (!promoteDeploymentId || !promoteTargetEnv) return
-    toast.promise(
-      promoteDeploymentMut.mutateAsync({
+    const toastId = toast.loading('Promoting deployment...')
+    promoteDeploymentMut.mutate(
+      {
         path: {
           project_id: project.id,
           deployment_id: promoteDeploymentId,
@@ -515,11 +522,13 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
         body: {
           target_environment_id: parseInt(promoteTargetEnv),
         },
-      }),
+      },
       {
-        loading: 'Promoting deployment...',
-        success: 'Deployment promoted successfully',
-        error: 'Failed to promote deployment',
+        onSuccess: () =>
+          announceOperation(queryClient, 'Deployment promotion started', {
+            id: toastId,
+          }),
+        onError: () => toast.dismiss(toastId),
       }
     )
   }
@@ -549,7 +558,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
           image_ref: ref,
         },
       })
-      toast.success('Image deployment started')
+      announceOperation(queryClient, 'Image deployment started')
       setImageDialogOpen(false)
       setImageEnv('')
       refetch()
@@ -584,7 +593,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
         path: { project_id: project.id, environment_id: parseInt(staticEnv) },
         body: { static_bundle_id: bundle.id },
       })
-      toast.success('Static deployment started')
+      announceOperation(queryClient, 'Static deployment started')
       setStaticDialogOpen(false)
       setStaticFile(null)
       setStaticEnv('')
