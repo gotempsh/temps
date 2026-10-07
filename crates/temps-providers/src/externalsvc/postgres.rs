@@ -27,6 +27,10 @@ use crate::utils::ensure_network_exists;
 /// indefinitely.
 const BACKUP_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
 
+/// Where a WAL-G restore records the PID of its `backup-fetch`, so a
+/// cancelled restore can stop the fetch without relying on `pkill`.
+const WALG_FETCH_PID_FILE: &str = "/tmp/walg_fetch.pid";
+
 use super::{
     ExternalService, HealthProbeResult, RuntimeEnvVar, ServiceConfig, ServiceResourceLimits,
     ServiceType,
@@ -881,6 +885,72 @@ impl PostgresService {
 
         info!("PostgreSQL container {} created and started", container.id);
         Ok(())
+    }
+
+    /// Shell script that stops a running WAL-G `backup-fetch` (by the PID it
+    /// recorded) and deletes everything a cancelled restore staged on the
+    /// volume. Waits up to ten seconds for the fetch to exit so the scratch
+    /// directory is not removed while it is still being written.
+    fn walg_fetch_abort_script(restore_temp: &str) -> String {
+        format!(
+            "if [ -f {pid_file} ]; then pid=$(cat {pid_file}); kill \"$pid\" 2>/dev/null; \
+             i=0; while kill -0 \"$pid\" 2>/dev/null && [ $i -lt 10 ]; do sleep 1; i=$((i+1)); done; fi; \
+             rm -rf {restore_temp} /var/lib/postgresql/walg-restore.env {pid_file}",
+            pid_file = WALG_FETCH_PID_FILE,
+            restore_temp = restore_temp,
+        )
+    }
+
+    /// Best-effort cleanup for a WAL-G restore cancelled before it touched
+    /// the live PGDATA. Failures are logged, not returned: the restore is
+    /// already being abandoned and the next restore clears `restore_temp`
+    /// before fetching into it.
+    async fn abort_walg_fetch(&self, container_name: &str, restore_temp: &str) {
+        use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
+
+        info!(
+            "Restore cancelled: stopping WAL-G fetch and removing '{}' in container '{}'",
+            restore_temp, container_name
+        );
+        let script = Self::walg_fetch_abort_script(restore_temp);
+        let exec = match self
+            .docker
+            .create_exec(
+                container_name,
+                CreateExecOptions {
+                    cmd: Some(vec!["sh", "-c", script.as_str()]),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    user: Some("postgres"),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(exec) => exec,
+            Err(e) => {
+                warn!(
+                    "Could not clean up cancelled WAL-G restore in container '{}': {}",
+                    container_name, e
+                );
+                return;
+            }
+        };
+        match self
+            .docker
+            .start_exec(&exec.id, None::<StartExecOptions>)
+            .await
+        {
+            Ok(StartExecResults::Attached { mut output, .. }) => {
+                // Drain output so the exec runs to completion before returning.
+                while output.next().await.is_some() {}
+            }
+            Ok(StartExecResults::Detached) => {}
+            Err(e) => warn!(
+                "Could not clean up cancelled WAL-G restore in container '{}': {}",
+                container_name, e
+            ),
+        }
     }
 
     /// Read a file from inside a container and return its contents as a String.
@@ -1915,6 +1985,7 @@ impl PostgresService {
         service_config: ServiceConfig,
         recovery_target: Option<&super::RecoveryTarget>,
         target_user_data: Option<&str>,
+        gate: &dyn super::RestoreGate,
     ) -> Result<()> {
         use bollard::exec::CreateExecOptions;
 
@@ -1975,8 +2046,11 @@ impl PostgresService {
         } else {
             "LATEST"
         };
+        // The fetch runs in the background of its shell so its PID can be
+        // recorded: a cancelled restore kills it by PID (see
+        // `abort_walg_fetch`) instead of depending on pkill being installed.
         let fetch_cmd_str = format!(
-            "mkdir -p {restore_temp} && rm -rf {restore_temp}/* && wal-g backup-fetch {restore_temp} {fetch_target} > /tmp/walg_restore.log 2>&1"
+            "mkdir -p {restore_temp} && rm -rf {restore_temp}/* && {{ wal-g backup-fetch {restore_temp} {fetch_target} > /tmp/walg_restore.log 2>&1 & echo $! > {WALG_FETCH_PID_FILE}; wait $!; }}"
         );
         let fetch_cmd = vec!["sh", "-c", &fetch_cmd_str];
 
@@ -2005,8 +2079,16 @@ impl PostgresService {
             )
             .await?;
 
-        // Poll for fetch completion
+        // Poll for fetch completion. Nothing outside `restore_temp` has been
+        // written yet, so a cancellation here stops the fetch and removes it.
         loop {
+            if gate.is_cancelled() {
+                self.abort_walg_fetch(&container_name, restore_temp).await;
+                return Err(super::RestoreCancelled {
+                    target: container_name.clone(),
+                }
+                .into());
+            }
             let inspect = self.docker.inspect_exec(&exec.id).await?;
             if let Some(running) = inspect.running {
                 if !running {
@@ -2135,6 +2217,14 @@ impl PostgresService {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+
+        // Last safe point. Everything so far lives in `restore_temp`; the
+        // next step stops the live server. A cancellation recorded before
+        // this call wins and the target is left exactly as it was.
+        if let Err(cancelled) = gate.begin_target_writes().await {
+            self.abort_walg_fetch(&container_name, restore_temp).await;
+            return Err(cancelled.into());
         }
 
         // Step 3: Stop the container. This cleanly shuts down PostgreSQL (PID 1)
@@ -2299,6 +2389,7 @@ impl PostgresService {
         backup_location: &str,
         s3_source: &temps_entities::s3_sources::Model,
         service_config: ServiceConfig,
+        gate: &dyn super::RestoreGate,
     ) -> Result<()> {
         info!("Restoring from legacy backup format: {}", backup_location);
 
@@ -2324,6 +2415,7 @@ impl PostgresService {
             &s3_source.bucket_name,
             backup_location,
             &compressed_path,
+            gate,
         )
         .await?;
         super::restore_staging::gunzip_file(
@@ -2333,6 +2425,10 @@ impl PostgresService {
         )
         .await?;
         let _ = tokio::fs::remove_file(&compressed_path).await;
+
+        // Last safe point: the dump is staged on the host and nothing has
+        // been loaded yet. The staging dir is removed when it drops.
+        gate.begin_target_writes().await?;
 
         let container_name = self.get_live_container_name(&postgres_config);
 
@@ -3706,13 +3802,33 @@ impl ExternalService for PostgresService {
         // Detect if this is a WAL-G backup (s3:// prefix) or a legacy backup (.sql.gz / .pgdump.gz)
         if backup_location.starts_with("s3://") {
             // WAL-G backup: use wal-g backup-fetch
-            self.restore_from_walg(s3_credentials, backup_location, service_config, None, None)
-                .await
+            self.restore_from_walg(
+                s3_credentials,
+                backup_location,
+                service_config,
+                None,
+                None,
+                &super::NoopRestoreGate,
+            )
+            .await
         } else {
             // Legacy backup: fall back to old psql/pg_restore approach
-            self.restore_from_legacy(s3_client, backup_location, s3_source, service_config)
-                .await
+            self.restore_from_legacy(
+                s3_client,
+                backup_location,
+                s3_source,
+                service_config,
+                &super::NoopRestoreGate,
+            )
+            .await
         }
+    }
+
+    /// Both restore paths stage the backup first — WAL-G fetches into
+    /// `restore_temp` while the server keeps running, a legacy dump is
+    /// downloaded to the host — and pass the gate before the first write.
+    fn defers_target_writes(&self, _backup_location: &str) -> bool {
+        true
     }
 
     async fn restore_in_place(&self, ctx: super::RestoreContext<'_>) -> Result<()> {
@@ -3724,6 +3840,7 @@ impl ExternalService for PostgresService {
                 ctx.source_config,
                 None,
                 target_user_data.as_deref(),
+                ctx.gate,
             )
             .await
         } else {
@@ -3732,6 +3849,7 @@ impl ExternalService for PostgresService {
                 ctx.backup_location,
                 ctx.s3_source,
                 ctx.source_config,
+                ctx.gate,
             )
             .await
         }
@@ -4128,6 +4246,7 @@ impl ExternalService for PostgresService {
                     new_service_config,
                     None,
                     target_user_data.as_deref(),
+                    ctx.gate,
                 )
                 .await?;
         } else {
@@ -4137,6 +4256,7 @@ impl ExternalService for PostgresService {
                     ctx.backup_location,
                     ctx.s3_source,
                     new_service_config,
+                    ctx.gate,
                 )
                 .await?;
         }
@@ -4231,6 +4351,7 @@ impl ExternalService for PostgresService {
                     new_service_config,
                     Some(&target),
                     target_user_data.as_deref(),
+                    ctx.gate,
                 )
                 .await?;
 
@@ -4268,6 +4389,7 @@ impl ExternalService for PostgresService {
                 ctx.source_config.clone(),
                 Some(&target),
                 target_user_data.as_deref(),
+                ctx.gate,
             )
             .await?;
             Ok(None)
@@ -4335,6 +4457,39 @@ impl PostgresService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn walg_fetch_abort_script_kills_the_recorded_fetch_and_removes_staged_data() {
+        let script = PostgresService::walg_fetch_abort_script("/var/lib/postgresql/restore_temp");
+
+        assert!(script.contains(&format!("pid=$(cat {})", WALG_FETCH_PID_FILE)));
+        assert!(script.contains("kill \"$pid\""));
+        assert!(
+            script.contains(
+                "rm -rf /var/lib/postgresql/restore_temp /var/lib/postgresql/walg-restore.env"
+            ),
+            "{script}"
+        );
+        // It must never touch the live data directory.
+        assert!(
+            !script.contains("PGDATA") && !script.contains("/data"),
+            "{script}"
+        );
+    }
+
+    #[test]
+    fn postgres_restores_defer_target_writes_to_the_gate() {
+        let docker = match bollard::Docker::connect_with_local_defaults() {
+            Ok(docker) => std::sync::Arc::new(docker),
+            Err(_) => {
+                println!("Docker client unavailable, skipping");
+                return;
+            }
+        };
+        let pg = PostgresService::new("gate-test".to_string(), docker);
+        assert!(pg.defers_target_writes("s3://bucket/walg"));
+        assert!(pg.defers_target_writes("external_services/postgres/x/backup.sql.gz"));
+    }
 
     fn backup_with_metadata(metadata: serde_json::Value) -> temps_entities::backups::Model {
         temps_entities::backups::Model {
@@ -6569,6 +6724,7 @@ mod tests {
             source_service: &source_service,
             source_config: cfg,
             pool: &mock_db,
+            gate: &crate::externalsvc::NoopRestoreGate,
         };
 
         let err = pg

@@ -120,6 +120,24 @@ pub struct RestoreRunAudit {
     pub cross_service_confirmed: bool,
 }
 
+/// A user asked to cancel a running restore. Recorded only when the
+/// cancellation was accepted; the run's final `cancelled` status (and what
+/// was cleaned up) is on the restore run itself.
+#[derive(Debug, Clone, Serialize)]
+pub struct RestoreRunCancellationAudit {
+    pub context: AuditContext,
+    pub restore_run_id: i32,
+    /// The service the restore writes onto (or clones, for a new service).
+    pub service_id: i32,
+    pub service_name: String,
+    pub service_type: String,
+    pub mode: String,
+    /// Phase the run was in when cancellation was requested.
+    pub phase: String,
+    /// Name of the new service a new-service restore was creating.
+    pub target_service_name: Option<String>,
+}
+
 /// Security audit record for a PostgreSQL major-upgrade mutation.
 ///
 /// A service may be linked to more than one project, so the complete project
@@ -477,6 +495,29 @@ impl AuditOperation for ScheduleRunNowAudit {
 impl AuditOperation for RestoreRunAudit {
     fn operation_type(&self) -> String {
         "EXTERNAL_SERVICE_RESTORE_RUN".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+impl AuditOperation for RestoreRunCancellationAudit {
+    fn operation_type(&self) -> String {
+        "EXTERNAL_SERVICE_RESTORE_RUN_CANCELLED".to_string()
     }
 
     fn user_id(&self) -> Option<i32> {

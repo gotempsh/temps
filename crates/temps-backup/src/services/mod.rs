@@ -7,6 +7,7 @@ mod capability;
 mod notifier;
 mod reconcile;
 mod restore;
+mod restore_cancel;
 mod restore_reconcile;
 // `pub(crate)` so the upload path in `engines::v2_common::apply_object_tags`
 // can reuse `is_unsupported_error` to decide whether a tagging failure is
@@ -29,6 +30,7 @@ pub use restore::{
     RestoreOriginBinding, RestorePlan, RestoreRequestMode, RestoreRunView, RestoreService,
     RestoreServiceIdentity,
 };
+pub use restore_cancel::{cancellable_phases, run_is_destructive, RestoreCancellations};
 pub use restore_reconcile::{
     active_restore_run_ids, reconcile_interrupted_restores, FenceTarget, ManagerRestoreFence,
     RestoreHelperFence, RestoreReconcileReport, INTERRUPTED_STATUS,

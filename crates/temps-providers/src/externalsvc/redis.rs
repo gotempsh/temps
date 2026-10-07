@@ -1551,6 +1551,7 @@ impl RedisService {
             &s3_source.bucket_name,
             backup_location,
             &gz_host_path,
+            &super::NoopRestoreGate,
         )
         .await?;
         super::restore_staging::gunzip_file(

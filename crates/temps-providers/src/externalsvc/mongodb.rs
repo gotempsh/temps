@@ -1395,6 +1395,7 @@ impl MongodbService {
             &s3_source.bucket_name,
             backup_location,
             &staged,
+            &super::NoopRestoreGate,
         )
         .await?;
         info!("Downloaded backup, size: {} bytes", size);
@@ -3074,6 +3075,13 @@ impl ExternalService for MongodbService {
     /// captured in the backup, which is what every meaningful restore scenario
     /// (including our e2e test's "post-backup documents must be absent after
     /// restore") requires.
+    /// Sidecar archive restores stage the archive on the host and pass the
+    /// gate before mongorestore runs. Legacy WAL-G (`s3://`) restores do not,
+    /// so the orchestrator gates those before calling in.
+    fn defers_target_writes(&self, backup_location: &str) -> bool {
+        !backup_location.starts_with("s3://")
+    }
+
     async fn restore_in_place(&self, ctx: super::RestoreContext<'_>) -> Result<()> {
         // WAL-G backups (created by the old gotempsh/mongodb-walg path) store
         // the whole backup set under an "s3://" prefix; they have their own
@@ -3115,6 +3123,7 @@ impl ExternalService for MongodbService {
             &ctx.s3_source.bucket_name,
             ctx.backup_location,
             &host_archive_path,
+            ctx.gate,
         )
         .await?;
 
@@ -3123,6 +3132,10 @@ impl ExternalService for MongodbService {
             archive_size,
             host_archive_path.display()
         );
+
+        // Last safe point: the archive is staged on the host and mongorestore
+        // has not run. `restore_dir` removes the archive when it drops.
+        ctx.gate.begin_target_writes().await?;
 
         // ── Run mongorestore sidecar ────────────────────────────────────────
         let result = self
@@ -3246,6 +3259,7 @@ impl ExternalService for MongodbService {
             &ctx.s3_source.bucket_name,
             ctx.backup_location,
             &host_archive_path,
+            ctx.gate,
         )
         .await?;
         info!(

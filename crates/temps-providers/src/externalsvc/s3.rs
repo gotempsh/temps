@@ -4279,6 +4279,7 @@ mod tests {
             source_service: &external_service,
             source_config: s3_config.clone(),
             pool: &mock_db,
+            gate: &super::super::NoopRestoreGate,
         };
 
         let restore_result = s3_service

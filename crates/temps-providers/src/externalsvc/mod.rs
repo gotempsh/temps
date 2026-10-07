@@ -1441,6 +1441,55 @@ pub struct RestoreContext<'a> {
     /// the password is whatever the backup's original credentials were.
     pub source_config: ServiceConfig,
     pub pool: &'a temps_database::DbConnection,
+    /// Cancellation and write-boundary hooks for this restore. Engines poll
+    /// [`RestoreGate::is_cancelled`] while they fetch the backup and call
+    /// [`RestoreGate::begin_target_writes`] right before their first write to
+    /// the target's live data. Callers that cannot cancel pass
+    /// [`NoopRestoreGate`].
+    pub gate: &'a dyn RestoreGate,
+}
+
+/// Returned by [`RestoreGate::begin_target_writes`] when a cancellation won
+/// the race against the restore's first write: the engine must remove its
+/// scratch data and return without touching the target.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("Restore of {target} was cancelled before it wrote to the target")]
+pub struct RestoreCancelled {
+    /// Name of the service (or container) the restore was writing to.
+    pub target: String,
+}
+
+/// Hooks a restore orchestrator hands to an engine so a restore can be
+/// cancelled while it is still only *reading* the backup.
+///
+/// The orchestrator owns the decision: `begin_target_writes` is the single
+/// point after which an in-place restore can no longer be stopped. An engine
+/// that honours the gate (see [`ExternalService::defers_target_writes`])
+/// must call it exactly once, after the backup is staged and before the
+/// first write to the target's data. Engines that do not honour it are gated
+/// by the orchestrator before they are called, which is always safe.
+#[async_trait]
+pub trait RestoreGate: Send + Sync {
+    /// Whether a cancellation is pending. Cheap; called between chunks.
+    fn is_cancelled(&self) -> bool;
+
+    /// Enter the write phase. `Err` means a cancellation was recorded first.
+    async fn begin_target_writes(&self) -> std::result::Result<(), RestoreCancelled>;
+}
+
+/// A gate for callers with no cancellation (CLI restores, tests): never
+/// cancelled, always allows writes.
+pub struct NoopRestoreGate;
+
+#[async_trait]
+impl RestoreGate for NoopRestoreGate {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+
+    async fn begin_target_writes(&self) -> std::result::Result<(), RestoreCancelled> {
+        Ok(())
+    }
 }
 
 /// Outcome of a restore-to-new-service operation.
@@ -1900,6 +1949,17 @@ pub trait ExternalService: Send + Sync {
     /// Restore into the existing service with access to the selected backup row.
     /// Engines that need backup-specific metadata (for example WAL-G user data)
     /// override this method; the default preserves the legacy restore path.
+    /// Whether `restore_in_place` (and an in-place `restore_pitr`) for a
+    /// backup at `backup_location` stages the backup first and calls
+    /// [`RestoreGate::begin_target_writes`] before writing to the target.
+    ///
+    /// Returning `true` lets an in-place restore be cancelled while the
+    /// backup downloads. The default is `false`: the orchestrator then closes
+    /// the gate itself before calling the engine, exactly as before.
+    fn defers_target_writes(&self, _backup_location: &str) -> bool {
+        false
+    }
+
     async fn restore_in_place(&self, ctx: RestoreContext<'_>) -> Result<()> {
         self.restore_from_s3(
             ctx.s3_client,

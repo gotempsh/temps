@@ -1885,6 +1885,7 @@ impl BackupCommand {
                 source_service: service_model,
                 source_config: service_config,
                 pool: db,
+                gate: &temps_providers::externalsvc::NoopRestoreGate,
             };
             service
                 .restore_in_place(restore_context)
