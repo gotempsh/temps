@@ -13,6 +13,7 @@ use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
 use crate::services::custom_domains::CustomDomainService;
+use crate::services::operations::OperationsService;
 use crate::services::project::ProjectService;
 
 /// Projects Plugin for managing project lifecycle and configurations
@@ -67,6 +68,10 @@ impl TempsPlugin for ProjectsPlugin {
             let custom_domain_service = Arc::new(CustomDomainService::new(db.clone()));
             context.register_service(custom_domain_service);
 
+            // Read-only operations feed for the console tray
+            let operations_service = Arc::new(OperationsService::new(db.clone()));
+            context.register_service(operations_service);
+
             tracing::debug!("Projects plugin services registered successfully");
             Ok(())
         })
@@ -100,6 +105,10 @@ impl TempsPlugin for ProjectsPlugin {
         // plugin is guaranteed to be present in the registry by this point.
         // When absent (plain OSS binary), project_access_guard! is a no-op.
         let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
+        let operations_state = Arc::new(crate::handlers::operations::OperationsAppState {
+            operations_service: context.require_service::<OperationsService>(),
+            project_access_checker: project_access_checker.clone(),
+        });
         // Central sensitive-action policy (MFA step-up). Resolved here rather
         // than in `register_services` for the same reason as the access
         // checker above: `configure_routes` is the first point at which the
@@ -121,7 +130,12 @@ impl TempsPlugin for ProjectsPlugin {
             project_access_checker,
             sensitive_action_authorizer,
         });
-        let routes = crate::handlers::configure_routes().with_state(app_state);
+        let routes = crate::handlers::configure_routes()
+            .with_state(app_state)
+            .merge(
+                crate::handlers::operations::configure_operations_routes()
+                    .with_state(operations_state),
+            );
         Some(PluginRoutes::new(routes))
     }
 
