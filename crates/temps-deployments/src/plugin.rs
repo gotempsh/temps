@@ -610,6 +610,26 @@ impl TempsPlugin for DeploymentsPlugin {
                 }
             }
 
+            // Failed cron invocations raise alarms (#1289). The monitoring
+            // plugin registers after this one, so the alarm service is only
+            // resolvable here.
+            match (
+                context.get_service::<temps_monitoring::alarm_service::AlarmService>(),
+                context.get_service::<crate::services::DatabaseCronConfigService>(),
+            ) {
+                (Some(alarm_service), Some(cron_service)) => {
+                    cron_service.set_alarm_service(alarm_service);
+                    tracing::debug!("AlarmService wired into cron scheduler");
+                }
+                (None, _) => tracing::warn!(
+                    "AlarmService not available - failed cron invocations will only be \
+                     recorded in their execution history, with no alarm or notification"
+                ),
+                (Some(_), None) => tracing::warn!(
+                    "Cron scheduler service is not registered; cron failure alarms are off"
+                ),
+            }
+
             // Wire auditing for deploy-path security events — currently the
             // ADR-045 record that a deployment received the host Docker
             // socket. Optional: an install with no audit sink still deploys,

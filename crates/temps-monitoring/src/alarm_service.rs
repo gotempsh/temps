@@ -86,6 +86,9 @@ pub enum AlarmType {
     /// that previously moved plaintext HTTP traffic now moves HTTPS traffic
     /// terminated with a real, publicly-trusted certificate (ADR-041 §2a).
     TraefikContainerDrift,
+    /// A scheduled cron invocation failed: the endpoint answered with a
+    /// non-2xx status or could not be reached.
+    CronJobFailed,
 }
 
 impl AlarmType {
@@ -117,6 +120,7 @@ impl AlarmType {
             Self::NodeFailover => "node_failover",
             Self::NodeResourcePressure => "node_resource_pressure",
             Self::TraefikContainerDrift => "traefik_container_drift",
+            Self::CronJobFailed => "cron_job_failed",
         }
     }
 
@@ -148,6 +152,7 @@ impl AlarmType {
             "node_failover" => Some(Self::NodeFailover),
             "node_resource_pressure" => Some(Self::NodeResourcePressure),
             "traefik_container_drift" => Some(Self::TraefikContainerDrift),
+            "cron_job_failed" => Some(Self::CronJobFailed),
             _ => None,
         }
     }
@@ -1622,6 +1627,7 @@ mod tests {
             AlarmType::NodeFailover,
             AlarmType::NodeResourcePressure,
             AlarmType::TraefikContainerDrift,
+            AlarmType::CronJobFailed,
         ];
 
         for t in &types {
