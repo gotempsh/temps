@@ -949,7 +949,15 @@ export function ServiceRestore() {
                       <TableRow
                         key={`${b.source}-${b.id}-${b.location}`}
                         className={`cursor-pointer ${isSel ? 'bg-accent' : ''}`}
-                        onClick={() => updateSelection({ backup: b })}
+                        onClick={() =>
+                          // Pin the source too: with only the backup in the
+                          // URL, a saved link would follow a later change of
+                          // the default source and no longer find it.
+                          updateSelection({
+                            sourceId: effectiveSourceId,
+                            backup: b,
+                          })
+                        }
                       >
                         <TableCell>
                           <RadioGroup value={isSel ? 'on' : ''}>

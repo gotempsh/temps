@@ -113,6 +113,19 @@ describe('patchRestoreSelection', () => {
   })
 })
 
+describe('selecting a backup from the default source', () => {
+  it('pins the source so a saved link survives a change of default', () => {
+    // No ?source= yet: the page fell back to the default source (7).
+    const next = patchRestoreSelection(new URLSearchParams(), {
+      sourceId: 7,
+      backup: entry({ id: 12 }),
+    })
+    const selection = parseRestoreSelection(next)
+    expect(selection.sourceId).toBe(7)
+    expect(selection.backupId).toBe(12)
+  })
+})
+
 describe('isSelectedBackup', () => {
   it('never matches an untracked entry by a database id', () => {
     const selection = parseRestoreSelection(new URLSearchParams('backup=12'))
