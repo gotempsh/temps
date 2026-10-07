@@ -506,6 +506,7 @@ pub async fn ensure_new_service_name_unclaimed<C: ConnectionTrait>(
 pub async fn teardown_cancelled_new_service<C: ConnectionTrait>(
     conn: &C,
     teardown: &dyn UnpersistedServiceTeardown,
+    probe: &dyn NewServiceResourceProbe,
     name: &str,
     service_type: ServiceType,
 ) -> CancelCleanup {
@@ -532,15 +533,35 @@ pub async fn teardown_cancelled_new_service<C: ConnectionTrait>(
         }
     }
     match teardown.remove(name, service_type).await {
-        Ok(()) => {
-            info!(
-                "Removed partially created service '{}' after a cancelled restore",
-                name
-            );
-            CancelCleanup::NewServiceRemoved {
-                name: name.to_string(),
+        // An engine's `remove()` skips objects it did not list and tolerates
+        // volume-removal errors, so success is only claimed once Docker
+        // confirms nothing under the name is left.
+        Ok(()) => match probe.existing(name, service_type).await {
+            Ok(left) if left.is_empty() => {
+                info!(
+                    "Removed partially created service '{}' after a cancelled restore",
+                    name
+                );
+                CancelCleanup::NewServiceRemoved {
+                    name: name.to_string(),
+                }
             }
-        }
+            Ok(left) => {
+                warn!(
+                    "Cancelled restore of '{}' left objects behind after removal: {}",
+                    name,
+                    left.join(", ")
+                );
+                CancelCleanup::NewServiceLeftBehind {
+                    name: name.to_string(),
+                    reason: format!("still present after removal: {}", left.join(", ")),
+                }
+            }
+            Err(reason) => CancelCleanup::NewServiceLeftBehind {
+                name: name.to_string(),
+                reason: format!("could not confirm it was removed: {}", reason),
+            },
+        },
         Err(reason) => {
             warn!(
                 "Could not remove partially created service '{}' after a cancelled restore: {}",
@@ -825,6 +846,19 @@ mod tests {
     struct RecordingTeardown {
         removed: Mutex<Vec<String>>,
         fail: bool,
+        /// What Docker still reports under the name after removal.
+        left_after_removal: Vec<String>,
+    }
+
+    #[async_trait]
+    impl NewServiceResourceProbe for RecordingTeardown {
+        async fn existing(
+            &self,
+            _name: &str,
+            _service_type: ServiceType,
+        ) -> Result<Vec<String>, String> {
+            Ok(self.left_after_removal.clone())
+        }
     }
 
     #[async_trait]
@@ -846,6 +880,7 @@ mod tests {
         RecordingTeardown {
             removed: Mutex::new(Vec::new()),
             fail,
+            left_after_removal: Vec::new(),
         }
     }
 
@@ -856,8 +891,14 @@ mod tests {
             .into_connection();
         let recorder = teardown(false);
 
-        let cleanup =
-            teardown_cancelled_new_service(&db, &recorder, "copy", ServiceType::Postgres).await;
+        let cleanup = teardown_cancelled_new_service(
+            &db,
+            &recorder,
+            &recorder,
+            "copy",
+            ServiceType::Postgres,
+        )
+        .await;
 
         assert_eq!(
             cleanup,
@@ -878,8 +919,14 @@ mod tests {
             .into_connection();
         let recorder = teardown(false);
 
-        let cleanup =
-            teardown_cancelled_new_service(&db, &recorder, "copy", ServiceType::Postgres).await;
+        let cleanup = teardown_cancelled_new_service(
+            &db,
+            &recorder,
+            &recorder,
+            "copy",
+            ServiceType::Postgres,
+        )
+        .await;
 
         assert!(
             matches!(&cleanup, CancelCleanup::NewServiceLeftBehind { reason, .. } if reason.contains("service 42")),
@@ -1038,15 +1085,51 @@ mod tests {
         assert!(err.to_string().contains("docker unreachable"), "{err}");
     }
 
+    /// REGRESSION (Greptile on #1295): an engine's `remove()` can return Ok
+    /// while a container or volume survives (it skips objects it did not
+    /// list and ignores volume errors). The run must say what is left, never
+    /// "nothing was left behind".
+    #[tokio::test]
+    async fn teardown_reports_objects_still_present_after_removal() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<temps_entities::external_services::Model>::new()])
+            .into_connection();
+        let mut recorder = teardown(false);
+        recorder.left_after_removal = vec!["volume postgres-copy_data".into()];
+
+        let cleanup = teardown_cancelled_new_service(
+            &db,
+            &recorder,
+            &recorder,
+            "copy",
+            ServiceType::Postgres,
+        )
+        .await;
+
+        assert_eq!(
+            cleanup,
+            CancelCleanup::NewServiceLeftBehind {
+                name: "copy".into(),
+                reason: "still present after removal: volume postgres-copy_data".into(),
+            }
+        );
+        assert!(!cancelled_message("provision", false, &cleanup).contains("nothing was left"));
+    }
+
     #[tokio::test]
     async fn failed_teardown_is_reported_not_hidden() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([Vec::<temps_entities::external_services::Model>::new()])
             .into_connection();
 
-        let cleanup =
-            teardown_cancelled_new_service(&db, &teardown(true), "copy", ServiceType::Postgres)
-                .await;
+        let cleanup = teardown_cancelled_new_service(
+            &db,
+            &teardown(true),
+            &teardown(true),
+            "copy",
+            ServiceType::Postgres,
+        )
+        .await;
 
         assert_eq!(
             cleanup,

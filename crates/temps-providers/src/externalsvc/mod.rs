@@ -1479,6 +1479,18 @@ pub struct RestoreCancelled {
     pub target: String,
 }
 
+/// A cancelled restore staged its backup with a process that could not be
+/// confirmed stopped, so it may still be writing into the service's scratch
+/// data. The run must keep holding the service until it is confirmed gone.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("Restore of {target} was cancelled, but its staged download could not be confirmed stopped: {reason}")]
+pub struct StagedRestoreStillRunning {
+    /// Name of the service (or container) the restore was staging for.
+    pub target: String,
+    /// Why the stop could not be confirmed.
+    pub reason: String,
+}
+
 /// Hooks a restore orchestrator hands to an engine so a restore can be
 /// cancelled while it is still only *reading* the backup.
 ///
@@ -1973,9 +1985,6 @@ pub trait ExternalService: Send + Sync {
         Err(anyhow::anyhow!("Restore not implemented for this service"))
     }
 
-    /// Restore into the existing service with access to the selected backup row.
-    /// Engines that need backup-specific metadata (for example WAL-G user data)
-    /// override this method; the default preserves the legacy restore path.
     /// Whether `restore_in_place` (and an in-place `restore_pitr`) for a
     /// backup at `backup_location` stages the backup first and calls
     /// [`RestoreGate::begin_target_writes`] before writing to the target.
@@ -1987,6 +1996,23 @@ pub trait ExternalService: Send + Sync {
         false
     }
 
+    /// Stop any restore download this service staged and is still running,
+    /// and confirm it has exited.
+    ///
+    /// An engine that stages a backup with a process detached from the
+    /// orchestrator (PostgreSQL's WAL-G `backup-fetch`) must make sure it is
+    /// gone before a cancelled or abandoned run releases the service: a
+    /// fetch that keeps writing into the shared scratch directory would mix
+    /// with the next restore's files. `Ok` means nothing is running any more;
+    /// an error means that could not be confirmed. Engines that stage
+    /// in-process have nothing to stop.
+    async fn stop_staged_restore(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Restore into the existing service with access to the selected backup row.
+    /// Engines that need backup-specific metadata (for example WAL-G user data)
+    /// override this method; the default preserves the legacy restore path.
     async fn restore_in_place(&self, ctx: RestoreContext<'_>) -> Result<()> {
         self.restore_from_s3(
             ctx.s3_client,

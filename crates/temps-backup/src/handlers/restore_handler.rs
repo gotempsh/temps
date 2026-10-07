@@ -92,6 +92,7 @@ impl From<RestoreError> for Problem {
             | RestoreError::Encryption { .. }
             | RestoreError::ExternalService { .. }
             | RestoreError::WorkerCrashed { .. }
+            | RestoreError::StagedRestoreStillRunning { .. }
             | RestoreError::Internal { .. }) => {
                 error!(error = %internal_error, "restore request failed internally");
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)

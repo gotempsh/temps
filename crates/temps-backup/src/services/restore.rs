@@ -102,6 +102,20 @@ pub enum RestoreError {
         message: String,
     },
 
+    /// A cancelled run staged its backup with a process that could not be
+    /// confirmed stopped. The run is kept active, holding the service, so no
+    /// other restore reuses the scratch data while it may still be written.
+    #[error(
+        "Restore run {restore_run_id} was cancelled, but its staged download in {target} could \
+         not be confirmed stopped ({reason}). The run stays active so no other restore uses the \
+         service until the download is confirmed gone; the next server start retries the check."
+    )]
+    StagedRestoreStillRunning {
+        restore_run_id: i32,
+        target: String,
+        reason: String,
+    },
+
     #[error("Restore run {restore_run_id} cannot be cancelled in phase '{phase}': {reason}")]
     RestoreNotCancellable {
         restore_run_id: i32,
@@ -1779,6 +1793,30 @@ async fn run_restore_worker(
             ),
             phase,
         }),
+        // A cancelled download that could not be confirmed stopped: retry
+        // the confirmation, and only release the service once it holds.
+        Ok(Err(still_running @ RestoreError::StagedRestoreStillRunning { .. })) => {
+            match confirm_staged_restore_stopped(&db, run_id, &fence).await {
+                Ok(phase) => Err(RestoreError::Cancelled {
+                    restore_run_id: run_id,
+                    message: super::restore_cancel::cancelled_message(
+                        &phase,
+                        destructive,
+                        &super::restore_cancel::CancelCleanup::TargetUntouched,
+                    ),
+                    phase,
+                }),
+                Err(e) => {
+                    error!("{} Last confirmation attempt: {}", still_running, e);
+                    telemetry.report(restore_outcome_event(
+                        mode_label,
+                        started.elapsed(),
+                        Err(still_running.to_string()),
+                    ));
+                    return Err(still_running);
+                }
+            }
+        }
         Ok(result) => result,
         Err(join_error) => {
             match settle_crashed_run(&db, run_id, &fence, join_error.to_string()).await {
@@ -2350,9 +2388,7 @@ async fn run_restore_inner(
                 instance
                     .restore_in_place(ctx)
                     .await
-                    .map_err(|e| RestoreError::ExternalService {
-                        reason: format!("in-place restore failed: {}", e),
-                    })
+                    .map_err(|e| engine_error(run_id, e, "in-place restore failed"))
             };
             if let Err(e) = result {
                 return Err(settle_destructive_failure(&db, run_id, &gate, e).await);
@@ -2363,22 +2399,20 @@ async fn run_restore_inner(
             name,
             parameter_overrides,
         } => {
-            // Everything this writes lands in a service the run is creating,
-            // so a cancellation drops the provision and tears it down.
-            let provision = instance.restore_to_new_service(ctx, name.clone(), parameter_overrides);
-            let provisioned = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => None,
-                result = provision => Some(result),
-            };
+            // Everything this writes lands in a service the run is creating.
+            // A cancellation lets the provision stop at its next check (the
+            // gate) rather than dropping it mid-call: a dropped Docker request
+            // can still create a container or volume after teardown looked.
+            // Only once the engine has returned is the service torn down.
+            let provisioned = instance
+                .restore_to_new_service(ctx, name.clone(), parameter_overrides)
+                .await;
+            if cancel.is_cancelled() {
+                return Err(cancel_new_service(&db, &mgr, run_id, &name, service_type).await);
+            }
             match provisioned {
-                Some(Ok(result)) if !cancel.is_cancelled() => Some((name, result)),
-                Some(Err(e)) if !cancel.is_cancelled() => {
-                    return Err(RestoreError::ExternalService {
-                        reason: format!("new-service restore failed: {}", e),
-                    })
-                }
-                _ => return Err(cancel_new_service(&db, &mgr, run_id, &name, service_type).await),
+                Ok(result) => Some((name, result)),
+                Err(e) => return Err(engine_error(run_id, e, "new-service restore failed")),
             }
         }
         RestoreRequestMode::Pitr {
@@ -2395,36 +2429,29 @@ async fn run_restore_inner(
                             run_id
                         ),
                     })?;
-                let recovery = instance.restore_pitr(ctx, target, true, new_service_name.clone());
-                let recovered = tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => None,
-                    result = recovery => Some(result),
-                };
+                // As for a new-service restore: let the recovery return
+                // before tearing down what it created.
+                let recovered = instance
+                    .restore_pitr(ctx, target, true, new_service_name.clone())
+                    .await;
+                if cancel.is_cancelled() {
+                    return Err(cancel_new_service(&db, &mgr, run_id, &name, service_type).await);
+                }
                 match recovered {
-                    Some(Ok(Some(result))) if !cancel.is_cancelled() => Some((name, result)),
-                    Some(Ok(None)) if !cancel.is_cancelled() => {
+                    Ok(Some(result)) => Some((name, result)),
+                    Ok(None) => {
                         return Err(RestoreError::Internal {
                             reason: "PITR to_new_service did not return a new service result"
                                 .into(),
                         })
                     }
-                    Some(Err(e)) if !cancel.is_cancelled() => {
-                        return Err(RestoreError::ExternalService {
-                            reason: format!("PITR failed: {}", e),
-                        })
-                    }
-                    _ => {
-                        return Err(cancel_new_service(&db, &mgr, run_id, &name, service_type).await)
-                    }
+                    Err(e) => return Err(engine_error(run_id, e, "PITR failed")),
                 }
             } else {
                 if let Err(e) = instance
                     .restore_pitr(ctx, target, false, None)
                     .await
-                    .map_err(|e| RestoreError::ExternalService {
-                        reason: format!("PITR failed: {}", e),
-                    })
+                    .map_err(|e| engine_error(run_id, e, "PITR failed"))
                 {
                     return Err(settle_destructive_failure(&db, run_id, &gate, e).await);
                 }
@@ -2514,6 +2541,22 @@ async fn run_restore_inner(
     Ok(target_service_id)
 }
 
+/// Map an engine error to a [`RestoreError`], keeping the one outcome the
+/// worker must act on rather than report: a staged download that could not be
+/// confirmed stopped.
+fn engine_error(run_id: i32, error: anyhow::Error, context: &str) -> RestoreError {
+    match error.downcast_ref::<temps_providers::externalsvc::StagedRestoreStillRunning>() {
+        Some(still_running) => RestoreError::StagedRestoreStillRunning {
+            restore_run_id: run_id,
+            target: still_running.target.clone(),
+            reason: still_running.reason.clone(),
+        },
+        None => RestoreError::ExternalService {
+            reason: format!("{}: {}", context, error),
+        },
+    }
+}
+
 /// Outcome of a destructive engine call that returned an error.
 ///
 /// If the run was cancelled and the engine never passed the gate, the error is
@@ -2525,7 +2568,10 @@ async fn settle_destructive_failure(
     gate: &super::restore_cancel::WorkerGate<'_, DatabaseConnection>,
     error: RestoreError,
 ) -> RestoreError {
-    if !gate.signalled() || gate.writes_started() {
+    if !gate.signalled()
+        || gate.writes_started()
+        || matches!(error, RestoreError::StagedRestoreStillRunning { .. })
+    {
         return error;
     }
     let phase = load_run_for_update(db, run_id)
@@ -2567,9 +2613,11 @@ async fn teardown_new_service(
             run_id, new_name, e
         );
     }
+    let manager = super::restore_cancel::ManagerServiceTeardown::new(mgr.clone());
     super::restore_cancel::teardown_cancelled_new_service(
         db,
-        &super::restore_cancel::ManagerServiceTeardown::new(mgr.clone()),
+        &manager,
+        &manager,
         new_name,
         service_type,
     )
@@ -2805,6 +2853,41 @@ async fn settle_crashed_run(
         }),
     }
 }
+
+/// Confirm that a cancelled run's staged download has stopped, retrying for
+/// about a minute (Docker may be briefly unavailable). Uses the same fence the
+/// startup reconciliation does, which also runs the engine's
+/// [`temps_providers::externalsvc::ExternalService::stop_staged_restore`].
+/// Returns the run's phase once confirmed.
+async fn confirm_staged_restore_stopped(
+    db: &DatabaseConnection,
+    run_id: i32,
+    fence: &dyn super::restore_reconcile::RestoreHelperFence,
+) -> Result<String, RestoreError> {
+    let run = load_run_for_update(db, run_id).await?;
+    let service = temps_entities::external_services::Entity::find_by_id(run.source_service_id)
+        .one(db)
+        .await?;
+    STAGED_STOP_RETRY
+        .config()
+        .retry(|| async {
+            super::restore_reconcile::fence_run_helpers(&run, service.as_ref(), fence)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|reason| RestoreError::Internal { reason })?;
+    Ok(run.phase)
+}
+
+/// Retry policy for confirming a cancelled download stopped before the run
+/// releases its service.
+const STAGED_STOP_RETRY: TerminalWriteRetry = TerminalWriteRetry {
+    attempts: 5,
+    base_delay: std::time::Duration::from_secs(2),
+    max_delay: std::time::Duration::from_secs(20),
+};
 
 /// Retry policy for the guarded move that precedes registering a new service.
 /// Short: the run is holding a provisioned container while it waits.
@@ -4382,6 +4465,34 @@ mod tests {
         assert!(!engines_compatible("postgres", "redis"));
         assert!(!engines_compatible("mongodb", "mariadb"));
         assert!(!engines_compatible("s3", "postgres"));
+    }
+
+    /// REGRESSION (Greptile on #1295): a download that could not be
+    /// confirmed stopped must reach the worker as its own outcome (which
+    /// keeps the run active), never as a plain failure or a cancellation.
+    #[test]
+    fn engine_error_keeps_an_unconfirmed_stop_typed() {
+        let still_running =
+            anyhow::Error::new(temps_providers::externalsvc::StagedRestoreStillRunning {
+                target: "postgres-orders".into(),
+                reason: "docker unreachable".into(),
+            });
+        match engine_error(7, still_running, "in-place restore failed") {
+            RestoreError::StagedRestoreStillRunning {
+                restore_run_id,
+                target,
+                reason,
+            } => {
+                assert_eq!(restore_run_id, 7);
+                assert_eq!(target, "postgres-orders");
+                assert_eq!(reason, "docker unreachable");
+            }
+            other => panic!("expected StagedRestoreStillRunning, got {other:?}"),
+        }
+        assert!(matches!(
+            engine_error(7, anyhow::anyhow!("disk full"), "in-place restore failed"),
+            RestoreError::ExternalService { ref reason } if reason == "in-place restore failed: disk full"
+        ));
     }
 
     #[test]

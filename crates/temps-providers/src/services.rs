@@ -1859,6 +1859,16 @@ impl ExternalServiceManager {
             report.stopped.extend(fenced.stopped);
             report.removed.extend(fenced.removed);
         }
+        // A download the engine staged inside the service itself (not a
+        // helper container) must be confirmed stopped too.
+        instance
+            .stop_staged_restore()
+            .await
+            .map_err(|e| RestoreFenceError::Stop {
+                target_container: instance.get_docker_container_name(),
+                helper: "staged restore download".to_string(),
+                reason: e.to_string(),
+            })?;
         Ok(Some(report))
     }
 
