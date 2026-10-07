@@ -221,6 +221,7 @@ The proxy enforces per-client-IP request limits on project traffic, after the pr
 - A client IP or CIDR range on an active blacklist gets `403 Forbidden`. The instance blacklist still applies under a project policy. Whitelisted IPs are not counted.
 - A request over a limit gets `429 Too Many Requests` with a `Retry-After` header. Limits use fixed one-minute and one-hour windows, so a client can briefly reach up to twice a limit across a window boundary.
 - Console traffic is not limited. The `proxy.rate_limited` metric counts rejected requests.
+- Each proxy process tracks up to 100,000 client/environment pairs (about 10 MB). Once that table is full, new clients are counted in shared overflow counters instead of individually, so limits keep applying. Clients that share an overflow counter share its budget, so during such a flood some legitimate clients can be limited early.
 - Each proxy process counts on its own, so limits apply per node. When any rate limit is configured, public ingress stays on the control plane rather than going directly to worker nodes.
 
 Separately, repeated failed attempts at preview and password-protected pages are rate limited.

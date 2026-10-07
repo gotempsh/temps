@@ -23,13 +23,20 @@
 //! can burst up to twice a limit across a window boundary.
 //!
 //! Memory is bounded by [`MAX_TRACKED_CLIENTS`] entries (roughly 100 bytes
-//! each, about 10 MB at the cap). Entries whose windows have both expired are
-//! swept at most once a minute. At the cap, a client with no entry yet is
-//! admitted without being counted (fail open, counted in
-//! [`RateLimiter::untracked_admissions`]) rather than rejecting traffic the
-//! limiter cannot attribute.
+//! each, about 10 MB at the cap) plus [`OVERFLOW_BUCKETS`] shared counters
+//! (256 KB). Entries whose windows have both expired are swept at most once a
+//! minute. At the cap, a client with no entry yet is counted in a shared
+//! overflow bucket picked by a randomly seeded hash of (scope, client IP), so
+//! limits keep applying to it: an attacker cannot fill the table to stop
+//! being counted, and one environment's traffic filling the table does not
+//! exempt another's clients. The cost lands only at saturation: clients that
+//! share a bucket share its budget, so they can be limited early (degrade
+//! toward stricter, never toward unlimited). Overflow admissions are counted
+//! in [`RateLimiter::overflow_admissions`].
 
 use dashmap::DashMap;
+use std::collections::hash_map::RandomState;
+use std::hash::BuildHasher;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -37,6 +44,9 @@ use std::sync::Arc;
 
 /// Upper bound on (scope, client IP) pairs tracked by one proxy process.
 pub const MAX_TRACKED_CLIENTS: usize = 100_000;
+
+/// Shared counters for clients that arrive while the table is full.
+pub const OVERFLOW_BUCKETS: usize = 16_384;
 
 /// Seconds between sweeps of expired entries.
 const SWEEP_INTERVAL_SECS: u64 = 60;
@@ -174,16 +184,39 @@ fn normalize(ip: IpAddr) -> IpAddr {
     }
 }
 
-#[derive(Default)]
 pub struct RateLimiter {
     clients: DashMap<(i64, IpAddr), Arc<ClientWindows>>,
+    capacity: usize,
+    /// Fallback counters once `clients` is at `capacity`.
+    overflow: Box<[ClientWindows]>,
+    /// Per-process random seed so clients cannot aim at a chosen bucket.
+    overflow_hasher: RandomState,
     last_sweep_secs: AtomicU64,
-    untracked: AtomicU64,
+    overflow_admissions: AtomicU64,
+}
+
+impl Default for RateLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RateLimiter {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_capacity(MAX_TRACKED_CLIENTS)
+    }
+
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            clients: DashMap::new(),
+            capacity,
+            overflow: (0..OVERFLOW_BUCKETS)
+                .map(|_| ClientWindows::default())
+                .collect(),
+            overflow_hasher: RandomState::new(),
+            last_sweep_secs: AtomicU64::new(0),
+            overflow_admissions: AtomicU64::new(0),
+        }
     }
 
     /// Decide one request. `now_secs` is Unix time, passed in for tests.
@@ -205,17 +238,29 @@ impl RateLimiter {
         self.maybe_sweep(now_secs);
 
         let key = (scope.key(), ip);
-        let windows = match self.clients.get(&key) {
-            Some(existing) => Arc::clone(existing.value()),
-            None => {
-                if self.clients.len() >= MAX_TRACKED_CLIENTS {
-                    self.untracked.fetch_add(1, Ordering::Relaxed);
-                    return RateLimitDecision::Allow;
-                }
-                Arc::clone(self.clients.entry(key).or_default().value())
+        match self.clients.get(&key) {
+            Some(existing) => {
+                let windows = Arc::clone(existing.value());
+                drop(existing);
+                Self::take(&windows, policy, now_secs)
             }
-        };
+            None if self.clients.len() >= self.capacity => {
+                self.overflow_admissions.fetch_add(1, Ordering::Relaxed);
+                let bucket = self.overflow_hasher.hash_one(key) as usize % self.overflow.len();
+                Self::take(&self.overflow[bucket], policy, now_secs)
+            }
+            None => {
+                let windows = Arc::clone(self.clients.entry(key).or_default().value());
+                Self::take(&windows, policy, now_secs)
+            }
+        }
+    }
 
+    fn take(
+        windows: &ClientWindows,
+        policy: &RateLimitPolicy<'_>,
+        now_secs: u64,
+    ) -> RateLimitDecision {
         let minute_window = (now_secs / 60) as u32;
         let hour_window = (now_secs / 3600) as u32;
         if !try_take(&windows.minute, minute_window, policy.per_minute) {
@@ -235,9 +280,10 @@ impl RateLimiter {
         RateLimitDecision::Allow
     }
 
-    /// Admissions that skipped counting because the limiter was at capacity.
-    pub fn untracked_admissions(&self) -> u64 {
-        self.untracked.load(Ordering::Relaxed)
+    /// Requests counted in a shared overflow bucket because the table was
+    /// full when their client was first seen.
+    pub fn overflow_admissions(&self) -> u64 {
+        self.overflow_admissions.load(Ordering::Relaxed)
     }
 
     /// Number of (scope, client IP) entries currently tracked.
@@ -505,6 +551,45 @@ mod tests {
         // Two hours later both windows have expired; the next request sweeps.
         limiter.check(RateLimitScope::Instance, ip("192.0.2.11"), &p, T0 + 7200);
         assert_eq!(limiter.tracked_clients(), 1);
+    }
+
+    #[test]
+    fn clients_seen_at_capacity_are_still_limited() {
+        let limiter = RateLimiter::with_capacity(2);
+        let p = policy(3, 0);
+        let env_a = RateLimitScope::Environment(1);
+        limiter.check(env_a, ip("192.0.2.1"), &p, T0);
+        limiter.check(env_a, ip("192.0.2.2"), &p, T0);
+        assert_eq!(limiter.tracked_clients(), 2);
+
+        // The table is full: a new client of the same environment, and one of
+        // another environment, are counted in overflow buckets, not let through.
+        for (scope, client) in [
+            (env_a, ip("198.51.100.7")),
+            (RateLimitScope::Environment(2), ip("203.0.113.9")),
+        ] {
+            for _ in 0..3 {
+                assert_eq!(
+                    limiter.check(scope, client, &p, T0),
+                    RateLimitDecision::Allow
+                );
+            }
+            assert!(matches!(
+                limiter.check(scope, client, &p, T0),
+                RateLimitDecision::Limited {
+                    window: RateLimitWindow::Minute,
+                    ..
+                }
+            ));
+        }
+        assert_eq!(limiter.tracked_clients(), 2);
+        assert!(limiter.overflow_admissions() >= 8);
+
+        // The overflow window rolls over like any other.
+        assert_eq!(
+            limiter.check(env_a, ip("198.51.100.7"), &p, T0 + 60),
+            RateLimitDecision::Allow
+        );
     }
 
     #[test]
