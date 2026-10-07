@@ -525,10 +525,14 @@ struct Frame {
     out_dir: Slot,
     /// For a config object: what its (last) `build` key resolves `outDir` to.
     build: Slot,
-    /// For a config object: it is not assigned to a variable, so it can be
-    /// one of the configs Vite actually uses (an export, a `defineConfig`
-    /// argument, a returned or ternary branch).
-    branch: bool,
+    /// For a config object that is one of several alternatives (a ternary
+    /// arm, or a `return` in a config function): the group of alternatives
+    /// it belongs to, keyed by its nearest enclosing call or parenthesis.
+    /// `None` for anything else: an export, a merged `mergeConfig` input, an
+    /// arrow-returned helper object.
+    branch_group: Option<usize>,
+    /// Unique id, used as the branch group of objects opened inside a `(`.
+    id: usize,
     /// For a config object: it has at least one member.
     has_members: bool,
     /// For a config object: one of its keys is a Vite top-level option.
@@ -547,7 +551,8 @@ impl Frame {
             config_build: false,
             out_dir: Slot::Absent,
             build: Slot::Absent,
-            branch: false,
+            branch_group: None,
+            id: 0,
             has_members: false,
             vite_key: false,
             opaque_members: false,
@@ -555,12 +560,12 @@ impl Frame {
     }
 
     /// An object literal; `in_config_scope` is the parent's `config_scope`,
-    /// `branch` whether it is not assigned to a variable.
-    fn object(in_config_scope: bool, config_build: bool, branch: bool) -> Self {
+    /// `branch_group` its group of alternative configs, if it is one.
+    fn object(in_config_scope: bool, config_build: bool, branch_group: Option<usize>) -> Self {
         Self {
             config: in_config_scope,
             config_build,
-            branch,
+            branch_group,
             ..Self::new(FrameKind::Object, false)
         }
     }
@@ -570,7 +575,7 @@ impl Frame {
     /// the default directory if it were the branch taken.
     fn default_dir_branch(&self) -> bool {
         self.config
-            && self.branch
+            && self.branch_group.is_some()
             && self.build == Slot::Absent
             && !self.opaque_members
             && (!self.has_members || self.vite_key)
@@ -660,19 +665,19 @@ fn paren_keeps_config_scope(tokens: &[Token], index: usize) -> bool {
 /// Hand a closed frame's findings on: the config's `build` object becomes the
 /// config's `build` value (a later `build` key replaces an earlier one, as in
 /// JavaScript), and a config object that had a `build` key reports it.
-fn close_frame(frame: Frame, parent: Option<&mut Frame>, results: &mut Vec<Slot>) {
+fn close_frame(frame: Frame, parent: Option<&mut Frame>, results: &mut Vec<(Slot, Option<usize>)>) {
     if frame.config_build {
         match parent {
             Some(parent) => parent.build = frame.out_dir,
-            None => results.push(frame.out_dir),
+            None => results.push((frame.out_dir, None)),
         }
     } else if frame.config && frame.build != Slot::Absent {
-        results.push(frame.build);
+        results.push((frame.build, frame.branch_group));
     } else if frame.default_dir_branch() {
-        // A branch without `build` (`cond ? { build } : {}`) builds into the
-        // default directory; it must take part in the comparison, or a
-        // disagreeing branch would be trusted.
-        results.push(Slot::Absent);
+        // An alternative without `build` (`cond ? { build } : {}`) builds into
+        // the default directory; it must take part in the comparison with its
+        // sibling alternatives, or a disagreeing branch would be trusted.
+        results.push((Slot::Absent, frame.branch_group));
     }
 }
 
@@ -703,7 +708,8 @@ fn close_frame(frame: Frame, parent: Option<&mut Frame>, results: &mut Vec<Slot>
 fn parse_vite_out_dir(source: &str) -> OutDir {
     let tokens = tokenize(source);
     let mut frames: Vec<Frame> = Vec::new();
-    let mut results: Vec<Slot> = Vec::new();
+    let mut results: Vec<(Slot, Option<usize>)> = Vec::new();
+    let mut next_frame_id = 1;
     let key_at = |index: usize| -> Option<String> {
         match tokens.get(index) {
             Some(Token::Word(word)) | Some(Token::Str(word)) => Some(word.clone()),
@@ -728,10 +734,30 @@ fn parse_vite_out_dir(source: &str) -> OutDir {
                         .then(|| key_at(index - 2))
                         .flatten();
                     let parent_is_config = frames.last().is_some_and(|frame| frame.config);
+                    // `? {` and a ternary `: {` (not a `key: {` inside an
+                    // object) open an arm; `return {` one of a function's
+                    // alternative results. Sibling alternatives share the
+                    // nearest enclosing call/parenthesis (0 at top level).
+                    let parent_is_object = frames
+                        .last()
+                        .is_some_and(|frame| frame.kind == FrameKind::Object);
+                    let alternative = match prev {
+                        Some(Token::Punct('?')) => true,
+                        Some(Token::Punct(':')) => !parent_is_object,
+                        Some(Token::Word(word)) => word == "return",
+                        _ => false,
+                    };
+                    let group = alternative.then(|| {
+                        frames
+                            .iter()
+                            .rev()
+                            .find(|frame| frame.kind == FrameKind::Paren)
+                            .map_or(0, |frame| frame.id)
+                    });
                     Frame::object(
                         config_scope,
                         parent_is_config && key.as_deref() == Some("build"),
-                        !matches!(prev, Some(Token::Punct('='))),
+                        group,
                     )
                 } else {
                     Frame::new(FrameKind::Block, config_scope)
@@ -740,7 +766,10 @@ fn parse_vite_out_dir(source: &str) -> OutDir {
             }
             Token::Punct('(') => {
                 let frame = if paren_keeps_config_scope(&tokens, index) {
-                    Frame::new(FrameKind::Paren, config_scope)
+                    let mut frame = Frame::new(FrameKind::Paren, config_scope);
+                    frame.id = next_frame_id;
+                    next_frame_id += 1;
+                    frame
                 } else {
                     Frame::new(FrameKind::Opaque, false)
                 };
@@ -765,7 +794,7 @@ fn parse_vite_out_dir(source: &str) -> OutDir {
                         && (punct_at(index + 1, &['='])
                             || (punct_at(index + 1, &[')']) && punct_at(index + 2, &['='])))
                     {
-                        frame.branch = false;
+                        frame.branch_group = None;
                     }
                     // `mergeConfig({ build }, other)`: a later argument may
                     // replace this config's `build`.
@@ -846,19 +875,28 @@ fn parse_vite_out_dir(source: &str) -> OutDir {
         close_frame(frame, frames.last_mut(), &mut results);
     }
     let mut found: Vec<String> = Vec::new();
-    // A config branch that leaves `outDir` unset builds into the default
-    // directory, which disagrees with any branch that sets it.
-    let mut default_branch = false;
-    for slot in results {
+    // Groups of alternatives in which some arm sets `outDir`, and groups in
+    // which some arm leaves it at the default. An alternative only disagrees
+    // with its own siblings: a merged input or an unrelated helper object is
+    // never an alternative to the exported config.
+    let mut literal_groups: Vec<usize> = Vec::new();
+    let mut default_groups: Vec<usize> = Vec::new();
+    for (slot, group) in results {
         match slot {
-            Slot::Absent => default_branch = true,
-            Slot::Literal(value) => found.push(value),
+            Slot::Absent => default_groups.extend(group),
+            Slot::Literal(value) => {
+                literal_groups.extend(group);
+                found.push(value);
+            }
             Slot::Unknown(reason) => return OutDir::Unresolvable(reason),
         }
     }
     found.sort();
     found.dedup();
-    if default_branch && !found.is_empty() {
+    if default_groups
+        .iter()
+        .any(|group| literal_groups.contains(group))
+    {
         return OutDir::Unresolvable(
             "build.outDir differs between config branches: one leaves it at the default",
         );
@@ -1388,6 +1426,12 @@ mod tests {
     #[test]
     fn non_config_objects_do_not_count_as_default_branches() {
         for config in [
+            // REGRESSION (Greptile on #1295): merged inputs are combined, not
+            // alternatives, and an unrelated helper object is not a branch.
+            "export default mergeConfig({ server: { port: 3000 } }, { build: { outDir: 'build' } })",
+            "const defaults = () => ({})\nexport default { build: { outDir: 'build' } }",
+            "function defaults() { return {} }\nexport default { build: { outDir: 'build' } }",
+            "export default defineConfig(({ mode }) => mergeConfig({ plugins: [] }, { build: { outDir: 'build' } }))",
             "const pkg = { name: 'app' }; export default { build: { outDir: 'build' } }",
             "function helper() { return { name: 'p', apply: 'build' } }\nexport default { build: { outDir: 'build' } }",
             "const shared = { plugins: [] }; export default { ...shared, build: { outDir: 'build' } }",
