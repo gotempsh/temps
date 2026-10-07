@@ -20,6 +20,8 @@
  */
 import { problemDetail } from '@/lib/api-problem'
 import {
+  OPERATIONS_HISTORY_PAGE_SIZE,
+  OPERATIONS_RUNNING_PAGE_SIZE,
   operationsBadgeText,
   operationsClampPage,
   operationsLeftRunning,
@@ -176,8 +178,8 @@ export function OperationsTray() {
               : null,
             onRetry: () => void runningQuery.refetch(),
             isPaging: runningQuery.isPlaceholderData,
-            onNewer: () => setOperationsTrayPage('running', runningPage - 1),
-            onOlder: () => setOperationsTrayPage('running', runningPage + 1),
+            pageSize: OPERATIONS_RUNNING_PAGE_SIZE,
+            onPageChange: (page) => setOperationsTrayPage('running', page),
           }}
           recent={{
             operations: feed.recent,
@@ -192,8 +194,8 @@ export function OperationsTray() {
               : null,
             onRetry: () => void finishedQuery.refetch(),
             isPaging: finishedQuery.isPlaceholderData,
-            onNewer: () => setOperationsTrayPage('recent', recentPage - 1),
-            onOlder: () => setOperationsTrayPage('recent', recentPage + 1),
+            pageSize: OPERATIONS_HISTORY_PAGE_SIZE,
+            onPageChange: (page) => setOperationsTrayPage('recent', page),
           }}
           localOperations={localOperations}
           runningCount={runningCount}

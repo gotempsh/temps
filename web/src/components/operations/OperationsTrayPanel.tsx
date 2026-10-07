@@ -8,6 +8,7 @@
  */
 import type { OperationEntry } from '@/api/client/types.gen'
 import { Badge } from '@/components/ui/badge'
+import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 import { Button } from '@/components/ui/button'
 import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -18,12 +19,13 @@ import {
   OPERATION_KIND_LABEL,
   OPERATION_STATUS_LABEL,
   operationContext,
+  operationsLastPage,
   operationStatusVariant,
   operationTimestamp,
   type OperationsPageNav,
 } from '@/lib/operations'
 import { cn } from '@/lib/utils'
-import { AlertCircle, ChevronLeft, ChevronRight } from 'lucide-react'
+import { AlertCircle, ChevronRight } from 'lucide-react'
 import { Link } from 'react-router'
 import type { LocalOperation } from './operations-tray-store'
 
@@ -46,8 +48,10 @@ export interface OperationsSectionState {
   onRetry: () => void
   /** Another page is loading; the current rows stay until it arrives. */
   isPaging: boolean
-  onNewer: () => void
-  onOlder: () => void
+  /** Rows per page; the shared pager derives positions from it. */
+  pageSize: number
+  /** Show `page` (1-based) in place of the current one. */
+  onPageChange: (page: number) => void
 }
 
 export interface OperationsTrayPanelProps {
@@ -213,7 +217,10 @@ function OperationSection({
   )
 }
 
-/** Newer/Older controls; each replaces the section's page. */
+/**
+ * The shared pager for one tray section. Each page change replaces the
+ * section's rows; `aria-busy` marks the outgoing page while the next loads.
+ */
 function SectionPager({
   noun,
   state,
@@ -223,33 +230,15 @@ function SectionPager({
 }) {
   const { nav } = state
   return (
-    <div className="flex items-center justify-between gap-2 border-t px-3 py-2">
-      <Button
-        variant="ghost"
-        size="sm"
-        disabled={!nav.hasNewer || state.isPaging}
-        onClick={state.onNewer}
-        aria-label={`Newer ${noun}`}
-      >
-        <ChevronLeft className="size-4" aria-hidden="true" />
-        Newer
-      </Button>
-      <p
-        className="text-xs text-muted-foreground tabular-nums"
-        aria-live="polite"
-      >
-        {state.isPaging ? 'Loading…' : `${nav.first}–${nav.last} of ${nav.total}`}
-      </p>
-      <Button
-        variant="ghost"
-        size="sm"
-        disabled={!nav.hasOlder || state.isPaging}
-        onClick={state.onOlder}
-        aria-label={`Older ${noun}`}
-      >
-        Older
-        <ChevronRight className="size-4" aria-hidden="true" />
-      </Button>
+    <div className="border-t px-3 py-2" aria-busy={state.isPaging}>
+      <ResponsivePagination
+        page={nav.page}
+        pageSize={state.pageSize}
+        total={nav.total}
+        totalPages={operationsLastPage(nav.total, state.pageSize)}
+        onPageChange={state.onPageChange}
+        ariaLabel={`Pages of ${noun}`}
+      />
     </div>
   )
 }

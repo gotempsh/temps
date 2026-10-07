@@ -57,8 +57,8 @@ function section(
     onRetry: noop,
     nav: EMPTY_OPERATIONS_PAGE_NAV,
     isPaging: false,
-    onNewer: noop,
-    onOlder: noop,
+    pageSize: 20,
+    onPageChange: noop,
     ...overrides,
   }
 }
@@ -194,42 +194,50 @@ describe('OperationsTrayPanel', () => {
     expect(html).toContain('1 running')
   })
 
-  test('counted running work past the first page is one click away', () => {
+  test('counted running work past the first page is reachable', () => {
     const html = render({
       running: section({
         operations: [entry()],
+        pageSize: 100,
         nav: nav({ page: 1, hasOlder: true, first: 1, last: 100, total: 113 }),
       }),
       runningCount: 113,
     })
-    expect(html).toContain('aria-label="Older running operations"')
-    expect(html).toContain('1–100 of 113')
+    expect(html).toContain('aria-label="Pages of running operations"')
+    expect(html).toContain('1 / 2')
     expect(html).toContain('113 running')
   })
 
-  test('history pages replace each other and disable while loading', () => {
+  test('history uses the shared pager and marks the page busy while loading', () => {
+    // REGRESSION (Greptile on #1295): the tray must use the shared
+    // ResponsivePagination control, compact page context included.
     const finished = section({
       operations: [entry({ id: 'deployment:40', status: 'succeeded' })],
-      nav: nav({ page: 2, hasNewer: true, hasOlder: true, first: 21, last: 40, total: 60 }),
+      nav: nav({
+        page: 2,
+        hasNewer: true,
+        hasOlder: true,
+        first: 21,
+        last: 40,
+        total: 60,
+      }),
     })
     const html = render({ recent: finished })
-    expect(html).toContain('aria-label="Newer recent operations"')
-    expect(html).toContain('aria-label="Older recent operations"')
-    expect(html).toContain('21–40 of 60')
-    const paging = render({ recent: { ...finished, isPaging: true } })
-    expect(paging).toContain('Loading…')
-    expect(paging).toContain('disabled')
+    expect(html).toContain('aria-label="Pages of recent operations"')
+    expect(html).toContain('2 / 3')
+    expect(render({ recent: { ...finished, isPaging: true } })).toContain(
+      'aria-busy="true"'
+    )
   })
 
-  test('no paging controls when everything fits on one page', () => {
+  test('no pager when everything fits on one page', () => {
     const html = render({
       recent: section({
         operations: [entry({ id: 'deployment:40', status: 'succeeded' })],
         nav: nav({ first: 1, last: 1, total: 1 }),
       }),
     })
-    expect(html).not.toContain('Older recent operations')
-    expect(html).not.toContain('Newer recent operations')
+    expect(html).not.toContain('Pages of recent operations')
   })
 
   test('a failing history feed keeps running rows and offers retry', () => {

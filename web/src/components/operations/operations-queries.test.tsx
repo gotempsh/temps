@@ -147,8 +147,8 @@ describe('operations tray queries', () => {
             isError: false,
             onRetry: noop,
             isPaging: false,
-            onNewer: noop,
-            onOlder: noop,
+            pageSize: 20,
+            onPageChange: noop,
           }}
           recent={{
             operations: feed.recent,
@@ -157,8 +157,8 @@ describe('operations tray queries', () => {
             isError: false,
             onRetry: noop,
             isPaging: false,
-            onNewer: noop,
-            onOlder: noop,
+            pageSize: 20,
+            onPageChange: noop,
           }}
           localOperations={[]}
           runningCount={feed.runningCount}
@@ -262,6 +262,10 @@ describe('operations tray queries', () => {
     expect(requests[1]?.searchParams.get('page')).toBe('2')
     expect(requests[1]?.searchParams.get('status')).toBe('running')
     expect(second.running).toHaveLength(30)
-    expect(second.runningNav).toMatchObject({ first: 101, last: 130, hasOlder: false })
+    expect(second.runningNav).toMatchObject({
+      first: 101,
+      last: 130,
+      hasOlder: false,
+    })
   })
 })
