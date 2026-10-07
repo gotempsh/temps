@@ -200,6 +200,7 @@ pub async fn get_alert_rule(
     request_body = CreateAlertRuleRequest,
     responses(
         (status = 201, description = "Alert rule created", body = AlertRuleResponse),
+        (status = 409, description = "The project already has the maximum number of error alert rules"),
         (status = 400, description = "Validation error"),
         (status = 500, description = "Internal server error")
     ),

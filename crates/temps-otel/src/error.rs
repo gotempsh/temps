@@ -84,6 +84,17 @@ pub enum OtelError {
     #[error("Metric alert rule {rule_id} not found")]
     MetricAlertNotFound { rule_id: i32 },
 
+    /// The project already holds the maximum number of API-created metric
+    /// alert rules. Maps to HTTP 409 Conflict.
+    #[error(
+        "Project {project_id} already has {existing} metric alert rules; the limit is {limit} per project. Delete or reuse an existing rule"
+    )]
+    MetricAlertLimitReached {
+        project_id: i32,
+        existing: u64,
+        limit: u64,
+    },
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -265,6 +276,7 @@ impl OtelError {
             OtelError::ProjectNotFound { .. }
             | OtelError::DashboardNotFound { .. }
             | OtelError::MetricAlertNotFound { .. } => "not_found",
+            OtelError::MetricAlertLimitReached { .. } => "limit_reached",
             OtelError::Internal { .. } => "internal",
         }
     }
@@ -305,6 +317,7 @@ impl OtelError {
             | OtelError::Validation { .. }
             | OtelError::DashboardNotFound { .. }
             | OtelError::MetricAlertNotFound { .. }
+            | OtelError::MetricAlertLimitReached { .. }
             | OtelError::Io(_)
             | OtelError::Serialization(_)
             | OtelError::Internal { .. } => false,

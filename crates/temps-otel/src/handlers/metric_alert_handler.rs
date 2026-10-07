@@ -373,6 +373,7 @@ pub async fn list_alerts(
     responses(
         (status = 201, description = "Alert rule created", body = OtelMetricAlertRuleResponse),
         (status = 400, description = "Validation error", body = ProblemDetails),
+        (status = 409, description = "The project already has the maximum number of metric alert rules", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails),
