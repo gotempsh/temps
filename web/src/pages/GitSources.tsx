@@ -60,7 +60,7 @@ const isGitHubApp = (provider: ProviderResponse) =>
 export function GitSources() {
   const { setBreadcrumbs } = useBreadcrumbs()
   const navigate = useNavigate()
-  const { feedback, showSuccess, clearFeedback } = useFeedback()
+  const { feedback, clearFeedback } = useFeedback()
   const queryClient = useQueryClient()
   const [providerToDelete, setProviderToDelete] =
     useState<ProviderResponse | null>(null)
@@ -99,7 +99,7 @@ export function GitSources() {
       const installUrl = `${baseUrl}/installations/new`
       window.open(installUrl, '_blank', 'noopener,noreferrer')
 
-      showSuccess('Opening GitHub App installation in new tab')
+      navigate(`/git-providers/${provider.id}`)
     }
   }
 

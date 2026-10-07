@@ -8,7 +8,9 @@ import {
   createGithubPatProviderMutation,
   createGitlabOauthProviderMutation,
   createGitlabPatProviderMutation,
+  getProviderConnectionsOptions,
   listDomainsOptions,
+  listConnectionsQueryKey,
   listGitProvidersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Alert, AlertDescription } from '@/components/ui/alert'
@@ -25,6 +27,9 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { usePlatformCapabilities } from '@/hooks/usePlatformCapabilities'
 import { cn } from '@/lib/utils'
+import { hasNewGitHubInstallation } from '@/lib/git-installation-polling'
+import { isGitHubApp } from '@/lib/provider'
+import { Button as AsyncButton, Callout, Status } from '@temps-sdk/ds'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertCircle,
@@ -119,6 +124,8 @@ export function GitProviderFlow({
   const [isWaitingForWebhook, setIsWaitingForWebhook] = useState(false)
   const pollingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const previousProviderCountRef = useRef<number>(0)
+  const previousConnectionIdsRef = useRef<number[]>([])
+  const expectedInstallationIdRef = useRef<string | null>(null)
 
   // Fetch existing git providers to check if there's already a GitHub app
   // Enable refetch interval when polling for installations
@@ -136,11 +143,23 @@ export function GitProviderFlow({
   })
 
   // Check if there's already a GitHub app provider
-  const existingGitHubApp = gitProviders.find(
-    (provider) =>
-      provider.provider_type === 'github' &&
-      provider.auth_method === 'github_app'
-  )
+  const existingGitHubApp = gitProviders.find(isGitHubApp)
+
+  const {
+    data: appConnections,
+    isPending: installationsLoading,
+    isFetching: installationsFetching,
+    error: installationError,
+    refetch: refetchInstallations,
+  } = useQuery({
+    ...getProviderConnectionsOptions({
+      path: { provider_id: existingGitHubApp?.id ?? 0 },
+    }),
+    enabled: !!existingGitHubApp,
+    refetchInterval: isWaitingForWebhook ? 2000 : false,
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: 'always',
+  })
 
   const domain = 'github.com'
 
@@ -163,10 +182,7 @@ export function GitProviderFlow({
       // Use queueMicrotask to defer state updates and prevent cascading renders
       queueMicrotask(() => {
         setIsWaitingForWebhook(true)
-        setIsPollingInstallations(true)
-
-        // Clean up the query param from the URL (prevent re-triggering on refresh)
-        window.history.replaceState({}, '', window.location.pathname)
+        expectedInstallationIdRef.current = searchParams.get('installation_id')
 
         toast.info('Setting up GitHub installation...', {
           description:
@@ -176,6 +192,32 @@ export function GitProviderFlow({
       })
     }
   }, [])
+
+  useEffect(() => {
+    if (
+      !isWaitingForWebhook ||
+      !hasNewGitHubInstallation(
+        appConnections,
+        previousConnectionIdsRef.current,
+        expectedInstallationIdRef.current
+      )
+    ) {
+      return
+    }
+
+    queueMicrotask(() => {
+      setIsWaitingForWebhook(false)
+      setCurrentStep('success')
+      queryClient.invalidateQueries({ queryKey: listConnectionsQueryKey() })
+      const url = new URL(window.location.href)
+      url.searchParams.delete('github_installation_processing')
+      url.searchParams.delete('github_installation_complete')
+      url.searchParams.delete('installation_id')
+      window.history.replaceState(window.history.state, '', url)
+      toast.success('GitHub App installation detected!')
+      onSuccess?.()
+    })
+  }, [appConnections, isWaitingForWebhook, onSuccess, queryClient])
 
   // Cleanup polling on unmount or when polling stops
   useEffect(() => {
@@ -215,7 +257,11 @@ export function GitProviderFlow({
     const previousCount = previousProviderCountRef.current
 
     // If we're polling and a new provider appeared
-    if (isPollingInstallations && currentCount > previousCount) {
+    if (
+      isPollingInstallations &&
+      !isWaitingForWebhook &&
+      currentCount > previousCount
+    ) {
       const newGitHubApp = gitProviders.find(
         (provider) =>
           provider.provider_type === 'github' &&
@@ -503,24 +549,38 @@ export function GitProviderFlow({
       return
     }
 
+    if (!existingGitHubApp.base_url) {
+      toast.error('The GitHub App installation URL is not configured')
+      return
+    }
+
+    if (!appConnections) {
+      if (installationError) {
+        toast.error(
+          'Could not load existing GitHub installations. Please retry.'
+        )
+      } else {
+        toast.info(
+          'Existing installations are still loading. Please try again.'
+        )
+      }
+      return
+    }
+
+    previousConnectionIdsRef.current = appConnections.map(
+      (connection) => connection.id
+    )
+    expectedInstallationIdRef.current = null
+
     const installUrl = `${existingGitHubApp.base_url}/installations/new`
-    window.open(installUrl, '_blank')
+    window.open(installUrl, '_blank', 'noopener,noreferrer')
 
     toast.success('Opening GitHub App installation...', {
       description: 'Complete the installation in the new tab, then return here',
       duration: 5000,
     })
 
-    // Start polling for new installations
-    setIsPollingInstallations(true)
-    toast.info('Watching for new installations...', {
-      description: 'Will auto-detect when you complete the installation',
-    })
-
-    setCurrentStep('success')
-    setTimeout(() => {
-      onSuccess?.()
-    }, 1500)
+    setIsWaitingForWebhook(true)
   }
 
   const handleMethodSelect = (method: Method) => {
@@ -706,38 +766,22 @@ export function GitProviderFlow({
 
   if (isWaitingForWebhook) {
     return (
-      <div className={cn('space-y-6', className)}>
-        <div className="text-center space-y-4 py-12">
-          <div className="flex justify-center">
-            <div className="h-20 w-20 rounded-full bg-blue-100 dark:bg-blue-900/20 flex items-center justify-center">
-              <Loader2 className="h-10 w-10 text-blue-600 dark:text-blue-400 animate-spin" />
-            </div>
-          </div>
-          <div>
-            <h3 className="text-xl sm:text-2xl font-semibold">
-              Setting Up GitHub Installation
-            </h3>
-            <p className="text-sm sm:text-base text-muted-foreground mt-2">
-              Processing your installation webhook...
-            </p>
-            <p className="text-xs sm:text-sm text-muted-foreground mt-4">
-              This usually takes a few seconds. Please wait.
-            </p>
-          </div>
+      <div className={cn('space-y-4', className)}>
+        <div role="status" className="space-y-2">
+          <Status tone="running" label="Waiting for GitHub installation" />
+          <p className="text-sm text-muted-foreground">
+            Complete the installation in GitHub, then return here. Your account
+            will appear automatically when GitHub confirms it.
+          </p>
         </div>
-
-        <Card className="border-blue-200 bg-blue-50/50 dark:bg-blue-950/20">
-          <CardContent className="pt-6">
-            <div className="space-y-2">
-              <h4 className="font-medium text-sm">What&apos;s happening?</h4>
-              <ul className="text-sm text-muted-foreground space-y-1 ml-4">
-                <li>• GitHub sent an installation webhook to our servers</li>
-                <li>• We&apos;re verifying and processing your installation</li>
-                <li>• Your GitHub App will be ready to use shortly</li>
-              </ul>
-            </div>
-          </CardContent>
-        </Card>
+        {installationError && (
+          <Callout tone="error" title="Could not check GitHub installations">
+            Check your connection to Temps. We will keep trying automatically.
+          </Callout>
+        )}
+        <Button variant="outline" onClick={() => setIsWaitingForWebhook(false)}>
+          Stop waiting
+        </Button>
       </div>
     )
   }
@@ -1286,19 +1330,37 @@ export function GitProviderFlow({
                     </AlertDescription>
                   </Alert>
 
+                  {installationError && !appConnections && (
+                    <Callout
+                      tone="error"
+                      title="Could not load existing installations"
+                    >
+                      Check your connection to Temps, then retry before
+                      installing the GitHub App.
+                    </Callout>
+                  )}
+
                   <div className="flex justify-end">
-                    <Button
+                    <AsyncButton
                       variant={
                         selectedMethod === 'existing-app' ? 'default' : 'ghost'
                       }
+                      busy={installationsLoading || installationsFetching}
+                      busyLabel="Loading installations..."
                       onClick={(e) => {
                         e.stopPropagation()
+                        if (installationError && !appConnections) {
+                          void refetchInstallations()
+                          return
+                        }
                         handleMethodSelect('existing-app')
                       }}
                     >
                       <GithubIcon className="mr-2 h-4 w-4" />
-                      Install Existing App
-                    </Button>
+                      {installationError && !appConnections
+                        ? 'Retry loading installations'
+                        : 'Install Existing App'}
+                    </AsyncButton>
                   </div>
                 </CardContent>
               </Card>
