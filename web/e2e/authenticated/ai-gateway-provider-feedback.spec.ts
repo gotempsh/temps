@@ -157,3 +157,123 @@ test('a gateway server failure without problem details gives a retry message', a
   ).toHaveCount(0)
   expect(consoleErrors).toEqual([])
 })
+
+for (const outcome of ['saved', 'rejected'] as const) {
+  test(`a pending gateway save cannot be dismissed before it is ${outcome}`, async ({
+    page,
+    consoleErrors,
+  }) => {
+    let finishSave!: () => void
+    const pendingResponse = new Promise<void>((resolve) => {
+      finishSave = resolve
+    })
+    let attempts = 0
+    let keys: ProviderKeyResponse[] = []
+    await page.route('**/api/ai/providers', async (route) => {
+      if (route.request().method() === 'GET') {
+        await route.fulfill({ json: keys })
+        return
+      }
+      expect(route.request().method()).toBe('POST')
+      attempts += 1
+      await pendingResponse
+      if (outcome === 'rejected') {
+        await route.fulfill({
+          status: 400,
+          json: { title: 'Validation error', detail: rejection },
+        })
+        return
+      }
+      keys = [
+        {
+          id: 1,
+          provider: 'openai',
+          display_name: displayName,
+          api_key_masked: '****-key',
+          base_url: baseUrl,
+          is_active: true,
+          created_at: '2026-01-01T00:00:00Z',
+          updated_at: '2026-01-01T00:00:00Z',
+        },
+      ]
+      await route.fulfill({ status: 201, json: keys[0] })
+    })
+
+    const dialog = await openProviderDialog(page)
+    const saveResponse = page.waitForResponse(
+      (response) =>
+        response.url().endsWith('/api/ai/providers') &&
+        response.request().method() === 'POST'
+    )
+    await dialog.getByRole('button', { name: 'Add key', exact: true }).click()
+    try {
+      await expect.poll(() => attempts).toBe(1)
+      const pendingButton = dialog.getByRole('button', {
+        name: 'Verifying & saving…',
+        exact: true,
+      })
+      await expect(pendingButton).toBeDisabled()
+      await dialog.getByRole('button', { name: 'Close', exact: true }).click()
+      await expect(dialog).toBeVisible({ timeout: 2_000 })
+      await page.keyboard.press('Escape')
+      await expect(dialog).toBeVisible()
+      await page.mouse.click(5, 5)
+      await expect(dialog).toBeVisible()
+      await expect(pendingButton).toBeDisabled()
+      await expect(
+        dialog.getByLabel('Display Name', { exact: true })
+      ).toHaveValue(displayName)
+      await expect(dialog.getByLabel('API Key', { exact: true })).toHaveValue(
+        apiKey
+      )
+      await expect(dialog.getByLabel('Custom Base URL')).toHaveValue(baseUrl)
+      await expect(
+        dialog.getByLabel('Display Name', { exact: true })
+      ).toBeDisabled()
+      await expect(dialog.getByLabel('API Key', { exact: true })).toBeDisabled()
+      await expect(dialog.getByLabel('Custom Base URL')).toBeDisabled()
+
+      finishSave()
+      expect((await saveResponse).status()).toBe(
+        outcome === 'saved' ? 201 : 400
+      )
+      if (outcome === 'saved') {
+        await expect(dialog).toBeHidden()
+        await expect(
+          page.getByText('Provider key added', { exact: true })
+        ).toBeVisible()
+      } else {
+        await expect(dialog.getByRole('alert')).toHaveText(rejection)
+        await dialog.getByRole('button', { name: 'Close', exact: true }).click()
+        await expect(dialog).toBeHidden()
+      }
+      await page
+        .getByRole('row')
+        .filter({ has: page.getByText('OpenAI', { exact: true }) })
+        .getByRole('button', {
+          name: outcome === 'saved' ? 'Add key' : 'Configure',
+          exact: true,
+        })
+        .click()
+      await expect(dialog).toBeVisible()
+      await expect(dialog.getByRole('alert')).toHaveCount(0)
+      await expect(dialog.getByLabel('API Key', { exact: true })).toHaveValue(
+        ''
+      )
+      await dialog
+        .getByLabel('Display Name', { exact: true })
+        .fill('Next setup')
+      await expect(
+        dialog.getByLabel('Display Name', { exact: true })
+      ).toHaveValue('Next setup')
+      await expect(
+        dialog.getByRole('button', { name: 'Add key' })
+      ).toBeEnabled()
+      expect(attempts).toBe(1)
+      expect(consoleErrors).toEqual([])
+    } finally {
+      finishSave()
+      await saveResponse
+    }
+  })
+}

@@ -4021,7 +4021,6 @@ export function AiGatewayPage() {
   // test surfaces as a 400 on the create call itself.
 
   const resetForm = () => {
-    createMutation.reset()
     setNewProvider('')
     setNewDisplayName('')
     setNewApiKey('')
@@ -4029,6 +4028,7 @@ export function AiGatewayPage() {
   }
 
   const handleCreate = () => {
+    if (createMutation.isPending) return
     if (!newProvider) {
       toast.error('Please select a provider')
       return
@@ -4479,11 +4479,24 @@ console.log(response.choices[0].message.content);`,
       <Dialog
         open={dialogOpen}
         onOpenChange={(open) => {
+          // Resetting a pending mutation detaches its observer without
+          // cancelling the save. Keep this setup open until it settles.
+          if (createMutation.isPending) return
           setDialogOpen(open)
-          if (!open) resetForm()
+          if (!open) {
+            createMutation.reset()
+            resetForm()
+          }
         }}
       >
-        <DialogContent>
+        <DialogContent
+          onInteractOutside={(event) => {
+            if (createMutation.isPending) event.preventDefault()
+          }}
+          onEscapeKeyDown={(event) => {
+            if (createMutation.isPending) event.preventDefault()
+          }}
+        >
           <>
             <DialogHeader>
               <DialogTitle>
@@ -4526,6 +4539,7 @@ console.log(response.choices[0].message.content);`,
                   id="displayName"
                   placeholder="Production API Key"
                   value={newDisplayName}
+                  disabled={createMutation.isPending}
                   onChange={(e) => setNewDisplayName(e.target.value)}
                 />
               </div>
@@ -4536,6 +4550,7 @@ console.log(response.choices[0].message.content);`,
                   type="password"
                   placeholder="sk-..."
                   value={newApiKey}
+                  disabled={createMutation.isPending}
                   onChange={(e) => setNewApiKey(e.target.value)}
                 />
                 <p className="text-xs text-muted-foreground">
@@ -4554,6 +4569,7 @@ console.log(response.choices[0].message.content);`,
                   id="baseUrl"
                   placeholder="https://api.openai.com/v1"
                   value={newBaseUrl}
+                  disabled={createMutation.isPending}
                   onChange={(e) => setNewBaseUrl(e.target.value)}
                 />
                 <p className="text-xs text-muted-foreground">
