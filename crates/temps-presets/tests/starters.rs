@@ -214,11 +214,50 @@ impl Drop for Container {
     }
 }
 
+/// The exit code of `container` if it is no longer running.
+fn exited_with(container: &str) -> Option<String> {
+    let state = run(Command::new("docker").args([
+        "inspect",
+        "--format",
+        "{{.State.Running}} {{.State.ExitCode}}",
+        container,
+    ]))
+    .ok()?;
+    let (running, code) = state.trim().split_once(' ')?;
+    (running == "false").then(|| code.to_string())
+}
+
+fn container_logs(container: &str) -> String {
+    Command::new("docker")
+        .args(["logs", "--tail", "40", container])
+        .output()
+        .map(|o| {
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            )
+        })
+        .unwrap_or_default()
+}
+
 /// Poll `url` until it answers, or give up.
+///
+/// A container that exits fails immediately rather than at the deadline: an
+/// image that built and packaged cleanly but cannot start (a framework
+/// misconfiguration, a `CMD` naming a file the build never produced) is
+/// exactly what this check exists to catch, and its own logs say why.
 fn wait_for_http(url: &str, timeout: Duration, container: &str) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     let mut last = String::new();
     while Instant::now() < deadline {
+        if let Some(code) = exited_with(container) {
+            return Err(format!(
+                "container exited during startup with code {code} before answering {url}\n\
+                 --- container logs ---\n{}",
+                container_logs(container)
+            ));
+        }
         let output = Command::new("curl")
             .args([
                 "--silent",
@@ -248,19 +287,9 @@ fn wait_for_http(url: &str, timeout: Duration, container: &str) -> Result<(), St
         std::thread::sleep(Duration::from_millis(500));
     }
 
-    let logs = Command::new("docker")
-        .args(["logs", "--tail", "40", container])
-        .output()
-        .map(|o| {
-            format!(
-                "{}{}",
-                String::from_utf8_lossy(&o.stdout),
-                String::from_utf8_lossy(&o.stderr)
-            )
-        })
-        .unwrap_or_default();
     Err(format!(
-        "no HTTP response from {url} within {timeout:?} (last: {last})\n--- container logs ---\n{logs}"
+        "no HTTP response from {url} within {timeout:?} (last: {last})\n--- container logs ---\n{}",
+        container_logs(container)
     ))
 }
 
