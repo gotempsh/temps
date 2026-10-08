@@ -1365,6 +1365,7 @@ pub async fn update_environment_settings(
         security_updated: settings.security.is_some(),
         attack_mode: settings.attack_mode,
         force_https: settings.force_https,
+        build_location: settings.build_location,
     };
 
     let audit_event = EnvironmentSettingsUpdatedAudit {

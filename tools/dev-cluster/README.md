@@ -72,6 +72,12 @@ For a **fresh** cluster, set `DEV_CLUSTER_SERVE_PROFILE=control-plane` and
 to reserve worker 1 for builds. Workers 2 and 3 remain workload targets.
 The same build protocol serves ordinary workers when no builder is available.
 
+With the default full profile the control plane builds locally. To exercise
+worker builds there, set **Build location** to *Worker node* on a project
+(Settings → Deploy defaults) or an environment. Builds the protocol cannot
+take (multi-architecture builds, no matching worker) stay on the control
+plane, and the build log says why.
+
 `DEV_CLUSTER_WORKER{1,2,3}_LABELS` is consumed only by the first `temps join`.
 Labels live in the control-plane node record after that. Changing the variable,
 restarting, or recreating a container with its existing volume does **not** update

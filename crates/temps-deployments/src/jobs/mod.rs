@@ -67,6 +67,7 @@ pub mod download_repo;
 pub mod image_source;
 pub mod mark_deployment_complete;
 pub mod node_health_check;
+pub(crate) mod node_image;
 pub mod npmrc;
 pub mod persist_static_assets;
 // Test-only: a demo/mock harness (mock `ImageBuilder`/`ContainerDeployer`,

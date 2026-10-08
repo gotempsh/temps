@@ -2910,6 +2910,24 @@ export type BuildLimitsSettings = {
 };
 
 /**
+ * Where a source deployment's image is built.
+ *
+ * The control plane is the default and the historical behaviour. `Node`
+ * moves the build — the most CPU- and memory-hungry step of a deployment —
+ * onto a worker node so it stops competing with the proxy, the database
+ * and running workloads on the control plane. A node labelled
+ * `temps.sh/role=builder` is preferred; otherwise the node the deployment
+ * is placed on builds it.
+ *
+ * `Node` is a preference, not a requirement: when no worker can take the
+ * build (none joined, none of the right architecture, or a
+ * multi-architecture build) the build runs on the control plane and the
+ * build log says why. A static site may build on a worker of any
+ * architecture, since its output is read from that node and never runs.
+ */
+export type BuildLocation = 'control_plane' | 'node';
+
+/**
  * The quote.
  */
 export type BulkActivationEstimateResponse = {
@@ -7085,6 +7103,7 @@ export type DeploymentConfig = {
      * Stored as JSONB so absent key → `None` (inherit), never silently defaults to false.
      */
     automaticDeploy?: boolean | null;
+    buildLocation?: BuildLocation | null;
     /**
      * Enable container exec/shell access (disabled by default for security)
      */
@@ -25430,6 +25449,7 @@ export type UpdateDashboardRequest = {
 
 export type UpdateDeploymentConfigRequest = {
     automaticDeploy?: boolean | null;
+    buildLocation?: BuildLocation | null;
     cpuLimit?: number | null;
     cpuRequest?: number | null;
     /**
@@ -25552,6 +25572,7 @@ export type UpdateEnvironmentSettingsRequest = {
      */
     automatic_deploy?: boolean | null;
     branch?: string | null;
+    build_location?: BuildLocation | null;
     /**
      * Maximum (limit) CPU in microcores. Send JSON `null` to clear → "no limit".
      * Absent leaves the current value unchanged.

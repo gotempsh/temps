@@ -21,6 +21,12 @@ import {
 } from '@/lib/environment-placement'
 import { projectHasGitRepo } from '@/lib/project-git'
 import {
+  BUILD_LOCATION_LABELS,
+  buildLocationToPayload,
+  buildLocationToSelect,
+  type BuildLocationSelect,
+} from '@/lib/build-location'
+import {
   Select,
   SelectContent,
   SelectItem,
@@ -33,6 +39,7 @@ import {
   Cpu,
   GitBranch,
   Gauge,
+  Hammer,
   KeyRound,
   Loader2,
   Moon,
@@ -42,6 +49,7 @@ import {
   X,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
+import { Link } from 'react-router'
 import { toast } from 'sonner'
 
 interface EnvironmentConfigurationCardProps {
@@ -153,6 +161,9 @@ export function EnvironmentConfigurationCard({
     force_https: forceHttpsToSelect(environment.force_https),
     protected: environment.protected ?? false,
     anti_affinity: environment.deployment_config?.antiAffinity ?? true,
+    build_location: buildLocationToSelect(
+      environment.deployment_config?.buildLocation
+    ),
     target_nodes: (environment.deployment_config?.targetNodes ??
       []) as number[],
     target_labels: (environment.deployment_config?.targetLabels ??
@@ -223,6 +234,9 @@ export function EnvironmentConfigurationCard({
       force_https: forceHttpsToSelect(environment.force_https),
       protected: environment.protected ?? false,
       anti_affinity: environment.deployment_config?.antiAffinity ?? true,
+      build_location: buildLocationToSelect(
+        environment.deployment_config?.buildLocation
+      ),
       target_nodes: (environment.deployment_config?.targetNodes ??
         []) as number[],
       target_labels: (environment.deployment_config?.targetLabels ??
@@ -322,6 +336,8 @@ export function EnvironmentConfigurationCard({
         // certificate-driven default), true/false force it.
         force_https: forceHttpsToPayload(formData.force_https),
         anti_affinity: formData.anti_affinity,
+        // Tri-state: null clears the override (follow the project).
+        build_location: buildLocationToPayload(formData.build_location),
         target_nodes: targetNodesToPayload(formData.target_nodes),
         target_labels: targetLabelsToPayload(formData.target_labels),
         on_demand: formData.on_demand,
@@ -748,6 +764,73 @@ export function EnvironmentConfigurationCard({
               }
               placeholder="Inherit"
             />
+          </div>
+        </SettingsSection>
+
+        {/* Build location: always visible so operators learn builds can
+            move off the control plane, even before a worker has joined. */}
+        <SettingsSection title="Builds" icon={Hammer}>
+          <div className="space-y-2">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+              <div className="flex-1 min-w-0">
+                <Label className="text-sm font-medium">Build location</Label>
+                <p className="text-xs text-muted-foreground">
+                  Where this environment's images are built. Building on a
+                  worker node keeps the CPU and memory of a build away from the
+                  proxy and running apps on the control plane.
+                </p>
+              </div>
+              <Select
+                value={formData.build_location}
+                onValueChange={(value) =>
+                  setFormData((prev) => ({
+                    ...prev,
+                    build_location: value as BuildLocationSelect,
+                  }))
+                }
+              >
+                <SelectTrigger className="w-full sm:w-[220px]">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="inherit">
+                    Inherit from project (
+                    {
+                      BUILD_LOCATION_LABELS[
+                        project.deployment_config?.buildLocation ??
+                          'control_plane'
+                      ]
+                    }
+                    )
+                  </SelectItem>
+                  <SelectItem value="control_plane">
+                    {BUILD_LOCATION_LABELS.control_plane}
+                  </SelectItem>
+                  <SelectItem value="node">
+                    {BUILD_LOCATION_LABELS.node}
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              A node labelled <code>temps.sh/role=builder</code> is preferred.
+              When no worker can take a build (none joined, none of the right
+              architecture, multi-architecture builds), it runs on the control
+              plane and the build log says why. Worker builds do not receive
+              build arguments.
+            </p>
+            {nodesQuery.isSuccess && activeNodes.length === 0 && (
+              <p className="text-xs text-muted-foreground">
+                No worker node is active yet, so builds run on the control
+                plane.{' '}
+                <Link
+                  to="/settings/nodes"
+                  className="underline underline-offset-2"
+                >
+                  Add a worker node
+                </Link>
+              </p>
+            )}
           </div>
         </SettingsSection>
 
