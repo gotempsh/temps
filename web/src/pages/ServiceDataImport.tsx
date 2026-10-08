@@ -90,7 +90,19 @@ export function ServiceDataImport() {
         }
       />
 
-      {availabilityQuery.isError ? (
+      {/* A failed refresh keeps the form (and what was typed in it) and the
+          history on screen; only a page that never loaded shows the error
+          alone. */}
+      {availabilityQuery.isError && availability && (
+        <ReadFailure
+          resource="import availability"
+          error={availabilityQuery.error}
+          cached
+          onRetry={() => void availabilityQuery.refetch()}
+          retrying={availabilityQuery.isFetching}
+        />
+      )}
+      {availabilityQuery.isError && !availability ? (
         <ReadFailure
           resource="import availability"
           error={availabilityQuery.error}

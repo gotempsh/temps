@@ -11,7 +11,6 @@ import type {
   DataImportSpec,
 } from '@/api/client/types.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
-import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -263,12 +262,16 @@ export function DataImportForm({
                         Existing:
                       </span>
                       {suggestions.map((name) => (
-                        <Badge
+                        <Button
                           key={name}
+                          type="button"
+                          size="sm"
                           variant={
                             name === targetDatabase ? 'default' : 'outline'
                           }
-                          className="cursor-pointer font-mono"
+                          className="h-6 rounded-full px-2.5 font-mono text-xs"
+                          aria-pressed={name === targetDatabase}
+                          aria-label={`Import into existing database ${name}`}
                           onClick={() =>
                             form.setValue('targetDatabase', name, {
                               shouldValidate: true,
@@ -276,7 +279,7 @@ export function DataImportForm({
                           }
                         >
                           {name}
-                        </Badge>
+                        </Button>
                       ))}
                     </div>
                   )}
