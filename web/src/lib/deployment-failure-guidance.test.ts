@@ -4,6 +4,7 @@
 import { describe, expect, test } from 'bun:test'
 
 import {
+  failedDeploymentImageRef,
   failureSettingsLink,
   failureStageLabel,
   failureTimeoutSummary,
@@ -61,5 +62,38 @@ describe('deployment failure guidance', () => {
         timeout_elapsed_seconds: null,
       })
     ).toBeNull()
+  })
+})
+
+describe('failed deployment image reference', () => {
+  test('shows the submitted image for registry-image pull failures', () => {
+    expect(
+      failedDeploymentImageRef(
+        { stage: 'image', code: 'image_not_found' },
+        ' registry.example.test/team/app:missing '
+      )
+    ).toBe('registry.example.test/team/app:missing')
+  })
+
+  test('never attributes a Dockerfile base image to the deployment image', () => {
+    expect(
+      failedDeploymentImageRef(
+        { stage: 'image', code: 'base_image_pull' },
+        'team/app:1'
+      )
+    ).toBeNull()
+  })
+
+  test('ignores non-image failures and deployments without an image', () => {
+    expect(
+      failedDeploymentImageRef(
+        { stage: 'health_check', code: 'health_check_failed' },
+        'team/app:1'
+      )
+    ).toBeNull()
+    expect(
+      failedDeploymentImageRef({ stage: 'image', code: 'image_not_found' }, '')
+    ).toBeNull()
+    expect(failedDeploymentImageRef(null, 'team/app:1')).toBeNull()
   })
 })

@@ -50,6 +50,7 @@ import {
 } from '@/components/ui/tooltip'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import {
+  failedDeploymentImageRef,
   failureSettingsLink,
   failureStageLabel,
   failureTimeoutSummary,
@@ -478,9 +479,12 @@ function SecondaryActions({
 function CancelledReason({
   deployment,
   projectSlug,
+  onEditImage,
 }: {
   deployment: DeploymentResponse
   projectSlug: string
+  /** Opens the redeploy dialog, where a registry image can be edited. */
+  onEditImage?: () => void
 }) {
   const [isExpanded, setIsExpanded] = useState(false)
   if (!deployment.cancelled_reason) return null
@@ -491,6 +495,10 @@ function CancelledReason({
     ? failureSettingsLink(failure.settings_section, projectSlug)
     : null
   const timeoutSummary = failure ? failureTimeoutSummary(failure) : null
+  const failedImageRef = failedDeploymentImageRef(
+    failure,
+    deployment.metadata?.externalImageRef
+  )
   return (
     <div
       className="flex items-start gap-2.5 rounded-lg border border-destructive/30 bg-destructive/5 p-4"
@@ -539,14 +547,38 @@ function CancelledReason({
                   .join(' · ')}
               </p>
             )}
-            {settingsLink && (
-              <Button asChild variant="outline" size="sm" className="h-7">
-                <Link to={settingsLink.href}>
-                  Open {settingsLink.label}
-                  <ExternalLink className="ml-1.5 h-3 w-3" />
-                </Link>
-              </Button>
+            {failedImageRef && (
+              <p
+                className="text-xs text-muted-foreground"
+                data-testid="deployment-failure-image"
+              >
+                Image:{' '}
+                <code className="break-all rounded bg-muted px-1 py-0.5 font-mono text-foreground">
+                  {failedImageRef}
+                </code>
+              </p>
             )}
+            <div className="flex flex-wrap gap-2">
+              {failedImageRef && onEditImage && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="h-7"
+                  onClick={onEditImage}
+                >
+                  Edit image and redeploy
+                </Button>
+              )}
+              {settingsLink && (
+                <Button asChild variant="outline" size="sm" className="h-7">
+                  <Link to={settingsLink.href}>
+                    Open {settingsLink.label}
+                    <ExternalLink className="ml-1.5 h-3 w-3" />
+                  </Link>
+                </Button>
+              )}
+            </div>
           </div>
         )}
         {deployment.status === 'failed' && (
@@ -1499,7 +1531,15 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
         />
 
         {/* Failure/cancellation reason — prominent, directly under the header. */}
-        <CancelledReason deployment={deployment} projectSlug={project.slug} />
+        <CancelledReason
+          deployment={deployment}
+          projectSlug={project.slug}
+          onEditImage={
+            redeployPlan?.kind === 'docker_image'
+              ? () => setIsRedeployModalOpen(true)
+              : undefined
+          }
+        />
 
         {/* Failed Compose candidates are the primary debugging surface, so
             keep their live logs beside the concise failure summary instead
