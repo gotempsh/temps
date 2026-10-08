@@ -33,7 +33,7 @@ use temps_entities::{
     notification_preferences, notification_providers, notification_routes, notifications, roles,
     user_roles, users,
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use utoipa::ToSchema;
 
 #[derive(Debug, thiserror::Error)]
@@ -201,6 +201,15 @@ fn provider_config_field<'a>(
     }
 }
 
+/// Result of [`NotificationService::test_provider`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderTestOutcome {
+    /// Whether every destination accepted the test notification.
+    pub success: bool,
+    /// What was confirmed, or why delivery failed and what to check.
+    pub message: String,
+}
+
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UpdateProviderRequest {
     pub name: Option<String>,
@@ -225,6 +234,75 @@ fn default_starttls_required() -> bool {
 
 fn default_accept_invalid_certs() -> bool {
     false // Default to secure behavior
+}
+
+impl std::fmt::Display for TlsMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TlsMode::None => f.write_str("none"),
+            TlsMode::Starttls => f.write_str("STARTTLS"),
+            TlsMode::Tls => f.write_str("TLS"),
+        }
+    }
+}
+
+/// Why an SMTP notification was not (fully) accepted. Messages carry the SMTP
+/// endpoint and TLS mode an operator needs to fix it, never credentials.
+#[derive(Debug, thiserror::Error)]
+pub enum EmailDeliveryError {
+    #[error(
+        "Email provider for SMTP server {smtp_host}:{smtp_port} has no valid recipients: \
+         add at least one recipient address or an admin user with an email address"
+    )]
+    NoRecipients { smtp_host: String, smtp_port: u16 },
+
+    #[error(
+        "SMTP server {smtp_host}:{smtp_port} (TLS mode: {tls_mode}) did not accept the message \
+         for any of {attempted} recipient(s): {failures}. Check that {smtp_host}:{smtp_port} is \
+         reachable from the Temps server and that the TLS mode matches what the server expects, \
+         then retry"
+    )]
+    AllRecipientsFailed {
+        smtp_host: String,
+        smtp_port: u16,
+        tls_mode: String,
+        attempted: usize,
+        failures: String,
+    },
+
+    #[error(
+        "SMTP server {smtp_host}:{smtp_port} accepted the message for only {accepted} of \
+         {attempted} recipient(s); not accepted: {failures}"
+    )]
+    PartialDelivery {
+        smtp_host: String,
+        smtp_port: u16,
+        accepted: usize,
+        attempted: usize,
+        failures: String,
+    },
+}
+
+/// Per-recipient outcome of one SMTP send.
+#[derive(Debug, Default)]
+struct EmailDeliveryReport {
+    accepted: Vec<String>,
+    /// `(recipient, reason)` for every address the SMTP server did not accept.
+    failed: Vec<(String, String)>,
+}
+
+impl EmailDeliveryReport {
+    fn attempted(&self) -> usize {
+        self.accepted.len() + self.failed.len()
+    }
+
+    fn describe_failures(&self) -> String {
+        self.failed
+            .iter()
+            .map(|(addr, reason)| format!("{addr} ({reason})"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
 }
 
 // Provider-specific structs
@@ -656,6 +734,15 @@ pub trait NotificationProvider: Send + Sync {
     async fn initialize(&mut self, db: Arc<DatabaseConnection>) -> Result<()>;
     async fn send(&self, notification: &Notification) -> Result<()>;
     async fn health_check(&self) -> Result<bool>;
+
+    /// Sends an operator-triggered test notification and describes what was
+    /// confirmed. Unlike [`NotificationProvider::send`], a test must fail on
+    /// *any* undelivered destination, so the operator never reads success
+    /// while part of the configuration is broken.
+    async fn send_test(&self, notification: &Notification) -> Result<String> {
+        self.send(notification).await?;
+        Ok("Test notification sent successfully".to_string())
+    }
 }
 
 const CLOUD_TITLE_MAX_CHARS: usize = 200;
@@ -938,9 +1025,8 @@ impl EmailProvider {
     }
 }
 
-#[async_trait]
-impl NotificationProvider for EmailProvider {
-    async fn initialize(&mut self, db: Arc<DatabaseConnection>) -> Result<()> {
+impl EmailProvider {
+    fn initialize_mailer(&mut self, db: Arc<DatabaseConnection>) -> Result<()> {
         let mut builder = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&self.smtp_host)
             .port(self.smtp_port);
 
@@ -1033,7 +1119,9 @@ impl NotificationProvider for EmailProvider {
         Ok(())
     }
 
-    async fn send(&self, notification: &Notification) -> Result<()> {
+    /// Sends one message per recipient and records which ones the SMTP
+    /// server accepted. Per-recipient failures are collected, not returned.
+    async fn deliver(&self, notification: &Notification) -> Result<EmailDeliveryReport> {
         let mailer = self
             .mailer
             .as_ref()
@@ -1077,6 +1165,7 @@ impl NotificationProvider for EmailProvider {
         all_recipients.dedup();
 
         // Send individual emails to each recipient
+        let mut report = EmailDeliveryReport::default();
         for addr in &all_recipients {
             match addr.parse::<Mailbox>() {
                 Ok(to_mailbox) => {
@@ -1087,17 +1176,96 @@ impl NotificationProvider for EmailProvider {
                         .header(ContentType::TEXT_HTML)
                         .body(email_body.clone())?;
 
-                    if let Err(e) = mailer.send(email_msg).await {
-                        error!("Failed to send email to {}: {}", addr, e);
+                    match mailer.send(email_msg).await {
+                        Ok(_) => report.accepted.push(addr.clone()),
+                        Err(e) => {
+                            error!(
+                                "Failed to send email to {} via SMTP server {}:{}: {}",
+                                addr, self.smtp_host, self.smtp_port, e
+                            );
+                            report.failed.push((addr.clone(), e.to_string()));
+                        }
                     }
                 }
                 Err(e) => {
                     error!("Invalid email address {}: {}", addr, e);
+                    report
+                        .failed
+                        .push((addr.clone(), format!("invalid address: {e}")));
                 }
             }
         }
 
+        Ok(report)
+    }
+
+    /// Maps a delivery report onto the provider contract. With
+    /// `require_all`, any recipient the SMTP server refused is an error
+    /// (provider tests); otherwise only a send that reached nobody is.
+    fn delivery_result(
+        &self,
+        report: &EmailDeliveryReport,
+        require_all: bool,
+    ) -> std::result::Result<(), EmailDeliveryError> {
+        if report.attempted() == 0 {
+            return Err(EmailDeliveryError::NoRecipients {
+                smtp_host: self.smtp_host.clone(),
+                smtp_port: self.smtp_port,
+            });
+        }
+        if report.accepted.is_empty() {
+            return Err(EmailDeliveryError::AllRecipientsFailed {
+                smtp_host: self.smtp_host.clone(),
+                smtp_port: self.smtp_port,
+                tls_mode: self.tls_mode.to_string(),
+                attempted: report.attempted(),
+                failures: report.describe_failures(),
+            });
+        }
+        if !report.failed.is_empty() {
+            let partial = EmailDeliveryError::PartialDelivery {
+                smtp_host: self.smtp_host.clone(),
+                smtp_port: self.smtp_port,
+                accepted: report.accepted.len(),
+                attempted: report.attempted(),
+                failures: report.describe_failures(),
+            };
+            if require_all {
+                return Err(partial);
+            }
+            // A real alert reached some recipients; resending would duplicate
+            // it for them, so it counts as delivered but is logged loudly.
+            warn!("{}", partial);
+        }
         Ok(())
+    }
+}
+
+#[async_trait]
+impl NotificationProvider for EmailProvider {
+    async fn initialize(&mut self, db: Arc<DatabaseConnection>) -> Result<()> {
+        self.initialize_mailer(db)
+    }
+
+    async fn send(&self, notification: &Notification) -> Result<()> {
+        let report = self.deliver(notification).await?;
+        self.delivery_result(&report, false)?;
+        Ok(())
+    }
+
+    async fn send_test(&self, notification: &Notification) -> Result<String> {
+        let report = self.deliver(notification).await?;
+        self.delivery_result(&report, true)?;
+        // SMTP acceptance is all Temps can observe; the receiving mail server
+        // may still bounce or spam-filter the message afterwards.
+        Ok(format!(
+            "SMTP server {}:{} accepted the test message for {} recipient(s): {}. \
+             Check the inbox (and spam folder) to confirm final delivery.",
+            self.smtp_host,
+            self.smtp_port,
+            report.accepted.len(),
+            report.accepted.join(", ")
+        ))
     }
 
     async fn health_check(&self) -> Result<bool> {
@@ -2397,7 +2565,10 @@ impl NotificationService {
         }
     }
 
-    pub async fn test_provider(&self, provider_id: i32) -> Result<bool> {
+    /// Sends a real test notification through one provider. A delivery
+    /// failure is a test *result* (`success: false` with the reason), not an
+    /// error; only a missing provider or an unloadable config is an error.
+    pub async fn test_provider(&self, provider_id: i32) -> Result<ProviderTestOutcome> {
         let provider = notification_providers::Entity::find_by_id(provider_id)
             .one(self.db.as_ref())
             .await?;
@@ -2411,14 +2582,45 @@ impl NotificationService {
             // A provider test must exercise delivery, not only configuration.
             // Otherwise the UI can report success while credentials, routing,
             // or the remote destination are unable to accept a message.
-            notification_provider.send(&notification).await?;
-            Ok(true)
+            match notification_provider.send_test(&notification).await {
+                Ok(message) => Ok(ProviderTestOutcome {
+                    success: true,
+                    message,
+                }),
+                Err(error) => {
+                    tracing::warn!(
+                        provider_id,
+                        provider_type = %provider.provider_type,
+                        error = %error,
+                        "Provider test notification was not delivered"
+                    );
+                    Ok(ProviderTestOutcome {
+                        success: false,
+                        message: format!("Test notification was not delivered: {error}"),
+                    })
+                }
+            }
         } else {
             Err(anyhow::anyhow!(
                 "Notification provider with ID {} not found",
                 provider_id
             ))
         }
+    }
+
+    /// Destinations a notification at `severity` would reach with the current
+    /// configuration: enabled providers on enabled routes covering that
+    /// severity, plus Temps Cloud when it delivers.
+    pub async fn destination_count(
+        &self,
+        severity: NotificationSeverity,
+    ) -> std::result::Result<usize, NotificationRouteError> {
+        let routed = self
+            .routing_service
+            .resolve_provider_models(severity)
+            .await?
+            .len();
+        Ok(routed + usize::from(self.cloud_notifications_enabled()))
     }
 
     /// Whether Temps Cloud delivers notifications in addition to the routed
@@ -2455,8 +2657,8 @@ impl NotificationService {
                 )
             } else {
                 match self.load_provider(&provider).await {
-                    Ok(loaded) => match loaded.send(&notification).await {
-                        Ok(()) => (RouteTestDeliveryStatus::Sent, None),
+                    Ok(loaded) => match loaded.send_test(&notification).await {
+                        Ok(_) => (RouteTestDeliveryStatus::Sent, None),
                         Err(error) => {
                             tracing::warn!(
                                 route_id,
@@ -2656,6 +2858,18 @@ impl CoreNotificationService for NotificationService {
             Ok(configured) => Ok(configured),
             Err(e) => Err(CoreNotificationError::ConfigurationError(e.to_string())),
         }
+    }
+
+    async fn destination_count(
+        &self,
+        severity: &str,
+    ) -> Result<Option<usize>, CoreNotificationError> {
+        let severity = NotificationRoutingService::parse_severity(severity)
+            .map_err(|e| CoreNotificationError::ConfigurationError(e.to_string()))?;
+        self.destination_count(severity)
+            .await
+            .map(Some)
+            .map_err(|e| CoreNotificationError::ConfigurationError(e.to_string()))
     }
 }
 
@@ -3161,6 +3375,156 @@ mod tests {
         );
         assert!(!error.contains("http"));
         assert!(!error.contains("token"));
+    }
+
+    /// Minimal plaintext SMTP server: accepts every recipient except those
+    /// starting with `reject`, which get a permanent 550.
+    async fn start_fake_smtp_server() -> u16 {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let (read, mut write) = stream.into_split();
+                    let mut lines = BufReader::new(read).lines();
+                    let _ = write.write_all(b"220 fake ESMTP\r\n").await;
+                    let mut in_data = false;
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let reply: &[u8] = if in_data {
+                            if line == "." {
+                                in_data = false;
+                                b"250 queued\r\n"
+                            } else {
+                                continue;
+                            }
+                        } else {
+                            let upper = line.to_ascii_uppercase();
+                            if upper.starts_with("RCPT TO:<REJECT") {
+                                b"550 no such user\r\n"
+                            } else if upper.starts_with("DATA") {
+                                in_data = true;
+                                b"354 go ahead\r\n"
+                            } else if upper.starts_with("QUIT") {
+                                let _ = write.write_all(b"221 bye\r\n").await;
+                                break;
+                            } else {
+                                b"250 ok\r\n"
+                            }
+                        };
+                        if write.write_all(reply).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    async fn smtp_test_provider(port: u16, recipients: &[&str]) -> EmailProvider {
+        let mut provider = EmailProvider {
+            smtp_host: "127.0.0.1".to_string(),
+            smtp_port: port,
+            username: None,
+            password: None,
+            from_address: "temps@example.com".to_string(),
+            from_name: None,
+            to_addresses: recipients.iter().map(|r| r.to_string()).collect(),
+            tls_mode: TlsMode::None,
+            starttls_required: false,
+            accept_invalid_certs: false,
+            mailer: None,
+            db: Arc::new(MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection()),
+        };
+        let db = provider.db.clone();
+        provider.initialize(db).await.unwrap();
+        provider
+    }
+
+    /// A port nothing listens on, so connections are refused.
+    async fn refused_smtp_port() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        port
+    }
+
+    #[tokio::test]
+    async fn test_email_send_succeeds_when_smtp_accepts_every_recipient() {
+        let port = start_fake_smtp_server().await;
+        let provider = smtp_test_provider(port, &["ops@example.com"]).await;
+        let notification = Notification::new("Alert", "Something broke");
+
+        provider.send(&notification).await.unwrap();
+        let message = provider.send_test(&notification).await.unwrap();
+        assert!(
+            message.contains(&format!("127.0.0.1:{port}"))
+                && message.contains("1 recipient(s)")
+                && message.contains("inbox"),
+            "test message should state SMTP acceptance, not inbox delivery: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_email_send_errors_when_smtp_connection_is_refused() {
+        let port = refused_smtp_port().await;
+        let provider = smtp_test_provider(port, &["ops@example.com"]).await;
+        let notification = Notification::new("Alert", "Something broke");
+
+        let error = provider.send(&notification).await.unwrap_err();
+        let delivery = error
+            .downcast_ref::<EmailDeliveryError>()
+            .expect("typed delivery error");
+        assert!(matches!(
+            delivery,
+            EmailDeliveryError::AllRecipientsFailed { attempted: 1, .. }
+        ));
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("127.0.0.1:{port}"))
+                && message.contains("TLS mode: none")
+                && message.contains("ops@example.com"),
+            "error should name endpoint, TLS mode and recipient: {message}"
+        );
+        assert!(provider.send_test(&notification).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_email_partial_delivery_fails_test_but_not_alert() {
+        let port = start_fake_smtp_server().await;
+        let provider = smtp_test_provider(port, &["ops@example.com", "reject@example.com"]).await;
+        let notification = Notification::new("Alert", "Something broke");
+
+        // A real alert that reached some recipients is delivered (no resend).
+        provider.send(&notification).await.unwrap();
+
+        // A provider test must surface the refused recipient.
+        let error = provider.send_test(&notification).await.unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<EmailDeliveryError>(),
+            Some(EmailDeliveryError::PartialDelivery {
+                accepted: 1,
+                attempted: 2,
+                ..
+            })
+        ));
+        assert!(error.to_string().contains("reject@example.com"));
+    }
+
+    #[tokio::test]
+    async fn test_email_send_errors_without_recipients() {
+        let port = start_fake_smtp_server().await;
+        let provider = smtp_test_provider(port, &[]).await;
+        let error = provider
+            .send(&Notification::new("Alert", "Something broke"))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<EmailDeliveryError>(),
+            Some(EmailDeliveryError::NoRecipients { .. })
+        ));
     }
 
     #[test]
@@ -4816,6 +5180,94 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn destination_count_only_counts_enabled_providers_routed_for_the_severity() {
+        let test_db = test_database_or_skip!();
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-destination-count-test",
+        ));
+        let service = NotificationService::new(test_db.connection_arc(), encryption_service);
+        assert_eq!(
+            service
+                .destination_count(NotificationSeverity::Critical)
+                .await
+                .unwrap(),
+            0
+        );
+
+        let slack = |hook: &str| {
+            serde_json::json!({
+                "webhook_url": format!("https://hooks.slack.com/services/TEST/TEST/{hook}"),
+                "channel": "#alerts"
+            })
+        };
+        let enabled = service
+            .add_provider("Enabled".to_string(), "slack".to_string(), slack("A"), true)
+            .await
+            .unwrap();
+        service
+            .add_provider(
+                "Disabled".to_string(),
+                "slack".to_string(),
+                slack("B"),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .destination_count(NotificationSeverity::Critical)
+                .await
+                .unwrap(),
+            1,
+            "a disabled provider is not a destination"
+        );
+
+        // Narrow the enabled provider's only route below critical.
+        let routing = NotificationRoutingService::new(test_db.connection_arc());
+        let route = routing
+            .list(1, 20)
+            .await
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|route| route.provider_ids == vec![enabled.id])
+            .unwrap();
+        routing
+            .update(
+                route.id,
+                crate::UpdateNotificationRoute {
+                    name: None,
+                    enabled: None,
+                    min_severity: Some("debug".to_string()),
+                    max_severity: Some("warning".to_string()),
+                    provider_ids: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .destination_count(NotificationSeverity::Critical)
+                .await
+                .unwrap(),
+            0,
+            "a provider whose routes stop below critical does not receive critical alarms"
+        );
+        assert!(
+            service.is_configured().await.unwrap(),
+            "the severity-blind check still reports a destination, which is why the \
+             health card must not rely on it for a critical alarm"
+        );
+        assert_eq!(
+            service
+                .destination_count(NotificationSeverity::Warning)
+                .await
+                .unwrap(),
+            1
+        );
     }
 
     #[tokio::test]

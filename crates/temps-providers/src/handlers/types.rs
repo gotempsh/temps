@@ -52,6 +52,9 @@ pub struct AppState {
     /// Step-up verification for destructive operations (replacing a
     /// database with imported data).
     pub sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
+    /// Answers whether any notification destination exists, so the health
+    /// card can say who (if anyone) a down alarm could have reached.
+    pub notification_service: Arc<dyn temps_core::notifications::NotificationService>,
 }
 
 /// Test doubles for the parts of [`AppState`] handler tests rarely exercise.
@@ -517,6 +520,51 @@ mod tests {
     };
 
     #[test]
+    fn down_alert_without_alarm_or_destination_claims_nothing() {
+        let now = chrono::Utc::now();
+        let alert = super::ServiceDownAlertResponse::new(None, "critical", Some(0), now);
+        assert_eq!(alert.alarm_id, None);
+        assert_eq!(alert.alarm_fired_at, None);
+        assert_eq!(alert.alert_severity, "critical");
+        assert_eq!(alert.notification_destinations, Some(0));
+        assert_eq!(alert.notification_setup_path, "/settings/notifications/new");
+    }
+
+    #[test]
+    fn down_alert_reports_alarm_and_only_an_active_silence() {
+        let now = chrono::Utc::now();
+        let mut alarm = crate::services::ServiceDownAlarm {
+            alarm_id: 42,
+            status: "firing".to_string(),
+            fired_at: now - chrono::Duration::minutes(5),
+            silenced_until: Some(now + chrono::Duration::hours(1)),
+        };
+        let alert = super::ServiceDownAlertResponse::new(Some(&alarm), "critical", Some(2), now);
+        assert_eq!(alert.notification_destinations, Some(2));
+        assert_eq!(alert.alarm_id, Some(42));
+        assert_eq!(alert.alarm_status.as_deref(), Some("firing"));
+        assert!(alert
+            .alarm_fired_at
+            .as_deref()
+            .is_some_and(|t| t.ends_with('Z')));
+        assert!(alert
+            .silenced_until
+            .as_deref()
+            .is_some_and(|t| t.ends_with('Z')));
+
+        alarm.silenced_until = Some(now - chrono::Duration::minutes(1));
+        let expired = super::ServiceDownAlertResponse::new(Some(&alarm), "critical", None, now);
+        assert_eq!(
+            expired.notification_destinations, None,
+            "unknown stays unknown"
+        );
+        assert_eq!(
+            expired.silenced_until, None,
+            "an expired silence is not reported"
+        );
+    }
+
+    #[test]
     fn deprecated_minio_is_not_advertised_for_creation() {
         assert!(!ServiceTypeRoute::get_all().contains(&ServiceTypeRoute::Minio));
         assert!(ProviderMetadata::get_creatable()
@@ -819,6 +867,69 @@ pub struct ServiceHealthResponse {
     pub uptime_24h_percent: Option<f64>,
     /// Most recent checks, newest-first (capped at `limit`).
     pub recent_checks: Vec<HealthCheckEntryResponse>,
+    /// What happened after the failure streak reached the alert threshold.
+    /// `null` while the service is below it. Notification *delivery* is not
+    /// tracked per alarm, so this never claims that anyone was notified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub down_alert: Option<ServiceDownAlertResponse>,
+}
+
+/// Alerting state for a service whose health checks keep failing.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
+pub struct ServiceDownAlertResponse {
+    /// The open down alarm, or `null` if none was raised (e.g. the alarm
+    /// could not be recorded, or it was resolved while checks still fail).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alarm_id: Option<i32>,
+    /// `firing` or `acknowledged`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alarm_status: Option<String>,
+    /// ISO 8601 time the alarm fired.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alarm_fired_at: Option<String>,
+    /// ISO 8601 time until which the alarm's notifications are muted, when
+    /// that time is still in the future.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub silenced_until: Option<String>,
+    /// Severity the down alarm is raised at (e.g. `critical`).
+    pub alert_severity: String,
+    /// How many notification destinations *currently* receive alerts of
+    /// `alert_severity`: enabled providers on enabled routes covering it,
+    /// plus Temps Cloud. This is today's configuration, not a record of who
+    /// received this alarm — Temps does not track per-alarm delivery.
+    /// `null` when it could not be determined.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notification_destinations: Option<u32>,
+    /// Console path where notification destinations are configured.
+    pub notification_setup_path: String,
+}
+
+impl ServiceDownAlertResponse {
+    pub const NOTIFICATION_SETUP_PATH: &'static str = "/settings/notifications/new";
+
+    pub fn new(
+        alarm: Option<&crate::services::ServiceDownAlarm>,
+        alert_severity: &str,
+        notification_destinations: Option<usize>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        Self {
+            alarm_id: alarm.map(|a| a.alarm_id),
+            alarm_status: alarm.map(|a| a.status.clone()),
+            alarm_fired_at: alarm.map(|a| {
+                a.fired_at
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            }),
+            silenced_until: alarm
+                .and_then(|a| a.silenced_until)
+                .filter(|until| *until > now)
+                .map(|until| until.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+            alert_severity: alert_severity.to_string(),
+            notification_destinations: notification_destinations
+                .map(|count| u32::try_from(count).unwrap_or(u32::MAX)),
+            notification_setup_path: Self::NOTIFICATION_SETUP_PATH.to_string(),
+        }
+    }
 }
 
 impl From<crate::services::ServiceHealthSnapshot> for ServiceHealthResponse {
@@ -841,6 +952,7 @@ impl From<crate::services::ServiceHealthSnapshot> for ServiceHealthResponse {
                     error_message: e.error_message,
                 })
                 .collect(),
+            down_alert: None,
         }
     }
 }
@@ -939,5 +1051,42 @@ impl From<crate::services::ClusterHealthReport> for ClusterHealthReportResponse 
             members: r.members.into_iter().map(Into::into).collect(),
             monitor_error: r.monitor_error,
         }
+    }
+}
+
+/// Notification service stand-in for handler tests: reports a fixed
+/// configuration state and drops everything sent to it.
+#[cfg(test)]
+pub(crate) struct StaticNotificationService {
+    /// Destinations reported for every severity; `None` = cannot tell.
+    pub destinations: Option<usize>,
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl temps_core::notifications::NotificationService for StaticNotificationService {
+    async fn send_email(
+        &self,
+        _message: temps_core::notifications::EmailMessage,
+    ) -> Result<(), temps_core::notifications::NotificationError> {
+        Ok(())
+    }
+
+    async fn send_notification(
+        &self,
+        _notification: temps_core::notifications::NotificationData,
+    ) -> Result<(), temps_core::notifications::NotificationError> {
+        Ok(())
+    }
+
+    async fn is_configured(&self) -> Result<bool, temps_core::notifications::NotificationError> {
+        Ok(self.destinations.unwrap_or(0) > 0)
+    }
+
+    async fn destination_count(
+        &self,
+        _severity: &str,
+    ) -> Result<Option<usize>, temps_core::notifications::NotificationError> {
+        Ok(self.destinations)
     }
 }

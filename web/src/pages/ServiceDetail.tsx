@@ -15,7 +15,10 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { revealServiceParameter } from '@/api/client/sdk.gen'
 import { cn } from '@/lib/utils'
-import { listExternalServiceBackupsOptions } from '@/lib/external-service-backups'
+import {
+  externalServiceBackupsQueryKey,
+  listExternalServiceBackupsOptions,
+} from '@/lib/external-service-backups'
 import { ClusterHealthPanel } from '@/components/storage/ClusterHealthPanel'
 import { MonitoringCard } from '@/components/storage/MonitoringCard'
 import { EditServiceDialog } from '@/components/storage/EditServiceDialog'
@@ -2067,9 +2070,13 @@ export function ServiceDetail() {
         serviceName={service.service.name}
         onSuccess={() => {
           // Reload the service so any status transition (e.g. "backing_up")
-          // shows immediately, plus the S3 source list and every per-source
-          // backup index so the Backups card picks up the new entry.
+          // shows immediately, this service's Backups card (the enqueue
+          // already inserted a `pending` row, which then polls to a terminal
+          // state), plus the S3 source list and every per-source index.
           refetch()
+          queryClient.invalidateQueries({
+            queryKey: externalServiceBackupsQueryKey(parseInt(id!)),
+          })
           queryClient.invalidateQueries({
             queryKey: getServiceOptions({
               path: { id: parseInt(id!) },

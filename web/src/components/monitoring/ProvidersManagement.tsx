@@ -41,6 +41,11 @@ import { withReturnTo } from '@/lib/safe-return-to'
 import { useMemo, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
+import {
+  providerTestFailureMessage,
+  providerTestSucceeded,
+  providerTestSuccessMessage,
+} from '@/lib/notification-provider-test'
 import { ProviderForm } from './ProviderForm'
 import { NotificationProviderIcon } from './NotificationProviderIcon'
 import { ProviderFormData, providerUpdateSchema } from './schemas'
@@ -174,9 +179,9 @@ export function ProvidersManagement({
 
   const testMutation = useMutation({
     ...testProviderMutation(),
-    meta: {
-      errorTitle: 'Failed to test provider',
-    },
+    // handleTest shows the failure with the provider's reason and a Retry
+    // action; the global error toast would only add a generic duplicate.
+    onError: () => {},
   })
 
   const editForm = useForm<ProviderFormData>({
@@ -281,23 +286,28 @@ export function ProvidersManagement({
   }
 
   const handleTest = async (provider: ExtendedNotificationProvider) => {
-    toast.promise(
-      testMutation.mutateAsync({
+    const toastId = toast.loading('Sending test notification...')
+    const retry = { label: 'Retry', onClick: () => void handleTest(provider) }
+    try {
+      const result = await testMutation.mutateAsync({
         path: { id: provider.id },
-      }),
-      {
-        loading: 'Sending test notification...',
-        success: (data) =>
-          data.success
-            ? 'Test notification sent successfully!'
-            : data.message || 'Failed to send test notification',
-        error: (error) => {
-          const message =
-            error?.response?.data?.detail || 'Failed to send test notification'
-          return message
-        },
+      })
+      if (providerTestSucceeded(result)) {
+        toast.success(providerTestSuccessMessage(result), { id: toastId })
+      } else {
+        toast.error('Test notification failed', {
+          id: toastId,
+          description: providerTestFailureMessage(result),
+          action: retry,
+        })
       }
-    )
+    } catch (error) {
+      toast.error('Test notification failed', {
+        id: toastId,
+        description: providerTestFailureMessage(undefined, error),
+        action: retry,
+      })
+    }
   }
 
   const handleEdit = (provider: ExtendedNotificationProvider) => {

@@ -44,7 +44,9 @@ use tracing::{debug, error, info, warn};
 const POSTGRES_WAL_KEY: &str = "postgres_wal";
 
 /// How many failed probes in a row before we raise an alert.
-const CONSECUTIVE_FAILURES_BEFORE_ALERT: i32 = 3;
+pub(crate) const CONSECUTIVE_FAILURES_BEFORE_ALERT: i32 = 3;
+/// Severity of the alarm raised when that streak is reached.
+pub(crate) const DOWN_ALERT_SEVERITY: AlarmSeverity = AlarmSeverity::Critical;
 
 /// Configuration for `ExternalServiceHealthMonitor`.
 #[derive(Debug, Clone)]
@@ -987,7 +989,7 @@ impl ExternalServiceHealthMonitor {
             container_id: None,
             service_id: Some(service.id),
             alarm_type: AlarmType::ExternalServiceDown,
-            severity: AlarmSeverity::Critical,
+            severity: DOWN_ALERT_SEVERITY,
             title,
             message,
             metadata: Some(serde_json::json!({

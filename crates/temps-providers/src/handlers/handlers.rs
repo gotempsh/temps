@@ -24,7 +24,7 @@ use temps_core::{
     },
     problemdetails::Problem,
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use utoipa::OpenApi;
 
 use super::audit::{
@@ -43,9 +43,10 @@ use crate::handlers::types::{
     EnvironmentVariableInfo, ExternalServiceDetails, ExternalServiceInfo, HealthCheckEntryResponse,
     ImportExternalServiceRequest, LinkServiceRequest, ProjectServiceInfo, ProviderMetadata,
     RepointContinuousArchiveSourceRequest, RetryClusterRequest, RuntimeCredentialsResponse,
-    SensitiveValueResponse, ServiceHealthResponse, ServiceHealthStatusBatchResponse,
-    ServiceHealthStatusEntryResponse, ServiceMemberInfo, ServiceParameter, ServiceTypeInfo,
-    ServiceTypeRoute, UpdateExternalServiceRequest, UpgradeExternalServiceRequest,
+    SensitiveValueResponse, ServiceDownAlertResponse, ServiceHealthResponse,
+    ServiceHealthStatusBatchResponse, ServiceHealthStatusEntryResponse, ServiceMemberInfo,
+    ServiceParameter, ServiceTypeInfo, ServiceTypeRoute, UpdateExternalServiceRequest,
+    UpgradeExternalServiceRequest,
 };
 use crate::services::{DatabaseProvisioningConfig, EnvironmentVariableOptions};
 use temps_core::AuditContext;
@@ -1490,6 +1491,43 @@ async fn get_cluster_health(
     Ok((StatusCode::OK, Json(body)))
 }
 
+/// Build the health response, adding the down-alert state once the failure
+/// streak has reached the alert threshold.
+async fn service_health_response(
+    app_state: &AppState,
+    snap: crate::services::ServiceHealthSnapshot,
+) -> ServiceHealthResponse {
+    let service_id = snap.service_id;
+    let reached_threshold =
+        snap.consecutive_failures >= crate::health_monitor::CONSECUTIVE_FAILURES_BEFORE_ALERT;
+    let alarm = snap.down_alarm.clone();
+    let mut response = ServiceHealthResponse::from(snap);
+    if reached_threshold {
+        let severity = crate::health_monitor::DOWN_ALERT_SEVERITY.as_str();
+        let destinations = match app_state
+            .notification_service
+            .destination_count(severity)
+            .await
+        {
+            Ok(count) => count,
+            Err(e) => {
+                warn!(
+                    "Could not count {} notification destinations for service {} health status: {}",
+                    severity, service_id, e
+                );
+                None
+            }
+        };
+        response.down_alert = Some(ServiceDownAlertResponse::new(
+            alarm.as_ref(),
+            severity,
+            destinations,
+            chrono::Utc::now(),
+        ));
+    }
+    response
+}
+
 /// Persisted health status for an external service
 ///
 /// Returns the latest health probe result recorded by
@@ -1528,7 +1566,10 @@ async fn get_service_health_status(
         .get_health_snapshot(id, limit)
         .await
     {
-        Ok(snap) => Ok((StatusCode::OK, Json(ServiceHealthResponse::from(snap)))),
+        Ok(snap) => Ok((
+            StatusCode::OK,
+            Json(service_health_response(&app_state, snap).await),
+        )),
         Err(crate::services::ExternalServiceError::ServiceNotFound { .. }) => {
             Err(not_found().detail("Service not found").build())
         }
@@ -1609,7 +1650,10 @@ async fn trigger_service_health_check(
         .get_health_snapshot(id, 50)
         .await
     {
-        Ok(snap) => Ok((StatusCode::OK, Json(ServiceHealthResponse::from(snap)))),
+        Ok(snap) => Ok((
+            StatusCode::OK,
+            Json(service_health_response(&app_state, snap).await),
+        )),
         Err(crate::services::ExternalServiceError::ServiceNotFound { .. }) => {
             Err(not_found().detail("Service not found").build())
         }
@@ -3536,6 +3580,7 @@ async fn update_service_resources(
         EnvironmentVariableInfo,
         SensitiveValueResponse,
         ServiceHealthResponse,
+        ServiceDownAlertResponse,
         HealthCheckEntryResponse,
         ServiceHealthStatusBatchResponse,
         ServiceHealthStatusEntryResponse,
@@ -3817,6 +3862,9 @@ mod tests {
             telemetry: Arc::new(temps_core::NoopTelemetryReporter),
             project_access_checker: Some(Arc::new(NarrowedServiceAccessChecker)),
             application_network_reconciler: Some(network_reconciler.clone()),
+            notification_service: Arc::new(crate::handlers::types::StaticNotificationService {
+                destinations: Some(0),
+            }),
         });
 
         let result = link_service_to_project(
@@ -4415,6 +4463,9 @@ mod tests {
             telemetry: Arc::new(temps_core::NoopTelemetryReporter),
             project_access_checker: None,
             application_network_reconciler: None,
+            notification_service: Arc::new(crate::handlers::types::StaticNotificationService {
+                destinations: Some(0),
+            }),
         });
 
         let response = reveal_service_parameter(

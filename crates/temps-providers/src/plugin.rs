@@ -245,6 +245,8 @@ impl TempsPlugin for ProvidersPlugin {
             context.require_service::<crate::data_import::DataImportService>();
         let sensitive_action_authorizer =
             context.require_service::<dyn temps_core::SensitiveActionAuthorizer>();
+        let notification_service =
+            context.require_service::<dyn temps_core::notifications::NotificationService>();
 
         // Create AppState for handlers
         let app_state = Arc::new(AppState {
@@ -261,6 +263,7 @@ impl TempsPlugin for ProvidersPlugin {
             application_network_reconciler,
             data_import_service,
             sensitive_action_authorizer,
+            notification_service,
         });
 
         // Configure routes with the app state

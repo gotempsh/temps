@@ -15516,6 +15516,8 @@
           "compose_unavailable",
           "volume_mount",
           "route_activation",
+          "registry_unavailable",
+          "image_pull_failed",
           "unknown"
         ],
         "type": "string"
@@ -47077,12 +47079,79 @@
         ],
         "type": "object"
       },
+      "ServiceDownAlertResponse": {
+        "description": "Alerting state for a service whose health checks keep failing.",
+        "properties": {
+          "alarm_fired_at": {
+            "description": "ISO 8601 time the alarm fired.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "alarm_id": {
+            "description": "The open down alarm, or `null` if none was raised (e.g. the alarm\ncould not be recorded, or it was resolved while checks still fail).",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "alarm_status": {
+            "description": "`firing` or `acknowledged`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "alert_severity": {
+            "description": "Severity the down alarm is raised at (e.g. `critical`).",
+            "type": "string"
+          },
+          "notification_destinations": {
+            "description": "How many notification destinations *currently* receive alerts of\n`alert_severity`: enabled providers on enabled routes covering it,\nplus Temps Cloud. This is today's configuration, not a record of who\nreceived this alarm — Temps does not track per-alarm delivery.\n`null` when it could not be determined.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "notification_setup_path": {
+            "description": "Console path where notification destinations are configured.",
+            "type": "string"
+          },
+          "silenced_until": {
+            "description": "ISO 8601 time until which the alarm's notifications are muted, when\nthat time is still in the future.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "alert_severity",
+          "notification_setup_path"
+        ],
+        "type": "object"
+      },
       "ServiceHealthResponse": {
         "properties": {
           "consecutive_failures": {
             "description": "Consecutive failed probes. Alert fires at 3.",
             "format": "int32",
             "type": "integer"
+          },
+          "down_alert": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ServiceDownAlertResponse",
+                "description": "What happened after the failure streak reached the alert threshold.\n`null` while the service is below it. Notification *delivery* is not\ntracked per alarm, so this never claims that anyone was notified."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "last_checked_at": {
             "type": [

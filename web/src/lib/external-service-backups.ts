@@ -74,6 +74,32 @@ export async function listExternalServiceBackups(
 }
 
 /**
+ * Key prefix shared by every page of one service's backup list. Invalidate
+ * it after enqueuing a backup so the new `pending` row shows immediately.
+ */
+export function externalServiceBackupsQueryKey(serviceId: number | undefined) {
+  return ['external-service-backups', serviceId] as const
+}
+
+/** Poll cadence while a listed backup is still queued or running. */
+export const ACTIVE_BACKUP_POLL_INTERVAL_MS = 3000
+
+const ACTIVE_BACKUP_STATES = new Set(['pending', 'running'])
+
+/**
+ * `refetchInterval` for the backup list: poll only while some listed backup
+ * has not reached a terminal state, so the card moves from queued to
+ * completed/failed on its own and stops polling once nothing is in flight.
+ */
+export function externalServiceBackupsRefetchInterval(
+  data: ServiceBackupListResponse | undefined
+): number | false {
+  return data?.backups.some((backup) => ACTIVE_BACKUP_STATES.has(backup.state))
+    ? ACTIVE_BACKUP_POLL_INTERVAL_MS
+    : false
+}
+
+/**
  * Returns TanStack Query `queryKey` + `queryFn` options for
  * `listExternalServiceBackups`, compatible with `useQuery`.
  */
@@ -83,8 +109,14 @@ export function listExternalServiceBackupsOptions(
   pageSize = 20
 ) {
   return {
-    queryKey: ['external-service-backups', serviceId, page, pageSize] as const,
+    queryKey: [
+      ...externalServiceBackupsQueryKey(serviceId),
+      page,
+      pageSize,
+    ] as const,
     queryFn: () => listExternalServiceBackups(serviceId!, page, pageSize),
     enabled: serviceId !== undefined,
+    refetchInterval: (query: { state: { data?: ServiceBackupListResponse } }) =>
+      externalServiceBackupsRefetchInterval(query.state.data),
   }
 }
