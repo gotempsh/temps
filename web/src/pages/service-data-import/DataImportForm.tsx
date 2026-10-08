@@ -166,9 +166,11 @@ export function DataImportForm({
   }
 
   return (
-    <Card>
+    <Card className="shadow-none">
       <CardHeader>
-        <CardTitle>Copy a database into this service</CardTitle>
+        <CardTitle className="text-lg">
+          Copy a database into this service
+        </CardTitle>
         <CardDescription>
           Temps connects to the source with the connection string below, dumps
           the database and loads it into a database of this service. The
@@ -269,7 +271,7 @@ export function DataImportForm({
                           variant={
                             name === targetDatabase ? 'default' : 'outline'
                           }
-                          className="h-6 rounded-full px-2.5 font-mono text-xs"
+                          className="rounded-full px-2.5 font-mono text-xs"
                           aria-pressed={name === targetDatabase}
                           aria-label={`Import into existing database ${name}`}
                           onClick={() =>

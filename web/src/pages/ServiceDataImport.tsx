@@ -110,7 +110,7 @@ export function ServiceDataImport() {
           retrying={availabilityQuery.isFetching}
         />
       ) : view.kind === 'loading' ? (
-        <Card>
+        <Card className="shadow-none">
           <CardHeader>
             <Skeleton className="h-6 w-64" />
             <Skeleton className="h-4 w-full max-w-xl" />

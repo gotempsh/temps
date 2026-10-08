@@ -107,6 +107,18 @@ function renderRunPage(runSeed: Seed) {
 
 const refreshError = new Error('Failed to fetch')
 
+// Shared Card classes and section-title classes, so the console surface
+// rules are checked on the rendered markup rather than on the source.
+function cardClasses(markup: string): string[] {
+  return [...markup.matchAll(/class="(rounded-lg border bg-card[^"]*)"/g)].map(
+    (m) => m[1]
+  )
+}
+
+function titleClass(markup: string, title: string): string | undefined {
+  return markup.match(new RegExp(`class="([^"]*)"[^>]*>${title}<`))?.[1]
+}
+
 describe('run detail after a failed refresh', () => {
   test('keeps the loaded details on screen under a stale-data warning', () => {
     const markup = renderRunPage({ data: run, error: refreshError })
@@ -151,5 +163,20 @@ describe('icon-only actions keep an accessible name on small screens', () => {
   test('a finished import names the target of "Import again"', () => {
     const markup = renderRunPage({ data: run })
     expect(markup).toContain('aria-label="Import again into shop_production"')
+  })
+})
+
+describe('console surfaces', () => {
+  test('cards have no decorative shadow and section titles are text-lg', () => {
+    const markup = renderRunPage({ data: run })
+    const cards = cardClasses(markup)
+    expect(cards.length).toBeGreaterThan(0)
+    for (const c of cards) expect(c).not.toContain('shadow-sm')
+    for (const title of ['Progress', 'Details', 'Transfer output']) {
+      const cls = titleClass(markup, title)
+      expect(cls).toBeDefined()
+      expect(cls).toContain('text-lg')
+      expect(cls).not.toContain('text-2xl')
+    }
   })
 })

@@ -109,9 +109,9 @@ export function DataImportRunsCard({
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
 
   return (
-    <Card>
+    <Card className="shadow-none">
       <CardHeader>
-        <CardTitle>Import history</CardTitle>
+        <CardTitle className="text-lg">Import history</CardTitle>
         <CardDescription>
           Imports into this service, newest first. Source credentials are never
           shown.

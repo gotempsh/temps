@@ -89,6 +89,18 @@ function renderImportPage(availabilitySeed: Seed) {
 
 const refreshError = new Error('Failed to fetch')
 
+// Shared Card classes and section-title classes, so the console surface
+// rules are checked on the rendered markup rather than on the source.
+function cardClasses(markup: string): string[] {
+  return [...markup.matchAll(/class="(rounded-lg border bg-card[^"]*)"/g)].map(
+    (m) => m[1]
+  )
+}
+
+function titleClass(markup: string, title: string): string | undefined {
+  return markup.match(new RegExp(`class="([^"]*)"[^>]*>${title}<`))?.[1]
+}
+
 describe('import page after a failed availability refresh', () => {
   test('keeps the form and history under a stale-data warning', () => {
     const markup = renderImportPage({ data: availability, error: refreshError })
@@ -122,5 +134,32 @@ describe('existing databases offered as targets', () => {
         )
       )
     }
+  })
+})
+
+describe('console surfaces', () => {
+  test('cards have no decorative shadow and section titles are text-lg', () => {
+    const markup = renderImportPage({ data: availability })
+    const cards = cardClasses(markup)
+    expect(cards.length).toBeGreaterThan(0)
+    for (const c of cards) expect(c).not.toContain('shadow-sm')
+    for (const title of [
+      'Copy a database into this service',
+      'Import history',
+    ]) {
+      const cls = titleClass(markup, title)
+      expect(cls).toBeDefined()
+      expect(cls).toContain('text-lg')
+      expect(cls).not.toContain('text-2xl')
+    }
+  })
+
+  test('existing-database suggestions keep the shared button height', () => {
+    const markup = renderImportPage({ data: availability })
+    const suggestion = markup.match(
+      /<button[^>]*class="([^"]*)"[^>]*aria-label="Import into existing database shop_production"/
+    )
+    expect(suggestion).not.toBeNull()
+    expect(suggestion?.[1]).not.toMatch(/(^|\s)h-6(\s|$)/)
   })
 })

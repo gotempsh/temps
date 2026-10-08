@@ -274,26 +274,26 @@ function RunBody({
       )}
       <OutcomeCard run={run} objectNoun={objectNoun} />
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
-        <Card className="lg:col-span-1">
+        <Card className="shadow-none lg:col-span-1">
           <CardHeader>
-            <CardTitle>Progress</CardTitle>
+            <CardTitle className="text-lg">Progress</CardTitle>
           </CardHeader>
           <CardContent>
             <PhaseTimeline steps={phaseSteps(run)} />
           </CardContent>
         </Card>
-        <Card className="lg:col-span-2">
+        <Card className="shadow-none lg:col-span-2">
           <CardHeader>
-            <CardTitle>Details</CardTitle>
+            <CardTitle className="text-lg">Details</CardTitle>
           </CardHeader>
           <CardContent>
             <RunDetails run={run} objectNoun={objectNoun} />
           </CardContent>
         </Card>
       </div>
-      <Card>
+      <Card className="shadow-none">
         <CardHeader>
-          <CardTitle>Transfer output</CardTitle>
+          <CardTitle className="text-lg">Transfer output</CardTitle>
           <CardDescription>
             The last lines printed by the dump and restore tools. Passwords and
             connection strings are removed before anything is stored.
@@ -337,7 +337,7 @@ function OutcomeCard({
     )
   }
   return (
-    <Card>
+    <Card className="shadow-none">
       <CardContent className="flex flex-col gap-3 pt-6 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex items-center gap-3">
           {isRunActive(run) ? (
