@@ -558,24 +558,7 @@ pub async fn export_image(
     let image = query.image;
     validate_image_reference(&image)?;
     let deadline = tokio::time::Instant::now() + BUILD_DEADLINE;
-    let permit =
-        match tokio::time::timeout_at(deadline, limits.image_import_slots.clone().acquire_owned())
-            .await
-        {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(_)) => {
-                return Err(AgentImageError::Unavailable(
-                    "Worker image operation capacity unavailable".into(),
-                )
-                .into())
-            }
-            Err(_) => {
-                return Err(AgentImageError::Deadline(format!(
-                    "Export of '{image}' waited 30 minutes for capacity"
-                ))
-                .into())
-            }
-        };
+    let permit = acquire_image_slot(&limits, deadline, &format!("Export of '{image}'")).await?;
     let export_result =
         tokio::time::timeout_at(deadline, state.image_builder.export_image_stream(&image))
             .await
@@ -601,9 +584,166 @@ pub async fn export_image(
         }
     };
     tracing::info!(image = %image, "Streaming image export");
-    // The permit lives in the stream state, so the slot is released exactly
-    // when the transfer ends — completed, failed, or dropped by the client.
-    let body = stream::unfold(
+    Ok(tar_response(stream_holding_slot(
+        exported,
+        permit,
+        deadline,
+        "Image export exceeded its 30-minute deadline",
+    )))
+}
+
+/// Query for `GET /agent/images/extract`.
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct ExtractImagePathQuery {
+    /// Image reference on this node, e.g. `temps-app:3f2a`.
+    pub image: String,
+    /// Absolute path inside the image to export, e.g. `/app/dist`.
+    pub path: String,
+}
+
+/// Longest image path accepted for export; matches Linux `PATH_MAX`.
+const MAX_IMAGE_PATH_BYTES: usize = 4096;
+
+fn validate_image_path(path: &str) -> Result<(), AgentImageError> {
+    let invalid = |reason: &str| {
+        Err(AgentImageError::Invalid(format!(
+            "Image path '{}' {reason}",
+            path.chars().take(256).collect::<String>()
+        )))
+    };
+    if path.len() > MAX_IMAGE_PATH_BYTES {
+        return invalid(&format!("exceeds {MAX_IMAGE_PATH_BYTES} bytes"));
+    }
+    if !path.starts_with('/') || path.contains('\0') {
+        return invalid("must be absolute and must not contain NUL bytes");
+    }
+    if Path::new(path)
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return invalid("must not contain '..' components");
+    }
+    if Path::new(path).file_name().is_none() {
+        return invalid("must name a file or directory, not the image root");
+    }
+    Ok(())
+}
+
+/// Stream one path of an image this node built as a container-archive tar.
+///
+/// The control plane uses it to collect a static site's output directory, or
+/// a container image's immutable assets, from the node that built the image
+/// — it has no Docker daemon to read the image itself. Only images already on
+/// this node are served; nothing is pulled on request. The control plane
+/// re-validates and unpacks the archive itself.
+#[utoipa::path(
+    tag = "Images",
+    get,
+    path = "/agent/images/extract",
+    params(ExtractImagePathQuery),
+    responses(
+        (status = 200, description = "Container-archive tar of the path", content_type = "application/x-tar", body = Vec<u8>),
+        (status = 400, description = "Invalid image reference or path"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Deployment-read permission required"),
+        (status = 404, description = "Image not present on this node"),
+        (status = 413, description = "Path exceeds the static archive limit"),
+        (status = 500, description = "Path export failed"),
+        (status = 503, description = "Image operation capacity unavailable"),
+        (status = 504, description = "Timed out waiting for image operation capacity")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn extract_image_path(
+    RequireAgentAuth(auth): RequireAgentAuth,
+    State(state): State<Arc<AgentState>>,
+    Extension(limits): Extension<Arc<AgentResourceLimits>>,
+    Query(query): Query<ExtractImagePathQuery>,
+) -> Result<Response, Problem> {
+    permission_guard!(auth, DeploymentsRead);
+    let ExtractImagePathQuery { image, path } = query;
+    validate_image_reference(&image)?;
+    validate_image_path(&path)?;
+    let deadline = tokio::time::Instant::now() + BUILD_DEADLINE;
+    let permit = acquire_image_slot(
+        &limits,
+        deadline,
+        &format!("Export of path '{path}' from '{image}'"),
+    )
+    .await?;
+    let export_result = tokio::time::timeout_at(
+        deadline,
+        state.image_builder.export_path_stream(&image, &path),
+    )
+    .await
+    .map_err(|_| {
+        AgentImageError::Deadline(format!(
+            "Export of path '{path}' from '{image}' exceeded 30 minutes before streaming"
+        ))
+    })?;
+    let exported = match export_result {
+        Ok(stream) => stream,
+        Err(BuilderError::ImageNotFound(_)) => {
+            return Err(AgentImageError::NotFound(format!(
+                "Image '{image}' is not present on this node"
+            ))
+            .into())
+        }
+        Err(BuilderError::InvalidContext(reason)) => {
+            return Err(AgentImageError::Invalid(reason).into())
+        }
+        Err(BuilderError::ResourceLimitExceeded(reason)) => {
+            return Err(AgentImageError::TooLarge(reason).into())
+        }
+        Err(error) => {
+            // Usually a path the image does not contain: callers probe
+            // several candidate asset directories, so this is not an error
+            // on the node.
+            tracing::warn!(image = %image, path = %path, "Image path export failed: {error}");
+            return Err(AgentImageError::Storage(format!(
+                "Cannot export path '{path}' from image '{image}': {error}"
+            ))
+            .into());
+        }
+    };
+    tracing::info!(image = %image, path = %path, "Streaming image path export");
+    Ok(tar_response(stream_holding_slot(
+        exported,
+        permit,
+        deadline,
+        "Image path export exceeded its 30-minute deadline",
+    )))
+}
+
+/// Wait until `deadline` for one of the node's image-operation slots, so
+/// exports, imports, pulls and builds share one concurrency bound.
+async fn acquire_image_slot(
+    limits: &AgentResourceLimits,
+    deadline: tokio::time::Instant,
+    operation: &str,
+) -> Result<tokio::sync::OwnedSemaphorePermit, AgentImageError> {
+    match tokio::time::timeout_at(deadline, limits.image_import_slots.clone().acquire_owned()).await
+    {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) => Err(AgentImageError::Unavailable(
+            "Worker image operation capacity unavailable".into(),
+        )),
+        Err(_) => Err(AgentImageError::Deadline(format!(
+            "{operation} waited 30 minutes for capacity"
+        ))),
+    }
+}
+
+/// Forward `exported` to the client. The permit lives in the stream state, so
+/// the slot is released exactly when the transfer ends — completed, failed,
+/// or dropped by the client.
+fn stream_holding_slot(
+    exported: temps_deployer::ImageImportStream,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    deadline: tokio::time::Instant,
+    deadline_message: &'static str,
+) -> Body {
+    Body::from_stream(stream::unfold(
         (exported, permit, false),
         move |(mut exported, permit, finished)| async move {
             if finished {
@@ -616,19 +756,22 @@ pub async fn export_image(
                 Err(_) => Some((
                     Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
-                        "Image export exceeded its 30-minute deadline",
+                        deadline_message,
                     )),
                     (exported, permit, true),
                 )),
             }
         },
-    );
-    Ok((
+    ))
+}
+
+fn tar_response(body: Body) -> Response {
+    (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/x-tar")],
-        Body::from_stream(body),
+        body,
     )
-        .into_response())
+        .into_response()
 }
 
 #[cfg(test)]
@@ -665,6 +808,7 @@ mod tests {
             .route("/build", post(build_image))
             .route("/inspect", get(inspect_image))
             .route("/export", get(export_image))
+            .route("/extract", get(extract_image_path))
             .layer(Extension(Arc::new(crate::auth::AgentAuth::new(
                 "node-token",
             ))))
@@ -674,6 +818,7 @@ mod tests {
             ("POST", "/build"),
             ("GET", "/inspect?image="),
             ("GET", "/export?image="),
+            ("GET", "/extract?image=&path=/app/dist"),
         ] {
             for token in [None, Some("Bearer wrong-token"), Some("Bearer node-token")] {
                 let mut request = axum::http::Request::builder()
@@ -761,6 +906,165 @@ mod tests {
             .unwrap();
         assert_eq!(slots.available_permits(), 1);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn image_path_validation_rejects_relative_traversal_and_root() {
+        assert!(validate_image_path("/app/dist").is_ok());
+        assert!(validate_image_path("/app/.next/static").is_ok());
+        for path in [
+            "",
+            "app/dist",
+            "/app/../etc",
+            "/",
+            "/app/\0dist",
+            &format!("/{}", "a".repeat(MAX_IMAGE_PATH_BYTES)),
+        ] {
+            let error = validate_image_path(path).expect_err(path);
+            assert!(matches!(error, AgentImageError::Invalid(_)), "{path:?}");
+        }
+    }
+
+    /// Serves `export_path_stream` from canned results keyed by image name.
+    struct PathExportBuilder;
+
+    #[async_trait::async_trait]
+    impl temps_deployer::ImageBuilder for PathExportBuilder {
+        async fn build_image(&self, _request: BuildRequest) -> Result<BuildResult, BuilderError> {
+            unimplemented!("not used by path export")
+        }
+        async fn build_image_with_callback(
+            &self,
+            _request: BuildRequestWithCallback,
+        ) -> Result<BuildResult, BuilderError> {
+            unimplemented!("not used by path export")
+        }
+        async fn import_image(
+            &self,
+            _image_path: std::path::PathBuf,
+            _tag: &str,
+        ) -> Result<String, BuilderError> {
+            unimplemented!("not used by path export")
+        }
+        async fn save_image(
+            &self,
+            _image_name: &str,
+            _output_path: &Path,
+        ) -> Result<(), BuilderError> {
+            unimplemented!("not used by path export")
+        }
+        async fn export_path_stream(
+            &self,
+            image_name: &str,
+            source_path: &str,
+        ) -> Result<temps_deployer::ImageImportStream, BuilderError> {
+            match image_name {
+                "temps-site:abc" => Ok(Box::pin(stream::iter(vec![Ok(bytes::Bytes::from(
+                    format!("tar-of:{source_path}"),
+                ))]))),
+                "temps-huge:abc" => Err(BuilderError::ResourceLimitExceeded(format!(
+                    "'{source_path}' exceeds the static archive limit"
+                ))),
+                _ => Err(BuilderError::ImageNotFound(image_name.to_string())),
+            }
+        }
+        async fn extract_from_image(
+            &self,
+            _image_name: &str,
+            _source_path: &str,
+            _destination_path: &Path,
+        ) -> Result<(), BuilderError> {
+            unimplemented!("the agent never unpacks for the control plane")
+        }
+        async fn list_images(&self) -> Result<Vec<String>, BuilderError> {
+            unimplemented!("not used by path export")
+        }
+        async fn remove_image(&self, _image_name: &str) -> Result<(), BuilderError> {
+            unimplemented!("not used by path export")
+        }
+        async fn inspect_image(
+            &self,
+            _image_name: &str,
+        ) -> Result<temps_deployer::ImageInfo, BuilderError> {
+            unimplemented!("not used by path export")
+        }
+        fn get_native_platform(&self) -> String {
+            "linux/amd64".into()
+        }
+    }
+
+    #[tokio::test]
+    async fn extract_image_path_streams_the_archive_and_releases_capacity() {
+        use axum::{routing::get, Router};
+        use tower::ServiceExt;
+        let remote = Arc::new(
+            temps_deployer::remote::RemoteNodeDeployer::new(
+                "http://127.0.0.1:9".into(),
+                "unused".into(),
+                "no-io".into(),
+            )
+            .unwrap(),
+        );
+        let state = Arc::new(AgentState {
+            container_deployer: remote,
+            image_builder: Arc::new(PathExportBuilder),
+            docker: None,
+            overlay_bridge_address: Default::default(),
+            overlay_peers: Default::default(),
+            platform: Default::default(),
+            host_bind_address: std::sync::Arc::new(std::sync::RwLock::new("127.0.0.1".into())),
+        });
+        let limits = Arc::new(AgentResourceLimits::new());
+        let slots = limits.image_import_slots.available_permits();
+        let router = Router::new()
+            .route("/extract", get(extract_image_path))
+            .layer(Extension(Arc::new(crate::auth::AgentAuth::new(
+                "node-token",
+            ))))
+            .layer(Extension(limits.clone()))
+            .with_state(state);
+        let request = |query: &str| {
+            axum::http::Request::builder()
+                .uri(format!("/extract?{query}"))
+                .header("authorization", "Bearer node-token")
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let response = router
+            .clone()
+            .oneshot(request("image=temps-site%3Aabc&path=%2Fapp%2Fdist"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/x-tar"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"tar-of:/app/dist");
+        assert_eq!(limits.image_import_slots.available_permits(), slots);
+
+        for (query, status) in [
+            (
+                "image=missing%3A1&path=%2Fapp%2Fdist",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "image=temps-huge%3Aabc&path=%2Fapp%2Fdist",
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+            (
+                "image=temps-site%3Aabc&path=%2Fapp%2F..%2Fetc",
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let response = router.clone().oneshot(request(query)).await.unwrap();
+            assert_eq!(response.status(), status, "{query}");
+            assert_eq!(limits.image_import_slots.available_permits(), slots);
+        }
     }
 
     #[tokio::test]

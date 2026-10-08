@@ -524,7 +524,7 @@ background tasks:
 | Vulnerability scanning | Trivy scans images in the *local* image store, and in this profile no image is ever stored here | Nowhere, in this profile. Reported as `vulnerability_scanning: false` — see the note below |
 | Agent sandboxes and the sandbox API | The sandbox API is built on the local container provider, so it is not constructed here, even for sandboxes that would run on workers | A `full`-profile control plane, which can also [place sandboxes on worker nodes](#sandboxes) |
 | Workload importers | Every importer adopts containers from the local daemon | A `full`-profile host |
-| Image builds from source | Builds run against a local daemon; there is none | Not yet supported — see [Building from source](#control-plane-builds) below |
+| Image builds from source | Builds run against a local daemon; there is none | A worker node — see [Building from source](#control-plane-builds) below |
 | On-demand wake/sleep, workspace preview gateway, Traefik label discovery | All operate on local containers | The node that owns the containers |
 
 <Note>
@@ -590,20 +590,34 @@ control plane tells the target worker to pull the image, and the worker pulls
 it directly from the registry. No image data passes through the control plane
 and no local daemon is involved.
 
-Deployments that **build from source** do not work in this profile yet. The
-build path runs against a local daemon, and this process has none. A build is
-refused with an explicit error rather than being attempted:
+Deployments that **build from source** run on a worker node. The control
+plane archives the repository it already checked out, uploads it to the chosen
+node over the authenticated agent channel, and streams the build output back
+into the deployment log. The image stays on the node that built it; a replica
+placed on another node receives it straight from the builder. No Docker daemon
+on the control plane is involved at any point.
 
-```
-This control plane runs no image builds (serve profile 'control-plane').
-Deploy a prebuilt image from a registry instead, or run the full profile on a
-node with Docker.
-```
+The build runs on a node joined with `--labels temps.sh/role=builder` of the
+target architecture when there is one — such nodes build but never host
+replicas — and otherwise on a worker eligible to run the deployment.
 
-Moving the build onto the worker node that will run the image is tracked in
-[issue #1034](https://github.com/gotempsh/temps/issues/1034) — it moves
-application source and build secrets across the control-plane → worker trust
-boundary, so it needs its own security review before implementation starts.
+**Static sites** (Vite, Create React App, Astro, ...) build the same way. The
+control plane then fetches only the output directory (for example `/app/dist`)
+from the node that built it, checks it under the same size, file-count and
+file-type limits as a local build, and serves it from its own proxy like any
+other static deployment. Static output does not depend on CPU architecture, so
+any eligible worker can build it, including on a mixed-architecture cluster.
+
+Current limits of worker builds:
+
+- **One target architecture per container image.** If the nodes a deployment
+  may run on span more than one architecture, it fails before any source is
+  uploaded and asks you to restrict target nodes or labels to one
+  architecture, or to deploy a prebuilt multi-platform registry image.
+- **No build secrets.** Generated package-registry credentials
+  (`NPM_TOKEN`/`.npmrc`) and environment values passed as build arguments are
+  not sent to workers. A build that needs them fails with a message naming
+  what was withheld.
 
 ---
 

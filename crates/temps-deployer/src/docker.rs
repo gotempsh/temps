@@ -444,6 +444,149 @@ fn combine_extraction_and_cleanup(
     }
 }
 
+/// The name Docker's container-archive API gives the root entry of a
+/// download of `source_path`: its final path component.
+fn static_archive_root(
+    source_path: &str,
+    image_name: &str,
+) -> Result<std::ffi::OsString, BuilderError> {
+    Path::new(source_path)
+        .file_name()
+        .filter(|component| !component.is_empty())
+        .map(|component| component.to_os_string())
+        .ok_or_else(|| {
+            BuilderError::InvalidContext(format!(
+                "Docker extraction source path '{source_path}' for image '{image_name}' must name a file or directory"
+            ))
+        })
+}
+
+/// Unpack a container-archive tar of `source_path` from `image_name` into
+/// `destination`, enforcing the static byte, entry, depth and type limits.
+///
+/// Shared by local extraction and by images built on a worker node, whose
+/// archive arrives over the agent channel. Either way the bytes are validated
+/// on the host that will serve them, never trusted for where they came from.
+pub(crate) async fn unpack_static_archive_stream<S, E>(
+    stream: S,
+    image_name: &str,
+    source_path: &str,
+    destination: &Path,
+) -> Result<(), BuilderError>
+where
+    S: Stream<Item = Result<bytes::Bytes, E>>,
+    E: std::fmt::Display,
+{
+    let archive_root = static_archive_root(source_path, image_name)?;
+
+    // The archive and extraction directory are removed when this scope exits.
+    let temp_dir = TempDir::new().map_err(|error| {
+        BuilderError::IoError(std::io::Error::new(
+            error.kind(),
+            format!(
+                "Failed to create temporary Docker extraction directory for image '{image_name}' path '{source_path}': {error}"
+            ),
+        ))
+    })?;
+    let archive_path = temp_dir.path().join("static-output.tar");
+    let extraction_path = temp_dir.path().join("extracted");
+
+    DockerRuntime::write_bounded_byte_stream(
+        stream,
+        &archive_path,
+        MAX_STATIC_ARCHIVE_STREAM_BYTES,
+        image_name,
+        source_path,
+    )
+    .await?;
+
+    let blocking_archive_path = archive_path.clone();
+    let blocking_extraction_path = extraction_path.clone();
+    let blocking_image_name = image_name.to_string();
+    let blocking_source_path = source_path.to_string();
+    tokio::task::spawn_blocking(move || {
+        extract_bounded_static_archive(
+            &blocking_archive_path,
+            &blocking_extraction_path,
+            &blocking_image_name,
+            &blocking_source_path,
+        )
+    })
+    .await
+    .map_err(|error| {
+        BuilderError::Other(format!(
+            "Docker archive extraction task failed for image '{image_name}' path '{source_path}': {error}"
+        ))
+    })??;
+
+    let extracted_dir = extraction_path.join(&archive_root);
+    let canonical_extraction_path = tokio::fs::canonicalize(&extraction_path)
+        .await
+        .map_err(|error| {
+            BuilderError::IoError(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "Failed to resolve Docker extraction root {} for image '{image_name}' path '{source_path}': {error}",
+                    extraction_path.display()
+                ),
+            ))
+        })?;
+    let canonical_extracted_dir = tokio::fs::canonicalize(&extracted_dir)
+        .await
+        .map_err(|error| {
+            BuilderError::IoError(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "Docker archive for image '{image_name}' path '{source_path}' did not contain expected directory {}: {error}",
+                    extracted_dir.display()
+                ),
+            ))
+        })?;
+    if !canonical_extracted_dir.starts_with(&canonical_extraction_path)
+        || !canonical_extracted_dir.is_dir()
+    {
+        return Err(BuilderError::InvalidContext(format!(
+            "Docker archive for image '{image_name}' path '{source_path}' did not resolve to a confined directory"
+        )));
+    }
+
+    tokio::fs::rename(&canonical_extracted_dir, destination)
+        .await
+        .map_err(|error| {
+            BuilderError::IoError(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "Failed to move extracted Docker files for image '{image_name}' path '{source_path}' from {} to {}: {error}",
+                    canonical_extracted_dir.display(),
+                    destination.display()
+                ),
+            ))
+        })
+}
+
+/// Stream `file` in fixed-size chunks, keeping `dir` (which contains it)
+/// alive until the stream ends or is dropped, so the staged archive is
+/// deleted exactly when the transfer finishes.
+fn stream_file_owning_dir(file: tokio::fs::File, dir: TempDir) -> ImageImportStream {
+    use tokio::io::AsyncReadExt;
+    const CHUNK_BYTES: usize = 64 * 1024;
+    Box::pin(futures::stream::unfold(
+        Some((file, dir)),
+        |state| async move {
+            let (mut file, dir) = state?;
+            let mut buffer = vec![0_u8; CHUNK_BYTES];
+            match file.read(&mut buffer).await {
+                Ok(0) => None,
+                Ok(read) => {
+                    buffer.truncate(read);
+                    Some((Ok(bytes::Bytes::from(buffer)), Some((file, dir))))
+                }
+                Err(error) => Some((Err(error), None)),
+            }
+        },
+    ))
+}
+
 fn checked_static_archive_entry_count(
     current: u32,
     image_name: &str,
@@ -2548,7 +2691,40 @@ impl DockerRuntime {
             .unwrap_or_else(crate::platform::native_platform)
     }
 
-    async fn write_bounded_byte_stream<S>(
+    /// Create (never start) a container from `image_name` so its filesystem
+    /// can be read through the container-archive API. The returned guard
+    /// removes it, including when the caller is cancelled.
+    async fn create_extraction_container(
+        docker: &Arc<Docker>,
+        image_name: &str,
+        source_path: &str,
+    ) -> Result<DockerContainerCleanupGuard, BuilderError> {
+        let container_config = bollard::models::ContainerCreateBody {
+            image: Some(image_name.to_string()),
+            cmd: Some(vec!["/bin/sh".to_string()]),
+            tty: Some(true),
+            ..Default::default()
+        };
+        let container = docker
+            .create_container(
+                Some(bollard::query_parameters::CreateContainerOptionsBuilder::new().build()),
+                container_config,
+            )
+            .await
+            .map_err(|error| {
+                BuilderError::Other(format!(
+                    "Failed to create container from image '{image_name}' to read path '{source_path}': {error}"
+                ))
+            })?;
+        Ok(DockerContainerCleanupGuard::new(
+            docker.clone(),
+            container.id,
+            image_name,
+            source_path,
+        ))
+    }
+
+    pub(crate) async fn write_bounded_byte_stream<S, E>(
         s: S,
         output_path: &Path,
         max_bytes: u64,
@@ -2556,7 +2732,8 @@ impl DockerRuntime {
         source_path: &str,
     ) -> Result<u64, BuilderError>
     where
-        S: Stream<Item = Result<bytes::Bytes, bollard::errors::Error>>,
+        S: Stream<Item = Result<bytes::Bytes, E>>,
+        E: std::fmt::Display,
     {
         let mut output = tokio::fs::File::create(output_path).await.map_err(|error| {
             BuilderError::IoError(std::io::Error::new(
@@ -3295,16 +3472,8 @@ impl ImageBuilder for DockerRuntime {
         destination_path: &Path,
     ) -> Result<(), BuilderError> {
         let docker = self.require_docker_for_build()?;
-
-        let archive_root = Path::new(source_path)
-            .file_name()
-            .filter(|component| !component.is_empty())
-            .ok_or_else(|| {
-                BuilderError::InvalidContext(format!(
-                    "Docker extraction source path '{source_path}' for image '{image_name}' must name a file or directory"
-                ))
-            })?
-            .to_os_string();
+        // Reject a path with no final component before touching the daemon.
+        static_archive_root(source_path, image_name)?;
 
         // Skip pull for local images (temps-* are built locally, not from a registry)
         if !image_name.starts_with("temps-") {
@@ -3321,55 +3490,9 @@ impl ImageBuilder for DockerRuntime {
                 .await;
         }
 
-        // Create container
-        let container_config = bollard::models::ContainerCreateBody {
-            image: Some(image_name.to_string()),
-            cmd: Some(vec!["/bin/sh".to_string()]),
-            tty: Some(true),
-            ..Default::default()
-        };
-
-        let container = docker
-            .create_container(
-                Some(bollard::query_parameters::CreateContainerOptionsBuilder::new().build()),
-                container_config,
-            )
-            .await
-            .map_err(|e| BuilderError::Other(format!("Failed to create container: {}", e)))?;
-
-        let container_id = container.id.clone();
-        // DockerContainerCleanupGuard is a leaf type that keeps Arc<Docker>
-        // directly (the daemon is available: we just created the container).
-        let mut cleanup_guard = DockerContainerCleanupGuard::new(
-            docker.clone(),
-            container_id.clone(),
-            image_name,
-            source_path,
-        );
-
-        // Download from the container into a bounded temporary file. The archive
-        // and extraction directory are removed when this scope exits.
-        let temp_dir = match TempDir::new() {
-            Ok(temp_dir) => temp_dir,
-            Err(error) => {
-                let operation = Err(BuilderError::IoError(std::io::Error::new(
-                    error.kind(),
-                    format!(
-                        "Failed to create temporary Docker extraction directory for image '{image_name}' path '{source_path}': {error}"
-                    ),
-                )));
-                let cleanup = cleanup_guard.cleanup().await;
-                return combine_extraction_and_cleanup(
-                    operation,
-                    cleanup,
-                    &container_id,
-                    image_name,
-                    source_path,
-                );
-            }
-        };
-        let archive_path = temp_dir.path().join("static-output.tar");
-        let extraction_path = temp_dir.path().join("extracted");
+        let mut cleanup_guard =
+            Self::create_extraction_container(&docker, image_name, source_path).await?;
+        let container_id = cleanup_guard.container_id.clone();
 
         let response_stream = docker.download_from_container(
             &container_id,
@@ -3377,84 +3500,90 @@ impl ImageBuilder for DockerRuntime {
                 path: source_path.to_string(),
             }),
         );
-
-        let operation = async {
-            Self::write_bounded_byte_stream(
-                response_stream,
-                &archive_path,
-                MAX_STATIC_ARCHIVE_STREAM_BYTES,
-                image_name,
-                source_path,
-            )
-            .await?;
-
-            let blocking_archive_path = archive_path.clone();
-            let blocking_extraction_path = extraction_path.clone();
-            let blocking_image_name = image_name.to_string();
-            let blocking_source_path = source_path.to_string();
-            tokio::task::spawn_blocking(move || {
-                extract_bounded_static_archive(
-                    &blocking_archive_path,
-                    &blocking_extraction_path,
-                    &blocking_image_name,
-                    &blocking_source_path,
-                )
-            })
-            .await
-            .map_err(|error| {
-                BuilderError::Other(format!(
-                    "Docker archive extraction task failed for image '{image_name}' path '{source_path}': {error}"
-                ))
-            })??;
-
-            let extracted_dir = extraction_path.join(&archive_root);
-            let canonical_extraction_path = tokio::fs::canonicalize(&extraction_path)
-                .await
-                .map_err(|error| {
-                    BuilderError::IoError(std::io::Error::new(
-                        error.kind(),
-                        format!(
-                            "Failed to resolve Docker extraction root {} for image '{image_name}' path '{source_path}': {error}",
-                            extraction_path.display()
-                        ),
-                    ))
-                })?;
-            let canonical_extracted_dir = tokio::fs::canonicalize(&extracted_dir)
-                .await
-                .map_err(|error| {
-                    BuilderError::IoError(std::io::Error::new(
-                        error.kind(),
-                        format!(
-                            "Docker archive for image '{image_name}' path '{source_path}' did not contain expected directory {}: {error}",
-                            extracted_dir.display()
-                        ),
-                    ))
-                })?;
-            if !canonical_extracted_dir.starts_with(&canonical_extraction_path)
-                || !canonical_extracted_dir.is_dir()
-            {
-                return Err(BuilderError::InvalidContext(format!(
-                    "Docker archive for image '{image_name}' path '{source_path}' did not resolve to a confined directory"
-                )));
-            }
-
-            tokio::fs::rename(&canonical_extracted_dir, destination_path)
-                .await
-                .map_err(|error| {
-                    BuilderError::IoError(std::io::Error::new(
-                        error.kind(),
-                        format!(
-                            "Failed to move extracted Docker files for image '{image_name}' path '{source_path}' from {} to {}: {error}",
-                            canonical_extracted_dir.display(),
-                            destination_path.display()
-                        ),
-                    ))
-                })?;
-            Ok(())
-        }
+        let operation = unpack_static_archive_stream(
+            response_stream,
+            image_name,
+            source_path,
+            destination_path,
+        )
         .await;
         let cleanup = cleanup_guard.cleanup().await;
         combine_extraction_and_cleanup(operation, cleanup, &container_id, image_name, source_path)
+    }
+
+    /// Stream `source_path` out of a locally present image as the raw
+    /// container-archive tar, for a control plane that unpacks it itself.
+    ///
+    /// Never pulls: the agent serves this for images it built, and a request
+    /// naming anything else is answered with `ImageNotFound` rather than
+    /// fetching an arbitrary reference onto the node. The archive is staged in
+    /// an owner-only temp directory under the same byte bound as local
+    /// extraction, so the temporary container is removed before the first
+    /// byte is sent and a slow reader cannot keep it alive.
+    async fn export_path_stream(
+        &self,
+        image_name: &str,
+        source_path: &str,
+    ) -> Result<ImageImportStream, BuilderError> {
+        let docker = self.require_docker_for_build()?;
+        static_archive_root(source_path, image_name)?;
+        match docker.inspect_image(image_name).await {
+            Ok(_) => {}
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => {
+                return Err(BuilderError::ImageNotFound(format!(
+                    "'{image_name}' is not present on this node"
+                )))
+            }
+            Err(error) => {
+                return Err(BuilderError::Other(format!(
+                    "Cannot inspect image '{image_name}' before exporting path '{source_path}': {error}"
+                )))
+            }
+        }
+
+        let temp_dir = TempDir::new().map_err(|error| {
+            BuilderError::IoError(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "Failed to create temporary directory to export path '{source_path}' from image '{image_name}': {error}"
+                ),
+            ))
+        })?;
+        let archive_path = temp_dir.path().join("path-export.tar");
+
+        let mut cleanup_guard =
+            Self::create_extraction_container(&docker, image_name, source_path).await?;
+        let container_id = cleanup_guard.container_id.clone();
+        let download = docker.download_from_container(
+            &container_id,
+            Some(bollard::query_parameters::DownloadFromContainerOptions {
+                path: source_path.to_string(),
+            }),
+        );
+        let operation = Self::write_bounded_byte_stream(
+            download,
+            &archive_path,
+            MAX_STATIC_ARCHIVE_STREAM_BYTES,
+            image_name,
+            source_path,
+        )
+        .await
+        .map(|_| ());
+        let cleanup = cleanup_guard.cleanup().await;
+        combine_extraction_and_cleanup(operation, cleanup, &container_id, image_name, source_path)?;
+
+        let file = tokio::fs::File::open(&archive_path).await.map_err(|error| {
+            BuilderError::IoError(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "Failed to reopen exported archive {} for image '{image_name}' path '{source_path}': {error}",
+                    archive_path.display()
+                ),
+            ))
+        })?;
+        Ok(stream_file_owning_dir(file, temp_dir))
     }
 
     async fn list_images(&self) -> Result<Vec<String>, BuilderError> {
@@ -5554,6 +5683,46 @@ mod docker_tests {
     /// in what Docker actually writes to `/etc/resolv.conf`, not in our
     /// in-memory list-building logic (already covered by the pure
     /// `dns_for_container` / `merge_dns_with_fallback` tests above).
+    /// The worker side of static extraction: a path is streamed out of a
+    /// local image as a container-archive tar the control plane can unpack.
+    #[tokio::test]
+    async fn export_path_stream_round_trips_through_the_static_unpacker() {
+        let runtime = match create_test_docker_runtime().await {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                println!("🔧 Docker not available, skipping: {error}");
+                return;
+            }
+        };
+        let reachable = match runtime.require_docker_for_build() {
+            Ok(docker) => docker.ping().await.is_ok(),
+            Err(_) => false,
+        };
+        if !reachable {
+            println!("🔧 Docker not available, skipping");
+            return;
+        }
+
+        let stream = runtime
+            .export_path_stream("alpine:latest", "/etc/apk")
+            .await
+            .expect("export /etc/apk from alpine:latest");
+        let workspace = TempDir::new().expect("workspace");
+        let destination = workspace.path().join("apk");
+        unpack_static_archive_stream(stream, "alpine:latest", "/etc/apk", &destination)
+            .await
+            .expect("exported archive unpacks under the static limits");
+        assert!(destination.join("repositories").is_file());
+
+        let missing = runtime
+            .export_path_stream("temps-definitely-missing:never", "/app/dist")
+            .await;
+        assert!(
+            matches!(missing, Err(BuilderError::ImageNotFound(_))),
+            "a missing image must not be pulled or reported as a generic failure"
+        );
+    }
+
     #[tokio::test]
     #[serial]
     async fn test_dns_fallback_survives_unreachable_primary_resolver() {

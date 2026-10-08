@@ -1345,15 +1345,68 @@ impl ImageBuilder for RemoteNodeDeployer {
         ))
     }
 
+    async fn export_path_stream(
+        &self,
+        image_name: &str,
+        source_path: &str,
+    ) -> Result<ImageImportStream, BuilderError> {
+        let url = format!("{}/agent/images/extract", self.agent_url);
+        let response = self
+            .client
+            .get(&url)
+            .bearer_auth(&self.token)
+            .timeout(IMAGE_EXPORT_REQUEST_TIMEOUT)
+            .query(&[("image", image_name), ("path", source_path)])
+            .send()
+            .await
+            .map_err(|error| {
+                BuilderError::Other(format!(
+                    "Cannot export path '{source_path}' of image '{image_name}' from node '{}': {error}",
+                    self.node_name
+                ))
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            let detail = agent_error_detail(response).await;
+            let message = format!(
+                "Node '{}' refused to export path '{source_path}' of image '{image_name}' (HTTP {status}): {detail}",
+                self.node_name
+            );
+            return Err(match status {
+                reqwest::StatusCode::NOT_FOUND => BuilderError::ImageNotFound(message),
+                reqwest::StatusCode::PAYLOAD_TOO_LARGE => {
+                    BuilderError::ResourceLimitExceeded(message)
+                }
+                _ => BuilderError::Other(message),
+            });
+        }
+        let node_name = self.node_name.clone();
+        Ok(Box::pin(response.bytes_stream().map_err(move |error| {
+            std::io::Error::other(format!(
+                "Path export stream from node '{node_name}' failed: {error}"
+            ))
+        })))
+    }
+
+    /// Extract from an image that lives on this worker.
+    ///
+    /// The worker only streams the raw archive; it is unpacked here under the
+    /// same byte, entry, depth and file-type limits as a local extraction, so
+    /// what lands on the control plane is validated by the control plane.
     async fn extract_from_image(
         &self,
-        _image_name: &str,
-        _source_path: &str,
-        _destination_path: &Path,
+        image_name: &str,
+        source_path: &str,
+        destination_path: &Path,
     ) -> Result<(), BuilderError> {
-        Err(BuilderError::Other(
-            "Extract from image not supported on remote nodes".into(),
-        ))
+        let stream = ImageBuilder::export_path_stream(self, image_name, source_path).await?;
+        crate::docker::unpack_static_archive_stream(
+            stream,
+            image_name,
+            source_path,
+            destination_path,
+        )
+        .await
     }
 
     async fn list_images(&self) -> Result<Vec<String>, BuilderError> {
@@ -1852,6 +1905,145 @@ mod tests {
         assert!(request
             .to_lowercase()
             .contains("authorization: bearer token"));
+    }
+
+    /// A container-archive tar rooted at `dist/`, as Docker returns for a
+    /// download of `/app/dist`. Leaked so the one-shot agent can serve it.
+    fn container_archive(entries: &[(&str, tar::EntryType, &[u8])]) -> &'static [u8] {
+        let mut builder = tar::Builder::new(Vec::new());
+        for (path, entry_type, content) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(*entry_type);
+            header.set_path(path).expect("tar path");
+            header.set_mode(if entry_type.is_dir() { 0o755 } else { 0o644 });
+            header.set_size(if entry_type.is_file() {
+                content.len() as u64
+            } else {
+                0
+            });
+            if entry_type.is_symlink() {
+                header.set_link_name("/etc/passwd").expect("link name");
+            }
+            header.set_cksum();
+            builder.append(&header, *content).expect("append tar entry");
+        }
+        Box::leak(builder.into_inner().expect("finish tar").into_boxed_slice())
+    }
+
+    #[tokio::test]
+    async fn extract_from_image_unpacks_the_worker_archive_into_destination() {
+        let archive = container_archive(&[
+            ("dist/", tar::EntryType::Directory, b""),
+            (
+                "dist/index.html",
+                tar::EntryType::Regular,
+                b"<html>ok</html>",
+            ),
+            ("dist/assets/", tar::EntryType::Directory, b""),
+            (
+                "dist/assets/app.js",
+                tar::EntryType::Regular,
+                b"console.log(1)",
+            ),
+        ]);
+        let (url, server) = spawn_one_shot_agent("200 OK", "application/x-tar", archive).await;
+        let remote = RemoteNodeDeployer::new(url, "node-token".into(), "builder-1".into()).unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let destination = workspace.path().join("static");
+
+        remote
+            .extract_from_image("temps-site:abc", "/app/dist", &destination)
+            .await
+            .expect("worker archive unpacks");
+
+        assert_eq!(
+            std::fs::read(destination.join("index.html")).unwrap(),
+            b"<html>ok</html>"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("assets/app.js")).unwrap(),
+            b"console.log(1)"
+        );
+        let request = server.await.unwrap();
+        assert!(
+            request.starts_with(
+                "GET /agent/images/extract?image=temps-site%3Aabc&path=%2Fapp%2Fdist "
+            ),
+            "{request}"
+        );
+        assert!(request
+            .to_lowercase()
+            .contains("authorization: bearer node-token"));
+    }
+
+    #[tokio::test]
+    async fn extract_from_image_rejects_unsafe_worker_archive_entries() {
+        // The worker is not trusted to have filtered its own archive: a
+        // symlink must be refused by the control plane's unpacker.
+        let archive = container_archive(&[
+            ("dist/", tar::EntryType::Directory, b""),
+            ("dist/index.html", tar::EntryType::Symlink, b""),
+        ]);
+        let (url, _server) = spawn_one_shot_agent("200 OK", "application/x-tar", archive).await;
+        let remote = RemoteNodeDeployer::new(url, "node-token".into(), "builder-1".into()).unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let destination = workspace.path().join("static");
+
+        let error = remote
+            .extract_from_image("temps-site:abc", "/app/dist", &destination)
+            .await
+            .expect_err("symlinks from a worker must be rejected");
+
+        assert!(matches!(error, BuilderError::InvalidContext(_)), "{error}");
+        assert!(error.to_string().contains("temps-site:abc"), "{error}");
+        assert!(
+            !destination.exists(),
+            "nothing may be published on rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn extract_from_image_maps_missing_image_to_image_not_found() {
+        let (url, _server) = spawn_one_shot_agent(
+            "404 Not Found",
+            "application/problem+json",
+            br#"{"title":"Image not found","status":404,"detail":"Worker image not found: Image 'temps-site:abc' is not present on this node"}"#,
+        )
+        .await;
+        let remote = RemoteNodeDeployer::new(url, "node-token".into(), "builder-1".into()).unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+
+        let error = remote
+            .extract_from_image("temps-site:abc", "/app/dist", &workspace.path().join("out"))
+            .await
+            .expect_err("missing image must fail");
+
+        assert!(matches!(error, BuilderError::ImageNotFound(_)), "{error}");
+        let message = error.to_string();
+        assert!(message.contains("builder-1"), "{message}");
+        assert!(message.contains("/app/dist"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn extract_from_image_maps_oversized_export_to_resource_limit() {
+        let (url, _server) = spawn_one_shot_agent(
+            "413 Payload Too Large",
+            "application/problem+json",
+            br#"{"title":"Image resource limit","status":413,"detail":"too large"}"#,
+        )
+        .await;
+        let remote = RemoteNodeDeployer::new(url, "node-token".into(), "builder-1".into()).unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+
+        let error = remote
+            .extract_from_image("temps-site:abc", "/app/dist", &workspace.path().join("out"))
+            .await
+            .expect_err("oversized export must fail");
+
+        assert!(
+            matches!(error, BuilderError::ResourceLimitExceeded(_)),
+            "{error}"
+        );
     }
 
     #[tokio::test]
