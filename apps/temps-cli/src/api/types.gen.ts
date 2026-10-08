@@ -21707,14 +21707,21 @@ export type ServiceDownAlertResponse = {
      */
     alarm_status?: string | null;
     /**
+     * Severity the down alarm is raised at (e.g. `critical`).
+     */
+    alert_severity: string;
+    /**
+     * How many notification destinations *currently* receive alerts of
+     * `alert_severity`: enabled providers on enabled routes covering it,
+     * plus Temps Cloud. This is today's configuration, not a record of who
+     * received this alarm — Temps does not track per-alarm delivery.
+     * `null` when it could not be determined.
+     */
+    notification_destinations?: number | null;
+    /**
      * Console path where notification destinations are configured.
      */
     notification_setup_path: string;
-    /**
-     * Whether any notification destination (an enabled, routed provider or
-     * Temps Cloud) exists. `null` when that could not be determined.
-     */
-    notifications_configured?: boolean | null;
     /**
      * ISO 8601 time until which the alarm's notifications are muted, when
      * that time is still in the future.

@@ -473,10 +473,11 @@ mod tests {
     #[test]
     fn down_alert_without_alarm_or_destination_claims_nothing() {
         let now = chrono::Utc::now();
-        let alert = super::ServiceDownAlertResponse::new(None, Some(false), now);
+        let alert = super::ServiceDownAlertResponse::new(None, "critical", Some(0), now);
         assert_eq!(alert.alarm_id, None);
         assert_eq!(alert.alarm_fired_at, None);
-        assert_eq!(alert.notifications_configured, Some(false));
+        assert_eq!(alert.alert_severity, "critical");
+        assert_eq!(alert.notification_destinations, Some(0));
         assert_eq!(alert.notification_setup_path, "/settings/notifications/new");
     }
 
@@ -489,7 +490,8 @@ mod tests {
             fired_at: now - chrono::Duration::minutes(5),
             silenced_until: Some(now + chrono::Duration::hours(1)),
         };
-        let alert = super::ServiceDownAlertResponse::new(Some(&alarm), Some(true), now);
+        let alert = super::ServiceDownAlertResponse::new(Some(&alarm), "critical", Some(2), now);
+        assert_eq!(alert.notification_destinations, Some(2));
         assert_eq!(alert.alarm_id, Some(42));
         assert_eq!(alert.alarm_status.as_deref(), Some("firing"));
         assert!(alert
@@ -502,7 +504,11 @@ mod tests {
             .is_some_and(|t| t.ends_with('Z')));
 
         alarm.silenced_until = Some(now - chrono::Duration::minutes(1));
-        let expired = super::ServiceDownAlertResponse::new(Some(&alarm), Some(true), now);
+        let expired = super::ServiceDownAlertResponse::new(Some(&alarm), "critical", None, now);
+        assert_eq!(
+            expired.notification_destinations, None,
+            "unknown stays unknown"
+        );
         assert_eq!(
             expired.silenced_until, None,
             "an expired silence is not reported"
@@ -836,10 +842,15 @@ pub struct ServiceDownAlertResponse {
     /// that time is still in the future.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub silenced_until: Option<String>,
-    /// Whether any notification destination (an enabled, routed provider or
-    /// Temps Cloud) exists. `null` when that could not be determined.
+    /// Severity the down alarm is raised at (e.g. `critical`).
+    pub alert_severity: String,
+    /// How many notification destinations *currently* receive alerts of
+    /// `alert_severity`: enabled providers on enabled routes covering it,
+    /// plus Temps Cloud. This is today's configuration, not a record of who
+    /// received this alarm — Temps does not track per-alarm delivery.
+    /// `null` when it could not be determined.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub notifications_configured: Option<bool>,
+    pub notification_destinations: Option<u32>,
     /// Console path where notification destinations are configured.
     pub notification_setup_path: String,
 }
@@ -849,7 +860,8 @@ impl ServiceDownAlertResponse {
 
     pub fn new(
         alarm: Option<&crate::services::ServiceDownAlarm>,
-        notifications_configured: Option<bool>,
+        alert_severity: &str,
+        notification_destinations: Option<usize>,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Self {
         Self {
@@ -863,7 +875,9 @@ impl ServiceDownAlertResponse {
                 .and_then(|a| a.silenced_until)
                 .filter(|until| *until > now)
                 .map(|until| until.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
-            notifications_configured,
+            alert_severity: alert_severity.to_string(),
+            notification_destinations: notification_destinations
+                .map(|count| u32::try_from(count).unwrap_or(u32::MAX)),
             notification_setup_path: Self::NOTIFICATION_SETUP_PATH.to_string(),
         }
     }
@@ -995,7 +1009,8 @@ impl From<crate::services::ClusterHealthReport> for ClusterHealthReportResponse 
 /// configuration state and drops everything sent to it.
 #[cfg(test)]
 pub(crate) struct StaticNotificationService {
-    pub configured: bool,
+    /// Destinations reported for every severity; `None` = cannot tell.
+    pub destinations: Option<usize>,
 }
 
 #[cfg(test)]
@@ -1016,6 +1031,13 @@ impl temps_core::notifications::NotificationService for StaticNotificationServic
     }
 
     async fn is_configured(&self) -> Result<bool, temps_core::notifications::NotificationError> {
-        Ok(self.configured)
+        Ok(self.destinations.unwrap_or(0) > 0)
+    }
+
+    async fn destination_count(
+        &self,
+        _severity: &str,
+    ) -> Result<Option<usize>, temps_core::notifications::NotificationError> {
+        Ok(self.destinations)
     }
 }

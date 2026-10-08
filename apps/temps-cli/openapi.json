@@ -46811,16 +46811,22 @@
               "null"
             ]
           },
+          "alert_severity": {
+            "description": "Severity the down alarm is raised at (e.g. `critical`).",
+            "type": "string"
+          },
+          "notification_destinations": {
+            "description": "How many notification destinations *currently* receive alerts of\n`alert_severity`: enabled providers on enabled routes covering it,\nplus Temps Cloud. This is today's configuration, not a record of who\nreceived this alarm — Temps does not track per-alarm delivery.\n`null` when it could not be determined.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "notification_setup_path": {
             "description": "Console path where notification destinations are configured.",
             "type": "string"
-          },
-          "notifications_configured": {
-            "description": "Whether any notification destination (an enabled, routed provider or\nTemps Cloud) exists. `null` when that could not be determined.",
-            "type": [
-              "boolean",
-              "null"
-            ]
           },
           "silenced_until": {
             "description": "ISO 8601 time until which the alarm's notifications are muted, when\nthat time is still in the future.",
@@ -46831,6 +46837,7 @@
           }
         },
         "required": [
+          "alert_severity",
           "notification_setup_path"
         ],
         "type": "object"

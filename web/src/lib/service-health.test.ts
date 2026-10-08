@@ -10,7 +10,8 @@ const alarm = (
   alarm_id: 11,
   alarm_status: 'firing',
   alarm_fired_at: '2026-01-01T10:00:00Z',
-  notifications_configured: true,
+  alert_severity: 'critical',
+  notification_destinations: 2,
   notification_setup_path: '/settings/notifications/new',
   ...overrides,
 })
@@ -23,19 +24,21 @@ const summarize = (failures: number, down_alert?: ServiceDownAlert) =>
   )
 
 describe('service failure summary', () => {
-  it('never claims an alert was sent', () => {
+  it('never claims this alarm was sent, delivered or routed', () => {
     const cases = [
       summarize(4),
       summarize(4, alarm()),
-      summarize(4, alarm({ notifications_configured: false })),
+      summarize(4, alarm({ notification_destinations: 1 })),
+      summarize(4, alarm({ notification_destinations: 0 })),
       summarize(4, alarm({ silenced_until: '2026-01-01T12:00:00Z' })),
       summarize(4, alarm({ alarm_id: null })),
-      summarize(4, alarm({ notifications_configured: null })),
+      summarize(4, alarm({ notification_destinations: null })),
     ]
     for (const summary of cases) {
       const text = `${summary.headline} ${summary.alertNote ?? ''}`
       expect(text).not.toContain('an alert has been sent')
-      expect(text).not.toMatch(/\b(was|were|been) (sent|delivered)\b/)
+      expect(text).not.toMatch(/\b(was|were|been) (sent|delivered|routed)\b/)
+      expect(text).not.toMatch(/routed to your/)
     }
   })
 
@@ -45,11 +48,11 @@ describe('service failure summary', () => {
     })
   })
 
-  it('explains a missing notification destination and links to setup', () => {
-    const summary = summarize(4, alarm({ notifications_configured: false }))
+  it('explains that nobody receives alerts of the alarm severity and links to setup', () => {
+    const summary = summarize(4, alarm({ notification_destinations: 0 }))
     expect(summary.headline).toBe('Service has failed 4 consecutive checks.')
     expect(summary.alertNote).toContain(
-      'no notification provider is configured'
+      'no notification destination receives critical alerts'
     )
     expect(summary.setupHref).toBe(
       '/settings/notifications/new?returnTo=%2Fstorage%2F7'
@@ -65,11 +68,24 @@ describe('service failure summary', () => {
     expect(summary.setupHref).toBeUndefined()
   })
 
-  it('says the alarm was routed, not delivered, when providers exist', () => {
-    const summary = summarize(3, alarm())
-    expect(summary.alertNote).toContain('routed to your notification providers')
-    expect(summary.alertNote).toContain("Delivery isn't confirmed")
-    expect(summary.alarmHref).toBe('/monitoring/alarms')
+  it('states current destinations for the severity without claiming delivery', () => {
+    const many = summarize(3, alarm())
+    expect(many.alertNote).toContain(
+      '2 notification destinations currently receive critical alerts'
+    )
+    expect(many.alertNote).toContain(
+      "Temps doesn't record whether this alarm reached them"
+    )
+    expect(many.alarmHref).toBe('/monitoring/alarms')
+    expect(
+      summarize(3, alarm({ notification_destinations: 1 })).alertNote
+    ).toContain('1 notification destination currently receives critical')
+  })
+
+  it('does not guess when the destination count is unknown', () => {
+    expect(
+      summarize(3, alarm({ notification_destinations: null })).alertNote
+    ).toBe('A down alarm was raised.')
   })
 
   it('distinguishes a detected failure with no alarm on record', () => {

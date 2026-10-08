@@ -560,7 +560,7 @@ mod tests {
             project_access_checker: None,
             application_network_reconciler: None,
             notification_service: Arc::new(crate::handlers::types::StaticNotificationService {
-                configured: false,
+                destinations: Some(0),
             }),
         })
     }

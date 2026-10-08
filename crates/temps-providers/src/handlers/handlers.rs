@@ -1503,19 +1503,25 @@ async fn service_health_response(
     let alarm = snap.down_alarm.clone();
     let mut response = ServiceHealthResponse::from(snap);
     if reached_threshold {
-        let notifications_configured = match app_state.notification_service.is_configured().await {
-            Ok(configured) => Some(configured),
+        let severity = crate::health_monitor::DOWN_ALERT_SEVERITY.as_str();
+        let destinations = match app_state
+            .notification_service
+            .destination_count(severity)
+            .await
+        {
+            Ok(count) => count,
             Err(e) => {
                 warn!(
-                    "Could not determine notification configuration for service {} health status: {}",
-                    service_id, e
+                    "Could not count {} notification destinations for service {} health status: {}",
+                    severity, service_id, e
                 );
                 None
             }
         };
         response.down_alert = Some(ServiceDownAlertResponse::new(
             alarm.as_ref(),
-            notifications_configured,
+            severity,
+            destinations,
             chrono::Utc::now(),
         ));
     }
@@ -3851,7 +3857,7 @@ mod tests {
             project_access_checker: Some(Arc::new(NarrowedServiceAccessChecker)),
             application_network_reconciler: Some(network_reconciler.clone()),
             notification_service: Arc::new(crate::handlers::types::StaticNotificationService {
-                configured: false,
+                destinations: Some(0),
             }),
         });
 
@@ -4446,7 +4452,7 @@ mod tests {
             project_access_checker: None,
             application_network_reconciler: None,
             notification_service: Arc::new(crate::handlers::types::StaticNotificationService {
-                configured: false,
+                destinations: Some(0),
             }),
         });
 

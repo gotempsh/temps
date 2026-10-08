@@ -2608,6 +2608,21 @@ impl NotificationService {
         }
     }
 
+    /// Destinations a notification at `severity` would reach with the current
+    /// configuration: enabled providers on enabled routes covering that
+    /// severity, plus Temps Cloud when it delivers.
+    pub async fn destination_count(
+        &self,
+        severity: NotificationSeverity,
+    ) -> std::result::Result<usize, NotificationRouteError> {
+        let routed = self
+            .routing_service
+            .resolve_provider_models(severity)
+            .await?
+            .len();
+        Ok(routed + usize::from(self.cloud_notifications_enabled()))
+    }
+
     /// Whether Temps Cloud delivers notifications in addition to the routed
     /// providers. When it does, every notification reaches someone even with
     /// no provider configured locally.
@@ -2843,6 +2858,18 @@ impl CoreNotificationService for NotificationService {
             Ok(configured) => Ok(configured),
             Err(e) => Err(CoreNotificationError::ConfigurationError(e.to_string())),
         }
+    }
+
+    async fn destination_count(
+        &self,
+        severity: &str,
+    ) -> Result<Option<usize>, CoreNotificationError> {
+        let severity = NotificationRoutingService::parse_severity(severity)
+            .map_err(|e| CoreNotificationError::ConfigurationError(e.to_string()))?;
+        self.destination_count(severity)
+            .await
+            .map(Some)
+            .map_err(|e| CoreNotificationError::ConfigurationError(e.to_string()))
     }
 }
 
@@ -5153,6 +5180,94 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn destination_count_only_counts_enabled_providers_routed_for_the_severity() {
+        let test_db = test_database_or_skip!();
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-destination-count-test",
+        ));
+        let service = NotificationService::new(test_db.connection_arc(), encryption_service);
+        assert_eq!(
+            service
+                .destination_count(NotificationSeverity::Critical)
+                .await
+                .unwrap(),
+            0
+        );
+
+        let slack = |hook: &str| {
+            serde_json::json!({
+                "webhook_url": format!("https://hooks.slack.com/services/TEST/TEST/{hook}"),
+                "channel": "#alerts"
+            })
+        };
+        let enabled = service
+            .add_provider("Enabled".to_string(), "slack".to_string(), slack("A"), true)
+            .await
+            .unwrap();
+        service
+            .add_provider(
+                "Disabled".to_string(),
+                "slack".to_string(),
+                slack("B"),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .destination_count(NotificationSeverity::Critical)
+                .await
+                .unwrap(),
+            1,
+            "a disabled provider is not a destination"
+        );
+
+        // Narrow the enabled provider's only route below critical.
+        let routing = NotificationRoutingService::new(test_db.connection_arc());
+        let route = routing
+            .list(1, 20)
+            .await
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|route| route.provider_ids == vec![enabled.id])
+            .unwrap();
+        routing
+            .update(
+                route.id,
+                crate::UpdateNotificationRoute {
+                    name: None,
+                    enabled: None,
+                    min_severity: Some("debug".to_string()),
+                    max_severity: Some("warning".to_string()),
+                    provider_ids: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .destination_count(NotificationSeverity::Critical)
+                .await
+                .unwrap(),
+            0,
+            "a provider whose routes stop below critical does not receive critical alarms"
+        );
+        assert!(
+            service.is_configured().await.unwrap(),
+            "the severity-blind check still reports a destination, which is why the \
+             health card must not rely on it for a critical alarm"
+        );
+        assert_eq!(
+            service
+                .destination_count(NotificationSeverity::Warning)
+                .await
+                .unwrap(),
+            1
+        );
     }
 
     #[tokio::test]
