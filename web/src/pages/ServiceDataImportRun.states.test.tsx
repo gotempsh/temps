@@ -131,3 +131,25 @@ describe('run detail after a failed refresh', () => {
     expect(markup).toContain('Imported 3 tables')
   })
 })
+
+describe('icon-only actions keep an accessible name on small screens', () => {
+  test('a running import names the run its cancel button stops', () => {
+    const markup = renderRunPage({
+      data: {
+        ...run,
+        status: 'running',
+        phase: 'transferring',
+        finished_at: null,
+      },
+    })
+    expect(markup).toContain(
+      'aria-label="Cancel import 31 into shop_production"'
+    )
+    expect(markup).toContain('aria-label="All imports into this service"')
+  })
+
+  test('a finished import names the target of "Import again"', () => {
+    const markup = renderRunPage({ data: run })
+    expect(markup).toContain('aria-label="Import again into shop_production"')
+  })
+})

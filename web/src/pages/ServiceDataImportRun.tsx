@@ -135,7 +135,10 @@ export function ServiceDataImportRun() {
   const actions = (
     <div className="flex gap-2">
       <Button variant="outline" size="sm" asChild>
-        <Link to={`/storage/${serviceId}/import-data`}>
+        <Link
+          to={`/storage/${serviceId}/import-data`}
+          aria-label="All imports into this service"
+        >
           <ArrowLeft className="h-4 w-4 sm:mr-2" />
           <span className="hidden sm:inline">All imports</span>
         </Link>
@@ -145,6 +148,7 @@ export function ServiceDataImportRun() {
           variant="outline"
           size="sm"
           disabled={run.cancel_requested || cancel.isPending}
+          aria-label={`Cancel import ${importId} into ${run.target_database}`}
           onClick={() =>
             cancel.mutate({ path: { id: serviceId, run_id: importId } })
           }
@@ -160,6 +164,7 @@ export function ServiceDataImportRun() {
       {run && !isRunActive(run) && (
         <Button
           size="sm"
+          aria-label={`Import again into ${run.target_database}`}
           onClick={() =>
             navigate(importAgainPath(serviceId, run.target_database))
           }

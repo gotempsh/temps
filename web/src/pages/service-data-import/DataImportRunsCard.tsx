@@ -263,6 +263,7 @@ function RunsBody({
                         disabled={
                           run.cancel_requested || cancellingId === run.id
                         }
+                        aria-label={`Cancel import ${run.id} into ${run.target_database}`}
                         onClick={() => onCancel(run.id)}
                       >
                         <XCircle className="h-4 w-4 sm:mr-2" />
