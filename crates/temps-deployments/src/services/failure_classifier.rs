@@ -632,6 +632,33 @@ pub const fn guidance_for(code: DeploymentFailureCode) -> FailureGuidance {
     }
 }
 
+/// Whether a registry pull failure shows the registry *refused* the
+/// credentials. A token or authorization step that failed only because the
+/// registry (or its token service) was unreachable or erroring is an outage,
+/// not bad credentials, so it needs an explicit 401/403/denial alongside it.
+fn registry_refused_credentials(r: &str) -> bool {
+    let refusal = contains_any(
+        r,
+        &[
+            "401 unauthorized",
+            "403 forbidden",
+            "unauthorized",
+            "forbidden",
+            "insufficient_scope",
+            "denied",
+        ],
+    );
+    let token_step = contains_any(
+        r,
+        &[
+            "failed to authorize",
+            "failed to fetch anonymous token",
+            "failed to fetch oauth token",
+        ],
+    );
+    refusal && (token_step || r.contains("401 unauthorized"))
+}
+
 /// Extract the id of the required job that failed, e.g. `build_image` from
 /// `Required job 'build_image' failed: ...`.
 pub fn failed_job_id(reason: &str) -> Option<&str> {
@@ -1025,16 +1052,7 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
                 "status code 401",
             ],
         ))
-        || (pull_evidence
-            && contains_any(
-                r,
-                &[
-                    "401 unauthorized",
-                    "failed to authorize",
-                    "failed to fetch anonymous token",
-                    "failed to fetch oauth token",
-                ],
-            ))
+        || (pull_evidence && registry_refused_credentials(r))
     {
         return make(S::Image, C::RegistryAuthentication);
     }
@@ -1809,6 +1827,29 @@ mod tests {
             "Docker responded with status code 500: failed to resolve reference \"ghcr.io/team/app:1\": failed to authorize: failed to fetch anonymous token: unexpected status from GET request: 401 Unauthorized",
         );
         assert_class(&reason, S::Image, C::RegistryAuthentication);
+    }
+
+    #[test]
+    fn token_service_outage_is_not_bad_credentials() {
+        for inner in [
+            "Docker responded with status code 500: failed to resolve reference \"ghcr.io/team/app:1\": failed to authorize: failed to fetch anonymous token: unexpected status from GET request to https://ghcr.io/token: 503 Service Unavailable",
+            "Docker responded with status code 500: failed to resolve reference \"registry.example.test/team/app:1\": failed to authorize: failed to fetch oauth token: Post \"https://registry.example.test/token\": dial tcp 10.0.0.1:443: connect: connection refused",
+            "Docker responded with status code 500: failed to fetch anonymous token: unexpected status: 502 Bad Gateway",
+        ] {
+            assert_class(
+                &external_pull_failure(inner),
+                S::Image,
+                C::RegistryUnavailable,
+            );
+        }
+        // A token step the registry answered with a refusal is still auth.
+        assert_class(
+            &external_pull_failure(
+                "Docker responded with status code 500: failed to authorize: failed to fetch oauth token: unexpected status: 403 Forbidden",
+            ),
+            S::Image,
+            C::RegistryAuthentication,
+        );
     }
 
     #[test]
