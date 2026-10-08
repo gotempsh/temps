@@ -230,9 +230,12 @@ async fn ensure_image(
         })
 }
 
-/// Create, start and wait for the helper, then stop it. Convenience for
-/// callers with no cancellation to honour between the steps (tests); the
-/// import job uses [`create_helper`] and [`start_and_wait`] directly.
+/// Create, start and wait for the helper, then stop it. Test-only: it starts
+/// the helper without checking for a cancellation that arrived while the
+/// image was pulled, so production code must not use it. The import job
+/// calls [`create_helper`], checks for a cancellation, then
+/// [`start_and_wait`].
+#[cfg(test)]
 pub async fn run_helper(
     docker: &Docker,
     request: &HelperRequest<'_>,

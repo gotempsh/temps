@@ -11,6 +11,7 @@
 //! rolls it back. `psql --single-transaction` would not do: it commits on
 //! end of input, partial input included.
 
+use std::str::FromStr;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -117,22 +118,41 @@ impl PostgresService {
             database
         );
         let operation = format!("connect to database '{database}'");
-        tokio::time::timeout(ADMIN_SQL_TIMEOUT, sqlx::PgConnection::connect(&url))
-            .await
-            .map_err(|_| {
-                DataImportError::target(
-                    service,
-                    &operation,
-                    format!("timed out after {}s", ADMIN_SQL_TIMEOUT.as_secs()),
-                )
-            })?
+        // The whole inspect/prepare step is bounded by `bounded_step`; the
+        // statement timeout also makes the server abandon a statement (a
+        // `DROP DATABASE` waiting on locks) instead of finishing it after the
+        // step has given up.
+        let options = sqlx::postgres::PgConnectOptions::from_str(&url)
             .map_err(|e| {
                 DataImportError::target(
                     service,
                     &operation,
                     scrub_secrets(&e.to_string(), &[url.clone(), pg.password.clone()]),
                 )
-            })
+            })?
+            .options([(
+                "statement_timeout",
+                format!("{}s", ADMIN_SQL_TIMEOUT.as_secs()),
+            )]);
+        tokio::time::timeout(
+            ADMIN_SQL_TIMEOUT,
+            sqlx::PgConnection::connect_with(&options),
+        )
+        .await
+        .map_err(|_| {
+            DataImportError::target(
+                service,
+                &operation,
+                format!("timed out after {}s", ADMIN_SQL_TIMEOUT.as_secs()),
+            )
+        })?
+        .map_err(|e| {
+            DataImportError::target(
+                service,
+                &operation,
+                scrub_secrets(&e.to_string(), &[url.clone(), pg.password.clone()]),
+            )
+        })
     }
 
     /// Body of `inspect_target`, bounded there.

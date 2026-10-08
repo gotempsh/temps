@@ -117,7 +117,21 @@ impl TempsPlugin for ProvidersPlugin {
             // more. Snapshot them now, before this process can start one, so
             // a fresh import is never mistaken for an orphan; then stop their
             // helpers and mark them interrupted in the background.
-            match crate::data_import::active_import_run_ids(db.as_ref()).await {
+            // The snapshot must be taken here, before routes serve, so a
+            // failed read is retried a few times in place rather than later.
+            let mut snapshot = crate::data_import::active_import_run_ids(db.as_ref()).await;
+            for delay_secs in [1, 2, 4] {
+                if snapshot.is_ok() {
+                    break;
+                }
+                tracing::warn!(
+                    retry_in_secs = delay_secs,
+                    "Could not list data imports interrupted by a restart; retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                snapshot = crate::data_import::active_import_run_ids(db.as_ref()).await;
+            }
+            match snapshot {
                 Ok(run_ids) if run_ids.is_empty() => {}
                 Ok(run_ids) => {
                     let data_import_service = data_import_service.clone();

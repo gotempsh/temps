@@ -71,6 +71,20 @@ pub const MAX_TIMEOUT_MINUTES: u32 = 24 * 60;
 /// Restore statuses that mean a restore may still be writing.
 const ACTIVE_RESTORE_STATUSES: [&str; 2] = ["pending", "running"];
 
+/// First and longest wait between attempts to settle an interrupted run.
+const RECONCILE_RETRY_BASE: Duration = Duration::from_secs(2);
+const RECONCILE_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// What one attempt to settle an interrupted run achieved.
+enum Reconciled {
+    /// This attempt marked it `interrupted`.
+    Settled,
+    /// It was already terminal (or gone); nothing to do.
+    AlreadySettled,
+    /// Docker or the database failed; try again later, run kept locked.
+    Retry,
+}
+
 /// What the caller asked for.
 #[derive(Clone)]
 pub struct StartDataImport {
@@ -261,7 +275,9 @@ impl DataImportService {
         let inspection = engine
             .inspect_target(&config, &request.target_database)
             .await?;
-        let preparation = plan_target_preparation(
+        // Refuses a non-empty target without `replace` before a run is
+        // recorded. The job plans again once the run holds the database lock.
+        plan_target_preparation(
             service_id,
             &request.target_database,
             inspection,
@@ -310,7 +326,7 @@ impl DataImportService {
             run_id: run.id,
             service_id,
             database: request.target_database,
-            preparation,
+            replace: request.replace,
             timeout,
             config,
             source,
@@ -457,58 +473,97 @@ impl DataImportService {
     ///
     /// `run_ids` must be snapshotted (with [`active_import_run_ids`]) before
     /// this process starts any import, so a run of this process can never be
-    /// mistaken for an orphan. A helper that cannot be stopped keeps its run
-    /// `running` — releasing it would let a second import race the survivor.
+    /// mistaken for an orphan. A run whose helper cannot be confirmed stopped
+    /// (Docker briefly unreachable) or whose row cannot be updated keeps its
+    /// lock and is retried with backoff until it settles: releasing it early
+    /// would let a second import race a surviving helper, and giving up would
+    /// leave the database locked until the next restart.
     pub async fn reconcile_interrupted(&self, run_ids: &[i32]) -> usize {
+        self.reconcile_with_backoff(run_ids, RECONCILE_RETRY_BASE, RECONCILE_RETRY_MAX)
+            .await
+    }
+
+    async fn reconcile_with_backoff(
+        &self,
+        run_ids: &[i32],
+        base_delay: Duration,
+        max_delay: Duration,
+    ) -> usize {
+        let mut pending = run_ids.to_vec();
         let mut settled = 0;
-        for run_id in run_ids {
-            let run = match service_data_imports::Entity::find_by_id(*run_id)
-                .one(self.db.as_ref())
-                .await
-            {
-                Ok(Some(run)) if run.status == STATUS_RUNNING => run,
-                Ok(_) => continue,
-                Err(e) => {
-                    error!(run_id, error = %e, "Could not load interrupted data import");
-                    continue;
-                }
-            };
-            if let Some(docker) = self.docker.get() {
-                if let Err(e) = runner::fence_run_helpers(docker, run.service_id, run.id).await {
-                    error!(
-                        run_id,
-                        service_id = run.service_id,
-                        error = %e,
-                        "Could not stop the helper of an interrupted data import; leaving it running"
-                    );
-                    continue;
+        let mut delay = base_delay;
+        loop {
+            let mut retry = Vec::new();
+            for run_id in pending {
+                match self.reconcile_one(run_id).await {
+                    Reconciled::Settled => settled += 1,
+                    Reconciled::AlreadySettled => {}
+                    Reconciled::Retry => retry.push(run_id),
                 }
             }
-            let message = interrupted_message(&run.phase, run.atomic_transfer);
-            match mark_terminal(
-                self.db.as_ref(),
-                run.id,
-                STATUS_INTERRUPTED,
-                Some(message),
-                None,
-                None,
-            )
+            if retry.is_empty() {
+                return settled;
+            }
+            warn!(
+                run_ids = ?retry,
+                retry_in_secs = delay.as_secs_f64(),
+                "Interrupted data imports not settled yet; keeping them locked and retrying"
+            );
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(max_delay);
+            pending = retry;
+        }
+    }
+
+    async fn reconcile_one(&self, run_id: i32) -> Reconciled {
+        let run = match service_data_imports::Entity::find_by_id(run_id)
+            .one(self.db.as_ref())
             .await
-            {
-                Ok(true) => {
-                    settled += 1;
-                    warn!(
-                        run_id,
-                        service_id = run.service_id,
-                        phase = %run.phase,
-                        "Marked data import interrupted by a server restart"
-                    );
-                }
-                Ok(false) => {}
-                Err(e) => error!(run_id, error = %e, "Could not mark data import interrupted"),
+        {
+            Ok(Some(run)) if run.status == STATUS_RUNNING => run,
+            Ok(_) => return Reconciled::AlreadySettled,
+            Err(e) => {
+                error!(run_id, error = %e, "Could not load interrupted data import");
+                return Reconciled::Retry;
+            }
+        };
+        if let Some(docker) = self.docker.get() {
+            if let Err(e) = runner::fence_run_helpers(docker, run.service_id, run.id).await {
+                error!(
+                    run_id,
+                    service_id = run.service_id,
+                    error = %e,
+                    "Could not stop the helper of an interrupted data import; keeping it running"
+                );
+                return Reconciled::Retry;
             }
         }
-        settled
+        let message = interrupted_message(&run.phase, run.atomic_transfer);
+        match mark_terminal(
+            self.db.as_ref(),
+            run.id,
+            STATUS_INTERRUPTED,
+            Some(message),
+            None,
+            None,
+        )
+        .await
+        {
+            Ok(true) => {
+                warn!(
+                    run_id,
+                    service_id = run.service_id,
+                    phase = %run.phase,
+                    "Marked data import interrupted by a server restart"
+                );
+                Reconciled::Settled
+            }
+            Ok(false) => Reconciled::AlreadySettled,
+            Err(e) => {
+                error!(run_id, error = %e, "Could not mark data import interrupted");
+                Reconciled::Retry
+            }
+        }
     }
 
     async fn load_service(
@@ -809,7 +864,7 @@ struct ImportJob {
     run_id: i32,
     service_id: i32,
     database: String,
-    preparation: TargetPreparation,
+    replace: bool,
     timeout: Duration,
     config: ServiceConfig,
     source: ImportSource,
@@ -830,25 +885,21 @@ impl ImportJob {
         };
         let mut secrets = self.source.secrets();
 
-        // `start` inspected the target a moment ago, but a deployment may have
-        // created tables since: re-check before touching it.
-        let preparation = if self.preparation == TargetPreparation::UseExisting {
-            let inspection = match engine.inspect_target(&self.config, &self.database).await {
-                Ok(inspection) => inspection,
-                Err(e) => return JobOutcome::failed(scrub_secrets(&e.to_string(), &secrets)),
-            };
-            match plan_target_preparation(
-                self.service_id,
-                &self.database,
-                inspection,
-                false,
-                &engine.import_spec().object_noun,
-            ) {
-                Ok(preparation) => preparation,
-                Err(e) => return JobOutcome::failed(e.to_string()),
-            }
-        } else {
-            self.preparation
+        // `start` inspected the target before the run held the database
+        // lock: since then a deployment may have created tables, or another
+        // import may have created and filled a database that was missing.
+        // Plan again from what is there now, whatever was found then.
+        let preparation = match current_preparation(
+            engine,
+            &self.config,
+            self.service_id,
+            &self.database,
+            self.replace,
+        )
+        .await
+        {
+            Ok(preparation) => preparation,
+            Err(e) => return JobOutcome::failed(scrub_secrets(&e.to_string(), &secrets)),
         };
 
         if self.cancel_requested().await {
@@ -1078,6 +1129,26 @@ impl ImportJob {
     }
 }
 
+/// Inspect the target and decide how to prepare it, refusing a target that
+/// is not empty unless `replace` was requested. Called once the run holds the
+/// database lock, so the decision reflects every import that finished before.
+async fn current_preparation(
+    engine: &dyn DataImportEngine,
+    config: &ServiceConfig,
+    service_id: i32,
+    database: &str,
+    replace: bool,
+) -> Result<TargetPreparation, DataImportError> {
+    let inspection = engine.inspect_target(config, database).await?;
+    plan_target_preparation(
+        service_id,
+        database,
+        inspection,
+        replace,
+        &engine.import_spec().object_noun,
+    )
+}
+
 /// Write a terminal status, only if the run is still `running`. Returns
 /// whether this call settled it.
 async fn mark_terminal(
@@ -1167,6 +1238,7 @@ async fn finalize_run(db: &DatabaseConnection, run_id: i32, outcome: JobOutcome)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data_import::{DataImportSpec, TargetInspection, TransferPlan, TransferTarget};
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
 
     fn run(id: i32, service_id: i32, status: &str) -> service_data_imports::Model {
@@ -1512,6 +1584,142 @@ mod tests {
         // started by it, so the run is settled without fencing.
         let settled = service_with(db).reconcile_interrupted(&[5, 6]).await;
         assert_eq!(settled, 1);
+    }
+
+    #[tokio::test]
+    async fn reconcile_keeps_retrying_a_run_it_could_not_settle() {
+        // The first attempt fails (the row cannot be read); the run is not
+        // given up on but retried, and settled once the database answers.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom("connection reset".to_string())])
+            .append_query_results([vec![run(5, 2, STATUS_RUNNING)]])
+            .append_exec_errors([sea_orm::DbErr::Custom("connection reset".to_string())])
+            .append_query_results([vec![run(5, 2, STATUS_RUNNING)]])
+            .append_exec_results([MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .into_connection();
+        let settled = service_with(db)
+            .reconcile_with_backoff(&[5], Duration::from_millis(1), Duration::from_millis(2))
+            .await;
+        assert_eq!(settled, 1);
+    }
+
+    /// Engine whose target is whatever the test says it is now.
+    struct TargetIs(TargetInspection);
+
+    #[async_trait::async_trait]
+    impl DataImportEngine for TargetIs {
+        fn import_spec(&self) -> DataImportSpec {
+            DataImportSpec {
+                engine_label: "Redis".to_string(),
+                source_schemes: vec!["redis".to_string()],
+                source_url_example: "redis://db.example.com:6379/0".to_string(),
+                allowed_source_options: vec![],
+                atomic: false,
+                object_noun: "key".to_string(),
+                max_target_length: 63,
+            }
+        }
+        fn parse_source(&self, _raw: &str) -> Result<ImportSource, DataImportError> {
+            Err(DataImportError::Validation {
+                message: "not used".to_string(),
+            })
+        }
+        fn validate_target_database(&self, _database: &str) -> Result<(), DataImportError> {
+            Ok(())
+        }
+        async fn inspect_target(
+            &self,
+            _config: &ServiceConfig,
+            _database: &str,
+        ) -> Result<TargetInspection, DataImportError> {
+            Ok(self.0)
+        }
+        async fn prepare_target(
+            &self,
+            _config: &ServiceConfig,
+            _database: &str,
+            _preparation: TargetPreparation,
+        ) -> Result<(), DataImportError> {
+            Ok(())
+        }
+        fn target_container(&self, _config: &ServiceConfig) -> Result<String, DataImportError> {
+            Ok("target".to_string())
+        }
+        async fn transfer_plan(
+            &self,
+            _config: &ServiceConfig,
+            _source: &ImportSource,
+            _target: &TransferTarget<'_>,
+        ) -> Result<TransferPlan, DataImportError> {
+            Err(DataImportError::Validation {
+                message: "not used".to_string(),
+            })
+        }
+    }
+
+    fn cache_config() -> ServiceConfig {
+        ServiceConfig {
+            name: "cache".to_string(),
+            service_type: ServiceType::Redis,
+            version: None,
+            parameters: serde_json::json!({}),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_target_filled_since_start_is_refused_without_replace() {
+        // `start` found "sessions" missing; another import created and filled
+        // it before this run took the lock. Planning again must refuse it
+        // rather than keep the stale "create" decision and write into it.
+        let engine = TargetIs(TargetInspection {
+            exists: true,
+            object_count: 1200,
+            size_bytes: None,
+        });
+        let error = current_preparation(&engine, &cache_config(), 3, "sessions", false)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            DataImportError::TargetNotEmpty { object_count: 1200, ref database, .. }
+                if database == "sessions"
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_plan_follows_the_target_as_it_is_now() {
+        let missing = TargetIs(TargetInspection {
+            exists: false,
+            object_count: 0,
+            size_bytes: None,
+        });
+        let empty = TargetIs(TargetInspection {
+            exists: true,
+            object_count: 0,
+            size_bytes: Some(0),
+        });
+        let filled = TargetIs(TargetInspection {
+            exists: true,
+            object_count: 4,
+            size_bytes: None,
+        });
+        let config = cache_config();
+        let plan = |engine, replace| current_preparation(engine, &config, 3, "sessions", replace);
+        assert_eq!(
+            plan(&missing, false).await.unwrap(),
+            TargetPreparation::Create
+        );
+        assert_eq!(
+            plan(&empty, false).await.unwrap(),
+            TargetPreparation::UseExisting
+        );
+        assert_eq!(
+            plan(&filled, true).await.unwrap(),
+            TargetPreparation::Recreate
+        );
     }
 
     #[tokio::test]
