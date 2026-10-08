@@ -7280,7 +7280,7 @@ export type DeploymentEnvironmentResponse = {
  * Allowlisted failure codes. Wire values are `snake_case` and stable; add new
  * variants rather than renaming existing ones.
  */
-export type DeploymentFailureCode = 'out_of_memory' | 'disk_exhausted' | 'timeout' | 'health_check_failed' | 'repository_authentication' | 'repository_not_found' | 'repository_clone' | 'dns_resolution' | 'network_connection' | 'dependency_lockfile_out_of_sync' | 'dependency_resolution' | 'dependency_download' | 'runtime_version_unsupported' | 'missing_build_script' | 'compile_error' | 'dockerfile_invalid' | 'base_image_pull' | 'image_missing' | 'static_output_missing' | 'port_unavailable' | 'permission_denied' | 'invalid_configuration' | 'container_start' | 'build_error' | 'platform_internal' | 'cancelled' | 'build_timeout' | 'source_timeout' | 'image_pull_timeout' | 'health_check_timeout' | 'app_not_listening' | 'container_exited' | 'image_not_found' | 'registry_authentication' | 'registry_rate_limited' | 'image_platform_mismatch' | 'compose_file_invalid' | 'compose_variable_missing' | 'compose_policy_rejected' | 'compose_build_failed' | 'compose_up_failed' | 'compose_unavailable' | 'volume_mount' | 'route_activation' | 'unknown';
+export type DeploymentFailureCode = 'out_of_memory' | 'disk_exhausted' | 'timeout' | 'health_check_failed' | 'repository_authentication' | 'repository_not_found' | 'repository_clone' | 'dns_resolution' | 'network_connection' | 'dependency_lockfile_out_of_sync' | 'dependency_resolution' | 'dependency_download' | 'runtime_version_unsupported' | 'missing_build_script' | 'compile_error' | 'dockerfile_invalid' | 'base_image_pull' | 'image_missing' | 'static_output_missing' | 'port_unavailable' | 'permission_denied' | 'invalid_configuration' | 'container_start' | 'build_error' | 'platform_internal' | 'cancelled' | 'build_timeout' | 'source_timeout' | 'image_pull_timeout' | 'health_check_timeout' | 'app_not_listening' | 'container_exited' | 'image_not_found' | 'registry_authentication' | 'registry_rate_limited' | 'image_platform_mismatch' | 'compose_file_invalid' | 'compose_variable_missing' | 'compose_policy_rejected' | 'compose_build_failed' | 'compose_up_failed' | 'compose_unavailable' | 'volume_mount' | 'route_activation' | 'registry_unavailable' | 'image_pull_failed' | 'unknown';
 
 /**
  * API view of a failed deployment's classification.
@@ -21689,11 +21689,52 @@ export type ServiceCreateAlertRuleRequest = {
     threshold: number;
 };
 
+/**
+ * Alerting state for a service whose health checks keep failing.
+ */
+export type ServiceDownAlertResponse = {
+    /**
+     * ISO 8601 time the alarm fired.
+     */
+    alarm_fired_at?: string | null;
+    /**
+     * The open down alarm, or `null` if none was raised (e.g. the alarm
+     * could not be recorded, or it was resolved while checks still fail).
+     */
+    alarm_id?: number | null;
+    /**
+     * `firing` or `acknowledged`.
+     */
+    alarm_status?: string | null;
+    /**
+     * Severity the down alarm is raised at (e.g. `critical`).
+     */
+    alert_severity: string;
+    /**
+     * How many notification destinations *currently* receive alerts of
+     * `alert_severity`: enabled providers on enabled routes covering it,
+     * plus Temps Cloud. This is today's configuration, not a record of who
+     * received this alarm — Temps does not track per-alarm delivery.
+     * `null` when it could not be determined.
+     */
+    notification_destinations?: number | null;
+    /**
+     * Console path where notification destinations are configured.
+     */
+    notification_setup_path: string;
+    /**
+     * ISO 8601 time until which the alarm's notifications are muted, when
+     * that time is still in the future.
+     */
+    silenced_until?: string | null;
+};
+
 export type ServiceHealthResponse = {
     /**
      * Consecutive failed probes. Alert fires at 3.
      */
     consecutive_failures: number;
+    down_alert?: ServiceDownAlertResponse | null;
     last_checked_at?: string | null;
     last_error?: string | null;
     /**

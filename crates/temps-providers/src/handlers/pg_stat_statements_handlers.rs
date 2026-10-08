@@ -559,6 +559,9 @@ mod tests {
             telemetry: Arc::new(temps_core::NoopTelemetryReporter),
             project_access_checker: None,
             application_network_reconciler: None,
+            notification_service: Arc::new(crate::handlers::types::StaticNotificationService {
+                destinations: Some(0),
+            }),
         })
     }
 

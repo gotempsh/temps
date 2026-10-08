@@ -8,6 +8,11 @@ import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { toast } from 'sonner'
 import {
+  providerTestFailureMessage,
+  providerTestSucceeded,
+  providerTestSuccessMessage,
+} from '@/lib/notification-provider-test'
+import {
   getNotificationProviderOptions,
   updateNotificationEmailProviderMutation,
   updateNotificationProviderMutation,
@@ -196,12 +201,11 @@ export function EditNotificationProvider() {
     },
   })
 
-  // Test mutation with toast.promise
   const testMutation = useMutation({
     ...testProvider2Mutation(),
-    meta: {
-      errorTitle: 'Failed to test provider',
-    },
+    // handleTest shows the failure with the provider's reason and a Retry
+    // action; the global error toast would only add a generic duplicate.
+    onError: () => {},
   })
 
   // Delete mutation
@@ -302,23 +306,28 @@ export function EditNotificationProvider() {
   const handleTest = async () => {
     if (!provider) return
 
-    toast.promise(
-      testMutation.mutateAsync({
+    const toastId = toast.loading('Sending test notification...')
+    const retry = { label: 'Retry', onClick: () => void handleTest() }
+    try {
+      const result = await testMutation.mutateAsync({
         path: { id: provider.id },
-      }),
-      {
-        loading: 'Sending test notification...',
-        success: (data) =>
-          data.success
-            ? 'Test notification sent successfully!'
-            : data.message || 'Failed to send test notification',
-        error: (error) => {
-          const message =
-            error?.response?.data?.detail || 'Failed to send test notification'
-          return message
-        },
+      })
+      if (providerTestSucceeded(result)) {
+        toast.success(providerTestSuccessMessage(result), { id: toastId })
+      } else {
+        toast.error('Test notification failed', {
+          id: toastId,
+          description: providerTestFailureMessage(result),
+          action: retry,
+        })
       }
-    )
+    } catch (error) {
+      toast.error('Test notification failed', {
+        id: toastId,
+        description: providerTestFailureMessage(undefined, error),
+        action: retry,
+      })
+    }
   }
 
   const handleDelete = async () => {

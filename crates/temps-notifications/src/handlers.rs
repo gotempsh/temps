@@ -904,7 +904,7 @@ async fn test_notification_provider(
     permission_guard!(auth, NotificationProvidersWrite);
     info!("Testing notification provider {}", id);
     match app_state.notification_service.test_provider(id).await {
-        Ok(result) => {
+        Ok(outcome) => {
             let audit = NotificationProviderAudit {
                 context: make_audit_context(&auth, &metadata),
                 provider_id: id,
@@ -915,16 +915,11 @@ async fn test_notification_provider(
                 error!("Failed to create audit log: {}", e);
             }
 
-            let message = if result {
-                Some("Test notification sent successfully".to_string())
-            } else {
-                Some("Test failed - provider connection or configuration issue".to_string())
-            };
             Ok((
                 StatusCode::OK,
                 Json(TestProviderResponse {
-                    success: result,
-                    message,
+                    success: outcome.success,
+                    message: Some(outcome.message),
                 }),
             ))
         }
@@ -3172,7 +3167,11 @@ mod tests {
             .test_provider(provider.id)
             .await?;
 
-        assert!(test_result, "Email test should succeed with Mailpit");
+        assert!(
+            test_result.success,
+            "Email test should succeed with Mailpit: {}",
+            test_result.message
+        );
 
         // You could also verify the email was received by querying Mailpit's API
         // at http://localhost:{mailpit_web_port}/api/v1/messages

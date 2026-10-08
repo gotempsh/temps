@@ -34,7 +34,12 @@ use utoipa::ToSchema;
 ///
 /// v2: job-aware stages, Compose and registry-image codes, stage-specific
 /// timeout codes, and health-check codes for apps that never listen.
-pub const FAILURE_CLASSIFIER_VERSION: u8 = 2;
+///
+/// v3: deploy-time registry pulls (`pull_external_image`, worker pulls) are
+/// never classified as a build's base-image pull; containerd-style registry
+/// errors are recognised, and unreachable registries and unrecognised pull
+/// failures get their own codes.
+pub const FAILURE_CLASSIFIER_VERSION: u8 = 3;
 
 /// Marker Compose deployments put before embedded container log tails.
 const CONTAINER_LOGS_MARKER: &str = "container logs for unhealthy/stopped services:";
@@ -159,6 +164,12 @@ pub enum DeploymentFailureCode {
     VolumeMount,
     /// The new deployment never became routable.
     RouteActivation,
+    // ── v3 ──────────────────────────────────────────────────────────────
+    /// The registry was unreachable or answered with a server error while
+    /// pulling the deploy image (transient; a retry may succeed).
+    RegistryUnavailable,
+    /// Pulling the deploy image failed for a reason not covered above.
+    ImagePullFailed,
     Unknown,
 }
 
@@ -209,6 +220,8 @@ impl DeploymentFailureCode {
             Self::ComposeUnavailable => "compose_unavailable",
             Self::VolumeMount => "volume_mount",
             Self::RouteActivation => "route_activation",
+            Self::RegistryUnavailable => "registry_unavailable",
+            Self::ImagePullFailed => "image_pull_failed",
             Self::Unknown => "unknown",
         }
     }
@@ -259,6 +272,8 @@ impl DeploymentFailureCode {
         Self::ComposeUnavailable,
         Self::VolumeMount,
         Self::RouteActivation,
+        Self::RegistryUnavailable,
+        Self::ImagePullFailed,
         Self::Unknown,
     ];
 }
@@ -594,6 +609,16 @@ pub const fn guidance_for(code: DeploymentFailureCode) -> FailureGuidance {
             "The deployment started but the proxy did not confirm its route in time, so it was rolled back. Retry; if it persists check the node's connectivity to the control plane.",
             None,
         ),
+        C::RegistryUnavailable => (
+            "Image registry unavailable",
+            "The registry could not be reached or returned a server error while pulling the deployment image. This is usually temporary: retry the deployment, and if it keeps failing check the registry's status and that this host can reach it.",
+            None,
+        ),
+        C::ImagePullFailed => (
+            "Deployment image could not be pulled",
+            "The image this deployment runs could not be pulled from its registry. Check the image reference and tag, add registry credentials if the image is private, then redeploy.",
+            Some(S::Source),
+        ),
         C::Unknown => (
             "Deployment failed",
             "Temps could not classify this failure. Open the failed stage below for the full error and logs; sending the failure report helps improve this message.",
@@ -605,6 +630,33 @@ pub const fn guidance_for(code: DeploymentFailureCode) -> FailureGuidance {
         remediation,
         settings_section,
     }
+}
+
+/// Whether a registry pull failure shows the registry *refused* the
+/// credentials. A token or authorization step that failed only because the
+/// registry (or its token service) was unreachable or erroring is an outage,
+/// not bad credentials, so it needs an explicit 401/403/denial alongside it.
+fn registry_refused_credentials(r: &str) -> bool {
+    let refusal = contains_any(
+        r,
+        &[
+            "401 unauthorized",
+            "403 forbidden",
+            "unauthorized",
+            "forbidden",
+            "insufficient_scope",
+            "denied",
+        ],
+    );
+    let token_step = contains_any(
+        r,
+        &[
+            "failed to authorize",
+            "failed to fetch anonymous token",
+            "failed to fetch oauth token",
+        ],
+    );
+    refusal && (token_step || r.contains("401 unauthorized"))
 }
 
 /// Extract the id of the required job that failed, e.g. `build_image` from
@@ -821,28 +873,33 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
             "took too long",
         ],
     );
-    let base_image_signal = contains_any(
-        r,
-        &[
-            "failed to resolve source metadata",
-            "failed to fetch oauth token",
-            "failed to fetch anonymous token",
-            "error pulling image configuration",
-            "failed to load metadata for",
-        ],
-    ) || (phase == Some(JobPhase::Build)
-        && contains_any(
+    // A job that pulls the image the deployment runs never builds, so it can
+    // never have failed on a Dockerfile's FROM line — even when the registry
+    // error text (token fetch, image configuration) matches a build's.
+    let deploy_phase = matches!(phase, Some(JobPhase::ImagePull) | Some(JobPhase::Deploy));
+    let base_image_signal = !deploy_phase
+        && (contains_any(
             r,
             &[
-                "failed to pull image",
-                "pull access denied",
-                "manifest unknown",
+                "failed to resolve source metadata",
+                "failed to fetch oauth token",
+                "failed to fetch anonymous token",
+                "error pulling image configuration",
+                "failed to load metadata for",
             ],
-        ));
+        ) || (phase == Some(JobPhase::Build)
+            && contains_any(
+                r,
+                &[
+                    "failed to pull image",
+                    "pull access denied",
+                    "manifest unknown",
+                ],
+            )));
     // A deploy-time image pull: the registry image the deployment runs, as
     // opposed to a base image used while building.
     let deploy_image_pull = !base_image_signal
-        && (matches!(phase, Some(JobPhase::ImagePull) | Some(JobPhase::Deploy))
+        && (deploy_phase
             || contains_any(
                 r,
                 &[
@@ -850,6 +907,21 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
                     "failed to pull image '",
                     "from its registry",
                     "image pull for '",
+                ],
+            ));
+    // The text itself shows a registry pull failed. Generic network/HTTP
+    // wording only counts as a registry problem with this evidence, since a
+    // deploy job's health check can fail with the same words.
+    let pull_evidence = deploy_image_pull
+        && (phase == Some(JobPhase::ImagePull)
+            || contains_any(
+                r,
+                &[
+                    "failed to pull image",
+                    "pull error:",
+                    "from its registry",
+                    "image pull for '",
+                    "docker compose pull failed",
                 ],
             ));
 
@@ -967,7 +1039,7 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
     {
         return make(S::Image, C::RegistryRateLimited);
     }
-    if deploy_image_pull
+    if (deploy_image_pull
         && contains_any(
             r,
             &[
@@ -979,12 +1051,13 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
                 "authentication required",
                 "status code 401",
             ],
-        )
+        ))
+        || (pull_evidence && registry_refused_credentials(r))
     {
         return make(S::Image, C::RegistryAuthentication);
     }
     if deploy_image_pull
-        && contains_any(
+        && (contains_any(
             r,
             &[
                 "manifest unknown",
@@ -994,10 +1067,36 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
                 "not found: manifest",
                 "manifest for",
                 "name unknown",
+                // Registries that hide private repositories (e.g. GHCR)
+                // answer a missing or inaccessible image with a bare denial.
+                "error from registry: denied",
+            ],
+        ) || (r.contains("failed to resolve reference") && r.contains(": not found")))
+    {
+        return make(S::Image, C::ImageNotFound);
+    }
+    // Docker reports a registry timeout as a 500 too; those stay timeouts.
+    if pull_evidence
+        && !timeout_signal
+        && contains_any(
+            r,
+            &[
+                "status code 500",
+                "status code 502",
+                "status code 503",
+                "status code 504",
+                "500 internal server error",
+                "502 bad gateway",
+                "503 service unavailable",
+                "504 gateway",
+                "received unexpected http status: 5",
+                "connection refused",
+                "connection reset",
+                "unexpected eof",
             ],
         )
     {
-        return make(S::Image, C::ImageNotFound);
+        return make(S::Image, C::RegistryUnavailable);
     }
 
     // ── Health checks and startup (specific runtime signals beat a generic
@@ -1232,7 +1331,13 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
             "manifest unknown",
         ],
     ) {
-        return make(S::Image, C::BaseImagePull);
+        // Only a build pulls base images; a deploy-time pull failure must
+        // not send the user to a FROM line they never wrote.
+        return if deploy_image_pull {
+            make(S::Image, C::ImagePullFailed)
+        } else {
+            make(S::Image, C::BaseImagePull)
+        };
     }
     if r.contains("image") && contains_any(r, &["not found", "missing", "no such image"]) {
         return make(S::Image, C::ImageMissing);
@@ -1683,6 +1788,119 @@ mod tests {
             Some("Failed to pull image registry.example.test/team/app:missing from its registry: Pull error: Docker responded with status code 404: manifest for registry.example.test/team/app:missing not found: manifest unknown. Local daemon images are never used as a fallback")
         );
         assert_class(&reason, S::Image, C::ImageNotFound);
+    }
+
+    /// The suffix `pull_external_image` appends to every registry failure.
+    fn external_pull_failure(inner: &str) -> String {
+        format!(
+            "Job execution failed: Required job 'pull_external_image' failed: {:?}",
+            Some(format!(
+                "Failed to pull image docker.io/library/app:missing from its registry: Pull error: {inner}. Local daemon images are never used as a fallback; use the authorized local-image claim path for an image built on this host."
+            ))
+        )
+    }
+
+    #[test]
+    fn containerd_missing_tag_is_image_not_found_not_base_image() {
+        // Docker 29 (containerd image store) wording for a tag that does not
+        // exist. Before v3 this fell through to "Base image pull failed".
+        let reason = external_pull_failure(
+            "Docker responded with status code 404: failed to resolve reference \"docker.io/library/app:missing\": docker.io/library/app:missing: not found",
+        );
+        assert_class(&reason, S::Image, C::ImageNotFound);
+        let info = describe_failure(Some(&reason)).unwrap();
+        assert!(!info.remediation.contains("FROM"), "{}", info.remediation);
+        assert_eq!(info.settings_section, Some(FailureSettingsSection::Source));
+    }
+
+    #[test]
+    fn registry_denial_for_hidden_private_image_is_image_not_found() {
+        let reason = external_pull_failure(
+            "Docker responded with status code 500: error from registry: denied\ndenied",
+        );
+        assert_class(&reason, S::Image, C::ImageNotFound);
+    }
+
+    #[test]
+    fn external_pull_token_failure_is_registry_auth_not_base_image() {
+        let reason = external_pull_failure(
+            "Docker responded with status code 500: failed to resolve reference \"ghcr.io/team/app:1\": failed to authorize: failed to fetch anonymous token: unexpected status from GET request: 401 Unauthorized",
+        );
+        assert_class(&reason, S::Image, C::RegistryAuthentication);
+    }
+
+    #[test]
+    fn token_service_outage_is_not_bad_credentials() {
+        for inner in [
+            "Docker responded with status code 500: failed to resolve reference \"ghcr.io/team/app:1\": failed to authorize: failed to fetch anonymous token: unexpected status from GET request to https://ghcr.io/token: 503 Service Unavailable",
+            "Docker responded with status code 500: failed to resolve reference \"registry.example.test/team/app:1\": failed to authorize: failed to fetch oauth token: Post \"https://registry.example.test/token\": dial tcp 10.0.0.1:443: connect: connection refused",
+            "Docker responded with status code 500: failed to fetch anonymous token: unexpected status: 502 Bad Gateway",
+        ] {
+            assert_class(
+                &external_pull_failure(inner),
+                S::Image,
+                C::RegistryUnavailable,
+            );
+        }
+        // A token step the registry answered with a refusal is still auth.
+        assert_class(
+            &external_pull_failure(
+                "Docker responded with status code 500: failed to authorize: failed to fetch oauth token: unexpected status: 403 Forbidden",
+            ),
+            S::Image,
+            C::RegistryAuthentication,
+        );
+    }
+
+    #[test]
+    fn external_pull_registry_outage_is_registry_unavailable() {
+        for inner in [
+            "Docker responded with status code 500: received unexpected HTTP status: 503 Service Unavailable",
+            "Docker responded with status code 500: Get \"https://registry.example.test/v2/\": dial tcp 10.0.0.1:443: connect: connection refused",
+        ] {
+            assert_class(
+                &external_pull_failure(inner),
+                S::Image,
+                C::RegistryUnavailable,
+            );
+        }
+        // A registry timeout reported as a 500 is still a pull timeout.
+        assert_class(
+            &external_pull_failure(
+                "Docker responded with status code 500: Get \"https://registry.example.test/v2/\": net/http: request canceled while waiting for connection (Client.Timeout exceeded while awaiting headers)",
+            ),
+            S::Image,
+            C::ImagePullTimeout,
+        );
+    }
+
+    #[test]
+    fn unrecognised_external_pull_failure_never_mentions_a_from_line() {
+        let reason = external_pull_failure("Docker responded with status code 400: something new");
+        assert_class(&reason, S::Image, C::ImagePullFailed);
+        let info = describe_failure(Some(&reason)).unwrap();
+        assert!(!info.remediation.contains("FROM"), "{}", info.remediation);
+    }
+
+    #[test]
+    fn deploy_health_check_refusal_is_not_a_registry_outage() {
+        let reason = wrapped(
+            "deploy_container",
+            "Health check failed: GET http://10.0.0.5:3000/ returned connection refused",
+        );
+        let class = classify_failure_reason(Some(&reason));
+        assert_ne!(class.code, C::RegistryUnavailable);
+    }
+
+    #[test]
+    fn dockerfile_from_pull_failure_keeps_base_image_guidance() {
+        let reason = wrapped(
+            "build_image",
+            "Failed to build image: Build failed: failed to solve: docker.io/library/debian:no-such-tag: failed to resolve source metadata for docker.io/library/debian:no-such-tag: docker.io/library/debian:no-such-tag: not found",
+        );
+        assert_class(&reason, S::Image, C::BaseImagePull);
+        let info = describe_failure(Some(&reason)).unwrap();
+        assert!(info.remediation.contains("FROM"));
     }
 
     #[test]

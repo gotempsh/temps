@@ -103,3 +103,21 @@ export function failureTimeoutSummary(
   }
   return parts.length > 0 ? parts.join(' · ') : null
 }
+
+/**
+ * The submitted image reference to show for a failed registry-image
+ * deployment, so the user can see exactly what was pulled and edit it. Null
+ * for failures that are not about that image (including a Dockerfile's base
+ * image, which the user did not submit as the deployment image).
+ */
+export function failedDeploymentImageRef(
+  failure: Pick<DeploymentFailureInfo, 'stage' | 'code'> | null | undefined,
+  externalImageRef: string | null | undefined
+): string | null {
+  const ref = externalImageRef?.trim()
+  if (!failure || !ref) return null
+  if (failure.stage !== 'image' || failure.code === 'base_image_pull') {
+    return null
+  }
+  return ref
+}
