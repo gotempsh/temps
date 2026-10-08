@@ -557,6 +557,9 @@ mod tests {
     }
 
     async fn mongodb_scenario(docker: &mut TestDocker) {
+        if !docker.ensure_images(&[MONGO_SIDECAR_IMAGE]).await {
+            return;
+        }
         let source = docker
             .run(
                 "mongo-source",

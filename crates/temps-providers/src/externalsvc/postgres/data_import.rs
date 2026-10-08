@@ -647,6 +647,12 @@ mod tests {
     }
 
     async fn postgres_scenario(docker: &mut TestDocker) {
+        if !docker
+            .ensure_images(&["postgres:16-bookworm", TARGET_IMAGE])
+            .await
+        {
+            return;
+        }
         let source = docker
             .run(
                 "pg-source",

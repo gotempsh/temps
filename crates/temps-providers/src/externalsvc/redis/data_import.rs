@@ -529,6 +529,9 @@ mod tests {
     }
 
     async fn redis_scenario(docker: &mut TestDocker) {
+        if !docker.ensure_images(&["redis:7.4"]).await {
+            return;
+        }
         let source = docker.run("redis-source", "redis:7.4", vec![], None).await;
         let target = docker
             .run("redis-target", "redis:7.4", vec![], Some("6379/tcp"))

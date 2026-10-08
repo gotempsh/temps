@@ -64,7 +64,25 @@ impl TestDocker {
         }
     }
 
-    /// Start `image` on the test network.
+    /// Make sure every image the test needs is present, pulling missing ones
+    /// (CI runners start with an empty image store). Returns false, after
+    /// saying why, when one cannot be pulled — the caller then skips, like
+    /// any Docker test whose environment cannot run it.
+    pub async fn ensure_images(&self, images: &[&str]) -> bool {
+        for image in images {
+            if self.docker.inspect_image(image).await.is_ok() {
+                continue;
+            }
+            if let Err(e) = crate::utils::pull_image_with_retry(&self.docker, image, None).await {
+                println!("Cannot pull {image} ({e}), skipping");
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Start `image` on the test network. The image must be present: call
+    /// [`Self::ensure_images`] first.
     pub async fn run(
         &mut self,
         prefix: &str,

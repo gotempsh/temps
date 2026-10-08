@@ -514,6 +514,9 @@ mod tests {
     }
 
     async fn mariadb_scenario(docker: &mut TestDocker) {
+        if !docker.ensure_images(&["mariadb:11.4"]).await {
+            return;
+        }
         let image_id = docker
             .docker
             .inspect_image("mariadb:11.4")
@@ -521,7 +524,7 @@ mod tests {
             .ok()
             .and_then(|image| image.id);
         let Some(image_id) = image_id else {
-            println!("mariadb:11.4 is not available locally, skipping");
+            println!("mariadb:11.4 has no image id, skipping");
             return;
         };
         let source = docker
