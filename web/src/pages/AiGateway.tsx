@@ -3951,7 +3951,7 @@ export function AiGatewayPage() {
       display_name: string
       api_key: string
       base_url?: string
-    }) => createProviderKey({ body: data }),
+    }) => createProviderKey({ body: data, throwOnError: true }),
     meta: { errorTitle: 'Failed to create provider key' },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['providerKeys'] })
@@ -4028,6 +4028,7 @@ export function AiGatewayPage() {
   }
 
   const handleCreate = () => {
+    if (createMutation.isPending) return
     if (!newProvider) {
       toast.error('Please select a provider')
       return
@@ -4478,11 +4479,24 @@ console.log(response.choices[0].message.content);`,
       <Dialog
         open={dialogOpen}
         onOpenChange={(open) => {
+          // Resetting a pending mutation detaches its observer without
+          // cancelling the save. Keep this setup open until it settles.
+          if (createMutation.isPending) return
           setDialogOpen(open)
-          if (!open) resetForm()
+          if (!open) {
+            createMutation.reset()
+            resetForm()
+          }
         }}
       >
-        <DialogContent>
+        <DialogContent
+          onInteractOutside={(event) => {
+            if (createMutation.isPending) event.preventDefault()
+          }}
+          onEscapeKeyDown={(event) => {
+            if (createMutation.isPending) event.preventDefault()
+          }}
+        >
           <>
             <DialogHeader>
               <DialogTitle>
@@ -4525,6 +4539,7 @@ console.log(response.choices[0].message.content);`,
                   id="displayName"
                   placeholder="Production API Key"
                   value={newDisplayName}
+                  disabled={createMutation.isPending}
                   onChange={(e) => setNewDisplayName(e.target.value)}
                 />
               </div>
@@ -4535,6 +4550,7 @@ console.log(response.choices[0].message.content);`,
                   type="password"
                   placeholder="sk-..."
                   value={newApiKey}
+                  disabled={createMutation.isPending}
                   onChange={(e) => setNewApiKey(e.target.value)}
                 />
                 <p className="text-xs text-muted-foreground">
@@ -4553,6 +4569,7 @@ console.log(response.choices[0].message.content);`,
                   id="baseUrl"
                   placeholder="https://api.openai.com/v1"
                   value={newBaseUrl}
+                  disabled={createMutation.isPending}
                   onChange={(e) => setNewBaseUrl(e.target.value)}
                 />
                 <p className="text-xs text-muted-foreground">
@@ -4564,6 +4581,14 @@ console.log(response.choices[0].message.content);`,
               We&apos;ll verify the key works before saving — this usually takes
               1–2 seconds.
             </p>
+            {createMutation.isError && (
+              <p role="alert" className="text-sm text-destructive">
+                {problemDetail(
+                  createMutation.error,
+                  'Could not add the provider key. Please try again.'
+                )}
+              </p>
+            )}
             <DialogFooter>
               <Button
                 onClick={handleCreate}
