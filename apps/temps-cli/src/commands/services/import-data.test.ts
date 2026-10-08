@@ -5,6 +5,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   chooseSourceUrl,
   describeOutcome,
+  HIDDEN_SOURCE,
   maskConnectionString,
   parseTimeoutMinutes,
   replaceConfirmationProblem,
@@ -36,6 +37,31 @@ describe('maskConnectionString', () => {
 
   test('leaves strings without credentials alone', () => {
     expect(maskConnectionString('mongodb://h.example.com/app')).toBe('mongodb://h.example.com/app')
+  })
+
+  test('hides a password that was not percent-encoded', () => {
+    expect(maskConnectionString('postgres://user:pa/ss@db.example.com/app')).toBe(
+      'postgres://***:***@db.example.com/app',
+    )
+    expect(maskConnectionString('postgres://user:p?w#d@x@db.example.com:5432/app')).toBe(
+      'postgres://***:***@db.example.com:5432/app',
+    )
+    for (const password of ['pa/ss', 'p?w#d@x']) {
+      expect(maskConnectionString(`mysql://root:${password}@db.example.com/app`)).not.toContain(
+        password,
+      )
+    }
+  })
+
+  test('hides credential options', () => {
+    expect(
+      maskConnectionString('postgres://db.example.com/app?password=hunter2&sslmode=require'),
+    ).toBe('postgres://db.example.com/app?password=***&sslmode=require')
+  })
+
+  test('hides anything that is not a connection string', () => {
+    expect(maskConnectionString('user:secret db.example.com')).toBe(HIDDEN_SOURCE)
+    expect(maskConnectionString('')).toBe(HIDDEN_SOURCE)
   })
 })
 

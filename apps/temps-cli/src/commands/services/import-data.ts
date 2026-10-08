@@ -101,9 +101,40 @@ export function chooseSourceUrl(
   return interactive ? { kind: 'prompt' } : { kind: 'missing' }
 }
 
-/** The connection string with user and password replaced by `***`. */
+/** Shown instead of a connection string that cannot be masked safely. */
+export const HIDDEN_SOURCE = '(connection string hidden)'
+
+const CREDENTIAL_OPTION = /pass|pwd|secret|token|key|auth/i
+
+/**
+ * The connection string with user and password replaced by `***`.
+ *
+ * A pasted password is often not percent-encoded and may contain `/`, `?`,
+ * `#` or `@`, so everything before the *last* `@` is treated as credentials:
+ * that can only hide too much, never print part of a password. Options whose
+ * name looks like a credential (`password=`, `token=`) have their value
+ * hidden. Anything that is not `scheme://…` is hidden entirely.
+ */
 export function maskConnectionString(url: string): string {
-  return url.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^@/?#]*@/i, '$1***:***@')
+  const match = /^([a-z][a-z0-9+.-]*:\/\/)(.*)$/is.exec(url.trim())
+  if (!match) return HIDDEN_SOURCE
+  const scheme = match[1] ?? ''
+  const rest = match[2] ?? ''
+  const at = rest.lastIndexOf('@')
+  const credentials = at === -1 ? '' : '***:***@'
+  const location = at === -1 ? rest : rest.slice(at + 1)
+  const queryStart = location.indexOf('?')
+  if (queryStart === -1) return `${scheme}${credentials}${location}`
+  const options = location
+    .slice(queryStart + 1)
+    .split('&')
+    .map((option) => {
+      const eq = option.indexOf('=')
+      const name = eq === -1 ? option : option.slice(0, eq)
+      return eq !== -1 && CREDENTIAL_OPTION.test(name) ? `${name}=***` : option
+    })
+    .join('&')
+  return `${scheme}${credentials}${location.slice(0, queryStart)}?${options}`
 }
 
 /**
