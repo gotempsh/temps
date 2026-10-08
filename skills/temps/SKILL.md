@@ -71,6 +71,7 @@ When the user opts in:
 | Authenticate, select a server, or execute CLI operations | [references/cli-runtime.md](references/cli-runtime.md), then [references/commands/INDEX.md](references/commands/INDEX.md) |
 | Create, link, deploy, or migrate an application | [howtos/deploy-application.md](howtos/deploy-application.md), [references/runtime-contract.md](references/runtime-contract.md) |
 | Configure a database, cache, or object store | [howtos/managed-services.md](howtos/managed-services.md) |
+| Copy an existing database into a managed service | [howtos/managed-services.md](howtos/managed-services.md#import-an-existing-database-into-a-managed-service) |
 | Configure, verify, or restore backups | [howtos/backup-recovery.md](howtos/backup-recovery.md) |
 | Diagnose an unhealthy deployment | [howtos/diagnose-deployment.md](howtos/diagnose-deployment.md) |
 | Automate Temps from CI | [howtos/ci-automation.md](howtos/ci-automation.md) |

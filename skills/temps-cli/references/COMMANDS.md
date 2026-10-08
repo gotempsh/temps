@@ -2143,6 +2143,12 @@ Manage external services (databases, caches, storage)
 - `restore` - Restore a service from a backup (in-place, new service, or PITR)
 - `restore-runs` - List recent restore runs for a service
 - `restore-run` - Show a single restore run
+- `restore-cancel` - Cancel a restore run that has not started writing data yet (refused once it has)
+- `import-data-availability` - Show whether a service can receive data imported from an external database, and what source it accepts
+- `import-data` - Copy a database from an external server into a database of this service (PostgreSQL, MariaDB/MySQL, MongoDB, Redis)
+- `import-data-runs` - List data imports into a service, newest first
+- `import-data-run` - Show one data import: outcome, phase, timings, who started it and the transfer output
+- `import-data-cancel` - Cancel a running data import (refused once the data has been copied)
 - `wal-health` - Probe a PostgreSQL service's WAL / archive_command health right now (archiver failures, backlog, stale replication slots) — diagnoses "Cloud backup mirror unavailable ... check that PostgreSQL's archive_command is succeeding" warnings
 
 ### `services list` (alias: `ls`)
@@ -2609,6 +2615,84 @@ Show a single restore run
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Restore run ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `services restore-cancel`
+
+Cancel a restore run that has not started writing data yet (refused once it has)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Restore run ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `services import-data-availability`
+
+Show whether a service can receive data imported from an external database, and what source it accepts
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `services import-data`
+
+Copy a database from an external server into a database of this service (PostgreSQL, MariaDB/MySQL, MongoDB, Redis)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID to import into | - | Yes |
+| `--target <name>` | Database that receives the data (created if missing; for Redis, the resource name, usually <project>_<environment>) | - | Yes |
+| `--source-url-env <var>` | Name of an environment variable holding the source connection string (recommended: keeps the password out of shell history) | - | No |
+| `--source-url <url>` | Source connection string (visible in shell history and the process list; prefer --source-url-env) | - | No |
+| `--replace` | Drop the target database first if it already holds data (DESTRUCTIVE) | - | No |
+| `--confirm-target <name>` | Required with --replace when not interactive: repeat the target name | - | No |
+| `--timeout <minutes>` | Stop the copy after this many minutes (server default when omitted) | - | No |
+| `-y, --yes` | Skip the confirmation prompt | - | No |
+| `--no-wait` | Return after starting instead of waiting for the result | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `services import-data-runs`
+
+List data imports into a service, newest first
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--page <n>` | Page number (default 1) | - | No |
+| `--page-size <n>` | Items per page (default 20, max 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `services import-data-run`
+
+Show one data import: outcome, phase, timings, who started it and the transfer output
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--run <id>` | Data import ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `services import-data-cancel`
+
+Cancel a running data import (refused once the data has been copied)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--run <id>` | Data import ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
 ### `services wal-health`

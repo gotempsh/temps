@@ -102,6 +102,7 @@ Use these routing hints:
 | Authenticate or select a server | `login`, `logout`, `whoami`, `context`, `configure` |
 | Create and deploy an application | `projects`, `deploy`, `deployments`, `environments` |
 | Manage databases and storage | `services`, `backups`, `data`, `kv`, `blob` |
+| Copy an external database into a managed service | `services import-data` (check `services import-data-availability` first) |
 | Configure traffic and TLS | `domains`, `custom-domains`, `dns`, `dns-provider` |
 | Inspect runtime behavior | `containers`, `runtime-logs`, `proxy-logs`, `services` |
 | Operate observability or review desktop/mobile Web Vitals | `analytics`, `errors`, `traces`, `session-replay`, `monitors`, `incidents` |
