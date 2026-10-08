@@ -61,6 +61,20 @@ class SelectTests(unittest.TestCase):
     def test_no_fallback_means_none(self):
         self.assertEqual(select(["v0.1.0-rc.1"], "stable"), (None, "stable"))
 
+    def test_stable_below_floor_falls_back_to_beta(self):
+        # A stable tag left over from an earlier line must not hide the
+        # fallback: it predates the tooling the upgrade test drives.
+        tags = ["v0.0.8", "v0.1.0-beta.56", "v0.1.0-beta.9", "v0.1.0-nightly.20261007.abc12345"]
+        self.assertEqual(select(tags, "stable", "beta", (0, 1, 0)), ("v0.1.0-beta.56", "beta"))
+
+    def test_floor_admits_the_first_stable_release_of_its_core(self):
+        tags = ["v0.0.8", "v0.1.0", "v0.1.1-rc.2"]
+        self.assertEqual(select(tags, "stable", "beta", (0, 1, 0)), ("v0.1.0", "stable"))
+
+    def test_floor_applies_to_the_fallback_channel(self):
+        self.assertEqual(select(["v0.0.8", "v0.0.9-rc.1"], "stable", "beta", (0, 1, 0)),
+                         (None, "beta"))
+
 
 class CommandLineTests(unittest.TestCase):
     def run_main(self, arguments, tags):
@@ -76,6 +90,17 @@ class CommandLineTests(unittest.TestCase):
         code, out, err = self.run_main(["--channel", "stable", "--fallback", "beta"], ["v0.1.0-rc.1"])
         self.assertEqual((code, out), (0, "v0.1.0-rc.1\n"))
         self.assertIn("::notice::No stable release yet", err)
+
+    def test_min_core_notice_names_the_floor(self):
+        code, out, err = self.run_main(
+            ["--channel", "stable", "--fallback", "beta", "--min-core", "v0.1.0"],
+            ["v0.0.8", "v0.1.0-beta.56"])
+        self.assertEqual((code, out), (0, "v0.1.0-beta.56\n"))
+        self.assertIn("::notice::No stable release at or above v0.1.0 yet", err)
+
+    def test_min_core_rejects_a_prerelease_floor(self):
+        with self.assertRaises(SystemExit):
+            self.run_main(["--channel", "stable", "--min-core", "v0.1.0-beta.1"], ["v0.1.0"])
 
     def test_empty_selection_fails_with_error(self):
         code, out, err = self.run_main(["--channel", "beta"], ["v0.1.0", "test-v0.2.0-rc.1"])

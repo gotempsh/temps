@@ -232,6 +232,18 @@ for (const width of [1440, 390]) {
         await route.fulfill({ status: 404, json: { detail: 'No deployments' } })
         return
       } else if (path.includes('active-visitors')) body = { count: 0 }
+      // The header's operations tray reads a page object; the default `[]`
+      // crashes it into the header error boundary, taking the breadcrumb
+      // this test asserts with it.
+      else if (path === '/operations') {
+        body = {
+          operations: [],
+          page: 1,
+          page_size: 20,
+          running_count: 0,
+          total: 0,
+        }
+      }
       await route.fulfill({ json: body })
     })
     await page.goto('/projects/example-app/environment-variables')

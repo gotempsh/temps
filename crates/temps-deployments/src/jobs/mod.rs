@@ -52,6 +52,7 @@ mod extraction_limit_tests {
 }
 
 pub mod build_image;
+pub mod builder_node;
 pub mod capture_source_files;
 pub mod capture_source_maps;
 pub mod configure_agents;
@@ -85,6 +86,7 @@ pub mod take_screenshot;
 pub mod verify_local_image;
 
 pub use build_image::*;
+pub use builder_node::BuilderNodeResolver;
 pub use capture_source_files::*;
 pub use capture_source_maps::*;
 pub use configure_agents::*;

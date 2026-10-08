@@ -25,7 +25,11 @@ name: Upgrade Tests
 #   testers take (manual runs).
 # Only published, non-draft releases that ship `temps-linux-amd64.tar.gz`
 # are candidates, so `test-v*` smoke-test releases and asset-less releases
-# are never picked. `previous-version` overrides the choice with a tag.
+# are never picked. Releases below v0.1.0 are not candidates either: they
+# predate `temps migrate`, which the test drives on the old binary, so the
+# stable default uses the beta fallback until v0.1.0 ships. A leftover
+# v0.0.x stable tag would otherwise be chosen and fail at the first step.
+# `previous-version` overrides the choice with a tag.
 on:
   workflow_call:
     inputs:
@@ -134,7 +138,8 @@ jobs:
             esac
             tag=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
               --jq '.[] | select(.draft | not) | select(any(.assets[]; .name == "temps-linux-amd64.tar.gz")) | .tag_name' |
-              python3 .github/scripts/release_select.py --channel "$PREVIOUS_CHANNEL" "${fallback[@]}")
+              python3 .github/scripts/release_select.py --channel "$PREVIOUS_CHANNEL" \
+                "${fallback[@]}" --min-core v0.1.0)
           fi
           test -n "$tag"
           echo "Previous release: $tag"
