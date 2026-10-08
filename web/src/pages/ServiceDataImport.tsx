@@ -113,6 +113,7 @@ export function ServiceDataImport() {
         <EmptyState
           icon={DatabaseZap}
           title="This service cannot receive imported data"
+          size="compact"
           description={
             <>
               {capitalize(view.reason)}. Imports work for standalone PostgreSQL,

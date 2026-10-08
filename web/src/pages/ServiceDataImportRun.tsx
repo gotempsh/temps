@@ -230,6 +230,7 @@ function RunBody({
       <EmptyState
         icon={ScrollText}
         title="Import not found"
+        size="compact"
         description="This link does not point at an import."
       />
     )

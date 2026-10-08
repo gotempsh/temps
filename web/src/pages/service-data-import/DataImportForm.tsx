@@ -30,7 +30,7 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
-import { Switch } from '@/components/ui/switch'
+import { Checkbox } from '@/components/ui/checkbox'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
@@ -81,8 +81,8 @@ export function DataImportForm({
     useSensitiveActionVerification()
 
   const schema = useMemo(
-    () => importFormSchema(maxTimeoutMinutes),
-    [maxTimeoutMinutes]
+    () => importFormSchema(maxTimeoutMinutes, spec.max_target_length),
+    [maxTimeoutMinutes, spec.max_target_length]
   )
   const form = useForm<ImportFormValues>({
     resolver: zodResolver(schema),
@@ -289,8 +289,17 @@ export function DataImportForm({
               control={form.control}
               name="replace"
               render={({ field }) => (
-                <FormItem className="flex flex-col gap-3 rounded-md border p-4 sm:flex-row sm:items-start sm:justify-between">
-                  <div className="space-y-1">
+                <FormItem className="flex flex-row items-start gap-3 rounded-md border p-4">
+                  <FormControl>
+                    <Checkbox
+                      checked={field.value}
+                      onCheckedChange={(checked) => {
+                        field.onChange(checked === true)
+                        form.clearErrors('replace')
+                      }}
+                    />
+                  </FormControl>
+                  <div className="space-y-1 leading-none">
                     <FormLabel>Replace the database if it holds data</FormLabel>
                     <FormDescription>
                       Without this, an import into a database that already has{' '}
@@ -300,15 +309,6 @@ export function DataImportForm({
                     </FormDescription>
                     <FormMessage />
                   </div>
-                  <FormControl>
-                    <Switch
-                      checked={field.value}
-                      onCheckedChange={(checked) => {
-                        field.onChange(checked)
-                        form.clearErrors('replace')
-                      }}
-                    />
-                  </FormControl>
                 </FormItem>
               )}
             />

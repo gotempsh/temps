@@ -227,7 +227,10 @@ export interface ImportFormValues {
   timeoutMinutes: number
 }
 
-export function importFormSchema(maxTimeoutMinutes: number) {
+export function importFormSchema(
+  maxTimeoutMinutes: number,
+  maxTargetLength: number = 63
+) {
   return z
     .object({
       sourceUrl: z
@@ -238,7 +241,10 @@ export function importFormSchema(maxTimeoutMinutes: number) {
         .string()
         .trim()
         .min(1, 'Name the database that receives the data.')
-        .max(64, 'Database names are at most 64 characters.'),
+        .max(
+          maxTargetLength,
+          `Names are at most ${maxTargetLength} characters for this service.`
+        ),
       replace: z.boolean(),
       confirmTargetDatabase: z.string(),
       timeoutMinutes: z

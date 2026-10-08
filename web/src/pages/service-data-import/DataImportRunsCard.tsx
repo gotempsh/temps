@@ -30,9 +30,9 @@ import {
 } from '@/components/ui/table'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ChevronRight, DatabaseZap, Loader2, XCircle } from 'lucide-react'
+import { RecordLink } from '@temps-sdk/ds'
+import { DatabaseZap, Loader2, XCircle } from 'lucide-react'
 import { Fragment, useEffect, useRef, useState } from 'react'
-import { Link, useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import {
   importPollInterval,
@@ -59,7 +59,6 @@ export function DataImportRunsCard({
   objectNoun,
 }: DataImportRunsCardProps) {
   const queryClient = useQueryClient()
-  const navigate = useNavigate()
   const [page, setPage] = useState(1)
   const options = listDataImportsOptions({
     path: { id: serviceId },
@@ -121,7 +120,6 @@ export function DataImportRunsCard({
       <CardContent>
         <RunsBody
           serviceId={serviceId}
-          onOpen={(runId) => navigate(importRunPath(serviceId, runId))}
           isPending={runsQuery.isPending}
           isError={runsQuery.isError}
           error={runsQuery.error}
@@ -154,7 +152,6 @@ export function DataImportRunsCard({
 
 interface RunsBodyProps {
   serviceId: number
-  onOpen: (runId: number) => void
   isPending: boolean
   isError: boolean
   error: unknown
@@ -168,7 +165,6 @@ interface RunsBodyProps {
 
 function RunsBody({
   serviceId,
-  onOpen,
   isPending,
   isError,
   error,
@@ -188,16 +184,20 @@ function RunsBody({
       </div>
     )
   }
-  if (isError) {
-    return (
-      <ReadFailure
-        resource="import history"
-        error={error}
-        onRetry={onRetry}
-        retrying={retrying}
-        embedded
-      />
-    )
+  const failure = isError ? (
+    <ReadFailure
+      resource="import history"
+      error={error}
+      cached={Boolean(runs && runs.length > 0)}
+      onRetry={onRetry}
+      retrying={retrying}
+      embedded
+    />
+  ) : null
+  // A failed refresh keeps the rows already loaded on screen, with the
+  // error above them; only a first load that failed shows the error alone.
+  if (isError && (!runs || runs.length === 0)) {
+    return failure
   }
   if (!runs || runs.length === 0) {
     return (
@@ -210,55 +210,52 @@ function RunsBody({
     )
   }
   return (
-    <div className="min-w-0 overflow-x-auto">
-      <Table className="min-w-[640px]">
-        <TableHeader>
-          <TableRow>
-            <TableHead>Started</TableHead>
-            <TableHead>Target</TableHead>
-            <TableHead className="hidden md:table-cell">Source</TableHead>
-            <TableHead>Status</TableHead>
-            <TableHead>Result</TableHead>
-            <TableHead className="w-0" />
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {runs.map((run) => (
-            <Fragment key={run.id}>
-              <TableRow
-                className="cursor-pointer"
-                onClick={() => onOpen(run.id)}
-              >
-                <TableCell className="whitespace-nowrap">
-                  <TimeAgo date={run.started_at} />
-                </TableCell>
-                <TableCell className="font-mono text-sm">
-                  <Link
-                    to={importRunPath(serviceId, run.id)}
-                    className="hover:underline"
-                    onClick={(event) => event.stopPropagation()}
-                  >
-                    {run.target_database}
-                  </Link>
-                  {run.replace_existing && (
-                    <Badge variant="outline" className="ml-2">
-                      replaced
+    <div className="space-y-4">
+      {failure}
+      <div className="min-w-0 overflow-x-auto">
+        <Table className="min-w-[640px]">
+          <TableHeader>
+            <TableRow>
+              <TableHead>Target</TableHead>
+              <TableHead>Started</TableHead>
+              <TableHead className="hidden md:table-cell">Source</TableHead>
+              <TableHead>Status</TableHead>
+              <TableHead>Result</TableHead>
+              <TableHead className="w-0" />
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {runs.map((run) => (
+              <Fragment key={run.id}>
+                <TableRow>
+                  <TableCell className="font-mono text-sm">
+                    <RecordLink
+                      to={importRunPath(serviceId, run.id)}
+                      aria-label={`View import ${run.id} into ${run.target_database}`}
+                    >
+                      {run.target_database}
+                    </RecordLink>
+                    {run.replace_existing && (
+                      <Badge variant="outline" className="ml-2">
+                        replaced
+                      </Badge>
+                    )}
+                  </TableCell>
+                  <TableCell className="whitespace-nowrap">
+                    <TimeAgo date={run.started_at} />
+                  </TableCell>
+                  <TableCell className="hidden max-w-[280px] truncate font-mono text-xs text-muted-foreground md:table-cell">
+                    {run.source}
+                  </TableCell>
+                  <TableCell>
+                    <Badge variant={statusVariant(run.status)}>
+                      {statusLabel(run.status)}
                     </Badge>
-                  )}
-                </TableCell>
-                <TableCell className="hidden max-w-[280px] truncate font-mono text-xs text-muted-foreground md:table-cell">
-                  {run.source}
-                </TableCell>
-                <TableCell>
-                  <Badge variant={statusVariant(run.status)}>
-                    {statusLabel(run.status)}
-                  </Badge>
-                </TableCell>
-                <TableCell className="text-sm text-muted-foreground">
-                  <RunResult run={run} objectNoun={objectNoun} />
-                </TableCell>
-                <TableCell>
-                  <div className="flex items-center justify-end gap-1">
+                  </TableCell>
+                  <TableCell className="text-sm text-muted-foreground">
+                    <RunResult run={run} objectNoun={objectNoun} />
+                  </TableCell>
+                  <TableCell>
                     {isRunActive(run) && (
                       <Button
                         variant="ghost"
@@ -266,47 +263,31 @@ function RunsBody({
                         disabled={
                           run.cancel_requested || cancellingId === run.id
                         }
-                        onClick={(event) => {
-                          event.stopPropagation()
-                          onCancel(run.id)
-                        }}
+                        onClick={() => onCancel(run.id)}
                       >
                         <XCircle className="h-4 w-4 sm:mr-2" />
                         <span className="hidden sm:inline">Cancel</span>
                       </Button>
                     )}
-                    <Button variant="ghost" size="sm" asChild>
-                      <Link
-                        to={importRunPath(serviceId, run.id)}
-                        aria-label={`Details of import ${run.id}`}
-                        onClick={(event) => event.stopPropagation()}
-                      >
-                        <span className="hidden sm:inline">Details</span>
-                        <ChevronRight className="h-4 w-4 sm:ml-1" />
-                      </Link>
-                    </Button>
-                  </div>
-                </TableCell>
-              </TableRow>
-              {run.error_message && (
-                <TableRow
-                  className="cursor-pointer hover:bg-transparent"
-                  onClick={() => onOpen(run.id)}
-                >
-                  <TableCell colSpan={6} className="pt-0">
-                    <p className="mb-1 font-mono text-xs text-muted-foreground md:hidden">
-                      {run.source}
-                    </p>
-                    <p className="line-clamp-2 text-sm text-muted-foreground">
-                      {run.error_message}
-                    </p>
                   </TableCell>
                 </TableRow>
-              )}
-            </Fragment>
-          ))}
-        </TableBody>
-      </Table>
+                {run.error_message && (
+                  <TableRow className="hover:bg-transparent">
+                    <TableCell colSpan={6} className="pt-0">
+                      <p className="mb-1 font-mono text-xs text-muted-foreground md:hidden">
+                        {run.source}
+                      </p>
+                      <p className="line-clamp-2 text-sm text-muted-foreground">
+                        {run.error_message}
+                      </p>
+                    </TableCell>
+                  </TableRow>
+                )}
+              </Fragment>
+            ))}
+          </TableBody>
+        </Table>
+      </div>
     </div>
   )
 }

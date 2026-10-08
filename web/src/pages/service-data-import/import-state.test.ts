@@ -192,6 +192,19 @@ describe('form', () => {
     ).toBe(true)
   })
 
+  test('bounds the target name by the engine limit', () => {
+    const long = 'a'.repeat(100)
+    expect(
+      importFormSchema(1440, 63).safeParse({ ...values, targetDatabase: long })
+        .success
+    ).toBe(false)
+    // Redis resource names may be up to 128 characters.
+    expect(
+      importFormSchema(1440, 128).safeParse({ ...values, targetDatabase: long })
+        .success
+    ).toBe(true)
+  })
+
   test('bounds the timeout', () => {
     const schema = importFormSchema(120)
     expect(schema.safeParse({ ...values, timeoutMinutes: 0 }).success).toBe(
