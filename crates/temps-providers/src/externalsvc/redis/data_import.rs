@@ -27,8 +27,8 @@ use redis::AsyncCommands;
 use super::{RedisConfig, RedisService};
 use crate::data_import::source::{parse_source_url, scrub_secrets, SourceUrlRules};
 use crate::data_import::{
-    bounded_step, DataImportEngine, DataImportError, DataImportSpec, ImportSource,
-    TargetInspection, TargetPreparation, TransferEnv, TransferPlan, TransferTarget,
+    DataImportEngine, DataImportError, DataImportSpec, ImportSource, TargetInspection,
+    TargetPreparation, TransferEnv, TransferPlan, TransferTarget, TARGET_STEP_TIMEOUT,
 };
 use crate::externalsvc::ServiceConfig;
 
@@ -80,6 +80,54 @@ impl RedisService {
                 scrub_secrets(&e.to_string(), std::slice::from_ref(&redis.password)),
             )
         })
+    }
+
+    /// Allocate (or find) the logical database of `resource`, exactly as
+    /// provisioning does.
+    ///
+    /// The allocation claims a DB (`SETNX` on its owner key) and then records
+    /// the resource's mapping in separate commands; dropping it between the
+    /// two would leave a claimed DB that no resource maps to, which neither
+    /// another allocation nor `drop_database` would ever release. So it runs
+    /// to completion in its own task — on a dedicated engine instance holding
+    /// the same configuration — and only the import's wait for it is
+    /// bounded. If the wait runs out, the allocation still finishes
+    /// consistently in the background, and a retry of the import reuses the
+    /// DB it allocated.
+    async fn import_allocate(
+        &self,
+        service: &str,
+        redis: &RedisConfig,
+        resource: &str,
+    ) -> Result<u8, DataImportError> {
+        let operation = format!("allocate a logical database for '{resource}'");
+        let allocator = RedisService::new(self.name.clone(), self.docker.clone());
+        *allocator.config.write().await = Some(redis.clone());
+        let owned_resource = resource.to_string();
+        let allocation =
+            tokio::spawn(async move { allocator.allocate_database(&owned_resource).await });
+        match tokio::time::timeout(TARGET_STEP_TIMEOUT, allocation).await {
+            Ok(Ok(Ok(db_number))) => Ok(db_number),
+            Ok(Ok(Err(e))) => Err(DataImportError::target(
+                service,
+                &operation,
+                scrub_secrets(&e.to_string(), std::slice::from_ref(&redis.password)),
+            )),
+            Ok(Err(join_error)) => Err(DataImportError::target(
+                service,
+                &operation,
+                format!("the allocation task stopped unexpectedly: {join_error}"),
+            )),
+            Err(_) => Err(DataImportError::target(
+                service,
+                &operation,
+                format!(
+                    "Redis did not answer within {}s; the allocation keeps running and \
+                     completes on its own, so run the import again once Redis responds",
+                    TARGET_STEP_TIMEOUT.as_secs()
+                ),
+            )),
+        }
     }
 
     /// Logical database allocated to `resource`, if any.
@@ -247,19 +295,7 @@ impl DataImportEngine for RedisService {
         }
         let service = config.name.as_str();
         let redis = self.import_hydrate(config).await?;
-        // Same allocation as provisioning: reuses the resource's DB when it
-        // has one, otherwise claims a free one.
-        let operation = format!("allocate a logical database for '{database}'");
-        let db_number = bounded_step(service, &operation, async {
-            self.allocate_database(database).await.map_err(|e| {
-                DataImportError::target(
-                    service,
-                    &operation,
-                    scrub_secrets(&e.to_string(), std::slice::from_ref(&redis.password)),
-                )
-            })
-        })
-        .await?;
+        let db_number = self.import_allocate(service, &redis, database).await?;
         if preparation == TargetPreparation::Recreate {
             let mut conn = self.import_connection(service, &redis).await?;
             let operation = format!("flush '{database}' (DB {db_number})");

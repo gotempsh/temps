@@ -11,10 +11,12 @@
 #
 # Between the halves each key travels as a RESP array
 # ["KEY", name, expire_at_ms, payload], where expire_at_ms is an absolute
-# time on this container's clock (0 = no expiry). The consumer turns it
-# back into the time left at the moment it sends RESTORE, so keys queued
-# between the halves do not live longer than on the source, and no clock
-# outside this container is involved.
+# time on this container's clock (0 = no expiry). The consumer translates it
+# onto the target's clock — the offset is measured once with TIME — and
+# restores with ABSTTL, so however long a key waits in a pipe or a batch it
+# expires when it would have on the source. Keys already past their expiry
+# are skipped; a key that expires while in flight is dropped by the target
+# itself (RESTORE ... ABSTTL with a past time creates nothing).
 #
 # DUMP/RESTORE is used rather than replication (SYNC/PSYNC) or an RDB file
 # because hosted Redis services commonly disable replication commands but
@@ -220,6 +222,15 @@ def produce():
     sys.stderr.write("temps-import: read %d keys from the source\n" % copied)
 
 
+def target_clock_offset(side, sock, reader):
+    """Milliseconds to add to this container's clock to get the target's."""
+    before = now_ms()
+    reply = call(side, sock, reader, "TIME")
+    after = now_ms()
+    target_ms = int(reply[0]) * 1000 + int(reply[1]) // 1000
+    return target_ms - (before + after) // 2
+
+
 def consume():
     env = os.environ
     side = "target"
@@ -232,6 +243,7 @@ def consume():
     )
     authenticate(side, sock, reader, "", env.get("TEMPS_IMPORT_TARGET_PASSWORD", ""))
     call(side, sock, reader, "SELECT", int(env["TEMPS_IMPORT_TARGET_DATABASE"]))
+    offset = target_clock_offset(side, sock, reader)
 
     source = Reader(sys.stdin.buffer.read1)
     batch, keys, size, written, expired = [], [], 0, 0, 0
@@ -248,16 +260,18 @@ def consume():
         if not isinstance(frame, list) or len(frame) != 4 or frame[0] != b"KEY":
             fail(side, "unexpected input from the source side")
         key, expire_at, payload = frame[1], int(frame[2]), frame[3]
+        # REPLACE: SCAN may return a key twice.
         if expire_at:
-            remaining = expire_at - now_ms()
-            if remaining <= 0:
+            if expire_at <= now_ms():
                 # Expired while queued: on the source it is gone too.
                 expired += 1
                 continue
+            encoded = encode(
+                "RESTORE", key, expire_at + offset, payload, "REPLACE", "ABSTTL"
+            )
         else:
-            remaining = 0
-        # REPLACE: SCAN may return a key twice. TTL 0 means no expiry.
-        encoded = encode("RESTORE", key, remaining, payload, "REPLACE")
+            # TTL 0 without ABSTTL: the key never expires.
+            encoded = encode("RESTORE", key, 0, payload, "REPLACE")
         batch.append(encoded)
         keys.append(key)
         size += len(encoded)
