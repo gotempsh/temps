@@ -25,8 +25,9 @@ use std::time::Duration;
 use chrono::Utc;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, DatabaseConnection, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, ConnectionTrait,
+    DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
+    TransactionTrait,
 };
 use temps_core::DockerHandle;
 use temps_entities::{external_services, restore_runs, service_data_imports, users};
@@ -241,7 +242,9 @@ impl DataImportService {
         let source = engine.parse_source(&request.source_url)?;
         let pins = pin_source_hosts(&source).await?;
 
-        self.ensure_no_active_restore(service_id).await?;
+        // Pre-checks for a readable error before any work; the authoritative
+        // checks repeat under the service lock when the run is recorded.
+        ensure_no_active_restore(self.db.as_ref(), service_id).await?;
         if let Some(run) = self
             .find_running(service_id, &request.target_database)
             .await?
@@ -272,33 +275,26 @@ impl DataImportService {
             runner::resolve_target_network(&docker, service_id, &target_container).await?;
         let target_port = resolved.instance.get_docker_internal_port();
 
-        let run = service_data_imports::ActiveModel {
-            service_id: Set(service_id),
-            service_type: Set(resolved.service.service_type.clone()),
-            target_database: Set(request.target_database.clone()),
-            source_display: Set(source.masked()),
-            source_database: Set(source.database().to_string()),
-            replace_existing: Set(request.replace),
-            atomic_transfer: Set(spec.atomic),
-            status: Set(STATUS_RUNNING.to_string()),
-            phase: Set(PHASE_PREPARING_TARGET.to_string()),
-            timeout_seconds: Set(i32::try_from(timeout.as_secs()).unwrap_or(i32::MAX)),
-            created_by: Set(request.created_by),
-            ..Default::default()
-        }
-        .insert(self.db.as_ref())
-        .await
-        .map_err(|e| match e.sql_err() {
-            // The partial unique index lost a race with a concurrent start.
-            Some(sea_orm::SqlErr::UniqueConstraintViolation(_)) => {
-                DataImportError::AlreadyRunning {
-                    service_id,
-                    database: request.target_database.clone(),
-                    run_id: 0,
-                }
-            }
-            _ => DataImportError::Database(e),
-        })?;
+        let run = insert_run_locked(
+            self.db.as_ref(),
+            service_id,
+            &request.target_database,
+            service_data_imports::ActiveModel {
+                service_id: Set(service_id),
+                service_type: Set(resolved.service.service_type.clone()),
+                target_database: Set(request.target_database.clone()),
+                source_display: Set(source.masked()),
+                source_database: Set(source.database().to_string()),
+                replace_existing: Set(request.replace),
+                atomic_transfer: Set(spec.atomic),
+                status: Set(STATUS_RUNNING.to_string()),
+                phase: Set(PHASE_PREPARING_TARGET.to_string()),
+                timeout_seconds: Set(i32::try_from(timeout.as_secs()).unwrap_or(i32::MAX)),
+                created_by: Set(request.created_by),
+                ..Default::default()
+            },
+        )
+        .await?;
 
         info!(
             run_id = run.id,
@@ -578,31 +574,6 @@ impl DataImportService {
         Ok(ResolvedTarget { service, instance })
     }
 
-    async fn ensure_no_active_restore(&self, service_id: i32) -> Result<(), DataImportError> {
-        // A restore writes into this service when it restores in place (or a
-        // PITR in place), or when this service is the one it provisioned.
-        let writes_here = Condition::any()
-            .add(
-                Condition::all()
-                    .add(restore_runs::Column::SourceServiceId.eq(service_id))
-                    .add(restore_runs::Column::TargetServiceId.is_null())
-                    .add(restore_runs::Column::TargetServiceName.is_null()),
-            )
-            .add(restore_runs::Column::TargetServiceId.eq(service_id));
-        let active = restore_runs::Entity::find()
-            .filter(restore_runs::Column::Status.is_in(ACTIVE_RESTORE_STATUSES))
-            .filter(writes_here)
-            .one(self.db.as_ref())
-            .await?;
-        match active {
-            Some(restore) => Err(DataImportError::RestoreInProgress {
-                service_id,
-                restore_run_id: restore.id,
-            }),
-            None => Ok(()),
-        }
-    }
-
     async fn find_running(
         &self,
         service_id: i32,
@@ -614,6 +585,87 @@ impl DataImportService {
             .filter(service_data_imports::Column::Status.eq(STATUS_RUNNING))
             .one(self.db.as_ref())
             .await?)
+    }
+}
+
+/// Refuse when a restore may be writing into `service_id`: one restoring in
+/// place (or a PITR in place) onto it, or one whose new service it is.
+async fn ensure_no_active_restore<C: ConnectionTrait>(
+    conn: &C,
+    service_id: i32,
+) -> Result<(), DataImportError> {
+    let writes_here = Condition::any()
+        .add(
+            Condition::all()
+                .add(restore_runs::Column::SourceServiceId.eq(service_id))
+                .add(restore_runs::Column::TargetServiceId.is_null())
+                .add(restore_runs::Column::TargetServiceName.is_null()),
+        )
+        .add(restore_runs::Column::TargetServiceId.eq(service_id));
+    let active = restore_runs::Entity::find()
+        .filter(restore_runs::Column::Status.is_in(ACTIVE_RESTORE_STATUSES))
+        .filter(writes_here)
+        .one(conn)
+        .await?;
+    match active {
+        Some(restore) => Err(DataImportError::RestoreInProgress {
+            service_id,
+            restore_run_id: restore.id,
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Record a new run under the service's row lock — the lock destructive
+/// restores take before checking for imports — after checking for a restore
+/// inside it, so an import and a restore can never both start on the same
+/// service. The partial unique index still settles two imports into the
+/// same database.
+async fn insert_run_locked(
+    db: &DatabaseConnection,
+    service_id: i32,
+    target_database: &str,
+    run: service_data_imports::ActiveModel,
+) -> Result<service_data_imports::Model, DataImportError> {
+    let transaction = db.begin().await?;
+    let inserted = async {
+        external_services::Entity::find_by_id(service_id)
+            .lock_exclusive()
+            .one(&transaction)
+            .await?
+            .ok_or(DataImportError::ServiceNotFound { service_id })?;
+        ensure_no_active_restore(&transaction, service_id).await?;
+        run.insert(&transaction)
+            .await
+            .map_err(|e| match e.sql_err() {
+                Some(sea_orm::SqlErr::UniqueConstraintViolation(_)) => {
+                    DataImportError::AlreadyRunning {
+                        service_id,
+                        database: target_database.to_string(),
+                        run_id: 0,
+                    }
+                }
+                _ => DataImportError::Database(e),
+            })
+    }
+    .await;
+    match inserted {
+        Ok(model) => {
+            transaction.commit().await?;
+            Ok(model)
+        }
+        Err(error) => {
+            // Roll back now rather than on drop, so the row lock is released
+            // immediately instead of when the pool next uses the connection.
+            if let Err(rollback_error) = transaction.rollback().await {
+                warn!(
+                    service_id,
+                    error = %rollback_error,
+                    "Rolling back a refused data import failed"
+                );
+            }
+            Err(error)
+        }
     }
 }
 
@@ -855,9 +907,35 @@ impl ImportJob {
             timeout: self.timeout,
             secrets: &secrets,
         };
-        let outcome = match runner::run_helper(&self.docker, &request).await {
+        // Created, not started: a cancellation that arrived while the image
+        // was being pulled is honoured before anything runs.
+        let container_id = match runner::create_helper(&self.docker, &request).await {
+            Ok(id) => id,
+            Err(e) => {
+                if self.cancel_requested().await {
+                    return JobOutcome::cancelled();
+                }
+                return JobOutcome::failed(scrub_secrets(&e.to_string(), &secrets));
+            }
+        };
+        if self.cancel_requested().await {
+            self.settle_helper(&container_id).await;
+            return JobOutcome::cancelled();
+        }
+        let started = runner::start_and_wait(&self.docker, &container_id, &request).await;
+        // The run — and the database lock it holds — is only released once
+        // the helper can no longer write.
+        self.settle_helper(&container_id).await;
+        let outcome = match started {
             Ok(outcome) => outcome,
-            Err(e) => return JobOutcome::failed(scrub_secrets(&e.to_string(), &secrets)),
+            Err(e) => {
+                // A cancel that removed the container before it started
+                // makes the start fail: that is a cancellation, not an error.
+                if self.cancel_requested().await {
+                    return JobOutcome::cancelled();
+                }
+                return JobOutcome::failed(scrub_secrets(&e.to_string(), &secrets));
+            }
         };
 
         let output = outcome.output().map(str::to_string);
@@ -924,6 +1002,30 @@ impl ImportJob {
             }
         };
         format!("{what}: {cause}. {leftover}")
+    }
+
+    /// Wait until the helper is confirmed stopped, retrying with backoff for
+    /// as long as it takes. Until then the run stays `running`, so the
+    /// partial unique index keeps a second import out of the database a
+    /// surviving helper might still be writing into.
+    async fn settle_helper(&self, container_id: &str) {
+        let mut delay = Duration::from_secs(2);
+        loop {
+            match runner::ensure_helper_stopped(&self.docker, self.service_id, container_id).await {
+                Ok(()) => return,
+                Err(e) => {
+                    warn!(
+                        run_id = self.run_id,
+                        service_id = self.service_id,
+                        error = %e,
+                        retry_in_secs = delay.as_secs(),
+                        "Data import helper not confirmed stopped; keeping the run active"
+                    );
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(60));
+                }
+            }
+        }
     }
 
     async fn cancel_requested(&self) -> bool {
@@ -1190,6 +1292,120 @@ mod tests {
         ));
         service.status = "running".to_string();
         assert!(ensure_running(&service).is_ok());
+    }
+
+    fn service_model(id: i32) -> external_services::Model {
+        external_services::Model {
+            id,
+            name: "orders".to_string(),
+            service_type: "postgres".to_string(),
+            version: None,
+            status: "running".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            slug: None,
+            config: None,
+            node_id: None,
+            topology: "standalone".to_string(),
+            error_message: None,
+            health_status: None,
+            last_health_check_at: None,
+            last_health_error: None,
+            consecutive_health_failures: 0,
+            health_metadata: None,
+            metrics_enabled: false,
+            default_backup_provisioned: false,
+            container_name: None,
+            ai_data_access: false,
+            created_by_user_id: None,
+            continuous_archive_s3_source_id: None,
+            continuous_archive_pinned_at: None,
+        }
+    }
+
+    fn restore_model(id: i32, service_id: i32) -> restore_runs::Model {
+        let now = Utc::now();
+        restore_runs::Model {
+            id,
+            source_backup_id: 1,
+            source_service_id: service_id,
+            target_service_id: None,
+            target_service_name: None,
+            mode: "in_place".to_string(),
+            status: "running".to_string(),
+            phase: "restore".to_string(),
+            recovery_target: None,
+            parameter_overrides: serde_json::json!({}),
+            resume_token: None,
+            log_id: "log".to_string(),
+            error_message: None,
+            attempt: 1,
+            started_at: Some(now),
+            finished_at: None,
+            created_by: 1,
+            created_at: now,
+            updated_at: now,
+            cancel_requested_at: None,
+            cancel_requested_by: None,
+        }
+    }
+
+    fn new_run(service_id: i32) -> service_data_imports::ActiveModel {
+        service_data_imports::ActiveModel {
+            service_id: Set(service_id),
+            service_type: Set("postgres".to_string()),
+            target_database: Set("shop_production".to_string()),
+            source_display: Set("postgres://***:***@db.example.com:5432/shop".to_string()),
+            source_database: Set("shop".to_string()),
+            status: Set(STATUS_RUNNING.to_string()),
+            phase: Set(PHASE_PREPARING_TARGET.to_string()),
+            timeout_seconds: Set(3600),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_restore_writing_into_the_service_blocks_the_import_under_the_lock() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // SELECT ... FOR UPDATE on the service row
+            .append_query_results([vec![service_model(4)]])
+            // the restore check, made while that lock is held
+            .append_query_results([vec![restore_model(9, 4)]])
+            .into_connection();
+        let error = insert_run_locked(&db, 4, "shop_production", new_run(4))
+            .await
+            .expect_err("must refuse");
+        assert!(matches!(
+            error,
+            DataImportError::RestoreInProgress {
+                service_id: 4,
+                restore_run_id: 9
+            }
+        ));
+        let log = db.into_transaction_log();
+        let statements = format!("{log:?}");
+        assert!(statements.contains("FOR UPDATE"), "{statements}");
+        assert!(
+            !statements.contains("INSERT"),
+            "nothing recorded: {statements}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_run_is_recorded_under_the_service_lock() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![service_model(4)]])
+            .append_query_results([Vec::<restore_runs::Model>::new()])
+            .append_query_results([vec![run(11, 4, STATUS_RUNNING)]])
+            .into_connection();
+        let recorded = insert_run_locked(&db, 4, "shop_production", new_run(4))
+            .await
+            .expect("recorded");
+        assert_eq!(recorded.id, 11);
+        let statements = format!("{:?}", db.into_transaction_log());
+        let lock = statements.find("FOR UPDATE").expect("locked");
+        let insert = statements.find("INSERT").expect("inserted");
+        assert!(lock < insert, "the lock is taken before the insert");
     }
 
     #[tokio::test]

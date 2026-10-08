@@ -74,6 +74,15 @@ pub enum RestoreError {
         restore_run_id: i32,
     },
 
+    #[error(
+        "Service {service_id} is receiving imported data (data import {data_import_run_id}). \
+         Wait for the import to finish, or cancel it, before restoring onto this service."
+    )]
+    DataImportActive {
+        service_id: i32,
+        data_import_run_id: i32,
+    },
+
     #[error("Restore run {restore_run_id} is already {status}, so there is nothing to cancel")]
     RestoreNotActive { restore_run_id: i32, status: String },
 
@@ -2881,6 +2890,20 @@ async fn lock_and_insert_restore_run(
                 restore_run_id: active.id,
             });
         }
+        // A data import writes into the same service. Imports take this same
+        // row lock before checking for restores, so exactly one of the two
+        // can start.
+        if let Some(import) = temps_entities::service_data_imports::Entity::find()
+            .filter(temps_entities::service_data_imports::Column::ServiceId.eq(target_service_id))
+            .filter(temps_entities::service_data_imports::Column::Status.eq("running"))
+            .one(transaction)
+            .await?
+        {
+            return Err(RestoreError::DataImportActive {
+                service_id: target_service_id,
+                data_import_run_id: import.id,
+            });
+        }
     }
     Ok(run_active.insert(transaction).await?)
 }
@@ -5654,6 +5677,50 @@ mod tests {
         )
         .await
         .expect("new-service restore alongside an in-place one");
+
+        // A destructive restore onto a service that is receiving imported
+        // data is refused under the same lock imports take.
+        let importing = temps_entities::external_services::ActiveModel {
+            name: Set("catalog".to_string()),
+            service_type: Set("postgres".to_string()),
+            status: Set("running".to_string()),
+            topology: Set("standalone".to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert importing service");
+        let import = temps_entities::service_data_imports::ActiveModel {
+            service_id: Set(importing.id),
+            service_type: Set("postgres".to_string()),
+            target_database: Set("catalog_production".to_string()),
+            source_display: Set("postgres://***:***@db.example.com:5432/catalog".to_string()),
+            source_database: Set("catalog".to_string()),
+            status: Set("running".to_string()),
+            phase: Set("transferring".to_string()),
+            timeout_seconds: Set(3600),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert running data import");
+        let err = insert_restore_run(
+            db.as_ref(),
+            new_run(importing.id, backup.id, user.id, "in_place", None),
+            Some(backup.id),
+            importing.id,
+            true,
+        )
+        .await
+        .expect_err("a restore must not overlap a running import");
+        assert!(
+            matches!(
+                err,
+                RestoreError::DataImportActive { service_id, data_import_run_id }
+                    if service_id == importing.id && data_import_run_id == import.id
+            ),
+            "got {err:?}"
+        );
 
         // Fencing fails: the run stays active and keeps blocking.
         let failing = AssertingFence {

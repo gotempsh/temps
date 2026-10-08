@@ -65,10 +65,26 @@ const PRODUCER: &str = "DUMP=$(command -v mariadb-dump || command -v mysqldump) 
 /// Rewrites every DEFINER to the service user, then applies the dump as root.
 const CONSUMER: &str = "CLIENT=$(command -v mariadb || command -v mysql) || \
      { echo 'temps-import: neither mariadb nor mysql is in the image' >&2; exit 127; }; \
-     sed -e 's/DEFINER=`[^`]*`@`[^`]*`/DEFINER=`'\"$TEMPS_IMPORT_TARGET_DEFINER\"'`@`%`/g' | \
+     sed -E -e \"$TEMPS_IMPORT_DEFINER_SED\" | \
      MYSQL_PWD=\"$TEMPS_IMPORT_TARGET_PASSWORD\" MARIADB_PWD=\"$TEMPS_IMPORT_TARGET_PASSWORD\" \
      \"$CLIENT\" --host=\"$TEMPS_IMPORT_TARGET_HOST\" --port=\"$TEMPS_IMPORT_TARGET_PORT\" \
      --user=root --skip-ssl --default-character-set=utf8mb4 \"$TEMPS_IMPORT_TARGET_DATABASE\"";
+
+/// The `sed -E` program that rewrites definers to `user`@`%`.
+///
+/// Only definition statements are touched: the version-comment form
+/// `mariadb-dump` writes for views, triggers and events
+/// (`/*!50013 DEFINER=…`, `/*!50017 DEFINER=…`, `/*!50117 DEFINER=…`) and
+/// `CREATE DEFINER=…` at the start of a routine. Data lines (`INSERT …`)
+/// are skipped entirely, so a row value that happens to contain
+/// `DEFINER=` is imported byte for byte. `user` has passed
+/// `validate_identifier` (`[A-Za-z0-9_]`), so it cannot break the program.
+fn definer_sed_program(user: &str) -> String {
+    format!(
+        "/^INSERT /!{{s#/\\*!([0-9]{{5}}) DEFINER=`[^`]*`@`[^`]*`#/*!\\1 DEFINER=`{user}`@`%`#g;\
+         s#^CREATE DEFINER=`[^`]*`@`[^`]*`#CREATE DEFINER=`{user}`@`%`#;}}"
+    )
+}
 
 impl MariaDbService {
     fn import_config(&self, config: &ServiceConfig) -> Result<MariaDbConfig, DataImportError> {
@@ -176,6 +192,7 @@ impl DataImportEngine for MariaDbService {
                 .collect(),
             atomic: false,
             object_noun: "table".to_string(),
+            max_target_length: 63,
         }
     }
 
@@ -306,7 +323,10 @@ impl DataImportEngine for MariaDbService {
                 TransferEnv::plain("TEMPS_IMPORT_TARGET_HOST", target.host),
                 TransferEnv::plain("TEMPS_IMPORT_TARGET_PORT", target.port),
                 TransferEnv::secret("TEMPS_IMPORT_TARGET_PASSWORD", maria.root_password),
-                TransferEnv::plain("TEMPS_IMPORT_TARGET_DEFINER", maria.username),
+                TransferEnv::plain(
+                    "TEMPS_IMPORT_DEFINER_SED",
+                    definer_sed_program(&maria.username),
+                ),
                 TransferEnv::plain("TEMPS_IMPORT_TARGET_DATABASE", target.database),
             ],
         })
@@ -436,6 +456,17 @@ mod tests {
     }
 
     #[test]
+    fn definer_rewrite_skips_data_lines() {
+        let program = definer_sed_program("app");
+        assert!(program.starts_with("/^INSERT /!{"), "{program}");
+        assert!(program.contains("DEFINER=`app`@`%`"), "{program}");
+        assert!(
+            !program.contains("s/DEFINER="),
+            "no unanchored global rewrite: {program}"
+        );
+    }
+
+    #[test]
     fn hints_cover_the_common_failures() {
         let cases = [
             ("ERROR 1045 (28000): Access denied for user 'x'@'1.2.3.4'", "user name or password"),
@@ -542,7 +573,10 @@ mod tests {
                      CREATE TABLE items (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(64), name_len INT); \
                      CREATE DEFINER='legacy_owner'@'%' TRIGGER items_len BEFORE INSERT ON items \
                        FOR EACH ROW SET NEW.name_len = CHAR_LENGTH(NEW.name); \
-                     INSERT INTO items (name) SELECT CONCAT('item-', seq) FROM seq_1_to_120;"
+                     INSERT INTO items (name) SELECT CONCAT('item-', seq) FROM seq_1_to_120; \
+                     CREATE TABLE notes (id INT PRIMARY KEY, body TEXT); \
+                     INSERT INTO notes VALUES (1, 'kept DEFINER=`legacy_owner`@`%` as written'); \
+                     CREATE DEFINER='legacy_owner'@'%' PROCEDURE count_items() SELECT COUNT(*) FROM items;"
                         .to_string(),
                 ],
             )
@@ -649,11 +683,31 @@ mod tests {
             .await,
             "app@%"
         );
+        assert_eq!(
+            target_sql(
+                docker,
+                &target.name,
+                "SELECT DEFINER FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = 'shop_production'"
+            )
+            .await,
+            "app@%",
+            "routines are re-owned too"
+        );
+        assert_eq!(
+            target_sql(
+                docker,
+                &target.name,
+                "SELECT body FROM shop_production.notes WHERE id = 1"
+            )
+            .await,
+            "kept DEFINER=`legacy_owner`@`%` as written",
+            "row values must never be rewritten"
+        );
         let inspection = engine
             .inspect_target(&config, "shop_production")
             .await
             .expect("inspect");
-        assert_eq!(inspection.object_count, 1);
+        assert_eq!(inspection.object_count, 2);
         assert!(plan_target_preparation(1, "shop_production", inspection, false, "table").is_err());
     }
 }

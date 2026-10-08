@@ -27,8 +27,8 @@ use redis::AsyncCommands;
 use super::{RedisConfig, RedisService};
 use crate::data_import::source::{parse_source_url, scrub_secrets, SourceUrlRules};
 use crate::data_import::{
-    DataImportEngine, DataImportError, DataImportSpec, ImportSource, TargetInspection,
-    TargetPreparation, TransferEnv, TransferPlan, TransferTarget,
+    bounded_step, DataImportEngine, DataImportError, DataImportSpec, ImportSource,
+    TargetInspection, TargetPreparation, TransferEnv, TransferPlan, TransferTarget,
 };
 use crate::externalsvc::ServiceConfig;
 
@@ -165,6 +165,7 @@ impl DataImportEngine for RedisService {
                 .collect(),
             atomic: false,
             object_noun: "key".to_string(),
+            max_target_length: MAX_TARGET_LEN as u32,
         }
     }
 
@@ -248,13 +249,17 @@ impl DataImportEngine for RedisService {
         let redis = self.import_hydrate(config).await?;
         // Same allocation as provisioning: reuses the resource's DB when it
         // has one, otherwise claims a free one.
-        let db_number = self.allocate_database(database).await.map_err(|e| {
-            DataImportError::target(
-                service,
-                format!("allocate a logical database for '{database}'"),
-                scrub_secrets(&e.to_string(), std::slice::from_ref(&redis.password)),
-            )
-        })?;
+        let operation = format!("allocate a logical database for '{database}'");
+        let db_number = bounded_step(service, &operation, async {
+            self.allocate_database(database).await.map_err(|e| {
+                DataImportError::target(
+                    service,
+                    &operation,
+                    scrub_secrets(&e.to_string(), std::slice::from_ref(&redis.password)),
+                )
+            })
+        })
+        .await?;
         if preparation == TargetPreparation::Recreate {
             let mut conn = self.import_connection(service, &redis).await?;
             let operation = format!("flush '{database}' (DB {db_number})");

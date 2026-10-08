@@ -71,6 +71,8 @@ pub struct DataImportSpec {
     pub atomic: bool,
     /// What the engine stores data in, singular ("table", "collection").
     pub object_noun: String,
+    /// Longest target database name the engine accepts.
+    pub max_target_length: u32,
 }
 
 /// State of the target database before an import.
@@ -116,6 +118,33 @@ pub fn plan_target_preparation(
             object_noun: object_noun.to_string(),
         }),
     }
+}
+
+/// Upper bound on one whole control-plane step against the target service
+/// (inspecting it, or creating / replacing the database), whatever number of
+/// connections and queries the engine needs for it.
+pub const TARGET_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Run one target step bounded by [`TARGET_STEP_TIMEOUT`]. A step that does
+/// not finish in time fails with a [`DataImportError::Target`] naming it,
+/// instead of holding the import (and its database lock) forever.
+pub async fn bounded_step<T, F>(
+    service: &str,
+    operation: &str,
+    step: F,
+) -> Result<T, DataImportError>
+where
+    F: std::future::Future<Output = Result<T, DataImportError>>,
+{
+    tokio::time::timeout(TARGET_STEP_TIMEOUT, step)
+        .await
+        .unwrap_or_else(|_| {
+            Err(DataImportError::target(
+                service,
+                operation,
+                format!("did not finish within {}s", TARGET_STEP_TIMEOUT.as_secs()),
+            ))
+        })
 }
 
 /// Where the helper container reaches the target service.
@@ -405,6 +434,17 @@ mod tests {
         assert!(message.contains("'shop'"), "{message}");
         assert!(message.contains("3 collection(s)"), "{message}");
         assert!(message.contains("replace"), "{message}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_target_step_that_hangs_fails_with_its_name() {
+        let error = bounded_step::<(), _>("orders", "drop database 'shop'", std::future::pending())
+            .await
+            .expect_err("must time out");
+        let message = error.to_string();
+        assert!(matches!(error, DataImportError::Target { .. }));
+        assert!(message.contains("drop database 'shop'"), "{message}");
+        assert!(message.contains("'orders'"), "{message}");
     }
 
     #[test]

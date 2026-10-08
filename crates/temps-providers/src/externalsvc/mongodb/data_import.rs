@@ -10,9 +10,14 @@
 //! Not atomic: a failed import can leave some collections behind. The spec
 //! says so and the console warns.
 //!
-//! `mongodb+srv://` sources are refused: their hosts come from a DNS SRV
-//! lookup made by the tool itself, so they could be neither checked by the
-//! SSRF guard nor pinned to the checked address.
+//! The source is always one host, reached with `directConnection=true`: the
+//! tools then talk only to that host — the one the SSRF guard checked and
+//! pinned — instead of discovering replica-set members from the server's
+//! own topology, which could name addresses that were never checked. For a
+//! replica set, point the import at one member (a secondary is fine: a
+//! direct connection reads from it). `mongodb+srv://` sources are refused
+//! for the same reason: their hosts come from a DNS SRV lookup made by the
+//! tool itself.
 
 use std::time::Duration;
 
@@ -57,8 +62,6 @@ const SOURCE_RULES: SourceUrlRules<'static> = SourceUrlRules {
         "tlsAllowInvalidCertificates",
         "tlsAllowInvalidHostnames",
         "tlsInsecure",
-        "replicaSet",
-        "directConnection",
         "readPreference",
         "appName",
         "connectTimeoutMS",
@@ -68,7 +71,8 @@ const SOURCE_RULES: SourceUrlRules<'static> = SourceUrlRules {
         "compressors",
     ],
     options_case_insensitive: true,
-    max_hosts: 16,
+    // One host, reached directly: see the module documentation.
+    max_hosts: 1,
     default_database: None,
 };
 
@@ -167,6 +171,19 @@ fn data_collections(names: Vec<String>) -> i64 {
         .count() as i64
 }
 
+/// The source URL with `directConnection=true`, so the tools never follow
+/// the server's replica-set topology to hosts the SSRF guard did not check.
+/// The option itself is not accepted from callers, so it cannot be present
+/// twice.
+fn direct_connection_url(raw: &str) -> String {
+    let separator = match raw.split_once('?') {
+        Some((_, query)) if !query.is_empty() => "&",
+        Some(_) => "",
+        None => "?",
+    };
+    format!("{raw}{separator}directConnection=true")
+}
+
 fn validate_source_options(source: &ImportSource) -> Result<(), DataImportError> {
     for (name, value) in source.options() {
         let valid = match name.as_str() {
@@ -210,6 +227,7 @@ impl DataImportEngine for MongodbService {
                 .collect(),
             atomic: false,
             object_noun: "collection".to_string(),
+            max_target_length: MAX_DATABASE_LEN as u32,
         }
     }
 
@@ -221,9 +239,9 @@ impl DataImportEngine for MongodbService {
         {
             return Err(DataImportError::invalid_source(
                 "mongodb+srv:// connection strings are not supported: the hosts they resolve to \
-                 cannot be checked before connecting. Use your provider's standard connection \
-                 string, which lists the hosts (mongodb://host1:27017,host2:27017/app?\
-                 replicaSet=…&tls=true&authSource=admin)",
+                 cannot be checked before connecting. Use a standard connection string naming \
+                 one member of the replica set (mongodb://host1:27017/app?tls=true&\
+                 authSource=admin); the import connects to that member directly",
             ));
         }
         let source = parse_source_url(raw, &SOURCE_RULES)?;
@@ -364,7 +382,7 @@ impl DataImportEngine for MongodbService {
             producer: PRODUCER.to_string(),
             consumer: CONSUMER.to_string(),
             env: vec![
-                TransferEnv::secret("TEMPS_IMPORT_SOURCE", source.raw()),
+                TransferEnv::secret("TEMPS_IMPORT_SOURCE", direct_connection_url(source.raw())),
                 TransferEnv::plain("TEMPS_IMPORT_SOURCE_DATABASE", source.database()),
                 TransferEnv::secret("TEMPS_IMPORT_TARGET", target_url),
                 TransferEnv::secret("TEMPS_IMPORT_TARGET_PASSWORD", mongo.password),
@@ -424,15 +442,28 @@ mod tests {
     }
 
     #[test]
-    fn accepts_replica_set_urls_and_refuses_srv() {
+    fn source_is_one_host_and_refuses_discovery_and_srv() {
         let engine = service();
         let source = engine
-            .parse_source(
-                "mongodb://u:p@a.example.com:27017,b.example.com:27017/shop?replicaSet=rs0&tls=true&authsource=admin",
-            )
+            .parse_source("mongodb://u:p@a.example.com:27017/shop?tls=true&authsource=admin")
             .expect("valid");
-        assert_eq!(source.endpoints().len(), 2);
+        assert_eq!(source.endpoints().len(), 1);
         assert_eq!(source.option("authSource"), Some("admin"));
+        // Several seeds would let the driver discover and dial members the
+        // SSRF guard never checked; so would choosing the topology.
+        for url in [
+            "mongodb://u:p@a.example.com:27017,b.example.com:27017/shop",
+            "mongodb://u:p@a.example.com/shop?replicaSet=rs0",
+            "mongodb://u:p@a.example.com/shop?directConnection=false",
+        ] {
+            assert!(
+                matches!(
+                    engine.parse_source(url),
+                    Err(DataImportError::InvalidSource { .. })
+                ),
+                "{url}"
+            );
+        }
 
         let error = engine
             .parse_source("mongodb+srv://u:p@cluster0.example.com/shop")
@@ -457,6 +488,22 @@ mod tests {
                 "{url}"
             );
         }
+    }
+
+    #[test]
+    fn transfer_url_forces_a_direct_connection() {
+        assert_eq!(
+            direct_connection_url("mongodb://u:p@h.example.com:27017/shop"),
+            "mongodb://u:p@h.example.com:27017/shop?directConnection=true"
+        );
+        assert_eq!(
+            direct_connection_url("mongodb://u:p@h.example.com/shop?tls=true"),
+            "mongodb://u:p@h.example.com/shop?tls=true&directConnection=true"
+        );
+        assert_eq!(
+            direct_connection_url("mongodb://h.example.com/shop?"),
+            "mongodb://h.example.com/shop?directConnection=true"
+        );
     }
 
     #[test]

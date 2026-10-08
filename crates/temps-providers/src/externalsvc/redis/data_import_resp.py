@@ -6,8 +6,15 @@
 # Run as two halves joined by a pipe, so a failure is attributed to the side
 # that caused it (see `data_import::runner::compose_script`):
 #
-#   python3 -c "$SCRIPT" produce   # source: SCAN + DUMP + PTTL -> RESP RESTOREs on stdout
-#   python3 -c "$SCRIPT" consume   # target: RESP RESTOREs on stdin -> SELECT db, pipeline
+#   python3 -c "$SCRIPT" produce   # source: SCAN + DUMP + PTTL -> key frames on stdout
+#   python3 -c "$SCRIPT" consume   # target: key frames on stdin -> SELECT db, RESTORE
+#
+# Between the halves each key travels as a RESP array
+# ["KEY", name, expire_at_ms, payload], where expire_at_ms is an absolute
+# time on this container's clock (0 = no expiry). The consumer turns it
+# back into the time left at the moment it sends RESTORE, so keys queued
+# between the halves do not live longer than on the source, and no clock
+# outside this container is involved.
 #
 # DUMP/RESTORE is used rather than replication (SYNC/PSYNC) or an RDB file
 # because hosted Redis services commonly disable replication commands but
@@ -21,6 +28,7 @@ import os
 import socket
 import ssl
 import sys
+import time
 
 SCAN_COUNT = 1000
 # Commands sent to the target before replies are read back.
@@ -115,6 +123,10 @@ class Reader(object):
         raise ValueError("unexpected RESP type %r" % kind)
 
 
+def now_ms():
+    return time.time_ns() // 1_000_000
+
+
 def show(key):
     text = repr(key)
     return text if len(text) <= 80 else text[:77] + "..."
@@ -183,6 +195,9 @@ def produce():
         reply = call(side, sock, reader, "SCAN", cursor, "COUNT", SCAN_COUNT)
         cursor, keys = reply[0], reply[1]
         if keys:
+            # Taken before asking: PTTL is measured after this instant, so
+            # sent_at + PTTL never lands later than the source's expiry.
+            sent_at = now_ms()
             sock.sendall(b"".join(encode("DUMP", k) + encode("PTTL", k) for k in keys))
             for key in keys:
                 payload = reader.reply()
@@ -190,11 +205,12 @@ def produce():
                 for result in (payload, ttl):
                     if isinstance(result, RedisError):
                         fail(side, "reading key %s failed: %s" % (show(key), result))
-                # Deleted or expired between SCAN and DUMP: nothing to copy.
-                if payload is None or ttl == -2:
+                # Deleted or expired since SCAN (-2), or expiring right now
+                # (0): nothing to copy. -1 means the key never expires.
+                if payload is None or ttl == -2 or ttl == 0:
                     continue
-                # REPLACE: SCAN may return a key twice.
-                out.write(encode("RESTORE", key, max(ttl, 0), payload, "REPLACE"))
+                expire_at = 0 if ttl == -1 else sent_at + ttl
+                out.write(encode("KEY", key, expire_at, payload))
                 copied += 1
             if copied and copied % 50000 < len(keys):
                 sys.stderr.write("temps-import: read %d keys\n" % copied)
@@ -218,7 +234,7 @@ def consume():
     call(side, sock, reader, "SELECT", int(env["TEMPS_IMPORT_TARGET_DATABASE"]))
 
     source = Reader(sys.stdin.buffer.read1)
-    batch, keys, size, written = [], [], 0, 0
+    batch, keys, size, written, expired = [], [], 0, 0, 0
 
     def flush():
         sock.sendall(b"".join(batch))
@@ -228,12 +244,22 @@ def consume():
                 fail(side, "restoring key %s failed: %s" % (show(key), reply))
 
     while not source.at_eof():
-        command = source.reply()
-        if not isinstance(command, list) or len(command) < 2:
+        frame = source.reply()
+        if not isinstance(frame, list) or len(frame) != 4 or frame[0] != b"KEY":
             fail(side, "unexpected input from the source side")
-        encoded = encode(*command)
+        key, expire_at, payload = frame[1], int(frame[2]), frame[3]
+        if expire_at:
+            remaining = expire_at - now_ms()
+            if remaining <= 0:
+                # Expired while queued: on the source it is gone too.
+                expired += 1
+                continue
+        else:
+            remaining = 0
+        # REPLACE: SCAN may return a key twice. TTL 0 means no expiry.
+        encoded = encode("RESTORE", key, remaining, payload, "REPLACE")
         batch.append(encoded)
-        keys.append(command[1])
+        keys.append(key)
         size += len(encoded)
         if len(batch) >= TARGET_BATCH or size >= TARGET_BATCH_BYTES:
             flush()
@@ -243,6 +269,11 @@ def consume():
         flush()
         written += len(batch)
     sys.stderr.write("temps-import: restored %d keys into the target\n" % written)
+    if expired:
+        sys.stderr.write(
+            "temps-import: skipped %d keys that expired before they could be restored\n"
+            % expired
+        )
 
 
 if __name__ == "__main__":

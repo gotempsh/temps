@@ -21,8 +21,8 @@ use crate::data_import::source::{
     parse_source_url, percent_encode_userinfo, scrub_secrets, SourceUrlRules,
 };
 use crate::data_import::{
-    DataImportEngine, DataImportError, DataImportSpec, ImportSource, TargetInspection,
-    TargetPreparation, TransferEnv, TransferPlan, TransferTarget,
+    bounded_step, DataImportEngine, DataImportError, DataImportSpec, ImportSource,
+    TargetInspection, TargetPreparation, TransferEnv, TransferPlan, TransferTarget,
 };
 use crate::externalsvc::ServiceConfig;
 
@@ -134,78 +134,9 @@ impl PostgresService {
                 )
             })
     }
-}
 
-fn sql_error(
-    service: &str,
-    operation: &str,
-    pg: &PostgresConfig,
-    e: sqlx::Error,
-) -> DataImportError {
-    DataImportError::target(
-        service,
-        operation,
-        scrub_secrets(&e.to_string(), std::slice::from_ref(&pg.password)),
-    )
-}
-
-/// Reject option values libpq would misread or that make no sense here.
-fn validate_source_options(source: &ImportSource) -> Result<(), DataImportError> {
-    for (name, value) in source.options() {
-        let valid = match name.as_str() {
-            "sslmode" => SSL_MODES.contains(&value.as_str()),
-            "target_session_attrs" => TARGET_SESSION_ATTRS.contains(&value.as_str()),
-            "connect_timeout" => !value.is_empty() && value.chars().all(|c| c.is_ascii_digit()),
-            _ => value
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')),
-        };
-        if !valid {
-            return Err(DataImportError::invalid_source(format!(
-                "option '{name}' has an unsupported value '{value}'"
-            )));
-        }
-    }
-    Ok(())
-}
-
-#[async_trait]
-impl DataImportEngine for PostgresService {
-    fn import_spec(&self) -> DataImportSpec {
-        DataImportSpec {
-            engine_label: "PostgreSQL".to_string(),
-            source_schemes: SOURCE_RULES.schemes.iter().map(|s| s.to_string()).collect(),
-            source_url_example: "postgres://user:password@db.example.com:5432/app?sslmode=require"
-                .to_string(),
-            allowed_source_options: SOURCE_RULES
-                .allowed_options
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-            atomic: true,
-            object_noun: "table".to_string(),
-        }
-    }
-
-    fn parse_source(&self, raw: &str) -> Result<ImportSource, DataImportError> {
-        let source = parse_source_url(raw, &SOURCE_RULES)?;
-        validate_source_options(&source)?;
-        Ok(source)
-    }
-
-    fn validate_target_database(&self, database: &str) -> Result<(), DataImportError> {
-        Self::validate_database_name(database)
-            .map_err(|e| DataImportError::invalid_target_database(database, e.to_string()))?;
-        if RESERVED_DATABASES.contains(&database) {
-            return Err(DataImportError::invalid_target_database(
-                database,
-                "it is a PostgreSQL system database",
-            ));
-        }
-        Ok(())
-    }
-
-    async fn inspect_target(
+    /// Body of `inspect_target`, bounded there.
+    async fn import_inspect(
         &self,
         config: &ServiceConfig,
         database: &str,
@@ -242,7 +173,8 @@ impl DataImportEngine for PostgresService {
         })
     }
 
-    async fn prepare_target(
+    /// Body of `prepare_target`, bounded there.
+    async fn import_prepare(
         &self,
         config: &ServiceConfig,
         database: &str,
@@ -303,6 +235,104 @@ impl DataImportEngine for PostgresService {
                     e.to_string(),
                 )
             })
+    }
+}
+
+fn sql_error(
+    service: &str,
+    operation: &str,
+    pg: &PostgresConfig,
+    e: sqlx::Error,
+) -> DataImportError {
+    DataImportError::target(
+        service,
+        operation,
+        scrub_secrets(&e.to_string(), std::slice::from_ref(&pg.password)),
+    )
+}
+
+/// Reject option values libpq would misread or that make no sense here.
+fn validate_source_options(source: &ImportSource) -> Result<(), DataImportError> {
+    for (name, value) in source.options() {
+        let valid = match name.as_str() {
+            "sslmode" => SSL_MODES.contains(&value.as_str()),
+            "target_session_attrs" => TARGET_SESSION_ATTRS.contains(&value.as_str()),
+            "connect_timeout" => !value.is_empty() && value.chars().all(|c| c.is_ascii_digit()),
+            _ => value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')),
+        };
+        if !valid {
+            return Err(DataImportError::invalid_source(format!(
+                "option '{name}' has an unsupported value '{value}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[async_trait]
+impl DataImportEngine for PostgresService {
+    fn import_spec(&self) -> DataImportSpec {
+        DataImportSpec {
+            engine_label: "PostgreSQL".to_string(),
+            source_schemes: SOURCE_RULES.schemes.iter().map(|s| s.to_string()).collect(),
+            source_url_example: "postgres://user:password@db.example.com:5432/app?sslmode=require"
+                .to_string(),
+            allowed_source_options: SOURCE_RULES
+                .allowed_options
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            atomic: true,
+            object_noun: "table".to_string(),
+            max_target_length: 63,
+        }
+    }
+
+    fn parse_source(&self, raw: &str) -> Result<ImportSource, DataImportError> {
+        let source = parse_source_url(raw, &SOURCE_RULES)?;
+        validate_source_options(&source)?;
+        Ok(source)
+    }
+
+    fn validate_target_database(&self, database: &str) -> Result<(), DataImportError> {
+        Self::validate_database_name(database)
+            .map_err(|e| DataImportError::invalid_target_database(database, e.to_string()))?;
+        if RESERVED_DATABASES.contains(&database) {
+            return Err(DataImportError::invalid_target_database(
+                database,
+                "it is a PostgreSQL system database",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn inspect_target(
+        &self,
+        config: &ServiceConfig,
+        database: &str,
+    ) -> Result<TargetInspection, DataImportError> {
+        bounded_step(
+            &config.name,
+            &format!("inspect database '{database}'"),
+            self.import_inspect(config, database),
+        )
+        .await
+    }
+
+    async fn prepare_target(
+        &self,
+        config: &ServiceConfig,
+        database: &str,
+        preparation: TargetPreparation,
+    ) -> Result<(), DataImportError> {
+        bounded_step(
+            &config.name,
+            &format!("prepare database '{database}'"),
+            self.import_prepare(config, database, preparation),
+        )
+        .await
     }
 
     fn target_container(&self, config: &ServiceConfig) -> Result<String, DataImportError> {

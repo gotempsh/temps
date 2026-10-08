@@ -230,14 +230,27 @@ async fn ensure_image(
         })
 }
 
-/// Start the helper and wait for it, bounded by the request's timeout.
-///
-/// Returns `Err` only when the helper could not be started; once it runs,
-/// every ending is a [`HelperOutcome`]. The container is always removed.
+/// Create, start and wait for the helper, then stop it. Convenience for
+/// callers with no cancellation to honour between the steps (tests); the
+/// import job uses [`create_helper`] and [`start_and_wait`] directly.
 pub async fn run_helper(
     docker: &Docker,
     request: &HelperRequest<'_>,
 ) -> Result<HelperOutcome, DataImportError> {
+    let id = create_helper(docker, request).await?;
+    let outcome = start_and_wait(docker, &id, request).await;
+    ensure_helper_stopped(docker, request.service_id, &id).await?;
+    outcome
+}
+
+/// Pull the image if needed and create (but do not start) the helper.
+/// Returns the container id. Splitting creation from start lets the caller
+/// check for a cancellation that arrived during a slow image pull before
+/// anything runs.
+pub async fn create_helper(
+    docker: &Docker,
+    request: &HelperRequest<'_>,
+) -> Result<String, DataImportError> {
     let service_id = request.service_id;
     ensure_image(docker, service_id, &request.plan.image).await?;
 
@@ -292,11 +305,27 @@ pub async fn run_helper(
         ),
     })?;
 
+    Ok(created.id)
+}
+
+/// Start a helper created by [`create_helper`] and wait for it, bounded by
+/// the request's timeout.
+///
+/// Returns `Err` only when the helper could not be started (for instance
+/// because a cancellation removed it first); once it runs, every ending is
+/// a [`HelperOutcome`]. The helper is removed on a best-effort basis; the
+/// caller must confirm it stopped with [`ensure_helper_stopped`].
+pub async fn start_and_wait(
+    docker: &Docker,
+    container_id: &str,
+    request: &HelperRequest<'_>,
+) -> Result<HelperOutcome, DataImportError> {
+    let service_id = request.service_id;
     if let Err(e) = docker
-        .start_container(&created.id, None::<StartContainerOptions>)
+        .start_container(container_id, None::<StartContainerOptions>)
         .await
     {
-        remove_container(docker, &created.id).await;
+        remove_container(docker, container_id).await;
         return Err(DataImportError::Helper {
             service_id,
             reason: format!(
@@ -314,7 +343,7 @@ pub async fn run_helper(
         "Started data import helper"
     );
 
-    let mut wait = docker.wait_container(&created.id, None::<WaitContainerOptions>);
+    let mut wait = docker.wait_container(container_id, None::<WaitContainerOptions>);
     let waited = tokio::time::timeout(request.timeout, wait.next()).await;
     let outcome = match waited {
         // bollard reports a non-zero exit as an error carrying the code.
@@ -327,14 +356,14 @@ pub async fn run_helper(
             reason: "the Docker wait stream ended without an exit status".to_string(),
         }),
         Err(_) => {
-            let output = log_tail(docker, &created.id, request.secrets).await;
+            let output = log_tail(docker, container_id, request.secrets).await;
             Err(HelperOutcome::TimedOut { output })
         }
     };
 
     let result = match outcome {
         Ok(exit_code) => {
-            let output = log_tail(docker, &created.id, request.secrets).await;
+            let output = log_tail(docker, container_id, request.secrets).await;
             match exit_code {
                 0 => HelperOutcome::Succeeded { output },
                 SOURCE_FAILED_EXIT => HelperOutcome::SourceFailed { output },
@@ -344,7 +373,7 @@ pub async fn run_helper(
         }
         Err(outcome) => outcome,
     };
-    remove_container(docker, &created.id).await;
+    remove_container(docker, container_id).await;
     Ok(result)
 }
 
@@ -400,6 +429,75 @@ async fn remove_container(docker: &Docker, container: &str) {
         })) => {}
         Ok(Err(e)) => warn!(container, "Could not remove data import helper: {}", e),
         Err(_) => warn!(container, "Removing data import helper timed out"),
+    }
+}
+
+/// Confirm the helper can no longer write: it is gone, or it exists but is
+/// not running. A running helper is killed and removed first. Returns an
+/// error when that cannot be confirmed (Docker unreachable, kill refused);
+/// the caller must then keep the run — and with it the database lock — and
+/// try again.
+pub async fn ensure_helper_stopped(
+    docker: &Docker,
+    service_id: i32,
+    container: &str,
+) -> Result<(), DataImportError> {
+    let unconfirmed = |reason: String| DataImportError::Helper {
+        service_id,
+        reason: format!("could not confirm helper '{container}' stopped: {reason}"),
+    };
+    if !helper_running(docker, container)
+        .await
+        .map_err(unconfirmed)?
+    {
+        remove_container(docker, container).await;
+        return Ok(());
+    }
+    // Still writing: force-remove kills it.
+    tokio::time::timeout(
+        DOCKER_API_TIMEOUT,
+        docker.remove_container(
+            container,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        ),
+    )
+    .await
+    .map_err(|_| unconfirmed("removing it timed out".to_string()))?
+    .or_else(|e| match e {
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        } => Ok(()),
+        other => Err(unconfirmed(other.to_string())),
+    })?;
+    if helper_running(docker, container)
+        .await
+        .map_err(unconfirmed)?
+    {
+        return Err(unconfirmed("it is still running after removal".to_string()));
+    }
+    Ok(())
+}
+
+/// Whether `container` exists and is running. `Err` when Docker cannot say.
+async fn helper_running(docker: &Docker, container: &str) -> Result<bool, String> {
+    match tokio::time::timeout(
+        DOCKER_API_TIMEOUT,
+        docker.inspect_container(container, None::<InspectContainerOptions>),
+    )
+    .await
+    {
+        Err(_) => Err("inspecting it timed out".to_string()),
+        Ok(Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        })) => Ok(false),
+        Ok(Err(e)) => Err(e.to_string()),
+        Ok(Ok(inspect)) => Ok(inspect
+            .state
+            .and_then(|state| state.running)
+            .unwrap_or(false)),
     }
 }
 
@@ -552,6 +650,67 @@ mod tests {
         let bounded = bound_output(&long);
         assert!(bounded.ends_with("ERROR: relation exists"));
         assert!(bounded.chars().count() <= LOG_TAIL_MAX_CHARS + 1);
+    }
+
+    /// A helper that is still running is killed and gone afterwards; one that
+    /// no longer exists counts as stopped. This is what keeps a run (and its
+    /// database lock) held until no writer can survive it.
+    #[tokio::test]
+    async fn ensure_helper_stopped_kills_a_running_helper() {
+        let Ok(docker) = Docker::connect_with_local_defaults() else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let image = "python:3.13-slim";
+        if ensure_image(&docker, 1, image).await.is_err() {
+            println!("{image} not available, skipping");
+            return;
+        }
+        let name = format!(
+            "temps-data-import-stop-test-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        );
+        docker
+            .create_container(
+                Some(CreateContainerOptionsBuilder::new().name(&name).build()),
+                ContainerCreateBody {
+                    image: Some(image.to_string()),
+                    cmd: Some(vec!["sleep".to_string(), "300".to_string()]),
+                    labels: Some(helper_labels(-1, 1)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create");
+        docker
+            .start_container(&name, None::<StartContainerOptions>)
+            .await
+            .expect("start");
+
+        ensure_helper_stopped(&docker, 1, &name)
+            .await
+            .expect("stopped");
+        let gone = docker
+            .inspect_container(&name, None::<InspectContainerOptions>)
+            .await;
+        assert!(
+            matches!(
+                gone,
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404,
+                    ..
+                })
+            ),
+            "helper must be gone: {gone:?}"
+        );
+        // Already gone: nothing left to stop.
+        ensure_helper_stopped(&docker, 1, &name)
+            .await
+            .expect("absent helper counts as stopped");
     }
 
     /// Runs the composed script in a real shell to prove each side's failure
