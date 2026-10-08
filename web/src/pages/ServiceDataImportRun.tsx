@@ -235,7 +235,9 @@ function RunBody({
       />
     )
   }
-  if (isError) {
+  // A failed refresh keeps the details already loaded, under a stale-data
+  // warning; only a run that never loaded shows the error alone.
+  if (isError && !run) {
     return (
       <ReadFailure
         resource="import"
@@ -256,6 +258,15 @@ function RunBody({
   }
   return (
     <div className="space-y-6">
+      {isError && (
+        <ReadFailure
+          resource="import"
+          error={error}
+          cached
+          onRetry={onRetry}
+          retrying={retrying}
+        />
+      )}
       <OutcomeCard run={run} objectNoun={objectNoun} />
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
         <Card className="lg:col-span-1">
