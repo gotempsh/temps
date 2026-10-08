@@ -47,9 +47,58 @@ pub struct AppState {
     /// changes. Absent when application workspaces are not installed.
     pub application_network_reconciler:
         Option<Arc<dyn temps_core::ApplicationDataNetworkReconciler>>,
+    /// Imports data from external databases into managed services.
+    pub data_import_service: Arc<crate::data_import::DataImportService>,
+    /// Step-up verification for destructive operations (replacing a
+    /// database with imported data).
+    pub sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
     /// Answers whether any notification destination exists, so the health
     /// card can say who (if anyone) a down alarm could have reached.
     pub notification_service: Arc<dyn temps_core::notifications::NotificationService>,
+}
+
+/// Test doubles for the parts of [`AppState`] handler tests rarely exercise.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::Arc;
+
+    use temps_core::{
+        SensitiveAction, SensitiveActionAuthorizationError, SensitiveActionAuthorizer,
+        SensitiveActionDecision, SensitiveActionPrincipal,
+    };
+
+    /// Allows every sensitive action.
+    pub(crate) struct AllowSensitiveActions;
+
+    #[async_trait::async_trait]
+    impl SensitiveActionAuthorizer for AllowSensitiveActions {
+        async fn authorize(
+            &self,
+            _action: &SensitiveAction,
+            _principal: &SensitiveActionPrincipal,
+        ) -> Result<SensitiveActionDecision, SensitiveActionAuthorizationError> {
+            Ok(SensitiveActionDecision::Allow)
+        }
+    }
+
+    pub(crate) fn allow_sensitive_actions() -> Arc<dyn SensitiveActionAuthorizer> {
+        Arc::new(AllowSensitiveActions)
+    }
+
+    /// A data import service with Docker disabled.
+    pub(crate) fn data_import_service(
+        manager: Arc<crate::services::ExternalServiceManager>,
+        db: Arc<sea_orm::DatabaseConnection>,
+    ) -> Arc<crate::data_import::DataImportService> {
+        Arc::new(crate::data_import::DataImportService::new(
+            db,
+            manager,
+            Arc::new(temps_core::DockerHandle::disabled(
+                "control-plane",
+                "handler test",
+            )),
+        ))
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]

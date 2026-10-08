@@ -68,11 +68,21 @@ impl TempsPlugin for ProvidersPlugin {
             let external_service_manager = Arc::new(ExternalServiceManager::new_with_handle(
                 db.clone(),
                 encryption_service.clone(),
-                docker_handle,
+                docker_handle.clone(),
                 local_workloads.local_workloads_enabled(),
                 dns_registry,
             ));
             context.register_service(external_service_manager.clone());
+
+            // Imports of external databases into managed services. Registered
+            // on every process so the console can always explain whether an
+            // import is possible here.
+            let data_import_service = Arc::new(crate::data_import::DataImportService::new(
+                db.clone(),
+                external_service_manager.clone(),
+                docker_handle,
+            ));
+            context.register_service(data_import_service.clone());
 
             let sandbox_runtime_credentials: Arc<
                 dyn temps_core::SandboxRuntimeCredentialsProvider,
@@ -101,6 +111,44 @@ impl TempsPlugin for ProvidersPlugin {
                 );
                 tracing::debug!("Providers plugin services registered successfully");
                 return Ok(());
+            }
+
+            // Imports left `running` by a previous process have no owner any
+            // more. Snapshot them now, before this process can start one, so
+            // a fresh import is never mistaken for an orphan; then stop their
+            // helpers and mark them interrupted in the background.
+            // The snapshot must be taken here, before routes serve, so a
+            // failed read is retried a few times in place rather than later.
+            let mut snapshot = crate::data_import::active_import_run_ids(db.as_ref()).await;
+            for delay_secs in [1, 2, 4] {
+                if snapshot.is_ok() {
+                    break;
+                }
+                tracing::warn!(
+                    retry_in_secs = delay_secs,
+                    "Could not list data imports interrupted by a restart; retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                snapshot = crate::data_import::active_import_run_ids(db.as_ref()).await;
+            }
+            match snapshot {
+                Ok(run_ids) if run_ids.is_empty() => {}
+                Ok(run_ids) => {
+                    let data_import_service = data_import_service.clone();
+                    tokio::spawn(async move {
+                        let settled = data_import_service.reconcile_interrupted(&run_ids).await;
+                        tracing::info!(
+                            found = run_ids.len(),
+                            settled,
+                            "Reconciled data imports interrupted by a restart"
+                        );
+                    });
+                }
+                Err(error) => tracing::error!(
+                    error = %error,
+                    "Could not list data imports interrupted by a restart; they stay running \
+                     until the next start"
+                ),
             }
 
             // Spawn role reconcilers for every cluster that's already
@@ -207,6 +255,10 @@ impl TempsPlugin for ProvidersPlugin {
         let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
         let application_network_reconciler =
             context.get_service::<dyn temps_core::ApplicationDataNetworkReconciler>();
+        let data_import_service =
+            context.require_service::<crate::data_import::DataImportService>();
+        let sensitive_action_authorizer =
+            context.require_service::<dyn temps_core::SensitiveActionAuthorizer>();
         let notification_service =
             context.require_service::<dyn temps_core::notifications::NotificationService>();
 
@@ -223,15 +275,21 @@ impl TempsPlugin for ProvidersPlugin {
             telemetry,
             project_access_checker,
             application_network_reconciler,
+            data_import_service,
+            sensitive_action_authorizer,
             notification_service,
         });
 
         // Configure routes with the app state
         let providers_routes = handlers::configure_routes().with_state(app_state.clone());
-        let pg_stat_routes =
-            crate::handlers::pg_stat_statements_handlers::configure_routes().with_state(app_state);
+        let pg_stat_routes = crate::handlers::pg_stat_statements_handlers::configure_routes()
+            .with_state(app_state.clone());
+        let data_import_routes =
+            crate::handlers::data_import_handlers::configure_routes().with_state(app_state);
 
-        let router = providers_routes.merge(pg_stat_routes);
+        let router = providers_routes
+            .merge(pg_stat_routes)
+            .merge(data_import_routes);
         Some(PluginRoutes::new(router))
     }
 
@@ -240,7 +298,9 @@ impl TempsPlugin for ProvidersPlugin {
         let base = <handlers::ExternalServiceApiDoc as OpenApiTrait>::openapi();
         use crate::handlers::pg_stat_statements_handlers::PgStatStatementsApiDoc;
         let pg_stat = <PgStatStatementsApiDoc as OpenApiTrait>::openapi();
-        Some(merge_openapi_schemas(base, vec![pg_stat]))
+        use crate::handlers::data_import_handlers::DataImportApiDoc;
+        let data_import = <DataImportApiDoc as OpenApiTrait>::openapi();
+        Some(merge_openapi_schemas(base, vec![pg_stat, data_import]))
     }
 }
 

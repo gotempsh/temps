@@ -59,6 +59,13 @@ impl From<RestoreError> for Problem {
                     .with_detail(error.to_string())
                     .with_value("active_restore_run_id", restore_run_id)
             }
+            RestoreError::DataImportActive {
+                data_import_run_id, ..
+            } => problemdetails::new(StatusCode::CONFLICT)
+                .with_type("https://temps.sh/probs/data-import-active")
+                .with_title("Data Import In Progress")
+                .with_detail(error.to_string())
+                .with_value("active_data_import_run_id", data_import_run_id),
             RestoreError::RestoreNotActive { ref status, .. } => {
                 let status = status.clone();
                 problemdetails::new(StatusCode::CONFLICT)
@@ -375,7 +382,7 @@ use crate::handlers::authz::{
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "Backup or service not found", body = ProblemDetails),
-        (status = 409, description = "Conflict: a destructive cross-service restore requires explicit confirmation (`cross-service-restore-not-confirmed`), another restore is already active on this service (`restore-already-active`, with `active_restore_run_id`), or the backup is being deleted", body = ProblemDetails),
+        (status = 409, description = "Conflict: a destructive cross-service restore requires explicit confirmation (`cross-service-restore-not-confirmed`), another restore is already active on this service (`restore-already-active`, with `active_restore_run_id`), data is being imported into it (`data-import-active`, with `active_data_import_run_id`), or the backup is being deleted", body = ProblemDetails),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1031,6 +1038,29 @@ mod tests {
         assert_eq!(
             problem.body.get("type").and_then(|t| t.as_str()),
             Some("https://temps.sh/probs/restore-cancelled")
+        );
+    }
+
+    /// A restore onto a service that is receiving imported data is a
+    /// conflict naming the import, so the client can open it.
+    #[test]
+    fn active_data_import_maps_to_409_naming_the_import() {
+        let problem: Problem = RestoreError::DataImportActive {
+            service_id: 7,
+            data_import_run_id: 13,
+        }
+        .into();
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert_eq!(
+            problem.body.get("type").and_then(|t| t.as_str()),
+            Some("https://temps.sh/probs/data-import-active")
+        );
+        assert_eq!(
+            problem
+                .body
+                .get("active_data_import_run_id")
+                .and_then(|id| id.as_i64()),
+            Some(13)
         );
     }
 

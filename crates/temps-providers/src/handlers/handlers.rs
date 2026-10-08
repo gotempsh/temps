@@ -3846,6 +3846,12 @@ mod tests {
         });
         let state = Arc::new(AppState {
             external_service_manager: manager.clone(),
+            data_import_service: crate::handlers::types::test_support::data_import_service(
+                manager.clone(),
+                db.clone(),
+            ),
+            sensitive_action_authorizer:
+                crate::handlers::types::test_support::allow_sensitive_actions(),
             audit_service: Arc::new(RecordingAuditLogger::default()),
             query_service: Arc::new(crate::QueryService::new(manager)),
             health_monitor: None,
@@ -4441,6 +4447,12 @@ mod tests {
         let audit_logger = RecordingAuditLogger::default();
         let state = Arc::new(AppState {
             external_service_manager: manager.clone(),
+            data_import_service: crate::handlers::types::test_support::data_import_service(
+                manager.clone(),
+                db.clone(),
+            ),
+            sensitive_action_authorizer:
+                crate::handlers::types::test_support::allow_sensitive_actions(),
             audit_service: Arc::new(audit_logger.clone()),
             query_service: Arc::new(crate::QueryService::new(manager)),
             health_monitor: None,
