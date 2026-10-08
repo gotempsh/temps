@@ -130,6 +130,7 @@ import {
   Radio,
   RefreshCcw,
   RotateCcw,
+  DatabaseZap,
   ScrollText,
   Server,
   Trash2,
@@ -892,6 +893,15 @@ export function ServiceDetail() {
                 >
                   <RotateCcw className="h-4 w-4 mr-2" />
                   Restore…
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  className="min-h-12 sm:min-h-8"
+                  onClick={() =>
+                    navigate(`/storage/${parseInt(id!)}/import-data`)
+                  }
+                >
+                  <DatabaseZap className="h-4 w-4 mr-2" />
+                  Import data…
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   className="min-h-12 sm:min-h-8"
