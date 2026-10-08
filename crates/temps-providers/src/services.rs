@@ -1429,6 +1429,18 @@ pub struct ServiceHealthSnapshot {
     pub uptime_24h_percent: Option<f64>,
     /// Most recent check results, newest-first.
     pub recent_checks: Vec<HealthCheckEntry>,
+    /// The still-open (firing or acknowledged) down alarm for this service.
+    /// Only looked up once the failure streak reaches the alert threshold.
+    pub down_alarm: Option<ServiceDownAlarm>,
+}
+
+/// The open `external_service_down` alarm raised by the health monitor.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ServiceDownAlarm {
+    pub alarm_id: i32,
+    pub status: String,
+    pub fired_at: chrono::DateTime<chrono::Utc>,
+    pub silenced_until: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Minimal per-service status entry returned by `list_health_statuses`.
@@ -3857,6 +3869,14 @@ impl ExternalServiceManager {
         // 24h uptime percentage based on stored history.
         let uptime_24h_percent = compute_uptime_percent(&recent_checks, 24);
 
+        let down_alarm = if service.consecutive_health_failures
+            >= crate::health_monitor::CONSECUTIVE_FAILURES_BEFORE_ALERT
+        {
+            self.open_down_alarm(service_id).await?
+        } else {
+            None
+        };
+
         Ok(ServiceHealthSnapshot {
             service_id,
             status: service.health_status,
@@ -3866,7 +3886,36 @@ impl ExternalServiceManager {
             response_time_ms,
             uptime_24h_percent,
             recent_checks,
+            down_alarm,
         })
+    }
+
+    /// The newest unresolved down alarm the health monitor raised for this
+    /// service, if any. An alarm row is what the monitor actually records;
+    /// whether a notification reached anyone is not tracked per alarm.
+    async fn open_down_alarm(
+        &self,
+        service_id: i32,
+    ) -> Result<Option<ServiceDownAlarm>, ExternalServiceError> {
+        use temps_monitoring::alarm_service::{AlarmStatus, AlarmType};
+
+        let alarm = temps_entities::alarms::Entity::find()
+            .filter(temps_entities::alarms::Column::ServiceId.eq(service_id))
+            .filter(
+                temps_entities::alarms::Column::AlarmType
+                    .eq(AlarmType::ExternalServiceDown.as_str()),
+            )
+            .filter(temps_entities::alarms::Column::Status.ne(AlarmStatus::Resolved.as_str()))
+            .order_by_desc(temps_entities::alarms::Column::FiredAt)
+            .one(self.db.as_ref())
+            .await?;
+
+        Ok(alarm.map(|alarm| ServiceDownAlarm {
+            alarm_id: alarm.id,
+            status: alarm.status,
+            fired_at: alarm.fired_at,
+            silenced_until: alarm.silenced_until,
+        }))
     }
 
     // Helper methods

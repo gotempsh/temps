@@ -44,7 +44,7 @@ use tracing::{debug, error, info, warn};
 const POSTGRES_WAL_KEY: &str = "postgres_wal";
 
 /// How many failed probes in a row before we raise an alert.
-const CONSECUTIVE_FAILURES_BEFORE_ALERT: i32 = 3;
+pub(crate) const CONSECUTIVE_FAILURES_BEFORE_ALERT: i32 = 3;
 
 /// Configuration for `ExternalServiceHealthMonitor`.
 #[derive(Debug, Clone)]

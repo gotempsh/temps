@@ -207,6 +207,8 @@ impl TempsPlugin for ProvidersPlugin {
         let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
         let application_network_reconciler =
             context.get_service::<dyn temps_core::ApplicationDataNetworkReconciler>();
+        let notification_service =
+            context.require_service::<dyn temps_core::notifications::NotificationService>();
 
         // Create AppState for handlers
         let app_state = Arc::new(AppState {
@@ -221,6 +223,7 @@ impl TempsPlugin for ProvidersPlugin {
             telemetry,
             project_access_checker,
             application_network_reconciler,
+            notification_service,
         });
 
         // Configure routes with the app state

@@ -18,6 +18,21 @@ export interface HealthCheckEntry {
   error_message?: string
 }
 
+/**
+ * What happened once the failure streak reached the alert threshold. The
+ * server does not track whether a notification was delivered, so neither
+ * does this: it only reports the alarm and whether any destination exists.
+ */
+export interface ServiceDownAlert {
+  alarm_id?: number | null
+  alarm_status?: string | null
+  alarm_fired_at?: string | null
+  silenced_until?: string | null
+  /** `null`/absent when the server could not determine it. */
+  notifications_configured?: boolean | null
+  notification_setup_path: string
+}
+
 export interface ServiceHealthResponse {
   service_id: number
   status?: HealthStatus | null
@@ -27,6 +42,72 @@ export interface ServiceHealthResponse {
   response_time_ms?: number | null
   uptime_24h_percent?: number | null
   recent_checks: HealthCheckEntry[]
+  down_alert?: ServiceDownAlert | null
+}
+
+/** Consecutive failed checks after which the health monitor raises an alarm. */
+export const FAILURES_BEFORE_ALERT = 3
+
+export interface ServiceFailureSummary {
+  headline: string
+  /** What happened to the alert, stated without claiming delivery. */
+  alertNote?: string
+  /** Where to fix a missing notification destination, with a way back. */
+  setupHref?: string
+  /** Where to see the raised alarm. */
+  alarmHref?: string
+}
+
+/**
+ * Wording for the health card's failure alert. Separates the three facts an
+ * operator needs: the failure was detected, an alarm was (or was not)
+ * raised, and whether any notification destination could have received it.
+ */
+export function serviceFailureSummary(
+  health: Pick<ServiceHealthResponse, 'consecutive_failures' | 'down_alert'>,
+  serviceId: number,
+  formatTime: (iso: string) => string = (iso) => new Date(iso).toLocaleString()
+): ServiceFailureSummary {
+  const failures = health.consecutive_failures
+  if (failures < FAILURES_BEFORE_ALERT) {
+    return { headline: `Service has failed ${failures} check(s) in a row.` }
+  }
+  const headline = `Service has failed ${failures} consecutive checks.`
+  const alert = health.down_alert
+  if (!alert) return { headline }
+  if (alert.alarm_id == null) {
+    return {
+      headline,
+      alertNote: 'No open down alarm is recorded for this service.',
+    }
+  }
+  const alarmHref = '/monitoring/alarms'
+  if (alert.silenced_until) {
+    return {
+      headline,
+      alertNote: `A down alarm was raised, but its notifications are silenced until ${formatTime(alert.silenced_until)}.`,
+      alarmHref,
+    }
+  }
+  if (alert.notifications_configured === false) {
+    const returnTo = encodeURIComponent(`/storage/${serviceId}`)
+    return {
+      headline,
+      alertNote:
+        'A down alarm was raised, but no notification provider is configured, so nobody was notified.',
+      setupHref: `${alert.notification_setup_path}?returnTo=${returnTo}`,
+      alarmHref,
+    }
+  }
+  if (alert.notifications_configured === true) {
+    return {
+      headline,
+      alertNote:
+        "A down alarm was raised and routed to your notification providers. Delivery isn't confirmed here; if nothing arrived, test the provider in Settings → Notifications.",
+      alarmHref,
+    }
+  }
+  return { headline, alertNote: 'A down alarm was raised.', alarmHref }
 }
 
 export interface ServiceHealthStatusEntry {
