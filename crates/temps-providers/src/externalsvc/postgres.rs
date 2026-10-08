@@ -3181,6 +3181,10 @@ impl ExternalService for PostgresService {
         })
     }
 
+    fn data_import(&self) -> Option<&dyn crate::data_import::DataImportEngine> {
+        Some(self)
+    }
+
     fn get_local_address(&self, service_config: ServiceConfig) -> Result<String> {
         let config = self.get_postgres_config(service_config)?;
         Ok(format!("localhost:{}", config.port))
@@ -4591,6 +4595,9 @@ impl PostgresService {
             .await
     }
 }
+
+/// Importing data from an external PostgreSQL server (see `crate::data_import`).
+mod data_import;
 
 #[cfg(test)]
 mod tests {

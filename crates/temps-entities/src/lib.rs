@@ -131,6 +131,7 @@ pub mod schedule_runs;
 pub mod secret_compose_services;
 pub mod secret_environments;
 pub mod secrets;
+pub mod service_data_imports;
 pub mod service_endpoints;
 pub mod service_members;
 pub mod sessions;

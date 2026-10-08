@@ -3751,6 +3751,10 @@ impl ExternalService for MariaDbService {
         })
     }
 
+    fn data_import(&self) -> Option<&dyn crate::data_import::DataImportEngine> {
+        Some(self)
+    }
+
     async fn init(&self, config: ServiceConfig) -> Result<HashMap<String, String>> {
         info!(
             "Initializing MariaDB service (name={}, type={:?}, version={:?})",
@@ -4726,6 +4730,9 @@ impl ExternalService for MariaDbService {
         })
     }
 }
+
+/// Importing data from an external MariaDB/MySQL server (see `crate::data_import`).
+mod data_import;
 
 #[cfg(test)]
 mod tests {

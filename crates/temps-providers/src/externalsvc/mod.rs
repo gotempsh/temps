@@ -1844,6 +1844,15 @@ pub trait ExternalService: Send + Sync {
         Ok(())
     }
 
+    /// This engine's support for importing data from an external database
+    /// (see [`crate::data_import`]). `None` — the default — means the engine
+    /// cannot receive imports; the console then says so instead of hiding
+    /// the feature. Engines opt in by implementing
+    /// [`crate::data_import::DataImportEngine`] and returning `Some(self)`.
+    fn data_import(&self) -> Option<&dyn crate::data_import::DataImportEngine> {
+        None
+    }
+
     /// Get service type
     fn get_type(&self) -> ServiceType;
 

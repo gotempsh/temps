@@ -2306,6 +2306,10 @@ impl ExternalService for MongodbService {
         })
     }
 
+    fn data_import(&self) -> Option<&dyn crate::data_import::DataImportEngine> {
+        Some(self)
+    }
+
     fn get_effective_address(&self, service_config: ServiceConfig) -> Result<(String, String)> {
         self.get_effective_address_for_environment(
             service_config,
@@ -3535,6 +3539,9 @@ impl ExternalService for MongodbService {
         Ok(config)
     }
 }
+
+/// Importing data from an external MongoDB server (see `crate::data_import`).
+mod data_import;
 
 #[cfg(test)]
 mod tests {

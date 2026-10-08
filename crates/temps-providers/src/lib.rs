@@ -5,6 +5,7 @@
 
 mod alert_rule_service;
 pub mod continuous_archive;
+pub mod data_import;
 pub mod env_vars_provider_impl;
 pub mod externalsvc;
 pub mod health_monitor;

@@ -75,6 +75,11 @@ pub enum SensitiveAction {
     RestoreExternalService {
         service_id: i32,
     },
+    /// Drop a non-empty database of a managed service and fill it with data
+    /// imported from an external server.
+    ReplaceServiceDatabase {
+        service_id: i32,
+    },
     DeleteBackup {
         backup_id: String,
     },
@@ -150,6 +155,7 @@ impl SensitiveAction {
             Self::UpdateAccountEmail => "update_account_email",
             Self::RotateClusterCa => "rotate_cluster_ca",
             Self::RestoreExternalService { .. } => "restore_external_service",
+            Self::ReplaceServiceDatabase { .. } => "replace_service_database",
             Self::DeleteBackup { .. } => "delete_backup",
             Self::RollbackPgUpgrade { .. } => "rollback_pg_upgrade",
             Self::DeleteTeam { .. } => "delete_team",
@@ -292,6 +298,10 @@ mod tests {
         assert_eq!(
             SensitiveAction::RestoreExternalService { service_id: 1 }.as_str(),
             "restore_external_service"
+        );
+        assert_eq!(
+            SensitiveAction::ReplaceServiceDatabase { service_id: 1 }.as_str(),
+            "replace_service_database"
         );
         assert_eq!(
             SensitiveAction::DeleteBackup {
