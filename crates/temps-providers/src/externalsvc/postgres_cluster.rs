@@ -2255,9 +2255,11 @@ host app_db app_user 10.0.0.0/8 md5
 mod scram_docker_tests {
     use super::*;
     use bollard::exec::{CreateExecOptions, StartExecResults};
-    use bollard::models::{ContainerCreateBody, HostConfig, NetworkCreateRequest};
+    use bollard::models::{
+        ContainerCreateBody, HostConfig, NetworkCreateRequest, RestartPolicy, RestartPolicyNameEnum,
+    };
     use bollard::query_parameters::{
-        CreateContainerOptionsBuilder, RemoveContainerOptions, RenameContainerOptions,
+        CreateContainerOptionsBuilder, LogsOptions, RemoveContainerOptions, RenameContainerOptions,
         StartContainerOptions, StopContainerOptions,
     };
     use futures::{FutureExt, StreamExt};
@@ -2269,6 +2271,12 @@ mod scram_docker_tests {
         docker: Arc<Docker>,
         network: String,
         containers: Vec<String>,
+        /// Create containers with the `unless-stopped` policy real cluster
+        /// members run with, so a keeper that exits while its monitor is
+        /// down comes back as it would in production. Off by default:
+        /// tests that assert a deliberate exit need the container to stay
+        /// down.
+        restart_unless_stopped: bool,
     }
 
     impl Fixture {
@@ -2316,6 +2324,7 @@ mod scram_docker_tests {
                 docker,
                 network,
                 containers: Vec::new(),
+                restart_unless_stopped: false,
             })
         }
 
@@ -2338,6 +2347,10 @@ mod scram_docker_tests {
                 host_config: Some(HostConfig {
                     network_mode: Some(self.network.clone()),
                     volumes_from: volume_from.map(|name| vec![format!("{name}:rw")]),
+                    restart_policy: self.restart_unless_stopped.then(|| RestartPolicy {
+                        name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -2405,6 +2418,23 @@ mod scram_docker_tests {
             cmd: Vec<String>,
             env: &HashMap<String, String>,
         ) -> (i64, String) {
+            match self.try_exec(container, cmd, env).await {
+                Ok(result) => result,
+                Err(e) => panic!(
+                    "create exec in {container}: {e}\n{}",
+                    self.describe(container).await
+                ),
+            }
+        }
+
+        /// Like `exec`, but returns the error when the exec cannot be
+        /// created, e.g. while the container is restarting.
+        async fn try_exec(
+            &self,
+            container: &str,
+            cmd: Vec<String>,
+            env: &HashMap<String, String>,
+        ) -> Result<(i64, String), bollard::errors::Error> {
             let env: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
             let exec = self
                 .docker
@@ -2418,8 +2448,7 @@ mod scram_docker_tests {
                         ..Default::default()
                     },
                 )
-                .await
-                .unwrap_or_else(|e| panic!("create exec in {container}: {e}"));
+                .await?;
             let mut out = String::new();
             if let Ok(StartExecResults::Attached { mut output, .. }) =
                 self.docker.start_exec(&exec.id, None).await
@@ -2435,7 +2464,69 @@ mod scram_docker_tests {
                 .ok()
                 .and_then(|i| i.exit_code)
                 .unwrap_or(-1);
-            (code, out)
+            Ok((code, out))
+        }
+
+        /// State, restart count and recent output of `container`, for
+        /// failure messages: a container that is not running says why.
+        async fn describe(&self, container: &str) -> String {
+            let state = match self.docker.inspect_container(container, None).await {
+                Ok(info) => {
+                    let state = info.state.unwrap_or_default();
+                    format!(
+                        "{container}: status={:?} exit_code={:?} error={:?} restart_count={:?}",
+                        state.status, state.exit_code, state.error, info.restart_count
+                    )
+                }
+                Err(e) => format!("{container}: inspect failed: {e}"),
+            };
+            let mut logs = self.docker.logs(
+                container,
+                Some(LogsOptions {
+                    stdout: true,
+                    stderr: true,
+                    tail: "40".to_string(),
+                    ..Default::default()
+                }),
+            );
+            let mut tail = String::new();
+            while let Some(Ok(chunk)) = logs.next().await {
+                tail.push_str(&chunk.to_string());
+            }
+            format!("{state}\nlast log lines of {container}:\n{tail}")
+        }
+
+        /// Wait until `container` runs and its PostgreSQL accepts
+        /// connections. After a restart the monitor still reports the
+        /// member's last state, so `wait_for` alone can pass before the
+        /// member is back.
+        async fn wait_serving(&self, container: &str, timeout: Duration) {
+            let start = Instant::now();
+            loop {
+                let probe = self
+                    .try_exec(
+                        container,
+                        vec![
+                            "pg_isready".into(),
+                            "-h".into(),
+                            "127.0.0.1".into(),
+                            "-p".into(),
+                            "5432".into(),
+                        ],
+                        &HashMap::new(),
+                    )
+                    .await;
+                if matches!(probe, Ok((0, _))) {
+                    return;
+                }
+                if start.elapsed() >= timeout {
+                    panic!(
+                        "{container} did not accept connections within {timeout:?} (last probe: {probe:?})\n{}",
+                        self.describe(container).await
+                    );
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
         }
 
         async fn sh(&self, container: &str, script: &str) -> (i64, String) {
@@ -2749,6 +2840,8 @@ mod scram_docker_tests {
         let Some(mut fx) = Fixture::new().await else {
             return;
         };
+        // This test restarts members while their monitor restarts too.
+        fx.restart_unless_stopped = true;
         let suffix = fx.network[fx.network.len() - 8..].to_string();
         let monitor = format!("legacy{suffix}-monitor");
         let n1 = format!("legacy{suffix}-1");
@@ -2889,6 +2982,8 @@ mod scram_docker_tests {
                 )
                 .await
                 .unwrap_or_else(|e| panic!("restart {monitor}: {e}"));
+            fx.wait_serving(&monitor, Duration::from_secs(240)).await;
+            fx.wait_serving(&n1, Duration::from_secs(240)).await;
             fx.wait_for(&monitor, &n1, "secondary", Duration::from_secs(240))
                 .await;
             assert_infrastructure_roles_require_passwords(&fx, &n2, &monitor, &[&n1, &n2], &auth)
