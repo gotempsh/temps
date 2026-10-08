@@ -14145,6 +14145,292 @@
         ],
         "type": "string"
       },
+      "DataImportAvailabilityResponse": {
+        "description": "Whether a service can receive imported data. A service that cannot is\nstill described, with the reason, so the console can explain instead of\nhiding the feature.",
+        "properties": {
+          "available": {
+            "description": "An import could start right now.",
+            "type": "boolean"
+          },
+          "default_timeout_minutes": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_timeout_minutes": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "reason": {
+            "description": "Why `supported` or `available` is false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "service_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "service_type": {
+            "type": "string"
+          },
+          "spec": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DataImportSpec",
+                "description": "What the engine accepts, when it supports imports."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "supported": {
+            "description": "The service's engine supports importing data.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "service_id",
+          "service_type",
+          "supported",
+          "available",
+          "default_timeout_minutes",
+          "max_timeout_minutes"
+        ],
+        "type": "object"
+      },
+      "DataImportRunListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/DataImportRunResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
+      "DataImportRunResponse": {
+        "description": "One data import run.",
+        "properties": {
+          "atomic": {
+            "description": "Whether a failed run leaves no imported data behind.",
+            "type": "boolean"
+          },
+          "cancel_requested": {
+            "type": "boolean"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "created_by": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "error_message": {
+            "description": "Why the run did not succeed, in one or two sentences.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "finished_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "helper_output": {
+            "description": "Last lines the transfer printed (dump/restore tool output), with every\nsecret removed. Present for successful runs too.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "phase": {
+            "description": "`preparing_target`, `transferring`, `verifying` or `finished`. Only a\nsuccessful run reaches `finished`; otherwise this is where it stopped.",
+            "type": "string"
+          },
+          "replace_existing": {
+            "type": "boolean"
+          },
+          "service_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "service_type": {
+            "type": "string"
+          },
+          "source": {
+            "description": "Source connection string with its credentials masked.",
+            "type": "string"
+          },
+          "source_database": {
+            "type": "string"
+          },
+          "started_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "started_by": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DataImportRunStarter",
+                "description": "The user who started the run, when they still exist."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "status": {
+            "description": "`running`, `succeeded`, `failed`, `cancelled` or `interrupted`.",
+            "type": "string"
+          },
+          "target_database": {
+            "type": "string"
+          },
+          "target_object_count": {
+            "description": "Tables/collections in the target after a successful import.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "target_size_bytes": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "timeout_seconds": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "service_id",
+          "service_type",
+          "target_database",
+          "source",
+          "source_database",
+          "replace_existing",
+          "atomic",
+          "status",
+          "phase",
+          "timeout_seconds",
+          "cancel_requested",
+          "started_at",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "DataImportRunStarter": {
+        "description": "The user who started a data import.",
+        "properties": {
+          "email": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "user_id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "user_id",
+          "name",
+          "email"
+        ],
+        "type": "object"
+      },
+      "DataImportSpec": {
+        "description": "What an engine accepts and how its imports behave. Returned to the console\nso the import form can explain itself before the user types anything.",
+        "properties": {
+          "allowed_source_options": {
+            "description": "Query-string options the source connection string may carry. Anything\nelse is refused, because some options redirect the client elsewhere\nor read local files.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "atomic": {
+            "description": "Whether a failed or interrupted import leaves no imported data behind.\nWhen false, a failure can leave the target partially written.",
+            "type": "boolean"
+          },
+          "engine_label": {
+            "description": "Human name of the engine, e.g. \"PostgreSQL\".",
+            "type": "string"
+          },
+          "object_noun": {
+            "description": "What the engine stores data in, singular (\"table\", \"collection\").",
+            "type": "string"
+          },
+          "source_schemes": {
+            "description": "URL schemes the source connection string may use.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "source_url_example": {
+            "description": "A complete example of a source connection string.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "engine_label",
+          "source_schemes",
+          "source_url_example",
+          "allowed_source_options",
+          "atomic",
+          "object_noun"
+        ],
+        "type": "object"
+      },
       "DatabaseMetricsResponse": {
         "description": "Response for the per-database metrics breakdown.",
         "properties": {
@@ -50265,6 +50551,44 @@
         ],
         "type": "object"
       },
+      "StartDataImportRequest": {
+        "description": "Start importing an external database into a database of this service.",
+        "properties": {
+          "confirm_target_database": {
+            "description": "Required when `replace` is true: must repeat `target_database`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "replace": {
+            "description": "Drop and re-create `target_database` when it already holds data.",
+            "type": "boolean"
+          },
+          "source_url": {
+            "description": "Connection string of the database to copy, e.g.\n`postgres://user:password@db.example.com:5432/app?sslmode=require`.\nMust name the database. Never stored or returned.",
+            "type": "string"
+          },
+          "target_database": {
+            "description": "Database of this service that receives the data. Created when it does\nnot exist; typically a project environment's database\n(`<project>_<environment>`).",
+            "type": "string"
+          },
+          "timeout_minutes": {
+            "description": "Transfer time limit in minutes (default 60, maximum 1440).",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "source_url",
+          "target_database"
+        ],
+        "type": "object"
+      },
       "StartPgUpgradeRequest": {
         "properties": {
           "from_image": {
@@ -79412,6 +79736,507 @@
           }
         },
         "summary": "Repoint a service's continuous archive source",
+        "tags": [
+          "External Services"
+        ]
+      }
+    },
+    "/external-services/{id}/data-imports": {
+      "get": {
+        "operationId": "list_data_imports",
+        "parameters": [
+          {
+            "description": "External service ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Page number, 1-based (default 1).",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Items per page (default 20, maximum 100).",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataImportRunListResponse"
+                }
+              }
+            },
+            "description": "Data import runs, newest first"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Service not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "External Services"
+        ]
+      },
+      "post": {
+        "operationId": "start_data_import",
+        "parameters": [
+          {
+            "description": "External service ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StartDataImportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataImportRunResponse"
+                }
+              }
+            },
+            "description": "Import started; poll the run"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid source connection string, target database, timeout or missing replace confirmation"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions, or a deployment token"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Service not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The service is not running (`service-not-ready`), the target database holds data and replace was not requested (`target-not-empty`), an import into it is already running (`import-already-running`, with `active_run_id`), or the service is being restored (`restore-in-progress`)"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The service's engine or topology cannot receive imports"
+          },
+          "428": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Replacing a database requires recent MFA verification"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The target service could not be inspected or prepared"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "This process has no Docker daemon"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "External Services"
+        ]
+      }
+    },
+    "/external-services/{id}/data-imports/availability": {
+      "get": {
+        "operationId": "get_data_import_availability",
+        "parameters": [
+          {
+            "description": "External service ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataImportAvailabilityResponse"
+                }
+              }
+            },
+            "description": "Whether the service can receive imported data"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Service not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "External Services"
+        ]
+      }
+    },
+    "/external-services/{id}/data-imports/{run_id}": {
+      "get": {
+        "operationId": "get_data_import",
+        "parameters": [
+          {
+            "description": "External service ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Data import run ID",
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataImportRunResponse"
+                }
+              }
+            },
+            "description": "The data import run"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Service or run not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "External Services"
+        ]
+      }
+    },
+    "/external-services/{id}/data-imports/{run_id}/cancel": {
+      "post": {
+        "operationId": "cancel_data_import",
+        "parameters": [
+          {
+            "description": "External service ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Data import run ID",
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataImportRunResponse"
+                }
+              }
+            },
+            "description": "Cancellation requested; the run settles as `cancelled` shortly"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions, or a deployment token"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Service or run not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The run has finished, or its data has already been copied"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "tags": [
           "External Services"
         ]

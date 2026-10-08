@@ -6666,6 +6666,132 @@ export type DataImplication = {
 export type DataImplicationSeverity = 'info' | 'warning' | 'data-not-migrated' | 'potential-data-loss';
 
 /**
+ * Whether a service can receive imported data. A service that cannot is
+ * still described, with the reason, so the console can explain instead of
+ * hiding the feature.
+ */
+export type DataImportAvailabilityResponse = {
+    /**
+     * An import could start right now.
+     */
+    available: boolean;
+    default_timeout_minutes: number;
+    max_timeout_minutes: number;
+    /**
+     * Why `supported` or `available` is false.
+     */
+    reason?: string | null;
+    service_id: number;
+    service_type: string;
+    spec?: DataImportSpec | null;
+    /**
+     * The service's engine supports importing data.
+     */
+    supported: boolean;
+};
+
+export type DataImportRunListResponse = {
+    items: Array<DataImportRunResponse>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+/**
+ * One data import run.
+ */
+export type DataImportRunResponse = {
+    /**
+     * Whether a failed run leaves no imported data behind.
+     */
+    atomic: boolean;
+    cancel_requested: boolean;
+    created_at: string;
+    created_by?: number | null;
+    /**
+     * Why the run did not succeed, in one or two sentences.
+     */
+    error_message?: string | null;
+    finished_at?: string | null;
+    /**
+     * Last lines the transfer printed (dump/restore tool output), with every
+     * secret removed. Present for successful runs too.
+     */
+    helper_output?: string | null;
+    id: number;
+    /**
+     * `preparing_target`, `transferring`, `verifying` or `finished`. Only a
+     * successful run reaches `finished`; otherwise this is where it stopped.
+     */
+    phase: string;
+    replace_existing: boolean;
+    service_id: number;
+    service_type: string;
+    /**
+     * Source connection string with its credentials masked.
+     */
+    source: string;
+    source_database: string;
+    started_at: string;
+    started_by?: DataImportRunStarter | null;
+    /**
+     * `running`, `succeeded`, `failed`, `cancelled` or `interrupted`.
+     */
+    status: string;
+    target_database: string;
+    /**
+     * Tables/collections in the target after a successful import.
+     */
+    target_object_count?: number | null;
+    target_size_bytes?: number | null;
+    timeout_seconds: number;
+    updated_at: string;
+};
+
+/**
+ * The user who started a data import.
+ */
+export type DataImportRunStarter = {
+    email: string;
+    name: string;
+    user_id: number;
+};
+
+/**
+ * What an engine accepts and how its imports behave. Returned to the console
+ * so the import form can explain itself before the user types anything.
+ */
+export type DataImportSpec = {
+    /**
+     * Query-string options the source connection string may carry. Anything
+     * else is refused, because some options redirect the client elsewhere
+     * or read local files.
+     */
+    allowed_source_options: Array<string>;
+    /**
+     * Whether a failed or interrupted import leaves no imported data behind.
+     * When false, a failure can leave the target partially written.
+     */
+    atomic: boolean;
+    /**
+     * Human name of the engine, e.g. "PostgreSQL".
+     */
+    engine_label: string;
+    /**
+     * What the engine stores data in, singular ("table", "collection").
+     */
+    object_noun: string;
+    /**
+     * URL schemes the source connection string may use.
+     */
+    source_schemes: Array<string>;
+    /**
+     * A complete example of a source connection string.
+     */
+    source_url_example: string;
+};
+
+/**
  * Response for the per-database metrics breakdown.
  */
 export type DatabaseMetricsResponse = {
@@ -23554,6 +23680,36 @@ export type StartAnalysisRequest = {
     user_context?: string | null;
 };
 
+/**
+ * Start importing an external database into a database of this service.
+ */
+export type StartDataImportRequest = {
+    /**
+     * Required when `replace` is true: must repeat `target_database`.
+     */
+    confirm_target_database?: string | null;
+    /**
+     * Drop and re-create `target_database` when it already holds data.
+     */
+    replace?: boolean;
+    /**
+     * Connection string of the database to copy, e.g.
+     * `postgres://user:password@db.example.com:5432/app?sslmode=require`.
+     * Must name the database. Never stored or returned.
+     */
+    source_url: string;
+    /**
+     * Database of this service that receives the data. Created when it does
+     * not exist; typically a project environment's database
+     * (`<project>_<environment>`).
+     */
+    target_database: string;
+    /**
+     * Transfer time limit in minutes (default 60, maximum 1440).
+     */
+    timeout_minutes?: number | null;
+};
+
 export type StartPgUpgradeRequest = {
     from_image: string;
     from_version: string;
@@ -39444,6 +39600,257 @@ export type RepointContinuousArchiveSourceResponses = {
 };
 
 export type RepointContinuousArchiveSourceResponse = RepointContinuousArchiveSourceResponses[keyof RepointContinuousArchiveSourceResponses];
+
+export type ListDataImportsData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: {
+        /**
+         * Page number, 1-based (default 1).
+         */
+        page?: number | null;
+        /**
+         * Items per page (default 20, maximum 100).
+         */
+        page_size?: number | null;
+    };
+    url: '/external-services/{id}/data-imports';
+};
+
+export type ListDataImportsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Service not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListDataImportsError = ListDataImportsErrors[keyof ListDataImportsErrors];
+
+export type ListDataImportsResponses = {
+    /**
+     * Data import runs, newest first
+     */
+    200: DataImportRunListResponse;
+};
+
+export type ListDataImportsResponse = ListDataImportsResponses[keyof ListDataImportsResponses];
+
+export type StartDataImportData = {
+    body: StartDataImportRequest;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/data-imports';
+};
+
+export type StartDataImportErrors = {
+    /**
+     * Invalid source connection string, target database, timeout or missing replace confirmation
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions, or a deployment token
+     */
+    403: ProblemDetails;
+    /**
+     * Service not found
+     */
+    404: ProblemDetails;
+    /**
+     * The service is not running (`service-not-ready`), the target database holds data and replace was not requested (`target-not-empty`), an import into it is already running (`import-already-running`, with `active_run_id`), or the service is being restored (`restore-in-progress`)
+     */
+    409: ProblemDetails;
+    /**
+     * The service's engine or topology cannot receive imports
+     */
+    422: ProblemDetails;
+    /**
+     * Replacing a database requires recent MFA verification
+     */
+    428: ProblemDetails;
+    /**
+     * The target service could not be inspected or prepared
+     */
+    502: ProblemDetails;
+    /**
+     * This process has no Docker daemon
+     */
+    503: ProblemDetails;
+};
+
+export type StartDataImportError = StartDataImportErrors[keyof StartDataImportErrors];
+
+export type StartDataImportResponses = {
+    /**
+     * Import started; poll the run
+     */
+    202: DataImportRunResponse;
+};
+
+export type StartDataImportResponse = StartDataImportResponses[keyof StartDataImportResponses];
+
+export type GetDataImportAvailabilityData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/data-imports/availability';
+};
+
+export type GetDataImportAvailabilityErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Service not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetDataImportAvailabilityError = GetDataImportAvailabilityErrors[keyof GetDataImportAvailabilityErrors];
+
+export type GetDataImportAvailabilityResponses = {
+    /**
+     * Whether the service can receive imported data
+     */
+    200: DataImportAvailabilityResponse;
+};
+
+export type GetDataImportAvailabilityResponse = GetDataImportAvailabilityResponses[keyof GetDataImportAvailabilityResponses];
+
+export type GetDataImportData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+        /**
+         * Data import run ID
+         */
+        run_id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/data-imports/{run_id}';
+};
+
+export type GetDataImportErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Service or run not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetDataImportError = GetDataImportErrors[keyof GetDataImportErrors];
+
+export type GetDataImportResponses = {
+    /**
+     * The data import run
+     */
+    200: DataImportRunResponse;
+};
+
+export type GetDataImportResponse = GetDataImportResponses[keyof GetDataImportResponses];
+
+export type CancelDataImportData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+        /**
+         * Data import run ID
+         */
+        run_id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/data-imports/{run_id}/cancel';
+};
+
+export type CancelDataImportErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions, or a deployment token
+     */
+    403: ProblemDetails;
+    /**
+     * Service or run not found
+     */
+    404: ProblemDetails;
+    /**
+     * The run has finished, or its data has already been copied
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type CancelDataImportError = CancelDataImportErrors[keyof CancelDataImportErrors];
+
+export type CancelDataImportResponses = {
+    /**
+     * Cancellation requested; the run settles as `cancelled` shortly
+     */
+    202: DataImportRunResponse;
+};
+
+export type CancelDataImportResponse = CancelDataImportResponses[keyof CancelDataImportResponses];
 
 export type RevealServiceEnvironmentVariablesData = {
     body?: never;
