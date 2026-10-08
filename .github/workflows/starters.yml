@@ -133,7 +133,7 @@ jobs:
           cargo test -p temps-presets --test starters -- --ignored --nocapture
 
   known-failing:
-    # java/spring-boot does not pass yet. It runs anyway and always reports
+    # These starters do not pass yet. They run anyway and always report
     # success, so the failure stays visible in the log without blocking a merge
     # — a red required check that everyone learns to ignore is worse than no
     # check at all.
@@ -144,6 +144,12 @@ jobs:
     # the application does start, so this is not jar selection. Not root-caused.
     #
     # Tracked in the autopack repository; remove this job when it is fixed.
+    #
+    # dockerfile (#1318): built through its own Dockerfile, as the Dockerfile
+    # preset deploys it. `RUN npm ci` fails because no package-lock.json is
+    # checked in, and `CMD ["node", "dist/index.js"]` names a file the build
+    # script never produces (it writes dist/index.html). The fix belongs in
+    # gotempsh/temps-examples; move it into the matrix above once it lands.
     name: known-failing (report only)
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -169,7 +175,7 @@ jobs:
         continue-on-error: true
         env:
           TEMPS_EXAMPLES_DIR: ${{ github.workspace }}/temps-examples/examples/starters
-          TEMPS_STARTERS_ONLY: java/spring-boot
+          TEMPS_STARTERS_ONLY: java/spring-boot,dockerfile
           DOCKER_BUILDKIT: '1'
         run: |
           cargo test -p temps-presets --test starters -- --ignored --nocapture

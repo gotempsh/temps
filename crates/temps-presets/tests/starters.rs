@@ -45,17 +45,40 @@ const BOOT_TIMEOUT: Duration = Duration::from_secs(60);
 /// waits out `docker stop`'s full grace period and gets SIGKILLed.
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Starters that this matrix deliberately does not build.
-///
-/// `dockerfile` exists to exercise the *Dockerfile* preset — it ships its own
-/// Dockerfile and expects to be built by it. Autopack ignores that file by
-/// design, so building it here would test nothing and fail confusingly.
-const EXCLUDED: &[&str] = &["dockerfile"];
+/// Port a Dockerfile starter listens on when its final stage exposes none,
+/// matching the platform's default for the Dockerfile preset.
+const DEFAULT_DOCKERFILE_PORT: u16 = 3000;
 
 struct Starter {
     /// Path relative to the starters root, e.g. `go/gin`.
     name: String,
     path: PathBuf,
+}
+
+/// How the platform builds a starter, and therefore how this test must.
+enum Build {
+    /// Rendered by [`AutopackPreset`], which serves on `$PORT`.
+    Autopack(String),
+    /// The starter's own Dockerfile, built as-is the way the Dockerfile preset
+    /// does. The proxy targets the port its final stage exposes.
+    OwnDockerfile { container_port: u16 },
+}
+
+impl Starter {
+    /// A starter that ships a Dockerfile is deployed through it: both Drop and
+    /// Git detection rank the Dockerfile preset above every language preset.
+    /// Skipping it here instead is how a starter whose own Dockerfile cannot
+    /// build (no lockfile for `npm ci`) or whose `CMD` names a file the build
+    /// never produces went unnoticed.
+    fn build(&self) -> Build {
+        match std::fs::read_to_string(self.path.join("Dockerfile")) {
+            Ok(dockerfile) => Build::OwnDockerfile {
+                container_port: temps_presets::detect_primary_exposed_port(&dockerfile)
+                    .unwrap_or(DEFAULT_DOCKERFILE_PORT),
+            },
+            Err(_) => Build::Autopack(dockerfile_for(self)),
+        }
+    }
 }
 
 fn starters_root() -> Option<PathBuf> {
@@ -111,7 +134,6 @@ fn discover(root: &Path) -> Vec<Starter> {
             });
         }
     }
-    found.retain(|s| !EXCLUDED.contains(&s.name.as_str()));
     found
 }
 
@@ -244,12 +266,14 @@ fn wait_for_http(url: &str, timeout: Duration, container: &str) -> Result<(), St
 
 /// Build, run, request, and stop one starter.
 fn verify(starter: &Starter) -> Result<(), String> {
-    let dockerfile = dockerfile_for(starter);
-    if dockerfile.contains("autopack could not plan") {
-        return Err(format!(
-            "the preset produced no build plan for `{}`:\n{dockerfile}",
-            starter.name
-        ));
+    let build = starter.build();
+    if let Build::Autopack(dockerfile) = &build {
+        if dockerfile.contains("autopack could not plan") {
+            return Err(format!(
+                "the preset produced no build plan for `{}`:\n{dockerfile}",
+                starter.name
+            ));
+        }
     }
 
     let tag = format!(
@@ -257,12 +281,25 @@ fn verify(starter: &Starter) -> Result<(), String> {
         starter.name.replace('/', "-").to_lowercase()
     );
 
-    // Feed the Dockerfile on stdin so the starter's own tree is never touched —
-    // a stray Dockerfile left in the checkout would change what the next run
-    // detects.
-    let mut build = Command::new("docker");
-    build
-        .args(["build", "--progress", "plain", "-t", &tag, "-f", "-", "."])
+    // Feed a rendered Dockerfile on stdin so the starter's own tree is never
+    // touched — a stray Dockerfile left in the checkout would change what the
+    // next run detects.
+    let dockerfile_arg = match &build {
+        Build::Autopack(_) => "-",
+        Build::OwnDockerfile { .. } => "Dockerfile",
+    };
+    let mut command = Command::new("docker");
+    command
+        .args([
+            "build",
+            "--progress",
+            "plain",
+            "-t",
+            &tag,
+            "-f",
+            dockerfile_arg,
+            ".",
+        ])
         .current_dir(&starter.path)
         .env("DOCKER_BUILDKIT", "1")
         .stdin(Stdio::piped())
@@ -272,16 +309,19 @@ fn verify(starter: &Starter) -> Result<(), String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = build
+    let mut child = command
         .spawn()
         .map_err(|e| format!("could not start docker build: {e}"))?;
     {
         use std::io::Write;
-        child
-            .stdin
-            .as_mut()
-            .expect("stdin")
-            .write_all(dockerfile.as_bytes())
+        let rendered = match &build {
+            Build::Autopack(dockerfile) => dockerfile.as_bytes(),
+            Build::OwnDockerfile { .. } => &[],
+        };
+        // Dropping stdin closes it, which is all an unused stdin needs.
+        let mut stdin = child.stdin.take().expect("stdin");
+        stdin
+            .write_all(rendered)
             .map_err(|e| format!("could not write the Dockerfile: {e}"))?;
     }
     let started = Instant::now();
@@ -293,6 +333,12 @@ fn verify(starter: &Starter) -> Result<(), String> {
         // of layer chatter and the error is always at the end.
         let log = String::from_utf8_lossy(&output.stderr);
         let tail: Vec<&str> = log.lines().rev().take(40).collect();
+        let dockerfile = match &build {
+            Build::Autopack(dockerfile) => dockerfile.clone(),
+            Build::OwnDockerfile { .. } => {
+                std::fs::read_to_string(starter.path.join("Dockerfile")).unwrap_or_default()
+            }
+        };
         return Err(format!(
             "docker build failed for `{}`\n--- build log (last 40 lines) ---\n{}\n--- Dockerfile ---\n{dockerfile}",
             starter.name,
@@ -307,6 +353,12 @@ fn verify(starter: &Starter) -> Result<(), String> {
     }
 
     let port = free_port();
+    // Autopack images listen on whatever `$PORT` says; a Dockerfile image
+    // listens where its author put it, and the platform routes to its EXPOSE.
+    let container_port = match build {
+        Build::Autopack(_) => port,
+        Build::OwnDockerfile { container_port } => container_port,
+    };
     // Deliberately not `--rm`: a container that exits on startup would be
     // removed before `docker logs` could say why, which is exactly the case
     // where the logs matter most. The Drop guard cleans up instead.
@@ -314,9 +366,9 @@ fn verify(starter: &Starter) -> Result<(), String> {
         "run",
         "--detach",
         "--env",
-        &format!("PORT={port}"),
+        &format!("PORT={container_port}"),
         "--publish",
-        &format!("127.0.0.1:{port}:{port}"),
+        &format!("127.0.0.1:{port}:{container_port}"),
         &tag,
     ]))?
     .trim()
@@ -443,6 +495,28 @@ mod discovery_tests {
         let dir = tree(&["sveltekit/package.json", "sveltekit/src/app.html"]);
         let names: Vec<_> = discover(dir.path()).into_iter().map(|s| s.name).collect();
         assert_eq!(names, ["sveltekit"]);
+    }
+
+    #[test]
+    fn the_dockerfile_starter_is_built_through_its_own_dockerfile() {
+        let dir = tree(&["dockerfile/package.json", "go/gin/go.mod"]);
+        std::fs::write(
+            dir.path().join("dockerfile/Dockerfile"),
+            "FROM node:22-alpine AS builder\nEXPOSE 9999\n\
+             FROM node:22-alpine\nEXPOSE 3001\nCMD [\"node\", \"server.js\"]\n",
+        )
+        .unwrap();
+        let starters = discover(dir.path());
+        let names: Vec<_> = starters.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["dockerfile", "go/gin"]);
+        // The proxy routes to the final stage's EXPOSE, so that is where the
+        // container must answer.
+        assert!(matches!(
+            starters[0].build(),
+            Build::OwnDockerfile {
+                container_port: 3001
+            }
+        ));
     }
 
     #[test]
