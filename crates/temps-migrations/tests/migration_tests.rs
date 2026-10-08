@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
+use sea_orm::{ConnectionTrait, Database, DatabaseConnection, TransactionTrait};
 use sea_orm_migration::{MigrationTrait, MigratorTrait, SchemaManager};
 use testcontainers::{
     core::{ContainerPort, WaitFor},
@@ -1187,20 +1187,25 @@ async fn test_legacy_monitor_reconciliation_rewrites_compressed_status_checks() 
          FROM show_chunks('status_checks', older_than => now() - interval '30 days') c"
     ))
     .await?;
-    let compressed = db
-        .query_one(sea_orm::Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT count(*) FILTER (WHERE is_compressed) AS compressed \
-             FROM timescaledb_information.chunks WHERE hypertable_name = 'status_checks'"
-                .to_string(),
-        ))
-        .await?
-        .expect("status_checks chunk count");
-    assert!(
-        compressed.try_get::<i64>("", "compressed")? > 0,
-        "test setup must compress at least one status_checks chunk, otherwise the \
-         decompression cap is never exercised"
+    recompress_old_status_checks(&db).await?;
+
+    // SeaORM runs every pending migration in one shared transaction, so the
+    // lifted cap must already be back to the server value when up() returns,
+    // before that transaction commits. Run up() on a transaction this test
+    // owns to read the cap there, then roll back so the real run below still
+    // starts from compressed history.
+    let reconcile = Migrator::migrations()
+        .into_iter()
+        .find(|migration| migration.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found in Migrator"));
+    let txn = db.begin().await?;
+    reconcile.up(&SchemaManager::new(&txn)).await?;
+    assert_eq!(
+        decompression_cap(&txn).await?,
+        "1",
+        "up() must reset the decompression cap before later migrations share its transaction"
     );
+    txn.rollback().await?;
 
     Migrator::up(&db, Some(1)).await?;
 
@@ -1218,18 +1223,18 @@ async fn test_legacy_monitor_reconciliation_rewrites_compressed_status_checks() 
     assert_eq!(owners.try_get::<i64>("", "canonical")?, 20);
     assert_eq!(owners.try_get::<i64>("", "duplicate")?, 0);
 
-    // The lifted cap is transaction-scoped and reset by the migration itself;
-    // the server-level value must be untouched for later sessions.
-    let cap = db
-        .query_one(sea_orm::Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT current_setting('timescaledb.max_tuples_decompressed_per_dml_transaction') \
-             AS cap"
-                .to_string(),
-        ))
-        .await?
-        .expect("decompression cap lookup");
-    assert_eq!(cap.try_get::<String>("", "cap")?, "1");
+    // up() decompressed the rows it rewrote. Compress them again so down()
+    // also has to rewrite compressed history, as it would on a real install
+    // where the compression policy ran between upgrade and rollback.
+    recompress_old_status_checks(&db).await?;
+    let txn = db.begin().await?;
+    reconcile.down(&SchemaManager::new(&txn)).await?;
+    assert_eq!(
+        decompression_cap(&txn).await?,
+        "1",
+        "down() must reset the decompression cap before later rollbacks share its transaction"
+    );
+    txn.rollback().await?;
 
     Migrator::down(&db, Some(1)).await?;
     let restored = db
@@ -1244,6 +1249,47 @@ async fn test_legacy_monitor_reconciliation_rewrites_compressed_status_checks() 
     assert_eq!(restored.try_get::<i64>("", "count")?, 20);
 
     Ok(())
+}
+
+/// Fully compress every `status_checks` chunk older than the compression
+/// policy. Decompressing first turns a partially compressed chunk (one that
+/// DML has already touched) back into a fully compressed one.
+async fn recompress_old_status_checks(db: &DatabaseConnection) -> anyhow::Result<()> {
+    db.execute_unprepared(
+        "SELECT decompress_chunk(c, if_compressed => TRUE) \
+         FROM show_chunks('status_checks', older_than => now() - interval '30 days') c; \
+         SELECT compress_chunk(c) \
+         FROM show_chunks('status_checks', older_than => now() - interval '30 days') c",
+    )
+    .await?;
+    let compressed = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*) FILTER (WHERE is_compressed) AS compressed \
+             FROM timescaledb_information.chunks WHERE hypertable_name = 'status_checks'"
+                .to_string(),
+        ))
+        .await?
+        .expect("status_checks chunk count");
+    assert!(
+        compressed.try_get::<i64>("", "compressed")? > 0,
+        "test setup must compress at least one status_checks chunk, otherwise the \
+         decompression cap is never exercised"
+    );
+    Ok(())
+}
+
+async fn decompression_cap(conn: &impl ConnectionTrait) -> anyhow::Result<String> {
+    let row = conn
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT current_setting('timescaledb.max_tuples_decompressed_per_dml_transaction') \
+             AS cap"
+                .to_string(),
+        ))
+        .await?
+        .expect("decompression cap lookup");
+    Ok(row.try_get::<String>("", "cap")?)
 }
 
 #[tokio::test]
