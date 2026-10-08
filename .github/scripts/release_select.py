@@ -22,6 +22,11 @@ release-workflow smoke test, for instance -- is ignored. `--fallback beta`
 lets the stable default still find something to test before the first
 stable release exists.
 
+`--min-core vX.Y.Z` ignores every release whose MAJOR.MINOR.PATCH core is
+below it, prereleases of that core included. A release older than the
+tooling the caller drives is not a usable starting point, and without the
+floor a leftover stable tag from an earlier line would hide the fallback.
+
 Prints the chosen tag on stdout and the reasoning on stderr.
 """
 
@@ -70,21 +75,33 @@ def in_channel(parsed, channel):
     raise ValueError(f"unknown channel '{channel}'")
 
 
-def highest(tags, channel):
+def highest(tags, channel, min_core=None):
     candidates = []
     for tag in tags:
         parsed = parse(tag)
-        if parsed is not None and in_channel(parsed, channel):
-            candidates.append((sort_key(parsed), tag.strip()))
+        if parsed is None or not in_channel(parsed, channel):
+            continue
+        if min_core is not None and parsed[0] < min_core:
+            continue
+        candidates.append((sort_key(parsed), tag.strip()))
     return max(candidates)[1] if candidates else None
 
 
-def select(tags, channel, fallback=None):
+def parse_min_core(value):
+    """`(major, minor, patch)` from `vX.Y.Z`; argparse type for `--min-core`."""
+    parsed = parse(value)
+    if parsed is None or parsed[1] is not None:
+        raise argparse.ArgumentTypeError(
+            f"--min-core must be a release version like v0.1.0, got '{value}'")
+    return parsed[0]
+
+
+def select(tags, channel, fallback=None, min_core=None):
     """Return `(tag_or_None, channel_used)`."""
     tags = [tag for tag in tags if tag.strip()]
-    chosen = highest(tags, channel)
+    chosen = highest(tags, channel, min_core)
     if chosen is None and fallback and fallback != channel:
-        return highest(tags, fallback), fallback
+        return highest(tags, fallback, min_core), fallback
     return chosen, channel
 
 
@@ -92,15 +109,19 @@ def main(argv, stdin, stdout, stderr):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--channel", required=True, choices=CHANNELS)
     parser.add_argument("--fallback", choices=CHANNELS)
+    parser.add_argument("--min-core", type=parse_min_core, metavar="vX.Y.Z")
     args = parser.parse_args(argv[1:])
-    tag, used = select(stdin.read().splitlines(), args.channel, args.fallback)
+    tag, used = select(stdin.read().splitlines(), args.channel, args.fallback, args.min_core)
+    floor = ("" if args.min_core is None
+             else " at or above v" + ".".join(str(part) for part in args.min_core))
     if tag is None:
         wanted = args.channel + (f" or {args.fallback}" if args.fallback else "")
-        print(f"::error::No published {wanted} release with the required asset was found.", file=stderr)
+        print(f"::error::No published {wanted} release{floor} with the required asset was found.",
+              file=stderr)
         return 1
     if used != args.channel:
-        print(f"::notice::No {args.channel} release yet; using the highest {used} release {tag}.",
-              file=stderr)
+        print(f"::notice::No {args.channel} release{floor} yet; using the highest {used} "
+              f"release {tag}.", file=stderr)
     else:
         print(f"Highest {used} release: {tag}", file=stderr)
     print(tag, file=stdout)
