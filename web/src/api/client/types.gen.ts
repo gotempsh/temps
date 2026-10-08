@@ -6778,6 +6778,10 @@ export type DataImportSpec = {
      */
     engine_label: string;
     /**
+     * Longest target database name the engine accepts.
+     */
+    max_target_length: number;
+    /**
      * What the engine stores data in, singular ("table", "collection").
      */
     object_noun: string;
@@ -40935,7 +40939,7 @@ export type StartRestoreErrors = {
      */
     404: ProblemDetails;
     /**
-     * Conflict: a destructive cross-service restore requires explicit confirmation (`cross-service-restore-not-confirmed`), another restore is already active on this service (`restore-already-active`, with `active_restore_run_id`), or the backup is being deleted
+     * Conflict: a destructive cross-service restore requires explicit confirmation (`cross-service-restore-not-confirmed`), another restore is already active on this service (`restore-already-active`, with `active_restore_run_id`), data is being imported into it (`data-import-active`, with `active_data_import_run_id`), or the backup is being deleted
      */
     409: ProblemDetails;
 };
