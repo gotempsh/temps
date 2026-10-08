@@ -4703,6 +4703,63 @@ mod tests {
     }
 
     #[test]
+    fn drop_offers_server_languages_that_ship_no_js_manifest() {
+        // The file layouts of the official Deno, Phoenix, plain-PHP and
+        // Vapor starters, zipped from the application root.
+        for (files, slug, label) in [
+            (
+                vec![("main.ts", "Deno.serve(() => new Response('ok'));")],
+                "nixpacks-deno",
+                "Deno",
+            ),
+            (
+                vec![
+                    ("mix.exs", "defmodule Hello.MixProject do end"),
+                    ("config/config.exs", "import Config"),
+                    (
+                        "lib/hello_web/router.ex",
+                        "defmodule HelloWeb.Router do end",
+                    ),
+                ],
+                "nixpacks-elixir",
+                "Elixir",
+            ),
+            (
+                vec![
+                    ("index.php", "<?php echo 'ok';"),
+                    ("nixpacks.toml", "[start]\ncmd = \"php -S 0.0.0.0:8000\""),
+                ],
+                "nixpacks-php",
+                "PHP",
+            ),
+            (
+                vec![
+                    ("Package.swift", "// swift-tools-version:5.9"),
+                    ("Sources/App/main.swift", "print(1)"),
+                ],
+                "nixpacks-swift",
+                "Swift",
+            ),
+        ] {
+            let zip = drop_test_zip(&files);
+            let manifests = inspect_zip_manifests(zip.path()).unwrap();
+            let candidates = drop_inspection_candidates(&manifests);
+            assert_eq!(candidates.len(), 1, "{slug}: {candidates:?}");
+            assert_eq!(candidates[0].directory, ".");
+            assert_eq!(candidates[0].preset, slug);
+            assert_eq!(candidates[0].label, label);
+            assert!(
+                !candidates[0].is_static,
+                "{slug} must not be served as files"
+            );
+            // Recognising more files must not loosen the archive policy.
+            let mut with_secret = files.clone();
+            with_secret.push((".env", "fixture-only"));
+            assert!(inspect_zip_manifests(drop_test_zip(&with_secret).path()).is_err());
+        }
+    }
+
+    #[test]
     fn drop_zip_ignores_dependency_manifests_but_checks_their_paths_for_secrets() {
         let mut files = vec![("composer.json".to_string(), "{}".to_string())];
         for index in 0..513 {

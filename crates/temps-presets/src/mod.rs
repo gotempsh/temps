@@ -494,6 +494,7 @@ pub fn all_presets() -> Vec<Box<dyn Preset>> {
         Box::new(NixpacksPreset::new(NixpacksProvider::Elixir)),
         Box::new(NixpacksPreset::new(NixpacksProvider::CSharp)),
         Box::new(NixpacksPreset::new(NixpacksProvider::Dart)),
+        Box::new(NixpacksPreset::new(NixpacksProvider::Swift)),
         Box::new(NixpacksPreset::new(NixpacksProvider::Static)),
     ]
 }
@@ -712,6 +713,21 @@ pub fn detect_all_presets_from_files(files: &[String]) -> Vec<Box<dyn Preset>> {
     if has_ruby {
         presets.push(Box::new(NixpacksPreset::new(NixpacksProvider::Ruby)));
     }
+    // Languages autopack builds with no preset of their own. Only explicit
+    // manifests count here: this sees one directory at a time, so it cannot
+    // tell a lone Deno `main.ts` from a Node app's `src/main.ts`.
+    for (manifests, provider) in [
+        (&["mix.exs"][..], NixpacksProvider::Elixir),
+        (&["Package.swift"][..], NixpacksProvider::Swift),
+        (
+            &["deno.json", "deno.jsonc", "deno.lock"][..],
+            NixpacksProvider::Deno,
+        ),
+    ] {
+        if manifests.iter().any(|name| file_named(name)) {
+            presets.push(Box::new(NixpacksPreset::new(provider)));
+        }
+    }
 
     // Check for Vite. A `vite.config.*` alone does not make a static site:
     // SvelteKit, React Router 7 framework mode, Remix, TanStack Start and
@@ -919,9 +935,8 @@ impl ProjectCandidate {
     /// Human-readable candidate label, including an explicitly selected language.
     pub fn label(&self) -> &'static str {
         match self.build_provider {
-            Some(NixpacksProvider::Ruby) => "Ruby",
-            Some(NixpacksProvider::Php) => "PHP",
-            _ => self.preset.display_name(),
+            Some(provider) => nixpacks_preset::provider_name(provider),
+            None => self.preset.display_name(),
         }
     }
 
@@ -1003,6 +1018,165 @@ pub fn is_project_candidate_directory(directory: &str) -> bool {
         && (directory == "." || directory.split('/').count() <= MAX_ROOT_DEPTH)
 }
 
+/// Manifests of server languages that have no dedicated preset and build
+/// through an explicit autopack provider. Each file is the one autopack's own
+/// provider detects, so a candidate offered from it is one the build plans
+/// rather than one it rejects. Listed in the order alternatives are offered.
+const SERVER_LANGUAGE_MANIFESTS: [(&str, NixpacksProvider, &str); 7] = [
+    (
+        "composer.json",
+        NixpacksProvider::Php,
+        "PHP composer.json found (server preset)",
+    ),
+    (
+        "Gemfile",
+        NixpacksProvider::Ruby,
+        "Ruby Gemfile found (server preset)",
+    ),
+    (
+        "mix.exs",
+        NixpacksProvider::Elixir,
+        "Elixir mix.exs found (server preset)",
+    ),
+    (
+        "Package.swift",
+        NixpacksProvider::Swift,
+        "Swift Package.swift found (server preset)",
+    ),
+    ("deno.json", NixpacksProvider::Deno, "Deno deno.json found"),
+    ("deno.jsonc", NixpacksProvider::Deno, "Deno deno.jsonc found"),
+    ("deno.lock", NixpacksProvider::Deno, "Deno deno.lock found"),
+];
+
+/// Entrypoints autopack's Deno provider accepts without a `deno.json`.
+const DENO_ENTRYPOINTS: [&str; 2] = ["main.ts", "mod.ts"];
+
+/// Manifests of other ecosystems that stop autopack from reading a lone
+/// `main.ts` as Deno. Mirrors autopack's own foreign-manifest list, so Drop
+/// never offers a Deno build that autopack would then not plan.
+const NON_DENO_ECOSYSTEM_MANIFESTS: [&str; 13] = [
+    "package.json",
+    "composer.json",
+    "Gemfile",
+    "go.mod",
+    "Cargo.toml",
+    "mix.exs",
+    "gleam.toml",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "requirements.txt",
+    "pyproject.toml",
+    "Pipfile",
+];
+
+/// Whether `name` on its own makes its directory an independently buildable
+/// project, whether or not a Dockerfile also lives there. This distinguishes a
+/// genuine monorepo service (its own Dockerfile *and* its own manifest, e.g.
+/// `apps/api/Dockerfile` + `apps/api/package.json`) from a bare Dockerfile
+/// conventionally tucked into `docker/` or `.devcontainer/`, whose `COPY`/`ADD`
+/// instructions typically reach back to the real repository root.
+pub fn is_project_manifest(name: &str) -> bool {
+    PROJECT_MANIFESTS.contains(&name)
+        || SERVER_LANGUAGE_MANIFESTS
+            .iter()
+            .any(|(manifest, _, _)| *manifest == name)
+        || name.ends_with(".csproj")
+        || name.starts_with("next.config.")
+        || name.starts_with("vite.config.")
+        || name.starts_with("astro.config.")
+}
+
+/// Project manifests other than the server-language ones above.
+const PROJECT_MANIFESTS: [&str; 13] = [
+    "package.json",
+    "docker-compose.yml",
+    "docker-compose.yaml",
+    "compose.yml",
+    "compose.yaml",
+    "Cargo.toml",
+    "go.mod",
+    "requirements.txt",
+    "pyproject.toml",
+    "pom.xml",
+    "build.gradle",
+    "index.html",
+    "nixpacks.toml",
+];
+
+/// Every file name that can make a directory deployable, for messages that
+/// tell a user what to add when nothing was found.
+pub fn project_signal_names() -> Vec<&'static str> {
+    let mut names = vec!["Dockerfile"];
+    names.extend(PROJECT_MANIFESTS);
+    names.extend(
+        SERVER_LANGUAGE_MANIFESTS
+            .iter()
+            .map(|(manifest, _, _)| *manifest),
+    );
+    names.extend(["*.csproj", "index.php", "main.ts (Deno)"]);
+    names
+}
+
+/// A file that names a project's entrypoint rather than describing the project.
+fn is_entrypoint_file(name: &str) -> bool {
+    name == "index.php" || DENO_ENTRYPOINTS.contains(&name)
+}
+
+/// The project root an entrypoint in `directory` belongs to: a `public/`
+/// holding `index.php` is the document root of a PHP application, not the
+/// application.
+fn entrypoint_root<'a>(directory: &'a str, names: &[&str]) -> &'a str {
+    if !names.contains(&"index.php") {
+        return directory;
+    }
+    match directory.rsplit_once('/') {
+        Some((parent, "public")) => parent,
+        None if directory == "public" => ".",
+        _ => directory,
+    }
+}
+
+fn directory_depth(directory: &str) -> usize {
+    if directory == "." {
+        0
+    } else {
+        directory.matches('/').count() + 1
+    }
+}
+
+/// Whether `directory` is `root` or lies beneath it.
+fn is_within(directory: &str, root: &str) -> bool {
+    root == "."
+        || directory == root
+        || directory
+            .strip_prefix(root)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn offer_provider(
+    candidates: &mut Vec<ProjectCandidate>,
+    root: &str,
+    provider: NixpacksProvider,
+    confidence: &'static str,
+    reason: &str,
+) {
+    if candidates
+        .iter()
+        .any(|candidate| candidate.build_provider == Some(provider))
+    {
+        return;
+    }
+    candidates.push(ProjectCandidate {
+        build_provider: Some(provider),
+        path: root.to_string(),
+        preset: PresetType::Nixpacks,
+        confidence,
+        reason: reason.to_string(),
+        dockerfile_path: None,
+    });
+}
+
 /// Detect deployable project roots from normalized archive entries.
 ///
 /// `files` maps slash-separated relative paths to the contents of small text
@@ -1027,37 +1201,8 @@ pub fn detect_project_candidates(
         by_directory.entry(directory).or_default().push(name);
     }
 
-    // Manifests that make a directory an independently buildable project on
-    // its own, regardless of whether a Dockerfile also lives there. This
-    // distinguishes a genuine monorepo service (its own Dockerfile *and* its
-    // own manifest, e.g. `apps/api/Dockerfile` + `apps/api/package.json`)
-    // from a bare Dockerfile conventionally tucked into a subdirectory like
-    // `docker/` or `.devcontainer/`, whose `COPY`/`ADD` instructions
-    // typically reach back to the real repository root.
-    let has_independent_manifest = |names: &[&str]| {
-        names.iter().any(|name| {
-            matches!(
-                *name,
-                "package.json"
-                    | "Gemfile"
-                    | "composer.json"
-                    | "docker-compose.yml"
-                    | "docker-compose.yaml"
-                    | "compose.yml"
-                    | "compose.yaml"
-                    | "Cargo.toml"
-                    | "go.mod"
-                    | "requirements.txt"
-                    | "pyproject.toml"
-                    | "pom.xml"
-                    | "build.gradle"
-                    | "index.html"
-            ) || name.ends_with(".csproj")
-                || name.starts_with("next.config.")
-                || name.starts_with("vite.config.")
-                || name.starts_with("astro.config.")
-        })
-    };
+    let has_independent_manifest =
+        |names: &[&str]| names.iter().any(|name| is_project_manifest(name));
 
     let mut roots = BTreeSet::new();
     // Subdirectories whose only signal is a bare `Dockerfile`, in a
@@ -1077,6 +1222,24 @@ pub fn detect_project_candidates(
         }
         if has_dockerfile || has_independent_manifest(names) {
             roots.insert(*directory);
+        }
+    }
+
+    // An entrypoint file (`index.php`, a lone `main.ts`) is how a project
+    // without a manifest announces itself, but the same files appear all over
+    // projects that have one: WordPress puts an `index.php` in nearly every
+    // directory, and a Vite app has `src/main.ts`. Such a file only starts a
+    // project when no enclosing directory already is one. Shallowest first,
+    // so an accepted entrypoint root also claims the entrypoints beneath it.
+    let mut entrypoint_roots: Vec<&str> = by_directory
+        .iter()
+        .filter(|(_, names)| names.iter().any(|name| is_entrypoint_file(name)))
+        .map(|(directory, names)| entrypoint_root(directory, names))
+        .collect();
+    entrypoint_roots.sort_by_key(|directory| (directory_depth(directory), *directory));
+    for directory in entrypoint_roots {
+        if !roots.iter().any(|root| is_within(directory, root)) {
+            roots.insert(directory);
         }
     }
 
@@ -1157,28 +1320,63 @@ pub fn detect_project_candidates(
             });
         }
         if !explicit_docker {
-            for (manifest, provider, reason) in [
-                (
-                    "composer.json",
-                    NixpacksProvider::Php,
-                    "PHP composer.json found (server preset)",
-                ),
-                (
-                    "Gemfile",
-                    NixpacksProvider::Ruby,
-                    "Ruby Gemfile found (server preset)",
-                ),
-            ] {
+            let has_public_index_php = by_directory
+                .get(at_root("public").as_str())
+                .is_some_and(|names| names.contains(&"index.php"));
+            for (manifest, provider, reason) in SERVER_LANGUAGE_MANIFESTS {
                 if has(manifest) {
-                    root_candidates.push(ProjectCandidate {
-                        build_provider: Some(provider),
-                        path: root.to_string(),
-                        preset: PresetType::Nixpacks,
-                        confidence: "high",
-                        reason: reason.to_string(),
-                        dockerfile_path: None,
-                    });
+                    offer_provider(&mut root_candidates, root, provider, "high", reason);
                 }
+            }
+            // Plain PHP needs no Composer: autopack serves `index.php` (or
+            // `public/index.php`) through FrankenPHP. The static preset would
+            // publish that source as text, so it is not offered at all.
+            if has("index.php") || has_public_index_php {
+                root_candidates.retain(|candidate| candidate.preset != PresetType::Static);
+            }
+            if has("index.php") {
+                offer_provider(
+                    &mut root_candidates,
+                    root,
+                    NixpacksProvider::Php,
+                    "high",
+                    "PHP index.php found (server preset)",
+                );
+            } else if has_public_index_php {
+                offer_provider(
+                    &mut root_candidates,
+                    root,
+                    NixpacksProvider::Php,
+                    "high",
+                    "PHP public/index.php found (server preset)",
+                );
+            }
+            // A lone `main.ts`/`mod.ts` is Deno's convention, and it is the
+            // rule autopack applies: only when no other ecosystem's manifest
+            // is present, since Node projects have a `main.ts` too.
+            if DENO_ENTRYPOINTS.iter().any(|name| has(name))
+                && !NON_DENO_ECOSYSTEM_MANIFESTS.iter().any(|name| has(name))
+            {
+                offer_provider(
+                    &mut root_candidates,
+                    root,
+                    NixpacksProvider::Deno,
+                    "medium",
+                    "Deno entrypoint found with no other manifest; add deno.json \
+                     with a `start` task to choose the start command explicitly",
+                );
+            }
+            // An explicit Nixpacks build plan with no language Temps can name
+            // still builds: autopack reads it and detects the provider.
+            if root_candidates.is_empty() && has("nixpacks.toml") {
+                root_candidates.push(ProjectCandidate {
+                    build_provider: None,
+                    path: root.to_string(),
+                    preset: PresetType::Nixpacks,
+                    confidence: "medium",
+                    reason: "nixpacks.toml found (language detected at build time)".to_string(),
+                    dockerfile_path: None,
+                });
             }
             // Vite assets and a generic JS manifest are common in server apps.
             // Prefer the server language, while keeping the JS option available.
@@ -2000,5 +2198,200 @@ mod git_tree_detection_tests {
         assert!(is_non_deployable_compose_dir("services/Examples/demo"));
         assert!(!is_non_deployable_compose_dir(""));
         assert!(!is_non_deployable_compose_dir("deploy"));
+    }
+
+    /// File lists of the official starters, as a Drop archive presents them:
+    /// every path is present, only recognised manifests carry contents.
+    fn archive(paths: &[&str]) -> BTreeMap<String, String> {
+        paths
+            .iter()
+            .map(|path| (path.to_string(), String::new()))
+            .collect()
+    }
+
+    fn wrapped(prefix: &str, paths: &[&str]) -> Vec<String> {
+        paths
+            .iter()
+            .map(|path| {
+                if prefix == "." {
+                    path.to_string()
+                } else {
+                    format!("{prefix}/{path}")
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn server_languages_without_a_js_manifest_are_deployable_from_drop() {
+        let phoenix = [
+            "config/config.exs",
+            "config/runtime.exs",
+            "lib/hello/application.ex",
+            "lib/hello_web.ex",
+            "lib/hello_web/controllers/page_controller.ex",
+            "lib/hello_web/endpoint.ex",
+            "lib/hello_web/router.ex",
+            "mix.exs",
+        ];
+        let vapor = ["Package.swift", "Sources/App/main.swift"];
+        let plain_php = ["index.php", "nixpacks.toml"];
+        let deno_config = ["deno.json", "main.ts"];
+        for (paths, slug, label) in [
+            (&phoenix[..], "nixpacks-elixir", "Elixir"),
+            (&vapor[..], "nixpacks-swift", "Swift"),
+            (&plain_php[..], "nixpacks-php", "PHP"),
+            (&deno_config[..], "nixpacks-deno", "Deno"),
+        ] {
+            // At the archive root, and wrapped in a folder as a zipped
+            // directory arrives.
+            for root in [".", "starter"] {
+                let files: BTreeMap<String, String> = wrapped(root, paths)
+                    .into_iter()
+                    .map(|path| (path, String::new()))
+                    .collect();
+                let candidates = detect_project_candidates(&files);
+                assert_eq!(candidates.len(), 1, "{slug} at {root}: {candidates:?}");
+                let candidate = &candidates[0];
+                assert_eq!(candidate.path, root, "{slug}");
+                assert_eq!(candidate.catalog_slug(), slug);
+                assert_eq!(candidate.label(), label);
+                assert_eq!(candidate.confidence, "high", "{slug}");
+                // The slug must create a project that builds with exactly
+                // that provider, not one that re-detects at build time.
+                let resolved = resolve_preset_slug(slug, None).unwrap();
+                let Some(StoredPresetConfig::Nixpacks(config)) = resolved.config else {
+                    panic!("{slug} must persist its explicit build provider");
+                };
+                assert_eq!(config.providers, vec![candidate.build_provider.unwrap()]);
+            }
+        }
+    }
+
+    #[test]
+    fn a_lone_deno_entrypoint_is_offered_with_how_to_make_it_explicit() {
+        for entrypoint in ["main.ts", "mod.ts"] {
+            let candidates = detect_project_candidates(&archive(&[entrypoint]));
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].catalog_slug(), "nixpacks-deno");
+            // Inferred from a file name, not declared: say so, and say how
+            // to declare it.
+            assert_eq!(candidates[0].confidence, "medium");
+            assert!(candidates[0].reason.contains("deno.json"));
+        }
+    }
+
+    #[test]
+    fn typescript_inside_another_project_is_not_mistaken_for_deno() {
+        // A Vite app's entrypoint, a Node server's `main.ts`, and arbitrary
+        // TypeScript files are not Deno projects.
+        let vite = archive(&["package.json", "vite.config.ts", "src/main.ts"]);
+        let vite = BTreeMap::from_iter(vite.into_iter().map(|(path, contents)| {
+            if path == "package.json" {
+                (path, r#"{"devDependencies":{"vite":"7"}}"#.to_string())
+            } else {
+                (path, contents)
+            }
+        }));
+        let candidates = detect_project_candidates(&vite);
+        assert_eq!(candidates.len(), 1, "{candidates:?}");
+        assert_eq!(candidates[0].preset, PresetType::Vite);
+
+        let node = archive(&["package.json", "main.ts"]);
+        let candidates = detect_project_candidates(&node);
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.build_provider != Some(NixpacksProvider::Deno)));
+
+        assert!(detect_project_candidates(&archive(&["lib/util.ts", "types.ts"])).is_empty());
+    }
+
+    #[test]
+    fn php_source_is_never_offered_as_a_static_site() {
+        let candidates = detect_project_candidates(&archive(&["index.php", "index.html"]));
+        // The static preset would publish the PHP source as text.
+        assert_eq!(candidates.len(), 1, "{candidates:?}");
+        assert_eq!(candidates[0].catalog_slug(), "nixpacks-php");
+    }
+
+    #[test]
+    fn public_index_php_roots_the_application_at_its_parent() {
+        for root in [".", "app"] {
+            let files: BTreeMap<String, String> = wrapped(root, &["public/index.php", "src/Kernel.php"])
+                .into_iter()
+                .map(|path| (path, String::new()))
+                .collect();
+            let candidates = detect_project_candidates(&files);
+            assert_eq!(candidates.len(), 1, "{candidates:?}");
+            assert_eq!(candidates[0].path, root);
+            assert_eq!(candidates[0].catalog_slug(), "nixpacks-php");
+        }
+    }
+
+    #[test]
+    fn nested_entrypoints_inside_a_project_do_not_become_projects() {
+        // WordPress ships an `index.php` in nearly every directory.
+        let wordpress = archive(&[
+            "index.php",
+            "wp-config.php",
+            "wp-content/index.php",
+            "wp-content/plugins/index.php",
+            "wp-content/themes/index.php",
+        ]);
+        let candidates = detect_project_candidates(&wordpress);
+        assert_eq!(candidates.len(), 1, "{candidates:?}");
+        assert_eq!(candidates[0].path, ".");
+        // Laravel: Composer at the root, the document root beneath it.
+        let laravel = archive(&["composer.json", "artisan", "public/index.php"]);
+        let candidates = detect_project_candidates(&laravel);
+        assert_eq!(candidates.len(), 1, "{candidates:?}");
+        assert_eq!(candidates[0].catalog_slug(), "nixpacks-php");
+    }
+
+    #[test]
+    fn a_nixpacks_plan_alone_is_offered_for_build_time_detection() {
+        let candidates = detect_project_candidates(&archive(&["nixpacks.toml", "app.sh"]));
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].catalog_slug(), "nixpacks");
+        resolve_preset_slug(candidates[0].catalog_slug(), None).unwrap();
+    }
+
+    #[test]
+    fn explicit_language_manifests_still_yield_to_a_dockerfile() {
+        for manifest in ["mix.exs", "Package.swift", "deno.json", "index.php"] {
+            let candidates = detect_project_candidates(&archive(&[manifest, "Dockerfile"]));
+            assert_eq!(candidates.len(), 1, "{manifest}: {candidates:?}");
+            assert_eq!(candidates[0].catalog_slug(), "dockerfile", "{manifest}");
+        }
+    }
+
+    #[test]
+    fn git_detection_recognises_the_same_explicit_language_manifests() {
+        assert_eq!(slugs(&["mix.exs"]), vec!["nixpacks-elixir"]);
+        assert_eq!(slugs(&["Package.swift"]), vec!["nixpacks-swift"]);
+        for manifest in ["deno.json", "deno.jsonc", "deno.lock"] {
+            assert_eq!(slugs(&[manifest, "main.ts"]), vec!["nixpacks-deno"]);
+        }
+        // Per-directory detection cannot see context, so a bare `main.ts`
+        // stays unclaimed there.
+        assert!(slugs(&["main.ts"]).is_empty());
+        for slug in ["nixpacks-elixir", "nixpacks-swift", "nixpacks-deno"] {
+            assert!(get_preset_by_slug(slug).is_some(), "{slug}");
+        }
+    }
+
+    #[test]
+    fn every_project_signal_is_named_for_the_not_found_message() {
+        let names = project_signal_names();
+        for expected in [
+            "Dockerfile",
+            "mix.exs",
+            "Package.swift",
+            "deno.json",
+            "index.php",
+            "nixpacks.toml",
+        ] {
+            assert!(names.contains(&expected), "{expected} missing from {names:?}");
+        }
     }
 }

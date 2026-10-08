@@ -31,7 +31,7 @@ use temps_entities::preset::NixpacksConfig;
 pub use temps_entities::preset::NixpacksProvider;
 use tracing::{debug, warn};
 
-fn provider_name(provider: NixpacksProvider) -> &'static str {
+pub(crate) fn provider_name(provider: NixpacksProvider) -> &'static str {
     match provider {
         NixpacksProvider::Auto => "Auto-detect",
         NixpacksProvider::Node => "Node.js",
