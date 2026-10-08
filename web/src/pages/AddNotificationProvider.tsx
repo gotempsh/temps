@@ -22,6 +22,11 @@ import { useForm } from 'react-hook-form'
 import { NotificationProviderIcon } from '@/components/monitoring/NotificationProviderIcon'
 import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
+import {
+  providerTestFailureMessage,
+  providerTestSucceeded,
+  providerTestSuccessMessage,
+} from '@/lib/notification-provider-test'
 import { ProviderForm } from '@/components/monitoring/ProviderForm'
 import {
   ProviderFormData,
@@ -482,27 +487,15 @@ function ProviderTestResult({
   result: { success: boolean; message?: string | null } | undefined
   error: unknown
 }) {
-  if (isSuccess && result?.success) {
-    return <Status tone="ok" label="Test notification sent" />
+  if (isSuccess && providerTestSucceeded(result)) {
+    return <Status tone="ok" label={providerTestSuccessMessage(result)} />
   }
   if ((isSuccess && result && !result.success) || error) {
     return (
       <Callout tone="error" title="Test notification failed">
-        {testFailureMessage(result, error)}
+        {providerTestFailureMessage(result, error)}
       </Callout>
     )
   }
   return null
-}
-
-function testFailureMessage(
-  result: { message?: string | null } | undefined,
-  error: unknown
-): string {
-  if (result?.message) return result.message
-  if (error && typeof error === 'object' && 'message' in error) {
-    const message = (error as { message?: unknown }).message
-    if (typeof message === 'string' && message) return message
-  }
-  return 'The provider rejected the test notification. Check its configuration.'
 }
