@@ -1088,6 +1088,164 @@ async fn test_legacy_monitor_reconciliation_merges_duplicates_and_preserves_hist
     Ok(())
 }
 
+/// Re-pointing a duplicate monitor's checks at the canonical monitor updates
+/// `status_checks` rows that live in compressed chunks once they are older
+/// than the 30-day compression policy. TimescaleDB aborts DML that
+/// decompresses more than `max_tuples_decompressed_per_dml_transaction`
+/// tuples, so on an install with long uptime history the migration failed and
+/// blocked the upgrade. The server here runs with that cap at 1 so a handful
+/// of compressed rows reproduces the failure; the migration must lift the cap
+/// for its own work and still re-point every check.
+#[tokio::test]
+async fn test_legacy_monitor_reconciliation_rewrites_compressed_status_checks() -> anyhow::Result<()>
+{
+    if external_db_configured() {
+        println!(
+            "Skipping compressed legacy-monitor reconciliation test: external database configured"
+        );
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+            "-c",
+            "timescaledb.max_tuples_decompressed_per_dml_transaction=1",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!(
+                "Skipping compressed legacy-monitor reconciliation test: Docker unavailable: {error}"
+            );
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+
+    let target = "m20260908_000001_reconcile_legacy_status_monitors";
+    let target_position = Migrator::migrations()
+        .iter()
+        .position(|migration| migration.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found in Migrator"));
+    Migrator::up(&db, Some(target_position as u32)).await?;
+
+    db.execute_unprepared(
+        "INSERT INTO projects (name, repo_name, repo_owner, directory, main_branch, preset, \
+         created_at, updated_at, slug) \
+         VALUES ('monitor-compressed-test', 'repo', 'owner', '.', 'main', 'nodejs', \
+                 now(), now(), 'monitor-compressed-test'); \
+         INSERT INTO environments \
+         (name, slug, subdomain, host, upstreams, created_at, updated_at, project_id) \
+         SELECT 'production', 'production', 'monitor-compressed-production', \
+                'monitor-compressed.test', '[]', now(), now(), id \
+         FROM projects WHERE slug = 'monitor-compressed-test'; \
+         INSERT INTO status_monitors \
+         (project_id, environment_id, name, monitor_type, check_path, \
+          check_interval_seconds, is_active, is_managed, created_at, updated_at) \
+         SELECT project_id, id, 'production Monitor', 'web', '/health', \
+                60, true, false, now() - interval '90 days', now() - interval '90 days' \
+         FROM environments WHERE subdomain = 'monitor-compressed-production'; \
+         INSERT INTO status_monitors \
+         (project_id, environment_id, name, monitor_type, check_path, \
+          check_interval_seconds, is_active, is_managed, created_at, updated_at) \
+         SELECT project_id, id, 'production Monitor', 'web', '/health', \
+                60, true, true, now() - interval '60 days', now() - interval '60 days' \
+         FROM environments WHERE subdomain = 'monitor-compressed-production'",
+    )
+    .await?;
+    let monitor_rows = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id FROM status_monitors ORDER BY id".to_string(),
+        ))
+        .await?;
+    let canonical_id = monitor_rows[0].try_get::<i32>("", "id")?;
+    let duplicate_id = monitor_rows[1].try_get::<i32>("", "id")?;
+
+    db.execute_unprepared(&format!(
+        "INSERT INTO status_checks (monitor_id, status, checked_at, created_at) \
+         SELECT {duplicate_id}, 'operational', \
+                now() - interval '40 days' - (s * interval '1 minute'), \
+                now() - interval '40 days' - (s * interval '1 minute') \
+         FROM generate_series(1, 20) s; \
+         SELECT compress_chunk(c, if_not_compressed => TRUE) \
+         FROM show_chunks('status_checks', older_than => now() - interval '30 days') c"
+    ))
+    .await?;
+    let compressed = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*) FILTER (WHERE is_compressed) AS compressed \
+             FROM timescaledb_information.chunks WHERE hypertable_name = 'status_checks'"
+                .to_string(),
+        ))
+        .await?
+        .expect("status_checks chunk count");
+    assert!(
+        compressed.try_get::<i64>("", "compressed")? > 0,
+        "test setup must compress at least one status_checks chunk, otherwise the \
+         decompression cap is never exercised"
+    );
+
+    Migrator::up(&db, Some(1)).await?;
+
+    let owners = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT count(*) FILTER (WHERE monitor_id = {canonical_id}) AS canonical, \
+                        count(*) FILTER (WHERE monitor_id = {duplicate_id}) AS duplicate \
+                 FROM status_checks"
+            ),
+        ))
+        .await?
+        .expect("status_checks owner counts");
+    assert_eq!(owners.try_get::<i64>("", "canonical")?, 20);
+    assert_eq!(owners.try_get::<i64>("", "duplicate")?, 0);
+
+    // The lifted cap is transaction-scoped and reset by the migration itself;
+    // the server-level value must be untouched for later sessions.
+    let cap = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT current_setting('timescaledb.max_tuples_decompressed_per_dml_transaction') \
+             AS cap"
+                .to_string(),
+        ))
+        .await?
+        .expect("decompression cap lookup");
+    assert_eq!(cap.try_get::<String>("", "cap")?, "1");
+
+    Migrator::down(&db, Some(1)).await?;
+    let restored = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT count(*) AS count FROM status_checks WHERE monitor_id = {duplicate_id}"
+            ),
+        ))
+        .await?
+        .expect("restored duplicate check count");
+    assert_eq!(restored.try_get::<i64>("", "count")?, 20);
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_preview_inclusion_default_migration_up_and_down() -> anyhow::Result<()> {
     if external_db_configured() {
