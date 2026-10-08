@@ -742,11 +742,7 @@ pub async fn inspect_drop_archive(
     })??;
 
     if candidates.is_empty() {
-        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
-            .with_title("No Deployable Project Found")
-            .with_detail(
-                "The archive does not contain a supported project manifest or index.html",
-            ));
+        return Err(no_deployable_project_problem());
     }
 
     let suggested_name = filename
@@ -760,6 +756,29 @@ pub async fn inspect_drop_archive(
         suggested_name,
         candidates,
     }))
+}
+
+/// Problem type the console keys its "nothing to deploy" onboarding state on.
+pub const DROP_NO_PROJECT_PROBLEM_TYPE: &str = "https://temps.sh/probs/drop-no-deployable-project";
+
+/// Rejection for an archive with no recognisable project root.
+///
+/// Retrying detection on the same files cannot succeed, so the detail names
+/// what Temps looks for and the one change that always works (a Dockerfile);
+/// `supported_files` lets the console render that list without parsing prose.
+fn no_deployable_project_problem() -> Problem {
+    let signals = temps_presets::project_signal_names();
+    problemdetails::new(StatusCode::BAD_REQUEST)
+        .with_type(DROP_NO_PROJECT_PROBLEM_TYPE)
+        .with_title("No Deployable Project Found")
+        .with_detail(format!(
+            "No deployable project was found in the archive. Temps looks for one of \
+             {} at the archive root or in a folder up to 4 levels deep. Add a \
+             Dockerfile to deploy any other application, or add the manifest \
+             your language uses.",
+            signals.join(", ")
+        ))
+        .with_value("supported_files", signals)
 }
 
 /// Bound the picker without letting one root's alternatives crowd out later
@@ -4146,12 +4165,13 @@ mod tests {
         canonicalize_template_upgrade_environment_variables, compose_path_for_candidate,
         drop_inspection_candidates, drop_preset_candidate_from, image_deployment_dispatch_feedback,
         image_template_preset_config, inspect_zip_manifests,
-        missing_required_template_configuration, parse_owner_repo_from_git_url,
-        production_environment_variable_names, project_created_from_template_telemetry_event,
-        require_git_settings_permissions, require_template_creation_permissions,
-        resolve_image_template_runtime, service_template_changes,
-        validate_template_service_selection, DropPresetCandidate, TemplateEnvironmentError,
-        TemplateRuntimeOverrideError, TemplateServiceSelectionError, MAX_DROP_CANDIDATES,
+        missing_required_template_configuration, no_deployable_project_problem,
+        parse_owner_repo_from_git_url, production_environment_variable_names,
+        project_created_from_template_telemetry_event, require_git_settings_permissions,
+        require_template_creation_permissions, resolve_image_template_runtime,
+        service_template_changes, validate_template_service_selection, DropPresetCandidate,
+        TemplateEnvironmentError, TemplateRuntimeOverrideError, TemplateServiceSelectionError,
+        DROP_NO_PROJECT_PROBLEM_TYPE, MAX_DROP_CANDIDATES,
     };
     use axum::http::StatusCode;
     use chrono::Utc;
@@ -4756,6 +4776,41 @@ mod tests {
             let mut with_secret = files.clone();
             with_secret.push((".env", "fixture-only"));
             assert!(inspect_zip_manifests(drop_test_zip(&with_secret).path()).is_err());
+        }
+    }
+
+    #[test]
+    fn drop_without_a_project_says_what_to_add() {
+        let zip = drop_test_zip(&[("notes.txt", "hello"), ("lib/util.ts", "export {}")]);
+        let manifests = inspect_zip_manifests(zip.path()).unwrap();
+        assert!(drop_inspection_candidates(&manifests).is_empty());
+
+        let problem = no_deployable_project_problem();
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            problem.body.get("type").and_then(|value| value.as_str()),
+            Some(DROP_NO_PROJECT_PROBLEM_TYPE)
+        );
+        let detail = problem.body["detail"].as_str().unwrap();
+        assert!(detail.contains("Add a Dockerfile"), "{detail}");
+        let supported: Vec<&str> = problem.body["supported_files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect();
+        for expected in [
+            "Dockerfile",
+            "package.json",
+            "mix.exs",
+            "Package.swift",
+            "deno.json",
+            "index.php",
+        ] {
+            assert!(
+                supported.contains(&expected),
+                "{expected} missing: {supported:?}"
+            );
         }
     }
 

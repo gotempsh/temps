@@ -29,6 +29,28 @@ export function presetConfigForDropCandidate(
   return undefined
 }
 
+/** Problem type `POST /drop/inspect` returns when nothing is deployable. */
+export const DROP_NO_PROJECT_PROBLEM_TYPE =
+  'https://temps.sh/probs/drop-no-deployable-project'
+
+/**
+ * The files Temps looks for, when `error` is the "nothing deployable"
+ * rejection; `null` for any other failure.
+ *
+ * Retrying detection on the same files cannot change that answer, so the
+ * console uses this to show what to add instead of offering a retry.
+ */
+export function dropDetectionGap(error: unknown): string[] | null {
+  if (!error || typeof error !== 'object') return null
+  const problem = error as { type?: unknown; supported_files?: unknown }
+  if (problem.type !== DROP_NO_PROJECT_PROBLEM_TYPE) return null
+  return Array.isArray(problem.supported_files)
+    ? problem.supported_files.filter(
+        (name): name is string => typeof name === 'string'
+      )
+    : []
+}
+
 interface PrepareAndInspectOptions {
   signal?: AbortSignal
   onArchivePrepared?: (archive: File) => void

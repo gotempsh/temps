@@ -14,6 +14,7 @@ import {
 } from '@/api/client'
 import { DetectedPresetCard } from '@/components/drop/DetectedPresetCard'
 import { DetectedPresetGrid } from '@/components/drop/DetectedPresetGrid'
+import { DropNoProjectFound } from '@/components/drop/DropNoProjectFound'
 import { DropZone } from '@/components/drop/DropZone'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
@@ -34,9 +35,12 @@ import {
 } from '@/lib/drop-archive'
 import { dropErrorMessage } from '@/lib/drop-files'
 import { sourceArchiveUploadsSupported } from '@/lib/platform-capabilities'
-import { prepareAndInspectDrop } from '@/lib/drop-preset-detection'
+import {
+  dropDetectionGap,
+  prepareAndInspectDrop,
+} from '@/lib/drop-preset-detection'
 import { cn } from '@/lib/utils'
-import { Loader2, UploadCloud, X } from 'lucide-react'
+import { FolderOpen, Loader2, UploadCloud, X } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router'
 
@@ -94,6 +98,8 @@ export function ProjectDrop({ project }: { project: ProjectResponse }) {
   const [rootPage, setRootPage] = useState('')
   const [stage, setStage] = useState<Stage>('idle')
   const [error, setError] = useState<string | null>(null)
+  // Files Temps looks for, once inspection found nothing it can build.
+  const [detectionGap, setDetectionGap] = useState<string[] | null>(null)
   const [preparedArchive, setPreparedArchive] = useState<File | null>(null)
   const [inspection, setInspection] = useState<DropInspectionResponse | null>(
     null
@@ -186,6 +192,7 @@ export function ProjectDrop({ project }: { project: ProjectResponse }) {
     } catch (caught) {
       if (detectionRunRef.current !== runId) return
       setError(dropErrorMessage(caught))
+      setDetectionGap(dropDetectionGap(caught))
       setPreparedArchive(null)
       setInspection(null)
       setStage('idle')
@@ -202,6 +209,7 @@ export function ProjectDrop({ project }: { project: ProjectResponse }) {
     detectionAbortRef.current = null
     setFiles(next)
     setError(null)
+    setDetectionGap(null)
     setPreparedArchive(null)
     setInspection(null)
     setCandidateIndex('0')
@@ -380,6 +388,7 @@ export function ProjectDrop({ project }: { project: ProjectResponse }) {
                         setPreparedArchive(null)
                         setInspection(null)
                         setError(null)
+                        setDetectionGap(null)
                         void detectSelection(files, value, runId)
                       }}
                       disabled={isBusy}
@@ -410,13 +419,16 @@ export function ProjectDrop({ project }: { project: ProjectResponse }) {
                   </div>
                 )}
 
-                {(!inspection || inspection.candidates.length === 1) && (
-                  <DetectedPresetCard
-                    candidate={candidate}
-                    isDetecting={stage === 'packing' || stage === 'detecting'}
-                    phase={stage === 'packing' ? 'packing' : 'detecting'}
-                  />
-                )}
+                {/* Once nothing deployable was found, "Temps will identify the
+                    framework" is no longer true; the gap notice replaces it. */}
+                {!detectionGap &&
+                  (!inspection || inspection.candidates.length === 1) && (
+                    <DetectedPresetCard
+                      candidate={candidate}
+                      isDetecting={stage === 'packing' || stage === 'detecting'}
+                      phase={stage === 'packing' ? 'packing' : 'detecting'}
+                    />
+                  )}
 
                 <div className="rounded-xl border bg-muted/35 p-4 text-sm">
                   <div className="flex items-center justify-between gap-3">
@@ -432,7 +444,11 @@ export function ProjectDrop({ project }: { project: ProjectResponse }) {
                   <div className="mt-3 flex items-center justify-between gap-3">
                     <span className="text-muted-foreground">Preset</span>
                     <span className="font-medium">
-                      {candidate ? candidate.label : 'Pending detection'}
+                      {candidate
+                        ? candidate.label
+                        : detectionGap
+                          ? 'Nothing detected'
+                          : 'Pending detection'}
                     </span>
                   </div>
                   <div className="mt-3 flex items-center justify-between gap-3">
@@ -443,28 +459,40 @@ export function ProjectDrop({ project }: { project: ProjectResponse }) {
                   </div>
                 </div>
 
-                {error && (
-                  <div
-                    role="alert"
-                    className="rounded-xl border border-destructive/30 bg-destructive/5 p-4 text-sm leading-6 text-destructive"
-                  >
-                    {error}
-                  </div>
+                {detectionGap ? (
+                  <DropNoProjectFound supportedFiles={detectionGap} />
+                ) : (
+                  error && (
+                    <div
+                      role="alert"
+                      className="rounded-xl border border-destructive/30 bg-destructive/5 p-4 text-sm leading-6 text-destructive"
+                    >
+                      {error}
+                    </div>
+                  )
                 )}
               </div>
 
               <Button
                 size="lg"
                 className="h-12 w-full"
-                disabled={files.length === 0 || isBusy || !environmentId}
-                onClick={run}
+                disabled={
+                  files.length === 0 ||
+                  isBusy ||
+                  (!detectionGap && !environmentId)
+                }
+                onClick={detectionGap ? () => select([]) : run}
               >
                 {isBusy ? (
                   <Loader2 className="mr-2 size-4 animate-spin" />
+                ) : detectionGap ? (
+                  <FolderOpen className="mr-2 size-4" />
                 ) : (
                   <UploadCloud className="mr-2 size-4" />
                 )}
-                {stageLabel(stage, candidate?.label, files.length > 0)}
+                {detectionGap
+                  ? 'Choose different files'
+                  : stageLabel(stage, candidate?.label, files.length > 0)}
               </Button>
             </aside>
           )}

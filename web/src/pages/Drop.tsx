@@ -18,6 +18,7 @@ import { DropZone } from '@/components/drop/DropZone'
 import { DropEnvironmentVariables } from '@/components/drop/DropEnvironmentVariables'
 import { DetectedPresetCard } from '@/components/drop/DetectedPresetCard'
 import { DetectedPresetGrid } from '@/components/drop/DetectedPresetGrid'
+import { DropNoProjectFound } from '@/components/drop/DropNoProjectFound'
 import { PageContainer } from '@/components/layout/PageContainer'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
@@ -47,6 +48,7 @@ import {
   type DropEnvironmentVariable,
 } from '@/lib/drop-environment-variables'
 import {
+  dropDetectionGap,
   prepareAndInspectDrop,
   presetConfigForDropCandidate,
 } from '@/lib/drop-preset-detection'
@@ -55,6 +57,7 @@ import { cn } from '@/lib/utils'
 import {
   ArrowRight,
   Check,
+  FolderOpen,
   Loader2,
   RotateCcw,
   UploadCloud,
@@ -114,6 +117,8 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
   const [rootPage, setRootPage] = useState('')
   const [stage, setStage] = useState<DropStage>('idle')
   const [error, setError] = useState<string | null>(null)
+  // Files Temps looks for, once inspection found nothing it can build.
+  const [detectionGap, setDetectionGap] = useState<string[] | null>(null)
   const [project, setProject] = useState<ProjectResponse | null>(null)
   const [environment, setEnvironment] = useState<EnvironmentResponse | null>(
     null
@@ -198,6 +203,7 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
     } catch (caught) {
       if (detectionRunRef.current !== runId) return
       setError(dropErrorMessage(caught))
+      setDetectionGap(dropDetectionGap(caught))
       setPreparedArchive(null)
       setInspection(null)
       setStage('idle')
@@ -214,6 +220,7 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
     detectionAbortRef.current = null
     setFiles(nextFiles)
     setError(null)
+    setDetectionGap(null)
     setProject(null)
     setEnvironment(null)
     setPreparedArchive(null)
@@ -257,6 +264,7 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
     setStage('idle')
     setError(null)
     setProject(null)
+    setDetectionGap(null)
     setEnvironment(null)
     setPreparedArchive(null)
     setInspection(null)
@@ -547,6 +555,7 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
                           setPreparedArchive(null)
                           setInspection(null)
                           setError(null)
+                          setDetectionGap(null)
                           void detectSelection(files, value, runId)
                         }}
                         disabled={isBusy}
@@ -583,13 +592,16 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
                   </div>
                 )}
 
-                {(!inspection || inspection.candidates.length === 1) && (
-                  <DetectedPresetCard
-                    candidate={selectedCandidate}
-                    isDetecting={stage === 'packing' || stage === 'detecting'}
-                    phase={stage === 'packing' ? 'packing' : 'detecting'}
-                  />
-                )}
+                {/* Once nothing deployable was found, "Temps will identify the
+                    framework" is no longer true; the gap notice replaces it. */}
+                {!detectionGap &&
+                  (!inspection || inspection.candidates.length === 1) && (
+                    <DetectedPresetCard
+                      candidate={selectedCandidate}
+                      isDetecting={stage === 'packing' || stage === 'detecting'}
+                      phase={stage === 'packing' ? 'packing' : 'detecting'}
+                    />
+                  )}
 
                 <div className="rounded-xl border bg-muted/35 p-4 text-sm">
                   <div className="flex items-center justify-between gap-3">
@@ -597,7 +609,9 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
                     <span className="font-medium">
                       {inspection
                         ? selectedCandidate?.label
-                        : 'Pending detection'}
+                        : detectionGap
+                          ? 'Nothing detected'
+                          : 'Pending detection'}
                     </span>
                   </div>
                   <div className="mt-3 flex items-center justify-between gap-3">
@@ -622,13 +636,17 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
                   </div>
                 </div>
 
-                {error && (
-                  <div
-                    role="alert"
-                    className="rounded-xl border border-destructive/30 bg-destructive/5 p-4 text-sm leading-6 text-destructive"
-                  >
-                    {error}
-                  </div>
+                {detectionGap ? (
+                  <DropNoProjectFound supportedFiles={detectionGap} />
+                ) : (
+                  error && (
+                    <div
+                      role="alert"
+                      className="rounded-xl border border-destructive/30 bg-destructive/5 p-4 text-sm leading-6 text-destructive"
+                    >
+                      {error}
+                    </div>
+                  )
                 )}
               </div>
 
@@ -636,14 +654,22 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
                 size="lg"
                 className="h-12 w-full"
                 disabled={files.length === 0 || isBusy}
-                onClick={deploy}
+                onClick={detectionGap ? reset : deploy}
               >
                 {isBusy ? (
                   <Loader2 className="mr-2 size-4 animate-spin" />
+                ) : detectionGap ? (
+                  <FolderOpen className="mr-2 size-4" />
                 ) : (
                   <UploadCloud className="mr-2 size-4" />
                 )}
-                {stageLabel(stage, selectedCandidate?.label, files.length > 0)}
+                {detectionGap
+                  ? 'Choose different files'
+                  : stageLabel(
+                      stage,
+                      selectedCandidate?.label,
+                      files.length > 0
+                    )}
               </Button>
               <p className="mt-3 text-center text-xs text-muted-foreground">
                 Failed setup is rolled back automatically.
