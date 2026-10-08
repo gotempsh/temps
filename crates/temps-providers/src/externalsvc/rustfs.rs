@@ -491,6 +491,17 @@ impl RustfsService {
     /// Public so callers that need to reason about the container — the blob
     /// plugin checking for a duplicate left by the pre-#495 naming split, for
     /// one — can ask instead of re-deriving `rustfs-{name}` themselves.
+    /// Restart-loop note for this service's container, if it has restarted.
+    async fn restart_loop_note(&self) -> Option<String> {
+        let name = self.get_container_name();
+        let info = self
+            .docker
+            .inspect_container(&name, None::<InspectContainerOptions>)
+            .await
+            .ok()?;
+        restart_loop_note(&name, info.restart_count.unwrap_or(0))
+    }
+
     pub fn get_container_name(&self) -> String {
         rustfs_container_name(&self.name)
     }
@@ -1057,6 +1068,67 @@ impl RustfsService {
 
 /// Container name of a service named `name`. The single derivation shared by
 /// the engine and anything that must find its container without an instance.
+/// Authenticated `ListBuckets` against a RustFS endpoint. An unauthenticated
+/// `/health` 200 does not prove the storage layer can serve S3 requests, so
+/// readiness and health are both judged by this call.
+async fn list_buckets_probe(endpoint: &str, cfg: &RustfsConfig) -> std::result::Result<(), String> {
+    let creds = aws_sdk_s3::config::Credentials::new(
+        cfg.access_key.clone(),
+        cfg.secret_key.clone(),
+        None,
+        None,
+        "rustfs-health-probe",
+    );
+    let s3_config = aws_sdk_s3::Config::builder()
+        .region(Region::new(cfg.region.clone()))
+        .endpoint_url(endpoint.to_string())
+        .credentials_provider(creds)
+        .force_path_style(true)
+        .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+        .build();
+    Client::from_conf(s3_config)
+        .list_buckets()
+        .send()
+        .await
+        .map(|_| ())
+        .map_err(|e| {
+            let status = e.raw_response().map(|r| r.status().as_u16());
+            s3_probe_failure(
+                "ListBuckets",
+                status,
+                &aws_sdk_s3::error::DisplayErrorContext(&e).to_string(),
+            )
+        })
+}
+
+/// Turn an S3 probe failure into a diagnostic that says what it means. The
+/// SDK's own `Display` is just "service error", which tells an operator
+/// nothing.
+fn s3_probe_failure(operation: &str, status: Option<u16>, detail: &str) -> String {
+    match status {
+        Some(503) => format!(
+            "{operation} failed with HTTP 503: RustFS is answering but its storage layer is \
+             not ready (still initializing, or initialization failed): {detail}"
+        ),
+        Some(code @ (401 | 403)) => format!(
+            "{operation} failed with HTTP {code}: RustFS rejected the service's access key: {detail}"
+        ),
+        Some(code) => format!("{operation} failed with HTTP {code}: {detail}"),
+        None => format!("{operation} failed: {detail}"),
+    }
+}
+
+/// Note appended to a failed probe when the container keeps restarting, which
+/// points at an initialization failure only its logs can explain.
+fn restart_loop_note(container_name: &str, restart_count: i64) -> Option<String> {
+    (restart_count > 0).then(|| {
+        format!(
+            ". Container '{container_name}' has restarted {restart_count} time(s); its logs \
+             (docker logs {container_name}) show why RustFS could not start its storage"
+        )
+    })
+}
+
 pub(crate) fn rustfs_container_name(name: &str) -> String {
     format!("rustfs-{}", name)
 }
@@ -1257,29 +1329,7 @@ impl ExternalService for RustfsService {
         let endpoint = format!("http://{}:{}", cfg.host, cfg.port);
         let start = Instant::now();
 
-        let probe = async {
-            let creds = aws_sdk_s3::config::Credentials::new(
-                cfg.access_key.clone(),
-                cfg.secret_key.clone(),
-                None,
-                None,
-                "rustfs-health-probe",
-            );
-            let s3_config = aws_sdk_s3::Config::builder()
-                .region(Region::new(cfg.region.clone()))
-                .endpoint_url(endpoint.clone())
-                .credentials_provider(creds)
-                .force_path_style(true)
-                .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
-                .build();
-            let client = Client::from_conf(s3_config);
-            client
-                .list_buckets()
-                .send()
-                .await
-                .map_err(|e| format!("ListBuckets failed: {}", e))?;
-            Ok::<(), String>(())
-        };
+        let probe = list_buckets_probe(&endpoint, &cfg);
 
         match tokio::time::timeout(PROBE_TIMEOUT, probe).await {
             Err(_) => Ok(HealthProbeResult::down(format!(
@@ -1287,10 +1337,13 @@ impl ExternalService for RustfsService {
                 endpoint,
                 PROBE_TIMEOUT.as_secs()
             ))),
-            Ok(Err(msg)) => Ok(HealthProbeResult::down(format!(
-                "rustfs probe to {} {}",
-                endpoint, msg
-            ))),
+            Ok(Err(msg)) => {
+                let restart_note = self.restart_loop_note().await.unwrap_or_default();
+                Ok(HealthProbeResult::down(format!(
+                    "rustfs probe to {} {}{}",
+                    endpoint, msg, restart_note
+                )))
+            }
             Ok(Ok(())) => {
                 let elapsed_ms = start.elapsed().as_millis();
                 let response_time = i32::try_from(elapsed_ms).ok();
@@ -2404,6 +2457,76 @@ mod tests {
 
     const TEST_IMAGE: &str = "rustfs/rustfs:1.0.0-alpha.98";
 
+    /// One-shot HTTP server answering every request with `status`.
+    async fn fake_s3_endpoint(status_line: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let body = "<Error><Code>ServiceUnavailable</Code><Message>store init in progress</Message></Error>";
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\ncontent-type: application/xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn probe_config() -> RustfsConfig {
+        RustfsConfig {
+            port: "9000".to_string(),
+            console_port: "9001".to_string(),
+            access_key: "probe-access".to_string(),
+            secret_key: "probe-secret".to_string(),
+            host: "127.0.0.1".to_string(),
+            region: "us-east-1".to_string(),
+            docker_image: DEFAULT_RUSTFS_IMAGE.to_string(),
+            metrics_ingest_key: None,
+            metrics_ingest_url: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn list_buckets_probe_explains_a_503_instead_of_service_error() {
+        let endpoint = fake_s3_endpoint("503 Service Unavailable").await;
+        let message = list_buckets_probe(&endpoint, &probe_config())
+            .await
+            .unwrap_err();
+        assert!(
+            message.contains("HTTP 503") && message.contains("storage layer is not ready"),
+            "diagnostic should state the status and what it means: {message}"
+        );
+        assert!(
+            message.contains("ServiceUnavailable"),
+            "diagnostic should carry the S3 error code: {message}"
+        );
+        assert!(!message.contains("probe-secret"));
+    }
+
+    #[tokio::test]
+    async fn list_buckets_probe_flags_rejected_credentials() {
+        let endpoint = fake_s3_endpoint("403 Forbidden").await;
+        let message = list_buckets_probe(&endpoint, &probe_config())
+            .await
+            .unwrap_err();
+        assert!(
+            message.contains("HTTP 403") && message.contains("access key"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn restart_loop_note_only_for_restarted_containers() {
+        assert_eq!(restart_loop_note("rustfs-a", 0), None);
+        let note = restart_loop_note("rustfs-a", 20).unwrap();
+        assert!(note.contains("restarted 20 time(s)") && note.contains("docker logs rustfs-a"));
+    }
+
     #[test]
     fn external_client_output_redacts_keys_and_credential_urls() {
         let output =
@@ -2686,6 +2809,154 @@ mod tests {
     ///
     /// Bucket names `app` and `app-logs` share a prefix on purpose: a listing
     /// or mirror without the trailing `/` would mix their objects.
+    /// Qualification gate for [`DEFAULT_RUSTFS_IMAGE`]: a service created the
+    /// way the console creates one, on fresh volumes, must serve authenticated
+    /// ListBuckets and CreateBucket (not just `/health`), must not be in a
+    /// restart loop, and must keep serving after a container restart.
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_default_image_fresh_volumes_serve_authenticated_s3() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => Arc::new(d),
+            Err(e) => {
+                println!("Docker not available, skipping test: {}", e);
+                return;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker daemon not responding, skipping test");
+            return;
+        }
+        let encryption_service =
+            Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
+        let service_name = format!("test-rustfs-qual-{}", chrono::Utc::now().timestamp_millis());
+        let service = RustfsService::new(service_name.clone(), docker.clone(), encryption_service);
+        let inferred = service
+            .init(ServiceConfig {
+                name: service_name.clone(),
+                service_type: ServiceType::Rustfs,
+                version: None,
+                parameters: serde_json::json!({
+                    "host": "localhost",
+                    "region": "us-east-1",
+                    "docker_image": DEFAULT_RUSTFS_IMAGE,
+                }),
+            })
+            .await
+            .expect("RustFS service should start");
+        let cfg: RustfsConfig = RustfsConfig {
+            port: inferred["port"].clone(),
+            console_port: inferred["console_port"].clone(),
+            access_key: inferred["access_key"].clone(),
+            secret_key: inferred["secret_key"].clone(),
+            host: "localhost".to_string(),
+            region: "us-east-1".to_string(),
+            docker_image: DEFAULT_RUSTFS_IMAGE.to_string(),
+            metrics_ingest_key: None,
+            metrics_ingest_url: None,
+        };
+        let endpoint = format!("http://localhost:{}", cfg.port);
+        let container = service.get_container_name();
+
+        async fn wait_for_s3(
+            endpoint: &str,
+            cfg: &RustfsConfig,
+        ) -> std::result::Result<(), String> {
+            let deadline = std::time::Instant::now() + Duration::from_secs(120);
+            loop {
+                match list_buckets_probe(endpoint, cfg).await {
+                    Ok(()) => return Ok(()),
+                    Err(e) if std::time::Instant::now() > deadline => return Err(e),
+                    Err(_) => sleep(Duration::from_secs(2)).await,
+                }
+            }
+        }
+
+        let result = async {
+            wait_for_s3(&endpoint, &cfg).await?;
+            let client = Client::from_conf(
+                aws_sdk_s3::Config::builder()
+                    .endpoint_url(&endpoint)
+                    .region(Region::new("us-east-1"))
+                    .behavior_version_latest()
+                    .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                        cfg.access_key.clone(),
+                        cfg.secret_key.clone(),
+                        None,
+                        None,
+                        "rustfs-qualification",
+                    ))
+                    .force_path_style(true)
+                    .build(),
+            );
+            client
+                .create_bucket()
+                .bucket("qualification")
+                .send()
+                .await
+                .map_err(|e| {
+                    format!(
+                        "CreateBucket failed: {}",
+                        aws_sdk_s3::error::DisplayErrorContext(&e)
+                    )
+                })?;
+            let restarts = docker
+                .inspect_container(&container, None::<InspectContainerOptions>)
+                .await
+                .map_err(|e| e.to_string())?
+                .restart_count
+                .unwrap_or(0);
+            if restarts != 0 {
+                return Err(format!(
+                    "container restarted {restarts} time(s) during first boot"
+                ));
+            }
+
+            docker
+                .restart_container(
+                    &container,
+                    None::<bollard::query_parameters::RestartContainerOptions>,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            wait_for_s3(&endpoint, &cfg)
+                .await
+                .map_err(|e| format!("after restart: {e}"))?;
+            let names: Vec<String> = client
+                .list_buckets()
+                .send()
+                .await
+                .map_err(|e| {
+                    format!(
+                        "ListBuckets after restart failed: {}",
+                        aws_sdk_s3::error::DisplayErrorContext(&e)
+                    )
+                })?
+                .buckets()
+                .iter()
+                .filter_map(|b| b.name().map(str::to_string))
+                .collect();
+            if !names.iter().any(|n| n == "qualification") {
+                return Err(format!("bucket lost across restart: {names:?}"));
+            }
+            Ok::<(), String>(())
+        }
+        .await;
+
+        let _ = service.cleanup().await;
+        for volume in rustfs_volume_names(&service_name) {
+            let _ = docker
+                .remove_volume(
+                    &volume,
+                    None::<bollard::query_parameters::RemoveVolumeOptions>,
+                )
+                .await;
+        }
+        if let Err(e) = result {
+            panic!("{DEFAULT_RUSTFS_IMAGE} failed fresh-volume S3 qualification: {e}");
+        }
+    }
+
     #[cfg(feature = "docker-tests")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_rustfs_backup_and_restore_in_place() {
