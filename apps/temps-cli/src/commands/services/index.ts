@@ -3,6 +3,7 @@
 
 import type { Command } from 'commander'
 import { registerRestoreCommands } from './restore.js'
+import { registerImportDataCommands } from './import-data.js'
 import { registerWalHealthCommands } from './wal-health.js'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
@@ -536,6 +537,7 @@ export function registerServicesCommands(program: Command): void {
   // Restore-related commands: capabilities, list backups on an S3 source,
   // kick off a restore (in-place / clone / PITR), show / list runs.
   registerRestoreCommands(services)
+  registerImportDataCommands(services)
 
   // Live WAL / archive_command diagnostics for PostgreSQL services.
   registerWalHealthCommands(services)
