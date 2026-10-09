@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { useNavigate, useParams } from 'react-router'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
@@ -59,20 +59,7 @@ export default function ApiKeyEdit() {
     ...getApiKeyOptions({ path: { id: apiKeyId } }),
     enabled: validId,
   })
-  const {
-    data: apiKey,
-    isLoading,
-    error: apiKeyError,
-    refetch: refetchApiKey,
-  } = apiKeyQuery
-
-  useEffect(() => {
-    if (apiKey && apiKeyError) {
-      toast.error('Failed to refresh API key', {
-        action: { label: 'Retry', onClick: () => void refetchApiKey() },
-      })
-    }
-  }, [apiKey, apiKeyError, refetchApiKey])
+  const { data: apiKey, isLoading, error: apiKeyError } = apiKeyQuery
 
   const [loadedApiKey, setLoadedApiKey] = useState(apiKey)
   if (apiKey !== loadedApiKey) {
@@ -147,7 +134,7 @@ export default function ApiKeyEdit() {
         <ReadFailure
           resource="API key"
           error={apiKeyError}
-          onRetry={() => void refetchApiKey()}
+          onRetry={() => void apiKeyQuery.refetch()}
           retrying={apiKeyQuery.isFetching}
         />
         <Button variant="ghost" onClick={() => navigate('/settings/keys')}>
@@ -202,6 +189,18 @@ export default function ApiKeyEdit() {
           </div>
         </div>
       </div>
+
+      {/* Editing stale settings would save over changes made since, so a
+          failed refresh is called out above the form. */}
+      {apiKeyError && (
+        <ReadFailure
+          resource="API key"
+          error={apiKeyError}
+          cached
+          onRetry={() => apiKeyQuery.refetch()}
+          retrying={apiKeyQuery.isFetching}
+        />
+      )}
 
       <form onSubmit={handleSubmit} className="space-y-6">
         {/* Key Information Card */}

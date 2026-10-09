@@ -114,9 +114,11 @@ export function ProjectFeatureFlags({ project }: ProjectFeatureFlagsProps) {
 
   const isLoading = flagsQuery.isPending || environmentsQuery.isPending
   // A failed read says nothing about how many flags exist. Only a successful
-  // read with zero rows may show the "No feature flags yet" onboarding.
-  const flagsReadFailed = flagsQuery.isError && flagsQuery.data === undefined
-  const flagsStale = flagsQuery.isError && flagsQuery.data !== undefined
+  // read with zero rows may show the "No feature flags yet" onboarding --
+  // including when the last good read was itself empty, since the failed
+  // refresh is the current answer. Cached rows stay under a stale banner.
+  const flagsReadFailed = flagsQuery.isError && flags.length === 0
+  const flagsStale = flagsQuery.isError && flags.length > 0
 
   return (
     <div className="space-y-6">

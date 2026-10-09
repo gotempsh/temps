@@ -345,6 +345,15 @@ export default function ApiKeyDetail() {
       facts={apiKeyFacts(apiKey)}
       main={
         <>
+          {apiKeyError && (
+            <ReadFailure
+              resource="API key"
+              error={apiKeyError}
+              cached
+              onRetry={() => apiKeyQuery.refetch()}
+              retrying={apiKeyQuery.isFetching}
+            />
+          )}
           {!apiKey.is_active && (
             <Callout tone="warning" title="This API key is inactive">
               It cannot be used for authentication until reactivated.

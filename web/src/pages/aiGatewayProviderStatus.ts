@@ -20,12 +20,17 @@ export interface ProviderKeysReadState {
   isError: boolean
 }
 
-/** True only when the list was never read successfully, so nothing is known. */
+/**
+ * True when the latest read failed and no key is cached to show instead.
+ *
+ * An empty cache counts as unknown too: the failed refresh is the current
+ * answer, and the last good read being empty does not prove it still is.
+ */
 export function providerKeysUnknown({
   keys,
   isError,
 }: ProviderKeysReadState): boolean {
-  return isError && keys === undefined
+  return isError && !keys?.length
 }
 
 export function aiProviderRowStatus(
@@ -38,7 +43,10 @@ export function aiProviderRowStatus(
   )
   if (providerKeys.some((key) => key.is_active)) return 'active'
   if (providerKeys.length > 0) return 'disabled'
-  return 'not-configured'
+  // "Not configured" is a claim only a successful read can make. A cached key
+  // keeps its last-known status under the stale banner; a provider with none
+  // cached is unknown until the list reads again.
+  return read.isError ? 'unknown' : 'not-configured'
 }
 
 /**

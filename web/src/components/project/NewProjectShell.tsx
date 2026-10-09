@@ -128,9 +128,10 @@ export function NewProjectShell({
         </div>
         {activeSource !== 'monitor' && (
           <div className="flex flex-wrap items-center gap-2">
-            {connections === undefined && connectionsQuery.isError ? (
-              // The read failed, so nothing is known about connections. The
-              // import area below carries the reason and a Retry.
+            {connectionsQuery.isError && connectionCount === 0 ? (
+              // The read failed and no connection is cached, so nothing is
+              // known -- a cached empty list is not "none connected" once a
+              // refresh fails. The import area carries the reason and Retry.
               <span className="inline-flex items-center gap-1.5 text-sm text-muted-foreground">
                 <CircleHelp className="h-4 w-4 shrink-0" aria-hidden="true" />
                 Git connections unavailable

@@ -118,3 +118,28 @@ test('the API key query rejects with the server problem, not undefined data', as
   expect(html).not.toContain('data is undefined')
   client.clear()
 })
+
+test('a failed refresh over a cached API key keeps the form and says it is stale', () => {
+  const client = createClient()
+  client.setQueryData(apiKeyKey, {
+    id: 1,
+    name: 'ci-deploy',
+    role_type: 'custom',
+    permissions: [],
+    is_active: true,
+    key_prefix: 'tk_abc',
+    created_at: '2026-01-01T00:00:00Z',
+  })
+  fail(client, apiKeyKey, {
+    title: 'Internal Server Error',
+    status: 500,
+    detail: 'api key store unavailable',
+  })
+  const html = render(client)
+  // The form itself renders (fields fill in after mount).
+  expect(html).toContain('Edit API Key')
+  expect(html).toContain('API key unavailable')
+  expect(html).toContain('Showing last-known data')
+  expect(html).toContain('api key store unavailable')
+  client.clear()
+})

@@ -109,7 +109,47 @@ test('loading connections shows skeletons, not "No Git provider connected"', () 
 })
 
 test('landing source: templates only for a verified empty list', () => {
-  expect(newProjectLandingSource(undefined)).toBeNull()
-  expect(newProjectLandingSource({ connections: [] })).toBe('templates')
-  expect(newProjectLandingSource({ connections: [{ id: 1 }] })).toBe('browse')
+  const ok = (connections: unknown[]) => ({
+    connections: { connections },
+    isError: false,
+  })
+  expect(
+    newProjectLandingSource({ connections: undefined, isError: false })
+  ).toBeNull()
+  expect(newProjectLandingSource(ok([]))).toBe('templates')
+  expect(newProjectLandingSource(ok([{ id: 1 }]))).toBe('browse')
+  // A failed refresh over a cached empty list decides nothing.
+  expect(
+    newProjectLandingSource({ connections: { connections: [] }, isError: true })
+  ).toBeNull()
+  // Cached connections still land on them under the stale banner.
+  expect(
+    newProjectLandingSource({
+      connections: { connections: [{ id: 1 }] },
+      isError: true,
+    })
+  ).toBe('browse')
 })
+
+const emptyConnections = {
+  connections: [],
+  page: 1,
+  per_page: 20,
+  total_count: 0,
+}
+for (const path of [
+  '/projects/new?source=browse',
+  '/projects/new?source=templates',
+]) {
+  test(`failed refresh over a cached empty list keeps the failure visible: ${path}`, () => {
+    const client = createClient()
+    client.setQueryData(connectionsKey, emptyConnections)
+    fail(client, connectionsKey, serverError)
+    const html = render(client, path)
+    expect(html).toContain('Git connections unavailable')
+    expect(html).toContain('Retry')
+    expect(html).not.toContain('No Git provider connected')
+    expect(html).not.toContain('Showing last-known data')
+    client.clear()
+  })
+}

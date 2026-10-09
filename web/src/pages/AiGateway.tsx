@@ -4276,7 +4276,7 @@ console.log(response.choices[0].message.content);`,
           <ReadFailure
             resource="AI provider keys"
             error={keysQuery.error}
-            cached={keysData !== undefined}
+            cached={!!keysData?.length}
             onRetry={() => void keysQuery.refetch()}
             retrying={keysQuery.isFetching}
           />

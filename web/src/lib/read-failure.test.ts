@@ -39,9 +39,9 @@ describe('readFailureKind', () => {
 
 describe('readFailureExplanation', () => {
   test('a forbidden read names the permission, a failed read the server', () => {
-    expect(readFailureExplanation({ title: 'Forbidden', status: 403 })).toContain(
-      'permission to read'
-    )
+    expect(
+      readFailureExplanation({ title: 'Forbidden', status: 403 })
+    ).toContain('permission to read')
     expect(readFailureExplanation({ title: 'Oops', status: 502 })).toContain(
       'Could not contact Temps'
     )
@@ -68,7 +68,22 @@ describe('readFailureServerDetail', () => {
       readFailureServerDetail(new TypeError('Failed to fetch'))
     ).toBeUndefined()
     expect(
-      readFailureServerDetail({ title: 'Server error', status: 500, detail: ' ' })
+      readFailureServerDetail({
+        title: 'Server error',
+        status: 500,
+        detail: ' ',
+      })
     ).toBeUndefined()
+  })
+
+  test('a malformed detail is ignored instead of throwing', () => {
+    for (const detail of [500, { reason: 'nested' }, ['a'], true]) {
+      expect(() =>
+        readFailureServerDetail({ title: 'Server error', status: 500, detail })
+      ).not.toThrow()
+      expect(
+        readFailureServerDetail({ title: 'Server error', status: 500, detail })
+      ).toBeUndefined()
+    }
   })
 })

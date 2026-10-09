@@ -127,6 +127,21 @@ test('cached flags stay visible when a refresh fails', () => {
   client.clear()
 })
 
+test('a failed refresh over a cached empty list is not shown as empty', () => {
+  // The last good read was empty, but the current read failed: the project
+  // may have flags by now, so the onboarding and its create buttons must not
+  // reappear.
+  const client = createClient()
+  client.setQueryData(environmentsKey, environments)
+  client.setQueryData(flagsKey, emptyPage)
+  fail(client, flagsKey, serverError)
+  const html = render(client)
+  expect(html).toContain('Feature flags unavailable')
+  expect(html).not.toContain('No feature flags yet')
+  expect(html).not.toContain('Showing last-known data')
+  client.clear()
+})
+
 test('verified empty list keeps the onboarding empty state', () => {
   const client = createClient()
   client.setQueryData(environmentsKey, environments)

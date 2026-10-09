@@ -251,6 +251,19 @@ export function OidcProviderDetailPage() {
         </div>
       </div>
 
+      {/* A failed refresh keeps the last-known settings on screen, but they
+          may have changed: say so and offer Retry rather than present them
+          as current. */}
+      {providersQuery.isError && (
+        <ReadFailure
+          resource="SSO provider"
+          error={providersQuery.error}
+          cached
+          onRetry={() => providersQuery.refetch()}
+          retrying={providersQuery.isFetching}
+        />
+      )}
+
       <ProviderEditor
         provider={provider}
         redirectUri={redirectUri}

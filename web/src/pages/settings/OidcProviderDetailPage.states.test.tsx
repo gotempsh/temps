@@ -102,3 +102,37 @@ test('a forbidden provider list read shows access denied with the reason', () =>
   expect(html).toContain('Back to authentication')
   client.clear()
 })
+
+test('a failed refresh over a cached provider keeps the settings but says they are stale', () => {
+  const client = createClient()
+  client.setQueryData(providersKey, [
+    {
+      id: 7,
+      name: 'Example SSO',
+      template: 'generic',
+      issuer_url: 'https://idp.example.test',
+      client_id: 'console',
+      client_secret: '***',
+      scopes: 'openid email profile',
+      default_role: 'user',
+      role_claim: '',
+      group_claim: '',
+      enabled: true,
+      jit_provisioning: true,
+      managed_by_cloud: false,
+      trust_idp_email: false,
+    },
+  ])
+  fail(client, providersKey, {
+    title: 'Internal Server Error',
+    status: 500,
+    detail: 'identity provider table unavailable',
+  })
+  const html = render(client)
+  expect(html).toContain('Example SSO')
+  expect(html).toContain('SSO provider unavailable')
+  expect(html).toContain('Showing last-known data')
+  expect(html).toContain('identity provider table unavailable')
+  expect(html).not.toContain('Provider not found')
+  client.clear()
+})

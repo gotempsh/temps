@@ -124,9 +124,16 @@ test('row status distinguishes unknown from not configured', () => {
   }
   expect(aiProviderRowStatus('openai', disabled)).toBe('disabled')
 
-  // Stale cache after a failed refresh: rows keep their last-known status,
-  // but the first-key onboarding is not offered on unverified data.
-  const stale = { keys: [], isError: true }
-  expect(aiProviderRowStatus('openai', stale)).toBe('not-configured')
+  // A failed refresh over a cached empty list is not "no keys": the last good
+  // read being empty does not prove it still is.
+  const staleEmpty = { keys: [], isError: true }
+  expect(aiProviderRowStatus('openai', staleEmpty)).toBe('unknown')
+  expect(shouldPromptForFirstProviderKey(staleEmpty, ['openai'])).toBe(false)
+
+  // Cached keys keep their last-known status under the stale banner, but a
+  // provider with no cached key cannot be called unconfigured.
+  const stale = { keys: [activeKey], isError: true }
+  expect(aiProviderRowStatus('openai', stale)).toBe('active')
+  expect(aiProviderRowStatus('anthropic', stale)).toBe('unknown')
   expect(shouldPromptForFirstProviderKey(stale, ['openai'])).toBe(false)
 })

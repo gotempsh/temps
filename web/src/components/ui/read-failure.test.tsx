@@ -48,3 +48,10 @@ test('a network error never shows the client-side exception text', () => {
   expect(html).not.toContain('Failed to fetch')
   expect(html).not.toContain('Server response')
 })
+
+test('a malformed problem body still renders the recovery state', () => {
+  const html = render({ title: 'Server error', status: 500, detail: 42 })
+  expect(html).toContain('API keys unavailable')
+  expect(html).toContain('Retry')
+  expect(html).not.toContain('Server response')
+})

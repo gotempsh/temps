@@ -50,6 +50,9 @@ export function readFailureExplanation(error: unknown): string {
  * console's internals, not the request, and is never shown as the reason.
  */
 export function readFailureServerDetail(error: unknown): string | undefined {
-  const detail = extractProblemDetails(error)?.detail?.trim()
-  return detail ? detail : undefined
+  // `extractProblemDetails` checks a body's shape, not its field types, so a
+  // malformed response can carry a non-string `detail`. Rendering must not
+  // throw on it: this runs inside the very component meant to recover.
+  const detail: unknown = extractProblemDetails(error)?.detail
+  return typeof detail === 'string' ? detail.trim() || undefined : undefined
 }
