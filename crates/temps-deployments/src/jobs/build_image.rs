@@ -56,6 +56,38 @@ fn preset_build_root(
             return Ok(if member { source_root } else { app }.to_path_buf());
         }
     }
+    if matches!(preset, "nixpacks-node" | "nixpacks" | "autopack")
+        && app.join("package.json").is_file()
+    {
+        if let Some(package) =
+            read_confined_control_file(source_root, &source_root.join("package.json"), 1024 * 1024)?
+        {
+            let manifest: serde_json::Value = serde_json::from_str(&package).map_err(|error| {
+                WorkflowError::JobValidationFailed(format!(
+                    "Cannot parse workspace package.json: {error}"
+                ))
+            })?;
+            if manifest.get("workspaces").is_some() {
+                let relative = app.strip_prefix(source_root).map_err(|_| {
+                    WorkflowError::JobValidationFailed(
+                        "Application directory escapes workspace root".to_string(),
+                    )
+                })?;
+                let member = temps_presets::package_workspace_contains(&package, relative)
+                    .map_err(WorkflowError::JobValidationFailed)?;
+                return Ok(if member { source_root } else { app }.to_path_buf());
+            }
+        }
+    }
+    if matches!(
+        preset,
+        "python" | "nixpacks-python" | "nixpacks" | "autopack"
+    ) && temps_presets::python_app_directory(source_root, app)
+        .map_err(WorkflowError::JobValidationFailed)?
+        .is_some()
+    {
+        return Ok(source_root.to_path_buf());
+    }
     if preset != "nextjs" {
         return Ok(app.to_path_buf());
     }
@@ -895,7 +927,7 @@ impl BuildImageJob {
         let preset_slug = preset.slug();
         let preset_root = preset_build_root(&preset_slug, source_root, build_context_dir)?;
         if preset_root != *build_context_dir {
-            self.log(context, format!("Workspace build context: {}; selected application: {}. Installing with the root lockfile and retaining sibling packages.", preset_root.display(), build_context_dir.display())).await?;
+            self.log(context, format!("Workspace build context: {}; selected application: {}. Retaining root configuration and sibling packages.", preset_root.display(), build_context_dir.display())).await?;
         }
 
         // Convert build args to build_vars format (Vec<String> of "KEY" for ARG directives)
@@ -2058,6 +2090,63 @@ mod tests {
         std::fs::write(root.join("outside.json"), "{}").unwrap();
         std::os::unix::fs::symlink(root.join("outside.json"), root.join("turbo.json")).unwrap();
         assert!(preset_build_root("nextjs", root, &app).is_err());
+    }
+
+    #[test]
+    fn python_sibling_context_is_limited_to_generated_python_builds() {
+        let repo = tempfile::tempdir().unwrap();
+        let app = repo.path().join("apps/api");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::create_dir_all(repo.path().join("packages/shared")).unwrap();
+        std::fs::write(app.join("requirements.txt"), "../../packages/shared").unwrap();
+        for preset in ["python", "nixpacks-python", "nixpacks", "autopack"] {
+            assert_eq!(
+                preset_build_root(preset, repo.path(), &app).unwrap(),
+                repo.path()
+            );
+        }
+        assert_eq!(
+            preset_build_root("dockerfile", repo.path(), &app).unwrap(),
+            app
+        );
+        std::fs::write(app.join("requirements.txt"), "../../../outside").unwrap();
+        assert!(preset_build_root("python", repo.path(), &app).is_err());
+    }
+
+    #[test]
+    fn package_workspace_context_requires_membership_and_generated_presets() {
+        let repo = tempfile::tempdir().unwrap();
+        let app = repo.path().join("apps/api");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("package.json"), "{}").unwrap();
+        for workspaces in [
+            serde_json::json!(["apps/*", "packages/*"]),
+            serde_json::json!({"packages":["apps/*", "packages/*"]}),
+        ] {
+            std::fs::write(
+                repo.path().join("package.json"),
+                serde_json::json!({"workspaces":workspaces}).to_string(),
+            )
+            .unwrap();
+            for preset in ["nixpacks-node", "nixpacks", "autopack"] {
+                assert_eq!(
+                    preset_build_root(preset, repo.path(), &app).unwrap(),
+                    repo.path()
+                );
+            }
+            assert_eq!(
+                preset_build_root("dockerfile", repo.path(), &app).unwrap(),
+                app
+            );
+        }
+        std::fs::write(
+            repo.path().join("package.json"),
+            r#"{"workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        for preset in ["nixpacks-node", "autopack"] {
+            assert_eq!(preset_build_root(preset, repo.path(), &app).unwrap(), app);
+        }
     }
 
     #[test]

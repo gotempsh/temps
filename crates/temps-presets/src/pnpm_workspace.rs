@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Membership of a selected package in the root pnpm workspace.
+//! Membership of a selected package in the root package-manager workspace.
 
 use picomatch_rs::{compile_matcher, CompileOptions};
 use regex::Regex;
@@ -35,9 +35,52 @@ pub fn pnpm_workspace_contains(contents: &str, relative: &Path) -> Result<bool, 
         .map_err(|error| format!("Cannot parse pnpm-workspace.yaml: {error}"))?
         .unwrap_or_default();
     let patterns = workspace.packages.unwrap_or_default();
+    workspace_patterns_contains(patterns, relative)
+}
+
+/// Match npm, Yarn or Bun workspace declarations in either package.json shape.
+pub fn package_workspace_contains(contents: &str, relative: &Path) -> Result<bool, String> {
+    let manifest: serde_json::Value = serde_json::from_str(contents)
+        .map_err(|error| format!("Cannot parse workspace package.json: {error}"))?;
+    let workspaces = manifest.get("workspaces");
+    let packages = workspaces.and_then(|value| {
+        value
+            .as_array()
+            .or_else(|| value.get("packages")?.as_array())
+    });
+    if workspaces.is_some() && packages.is_none() {
+        return Err(
+            "package.json workspaces must be an array or an object with a packages array"
+                .to_string(),
+        );
+    }
+    let patterns = packages
+        .into_iter()
+        .flatten()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| "Workspace package patterns must be strings".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    workspace_patterns_contains(patterns, relative)
+}
+
+fn workspace_patterns_contains(patterns: Vec<String>, relative: &Path) -> Result<bool, String> {
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return Err(format!(
+            "Invalid workspace package directory '{}'",
+            relative.display()
+        ));
+    }
     let candidate = relative.to_str().ok_or_else(|| {
         format!(
-            "pnpm workspace package directory '{}' must be UTF-8",
+            "workspace package directory '{}' must be UTF-8",
             relative.display()
         )
     })?;
@@ -58,7 +101,7 @@ pub fn pnpm_workspace_contains(contents: &str, relative: &Path) -> Result<bool, 
             .collect();
         if pattern.starts_with('/') || parts.contains(&"..") {
             return Err(format!(
-                "pnpm workspace package pattern '{pattern}' must stay within the root"
+                "workspace package pattern '{pattern}' must stay within the root"
             ));
         }
         let pattern = parts.join("/");
@@ -80,7 +123,7 @@ pub fn pnpm_workspace_contains(contents: &str, relative: &Path) -> Result<bool, 
                 > MAX_GROUP_OPENERS
             || pattern.matches("!(").count() > MAX_NEGATIVE_GROUPS
         {
-            return Err(format!("pnpm workspace package pattern exceeds the {MAX_PATTERN_BYTES} byte, {MAX_GROUP_OPENERS} group or {MAX_NEGATIVE_GROUPS} negative-group compile limit"));
+            return Err(format!("workspace package pattern exceeds the {MAX_PATTERN_BYTES} byte, {MAX_GROUP_OPENERS} group or {MAX_NEGATIVE_GROUPS} negative-group compile limit"));
         }
         // The upstream brace expander adds one to the unsigned distance between
         // signed endpoints. Reject that addition's overflow before compilation;
@@ -89,7 +132,7 @@ pub fn pnpm_workspace_contains(contents: &str, relative: &Path) -> Result<bool, 
             if let (Ok(start), Ok(end)) = (range[1].parse::<i64>(), range[2].parse::<i64>()) {
                 if start.abs_diff(end).checked_add(1).is_none() {
                     return Err(format!(
-                        "pnpm workspace package pattern '{pattern}' contains an overflowing numeric range"
+                        "workspace package pattern '{pattern}' contains an overflowing numeric range"
                     ));
                 }
             }
@@ -102,11 +145,9 @@ pub fn pnpm_workspace_contains(contents: &str, relative: &Path) -> Result<bool, 
                 ..CompileOptions::default()
             },
         )
-        .map_err(|error| {
-            format!("Invalid pnpm workspace package pattern '{pattern}': {error:?}")
-        })?;
+        .map_err(|error| format!("Invalid workspace package pattern '{pattern}': {error:?}"))?;
         if glob.is_match(candidate).map_err(|error| {
-            format!("Cannot match pnpm workspace package pattern '{pattern}': {error:?}")
+            format!("Cannot match workspace package pattern '{pattern}': {error:?}")
         })? {
             if exclude {
                 excluded = true;
@@ -122,7 +163,12 @@ pub(crate) fn app_is_member(root: &Path, app: &Path) -> Result<bool, String> {
     if !app.join("package.json").is_file() {
         return Ok(false);
     }
-    let marker = root.join("pnpm-workspace.yaml");
+    let pnpm = root.join("pnpm-workspace.yaml").exists();
+    let marker = root.join(if pnpm {
+        "pnpm-workspace.yaml"
+    } else {
+        "package.json"
+    });
     let metadata = match std::fs::symlink_metadata(&marker) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -130,13 +176,13 @@ pub(crate) fn app_is_member(root: &Path, app: &Path) -> Result<bool, String> {
     };
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(format!(
-            "pnpm workspace file '{}' must be a regular non-symlink file",
+            "Workspace control file '{}' must be a regular non-symlink file",
             marker.display()
         ));
     }
     let relative = app.strip_prefix(root).map_err(|_| {
         format!(
-            "Application '{}' escapes pnpm workspace '{}'",
+            "Application '{}' escapes workspace '{}'",
             app.display(),
             root.display()
         )
@@ -149,16 +195,44 @@ pub(crate) fn app_is_member(root: &Path, app: &Path) -> Result<bool, String> {
         .map_err(|error| format!("Cannot read '{}': {error}", marker.display()))?;
     if contents.len() > 1024 * 1024 {
         return Err(format!(
-            "pnpm workspace file '{}' exceeds the 1 MiB limit",
+            "Workspace control file '{}' exceeds the 1 MiB limit",
             marker.display()
         ));
     }
-    pnpm_workspace_contains(&contents, relative)
+    if pnpm {
+        pnpm_workspace_contains(&contents, relative)
+    } else {
+        package_workspace_contains(&contents, relative)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn package_workspaces_support_both_shapes_and_preserve_exclusions() {
+        for contents in [
+            r#"{"workspaces":["apps/*","!apps/private"]}"#,
+            r#"{"workspaces":{"packages":["apps/*","!apps/private"]}}"#,
+        ] {
+            assert!(package_workspace_contains(contents, Path::new("apps/api")).unwrap());
+            for path in ["apps/private", "tools/api", "apps/nested/api"] {
+                assert!(!package_workspace_contains(contents, Path::new(path)).unwrap());
+            }
+            assert!(package_workspace_contains(contents, Path::new("../apps/api")).is_err());
+        }
+        assert!(!package_workspace_contains("{}", Path::new("apps/api")).unwrap());
+        for invalid in [
+            r#"{"workspaces":false}"#,
+            r#"{"workspaces":{"packages":"apps/*"}}"#,
+        ] {
+            assert!(package_workspace_contains(invalid, Path::new("apps/api")).is_err());
+        }
+        assert!(
+            package_workspace_contains(r#"{"workspaces":[false]}"#, Path::new("apps/api")).is_err()
+        );
+    }
 
     #[test]
     fn membership_honors_positive_negative_and_nested_patterns() {
@@ -316,14 +390,12 @@ mod tests {
     #[test]
     fn negative_group_budget_bounds_suffix_recompilation() {
         let repeated = format!("apps/{}web", "!(*).".repeat(9));
-        let contents =
-            serde_yaml::to_string(&serde_json::json!({"packages": [repeated]})).unwrap();
+        let contents = serde_yaml::to_string(&serde_json::json!({"packages": [repeated]})).unwrap();
         let error = pnpm_workspace_contains(&contents, Path::new("apps/web")).unwrap_err();
         assert!(error.contains("8 negative-group compile limit"), "{error}");
 
         let nested = format!("apps/{}web{}", "!(".repeat(8), ")".repeat(8));
-        let contents =
-            serde_yaml::to_string(&serde_json::json!({"packages": [nested]})).unwrap();
+        let contents = serde_yaml::to_string(&serde_json::json!({"packages": [nested]})).unwrap();
         assert!(pnpm_workspace_contains(&contents, Path::new("apps/web")).is_ok());
     }
 

@@ -37,7 +37,7 @@ pub mod preset_provider;
 pub mod providers;
 
 // Re-export Preset enum from temps-entities
-pub use autopack_preset::AutopackPreset;
+pub use autopack_preset::{python_app_directory, AutopackPreset};
 use build_system::BuildSystem;
 pub use build_system::MonorepoTool;
 use docker::DockerfilePreset;
@@ -50,7 +50,7 @@ pub use go_preset::GoPreset;
 pub use java_preset::JavaPreset;
 pub use nextjs::NextJs;
 pub use nixpacks_preset::{NixpacksPreset, NixpacksProvider};
-pub use pnpm_workspace::pnpm_workspace_contains;
+pub use pnpm_workspace::{package_workspace_contains, pnpm_workspace_contains};
 pub use preset_config::PresetConfig;
 pub use python_preset::PythonPreset;
 pub use react_app::CreateReactApp;
