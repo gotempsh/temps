@@ -18,7 +18,7 @@ use std::net::IpAddr;
 /// mapped form; without unwrapping it, `Ipv6Addr::is_loopback` reports `false`
 /// (it only recognizes `::1`), silently leaving the feature inert even when
 /// correctly enabled and configured.
-fn peer_is_loopback(peer: IpAddr) -> bool {
+pub(crate) fn peer_is_loopback(peer: IpAddr) -> bool {
     match peer {
         IpAddr::V4(v4) => v4.is_loopback(),
         IpAddr::V6(v6) => {
