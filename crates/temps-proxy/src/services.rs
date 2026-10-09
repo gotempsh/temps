@@ -5,7 +5,7 @@ use crate::config::*;
 use crate::service::lb_service::LbService;
 use crate::traits::*;
 use async_trait::async_trait;
-use pingora_core::{upstreams::peer::HttpPeer, Result as PingoraResult};
+use pingora_core::{upstreams::peer::HttpPeer, Error, ErrorType, Result as PingoraResult};
 use std::sync::Arc;
 use temps_routes::CachedPeerTable;
 use tracing::debug;
@@ -192,6 +192,35 @@ impl UpstreamResolver for UpstreamResolverImpl {
             }
         }
 
+        // The host belongs to a deployment whose containers are all down (or
+        // that is paused). Fail the request so `fail_to_proxy` answers 503:
+        // falling through to the console would serve its SPA with HTTP 200
+        // on the application's own hostname, and uptime monitors would
+        // report the stopped app as operational (issue #1334). Marked as an
+        // upstream failure: the application is down, Temps is not.
+        if let Some(unavailable) = self.route_table.get_unavailable_route(host) {
+            debug!(
+                host,
+                project_id = unavailable.project.id,
+                environment_id = unavailable.environment.id,
+                deployment_id = unavailable.deployment.id,
+                reason = unavailable.reason.as_str(),
+                "Host has no live upstream; failing the request instead of routing to the console"
+            );
+            return Err(Error::explain(
+                ErrorType::ConnectNoRoute,
+                format!(
+                    "no live upstream for host '{}' (project {}, environment {}, deployment {}): {}",
+                    host,
+                    unavailable.project.id,
+                    unavailable.environment.id,
+                    unavailable.deployment.id,
+                    unavailable.reason.as_str()
+                ),
+            )
+            .into_up());
+        }
+
         let endpoint_path = path.split_once('?').map_or(path, |(path, _)| path);
         let dns_method_matches = (method == "GET" && endpoint_path.ends_with("/dns/changes"))
             || (method == "POST" && endpoint_path.ends_with("/dns/ack"));
@@ -250,6 +279,11 @@ impl UpstreamResolver for UpstreamResolverImpl {
         {
             return true;
         }
+        // A project host whose containers are down is still a project host:
+        // it must reach the 503, not the admin gate's 404.
+        if self.route_table.get_unavailable_route(host).is_some() {
+            return true;
+        }
         // Lock-free snapshot lookup for operator-defined custom routes.
         self.lb_service.has_route_in_snapshot(host)
     }
@@ -274,11 +308,23 @@ impl ProjectContextResolverImpl {
     }
 
     fn project_context_from_route(&self, host: &str) -> Option<ProjectContext> {
-        let route_info = self.route_table.get_route(host)?;
+        if let Some(route_info) = self.route_table.get_route(host) {
+            return Some(ProjectContext {
+                project: route_info.project?,
+                environment: route_info.environment?,
+                deployment: route_info.deployment?,
+                upstream_unavailable: false,
+            });
+        }
+        // A host whose deployment has no live upstream still belongs to that
+        // project: attribute the failed request to it and apply its request
+        // policy before the resolver fails it with a 503.
+        let unavailable = self.route_table.get_unavailable_route(host)?;
         Some(ProjectContext {
-            project: route_info.project?,
-            environment: route_info.environment?,
-            deployment: route_info.deployment?,
+            project: unavailable.project,
+            environment: unavailable.environment,
+            deployment: unavailable.deployment,
+            upstream_unavailable: true,
         })
     }
 }
@@ -485,5 +531,166 @@ mod dns_sync_tests {
             },
         ))
         .await;
+    }
+}
+
+#[cfg(test)]
+mod unavailable_host_tests {
+    //! Issue #1334: a host whose deployment has no live upstream must fail
+    //! (and be answered 503 by `fail_to_proxy`), never fall back to the
+    //! console, while every other console fallback keeps working.
+    use super::*;
+    use crate::test_utils::TestDBMockOperations;
+    use pingora_core::upstreams::peer::Peer;
+    use pingora_core::ErrorSource;
+    use sea_orm::{ActiveModelTrait, Set};
+    use temps_database::test_utils::TestDatabase;
+
+    const CONSOLE: &str = "127.0.0.1:18085";
+    const STOPPED_HOST: &str = "stopped-app.example.com";
+
+    struct StoppedApp {
+        _database: TestDatabase,
+        route_table: Arc<CachedPeerTable>,
+        lb_service: Arc<LbService>,
+        ids: (i32, i32, i32),
+    }
+
+    /// A project whose custom domain [`STOPPED_HOST`] points at a deployment
+    /// whose only container exited, loaded into a real route table. `None`
+    /// when Docker is unavailable.
+    async fn stopped_app() -> Option<StoppedApp> {
+        let database = match TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Skipping unavailable-host resolver test: Docker runtime unavailable");
+                return None;
+            }
+            Err(error) => panic!("Could not create isolated test database: {error}"),
+        };
+        let db = database.connection_arc();
+        let test_db = TestDBMockOperations::new(db.clone()).await.unwrap();
+        let (project, environment, deployment) = test_db
+            .create_test_project_with_domain(STOPPED_HOST)
+            .await
+            .unwrap();
+        temps_entities::deployment_containers::ActiveModel {
+            deployment_id: Set(deployment.id),
+            container_id: Set("stopped-app-container".to_string()),
+            container_name: Set("stopped-app-container".to_string()),
+            container_port: Set(3000),
+            host_port: Set(Some(9800)),
+            status: Set(Some("exited".to_string())),
+            deployed_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let route_table = Arc::new(CachedPeerTable::new(db.clone()));
+        route_table.load_routes().await.unwrap();
+        Some(StoppedApp {
+            _database: database,
+            route_table,
+            lb_service: Arc::new(LbService::new(db)),
+            ids: (project.id, environment.id, deployment.id),
+        })
+    }
+
+    fn resolver(app: &StoppedApp) -> UpstreamResolverImpl {
+        UpstreamResolverImpl::new(
+            Arc::new(ProxyConfig {
+                console_address: CONSOLE.into(),
+                ..ProxyConfig::default()
+            }),
+            app.lb_service.clone(),
+            app.route_table.clone(),
+        )
+    }
+
+    async fn peer_address(resolver: &UpstreamResolverImpl, host: &str, path: &str) -> String {
+        match resolver
+            .resolve_peer_for_request(host, path, "GET", None)
+            .await
+        {
+            Ok(selection) => selection.peer.address().to_string(),
+            Err(error) => panic!("{host}{path} must resolve to a peer: {error}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stopped_app_host_fails_instead_of_routing_to_the_console() {
+        let Some(app) = stopped_app().await else {
+            return;
+        };
+        let resolver = resolver(&app);
+
+        let error = match resolver
+            .resolve_peer_for_request(STOPPED_HOST, "/", "GET", None)
+            .await
+        {
+            Ok(selection) => panic!(
+                "a stopped app must not be proxied anywhere, got {}",
+                selection.peer.address()
+            ),
+            Err(error) => error,
+        };
+        assert_eq!(error.etype(), &ErrorType::ConnectNoRoute);
+        assert_eq!(
+            error.esource(),
+            &ErrorSource::Upstream,
+            "the application is down, not Temps: log it as an upstream failure"
+        );
+
+        // The admin gate must treat it as a project host (503, not 404).
+        assert!(resolver.has_route_for_host(STOPPED_HOST).await);
+        assert!(!resolver.has_route_for_host("unknown.example.com").await);
+
+        // Every other console fallback is unchanged.
+        assert_eq!(
+            peer_address(&resolver, "unknown.example.com", "/").await,
+            CONSOLE
+        );
+        assert_eq!(
+            peer_address(&resolver, STOPPED_HOST, "/api/_temps/health").await,
+            CONSOLE,
+            "the /api/_temps prefix still reaches the console from any host"
+        );
+        assert_eq!(
+            peer_address(&resolver, STOPPED_HOST, "/api/otel/v1/traces").await,
+            CONSOLE
+        );
+    }
+
+    #[tokio::test]
+    async fn stopped_app_requests_are_attributed_to_their_project() {
+        let Some(app) = stopped_app().await else {
+            return;
+        };
+        let resolver = ProjectContextResolverImpl::new(app.route_table.clone());
+
+        let context = resolver
+            .resolve_context(STOPPED_HOST)
+            .await
+            .expect("a stopped app's request must still be attributed");
+        assert_eq!(
+            (
+                context.project.id,
+                context.environment.id,
+                context.deployment.id
+            ),
+            app.ids
+        );
+        assert!(context.upstream_unavailable);
+        assert!(!resolver.is_static_deployment(STOPPED_HOST).await);
+        assert!(resolver.get_redirect_info(STOPPED_HOST).await.is_none());
+        assert!(resolver
+            .resolve_context("unknown.example.com")
+            .await
+            .is_none());
     }
 }

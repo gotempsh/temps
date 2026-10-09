@@ -64,6 +64,7 @@ enum ContainerOp {
     PersistRuntimeInfo,
     PersistExitInfo,
     ClearStopMarker,
+    RestoreRunningStatus,
     FireStatusAlarm,
     FireResourceAlarm,
 }
@@ -74,6 +75,9 @@ impl ContainerOp {
             Self::PersistRuntimeInfo => "persist container runtime information and refresh routes",
             Self::PersistExitInfo => "persist container exit information",
             Self::ClearStopMarker => "clear the stopped marker of a running container",
+            Self::RestoreRunningStatus => {
+                "mark a restarted container as running again and refresh routes"
+            }
             Self::FireStatusAlarm => "fire the container status alarm",
             Self::FireResourceAlarm => "fire the container resource alarm",
         }
@@ -253,6 +257,12 @@ fn published_tcp_port_bindings(
 fn is_intentionally_stopped(status: Option<&str>) -> bool {
     status.is_some_and(|status| status == "stopped" || status.starts_with("retained:"))
 }
+
+/// Statuses the poll loop itself writes when Docker reports a container
+/// down without anyone having stopped it on purpose (see `persist_exit_info`).
+/// The route table only routes NULL/`"running"` rows, so one of these left
+/// behind after the container runs again keeps its app off the network.
+const UNINTENDED_EXIT_STATUSES: [&str; 2] = ["exited", "dead"];
 
 /// Truncate a timestamp to the microsecond precision Postgres stores.
 /// Docker reports nanoseconds, so comparing a live Docker timestamp with its
@@ -699,16 +709,39 @@ impl ContainerHealthMonitor {
         // Persist runtime metadata (started_at, cpu_limit_cores) once they're
         // observed. These don't change while a container is running, so the
         // diff check in persist_runtime_info skips writes after the first hit.
-        match self.persist_runtime_info(container, info).await {
-            Ok(()) => self
-                .log_state
-                .report_op_success(container, ContainerOp::PersistRuntimeInfo),
+        let runtime_persisted = match self.persist_runtime_info(container, info).await {
+            Ok(()) => {
+                self.log_state
+                    .report_op_success(container, ContainerOp::PersistRuntimeInfo);
+                true
+            }
             Err(error) => {
                 self.log_state.report_op_failure(
                     container,
                     ContainerOp::PersistRuntimeInfo,
                     &error,
                 );
+                false
+            }
+        };
+
+        // A crashed (or `docker stop`ped) container that runs again must be
+        // made routable again, otherwise the route table keeps excluding it
+        // and its app stays down for good. Only once its current published
+        // port is recorded: restoring it after a failed runtime write would
+        // reload routes onto the stale port. The next poll retries both.
+        if runtime_persisted && Self::needs_running_status_restore(container, info) {
+            match self.restore_running_status(container).await {
+                Ok(_) => self
+                    .log_state
+                    .report_op_success(container, ContainerOp::RestoreRunningStatus),
+                Err(error) => {
+                    self.log_state.report_op_failure(
+                        container,
+                        ContainerOp::RestoreRunningStatus,
+                        &error,
+                    );
+                }
             }
         }
 
@@ -1004,6 +1037,61 @@ impl ContainerHealthMonitor {
             temps_deployer::ContainerStatus::Running => self.note_container_up(container),
             _ => {}
         }
+    }
+
+    /// Whether Docker reports `container` running while its row still holds
+    /// a non-intentional exit status (`"exited"`/`"dead"`).
+    fn needs_running_status_restore(
+        container: &deployment_containers::Model,
+        info: &temps_deployer::ContainerInfo,
+    ) -> bool {
+        matches!(info.status, temps_deployer::ContainerStatus::Running)
+            && container
+                .status
+                .as_deref()
+                .is_some_and(|status| UNINTENDED_EXIT_STATUSES.contains(&status))
+    }
+
+    /// Replace an `"exited"`/`"dead"` status with `"running"` and reload the
+    /// route table in the same transaction, so a failed notification leaves
+    /// the old status in place and the next poll retries both. Conditional on
+    /// the old status still being there, so a concurrent stop or pause
+    /// (`"stopped"`, `"retained:*"`) is never overwritten. Returns whether
+    /// the row changed.
+    async fn restore_running_status(
+        &self,
+        container: &deployment_containers::Model,
+    ) -> Result<bool, DbErr> {
+        let txn = self.db.begin().await?;
+        let updated = deployment_containers::Entity::update_many()
+            .col_expr(
+                deployment_containers::Column::Status,
+                Expr::value("running"),
+            )
+            .filter(deployment_containers::Column::Id.eq(container.id))
+            .filter(deployment_containers::Column::Status.is_in(UNINTENDED_EXIT_STATUSES))
+            .exec(&txn)
+            .await?;
+        if updated.rows_affected == 0 {
+            // Someone else changed the status since this poll read it.
+            txn.rollback().await?;
+            return Ok(false);
+        }
+        txn.execute(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT pg_notify('route_table_changes', '')".to_string(),
+        ))
+        .await?;
+        txn.commit().await?;
+        info!(
+            container_id = container.id,
+            deployment_id = container.deployment_id,
+            previous_status = container.status.as_deref().unwrap_or_default(),
+            "Container {} ({}) is running again; restored its route",
+            container.id,
+            container.container_name
+        );
+        Ok(true)
     }
 
     /// Log once when a container previously reported as exited is up again.
@@ -2037,6 +2125,164 @@ mod tests {
             transactions.len(),
             1,
             "update and notification share a transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn restored_running_status_and_route_notification_share_a_transaction() {
+        let mut container = make_container_model(1);
+        container.status = Some("exited".to_string());
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results([
+                    sea_orm::MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1,
+                    },
+                    sea_orm::MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1,
+                    },
+                ])
+                .into_connection(),
+        );
+        let monitor = ContainerHealthMonitor::new(
+            db.clone(),
+            Arc::new(MockDeployer::new(0, ContainerStatus::Running)),
+            make_alarm_service(db.clone()),
+            ContainerHealthConfig::default(),
+        );
+
+        assert!(monitor.restore_running_status(&container).await.unwrap());
+
+        drop(monitor);
+        let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
+        let sql = format!("{transactions:?}");
+        assert!(sql.contains("running"), "status must be restored: {sql}");
+        assert!(
+            sql.contains("exited") && sql.contains("dead"),
+            "only a non-intentional exit status may be replaced: {sql}"
+        );
+        assert!(
+            sql.contains("pg_notify"),
+            "the proxy must reload to route the container again: {sql}"
+        );
+        assert_eq!(
+            transactions.len(),
+            1,
+            "update and notification share a transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrently_changed_status_is_not_restored_and_does_not_notify() {
+        let mut container = make_container_model(1);
+        container.status = Some("exited".to_string());
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 0,
+                }])
+                .into_connection(),
+        );
+        let monitor = ContainerHealthMonitor::new(
+            db.clone(),
+            Arc::new(MockDeployer::new(0, ContainerStatus::Running)),
+            make_alarm_service(db.clone()),
+            ContainerHealthConfig::default(),
+        );
+
+        assert!(!monitor.restore_running_status(&container).await.unwrap());
+
+        drop(monitor);
+        let sql = format!("{:?}", Arc::try_unwrap(db).unwrap().into_transaction_log());
+        assert!(
+            !sql.contains("pg_notify"),
+            "nothing changed, so routes need no reload: {sql}"
+        );
+    }
+
+    /// Docker info for a running container now published on host port 32001.
+    async fn running_info_on_new_port() -> temps_deployer::ContainerInfo {
+        let deployer = MockDeployer::new(0, ContainerStatus::Running);
+        let mut info = deployer.get_container_info("abc123").await.unwrap();
+        info.ports = vec![temps_deployer::PortMapping {
+            host_port: 32001,
+            container_port: 3000,
+            protocol: temps_deployer::Protocol::Tcp,
+            host_ip: None,
+        }];
+        info
+    }
+
+    #[tokio::test]
+    async fn failed_runtime_write_does_not_restore_routing_onto_the_stale_port() {
+        let mut container = make_container_model(1);
+        container.status = Some("exited".to_string());
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors([DbErr::Custom("connection reset".to_string())])
+                .into_connection(),
+        );
+        let monitor = ContainerHealthMonitor::new(
+            db.clone(),
+            Arc::new(MockDeployer::new(0, ContainerStatus::Running)),
+            make_alarm_service(db.clone()),
+            ContainerHealthConfig::default(),
+        );
+        let info = running_info_on_new_port().await;
+
+        monitor
+            .process_container_info(&container, &make_deployment_model(), &info)
+            .await;
+
+        drop(monitor);
+        let sql = format!("{:?}", Arc::try_unwrap(db).unwrap().into_transaction_log());
+        assert!(sql.contains("32001"), "the port write was attempted: {sql}");
+        assert!(
+            !sql.contains("running") && !sql.contains("pg_notify"),
+            "routes must not be restored while the old port is still recorded: {sql}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovered_container_records_its_port_before_routing_is_restored() {
+        let mut container = make_container_model(1);
+        container.status = Some("exited".to_string());
+        let mut updated = container.clone();
+        updated.host_port = Some(32001);
+        let exec_ok = || sea_orm::MockExecResult {
+            last_insert_id: 0,
+            rows_affected: 1,
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[updated]])
+                .append_exec_results([exec_ok(), exec_ok(), exec_ok()])
+                .into_connection(),
+        );
+        let monitor = ContainerHealthMonitor::new(
+            db.clone(),
+            Arc::new(MockDeployer::new(0, ContainerStatus::Running)),
+            make_alarm_service(db.clone()),
+            ContainerHealthConfig::default(),
+        );
+        let info = running_info_on_new_port().await;
+
+        monitor
+            .process_container_info(&container, &make_deployment_model(), &info)
+            .await;
+
+        drop(monitor);
+        let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
+        assert_eq!(transactions.len(), 2, "{transactions:?}");
+        let port_write = format!("{:?}", transactions[0]);
+        let restore = format!("{:?}", transactions[1]);
+        assert!(port_write.contains("32001"), "{port_write}");
+        assert!(
+            restore.contains("running") && restore.contains("pg_notify"),
+            "the status is restored only after the new port is recorded: {restore}"
         );
     }
 
@@ -3086,6 +3332,88 @@ mod tests {
             1,
             "a crash after the restart is a real crash: {alarms:?}"
         );
+    }
+
+    /// Issue #1334: a container that crashed or was `docker stop`ped is
+    /// recorded as "exited", which the route table never routes. Once it runs
+    /// again the poll must mark it "running" (and reload routes), otherwise
+    /// its app stays off the network after recovering.
+    #[tokio::test]
+    async fn restarted_exited_container_is_running_again() {
+        let Some(fixture) = exit_fixture().await else {
+            return;
+        };
+        let current = fixture.deployment("app-8", "completed").await;
+        fixture.serve(&current).await;
+        let crashed = fixture.container(&current, "exited").await;
+        let died = fixture
+            .container(&fixture.deployment("app-9", "completed").await, "dead")
+            .await;
+        let retained = fixture
+            .container(
+                &fixture.deployment("app-10", "failed").await,
+                "retained:stopped-after-failed-readiness",
+            )
+            .await;
+
+        fixture.poll_with_status(ContainerStatus::Running).await;
+
+        for (id, expected) in [
+            (crashed.id, "running"),
+            (died.id, "running"),
+            // An intentional marker is not a crash status: unchanged.
+            (retained.id, "retained:stopped-after-failed-readiness"),
+        ] {
+            let row = deployment_containers::Entity::find_by_id(id)
+                .one(fixture.db.as_ref())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.status.as_deref(), Some(expected), "container {id}");
+        }
+
+        // Back to normal: its next crash is a real crash.
+        fixture.poll_with_exited_containers().await;
+        let alarms = fixture.alarms().await;
+        assert!(
+            alarms
+                .iter()
+                .any(|alarm| alarm.container_id == Some(crashed.id)),
+            "a crash after the recovery must alarm: {alarms:?}"
+        );
+    }
+
+    /// The restore is conditional on the status the poll read: a container
+    /// stopped by the user in the meantime keeps its marker.
+    #[tokio::test]
+    async fn restoring_running_status_never_overwrites_a_concurrent_stop() {
+        let Some(fixture) = exit_fixture().await else {
+            return;
+        };
+        let current = fixture.deployment("app-8", "completed").await;
+        fixture.serve(&current).await;
+        let stopped = fixture.container(&current, "stopped").await;
+        // The poll's snapshot still says "exited"; the user stopped it since.
+        let mut stale_snapshot = stopped.clone();
+        stale_snapshot.status = Some("exited".to_string());
+
+        let monitor = ContainerHealthMonitor::new(
+            fixture.db.clone(),
+            Arc::new(MockDeployer::new(0, ContainerStatus::Running)),
+            make_alarm_service(fixture.db.clone()),
+            ContainerHealthConfig::default(),
+        );
+        assert!(!monitor
+            .restore_running_status(&stale_snapshot)
+            .await
+            .unwrap());
+
+        let row = deployment_containers::Entity::find_by_id(stopped.id)
+            .one(fixture.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status.as_deref(), Some("stopped"));
     }
 
     #[tokio::test]

@@ -184,6 +184,7 @@ pub fn create_test_project_context(
         project: Arc::new(project),
         environment: Arc::new(environment),
         deployment: Arc::new(deployment),
+        upstream_unavailable: false,
     }
 }
 

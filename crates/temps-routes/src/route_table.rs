@@ -313,6 +313,111 @@ pub struct OnDemandConfigEntry {
     pub wake_timeout_seconds: i32,
 }
 
+/// Why an application hostname currently has no live upstream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnavailableReason {
+    /// The current deployment has no running container the proxy can reach:
+    /// every container exited, was stopped, or lost its published port.
+    NoLiveBackend,
+    /// The current deployment was paused by the user.
+    Paused,
+}
+
+impl UnavailableReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoLiveBackend => "no_live_backend",
+            Self::Paused => "paused",
+        }
+    }
+}
+
+/// An application hostname whose deployment exists but cannot serve traffic
+/// right now (issue #1334).
+///
+/// These hosts are kept out of the routable maps, so nothing ever dials a
+/// dead or reassigned port, but they are remembered so the proxy can answer
+/// with a 503 instead of falling back to the console. Without this, a
+/// stopped app's hostname served the console SPA with HTTP 200 and uptime
+/// monitors reported the app as operational.
+#[derive(Clone, Debug)]
+pub struct UnavailableRoute {
+    pub project: Arc<projects::Model>,
+    pub environment: Arc<environments::Model>,
+    pub deployment: Arc<deployments::Model>,
+    pub reason: UnavailableReason,
+}
+
+/// Hostnames of a deployment that has no live upstream, keyed like the route
+/// maps. Wildcard hosts are stored by their base domain so a lookup never
+/// allocates.
+#[derive(Clone, Debug, Default)]
+struct UnavailableHosts {
+    exact: HashMap<String, UnavailableRoute>,
+    wildcard_bases: HashMap<String, UnavailableRoute>,
+}
+
+impl UnavailableHosts {
+    /// Record `host` unless an earlier pass already did. Like the live route
+    /// maps, the first section of `load_routes` to claim a host owns it.
+    fn record(&mut self, host: &str, route: &UnavailableRoute) {
+        let (map, key) = match host.strip_prefix("*.") {
+            Some(base) if !base.is_empty() => (&mut self.wildcard_bases, base),
+            Some(_) => return,
+            None => (&mut self.exact, host),
+        };
+        if !map.contains_key(key) {
+            map.insert(key.to_string(), route.clone());
+        }
+    }
+
+    fn get(&self, host: &str) -> Option<&UnavailableRoute> {
+        self.exact.get(host).or_else(|| {
+            let (label, base) = host.split_once('.')?;
+            if label.is_empty() {
+                return None;
+            }
+            self.wildcard_bases.get(base)
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.exact.len() + self.wildcard_bases.len()
+    }
+}
+
+/// Describe a deployment whose hostnames are skipped for lack of a live
+/// upstream. `None` when the project is unknown, since the proxy needs the
+/// full context to attribute the failed request.
+fn unavailable_route_for(
+    project: Option<&Arc<projects::Model>>,
+    environment: &Arc<environments::Model>,
+    deployment: &Arc<deployments::Model>,
+) -> Option<UnavailableRoute> {
+    let reason = if deployment.state == "paused" {
+        UnavailableReason::Paused
+    } else {
+        UnavailableReason::NoLiveBackend
+    };
+    Some(UnavailableRoute {
+        project: Arc::clone(project?),
+        environment: Arc::clone(environment),
+        deployment: Arc::clone(deployment),
+        reason,
+    })
+}
+
+/// Whether a Compose project deliberately has no public URL: without a
+/// public-port selection its generic hostnames stay private, so an empty
+/// backend there is the configured state, not an outage.
+fn compose_without_public_ports(project: Option<&projects::Model>) -> bool {
+    matches!(
+        project.and_then(|project| project.preset_config.as_ref()),
+        Some(temps_entities::preset::PresetConfig::DockerCompose(config))
+            if config.public_ports.is_empty()
+    )
+}
+
 /// A single backend entry: network address plus container metadata for tracking.
 #[derive(Clone, Debug)]
 pub struct BackendEntry {
@@ -521,6 +626,22 @@ struct RouteTableSnapshot {
     tls_wildcards: WildcardMatcher,
     legacy: LegacyRouteTable,
     ownership: RouteOwnershipSnapshot,
+    /// Application hosts with no live upstream. Deliberately not part of
+    /// `ownership`, so on-demand wake gating is unchanged.
+    unavailable: UnavailableHosts,
+}
+
+impl RouteTableSnapshot {
+    /// Whether any routable map resolves `host`, in the same order as
+    /// `resolve_route_for_sni`, without cloning a `RouteInfo`.
+    fn has_live_route(&self, host: &str) -> bool {
+        self.tls_routes.contains_key(host)
+            || self.tls_wildcards.match_domain(host).is_some()
+            || self.http_routes.contains_key(host)
+            || self.legacy.exact.contains_key(host)
+            || self.http_wildcards.match_domain(host).is_some()
+            || self.legacy.wildcards.match_domain(host).is_some()
+    }
 }
 
 impl LegacyRouteTable {
@@ -906,6 +1027,9 @@ impl CachedPeerTable {
 
         let mut routes = HashMap::new();
         let mut sleeping_environments: Vec<SleepingEnvironmentEntry> = Vec::new();
+        // App hostnames skipped below because their deployment has no live
+        // upstream. Served as a 503 by the proxy instead of the console.
+        let mut unavailable = UnavailableHosts::default();
 
         // Build entity caches as we go - only cache what we actually need for routing
         let mut projects_cache: HashMap<i32, Arc<projects::Model>> = HashMap::new();
@@ -1056,9 +1180,9 @@ impl CachedPeerTable {
                         // Determine backend type: static directory or upstream containers
                         let backend = if let Some(static_dir) = &deployment.static_dir_location {
                             // Static deployment - serve from directory
-                            BackendType::StaticDir {
+                            Some(BackendType::StaticDir {
                                 path: static_dir.clone(),
-                            }
+                            })
                         } else if !containers.is_empty() {
                             let public_port = project
                                 .and_then(|project| project.preset_config.as_ref())
@@ -1068,45 +1192,64 @@ impl CachedPeerTable {
                                     }
                                     _ => None,
                                 });
-                            let Some(route_containers) =
-                                select_public_route_containers(&containers, public_port)
-                            else {
-                                continue;
-                            };
-                            let mut backend_entries = Vec::with_capacity(route_containers.len());
-                            for c in route_containers {
-                                let node_addr = resolve_node_private_address(
-                                    c.node_id,
-                                    &mut nodes_cache,
-                                    self.db.as_ref(),
-                                )
-                                .await;
-                                let entry = match public_port {
-                                    Some(port) => build_public_compose_backend_entry(
-                                        c,
-                                        node_addr.as_deref(),
-                                        port,
-                                        self.runtime_context.as_ref(),
-                                    ),
-                                    None => build_backend_entry(
-                                        c,
-                                        node_addr.as_deref(),
-                                        self.runtime_context.as_ref(),
-                                    ),
-                                };
-                                if let Some(entry) = entry {
-                                    backend_entries.push(entry);
+                            match select_public_route_containers(&containers, public_port) {
+                                // A Compose stack without a public port is private.
+                                None if public_port.is_none() => continue,
+                                // The public service has no running container.
+                                None => None,
+                                Some(route_containers) => {
+                                    let mut backend_entries =
+                                        Vec::with_capacity(route_containers.len());
+                                    for c in route_containers {
+                                        let node_addr = resolve_node_private_address(
+                                            c.node_id,
+                                            &mut nodes_cache,
+                                            self.db.as_ref(),
+                                        )
+                                        .await;
+                                        let entry = match public_port {
+                                            Some(port) => build_public_compose_backend_entry(
+                                                c,
+                                                node_addr.as_deref(),
+                                                port,
+                                                self.runtime_context.as_ref(),
+                                            ),
+                                            None => build_backend_entry(
+                                                c,
+                                                node_addr.as_deref(),
+                                                self.runtime_context.as_ref(),
+                                            ),
+                                        };
+                                        if let Some(entry) = entry {
+                                            backend_entries.push(entry);
+                                        }
+                                    }
+                                    (!backend_entries.is_empty()).then(|| BackendType::Upstream {
+                                        backends: backend_entries,
+                                        round_robin_counter: Arc::new(AtomicUsize::new(0)),
+                                    })
                                 }
                             }
-                            if backend_entries.is_empty() {
-                                continue;
-                            }
-                            BackendType::Upstream {
-                                backends: backend_entries,
-                                round_robin_counter: Arc::new(AtomicUsize::new(0)),
-                            }
                         } else {
-                            // No backend available, skip this route
+                            None
+                        };
+
+                        // No live backend (containers stopped, crashed or
+                        // unreachable, or the deployment is paused): keep the
+                        // host out of the routable maps, but remember it so
+                        // the proxy answers 503 instead of the console.
+                        let Some(backend) = backend else {
+                            if !compose_without_public_ports(project.map(Arc::as_ref)) {
+                                if let Some(route) =
+                                    unavailable_route_for(project, environment, deployment)
+                                {
+                                    debug!(
+                                        "Environment domain has no live backend: {} (project={}, env={}, deploy={}, reason={})",
+                                        env_domain.domain, environment.project_id, environment.id, deployment_id, route.reason.as_str()
+                                    );
+                                    unavailable.record(&env_domain.domain, &route);
+                                }
+                            }
                             continue;
                         };
 
@@ -1343,9 +1486,9 @@ impl CachedPeerTable {
                         // Determine backend type: static directory or upstream containers
                         let backend = if let Some(static_dir) = &deployment.static_dir_location {
                             // Static deployment - serve from directory
-                            BackendType::StaticDir {
+                            Some(BackendType::StaticDir {
                                 path: static_dir.clone(),
-                            }
+                            })
                         } else if !target_containers.is_empty() {
                             // Container deployment - proxy to containers
                             let mut backend_entries = Vec::with_capacity(target_containers.len());
@@ -1364,15 +1507,26 @@ impl CachedPeerTable {
                                     backend_entries.push(entry);
                                 }
                             }
-                            if backend_entries.is_empty() {
-                                continue;
-                            }
-                            BackendType::Upstream {
+                            (!backend_entries.is_empty()).then(|| BackendType::Upstream {
                                 backends: backend_entries,
                                 round_robin_counter: Arc::new(AtomicUsize::new(0)),
-                            }
+                            })
                         } else {
-                            // No backend available, skip this route
+                            None
+                        };
+
+                        // An operator-attached domain with no live backend is
+                        // an outage, never a console URL (see section 1).
+                        let Some(backend) = backend else {
+                            if let Some(route) =
+                                unavailable_route_for(project, environment, deployment)
+                            {
+                                debug!(
+                                    "Custom domain has no live backend: {} (project={}, env={}, deploy={}, reason={})",
+                                    custom_domain.domain, custom_domain.project_id, environment.id, deployment_id, route.reason.as_str()
+                                );
+                                unavailable.record(&custom_domain.domain, &route);
+                            }
                             continue;
                         };
 
@@ -1565,15 +1719,18 @@ impl CachedPeerTable {
                     // Determine backend type: static directory or upstream containers
                     let backend = if let Some(static_dir) = &deployment.static_dir_location {
                         // Static deployment - serve from directory
-                        BackendType::StaticDir {
+                        Some(BackendType::StaticDir {
                             path: static_dir.clone(),
-                        }
+                        })
                     } else if !containers.is_empty() {
                         // For Compose deployments, the main route uses only
                         // the first explicitly configured public port. A stack
-                        // with no public ports (or a stale service reference)
-                        // remains private instead of exposing whichever
-                        // container happened to be discovered first.
+                        // with no public ports remains private instead of
+                        // exposing whichever container happened to be
+                        // discovered first. When the public service has no
+                        // running container (or a stale service reference),
+                        // nothing is routed and the hosts are reported
+                        // unavailable below.
                         let is_compose = containers.iter().any(|c| c.service_name.is_some());
                         let (route_containers, public_port): (
                             Vec<&deployment_containers::Model>,
@@ -1599,9 +1756,6 @@ impl CachedPeerTable {
                                         .iter()
                                         .filter(|c| c.service_name.as_deref() == Some(&pp.service))
                                         .collect();
-                                    if cs.is_empty() {
-                                        continue;
-                                    }
                                     (cs, Some(pp))
                                 }
                                 None => continue,
@@ -1635,15 +1789,49 @@ impl CachedPeerTable {
                                 backend_entries.push(entry);
                             }
                         }
-                        if backend_entries.is_empty() {
-                            continue;
-                        }
-                        BackendType::Upstream {
+                        (!backend_entries.is_empty()).then(|| BackendType::Upstream {
                             backends: backend_entries,
                             round_robin_counter: Arc::new(AtomicUsize::new(0)),
-                        }
+                        })
                     } else {
-                        // No backend available, skip this route
+                        None
+                    };
+
+                    // No live backend: report every hostname this section
+                    // would have routed for the environment as unavailable
+                    // (see section 1), including the public Compose service
+                    // URLs and the internal `*.temps.local` name.
+                    let Some(backend) = backend else {
+                        let route = environment
+                            .filter(|_| !compose_without_public_ports(project.map(Arc::as_ref)))
+                            .and_then(|environment| {
+                                unavailable_route_for(project, environment, deployment)
+                            });
+                        if let Some(route) = route {
+                            let mut hosts = vec![
+                                main_url.clone(),
+                                PublicHostnameStrategy::Standard
+                                    .environment_hostname(&preview_domain, main_url),
+                            ];
+                            let env_slug = env.slug.trim();
+                            let proj_slug = route.project.slug.trim();
+                            if !env_slug.is_empty() && !proj_slug.is_empty() {
+                                hosts.push(format!("{}.{}.temps.local", env_slug, proj_slug));
+                            }
+                            hosts.extend(compose_public_service_hostnames(
+                                route.project.preset_config.as_ref(),
+                                &preview_domain,
+                                match_strategy(&hostname_strategies, &preview_domain),
+                                main_url,
+                            ));
+                            debug!(
+                                "Environment has no live backend: {:?} (project={}, env={}, deploy={}, reason={})",
+                                hosts, env.project_id, env.id, deployment_id, route.reason.as_str()
+                            );
+                            for host in &hosts {
+                                unavailable.record(host, &route);
+                            }
+                        }
                         continue;
                     };
 
@@ -1790,11 +1978,29 @@ impl CachedPeerTable {
 
                             let route_labels =
                                 temps_entities::preset::compose_public_route_labels(&public_ports);
+                            // A public service with no running container (or
+                            // no reachable port) is down while the rest of
+                            // the stack runs: its URL answers 503.
+                            let svc_unavailable = environment.and_then(|environment| {
+                                unavailable_route_for(project, environment, deployment)
+                            });
+                            let svc_strategy =
+                                match_strategy(&hostname_strategies, &preview_domain);
                             for (public_port, route_label) in public_ports.iter().zip(&route_labels)
                             {
+                                let svc_domain = svc_strategy.service_hostname(
+                                    &preview_domain,
+                                    main_url,
+                                    route_label,
+                                );
                                 let svc_containers = match services.get(&public_port.service) {
                                     Some(c) => c,
-                                    None => continue,
+                                    None => {
+                                        if let Some(route) = &svc_unavailable {
+                                            unavailable.record(&svc_domain, route);
+                                        }
+                                        continue;
+                                    }
                                 };
 
                                 let mut svc_backends = Vec::with_capacity(svc_containers.len());
@@ -1824,6 +2030,9 @@ impl CachedPeerTable {
                                 }
 
                                 if svc_backends.is_empty() {
+                                    if let Some(route) = &svc_unavailable {
+                                        unavailable.record(&svc_domain, route);
+                                    }
                                     continue;
                                 }
 
@@ -1847,13 +2056,6 @@ impl CachedPeerTable {
                                     cert_eligible: true,
                                 };
 
-                                let svc_strategy =
-                                    match_strategy(&hostname_strategies, &preview_domain);
-                                let svc_domain = svc_strategy.service_hostname(
-                                    &preview_domain,
-                                    main_url,
-                                    route_label,
-                                );
                                 if let std::collections::hash_map::Entry::Vacant(e) =
                                     routes.entry(svc_domain.clone())
                                 {
@@ -1961,9 +2163,9 @@ impl CachedPeerTable {
                     // Determine backend type: static directory or upstream containers
                     let backend = if let Some(static_dir) = &deployment.static_dir_location {
                         // Static deployment - serve from directory
-                        BackendType::StaticDir {
+                        Some(BackendType::StaticDir {
                             path: static_dir.clone(),
-                        }
+                        })
                     } else if !containers.is_empty() {
                         let public_port =
                             project
@@ -1975,52 +2177,69 @@ impl CachedPeerTable {
                                     }
                                     _ => None,
                                 });
-                        let Some(route_containers) =
-                            select_public_route_containers(&containers, public_port)
-                        else {
-                            continue;
-                        };
-                        let mut backend_entries = Vec::with_capacity(route_containers.len());
-                        for c in route_containers {
-                            let node_addr = resolve_node_private_address(
-                                c.node_id,
-                                &mut nodes_cache,
-                                self.db.as_ref(),
-                            )
-                            .await;
-                            let entry = match public_port {
-                                Some(port) => build_public_compose_backend_entry(
-                                    c,
-                                    node_addr.as_deref(),
-                                    port,
-                                    self.runtime_context.as_ref(),
-                                ),
-                                None => build_backend_entry(
-                                    c,
-                                    node_addr.as_deref(),
-                                    self.runtime_context.as_ref(),
-                                ),
-                            };
-                            if let Some(entry) = entry {
-                                backend_entries.push(entry);
+                        match select_public_route_containers(&containers, public_port) {
+                            // A Compose stack without a public port is private.
+                            None if public_port.is_none() => continue,
+                            // The public service has no running container.
+                            None => None,
+                            Some(route_containers) => {
+                                let mut backend_entries =
+                                    Vec::with_capacity(route_containers.len());
+                                for c in route_containers {
+                                    let node_addr = resolve_node_private_address(
+                                        c.node_id,
+                                        &mut nodes_cache,
+                                        self.db.as_ref(),
+                                    )
+                                    .await;
+                                    let entry = match public_port {
+                                        Some(port) => build_public_compose_backend_entry(
+                                            c,
+                                            node_addr.as_deref(),
+                                            port,
+                                            self.runtime_context.as_ref(),
+                                        ),
+                                        None => build_backend_entry(
+                                            c,
+                                            node_addr.as_deref(),
+                                            self.runtime_context.as_ref(),
+                                        ),
+                                    };
+                                    if let Some(entry) = entry {
+                                        backend_entries.push(entry);
+                                    }
+                                }
+                                (!backend_entries.is_empty()).then(|| BackendType::Upstream {
+                                    backends: backend_entries,
+                                    round_robin_counter: Arc::new(AtomicUsize::new(0)),
+                                })
                             }
                         }
-                        if backend_entries.is_empty() {
-                            continue;
-                        }
-                        BackendType::Upstream {
-                            backends: backend_entries,
-                            round_robin_counter: Arc::new(AtomicUsize::new(0)),
-                        }
                     } else {
-                        // No backend available, skip this route
-                        continue;
+                        None
                     };
 
                     // Generate a fallback route using deployment slug if no other routes exist
                     // This ensures every active deployment is accessible
                     let fallback_domain = PublicHostnameStrategy::Standard
                         .deployment_hostname(&preview_domain, &deployment.slug);
+
+                    // No live backend: the deployment URL answers 503 (see
+                    // section 1) rather than falling through to the console.
+                    let Some(backend) = backend else {
+                        if !compose_without_public_ports(Some(project.as_ref())) {
+                            if let Some(route) =
+                                unavailable_route_for(Some(project), environment, deployment)
+                            {
+                                debug!(
+                                    "Deployment fallback host has no live backend: {} (project={}, env={}, deploy={}, reason={})",
+                                    fallback_domain, env.project_id, env.id, deployment_id, route.reason.as_str()
+                                );
+                                unavailable.record(&fallback_domain, &route);
+                            }
+                        }
+                        continue;
+                    };
 
                     if !routes.contains_key(&fallback_domain) {
                         routes.insert(
@@ -2224,6 +2443,22 @@ impl CachedPeerTable {
             }
         }
 
+        // A live route always wins over an unavailable entry for the same
+        // host, whichever section recorded it, and the console hostname is
+        // never reported as an application host. Lookups re-check live
+        // wildcard routes; this keeps the map down to hosts that matter.
+        unavailable.exact.retain(|host, _| {
+            !routes.contains_key(host)
+                && !http_routes_map.contains_key(host)
+                && !tls_routes_map.contains_key(host)
+        });
+        unavailable
+            .wildcard_bases
+            .retain(|base, _| !routes.contains_key(&format!("*.{base}")));
+        if let Some(console_host) = app_settings.console_hostname() {
+            unavailable.exact.remove(&console_host);
+        }
+
         // Build the wildcard index for legacy project/environment routes. A
         // concrete hostname resolved through a wildcard is deliberately not
         // eligible for on-demand HTTP-01 issuance: one stored wildcard may
@@ -2254,6 +2489,7 @@ impl CachedPeerTable {
         let http_wildcards_count = http_wildcards_matcher.len();
         let tls_wildcards_count = tls_wildcards_matcher.len();
         let legacy_wildcards_count = legacy_wildcards_matcher.len();
+        let unavailable_count = unavailable.len();
 
         let new_snapshot = Arc::new(RouteTableSnapshot {
             http_routes: http_routes_map,
@@ -2266,6 +2502,7 @@ impl CachedPeerTable {
                 reserved_console_host: app_settings.console_hostname(),
             },
             ownership: route_ownership,
+            unavailable,
         });
 
         // Collect on-demand configs for awake environments so the idle sweep can track them.
@@ -2311,8 +2548,8 @@ impl CachedPeerTable {
         }
 
         info!(
-            "Route table loaded with {} legacy routes; typed caches contain {} HTTP exact, {} TLS exact, {} HTTP wildcards, {} TLS wildcards, {} legacy wildcards",
-            route_count, http_routes_count, tls_routes_count, http_wildcards_count, tls_wildcards_count, legacy_wildcards_count
+            "Route table loaded with {} legacy routes; typed caches contain {} HTTP exact, {} TLS exact, {} HTTP wildcards, {} TLS wildcards, {} legacy wildcards; {} application hosts have no live backend",
+            route_count, http_routes_count, tls_routes_count, http_wildcards_count, tls_wildcards_count, legacy_wildcards_count, unavailable_count
         );
         debug!(
             "Found {} on-demand configs for idle tracking",
@@ -2395,6 +2632,36 @@ impl CachedPeerTable {
     /// Get route information for a host (O(1) lookup)
     pub fn get_route(&self, host: &str) -> Option<RouteInfo> {
         self.route_snapshot.load().legacy.get(host).cloned()
+    }
+
+    /// Look up an application hostname whose deployment currently has no live
+    /// upstream (stopped or crashed containers, or a paused deployment).
+    ///
+    /// Returns `None` whenever a live route resolves the host, so a routable
+    /// host is never reported as unavailable, and for the reserved console
+    /// hostname. Sleeping on-demand environments are never recorded here:
+    /// they keep going through the wake path. One snapshot load; meant for
+    /// the proxy's route-miss path, not for every request.
+    pub fn get_unavailable_route(&self, host: &str) -> Option<UnavailableRoute> {
+        let snapshot = self.route_snapshot.load();
+        // The unavailable map is usually empty, so check it first: console
+        // and unknown-host requests pay one hash lookup, not the full chain.
+        let route = snapshot.unavailable.get(host)?;
+        if snapshot.legacy.reserved_console_host.as_deref() == Some(host)
+            || snapshot.has_live_route(host)
+        {
+            return None;
+        }
+        Some(route.clone())
+    }
+
+    /// Record an unavailable hostname for cross-crate tests without database
+    /// setup. Not used on the production load path.
+    #[doc(hidden)]
+    pub fn insert_unavailable_route_for_test(&self, host: &str, route: UnavailableRoute) {
+        let mut snapshot = (*self.route_snapshot.load_full()).clone();
+        snapshot.unavailable.record(host, &route);
+        self.route_snapshot.store(Arc::new(snapshot));
     }
 
     /// Whether this hostname is reserved for the control-plane console.
@@ -3560,5 +3827,322 @@ mod tests {
 
         let loaded = handle.await.expect("waiter task panicked");
         assert!(loaded, "waiter must wake and report loaded after a bump");
+    }
+}
+
+#[cfg(test)]
+mod unavailable_route_tests {
+    use super::CachedPeerTable;
+    use crate::test_utils::TestDBMockOperations;
+    use sea_orm::{ActiveModelTrait, Set};
+    use temps_database::test_utils::TestDatabase;
+    use temps_entities::{custom_routes, environment_domains};
+
+    // ── Hosts without a live backend (issue #1334) ────────────────────
+    //
+    // A deployment whose containers are all down used to vanish from the
+    // route table, so the proxy fell back to the console and answered the
+    // app's hostname with the console SPA and HTTP 200. These hosts must stay
+    // unroutable but be reported through `get_unavailable_route`.
+
+    /// Isolated database, or `None` when Docker is unavailable.
+    async fn database_or_skip() -> Option<TestDatabase> {
+        match TestDatabase::with_migrations().await {
+            Ok(database) => Some(database),
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Skipping unavailable-route test: Docker runtime unavailable: {error}");
+                None
+            }
+            Err(error) => panic!("Could not create isolated test database: {error}"),
+        }
+    }
+
+    /// One container row for `deployment_id` in `status`.
+    async fn insert_container(
+        test_db: &TestDBMockOperations,
+        deployment_id: i32,
+        status: &str,
+        host_port: Option<i32>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use temps_entities::deployment_containers;
+        deployment_containers::ActiveModel {
+            deployment_id: Set(deployment_id),
+            container_id: Set(format!("container-{status}-{deployment_id}")),
+            container_name: Set(format!("container-{status}-{deployment_id}")),
+            container_port: Set(3000),
+            host_port: Set(host_port),
+            image_name: Set(Some("test-image:latest".to_string())),
+            status: Set(Some(status.to_string())),
+            deployed_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await?;
+        Ok(())
+    }
+
+    async fn insert_environment_domain(
+        test_db: &TestDBMockOperations,
+        environment_id: i32,
+        domain: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        environment_domains::ActiveModel {
+            domain: Set(domain.to_string()),
+            environment_id: Set(environment_id),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await?;
+        Ok(())
+    }
+
+    /// Assert `host` is not routable and is reported unavailable for exactly
+    /// this project/environment/deployment.
+    fn assert_unavailable(
+        route_table: &CachedPeerTable,
+        host: &str,
+        ids: (i32, i32, i32),
+        reason: crate::route_table::UnavailableReason,
+    ) {
+        assert!(
+            route_table.get_route_by_host(host).is_none()
+                && route_table.get_route(host).is_none()
+                && route_table.resolve_route_for_sni(host).is_none(),
+            "{host} has no live backend and must not be routable"
+        );
+        let unavailable = route_table
+            .get_unavailable_route(host)
+            .unwrap_or_else(|| panic!("{host} must be reported as unavailable"));
+        assert_eq!(
+            (
+                unavailable.project.id,
+                unavailable.environment.id,
+                unavailable.deployment.id
+            ),
+            ids,
+            "{host} must be attributed to its own project/environment/deployment"
+        );
+        assert_eq!(unavailable.reason, reason, "{host}");
+    }
+
+    #[tokio::test]
+    async fn exited_only_container_reports_app_hosts_unavailable(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::route_table::UnavailableReason;
+        use temps_entities::environments;
+
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        let (project, environment, deployment) = test_db
+            .create_test_project_with_domain("exited-app.example.com")
+            .await?;
+        environments::ActiveModel {
+            id: Set(environment.id),
+            subdomain: Set("exited-app-production".to_string()),
+            ..Default::default()
+        }
+        .update(test_db.db.as_ref())
+        .await?;
+        // Docker reported the container as exited (`docker stop` or a crash).
+        insert_container(&test_db, deployment.id, "exited", Some(9700)).await?;
+        insert_environment_domain(&test_db, environment.id, "exited-app.preview.example.com")
+            .await?;
+
+        let route_table = CachedPeerTable::new(test_db.db.clone());
+        route_table.load_routes().await?;
+
+        let ids = (project.id, environment.id, deployment.id);
+        // Section 1 (environment domain), section 4 (the environment's own
+        // hostname and its internal name).
+        for host in [
+            "exited-app.preview.example.com".to_string(),
+            "exited-app-production".to_string(),
+            format!("production.{}.temps.local", project.slug),
+        ] {
+            assert_unavailable(&route_table, &host, ids, UnavailableReason::NoLiveBackend);
+        }
+        assert!(
+            route_table
+                .get_unavailable_route("unknown.example.com")
+                .is_none(),
+            "a host no project owns is not an application outage"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn host_mode_container_without_published_port_is_unavailable(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::route_table::UnavailableReason;
+
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        let (project, environment, deployment) = test_db
+            .create_test_project_with_domain("no-port.example.com")
+            .await?;
+        // Still "running" in the database, but the health monitor cleared
+        // the host port because Docker no longer publishes one.
+        insert_container(&test_db, deployment.id, "running", None).await?;
+        insert_environment_domain(&test_db, environment.id, "no-port.preview.example.com").await?;
+
+        // `CachedPeerTable::new` runs in Host execution mode, where a
+        // container is only reachable through its published port.
+        let route_table = CachedPeerTable::new(test_db.db.clone());
+        route_table.load_routes().await?;
+
+        assert_unavailable(
+            &route_table,
+            "no-port.preview.example.com",
+            (project.id, environment.id, deployment.id),
+            UnavailableReason::NoLiveBackend,
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn paused_deployment_hosts_are_unavailable() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::route_table::UnavailableReason;
+        use temps_entities::deployments;
+
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        let (project, environment, deployment) = test_db
+            .create_test_project_with_domain("paused-app.example.com")
+            .await?;
+        // Even a container row that still says "running" is not routed
+        // while the deployment is paused.
+        insert_container(&test_db, deployment.id, "running", Some(9701)).await?;
+        deployments::ActiveModel {
+            id: Set(deployment.id),
+            state: Set("paused".to_string()),
+            ..Default::default()
+        }
+        .update(test_db.db.as_ref())
+        .await?;
+        insert_environment_domain(&test_db, environment.id, "paused-app.preview.example.com")
+            .await?;
+
+        let route_table = CachedPeerTable::new(test_db.db.clone());
+        route_table.load_routes().await?;
+
+        assert_unavailable(
+            &route_table,
+            "paused-app.preview.example.com",
+            (project.id, environment.id, deployment.id),
+            UnavailableReason::Paused,
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sleeping_on_demand_environment_is_left_to_the_wake_path(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use temps_entities::environments;
+
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        let (_project, environment, deployment) = test_db
+            .create_test_project_with_domain("sleeping-app.example.com")
+            .await?;
+        environments::ActiveModel {
+            id: Set(environment.id),
+            sleeping: Set(true),
+            ..Default::default()
+        }
+        .update(test_db.db.as_ref())
+        .await?;
+        insert_container(&test_db, deployment.id, "exited", Some(9702)).await?;
+        insert_environment_domain(&test_db, environment.id, "sleeping-app.preview.example.com")
+            .await?;
+
+        let route_table = CachedPeerTable::new(test_db.db.clone());
+        let sleeping = route_table.load_routes().await?;
+
+        let host = "sleeping-app.preview.example.com";
+        assert!(route_table.get_route_by_host(host).is_none());
+        assert!(
+            route_table.get_unavailable_route(host).is_none(),
+            "a sleeping environment must keep waking on request, not answer 503"
+        );
+        assert!(
+            sleeping
+                .iter()
+                .any(|entry| entry.domain == host && entry.environment_id == environment.id),
+            "the sleeping environment must still be handed to the wake path: {sleeping:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_route_always_wins_over_an_unavailable_entry(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::route_table::UnavailableReason;
+
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        let (project, environment, deployment) = test_db
+            .create_test_project_with_domain("down-app.example.com")
+            .await?;
+        insert_container(&test_db, deployment.id, "exited", Some(9703)).await?;
+        for domain in [
+            "shared.example.com",
+            "app.wild.example.com",
+            "only-down.example.com",
+        ] {
+            insert_environment_domain(&test_db, environment.id, domain).await?;
+        }
+        // Operator routes that resolve two of those hosts to a live upstream:
+        // one exact, one through a wildcard.
+        for domain in ["shared.example.com", "*.wild.example.com"] {
+            custom_routes::ActiveModel {
+                domain: Set(domain.to_string()),
+                host: Set("localhost".to_string()),
+                port: Set(8080),
+                enabled: Set(true),
+                ..Default::default()
+            }
+            .insert(test_db.db.as_ref())
+            .await?;
+        }
+
+        let route_table = CachedPeerTable::new(test_db.db.clone());
+        route_table.load_routes().await?;
+
+        for host in ["shared.example.com", "app.wild.example.com"] {
+            assert!(
+                route_table.get_route_by_host(host).is_some(),
+                "{host} has a live route"
+            );
+            assert!(
+                route_table.get_unavailable_route(host).is_none(),
+                "{host} has a live route and must not be reported unavailable"
+            );
+        }
+        assert_unavailable(
+            &route_table,
+            "only-down.example.com",
+            (project.id, environment.id, deployment.id),
+            UnavailableReason::NoLiveBackend,
+        );
+
+        Ok(())
     }
 }
