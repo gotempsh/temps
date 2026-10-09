@@ -802,20 +802,21 @@ impl RedisService {
     /// releasing the database it created either finishes before (and the
     /// mapping is gone) or finds its claim gone and releases nothing.
     async fn allocate_database(&self, resource_name: &str) -> Result<u8> {
-        self.allocate_database_tracked(resource_name, true)
-            .await
-            .map(|(db_number, _)| db_number)
+        self.allocate_database_for(resource_name, None).await
     }
 
-    /// [`Self::allocate_database`], also reporting whether this call created
-    /// the mapping (`false` when it reused one). `adopt` removes a data
-    /// import's claim before reading the mapping; only the import that holds
-    /// the claim allocates without adopting.
-    pub(super) async fn allocate_database_tracked(
+    /// [`Self::allocate_database`] on behalf of `import_run`, when set: the
+    /// import that holds a pending claim on the resource (`"{run}:pending"`)
+    /// allocates without adopting, and if this call creates the mapping it
+    /// confirms the claim as `"{run}:{db}"` in the same atomic step. A run
+    /// that reuses a mapping, or whose pending claim was adopted meanwhile,
+    /// ends up with no confirmed claim and can never release.
+    pub(super) async fn allocate_database_for(
         &self,
         resource_name: &str,
-        adopt: bool,
-    ) -> Result<(u8, bool)> {
+        import_run: Option<i32>,
+    ) -> Result<u8> {
+        let adopt = import_run.is_none();
         let mut conn = self.get_connection().await?;
         redis::cmd("SELECT")
             .arg(0)
@@ -837,7 +838,7 @@ impl RedisService {
             )
         })?;
         if let Some(db_number) = existing {
-            return Ok((db_number, false));
+            return Ok(db_number);
         }
 
         for db_number in 1..=15 {
@@ -913,17 +914,33 @@ impl RedisService {
                     continue;
                 }
 
-                conn.set::<_, _, ()>(&mapping_key, db_number)
+                let stored = match import_run {
+                    None => conn.set::<_, _, ()>(&mapping_key, db_number).await,
+                    Some(run) => redis::Script::new(
+                        "redis.call('SET', KEYS[1], ARGV[1]) \
+                             if redis.call('GET', KEYS[2]) == ARGV[2] then \
+                               redis.call('SET', KEYS[2], ARGV[3]) \
+                             end \
+                             return 1",
+                    )
+                    .key(&mapping_key)
+                    .key(Self::import_claim_key(resource_name))
+                    .arg(db_number)
+                    .arg(format!("{run}:pending"))
+                    .arg(format!("{run}:{db_number}"))
+                    .invoke_async::<i64>(&mut conn)
                     .await
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "Failed to store Redis DB {} mapping for resource '{}': {}",
-                            db_number,
-                            resource_name,
-                            e
-                        )
-                    })?;
-                return Ok((db_number, true));
+                    .map(|_| ()),
+                };
+                stored.map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to store Redis DB {} mapping for resource '{}': {}",
+                        db_number,
+                        resource_name,
+                        e
+                    )
+                })?;
+                return Ok(db_number);
             }
 
             let owner: Option<String> = conn.get(&owner_key).await.map_err(|e| {
@@ -945,7 +962,7 @@ impl RedisService {
                             e
                         )
                     })?;
-                return Ok((db_number, false));
+                return Ok(db_number);
             }
         }
 

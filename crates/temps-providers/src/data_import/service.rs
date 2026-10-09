@@ -863,6 +863,17 @@ impl JobOutcome {
 const PARTIAL_LEFTOVER: &str =
     "The target database may contain part of the data; run the import again with replace enabled.";
 
+/// Whether a run set out to create its target database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetCreation {
+    /// The target existed, or the run failed before preparing it.
+    None,
+    /// Preparing a new target failed: it may or may not have been allocated.
+    Attempted,
+    /// The run created the target.
+    Created,
+}
+
 /// What happened to a database a failed run created.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CreatedTargetRelease {
@@ -961,20 +972,21 @@ struct ImportJob {
 
 impl ImportJob {
     async fn execute(self) -> JobOutcome {
-        let mut created_target = false;
-        let outcome = self.run(&mut created_target).await;
-        if !created_target || outcome.status == STATUS_SUCCEEDED {
+        let mut creation = TargetCreation::None;
+        let outcome = self.run(&mut creation).await;
+        if creation == TargetCreation::None || outcome.status == STATUS_SUCCEEDED {
             return outcome;
         }
         // Every path out of `run` after the target was created settles the
         // helper first, so nothing writes into the database any more, and
         // the run still holds the database lock until it is finalized.
-        self.release_created_target(outcome).await
+        self.release_created_target(outcome, creation).await
     }
 
-    /// The import itself. Sets `created_target` once this run has created
-    /// the target database, so a failure can release what it created.
-    async fn run(&self, created_target: &mut bool) -> JobOutcome {
+    /// The import itself. Records in `creation` that this run set out to
+    /// create the target database, so a failure can release what it created
+    /// — including when preparing it failed after the database was allocated.
+    async fn run(&self, creation: &mut TargetCreation) -> JobOutcome {
         let Some(engine) = self.instance.data_import() else {
             return JobOutcome::failed("the service engine no longer supports imports".to_string());
         };
@@ -1000,13 +1012,18 @@ impl ImportJob {
         if self.cancel_requested().await {
             return JobOutcome::cancelled();
         }
+        if preparation == TargetPreparation::Create {
+            *creation = TargetCreation::Attempted;
+        }
         if let Err(e) = engine
             .prepare_target(&self.config, &self.database, preparation, self.run_id)
             .await
         {
             return JobOutcome::failed(scrub_secrets(&e.to_string(), &secrets));
         }
-        *created_target = preparation == TargetPreparation::Create;
+        if preparation == TargetPreparation::Create {
+            *creation = TargetCreation::Created;
+        }
 
         let plan = match engine
             .transfer_plan(
@@ -1120,7 +1137,15 @@ impl ImportJob {
     /// deployment of it may have started using the database while the
     /// import ran, and releasing would empty it and hand its number to the
     /// next resource. Whatever happens is stated in the run's message.
-    async fn release_created_target(&self, mut outcome: JobOutcome) -> JobOutcome {
+    ///
+    /// After an `Attempted` creation (preparing the target failed) the run
+    /// may or may not have allocated it; the engine releases only what this
+    /// run provably created, and the message is left alone when nothing was.
+    async fn release_created_target(
+        &self,
+        mut outcome: JobOutcome,
+        creation: TargetCreation,
+    ) -> JobOutcome {
         let Some(engine) = self.instance.data_import() else {
             return outcome;
         };
@@ -1157,6 +1182,7 @@ impl ImportJob {
                     );
                     CreatedTargetRelease::Released
                 }
+                Ok(false) if creation == TargetCreation::Attempted => return outcome,
                 Ok(false) => {
                     info!(
                         run_id = self.run_id,
@@ -1183,6 +1209,11 @@ impl ImportJob {
                 reason = %reason,
                 "Could not release the database a failed data import created"
             );
+            // Preparing failed too: whether anything was created is unknown,
+            // and the preparation error already explains the run.
+            if creation == TargetCreation::Attempted {
+                return outcome;
+            }
         }
         outcome.error_message =
             Some(release.describe(outcome.error_message.as_deref(), &self.database));
