@@ -1565,6 +1565,7 @@ impl DeployImageJob {
     async fn ensure_node_built_image_local(
         &self,
         image_tag: &str,
+        expected_image_id: Option<&str>,
         builder_node_id: i32,
         context: &WorkflowContext,
     ) -> Result<(), WorkflowError> {
@@ -1574,6 +1575,17 @@ impl DeployImageJob {
                  control plane has no image builder to import it into"
             ))
         })?;
+        // The build normally copied the image here already. Accept it by id
+        // before resolving the worker at all, so a worker that has since
+        // restarted, left the cluster, or pruned the image cannot fail a
+        // replica that already has what it needs.
+        if let (Some(expected), Ok(cached)) =
+            (expected_image_id, local.inspect_image(image_tag).await)
+        {
+            if super::node_image::same_image_id(&cached.id, expected) {
+                return Ok(());
+            }
+        }
         let owner = self.remote_deployer_for_node_id(builder_node_id).await?;
         let owner_name = owner.node_name().to_string();
         let started = std::time::Instant::now();
@@ -1582,6 +1594,7 @@ impl DeployImageJob {
             &owner_name,
             local.as_ref(),
             image_tag,
+            expected_image_id,
         )
         .await;
         match copied {
@@ -2552,6 +2565,7 @@ impl DeployImageJob {
                         // place a socket-granted project on a host that does
                         // not grant it.
                         project_slug: self.config.project_slug.as_deref(),
+                        exclude_control_plane: false,
                     },
                 )
                 .await
@@ -2757,8 +2771,16 @@ impl DeployImageJob {
                     // `node`) copies its image here when it finishes; if that
                     // copy failed, retry it before starting the replica.
                     if let Some(builder_id) = image_output.builder_node_id {
-                        self.ensure_node_built_image_local(&replica_image_tag, builder_id, context)
-                            .await?;
+                        // The recorded id belongs to the primary tag only.
+                        let expected_image_id = (replica_image_tag == image_output.image_tag)
+                            .then_some(image_output.image_id.as_str());
+                        self.ensure_node_built_image_local(
+                            &replica_image_tag,
+                            expected_image_id,
+                            builder_id,
+                            context,
+                        )
+                        .await?;
                     }
                     // Remote replicas are checked before the image is
                     // transferred; local ones had no equivalent guard, so a

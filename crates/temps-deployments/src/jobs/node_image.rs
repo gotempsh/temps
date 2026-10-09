@@ -19,24 +19,42 @@ pub(crate) enum NodeImageCopy {
     Transferred,
 }
 
+/// Whether two Docker image ids name the same image, with or without the
+/// `sha256:` prefix.
+pub(crate) fn same_image_id(a: &str, b: &str) -> bool {
+    let strip = |id: &str| id.trim().trim_start_matches("sha256:").to_ascii_lowercase();
+    !a.trim().is_empty() && strip(a) == strip(b)
+}
+
 /// Stream `image_tag` from the worker that built it into `destination`,
 /// unless `destination` already holds the same image.
 ///
 /// Identity is the image id, not the tag: a tag left over from an earlier
-/// build would otherwise be deployed in place of the one just built.
+/// build would otherwise be deployed in place of the one just built. When
+/// the build's image id is already known (`expected_image_id`), a matching
+/// local image is accepted without contacting the worker at all, so a copy
+/// made right after the build survives the worker restarting or pruning it.
 pub(crate) async fn copy_node_built_image(
     owner: &dyn temps_deployer::ImageBuilder,
     owner_name: &str,
     destination: &dyn temps_deployer::ImageBuilder,
     image_tag: &str,
+    expected_image_id: Option<&str>,
 ) -> Result<NodeImageCopy, WorkflowError> {
+    if let Some(expected) = expected_image_id {
+        if let Ok(cached) = destination.inspect_image(image_tag).await {
+            if same_image_id(&cached.id, expected) {
+                return Ok(NodeImageCopy::AlreadyPresent);
+            }
+        }
+    }
     let built = owner.inspect_image(image_tag).await.map_err(|error| {
         WorkflowError::JobExecutionFailed(format!(
             "Cannot inspect worker-built image '{image_tag}' on build node '{owner_name}': {error}"
         ))
     })?;
     if let Ok(cached) = destination.inspect_image(image_tag).await {
-        if cached.id == built.id {
+        if same_image_id(&cached.id, &built.id) {
             return Ok(NodeImageCopy::AlreadyPresent);
         }
     }
@@ -59,7 +77,7 @@ pub(crate) async fn copy_node_built_image(
             "Cannot verify image '{image_tag}' imported from build node '{owner_name}': {error}"
         ))
     })?;
-    if imported.id != built.id {
+    if !same_image_id(&imported.id, &built.id) {
         return Err(WorkflowError::JobValidationFailed(format!(
             "Image '{image_tag}' imported into the control plane is {} but build node \
              '{owner_name}' built {}",
@@ -230,7 +248,7 @@ mod tests {
         let worker = FakeImageStore::holding("app:latest", "sha256:built");
         let control_plane = FakeImageStore::default();
 
-        let outcome = copy_node_built_image(&worker, "builder-1", &control_plane, "app:latest")
+        let outcome = copy_node_built_image(&worker, "builder-1", &control_plane, "app:latest", None)
             .await
             .expect("copy succeeds");
 
@@ -247,7 +265,7 @@ mod tests {
         let worker = FakeImageStore::holding("app:latest", "sha256:built");
         let control_plane = FakeImageStore::holding("app:latest", "sha256:built");
 
-        let outcome = copy_node_built_image(&worker, "builder-1", &control_plane, "app:latest")
+        let outcome = copy_node_built_image(&worker, "builder-1", &control_plane, "app:latest", None)
             .await
             .expect("copy succeeds");
 
@@ -262,7 +280,7 @@ mod tests {
         let worker = FakeImageStore::holding("app:latest", "sha256:built");
         let control_plane = FakeImageStore::holding("app:latest", "sha256:stale");
 
-        let outcome = copy_node_built_image(&worker, "builder-1", &control_plane, "app:latest")
+        let outcome = copy_node_built_image(&worker, "builder-1", &control_plane, "app:latest", None)
             .await
             .expect("copy succeeds");
 
@@ -283,7 +301,7 @@ mod tests {
             ..Default::default()
         };
 
-        let error = copy_node_built_image(&worker, "builder-1", &control_plane, "app:latest")
+        let error = copy_node_built_image(&worker, "builder-1", &control_plane, "app:latest", None)
             .await
             .unwrap_err();
 
@@ -297,13 +315,68 @@ mod tests {
         }
     }
 
+    /// Once the image the build produced is on the control plane, a later
+    /// check must not depend on the worker: it may have restarted, become
+    /// unreachable, or pruned the image since.
+    #[tokio::test]
+    async fn copied_image_is_accepted_without_contacting_the_worker() {
+        // The worker no longer has the image; any contact would fail.
+        let worker = FakeImageStore::default();
+        let control_plane = FakeImageStore::holding("app:latest", "sha256:built");
+
+        let outcome = copy_node_built_image(
+            &worker,
+            "builder-1",
+            &control_plane,
+            "app:latest",
+            Some("built"),
+        )
+        .await
+        .expect("the local copy is the image that was built");
+
+        assert_eq!(outcome, NodeImageCopy::AlreadyPresent);
+        assert!(control_plane.imports.lock().unwrap().is_empty());
+    }
+
+    /// A known build id that the local image does not match still copies
+    /// from the worker, replacing the stale image.
+    #[tokio::test]
+    async fn stale_local_image_is_replaced_even_when_the_build_id_is_known() {
+        let worker = FakeImageStore::holding("app:latest", "sha256:built");
+        let control_plane = FakeImageStore::holding("app:latest", "sha256:stale");
+
+        let outcome = copy_node_built_image(
+            &worker,
+            "builder-1",
+            &control_plane,
+            "app:latest",
+            Some("sha256:built"),
+        )
+        .await
+        .expect("copy succeeds");
+
+        assert_eq!(outcome, NodeImageCopy::Transferred);
+        assert_eq!(
+            control_plane.images.lock().unwrap().get("app:latest"),
+            Some(&"sha256:built".to_string())
+        );
+    }
+
+    #[test]
+    fn image_ids_compare_with_or_without_the_digest_prefix() {
+        assert!(same_image_id("sha256:ABC", "abc"));
+        assert!(same_image_id("abc", "sha256:abc"));
+        assert!(!same_image_id("sha256:abc", "sha256:abd"));
+        assert!(!same_image_id("", ""));
+    }
+
     /// A worker that no longer holds the image is reported by name.
     #[tokio::test]
     async fn missing_node_built_image_names_the_build_node() {
         let worker = FakeImageStore::default();
         let control_plane = FakeImageStore::default();
 
-        let error = copy_node_built_image(&worker, "builder-1", &control_plane, "app:latest")
+        let error = copy_node_built_image(&worker, "builder-1", &control_plane, "app:latest", None)
             .await
             .unwrap_err();
 

@@ -200,6 +200,10 @@ pub struct ReplicaPlacementRequest<'a> {
     /// behaviour, and the right answer for callers that are not placing an
     /// application deployment.
     pub project_slug: Option<&'a str>,
+    /// Keep the control plane out of the pool, so only worker nodes are
+    /// considered. Used to pick a worker to take a build off the control
+    /// plane; `false` for every replica placement.
+    pub exclude_control_plane: bool,
 }
 
 /// Result of a scheduling pass: where the replicas go, plus what was left out.
@@ -791,6 +795,7 @@ impl NodeScheduler {
             exclude_node_ids,
             image_platforms,
             project_slug: None,
+            exclude_control_plane: false,
         })
         .await
     }
@@ -812,6 +817,7 @@ impl NodeScheduler {
             exclude_node_ids,
             image_platforms,
             project_slug,
+            exclude_control_plane,
         } = request;
         let target_node_ids = placement_node_ids(target_node_ids);
         let targets_control_plane =
@@ -1027,12 +1033,14 @@ impl NodeScheduler {
         let has_label_constraints = selector_map.is_some_and(|map| !map.is_empty());
         let local_matches_constraints =
             !has_label_constraints && target_node_ids.is_none_or(|_| targets_control_plane);
-        // Four independent reasons Local can drop out of the pool: it cannot
-        // run the image, it does not satisfy an explicit placement constraint,
+        // Five independent reasons Local can drop out of the pool: the caller
+        // wants a worker (a build moved off the control plane), it cannot run
+        // the image, it does not satisfy an explicit placement constraint,
         // this process is not allowed to run workloads at all, or — for a
         // project granted host Docker access somewhere — this control plane's
         // own environment does not grant it (ADR 045).
-        let include_local = self.local_workloads_enabled
+        let include_local = !exclude_control_plane
+            && self.local_workloads_enabled
             && local_compatible
             && local_matches_constraints
             && local_grants_socket;
@@ -1747,6 +1755,7 @@ mod tests {
                 exclude_node_ids: &[],
                 image_platforms: &[],
                 project_slug,
+                exclude_control_plane: false,
             }
         }
 
@@ -1913,6 +1922,7 @@ mod tests {
                     exclude_node_ids: &[],
                     image_platforms: &[],
                     project_slug: Some("node-daemon"),
+                    exclude_control_plane: false,
                 })
                 .await
                 .expect_err("three spread replicas cannot fit on two eligible hosts");
@@ -4231,5 +4241,58 @@ mod tests {
         let mut unknown = builder_node(1, "builder", "linux/amd64");
         unknown.architecture = None;
         assert!(pick_builder_node(vec![unknown], "linux/amd64").is_none());
+    }
+
+    fn build_offload_placement(exclude_control_plane: bool) -> ReplicaPlacementRequest<'static> {
+        ReplicaPlacementRequest {
+            replica_count: 1,
+            labels: None,
+            target_node_ids: None,
+            anti_affinity: true,
+            exclude_node_ids: &[],
+            image_platforms: &[],
+            project_slug: None,
+            exclude_control_plane,
+        }
+    }
+
+    /// Without capacity data the control plane comes first in the pool, so
+    /// an ordinary single-replica placement lands on it. That is right for a
+    /// replica and wrong for a build being moved off the control plane.
+    #[tokio::test]
+    async fn build_offload_placement_never_picks_the_control_plane() {
+        let ordinary = scheduler_with_nodes(vec![make_node(1, "worker-1")], "linux/amd64")
+            .schedule_placement(build_offload_placement(false))
+            .await
+            .unwrap();
+        assert!(ordinary.assignments[0].is_local());
+
+        let offload = scheduler_with_nodes(vec![make_node(1, "worker-1")], "linux/amd64")
+            .schedule_placement(build_offload_placement(true))
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                offload.assignments[0],
+                NodeAssignment::Remote { node_id: 1, .. }
+            ),
+            "{:?}",
+            offload.assignments
+        );
+    }
+
+    /// With no worker at all, excluding the control plane is an error the
+    /// caller turns into "build on the control plane, and say why" -- never a
+    /// silent `Local`.
+    #[tokio::test]
+    async fn build_offload_placement_without_workers_is_an_error() {
+        let error = scheduler_with_nodes(Vec::new(), "linux/amd64")
+            .schedule_placement(build_offload_placement(true))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, NodeError::NoCompatibleNode { .. }),
+            "{error:?}"
+        );
     }
 }

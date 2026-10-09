@@ -620,6 +620,7 @@ impl BuildImageJob {
             node_name,
             control_plane.as_ref(),
             image_tag,
+            None,
         )
         .await
         {

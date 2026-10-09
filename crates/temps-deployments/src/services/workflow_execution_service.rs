@@ -253,12 +253,20 @@ struct OffloadBuildCandidate {
 /// server knows, never a configuration error, so the deployment still ships.
 fn offload_build_candidate(
     static_output_only: bool,
+    needs_npm_credentials: bool,
     cross_build_platforms: &[String],
     control_plane_platform: Option<&str>,
     scheduler_available: bool,
 ) -> Result<OffloadBuildCandidate, String> {
     if !scheduler_available {
         return Err("node scheduling is not available on this server".to_string());
+    }
+    // `.npmrc` is generated from these on the control plane only; a worker
+    // build would fail outright, and the values must not leave this host.
+    if needs_npm_credentials {
+        return Err("this build uses NPM_TOKEN or NPM_RC for private packages, and worker \
+             builds cannot receive registry credentials yet"
+            .to_string());
     }
     // DeployStaticJob reads the output files from the build node, and the
     // image itself runs nowhere.
@@ -1054,6 +1062,10 @@ impl WorkflowExecutionService {
                     "build_args",
                 )
                 .map_err(|e| WorkflowExecutionError::InvalidJobConfig(e.to_string()))?;
+                // Worker builds cannot receive registry credentials, so a
+                // build that needs them stays on the control plane.
+                let needs_npm_credentials =
+                    crate::jobs::npmrc::plan_npmrc(&build_args_map).is_some();
                 if !build_args_map.is_empty() {
                     let build_args: Vec<(String, String)> = build_args_map.into_iter().collect();
                     builder = builder.build_args(build_args);
@@ -1208,6 +1220,7 @@ impl WorkflowExecutionService {
                             target_nodes.as_deref(),
                             target_labels.as_ref(),
                             &cross_build_platforms,
+                            needs_npm_credentials,
                         )
                         .await
                     {
@@ -2681,6 +2694,7 @@ impl WorkflowExecutionService {
         target_nodes: Option<&[i32]>,
         target_labels: Option<&serde_json::Value>,
         cross_build_platforms: &[String],
+        needs_npm_credentials: bool,
     ) -> Result<SelectedNodeBuilder, String> {
         let static_output_only = deployment_jobs::Entity::find()
             .filter(deployment_jobs::Column::DeploymentId.eq(deployment_id))
@@ -2699,6 +2713,7 @@ impl WorkflowExecutionService {
         let scheduler = self.node_scheduler.get();
         let candidate = offload_build_candidate(
             static_output_only,
+            needs_npm_credentials,
             cross_build_platforms,
             control_plane_platform.as_deref(),
             scheduler.is_some(),
@@ -2731,9 +2746,33 @@ impl WorkflowExecutionService {
                 exclude_node_ids: &[],
                 image_platforms: &required_platforms,
                 project_slug: Some(project_slug),
+                // Only workers: the control plane is what the build is
+                // moving off, so it must never win the placement.
+                exclude_control_plane: true,
             })
-            .await
-            .map_err(|error| format!("could not choose a worker node: {error}"))?;
+            .await;
+        let no_worker = || {
+            let needed = candidate
+                .platform
+                .as_deref()
+                .map(|platform| format!(" runs {platform}"))
+                .unwrap_or_default();
+            format!(
+                "no active worker node{needed} for this deployment. Join one with `temps join`, \
+                 or label a node `{}={}` to dedicate it to builds",
+                crate::services::node_scheduler::NODE_ROLE_LABEL,
+                crate::services::node_scheduler::BUILDER_NODE_ROLE,
+            )
+        };
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            // An empty worker pool, with or without placement constraints.
+            Err(
+                crate::services::node_service::NodeError::NoCompatibleNode { .. }
+                | crate::services::node_service::NodeError::LocalWorkloadsDisabled { .. },
+            ) => return Err(no_worker()),
+            Err(error) => return Err(format!("could not choose a worker node: {error}")),
+        };
         let Some(crate::services::NodeAssignment::Remote {
             node_id: target_id,
             node_name: target_name,
@@ -2741,17 +2780,7 @@ impl WorkflowExecutionService {
             ..
         }) = outcome.assignments.into_iter().next()
         else {
-            let needed = candidate
-                .platform
-                .as_deref()
-                .map(|platform| format!(" runs {platform}"))
-                .unwrap_or_default();
-            return Err(format!(
-                "no active worker node{needed} for this deployment. Join one with `temps join`, \
-                 or label a node `{}={}` to dedicate it to builds",
-                crate::services::node_scheduler::NODE_ROLE_LABEL,
-                crate::services::node_scheduler::BUILDER_NODE_ROLE,
-            ));
+            return Err(no_worker());
         };
 
         let platform = match candidate.platform {
@@ -2860,6 +2889,7 @@ impl WorkflowExecutionService {
                 exclude_node_ids: &[],
                 image_platforms: &required_platforms,
                 project_slug: Some(project_slug),
+                exclude_control_plane: false,
             })
             .await
             .map_err(|error| {
@@ -3836,7 +3866,7 @@ mod tests {
         use super::{offload_build_candidate, OffloadBuildCandidate};
 
         assert_eq!(
-            offload_build_candidate(false, &[], Some("linux/amd64"), true),
+            offload_build_candidate(false, false, &[], Some("linux/amd64"), true),
             Ok(OffloadBuildCandidate {
                 platform: Some("linux/amd64".to_string())
             })
@@ -3844,13 +3874,13 @@ mod tests {
         // A single requested platform is still one image, built for that
         // platform rather than the control plane's.
         assert_eq!(
-            offload_build_candidate(false, &["linux/arm64".into()], Some("linux/amd64"), true),
+            offload_build_candidate(false, false, &["linux/arm64".into()], Some("linux/amd64"), true),
             Ok(OffloadBuildCandidate {
                 platform: Some("linux/arm64".to_string())
             })
         );
         assert_eq!(
-            offload_build_candidate(false, &[], Some(" linux/amd64 "), true),
+            offload_build_candidate(false, false, &[], Some(" linux/amd64 "), true),
             Ok(OffloadBuildCandidate {
                 platform: Some("linux/amd64".to_string())
             })
@@ -3866,13 +3896,12 @@ mod tests {
 
         for platform in [None, Some("linux/amd64")] {
             assert_eq!(
-                offload_build_candidate(true, &[], platform, true),
+                offload_build_candidate(true, false, &[], platform, true),
                 Ok(OffloadBuildCandidate { platform: None })
             );
         }
         assert_eq!(
-            offload_build_candidate(
-                true,
+            offload_build_candidate(true, false,
                 &["linux/amd64".into(), "linux/arm64".into()],
                 Some("linux/amd64"),
                 true
@@ -3885,8 +3914,7 @@ mod tests {
     fn offload_build_candidate_explains_every_reason_to_stay_local() {
         use super::offload_build_candidate;
 
-        let multi_arch = offload_build_candidate(
-            false,
+        let multi_arch = offload_build_candidate(false, false,
             &["linux/amd64".into(), "linux/arm64".into()],
             Some("linux/amd64"),
             true,
@@ -3897,14 +3925,30 @@ mod tests {
 
         for static_output_only in [false, true] {
             let no_scheduler =
-                offload_build_candidate(static_output_only, &[], Some("linux/amd64"), false)
+                offload_build_candidate(static_output_only, false, &[], Some("linux/amd64"), false)
                     .unwrap_err();
             assert!(no_scheduler.contains("node scheduling"), "{no_scheduler}");
         }
 
         for platform in [None, Some(""), Some("not-a-platform")] {
-            let unknown = offload_build_candidate(false, &[], platform, true).unwrap_err();
+            let unknown = offload_build_candidate(false, false, &[], platform, true).unwrap_err();
             assert!(unknown.contains("platform is not known"), "{unknown}");
+        }
+    }
+
+    /// Private npm credentials are only ever written into a build context on
+    /// the control plane, so such a build -- static or not -- stays there
+    /// with a reason instead of failing on the worker.
+    #[test]
+    fn offload_build_candidate_keeps_npm_credential_builds_local() {
+        use super::offload_build_candidate;
+
+        for static_output_only in [false, true] {
+            let reason =
+                offload_build_candidate(static_output_only, true, &[], Some("linux/amd64"), true)
+                    .unwrap_err();
+            assert!(reason.contains("NPM_TOKEN"), "{reason}");
+            assert!(reason.contains("NPM_RC"), "{reason}");
         }
     }
     use super::*;
