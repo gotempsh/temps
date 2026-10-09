@@ -981,11 +981,13 @@ impl SandboxProvider for MicrosandboxSandboxProvider {
         path: &str,
         max_bytes: u64,
     ) -> Result<Vec<u8>, AgentError> {
-        // Stat first so an oversized file is never buffered on the host.
+        // Stat first to reject an oversized file without reading it, then
+        // stream and stop at the limit: the file may grow between the two,
+        // and host memory must never exceed `max_bytes` plus one chunk.
         let name = handle.sandbox_name.as_str();
         let sandbox = self.connected(name).await?;
-        let size = sandbox
-            .fs()
+        let fs = sandbox.fs();
+        let size = fs
             .stat(path)
             .await
             .map_err(|e| Self::err(name, &format!("stat '{}'", path), e))?
@@ -993,10 +995,20 @@ impl SandboxProvider for MicrosandboxSandboxProvider {
         if size > max_bytes {
             return Err(crate::sandbox::file_too_large(handle, path, max_bytes));
         }
-        let contents = self.read_file(handle, path).await?;
-        // The file may have grown between stat and read.
-        if contents.len() as u64 > max_bytes {
-            return Err(crate::sandbox::file_too_large(handle, path, max_bytes));
+        let operation = format!("read_file_bounded '{}'", path);
+        let mut stream = fs.read_stream(path).await.map_err(|e| {
+            self.evict(name);
+            Self::err(name, &operation, e)
+        })?;
+        let mut contents = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
+        while let Some(chunk) = stream.recv().await.map_err(|e| {
+            self.evict(name);
+            Self::err(name, &operation, e)
+        })? {
+            if (contents.len() + chunk.len()) as u64 > max_bytes {
+                return Err(crate::sandbox::file_too_large(handle, path, max_bytes));
+            }
+            contents.extend_from_slice(&chunk);
         }
         Ok(contents)
     }
@@ -1820,6 +1832,31 @@ mod tests {
                     }
                     other => panic!("expected size-limit error, got {other:?}"),
                 }
+                assert_eq!(
+                    provider
+                        .read_file_bounded(&handle, path, payload.len() as u64)
+                        .await
+                        .unwrap(),
+                    payload,
+                    "a file exactly at the limit is returned whole"
+                );
+                // A multi-chunk file streams through the bounded reader intact.
+                let big = sh(
+                    provider,
+                    &handle,
+                    "head -c 1048576 /dev/urandom > /workspace/big.bin",
+                )
+                .await;
+                assert_eq!(big.exit_code, 0, "{}", big.stderr);
+                let whole = provider
+                    .read_file(&handle, "/workspace/big.bin")
+                    .await
+                    .unwrap();
+                let bounded = provider
+                    .read_file_bounded(&handle, "/workspace/big.bin", 1_048_576)
+                    .await
+                    .unwrap();
+                assert!(bounded == whole, "bounded stream matches the full read");
                 match provider.read_file(&handle, "/workspace/missing").await {
                     Err(AgentError::SandboxExecFailed {
                         sandbox_id, reason, ..
