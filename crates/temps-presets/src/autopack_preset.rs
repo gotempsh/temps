@@ -54,8 +54,13 @@ pub(crate) fn render(
         );
     }
 
+    let python_app = if provider.is_none() || provider == Some("python") {
+        python_app_directory(config.root_local_path, config.local_path)?
+    } else {
+        None
+    };
     let workspace_app = if provider.is_none() || provider == Some("node") {
-        pnpm_app_directory(config)?
+        node_app_directory(config)?
     } else {
         None
     };
@@ -118,7 +123,15 @@ pub(crate) fn render(
         selected_env.set("AUTOPACK_PROVIDER", "node");
         let selected_analysis = analyze(&selected, &selected_env, &autopack_providers::registry())
             .map_err(|e| e.to_string())?;
-        let start = selected_analysis
+        let root_package: autopack_providers::node::PackageJson = app
+            .read_json_opt("package.json")
+            .map_err(|e| e.to_string())?
+            .unwrap_or_default();
+        let manager = autopack_providers::node::PackageManager::detect(&app, &root_package);
+        let selected_package: autopack_providers::node::PackageJson = selected
+            .read_json("package.json")
+            .map_err(|e| e.to_string())?;
+        let inferred_start = selected_analysis
             .plan
             .deploy
             .start_command
@@ -126,6 +139,24 @@ pub(crate) fn render(
             .ok_or_else(|| {
                 format!("No start command found for workspace application {relative}")
             })?;
+        let selected_manager =
+            autopack_providers::node::PackageManager::detect(&selected, &selected_package);
+        // Keep direct starts so the application receives SIGTERM. Yarn Berry
+        // needs its launcher to activate the package loader, while compound
+        // start scripts need the root manager rather than the app's fallback.
+        let start = if manager != autopack_providers::node::PackageManager::Pnpm
+            && (inferred_start == selected_manager.run_command("start")
+                || (manager == autopack_providers::node::PackageManager::YarnBerry
+                    && selected_package.script("start") == Some(inferred_start)))
+        {
+            manager.run_command("start")
+        } else if matches!(manager, autopack_providers::node::PackageManager::YarnBerry)
+            && inferred_start.starts_with("node ")
+        {
+            format!("yarn {inferred_start}")
+        } else {
+            inferred_start.to_string()
+        };
         env.set("AUTOPACK_PROVIDER", "node");
         env.set(
             "AUTOPACK_START_CMD",
@@ -134,7 +165,13 @@ pub(crate) fn render(
         if config.build_command.is_none() {
             env.set(
                 "AUTOPACK_BUILD_CMD",
-                format!("pnpm --filter './{relative}...' --if-present run build"),
+                if manager == autopack_providers::node::PackageManager::Pnpm {
+                    format!("pnpm --filter './{relative}...' --if-present run build")
+                } else if selected_package.script("build").is_some() {
+                    format!("cd /app/{relative} && {}", manager.run_command("build"))
+                } else {
+                    ":".to_string()
+                },
             );
         } else if let Some(command) = config.build_command {
             env.set(
@@ -173,7 +210,29 @@ pub(crate) fn render(
             }
         }
     }
-    let analysis = analyze(&app, &env, &registry).map_err(|e| e.to_string())?;
+    let mut analysis = analyze(&app, &env, &registry).map_err(|e| e.to_string())?;
+    if let Some(relative) = python_app.filter(|_| analysis.provider == "python") {
+        // Analysis stays inside the selected application capability. Only the
+        // explicitly supplied repository root is copied into the build; install
+        // and build commands retain the app's cwd, so relative pip paths work.
+        for step in &mut analysis.plan.steps {
+            if matches!(step.name.as_str(), "install" | "build") {
+                for input in &mut step.inputs {
+                    if input.local {
+                        *input = autopack_core::plan::Layer::local();
+                    }
+                }
+                for command in &mut step.commands {
+                    if let autopack_core::plan::Command::Exec(exec) = command {
+                        exec.cmd = format!("cd /app/{relative} && {}", exec.cmd);
+                    }
+                }
+            }
+        }
+        if let Some(start) = &mut analysis.plan.deploy.start_command {
+            *start = format!("cd /app/{relative} && {start}");
+        }
+    }
 
     info!(
         provider = %analysis.provider,
@@ -231,21 +290,26 @@ pub(crate) fn untranslated_config_notes<'a>(
         .collect()
 }
 
-/// A pnpm workspace app directory safe to use in Dockerfile paths and shell filters.
-/// Check membership here too: presets may also be invoked outside the build job.
+/// Retain the pnpm-only helper for templates that use pnpm filters.
 pub(crate) fn pnpm_app_directory(config: &DockerfileConfig<'_>) -> Result<Option<String>, String> {
-    if config.root_local_path == config.local_path
-        || !config.root_local_path.join("pnpm-workspace.yaml").is_file()
-    {
+    if !config.root_local_path.join("pnpm-workspace.yaml").is_file() {
+        return Ok(None);
+    }
+    node_app_directory(config)
+}
+
+/// A selected workspace package confined to the explicit repository root.
+pub(crate) fn node_app_directory(config: &DockerfileConfig<'_>) -> Result<Option<String>, String> {
+    if config.root_local_path == config.local_path {
         return Ok(None);
     }
     let relative = config
         .local_path
         .strip_prefix(config.root_local_path)
-        .map_err(|_| "Application directory escapes the pnpm workspace root".to_string())?;
+        .map_err(|_| "Application directory escapes the workspace root".to_string())?;
     let text = relative
         .to_str()
-        .ok_or_else(|| "pnpm workspace application directory must be UTF-8".to_string())?;
+        .ok_or_else(|| "Workspace application directory must be UTF-8".to_string())?;
     if text.is_empty()
         || !text
             .chars()
@@ -255,13 +319,79 @@ pub(crate) fn pnpm_app_directory(config: &DockerfileConfig<'_>) -> Result<Option
             .any(|c| !matches!(c, std::path::Component::Normal(_)))
     {
         return Err(format!(
-            "Unsupported pnpm workspace application directory: {text}"
+            "Unsupported workspace application directory: {text}"
         ));
     }
     if !super::pnpm_workspace::app_is_member(config.root_local_path, config.local_path)? {
         return Ok(None);
     }
     Ok(Some(text.to_string()))
+}
+
+/// The selected pip application when it needs a sibling package in the source
+/// repository. Dependency paths may leave the app, never the repository.
+pub fn python_app_directory(root: &Path, selected: &Path) -> Result<Option<String>, String> {
+    if root == selected {
+        return Ok(None);
+    }
+    let relative = selected
+        .strip_prefix(root)
+        .map_err(|_| "Python application directory escapes the source repository".to_string())?;
+    let text = relative
+        .to_str()
+        .ok_or_else(|| "Python application directory must be UTF-8".to_string())?;
+    if text.is_empty()
+        || !text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/_.-".contains(c))
+        || relative
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return Err("Unsupported Python application directory: use a Dockerfile with an explicit repository build context".to_string());
+    }
+    let repository = App::new(root).map_err(|e| e.to_string())?;
+    let requirements = relative.join("requirements.txt");
+    if !repository.has_file(&requirements) {
+        return Ok(None);
+    }
+    let metadata =
+        std::fs::symlink_metadata(root.join(&requirements)).map_err(|e| e.to_string())?;
+    if !metadata.is_file() {
+        return Err("Python requirements.txt must be a regular non-symlink file".to_string());
+    }
+    if metadata.len() > 1024 * 1024 {
+        return Err("Python requirements.txt exceeds the 1 MiB planning limit".to_string());
+    }
+    let contents = repository
+        .read_file(&requirements)
+        .map_err(|e| e.to_string())?;
+    let mut needs_repository = false;
+    for line in contents.lines() {
+        let requirement = line
+            .trim()
+            .strip_prefix("-e ")
+            .or_else(|| line.trim().strip_prefix("--editable "))
+            .unwrap_or(line.trim());
+        let requirement = requirement.split(" #").next().unwrap_or(requirement).trim();
+        if !requirement.starts_with("../") && !requirement.starts_with("./") {
+            continue;
+        }
+        let mut resolved = std::path::PathBuf::new();
+        for component in relative.join(requirement).components() {
+            match component {
+                std::path::Component::Normal(part) => resolved.push(part),
+                std::path::Component::CurDir => {},
+                std::path::Component::ParentDir if resolved.pop() => {},
+                _ => return Err(format!("Local Python dependency '{requirement}' escapes the source repository. Include the package inside the uploaded repository, or use a Dockerfile with an explicit build context.")),
+            }
+        }
+        if !repository.has_dir(&resolved) && !repository.has_file(&resolved) {
+            return Err(format!("Local Python dependency '{requirement}' is missing or leaves the source repository through a symlink. Upload the complete repository or use a Dockerfile with an explicit repository build context."));
+        }
+        needs_repository |= !resolved.starts_with(relative);
+    }
+    Ok(needs_repository.then(|| text.to_string()))
 }
 
 /// True when `name` can be declared as a Dockerfile `ARG` by autopack.
@@ -777,6 +907,180 @@ mod tests {
             "{result}"
         );
         assert!(!result.contains("node wrong.js"), "{result}");
+    }
+
+    #[test]
+    fn python_sibling_packages_keep_install_build_and_start_cwd() {
+        let repo = fixture(&[
+            (
+                "apps/api/requirements.txt",
+                "../../packages/shared\nflask==3.1.2",
+            ),
+            (
+                "apps/api/app.py",
+                "from flask import Flask\napp = Flask(__name__)",
+            ),
+            (
+                "packages/shared/pyproject.toml",
+                "[project]\nname='fixture-shared'\nversion='1.0.0'",
+            ),
+        ]);
+        let app = repo.path().join("apps/api");
+        let config = DockerfileConfig::new(repo.path(), &app, "fixture").with_buildkit(true);
+        assert_eq!(
+            python_app_directory(repo.path(), &app).unwrap(),
+            Some("apps/api".to_string())
+        );
+        let rendered = render(&config, Some("python")).unwrap().content;
+        assert!(rendered.contains("COPY . /app"), "{rendered}");
+        assert!(
+            rendered.contains("cd /app/apps/api && sh -c 'pip install -r requirements.txt'"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("cd /app/apps/api && gunicorn app:app"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn python_dependency_paths_cannot_escape_the_supplied_repository() {
+        let repo = fixture(&[
+            ("apps/api/requirements.txt", "../../../outside"),
+            ("apps/api/app.py", ""),
+        ]);
+        let app = repo.path().join("apps/api");
+        let error = python_app_directory(repo.path(), &app).unwrap_err();
+        assert!(error.contains("escapes the source repository"), "{error}");
+        assert!(error.contains("Dockerfile"), "{error}");
+        std::fs::write(app.join("requirements.txt"), "../../packages/missing").unwrap();
+        assert!(python_app_directory(repo.path(), &app)
+            .unwrap_err()
+            .contains("missing"));
+        std::fs::write(app.join("requirements.txt"), "flask==3.1.2").unwrap();
+        assert_eq!(python_app_directory(repo.path(), &app).unwrap(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn python_local_dependency_symlinks_never_import_host_files() {
+        let outside = tempfile::tempdir().unwrap();
+        let repo = fixture(&[("apps/api/requirements.txt", "../../packages/shared")]);
+        std::fs::create_dir_all(repo.path().join("packages")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), repo.path().join("packages/shared")).unwrap();
+        assert!(
+            python_app_directory(repo.path(), &repo.path().join("apps/api"))
+                .unwrap_err()
+                .contains("symlink")
+        );
+    }
+
+    #[test]
+    fn npm_yarn_and_bun_use_root_manager_and_selected_app() {
+        for (pin, manager, install) in [
+            ("npm@10.9.0", "npm", "npm install"),
+            ("yarn@4.6.0", "yarn", "yarn install"),
+            ("bun@1.2.22", "bun", "bun install"),
+        ] {
+            let root = serde_json::json!({"private":true,"packageManager":pin,"workspaces":["apps/*","packages/*"],"scripts":{"start":"node wrong.js","build":"node wrong.js"}}).to_string();
+            let repo = fixture(&[
+                ("package.json", &root),
+                (
+                    "apps/api/package.json",
+                    r#"{"scripts":{"start":"node server.js","build":"node build.js"},"dependencies":{"@fixture/shared":"workspace:*"}}"#,
+                ),
+                ("apps/api/server.js", ""),
+                (
+                    "packages/shared/package.json",
+                    r#"{"name":"@fixture/shared","version":"1.0.0"}"#,
+                ),
+            ]);
+            let app = repo.path().join("apps/api");
+            let config = DockerfileConfig::new(repo.path(), &app, "fixture").with_buildkit(true);
+            let result = render(&config, Some("node")).unwrap().content;
+            assert!(result.contains(install), "{pin}: {result}");
+            assert!(
+                result.contains(&format!("cd /app/apps/api && {manager} run build")),
+                "{pin}: {result}"
+            );
+            let start = if manager == "yarn" {
+                "yarn run start"
+            } else {
+                "node server.js"
+            };
+            assert!(
+                result.contains(&format!(
+                    "PATH=/app/apps/api/node_modules/.bin:$PATH {start}"
+                )),
+                "{pin}: {result}"
+            );
+            assert!(!result.contains("node wrong.js"), "{pin}: {result}");
+            assert!(result.contains("COPY . /app"), "{pin}: {result}");
+        }
+    }
+
+    #[test]
+    fn workspace_manager_selection_preserves_explicit_app_start_commands() {
+        for pin in ["npm@10.9.0", "yarn@4.6.0", "bun@1.2.22"] {
+            let root =
+                serde_json::json!({"private":true,"packageManager":pin,"workspaces":["apps/*"]})
+                    .to_string();
+            for (file, contents) in [
+                ("Procfile", "web: node configured.js"),
+                (
+                    "autopack.json",
+                    r#"{"deploy":{"startCommand":"node configured.js"}}"#,
+                ),
+            ] {
+                let config_path = format!("apps/api/{file}");
+                let repo = fixture(&[
+                    ("package.json", &root),
+                    (
+                        "apps/api/package.json",
+                        r#"{"scripts":{"start":"node wrong.js"}}"#,
+                    ),
+                    (&config_path, contents),
+                    ("apps/api/configured.js", ""),
+                ]);
+                let app = repo.path().join("apps/api");
+                let config =
+                    DockerfileConfig::new(repo.path(), &app, "fixture").with_buildkit(true);
+                let result = render(&config, Some("node")).unwrap().content;
+                assert!(result.contains("node configured.js"), "{pin}: {result}");
+                assert!(!result.contains("run start"), "{pin}: {result}");
+                assert!(!result.contains("node wrong.js"), "{pin}: {result}");
+            }
+        }
+    }
+
+    #[test]
+    fn compound_workspace_start_scripts_use_the_root_manager() {
+        for (pin, manager) in [
+            ("npm@10.9.0", "npm"),
+            ("yarn@4.6.0", "yarn"),
+            ("bun@1.2.22", "bun"),
+        ] {
+            let root =
+                serde_json::json!({"private":true,"packageManager":pin,"workspaces":["apps/*"]})
+                    .to_string();
+            let repo = fixture(&[
+                ("package.json", &root),
+                (
+                    "apps/api/package.json",
+                    r#"{"scripts":{"start":"node prepare.js && node server.js"}}"#,
+                ),
+                ("apps/api/server.js", ""),
+            ]);
+            let app = repo.path().join("apps/api");
+            let config = DockerfileConfig::new(repo.path(), &app, "fixture").with_buildkit(true);
+            let result = render(&config, Some("node")).unwrap().content;
+            assert!(
+                result.contains(&format!(
+                    "PATH=/app/apps/api/node_modules/.bin:$PATH {manager} run start"
+                )),
+                "{pin}: {result}"
+            );
+        }
     }
 
     #[test]
