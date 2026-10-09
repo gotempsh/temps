@@ -45,8 +45,8 @@ const BOOT_TIMEOUT: Duration = Duration::from_secs(60);
 /// waits out `docker stop`'s full grace period and gets SIGKILLed.
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Port a Dockerfile starter listens on when its final stage exposes none,
-/// matching the platform's default for the Dockerfile preset.
+/// Port the platform targets when a built image exposes none — the
+/// deployment's configured default.
 const DEFAULT_DOCKERFILE_PORT: u16 = 3000;
 
 struct Starter {
@@ -60,8 +60,9 @@ enum Build {
     /// Rendered by [`AutopackPreset`], which serves on `$PORT`.
     Autopack(String),
     /// The starter's own Dockerfile, built as-is the way the Dockerfile preset
-    /// does. The proxy targets the port its final stage exposes.
-    OwnDockerfile { container_port: u16 },
+    /// does. The proxy targets the first port the *built image* exposes
+    /// (see [`image_port`]).
+    OwnDockerfile,
 }
 
 impl Starter {
@@ -71,12 +72,10 @@ impl Starter {
     /// build (no lockfile for `npm ci`) or whose `CMD` names a file the build
     /// never produces went unnoticed.
     fn build(&self) -> Build {
-        match std::fs::read_to_string(self.path.join("Dockerfile")) {
-            Ok(dockerfile) => Build::OwnDockerfile {
-                container_port: temps_presets::detect_primary_exposed_port(&dockerfile)
-                    .unwrap_or(DEFAULT_DOCKERFILE_PORT),
-            },
-            Err(_) => Build::Autopack(dockerfile_for(self)),
+        if self.path.join("Dockerfile").is_file() {
+            Build::OwnDockerfile
+        } else {
+            Build::Autopack(dockerfile_for(self))
         }
     }
 }
@@ -293,6 +292,27 @@ fn wait_for_http(url: &str, timeout: Duration, container: &str) -> Result<(), St
     ))
 }
 
+/// The port the platform routes to for a built image: the first exposed port
+/// in Docker's order, else the configured default. Mirrors deployment's
+/// `get_primary_port`, which reads the same image config.
+fn image_port(tag: &str) -> Result<u16, String> {
+    let exposed = run(Command::new("docker").args([
+        "image",
+        "inspect",
+        "--format",
+        "{{range $port, $_ := .Config.ExposedPorts}}{{$port}} {{end}}",
+        tag,
+    ]))?;
+    Ok(primary_exposed_port(&exposed).unwrap_or(DEFAULT_DOCKERFILE_PORT))
+}
+
+/// First port in `docker image inspect` ExposedPorts output (`3000/tcp 80/tcp`).
+fn primary_exposed_port(exposed: &str) -> Option<u16> {
+    exposed
+        .split_whitespace()
+        .find_map(|spec| spec.split('/').next()?.parse().ok())
+}
+
 /// Build, run, request, and stop one starter.
 fn verify(starter: &Starter) -> Result<(), String> {
     let build = starter.build();
@@ -315,7 +335,7 @@ fn verify(starter: &Starter) -> Result<(), String> {
     // next run detects.
     let dockerfile_arg = match &build {
         Build::Autopack(_) => "-",
-        Build::OwnDockerfile { .. } => "Dockerfile",
+        Build::OwnDockerfile => "Dockerfile",
     };
     let mut command = Command::new("docker");
     command
@@ -345,7 +365,7 @@ fn verify(starter: &Starter) -> Result<(), String> {
         use std::io::Write;
         let rendered = match &build {
             Build::Autopack(dockerfile) => dockerfile.as_bytes(),
-            Build::OwnDockerfile { .. } => &[],
+            Build::OwnDockerfile => &[],
         };
         // Dropping stdin closes it, which is all an unused stdin needs.
         let mut stdin = child.stdin.take().expect("stdin");
@@ -364,7 +384,7 @@ fn verify(starter: &Starter) -> Result<(), String> {
         let tail: Vec<&str> = log.lines().rev().take(40).collect();
         let dockerfile = match &build {
             Build::Autopack(dockerfile) => dockerfile.clone(),
-            Build::OwnDockerfile { .. } => {
+            Build::OwnDockerfile => {
                 std::fs::read_to_string(starter.path.join("Dockerfile")).unwrap_or_default()
             }
         };
@@ -383,10 +403,12 @@ fn verify(starter: &Starter) -> Result<(), String> {
 
     let port = free_port();
     // Autopack images listen on whatever `$PORT` says; a Dockerfile image
-    // listens where its author put it, and the platform routes to its EXPOSE.
+    // listens where its author put it, and the platform routes to what the
+    // built image exposes — including `EXPOSE ${ARG}` and ports inherited
+    // from the base image, which the Dockerfile text alone cannot tell.
     let container_port = match build {
         Build::Autopack(_) => port,
-        Build::OwnDockerfile { container_port } => container_port,
+        Build::OwnDockerfile => image_port(&tag)?,
     };
     // Deliberately not `--rm`: a container that exits on startup would be
     // removed before `docker logs` could say why, which is exactly the case
@@ -538,14 +560,18 @@ mod discovery_tests {
         let starters = discover(dir.path());
         let names: Vec<_> = starters.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["dockerfile", "go/gin"]);
-        // The proxy routes to the final stage's EXPOSE, so that is where the
-        // container must answer.
-        assert!(matches!(
-            starters[0].build(),
-            Build::OwnDockerfile {
-                container_port: 3001
-            }
-        ));
+        assert!(matches!(starters[0].build(), Build::OwnDockerfile));
+    }
+
+    #[test]
+    fn the_container_port_comes_from_the_built_image_config() {
+        // Docker lists exposed ports sorted; the platform takes the first.
+        assert_eq!(primary_exposed_port("3001/tcp 8080/tcp \n"), Some(3001));
+        assert_eq!(primary_exposed_port("53/udp"), Some(53));
+        // Nothing exposed (no EXPOSE, or only an unresolved one): the caller
+        // falls back to the configured default, as deployment does.
+        assert_eq!(primary_exposed_port("\n"), None);
+        assert_eq!(primary_exposed_port("garbage/tcp"), None);
     }
 
     #[test]
