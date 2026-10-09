@@ -180,3 +180,13 @@ export function dropErrorMessage(
   }
   return fallback
 }
+
+/** A structural archive rejection needs new files, rather than a retry. */
+export function dropArchiveErrorDetails(error: unknown): string | null {
+  if (!error || typeof error !== 'object') return null
+  const problem = error as { title?: unknown; detail?: unknown }
+  if (problem.title !== 'Invalid ZIP Archive') return null
+  return typeof problem.detail === 'string' && problem.detail.trim()
+    ? problem.detail
+    : 'Archive validation rejected this file.'
+}

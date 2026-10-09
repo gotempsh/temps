@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
-import { filesFromDrop } from './drop-files'
+import { dropArchiveErrorDetails, filesFromDrop } from './drop-files'
 
 type FakeEntry = {
   isFile: boolean
@@ -143,5 +143,39 @@ describe('filesFromDrop', () => {
       filesFromDrop(dropEvent(root), { signal: controller.signal })
     ).rejects.toThrow()
     expect(filesRead).toBe(1)
+  })
+})
+
+describe('archive rejection feedback', () => {
+  test('recognizes the structural Problem Details title and keeps diagnostics', () => {
+    expect(
+      dropArchiveErrorDetails({
+        title: 'Invalid ZIP Archive',
+        detail: 'ZIP end-of-central-directory record not found',
+      })
+    ).toBe('ZIP end-of-central-directory record not found')
+    expect(dropArchiveErrorDetails({ title: 'Invalid ZIP Archive' })).toBe(
+      'Archive validation rejected this file.'
+    )
+  })
+
+  test('keeps unsafe-path rejections actionable without discarding the reason', () => {
+    expect(
+      dropArchiveErrorDetails({
+        title: 'Invalid ZIP Archive',
+        detail: 'Archive entry would escape the project directory',
+      })
+    ).toBe('Archive entry would escape the project directory')
+  })
+
+  test('leaves temporary service and network failures retryable', () => {
+    for (const error of [
+      new TypeError('Failed to fetch'),
+      { title: 'ZIP Validation Failed', detail: 'Temporary worker failure' },
+      { title: 'Service Unavailable', detail: 'Try again shortly' },
+      null,
+    ]) {
+      expect(dropArchiveErrorDetails(error)).toBeNull()
+    }
   })
 })
