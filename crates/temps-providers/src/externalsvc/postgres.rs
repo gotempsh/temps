@@ -70,6 +70,9 @@ fn shell_export_assignment(line: &str) -> Option<String> {
 /// wording-independent match instead of matching on `e.to_string()`.
 #[derive(Debug, thiserror::Error)]
 pub enum PostgresUpgradeRejected {
+    #[error("This service already uses the selected PostgreSQL image ({image}). Choose a different image to upgrade.")]
+    AlreadySelected { image: String },
+
     #[error("Cannot downgrade PostgreSQL (from {from} to {to})")]
     Downgrade { from: u32, to: u32 },
 
@@ -4040,6 +4043,14 @@ impl ExternalService for PostgresService {
             .into());
         }
 
+        // Reject an ordinary no-op selection before any Docker/network work.
+        if old_pg_config.docker_image == new_pg_config.docker_image {
+            return Err(PostgresUpgradeRejected::AlreadySelected {
+                image: old_pg_config.docker_image,
+            }
+            .into());
+        }
+
         // Verify the new image can be pulled BEFORE stopping the old container
         info!(
             "Verifying new Docker image is available: {}",
@@ -4052,12 +4063,6 @@ impl ExternalService for PostgresService {
         // Same major version — image swap only (e.g., postgres:18 -> gotempsh/postgres-walg:18).
         // No pg_upgrade needed. Just recreate the container with the new image;
         // data is preserved on the Docker volume.
-        if old_pg_config.docker_image == new_pg_config.docker_image {
-            return Err(anyhow::anyhow!(
-                "New image is identical to current image ({})",
-                old_pg_config.docker_image
-            ));
-        }
         info!(
             "Same PostgreSQL major version ({}), swapping image without pg_upgrade",
             old_version
@@ -6694,6 +6699,39 @@ mod tests {
     }
 
     // ── Database Name SQL Injection Prevention Tests ─────────────────
+
+    #[tokio::test]
+    async fn identical_image_upgrade_rejected_before_contacting_docker() {
+        // An unreachable daemon makes any pull or lifecycle mutation fail;
+        // the typed rejection must precede all of them.
+        let docker = Arc::new(
+            Docker::connect_with_http("http://127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION)
+                .unwrap(),
+        );
+        let service = PostgresService::new("same-image-test".to_string(), docker);
+        let config = ServiceConfig {
+            name: "same-image-test".to_string(),
+            service_type: ServiceType::Postgres,
+            version: None,
+            parameters: serde_json::json!({
+                "docker_image": "gotempsh/postgres-walg:18-bookworm",
+                "database": "app",
+                "username": "app",
+                "password": "test-password",
+                "port": "5432",
+            }),
+        };
+        let error = service.upgrade(config.clone(), config).await.unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<PostgresUpgradeRejected>(),
+                Some(PostgresUpgradeRejected::AlreadySelected { image })
+                    if image == "gotempsh/postgres-walg:18-bookworm"
+            ),
+            "{error}"
+        );
+        assert!(error.to_string().contains("already uses the selected"));
+    }
 
     #[test]
     fn postgres_upgrade_rejected_roundtrips_through_anyhow() {
