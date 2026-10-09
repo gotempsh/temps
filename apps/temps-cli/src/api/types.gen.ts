@@ -40965,7 +40965,7 @@ export type StartServiceErrors = {
      */
     404: unknown;
     /**
-     * A Postgres major upgrade is in progress, or duplicate service names prevent safe resource control
+     * A Postgres major upgrade is in progress, duplicate service names prevent safe resource control, another cluster action is in progress, the cluster or one of its members is still being provisioned, or the cluster's provisioning failed
      */
     409: unknown;
     /**
@@ -41033,7 +41033,7 @@ export type StopServiceErrors = {
      */
     404: unknown;
     /**
-     * Duplicate service names prevent safe resource control
+     * Duplicate service names prevent safe resource control, another cluster action is in progress, or the cluster or one of its members is still being provisioned
      */
     409: unknown;
     /**

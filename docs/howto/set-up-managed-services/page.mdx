@@ -317,5 +317,5 @@ curl -X POST "https://your-temps-instance/api/external-services/{id}/upgrade" \
 Or from the dashboard, go to the service details page and click **Upgrade**.
 
 <Note>
-**Major version upgrades** (e.g. PostgreSQL 16 to 17) may require data migration. Always back up the service before upgrading. For PostgreSQL, major version upgrades typically require a dump and restore — the Docker image swap alone may not be sufficient.
+**Major version upgrades** (e.g. PostgreSQL 16 to 17) may require data migration. Always back up the service before upgrading. For PostgreSQL, major version upgrades typically require a dump and restore — the Docker image swap alone may not be sufficient. The guided PostgreSQL major upgrade first takes a full backup of the service being upgraded to the default S3 source, so it is refused up front when no default S3 source is configured. If that backup fails, nothing is migrated and the error names the backup's cause.
 </Note>
