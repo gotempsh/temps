@@ -82,14 +82,13 @@ fn preset_build_root(
     // A nested Go module or Cargo crate whose `replace`/`path` dependencies or
     // workspace live beside it builds from the repository root; the preset
     // runs its commands in the application's directory.
-    if matches!(
-        preset,
-        "go" | "rust" | "nixpacks-go" | "nixpacks-rust" | "nixpacks" | "autopack"
-    ) && temps_presets::compiled_workspace_app(source_root, app)
-        .map_err(WorkflowError::JobValidationFailed)?
-        .is_some()
-    {
-        return Ok(source_root.to_path_buf());
+    if let Some(language) = temps_presets::CompiledLanguage::for_preset(preset, app) {
+        if temps_presets::compiled_workspace_app(source_root, app, language)
+            .map_err(WorkflowError::JobValidationFailed)?
+            .is_some()
+        {
+            return Ok(source_root.to_path_buf());
+        }
     }
     if matches!(
         preset,
@@ -2236,6 +2235,22 @@ mod tests {
             preset_build_root("go", &root, &go_app),
             Err(WorkflowError::JobValidationFailed(_))
         ));
+
+        // The same broken go.mod beside a JavaScript application is never
+        // read when the build is JavaScript: the application builds alone.
+        std::fs::write(
+            go_app.join("package.json"),
+            r#"{"name":"web","scripts":{"start":"node server.js"}}"#,
+        )
+        .unwrap();
+        for preset in ["nixpacks", "autopack", "nixpacks-node"] {
+            assert_eq!(
+                preset_build_root(preset, &root, &go_app).unwrap(),
+                go_app,
+                "{preset}"
+            );
+        }
+        assert!(preset_build_root("go", &root, &go_app).is_err());
     }
 
     #[test]

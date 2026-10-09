@@ -25,11 +25,27 @@ pub enum CompiledLanguage {
 }
 
 impl CompiledLanguage {
-    /// The autopack provider that builds this language.
-    pub fn autopack_provider(self) -> &'static str {
-        match self {
-            CompiledLanguage::Go => "go",
-            CompiledLanguage::Cargo => "rust",
+    /// The language an autopack provider builds, when it is one of these.
+    pub fn from_autopack_provider(provider: &str) -> Option<Self> {
+        match provider {
+            "go" => Some(CompiledLanguage::Go),
+            "rust" => Some(CompiledLanguage::Cargo),
+            _ => None,
+        }
+    }
+
+    /// The language a preset builds the application at `app` with: fixed for
+    /// a language preset, detected the way autopack detects it for an
+    /// auto-detecting one. `None` when the build is not Go or Cargo, so a
+    /// `go.mod` or `Cargo.toml` the build never reads is never inspected.
+    pub fn for_preset(preset: &str, app: &Path) -> Option<Self> {
+        match preset {
+            "go" | "nixpacks-go" => Some(CompiledLanguage::Go),
+            "rust" | "nixpacks-rust" => Some(CompiledLanguage::Cargo),
+            "nixpacks" | "autopack" => crate::NixpacksPreset::detect_provider_id(app)
+                .as_deref()
+                .and_then(Self::from_autopack_provider),
+            _ => None,
         }
     }
 }
@@ -49,12 +65,13 @@ pub struct CompiledWorkspaceApp {
 /// The selected Go module or Cargo crate when it needs sibling directories of
 /// the repository at `root`; `None` when building it alone is enough.
 ///
-/// A `package.json` beside the manifest (frontend tooling, for example) does
-/// not change this: callers decide which language builds the application,
-/// and a JavaScript workspace is resolved before this is consulted.
+/// Only the manifest of `language`, the one the build uses, is read: a
+/// `go.mod` beside a JavaScript application, or a `package.json` beside a Go
+/// module, neither fails nor redirects the build.
 pub fn compiled_workspace_app(
     root: &Path,
     selected: &Path,
+    language: CompiledLanguage,
 ) -> Result<Option<CompiledWorkspaceApp>, String> {
     if root == selected {
         return Ok(None);
@@ -69,18 +86,20 @@ pub fn compiled_workspace_app(
     {
         return Err("Application directory escapes the source repository".to_string());
     }
-    let (language, ignore_go_work) = if is_regular_file(&selected.join("go.mod")) {
-        match go_needs_repository(root, relative)? {
-            Some(ignore_go_work) => (CompiledLanguage::Go, ignore_go_work),
-            None => return Ok(None),
+    let ignore_go_work = match language {
+        CompiledLanguage::Go if is_regular_file(&selected.join("go.mod")) => {
+            match go_needs_repository(root, relative)? {
+                Some(ignore_go_work) => ignore_go_work,
+                None => return Ok(None),
+            }
         }
-    } else if is_regular_file(&selected.join("Cargo.toml")) {
-        if !cargo_needs_repository(root, relative)? {
-            return Ok(None);
+        CompiledLanguage::Cargo if is_regular_file(&selected.join("Cargo.toml")) => {
+            if !cargo_needs_repository(root, relative)? {
+                return Ok(None);
+            }
+            false
         }
-        (CompiledLanguage::Cargo, false)
-    } else {
-        return Ok(None);
+        CompiledLanguage::Go | CompiledLanguage::Cargo => return Ok(None),
     };
     let text = relative
         .to_str()
@@ -537,8 +556,15 @@ mod tests {
         root
     }
 
+    /// `apps/api`, built as the language whose manifest it has.
     fn app(root: &tempfile::TempDir) -> Result<Option<CompiledWorkspaceApp>, String> {
-        compiled_workspace_app(root.path(), &root.path().join("apps/api"))
+        let selected = root.path().join("apps/api");
+        let language = if selected.join("go.mod").is_file() {
+            CompiledLanguage::Go
+        } else {
+            CompiledLanguage::Cargo
+        };
+        compiled_workspace_app(root.path(), &selected, language)
     }
 
     const SHARED_GO: (&str, &str) = ("packages/shared/go.mod", "module example.test/qa/shared\n");
@@ -604,7 +630,8 @@ mod tests {
     }
 
     /// Frontend tooling beside a Go module or Cargo crate (a package.json for
-    /// CSS or asset builds) must not hide its sibling dependencies.
+    /// CSS or asset builds) must not hide its sibling dependencies when the
+    /// build is Go or Cargo.
     #[test]
     fn a_package_json_beside_the_manifest_keeps_sibling_dependencies() {
         let root = repository(&[
@@ -626,6 +653,47 @@ mod tests {
         ]);
         assert_eq!(
             app(&root).unwrap().map(|app| app.language),
+            Some(CompiledLanguage::Cargo)
+        );
+    }
+
+    /// A manifest the build never reads is never inspected: a JavaScript
+    /// application with a stray `go.mod` whose replacement points nowhere
+    /// still builds, and an auto-detecting preset only checks the language it
+    /// detects.
+    #[test]
+    fn manifests_of_another_language_are_ignored() {
+        let root = repository(&[
+            (
+                "apps/api/package.json",
+                "{\"name\":\"web\",\"scripts\":{\"start\":\"node server.js\"}}",
+            ),
+            ("apps/api/go.mod", "module a\nreplace b => ../../packages/missing\n"),
+            (
+                "apps/api/Cargo.toml",
+                "[package]\nname = \"a\"\nversion = \"0.1.0\"\n[dependencies]\nb = { path = \"../../../outside\" }\n",
+            ),
+        ]);
+        let selected = root.path().join("apps/api");
+        assert!(compiled_workspace_app(root.path(), &selected, CompiledLanguage::Go).is_err());
+        assert!(compiled_workspace_app(root.path(), &selected, CompiledLanguage::Cargo).is_err());
+        assert_eq!(CompiledLanguage::for_preset("nixpacks", &selected), None);
+        assert_eq!(CompiledLanguage::for_preset("autopack", &selected), None);
+        assert_eq!(CompiledLanguage::for_preset("nextjs", &selected), None);
+
+        // Asked about Cargo, a Go module is not a Cargo crate, and the reverse.
+        let root = repository(&[("apps/api/go.mod", "module a\nreplace b => ../../packages/missing\n")]);
+        let selected = root.path().join("apps/api");
+        assert_eq!(
+            compiled_workspace_app(root.path(), &selected, CompiledLanguage::Cargo),
+            Ok(None)
+        );
+        assert_eq!(
+            CompiledLanguage::for_preset("autopack", &selected),
+            Some(CompiledLanguage::Go)
+        );
+        assert_eq!(
+            CompiledLanguage::for_preset("rust", &selected),
             Some(CompiledLanguage::Cargo)
         );
     }
@@ -752,13 +820,20 @@ mod tests {
     #[test]
     fn the_root_application_and_unsafe_directories() {
         let root = repository(&[("go.mod", "module a\n")]);
-        assert_eq!(compiled_workspace_app(root.path(), root.path()), Ok(None));
+        assert_eq!(
+            compiled_workspace_app(root.path(), root.path(), CompiledLanguage::Go),
+            Ok(None)
+        );
         let root = repository(&[
             ("apps/my api/go.mod", "module a\nreplace b => ../../packages/shared\n"),
             SHARED_GO,
         ]);
-        let error =
-            compiled_workspace_app(root.path(), &root.path().join("apps/my api")).unwrap_err();
+        let error = compiled_workspace_app(
+            root.path(),
+            &root.path().join("apps/my api"),
+            CompiledLanguage::Go,
+        )
+        .unwrap_err();
         assert!(error.contains("Unsupported application directory"), "{error}");
     }
 

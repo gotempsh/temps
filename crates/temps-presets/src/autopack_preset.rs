@@ -224,11 +224,10 @@ pub(crate) fn render(
     let nested_prefix = if analysis.provider == "python" {
         python_app_directory(config.root_local_path, config.local_path)?
             .map(|relative| (format!("cd /app/{relative} && "), relative))
-    } else if config.root_local_path == config.local_path {
-        None
-    } else {
-        crate::compiled_workspace_app(config.root_local_path, config.local_path)?
-            .filter(|app| analysis.provider == app.language.autopack_provider())
+    } else if let Some(language) =
+        crate::CompiledLanguage::from_autopack_provider(&analysis.provider)
+    {
+        crate::compiled_workspace_app(config.root_local_path, config.local_path, language)?
             .map(|compiled| {
                 let mut prefix = format!("cd /app/{} && ", compiled.relative);
                 match compiled.language {
@@ -247,6 +246,8 @@ pub(crate) fn render(
                 }
                 (prefix, compiled.relative)
             })
+    } else {
+        None
     };
     if let Some((prefix, relative)) = nested_prefix {
         for step in &mut analysis.plan.steps {
