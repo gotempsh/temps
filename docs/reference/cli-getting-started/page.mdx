@@ -136,21 +136,21 @@ temps projects list
 bunx @temps-sdk/cli projects create \
   --name my-app \
   --description "My awesome application" \
-  --repo https://github.com/myuser/my-app
+  --repo myuser/my-app
 ```
 
 ```bash {{ title: 'npx' }}
 npx @temps-sdk/cli projects create \
   --name my-app \
   --description "My awesome application" \
-  --repo https://github.com/myuser/my-app
+  --repo myuser/my-app
 ```
 
 ```bash {{ title: 'global' }}
 temps projects create \
   --name my-app \
   --description "My awesome application" \
-  --repo https://github.com/myuser/my-app
+  --repo myuser/my-app
 ```
 
 </CodeGroup>
@@ -178,18 +178,20 @@ temps deploy --project my-app --environment production
 <CodeGroup title="Stream logs">
 
 ```bash {{ title: 'bunx' }}
-bunx @temps-sdk/cli logs --project my-app --follow
+bunx @temps-sdk/cli deployments logs --project my-app --follow
 ```
 
 ```bash {{ title: 'npx' }}
-npx @temps-sdk/cli logs --project my-app --follow
+npx @temps-sdk/cli deployments logs --project my-app --follow
 ```
 
 ```bash {{ title: 'global' }}
-temps logs --project my-app --follow
+temps deployments logs --project my-app --follow
 ```
 
 </CodeGroup>
+
+This follows the build and deploy steps of the latest deployment. For your running application's output, use `runtime-logs --project my-app --follow` instead.
 
 ---
 
@@ -242,33 +244,33 @@ temps projects delete --project my-app
 # List environment variables
 bunx @temps-sdk/cli environments vars list --project my-app
 
-# Set an environment variable
-bunx @temps-sdk/cli environments vars set DATABASE_URL=postgres://... --environments production
+# Set an environment variable (prompts for the value)
+bunx @temps-sdk/cli environments vars set --project my-app DATABASE_URL --environments production
 
 # Import from .env file
-bunx @temps-sdk/cli environments vars import .env --environments production
+bunx @temps-sdk/cli environments vars import --project my-app .env --environments production
 ```
 
 ```bash {{ title: 'npx' }}
 # List environment variables
 npx @temps-sdk/cli environments vars list --project my-app
 
-# Set an environment variable
-npx @temps-sdk/cli environments vars set DATABASE_URL=postgres://... --environments production
+# Set an environment variable (prompts for the value)
+npx @temps-sdk/cli environments vars set --project my-app DATABASE_URL --environments production
 
 # Import from .env file
-npx @temps-sdk/cli environments vars import .env --environments production
+npx @temps-sdk/cli environments vars import --project my-app .env --environments production
 ```
 
 ```bash {{ title: 'global' }}
 # List environment variables
 temps environments vars list --project my-app
 
-# Set an environment variable
-temps environments vars set DATABASE_URL=postgres://... --environments production
+# Set an environment variable (prompts for the value)
+temps environments vars set --project my-app DATABASE_URL --environments production
 
 # Import from .env file
-temps environments vars import .env --environments production
+temps environments vars import --project my-app .env --environments production
 ```
 
 </CodeGroup>

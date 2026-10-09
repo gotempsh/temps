@@ -325,8 +325,9 @@ capture_message('Test message from Temps', level='info')
 ```
 
 ```bash {{ title: 'CLI' }}
-# Send test error via CLI
-temps error-tracking test --project my-app
+# The CLI cannot send a test error. After sending one from your SDK,
+# confirm it arrived (use your project's numeric ID):
+temps errors list --project-id 42 --status unresolved
 ```
 </CodeGroup>
 
@@ -381,30 +382,7 @@ with sentry_sdk.configure_scope() as scope:
 
 ### Merge & Split Groups
 
-<Row>
-  <Col>
-    **Merge Groups**
-
-    Combine multiple error groups that should be treated as one:
-
-    ```bash
-    temps error-tracking merge \
-      --groups error-1,error-2,error-3 \
-      --target error-1
-    ```
-  </Col>
-  <Col>
-    **Split Groups**
-
-    Separate errors that were incorrectly grouped:
-
-    ```bash
-    temps error-tracking split \
-      --group error-1 \
-      --event-ids evt-123,evt-456
-    ```
-  </Col>
-</Row>
+Groups cannot be merged or split after the fact. To change how future events group, send a [custom fingerprint](#custom-fingerprinting) from your SDK: events with the same fingerprint land in one group, and events with different fingerprints are kept apart.
 
 ---
 
@@ -587,42 +565,30 @@ Manage error lifecycle from discovery to resolution.
 
 <CodeGroup title="Resolve Errors">
 ```bash {{ title: 'CLI' }}
-# Resolve error group
-temps error-tracking resolve --group error-123
+# Find the group ID (numeric) of an unresolved error
+temps errors list --project-id 42 --status unresolved
 
-# Resolve in specific release
-temps error-tracking resolve --group error-123 --in-release 1.0.1
+# Resolve one error group
+temps errors update --project-id 42 --group-id 123 --status resolved
 
-# Resolve multiple groups
-temps error-tracking resolve --groups error-123,error-456,error-789
-```
-
-```typescript {{ title: 'Dashboard' }}
-// Resolve via dashboard
-// Navigate to: Error Details > Actions > Resolve
-
-// Options:
-// - Mark as resolved now
-// - Resolve in next release
-// - Resolve in specific release
-// - Set auto-resolve (if no new events in X days)
+# Reopen it
+temps errors update --project-id 42 --group-id 123 --status unresolved
 ```
 
 ```typescript {{ title: 'API' }}
-// Resolve error group via API
-await fetch('/api/error-groups/error-123/resolve', {
-  method: 'POST',
+// Resolve error group 123 in project 42
+await fetch('https://your-temps-instance.com/api/projects/42/error-groups/123', {
+  method: 'PUT',
   headers: {
     'Authorization': `Bearer ${API_KEY}`,
     'Content-Type': 'application/json'
   },
-  body: JSON.stringify({
-    resolution: 'next_release',
-    comment: 'Fixed in PR #456'
-  })
+  body: JSON.stringify({ status: 'resolved' })
 });
 ```
 </CodeGroup>
+
+The CLI and API change one group at a time; to resolve several, run the command once per group ID.
 
 ### Auto-Resolution
 
@@ -680,13 +646,12 @@ Sentry.init({
 ```
 
 ```bash {{ title: 'CLI' }}
-# Ignore error group
-temps error-tracking ignore --group error-123
-
-# Ignore with pattern
-temps error-tracking ignore --pattern "Loading chunk .* failed"
+# Ignore one error group
+temps errors update --project-id 42 --group-id 123 --status ignored
 ```
 </CodeGroup>
+
+Ignoring by message pattern is done in the SDK with `ignoreErrors`, as shown above; the server has no pattern rules.
 
 ---
 

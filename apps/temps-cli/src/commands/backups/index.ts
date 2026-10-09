@@ -188,7 +188,7 @@ export function registerBackupsCommands(program: Command): void {
     .description('Create a backup schedule')
     .option('-n, --name <name>', 'Schedule name')
     .option('-t, --type <type>', 'Backup type (full, incremental)')
-    .option('-s, --schedule <cron>', 'Schedule expression (cron format)')
+    .option('-s, --schedule <cron>', 'Schedule expression: six-field cron with seconds first, e.g. "0 0 2 * * *"')
     .option('-r, --retention <days>', 'Retention period in days')
     .option('-d, --description <desc>', 'Description')
     .option('--s3-source-id <id>', 'S3 Source ID')
@@ -422,8 +422,8 @@ async function createSchedule(options: CreateScheduleOptions): Promise<void> {
     })
 
     scheduleExpression = options.schedule || await promptText({
-      message: 'Schedule expression (cron format, e.g., 0 2 * * * for daily at 2 AM)',
-      default: '0 2 * * *',
+      message: 'Schedule expression (cron with seconds first, e.g., 0 0 2 * * * for daily at 2 AM)',
+      default: '0 0 2 * * *',
       required: true,
     })
 

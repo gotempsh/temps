@@ -51,7 +51,7 @@ Create a backup schedule
 |------|-------------|---------|----------|
 | `-n, --name <name>` | Schedule name | - | No |
 | `-t, --type <type>` | Backup type (full, incremental) | - | No |
-| `-s, --schedule <cron>` | Schedule expression (cron format) | - | No |
+| `-s, --schedule <cron>` | Schedule expression: six-field cron with seconds first, e.g. "0 0 2 * * *" | - | No |
 | `-r, --retention <days>` | Retention period in days | - | No |
 | `-d, --description <desc>` | Description | - | No |
 | `--s3-source-id <id>` | S3 Source ID | - | No |

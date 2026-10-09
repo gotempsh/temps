@@ -128,17 +128,22 @@ bunx @temps-sdk/cli projects create -n "my-laravel-app" -d "Laravel application"
 ## Step 3: Provision a database {{ anchor: true, id: 'database' }}
 
 ```bash
-bunx @temps-sdk/cli services create -p my-laravel-app -t postgres -n "laravel-db"
+# Create the database, find its ID, then link it to the project
+bunx @temps-sdk/cli services create -t postgres -n "laravel-db" -y
+bunx @temps-sdk/cli services list
+bunx @temps-sdk/cli services link --id <service-id> -p my-laravel-app
 ```
 
-The `DATABASE_URL` environment variable is automatically injected.
+Once linked, the `DATABASE_URL` environment variable is injected into the project.
 
 ### Using MariaDB instead
 
 If your Laravel app is already configured for MySQL, create a MariaDB service instead of PostgreSQL:
 
 ```bash
-bunx @temps-sdk/cli services create -p my-laravel-app -t mariadb -n "laravel-db"
+bunx @temps-sdk/cli services create -t mariadb -n "laravel-db" -y
+bunx @temps-sdk/cli services list
+bunx @temps-sdk/cli services link --id <service-id> -p my-laravel-app
 ```
 
 Set `DB_CONNECTION=mysql`. Temps injects a MySQL-compatible `DATABASE_URL` plus `MYSQL_*` and `MARIADB_*` variables for the linked MariaDB service.
@@ -199,11 +204,15 @@ bunx @temps-sdk/cli deploy my-laravel-app -b main -e production -y
 
 ## Step 7: Run migrations {{ anchor: true, id: 'migrations' }}
 
+Temps does not have a remote "run one command" CLI action yet, so migrations are run directly against the container over SSH. Find the container name, then run the migration:
+
 ```bash
-bunx @temps-sdk/cli exec my-laravel-app -- php artisan migrate --force
+bunx @temps-sdk/cli projects show -p my-laravel-app --json   # note the numeric "id"
+bunx @temps-sdk/cli containers list -p <project-id>           # note the container_name
+ssh your-server 'docker exec <container_name> php artisan migrate --force'
 ```
 
-Run migrations as a one-off release step for each deployment. Do not put
+Run migrations as a one-off release step for each deployment, manually or from your CI/CD pipeline right after the deploy step. Do not put
 `php artisan migrate --force` in the container start command: rolling deploys,
 restarts, or multiple replicas can start the command more than once.
 

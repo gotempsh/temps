@@ -118,14 +118,12 @@ The browser flow is interactive by design — it expects a human to click "Appro
 <CodeGroup title="Login with an API key">
 
 ```bash {{ title: 'bunx' }}
-bunx @temps-sdk/cli login \
-  --url https://your-temps-server.com \
+bunx @temps-sdk/cli login https://your-temps-server.com \
   --api-key "$TEMPS_API_KEY"
 ```
 
 ```bash {{ title: 'global' }}
-temps login \
-  --url https://your-temps-server.com \
+temps login https://your-temps-server.com \
   --api-key "$TEMPS_API_KEY"
 ```
 
@@ -145,19 +143,17 @@ For automated jobs that can't sit through an MFA prompt, generate an API key fro
 
 ## Switch between Temps instances {{ anchor: true, id: 'switch-between-temps-instances' }}
 
-The CLI supports multiple named contexts so you can keep credentials for several Temps servers side by side. Pass `--url` to log in to a second server without disturbing the first:
+The CLI supports multiple named contexts so you can keep credentials for several Temps servers side by side. Pass the server URL as the argument to log in to a second server without disturbing the first:
 
 <CodeGroup title="Add a second context">
 
 ```bash {{ title: 'bunx' }}
-bunx @temps-sdk/cli login \
-  --url https://staging.temps.example.com \
+bunx @temps-sdk/cli login https://staging.temps.example.com \
   --context staging
 ```
 
 ```bash {{ title: 'global' }}
-temps login \
-  --url https://staging.temps.example.com \
+temps login https://staging.temps.example.com \
   --context staging
 ```
 
@@ -213,6 +209,6 @@ This revokes the active context's API key on the server and removes it locally. 
 
 **The CLI polls forever after I approved in the browser.** Check that the CLI is talking to the same server you approved on — `temps whoami` after a failed login will show whether anything stuck. If the URL has a typo or points to the wrong server, you'll see the approval succeed in your browser but the CLI will never see it.
 
-**"Already logged in as someone@example.com".** The CLI refuses to overwrite an existing context. Run `temps logout` first, or pass `--url` / `--context` to add a second context alongside the current one.
+**"Already logged in as someone@example.com".** The CLI refuses to overwrite an existing context. Run `temps logout` first, or pass a different server URL (`temps login <url>`) or `--context <name>` to add a second context alongside the current one.
 
 **I'm in a script and the prompt won't work.** Don't use the device flow. Generate an API key in the dashboard and pass it via `--api-key` (see [Log in from a headless shell or CI](#log-in-from-a-headless-shell-or-ci)).
