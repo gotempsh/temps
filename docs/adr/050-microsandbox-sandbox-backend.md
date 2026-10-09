@@ -82,8 +82,8 @@ All SDK state lives under a Temps-owned home, never the user's `~/.microsandbox`
 
 | `SandboxProvider` | microsandbox v1 |
 |---|---|
-| `create` | `Sandbox::builder(name).image(..).cpus(..).memory(..).security(Restricted).replace().create_detached()`; rootfs patch creates `/workspace`, then a non-empty `host_work_dir` (e.g. a workflow's cloned repository, which Docker bind-mounts) is copied into it before the handle is returned — symlinks skipped, modes kept, a failed copy destroys the VM; `disk_size_mb` → `root_disk`; `pids_limit` → `RLIMIT_NPROC`; labels `sh.temps.*` |
-| `exec` / `exec_as_root` / `exec_as_user` / `exec_streamed` | `exec_stream_with` (args, cwd, env, user); stdout/stderr split; line-buffered callbacks with partial lines capped at 64 KiB; captured output bounded at 16 MiB per stream |
+| `create` | `Sandbox::builder(name).image(..).cpus(..).memory(..).security(Restricted).replace().create_detached()`; rootfs patch creates `/workspace`, then a non-empty `host_work_dir` (e.g. a workflow's cloned repository, which Docker bind-mounts) is streamed into it in 256 KiB chunks before the handle is returned — symlinks skipped, modes kept, a failed copy destroys the VM; `disk_size_mb` → `root_disk`; `pids_limit` → `RLIMIT_NPROC`; labels `sh.temps.*` |
+| `exec` / `exec_as_root` / `exec_as_user` / `exec_streamed` | `exec_stream_with` (args, cwd, env, user); stdout/stderr split; line-buffered callbacks that never split a record — a line over 8 MiB is withheld whole and reported in the result; captured output bounded at 16 MiB per stream |
 | `read_file` / `write_file` / `read_file_bounded` / `write_directory` | agent fs channel (`fs().read/write/mkdir/set_stat/stat`). The bounded read stats first, so oversized files are never buffered. Directory upload skips symlinks |
 | `kill_processes` | `pkill -<sig> -f` as root (best-effort, per contract) |
 | `stop` / `start` / `destroy` / `is_alive` | SDK handle `stop` / `connect_or_start_detached` / `destroy` / status |

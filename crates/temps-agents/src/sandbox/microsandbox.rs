@@ -88,10 +88,15 @@ const MIN_MEMORY_MIB: u64 = 128;
 /// exhaust host memory.
 const MAX_CAPTURED_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 
-/// Longest partial line held while waiting for a newline. A longer run of
-/// newline-free output is delivered as its own line, so host memory per
-/// stream stays bounded however the guest writes.
-const MAX_PENDING_LINE_BYTES: usize = 64 * 1024;
+/// Longest line delivered to output callbacks. Callers parse each line as
+/// one record (agent CLIs emit one JSON event per line, carrying whole
+/// messages and tool inputs), so a line is never split: one longer than
+/// this is dropped from the callbacks as a whole and reported in the exec
+/// result. Bounds host memory per stream however the guest writes.
+const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Chunk size for streaming host files into a guest.
+const UPLOAD_CHUNK_BYTES: usize = 256 * 1024;
 
 /// How long `connect` waits for the in-guest agent handshake.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -355,6 +360,11 @@ struct StreamCapture {
     pending: Vec<u8>,
     captured: Vec<u8>,
     dropped: usize,
+    /// The current line already exceeded [`MAX_LINE_BYTES`]; its remaining
+    /// bytes are discarded up to the next newline.
+    discarding: bool,
+    /// Lines withheld from callbacks for exceeding [`MAX_LINE_BYTES`].
+    oversized_lines: usize,
 }
 
 impl StreamCapture {
@@ -368,25 +378,30 @@ impl StreamCapture {
         let mut lines = Vec::new();
         let mut rest = chunk;
         while !rest.is_empty() {
-            // Take up to the next newline, but never let `pending` grow past
-            // the cap: a newline-free stream is split into capped lines. The
-            // search looks one byte past the room so a newline landing
-            // exactly on the cap ends that line instead of an empty one.
-            let room = MAX_PENDING_LINE_BYTES - self.pending.len();
-            let search = &rest[..rest.len().min(room + 1)];
-            match search.iter().position(|b| *b == b'\n') {
-                Some(pos) => {
-                    self.pending.extend_from_slice(&rest[..pos]);
-                    lines.push(self.take_line());
-                    rest = &rest[pos + 1..];
+            let newline = rest.iter().position(|b| *b == b'\n');
+            let (segment, ends_line) = match newline {
+                Some(pos) => (&rest[..pos], true),
+                None => (rest, false),
+            };
+            rest = match newline {
+                Some(pos) => &rest[pos + 1..],
+                None => &[],
+            };
+            if !self.discarding {
+                if self.pending.len() + segment.len() > MAX_LINE_BYTES {
+                    // Never deliver a fragment: drop the whole record.
+                    self.pending = Vec::new();
+                    self.discarding = true;
+                    self.oversized_lines += 1;
+                } else {
+                    self.pending.extend_from_slice(segment);
                 }
-                None => {
-                    let take = rest.len().min(room);
-                    self.pending.extend_from_slice(&rest[..take]);
-                    rest = &rest[take..];
-                    if self.pending.len() >= MAX_PENDING_LINE_BYTES {
-                        lines.push(self.take_line());
-                    }
+            }
+            if ends_line {
+                if self.discarding {
+                    self.discarding = false;
+                } else {
+                    lines.push(self.take_line());
                 }
             }
         }
@@ -402,6 +417,7 @@ impl StreamCapture {
 
     /// The trailing partial line, if the command didn't end with a newline.
     fn finish_line(&mut self) -> Option<String> {
+        self.discarding = false;
         if self.pending.is_empty() {
             return None;
         }
@@ -415,6 +431,12 @@ impl StreamCapture {
             text.push_str(&format!(
                 "\n[temps: output truncated, {} further bytes not retained]\n",
                 self.dropped
+            ));
+        }
+        if self.oversized_lines > 0 {
+            text.push_str(&format!(
+                "\n[temps: {} output line(s) longer than {} bytes were not delivered to the stream]\n",
+                self.oversized_lines, MAX_LINE_BYTES
             ));
         }
         text
@@ -653,6 +675,16 @@ impl MicrosandboxSandboxProvider {
         if let Some(line) = stderr.finish_line() {
             sink.emit(ExecStream::Stderr, line).await;
         }
+        if stdout.oversized_lines + stderr.oversized_lines > 0 {
+            tracing::warn!(
+                sandbox = %name,
+                program = %program,
+                stdout_lines = stdout.oversized_lines,
+                stderr_lines = stderr.oversized_lines,
+                max_line_bytes = MAX_LINE_BYTES,
+                "microsandbox exec output lines over the line cap were not delivered"
+            );
+        }
         Ok(SandboxExecResult {
             exit_code,
             stdout: stdout.into_text(),
@@ -703,6 +735,69 @@ impl MicrosandboxSandboxProvider {
                 provider: PROVIDER_NAME.to_string(),
                 reason: format!("creating {} from image {}: {}", name, image, e),
             })
+    }
+
+    /// Stream one host file into the guest in fixed-size chunks, so host
+    /// memory stays at one chunk however large the file is.
+    async fn upload_file(
+        &self,
+        name: &str,
+        host_path: &Path,
+        guest_path: &str,
+        mode: u32,
+    ) -> Result<(), AgentError> {
+        use tokio::io::AsyncReadExt;
+        let operation = format!("upload '{}' to '{}'", host_path.display(), guest_path);
+        let mut file = tokio::fs::File::open(host_path)
+            .await
+            .map_err(|e| Self::err(name, &operation, e))?;
+        let sandbox = self.connected(name).await?;
+        let fs = sandbox.fs();
+        let result: Result<(), AgentError> = async {
+            if let Some(parent) = Path::new(guest_path)
+                .parent()
+                .filter(|p| *p != Path::new("/"))
+            {
+                fs.mkdir(&parent.to_string_lossy())
+                    .await
+                    .map_err(|e| Self::err(name, &operation, e))?;
+            }
+            let sink = fs
+                .write_stream(guest_path)
+                .await
+                .map_err(|e| Self::err(name, &operation, e))?;
+            let mut buf = vec![0u8; UPLOAD_CHUNK_BYTES];
+            loop {
+                let read = file
+                    .read(&mut buf)
+                    .await
+                    .map_err(|e| Self::err(name, &operation, e))?;
+                if read == 0 {
+                    break;
+                }
+                sink.write(&buf[..read])
+                    .await
+                    .map_err(|e| Self::err(name, &operation, e))?;
+            }
+            sink.close()
+                .await
+                .map_err(|e| Self::err(name, &operation, e))?;
+            fs.set_stat(
+                guest_path,
+                false,
+                FsSetAttrs {
+                    mode: Some(mode),
+                    ..FsSetAttrs::default()
+                },
+            )
+            .await
+            .map_err(|e| Self::err(name, &operation, e))
+        }
+        .await;
+        if result.is_err() {
+            self.evict(name);
+        }
+        result
     }
 
     /// Copy `host_work_dir` into the guest work dir. A missing or empty
@@ -928,8 +1023,8 @@ impl SandboxProvider for MicrosandboxSandboxProvider {
         local_dir: &Path,
         target_path: &str,
     ) -> Result<(), AgentError> {
-        // Per-file writes over the agent's fs channel — same approach as the
-        // Firecracker backend. Symlinks are skipped (not followed) so a link
+        // Per-file streamed writes over the agent's fs channel. Symlinks are
+        // skipped (not followed) so a link
         // in the source tree can't pull host files outside `local_dir` in.
         let mut stack = vec![local_dir.to_path_buf()];
         while let Some(dir) = stack.pop() {
@@ -949,11 +1044,10 @@ impl SandboxProvider for MicrosandboxSandboxProvider {
                     stack.push(path);
                 } else if meta.is_file() {
                     use std::os::unix::fs::PermissionsExt;
-                    let contents = std::fs::read(&path)?;
-                    self.write_file(
-                        handle,
+                    self.upload_file(
+                        &handle.sandbox_name,
+                        &path,
                         &target,
-                        &contents,
                         meta.permissions().mode() & 0o777,
                     )
                     .await?;
@@ -1623,37 +1717,46 @@ mod tests {
 
     #[test]
     fn stream_capture_bounds_newline_free_output() {
-        // 1 GiB-style output with no newline, fed in many chunks: the
-        // partial-line buffer must never exceed its cap.
+        // Far more newline-free output than the line cap, in many chunks:
+        // the partial-line buffer stays bounded and nothing is delivered
+        // as a fragment.
         let mut s = StreamCapture::default();
-        let chunk = vec![b'z'; 48 * 1024];
-        let mut delivered = 0usize;
-        for _ in 0..40 {
-            for line in s.push(&chunk) {
-                assert_eq!(line.len(), MAX_PENDING_LINE_BYTES);
-                delivered += line.len();
-            }
-            assert!(s.pending.len() < MAX_PENDING_LINE_BYTES);
+        let chunk = vec![b'z'; 1024 * 1024];
+        for _ in 0..(MAX_LINE_BYTES / chunk.len() + 4) {
+            assert!(s.push(&chunk).is_empty(), "no fragments");
+            assert!(s.pending.len() <= MAX_LINE_BYTES);
         }
-        let tail = s.finish_line().map_or(0, |l| l.len());
-        assert_eq!(delivered + tail, 40 * chunk.len());
+        assert_eq!(s.finish_line(), None);
+        assert_eq!(s.oversized_lines, 1);
+        assert!(s
+            .into_text()
+            .contains("1 output line(s) longer than 8388608 bytes were not delivered"));
     }
 
     #[test]
-    fn stream_capture_newline_at_cap_boundary() {
+    fn stream_capture_drops_an_oversized_record_whole_and_resumes() {
         let mut s = StreamCapture::default();
-        let mut chunk = vec![b'q'; MAX_PENDING_LINE_BYTES];
-        chunk.push(b'\n');
-        chunk.extend_from_slice(b"next\n");
+        let big = format!("{{\"text\":\"{}\"}}", "x".repeat(MAX_LINE_BYTES));
+        let mut lines = s.push(b"{\"type\":\"start\"}\n");
+        // The oversized record arrives in pieces, then normal records follow.
+        for piece in big.as_bytes().chunks(300_000) {
+            lines.extend(s.push(piece));
+        }
+        lines.extend(s.push(b"\n{\"type\":\"end\"}\n"));
+        assert_eq!(lines, vec!["{\"type\":\"start\"}", "{\"type\":\"end\"}"]);
+        assert_eq!(s.oversized_lines, 1);
+    }
+
+    #[test]
+    fn stream_capture_keeps_a_record_at_the_line_cap_whole() {
+        let mut s = StreamCapture::default();
+        let mut chunk = vec![b'q'; MAX_LINE_BYTES];
+        chunk.extend_from_slice(b"\nnext\n");
         let lines = s.push(&chunk);
-        assert_eq!(
-            lines.len(),
-            2,
-            "a newline on the cap must not add an empty line"
-        );
-        assert_eq!(lines[0].len(), MAX_PENDING_LINE_BYTES);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].len(), MAX_LINE_BYTES);
         assert_eq!(lines[1], "next");
-        assert_eq!(s.finish_line(), None);
+        assert_eq!(s.oversized_lines, 0);
     }
 
     // ── End-to-end: real microVMs ──────────────────────────────────────
@@ -1943,6 +2046,12 @@ mod tests {
         std::fs::create_dir_all(host.path().join("src/nested")).unwrap();
         std::fs::write(host.path().join("README.md"), b"seeded-readme\n").unwrap();
         std::fs::write(host.path().join("src/nested/lib.rs"), b"pub fn f() {}\n").unwrap();
+        // Larger than one upload chunk, with a non-repeating pattern, so a
+        // dropped or reordered chunk shows up as a content mismatch.
+        let big: Vec<u8> = (0..(UPLOAD_CHUNK_BYTES * 3 + 4321) as u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+            .collect();
+        std::fs::write(host.path().join("src/big.bin"), &big).unwrap();
         let script = host.path().join("run.sh");
         std::fs::write(&script, b"#!/bin/sh\necho ran\n").unwrap();
         {
@@ -1967,6 +2076,11 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(nested, b"pub fn f() {}\n");
+                let copied = provider
+                    .read_file(&handle, &format!("{WORK_DIR}/src/big.bin"))
+                    .await
+                    .unwrap();
+                assert!(copied == big, "multi-chunk file copied byte-for-byte");
                 let ran = sh(provider, &handle, &format!("cd {WORK_DIR} && ./run.sh")).await;
                 assert_eq!(ran.exit_code, 0, "mode preserved: {}", ran.stderr);
                 assert_eq!(ran.stdout.trim(), "ran");
