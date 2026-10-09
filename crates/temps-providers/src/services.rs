@@ -16459,19 +16459,145 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_create_s3_service() {
+        struct S3FixtureResources {
+            name: String,
+        }
+
+        impl Drop for S3FixtureResources {
+            fn drop(&mut self) {
+                let name = self.name.clone();
+                let cleanup = std::thread::spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("Failed to start S3 fixture cleanup runtime");
+                    runtime.block_on(async {
+                        let cleanup = async {
+                            // A fresh client keeps cleanup independent of the test runtime.
+                            let docker = Docker::connect_with_local_defaults()
+                                .map_err(|error| error.to_string())?;
+                            let container_name = format!("rustfs-{name}");
+                            match docker
+                                .inspect_container(
+                                    &container_name,
+                                    None::<bollard::query_parameters::InspectContainerOptions>,
+                                )
+                                .await
+                            {
+                                Ok(container) => {
+                                    let labels = container.config.and_then(|config| config.labels);
+                                    if labels
+                                        .as_ref()
+                                        .and_then(|labels| labels.get("temps.service_name"))
+                                        != Some(&name)
+                                    {
+                                        return Err(format!(
+                                            "Refusing to clean S3 fixture container '{container_name}': ownership label changed"
+                                        ));
+                                    }
+                                    let id = container.id.ok_or_else(|| {
+                                        format!("S3 fixture container '{container_name}' has no ID")
+                                    })?;
+                                    docker
+                                        .remove_container(
+                                            &id,
+                                            Some(bollard::query_parameters::RemoveContainerOptions {
+                                                force: true,
+                                                ..Default::default()
+                                            }),
+                                        )
+                                        .await
+                                        .map_err(|error| error.to_string())?;
+                                }
+                                Err(bollard::errors::Error::DockerResponseServerError {
+                                    status_code: 404,
+                                    ..
+                                }) => {}
+                                Err(error) => return Err(error.to_string()),
+                            }
+                            for volume in [format!("rustfs_{name}_data"), format!("rustfs_{name}_logs")] {
+                                match docker
+                                    .remove_volume(
+                                        &volume,
+                                        None::<bollard::query_parameters::RemoveVolumeOptions>,
+                                    )
+                                    .await
+                                {
+                                    Ok(())
+                                    | Err(bollard::errors::Error::DockerResponseServerError {
+                                        status_code: 404,
+                                        ..
+                                    }) => {}
+                                    Err(error) => return Err(format!("Volume '{volume}': {error}")),
+                                }
+                            }
+                            Ok::<(), String>(())
+                        };
+                        match tokio::time::timeout(std::time::Duration::from_secs(20), cleanup).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => eprintln!("S3 fixture '{name}' cleanup failed: {error}"),
+                            Err(_) => eprintln!("S3 fixture '{name}' cleanup exceeded 20 seconds"),
+                        }
+                    });
+                });
+                if cleanup.join().is_err() {
+                    eprintln!("S3 fixture '{}' cleanup thread panicked", self.name);
+                }
+            }
+        }
+
         let (manager, _test_db) = setup_test_manager_or_skip!();
-
-        let random_unused_port = get_unused_port();
-        let mut params = HashMap::new();
-        params.insert(
-            "port".to_string(),
-            JsonValue::String(random_unused_port.to_string()),
+        let name = format!("test-s3-{}", uuid::Uuid::new_v4());
+        let docker = manager.require_docker().unwrap();
+        let container_name = format!("rustfs-{name}");
+        assert!(
+            matches!(
+                docker
+                    .inspect_container(
+                        &container_name,
+                        None::<bollard::query_parameters::InspectContainerOptions>
+                    )
+                    .await,
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404,
+                    ..
+                })
+            ),
+            "S3 fixture container '{container_name}' must not exist before creation"
         );
-        // Note: bucket_name is not a parameter - buckets are created dynamically during provisioning
-        // access_key and secret_key have defaults, so they're optional
-
+        for volume in [format!("rustfs_{name}_data"), format!("rustfs_{name}_logs")] {
+            assert!(
+                matches!(
+                    docker.inspect_volume(&volume).await,
+                    Err(bollard::errors::Error::DockerResponseServerError {
+                        status_code: 404,
+                        ..
+                    })
+                ),
+                "S3 fixture volume '{volume}' must not exist before creation"
+            );
+        }
+        // These UUID-derived resources were absent above; clean them even if
+        // creation or a readiness assertion fails before delete_service runs.
+        let _cleanup = S3FixtureResources { name: name.clone() };
+        let api_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let console_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut params = HashMap::from([
+            (
+                "port".to_string(),
+                JsonValue::String(api_listener.local_addr().unwrap().port().to_string()),
+            ),
+            (
+                "console_port".to_string(),
+                JsonValue::String(console_listener.local_addr().unwrap().port().to_string()),
+            ),
+        ]);
+        // A test-only override lets shared-host runs use a run-owned image.
+        if let Ok(image) = std::env::var("TEMPS_TEST_RUSTFS_DOCKER_IMAGE") {
+            params.insert("docker_image".to_string(), JsonValue::String(image));
+        }
         let request = CreateExternalServiceRequest {
-            name: "test-s3".to_string(),
+            name: name.clone(),
             service_type: ServiceType::S3,
             version: None,
             parameters: params,
@@ -16479,16 +16605,54 @@ mod tests {
             topology: "standalone".to_string(),
             members: Vec::new(),
         };
-
-        let result = manager.create_service(request).await;
-
-        let service = result.expect("Failed to create S3 service");
-        assert_eq!(service.name, "test-s3");
+        drop(api_listener);
+        drop(console_listener);
+        let mut service = manager
+            .create_service(request)
+            .await
+            .expect("Failed to create S3 service");
+        assert_eq!(service.name, name);
         assert_eq!(service.service_type, ServiceType::S3);
-        assert_eq!(service.status, "running");
+        eprintln!(
+            "S3 fixture '{name}' created with status '{}'",
+            service.status
+        );
 
-        // Cleanup
-        let _ = manager.delete_service(service.id).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(190);
+        while service.status != "running" {
+            // Readiness is additive: this test also compiles on versions that
+            // mark the service running synchronously and omit the field.
+            let snapshot = serde_json::to_value(&service).unwrap();
+            let diagnostic = format!(
+                "status={}, error={:?}, readiness={:?}",
+                service.status,
+                service.error_message,
+                snapshot.get("readiness")
+            );
+            assert_ne!(
+                service.status, "failed",
+                "S3 fixture '{name}' failed: {diagnostic}"
+            );
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "S3 fixture '{name}' did not become ready within 190 seconds: {diagnostic}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            service = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                manager.get_service_info(service.id),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("S3 fixture '{name}' status read timed out: {diagnostic}"))
+            .unwrap_or_else(|error| {
+                panic!("S3 fixture '{name}' status read failed: {error}; {diagnostic}")
+            });
+        }
+        eprintln!("S3 fixture '{name}' reached running");
+        manager
+            .delete_service(service.id)
+            .await
+            .expect("Failed to delete owned S3 fixture");
     }
 
     #[cfg(feature = "docker-tests")]
