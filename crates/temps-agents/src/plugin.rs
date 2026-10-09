@@ -170,13 +170,15 @@ async fn build_sandbox_provider(
     if let Some(microsandbox) = microsandbox_provider(&data_dir) {
         backends.insert(SandboxBackend::Microsandbox, microsandbox);
     }
+    // Resolved before the Docker-only return so a configured-but-unavailable
+    // microVM default is still logged on hosts where only Docker is live.
+    let default = default_sandbox_backend(settings.sandbox_backend.as_deref(), |backend| {
+        backends.contains_key(&backend)
+    });
     if backends.is_empty() {
         return docker_provider;
     }
 
-    let default = default_sandbox_backend(settings.sandbox_backend.as_deref(), |backend| {
-        backends.contains_key(&backend)
-    });
     backends.insert(SandboxBackend::Docker, docker_provider);
     let mut available: Vec<String> = backends.keys().map(|b| b.to_string()).collect();
     available.sort();

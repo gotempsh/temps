@@ -88,6 +88,11 @@ const MIN_MEMORY_MIB: u64 = 128;
 /// exhaust host memory.
 const MAX_CAPTURED_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 
+/// Longest partial line held while waiting for a newline. A longer run of
+/// newline-free output is delivered as its own line, so host memory per
+/// stream stays bounded however the guest writes.
+const MAX_PENDING_LINE_BYTES: usize = 64 * 1024;
+
 /// How long `connect` waits for the in-guest agent handshake.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -360,14 +365,39 @@ impl StreamCapture {
         self.captured.extend_from_slice(&chunk[..kept]);
         self.dropped += chunk.len() - kept;
 
-        self.pending.extend_from_slice(chunk);
         let mut lines = Vec::new();
-        while let Some(pos) = self.pending.iter().position(|b| *b == b'\n') {
-            let line: Vec<u8> = self.pending.drain(..=pos).collect();
-            let text = String::from_utf8_lossy(&line[..line.len() - 1]);
-            lines.push(text.trim_end_matches('\r').to_string());
+        let mut rest = chunk;
+        while !rest.is_empty() {
+            // Take up to the next newline, but never let `pending` grow past
+            // the cap: a newline-free stream is split into capped lines. The
+            // search looks one byte past the room so a newline landing
+            // exactly on the cap ends that line instead of an empty one.
+            let room = MAX_PENDING_LINE_BYTES - self.pending.len();
+            let search = &rest[..rest.len().min(room + 1)];
+            match search.iter().position(|b| *b == b'\n') {
+                Some(pos) => {
+                    self.pending.extend_from_slice(&rest[..pos]);
+                    lines.push(self.take_line());
+                    rest = &rest[pos + 1..];
+                }
+                None => {
+                    let take = rest.len().min(room);
+                    self.pending.extend_from_slice(&rest[..take]);
+                    rest = &rest[take..];
+                    if self.pending.len() >= MAX_PENDING_LINE_BYTES {
+                        lines.push(self.take_line());
+                    }
+                }
+            }
         }
         lines
+    }
+
+    fn take_line(&mut self) -> String {
+        let line = std::mem::take(&mut self.pending);
+        String::from_utf8_lossy(&line)
+            .trim_end_matches('\r')
+            .to_string()
     }
 
     /// The trailing partial line, if the command didn't end with a newline.
@@ -675,6 +705,40 @@ impl MicrosandboxSandboxProvider {
             })
     }
 
+    /// Copy `host_work_dir` into the guest work dir. A missing or empty
+    /// directory is a valid "start with an empty workspace" request.
+    async fn seed_workspace(
+        &self,
+        handle: &SandboxHandle,
+        run_id: i32,
+        host_work_dir: &Path,
+    ) -> Result<(), AgentError> {
+        if !workspace_has_entries(host_work_dir) {
+            return Ok(());
+        }
+        let started = Instant::now();
+        self.write_directory(handle, host_work_dir, WORK_DIR)
+            .await
+            .map_err(|e| AgentError::SandboxCreationFailed {
+                run_id,
+                provider: PROVIDER_NAME.to_string(),
+                reason: format!(
+                    "copying workspace {} into {}:{}: {}",
+                    host_work_dir.display(),
+                    handle.sandbox_name,
+                    WORK_DIR,
+                    e
+                ),
+            })?;
+        tracing::info!(
+            sandbox = %handle.sandbox_name,
+            source = %host_work_dir.display(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "microsandbox workspace seeded"
+        );
+        Ok(())
+    }
+
     fn ensure_home(&self) -> Result<(), AgentError> {
         let home = self.config.home();
         std::fs::create_dir_all(&home)?;
@@ -706,15 +770,32 @@ impl SandboxProvider for MicrosandboxSandboxProvider {
         self.evict(&name);
 
         let started = Instant::now();
+        let host_work_dir = config.host_work_dir.clone();
         let sandbox = self.create_inner(config, &name, &image).await?;
         self.cache_put(&name, sandbox);
+        let handle = Self::handle_for(&name, image.clone());
+
+        // Docker bind-mounts `host_work_dir` at the work dir; a VM can't, so
+        // copy the prepared tree (e.g. the cloned repository) in before the
+        // caller sees the handle. A VM without its workspace is useless, so
+        // a failed copy tears it down rather than returning it.
+        if let Err(error) = self.seed_workspace(&handle, run_id, &host_work_dir).await {
+            if let Err(cleanup) = self.destroy(&handle, true).await {
+                tracing::warn!(
+                    sandbox = %name,
+                    "failed to destroy microsandbox sandbox after workspace seeding failed: {}",
+                    cleanup
+                );
+            }
+            return Err(error);
+        }
         tracing::info!(
             sandbox = %name,
             image = %image,
             elapsed_ms = started.elapsed().as_millis() as u64,
             "microsandbox sandbox up"
         );
-        Ok(Self::handle_for(&name, image))
+        Ok(handle)
     }
 
     async fn exec(
@@ -1193,6 +1274,12 @@ fn set_dir_private(path: &Path) {
     }
 }
 
+/// Whether `dir` is an existing directory with at least one entry — i.e.
+/// there is a prepared workspace to copy into a new VM.
+fn workspace_has_entries(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1203,7 +1290,8 @@ mod tests {
             owner_user_id: None,
             run_id: 7,
             container_name_override: None,
-            host_work_dir: PathBuf::from("/tmp"),
+            // Nonexistent: create seeds nothing unless a test opts in.
+            host_work_dir: PathBuf::from("/nonexistent/temps-msb-test-workspace"),
             workspace_volume: None,
             image: None,
             cpu_limit: None,
@@ -1533,6 +1621,41 @@ mod tests {
         assert!(text.len() < MAX_CAPTURED_OUTPUT_BYTES + 200);
     }
 
+    #[test]
+    fn stream_capture_bounds_newline_free_output() {
+        // 1 GiB-style output with no newline, fed in many chunks: the
+        // partial-line buffer must never exceed its cap.
+        let mut s = StreamCapture::default();
+        let chunk = vec![b'z'; 48 * 1024];
+        let mut delivered = 0usize;
+        for _ in 0..40 {
+            for line in s.push(&chunk) {
+                assert_eq!(line.len(), MAX_PENDING_LINE_BYTES);
+                delivered += line.len();
+            }
+            assert!(s.pending.len() < MAX_PENDING_LINE_BYTES);
+        }
+        let tail = s.finish_line().map_or(0, |l| l.len());
+        assert_eq!(delivered + tail, 40 * chunk.len());
+    }
+
+    #[test]
+    fn stream_capture_newline_at_cap_boundary() {
+        let mut s = StreamCapture::default();
+        let mut chunk = vec![b'q'; MAX_PENDING_LINE_BYTES];
+        chunk.push(b'\n');
+        chunk.extend_from_slice(b"next\n");
+        let lines = s.push(&chunk);
+        assert_eq!(
+            lines.len(),
+            2,
+            "a newline on the cap must not add an empty line"
+        );
+        assert_eq!(lines[0].len(), MAX_PENDING_LINE_BYTES);
+        assert_eq!(lines[1], "next");
+        assert_eq!(s.finish_line(), None);
+    }
+
     // ── End-to-end: real microVMs ──────────────────────────────────────
     //
     // These boot real VMs through the provider. Like the Docker tests they
@@ -1790,6 +1913,68 @@ mod tests {
                 let recovered = provider.recover_by_name(&label).await.unwrap().unwrap();
                 assert_eq!(recovered.sandbox_name, handle.sandbox_name);
                 assert_eq!(recovered.backend, SandboxBackend::Microsandbox);
+            }
+        })
+        .await;
+    }
+
+    #[test]
+    fn workspace_has_entries_only_for_nonempty_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!workspace_has_entries(dir.path()), "empty dir");
+        assert!(!workspace_has_entries(&dir.path().join("missing")));
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(workspace_has_entries(dir.path()));
+        assert!(!workspace_has_entries(&file), "a file is not a workspace");
+    }
+
+    #[tokio::test]
+    async fn e2e_create_seeds_workspace_from_host_work_dir() {
+        let Some(provider) = e2e_provider() else {
+            return;
+        };
+        // A prepared workspace like a workflow's cloned repository: nested
+        // files, an executable, and a symlink pointing outside the tree,
+        // which must not be followed into the guest.
+        let host = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("host-secret"), b"do-not-copy").unwrap();
+        std::fs::create_dir_all(host.path().join("src/nested")).unwrap();
+        std::fs::write(host.path().join("README.md"), b"seeded-readme\n").unwrap();
+        std::fs::write(host.path().join("src/nested/lib.rs"), b"pub fn f() {}\n").unwrap();
+        let script = host.path().join("run.sh");
+        std::fs::write(&script, b"#!/bin/sh\necho ran\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::os::unix::fs::symlink(outside.path().join("host-secret"), host.path().join("leak"))
+            .unwrap();
+
+        let mut config = e2e_config("seed", "none");
+        config.host_work_dir = host.path().to_path_buf();
+        with_sandbox(&provider, config, |handle| {
+            let provider = &provider;
+            async move {
+                let readme = provider
+                    .read_file(&handle, &format!("{WORK_DIR}/README.md"))
+                    .await
+                    .unwrap();
+                assert_eq!(readme, b"seeded-readme\n");
+                let nested = provider
+                    .read_file(&handle, &format!("{WORK_DIR}/src/nested/lib.rs"))
+                    .await
+                    .unwrap();
+                assert_eq!(nested, b"pub fn f() {}\n");
+                let ran = sh(provider, &handle, &format!("cd {WORK_DIR} && ./run.sh")).await;
+                assert_eq!(ran.exit_code, 0, "mode preserved: {}", ran.stderr);
+                assert_eq!(ran.stdout.trim(), "ran");
+                let leak = sh(provider, &handle, &format!("test -e {WORK_DIR}/leak")).await;
+                assert_ne!(
+                    leak.exit_code, 0,
+                    "symlinks are not followed into the guest"
+                );
             }
         })
         .await;

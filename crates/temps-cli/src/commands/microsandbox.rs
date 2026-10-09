@@ -152,7 +152,12 @@ async fn smoke_test(provider: &MicrosandboxSandboxProvider) -> anyhow::Result<()
     let config = SandboxCreateConfig {
         run_id: 0,
         container_name_override: Some(SMOKE_LABEL.to_string()),
-        host_work_dir: std::env::temp_dir(),
+        // Never created: the VM's workspace is seeded from this directory,
+        // and the smoke test needs an empty one.
+        host_work_dir: std::env::temp_dir().join(format!(
+            "temps-microsandbox-smoke-{}-empty",
+            std::process::id()
+        )),
         workspace_volume: None,
         image: Some(SMOKE_IMAGE.to_string()),
         cpu_limit: Some(1.0),
