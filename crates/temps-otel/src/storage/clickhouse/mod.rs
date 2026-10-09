@@ -53,6 +53,7 @@
 //! (`TraceSortField` / `SortOrder`) with no user-controlled input path.
 
 pub mod migrations;
+pub mod read_limits;
 
 use migrations::WriteTable;
 
@@ -1286,11 +1287,31 @@ pub(crate) fn ch_ingest_err(operation: &str, err: ::clickhouse::error::Error) ->
 }
 
 /// Wrap a ClickHouse query error into an [`OtelError::Storage`] with context.
+///
+/// A read that hit one of the limits of [`read_limits`] says so -- which limit,
+/// and what to do about it -- instead of surfacing the server's raw text alone.
 pub(crate) fn ch_query_err(operation: &str, err: ::clickhouse::error::Error) -> OtelError {
-    let kind = ch_err_kind(&err);
-    OtelError::Storage {
-        message: format!("ClickHouse query {operation} failed: {err}"),
-        kind,
+    use read_limits::{classify, Failure};
+    match classify(&err) {
+        Failure::MemoryLimit => OtelError::Storage {
+            message: format!(
+                "ClickHouse query {operation} exceeded its {} MiB memory budget; \
+                 narrow the time window or filters: {err}",
+                read_limits::READ_MAX_MEMORY_BYTES >> 20
+            ),
+            kind: StorageErrorKind::ClickHouseOther,
+        },
+        Failure::Timeout => OtelError::Storage {
+            message: format!(
+                "ClickHouse query {operation} exceeded its {:?} time budget: {err}",
+                read_limits::READ_MAX_EXECUTION_TIME
+            ),
+            kind: StorageErrorKind::ClickHouseTimeout,
+        },
+        Failure::Other => OtelError::Storage {
+            message: format!("ClickHouse query {operation} failed: {err}"),
+            kind: ch_err_kind(&err),
+        },
     }
 }
 
@@ -1334,8 +1355,13 @@ pub fn trace_ref_version(first_seen_ms: i64) -> u64 {
 /// methods delegate to the inner `TimescaleDbStorage` until Phase 1–4
 /// implementations land (see module-level doc).
 pub struct ClickHouseOtelStorage {
-    /// ClickHouse client — cheap to clone (Arc-backed internally).
+    /// ClickHouse client — cheap to clone (Arc-backed internally). Used for
+    /// writes, migrations and health checks; carries no read limits.
     ch: ::clickhouse::Client,
+    /// The same connection with the read bounds of [`read_limits`] applied.
+    /// Every SELECT goes through this one, so no read depends on the server
+    /// profile alone for its memory or time ceiling.
+    read: ::clickhouse::Client,
     /// Postgres/TimescaleDB inner storage for delegation.
     ///
     /// All non-span methods and (for now) all span read methods are
@@ -1432,8 +1458,10 @@ impl ClickHouseOtelStorage {
             .with_database(&config.database)
             .with_user(&config.user)
             .with_password(&config.password);
+        let read = read_limits::bounded_read_client(&ch);
         Self {
             ch,
+            read,
             inner,
             resolver,
             facet_cache,
@@ -1491,7 +1519,7 @@ impl OtelStorage for ClickHouseOtelStorage {
             .as_ref()
             .map(|c| c.load_full())
             .unwrap_or_default();
-        super::global_traces::clickhouse_local(&self.ch, &query, &facets).await
+        super::global_traces::clickhouse_local(&self.read, &query, &facets).await
     }
     // ── Span write (ClickHouse — system of record) ──────────────────────────
 
@@ -1768,7 +1796,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         };
 
         // Apply binds sequentially to the query builder.
-        let mut q = self.ch.query(&sql);
+        let mut q = self.read.query(&sql);
         for b in all_binds {
             q = match b {
                 Bv::I32(v) => q.bind(v),
@@ -2093,7 +2121,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         all_binds.push(Bv::I64(offset as i64));
         let binds = all_binds;
 
-        let mut q = self.ch.query(&sql);
+        let mut q = self.read.query(&sql);
         for b in binds {
             q = match b {
                 Bv::I32(v) => q.bind(v),
@@ -2269,7 +2297,7 @@ impl OtelStorage for ClickHouseOtelStorage {
             )
         };
 
-        let mut q = self.ch.query(&sql);
+        let mut q = self.read.query(&sql);
         for b in binds {
             q = match b {
                 Bv::I32(v) => q.bind(v),
@@ -2307,7 +2335,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         }
 
         let rows = self
-            .ch
+            .read
             .query("SELECT 1 AS one FROM spans WHERE project_id = ? LIMIT 1")
             .bind(project_id)
             .fetch_all::<ChExistsRow>()
@@ -2352,7 +2380,7 @@ impl OtelStorage for ClickHouseOtelStorage {
                    ORDER BY start_time ASC";
 
         let rows = self
-            .ch
+            .read
             .query(sql)
             .bind(project_id)
             .bind(trace_id)
@@ -2493,7 +2521,7 @@ impl OtelStorage for ClickHouseOtelStorage {
             LIMIT ? OFFSET ?"#
         );
 
-        let mut q = bind_all(self.ch.query(&sql), binds);
+        let mut q = bind_all(self.read.query(&sql), binds);
         q = q
             .bind(query.min_count as i64)
             .bind(limit as i64)
@@ -2523,7 +2551,7 @@ impl OtelStorage for ClickHouseOtelStorage {
             )"#
         );
 
-        let q = bind_all(self.ch.query(&sql), binds).bind(query.min_count as i64);
+        let q = bind_all(self.read.query(&sql), binds).bind(query.min_count as i64);
 
         let row = q
             .fetch_one::<ChCountRow>()
@@ -2670,7 +2698,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         binds.push(Bv::I64(limit as i64));
         binds.push(Bv::I64(offset as i64));
 
-        let mut q = self.ch.query(&sql);
+        let mut q = self.read.query(&sql);
         for b in binds {
             q = match b {
                 Bv::I32(v) => q.bind(v),
@@ -2762,7 +2790,7 @@ impl OtelStorage for ClickHouseOtelStorage {
                    ORDER BY start_time ASC";
 
         let rows = self
-            .ch
+            .read
             .query(sql)
             .bind(project_id)
             .bind(trace_id)
@@ -2857,7 +2885,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         let where_sql = where_parts.join(" AND ");
         let sql = format!("SELECT uniqExact(trace_id) AS cnt FROM spans FINAL WHERE {where_sql}");
 
-        let mut q = self.ch.query(&sql);
+        let mut q = self.read.query(&sql);
         for b in binds {
             q = match b {
                 Bv::I32(v) => q.bind(v),
@@ -2893,7 +2921,7 @@ impl OtelStorage for ClickHouseOtelStorage {
                    ORDER BY start_time ASC";
 
         let rows = self
-            .ch
+            .read
             .query(sql)
             .bind(project_id)
             .bind(trace_id)
@@ -3190,7 +3218,7 @@ impl OtelStorage for ClickHouseOtelStorage {
 
         // Bind order: SELECT group keys first (the `attributes[?]` in the
         // projection), then WHERE params in clause order, then LIMIT.
-        let mut q = self.ch.query(&sql);
+        let mut q = self.read.query(&sql);
         for key in &query.group_by {
             q = q.bind(key.clone());
         }
@@ -3255,7 +3283,7 @@ impl OtelStorage for ClickHouseOtelStorage {
              ORDER BY bucket_ms ASC \
              LIMIT ?"
         );
-        let mut hq = self.ch.query(&hist_sql);
+        let mut hq = self.read.query(&hist_sql);
         for key in &query.group_by {
             hq = hq.bind(key.clone());
         }
@@ -3350,7 +3378,7 @@ impl OtelStorage for ClickHouseOtelStorage {
     /// List distinct metric names for a project from the CH `metrics` table.
     async fn list_metric_names(&self, project_id: i32) -> StorageResult<Vec<String>> {
         let rows = self
-            .ch
+            .read
             .query(
                 "SELECT DISTINCT metric_name FROM metrics \
                  WHERE project_id = ? ORDER BY metric_name",
@@ -3373,7 +3401,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         // Sample recent rows first (subquery LIMIT), then ARRAY JOIN the sampled
         // attribute-key arrays — keeps the unnest bounded on high-volume metrics.
         let rows = self
-            .ch
+            .read
             .query(
                 "SELECT DISTINCT label_key FROM ( \
                    SELECT mapKeys(attributes) AS ks FROM metrics \
@@ -3406,7 +3434,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         // `attributes[?]` reads the value for the chosen key; `mapContains` keeps
         // only rows that actually carry it. Sampled and capped like the keys query.
         let rows = self
-            .ch
+            .read
             .query(
                 "SELECT DISTINCT label_key FROM ( \
                    SELECT attributes[?] AS label_key FROM metrics \
@@ -3534,7 +3562,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         // min(first_seen) at query time keeps the earliest observation even
         // before ReplacingMergeTree merges collapse duplicate pairs.
         let ch_rows = self
-            .ch
+            .read
             .query(
                 "SELECT project_id, \
                         toInt64(toUnixTimestamp64Milli(min(first_seen))) AS first_seen_ms \
@@ -3690,7 +3718,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         "#;
 
         let ch_bytes = self
-            .ch
+            .read
             .query(CH_QUOTA_BYTES_SQL)
             .bind(project_id)
             .bind(project_id)
@@ -3786,7 +3814,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         );
 
         let mut q = self
-            .ch
+            .read
             .query(&sql)
             .bind(project_id)
             .bind(service_name)
@@ -3851,7 +3879,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         );
 
         let mut q = self
-            .ch
+            .read
             .query(&sql)
             .bind(project_id)
             .bind(service_name)
@@ -4261,6 +4289,27 @@ mod tests {
         let err = ::clickhouse::error::Error::BadResponse("timeout".into());
         let otel_err = ch_query_err("query_trace_summaries", err);
         assert!(otel_err.to_string().contains("query_trace_summaries"));
+    }
+
+    #[test]
+    fn ch_query_err_names_the_budget_a_read_exceeded() {
+        let memory = ::clickhouse::error::Error::BadResponse(
+            "Code: 241. DB::Exception: Query memory limit exceeded (MEMORY_LIMIT_EXCEEDED)".into(),
+        );
+        let message = ch_query_err("query_span_stats", memory).to_string();
+        assert!(message.contains("query_span_stats"), "{message}");
+        assert!(message.contains("1024 MiB memory budget"), "{message}");
+
+        let timeout = ::clickhouse::error::Error::BadResponse(
+            "Code: 159. DB::Exception: Timeout exceeded (TIMEOUT_EXCEEDED)".into(),
+        );
+        match ch_query_err("query_metrics", timeout) {
+            OtelError::Storage { kind, message } => {
+                assert_eq!(kind, StorageErrorKind::ClickHouseTimeout);
+                assert!(message.contains("60s time budget"), "{message}");
+            }
+            other => panic!("expected a storage error, got {other:?}"),
+        }
     }
 
     #[test]
