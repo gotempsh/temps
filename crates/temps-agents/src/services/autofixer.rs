@@ -731,6 +731,15 @@ impl AutofixerService {
             )
             .await?;
 
+        // A microVM backend keeps the agent's edits in its guest; bring them
+        // into `work_dir` before changes are read from it (here and again at
+        // PR creation). A no-op for Docker, whose work dir is this directory.
+        if self.sandbox_registry.has_sandbox(run_id).await {
+            self.sandbox_registry
+                .sync_workspace_to_host(run_id, &work_dir)
+                .await?;
+        }
+
         // Detect changed files
         let changed_files = self.detect_changed_files(&work_dir, run_id).await?;
 

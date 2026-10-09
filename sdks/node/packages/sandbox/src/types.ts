@@ -47,12 +47,13 @@ export interface CreateSandboxOptions {
   /** Optional plaintext password for preview URLs (8–256 chars). */
   previewPassword?: string;
   /**
-   * Isolation backend: 'docker' (default) or 'firecracker' (hardware-
+   * Isolation backend: 'docker' (default), 'firecracker' (hardware-
    * virtualized microVM; requires a host provisioned with
-   * `temps firecracker setup`). Requesting an unavailable backend fails
-   * rather than silently downgrading isolation.
+   * `temps firecracker setup`) or 'microsandbox' (experimental libkrun
+   * microVM; requires `temps microsandbox setup`). Requesting an
+   * unavailable backend fails rather than silently downgrading isolation.
    */
-  backend?: 'docker' | 'firecracker';
+  backend?: 'docker' | 'firecracker' | 'microsandbox';
   /**
    * Node to run the sandbox on: a worker node name, a node id, or
    * `'control-plane'`. Omit it to let Temps place the sandbox on an allowed
@@ -70,7 +71,7 @@ export interface SandboxSummary {
   status: string;
   image: string | null;
   workDir: string;
-  /** Isolation backend the sandbox runs on ('docker' | 'firecracker'). */
+  /** Isolation backend the sandbox runs on ('docker' | 'firecracker' | 'microsandbox'). */
   backend?: string;
   /** Root disk size in MB (Firecracker). */
   diskSizeMb?: number;

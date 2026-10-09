@@ -2480,6 +2480,25 @@ fn validate_request_timeouts(timeouts: &RequestTimeoutSettings) -> Result<(), Pr
     Ok(())
 }
 
+/// Host-default sandbox backend accepted in platform settings. Selecting a
+/// backend this host can't run is allowed (the settings page shows its
+/// onboarding state); the agents plugin only routes to registered backends.
+fn validate_sandbox_backend(backend: Option<&str>) -> Result<(), Problem> {
+    let Some(backend) = backend.map(str::trim) else {
+        return Ok(());
+    };
+    if matches!(backend, "docker" | "firecracker" | "microsandbox") {
+        return Ok(());
+    }
+    Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+        .title("Invalid Sandbox Backend")
+        .detail(format!(
+            "sandbox_backend must be \"docker\", \"firecracker\" or \"microsandbox\", got \"{}\"",
+            backend
+        ))
+        .build())
+}
+
 fn validate_monitoring_settings(monitoring: &MonitoringSettings) -> Result<(), Problem> {
     if monitoring.scrape_interval_secs < 15 {
         return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
@@ -2955,18 +2974,7 @@ async fn update_settings(
         }
     }
 
-    if let Some(ref backend) = settings.agent_sandbox.sandbox_backend {
-        let backend = backend.trim();
-        if backend != "docker" && backend != "firecracker" {
-            return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
-                .title("Invalid Sandbox Backend")
-                .detail(format!(
-                    "sandbox_backend must be \"docker\" or \"firecracker\", got \"{}\"",
-                    backend
-                ))
-                .build());
-        }
-    }
+    validate_sandbox_backend(settings.agent_sandbox.sandbox_backend.as_deref())?;
 
     validate_monitoring_settings(&settings.monitoring)?;
     validate_ai_chat_limits(&settings.ai_chat_limits)?;
@@ -3440,6 +3448,22 @@ async fn refresh_route_table(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sandbox_backend_setting_accepts_the_three_public_backends() {
+        assert!(validate_sandbox_backend(None).is_ok());
+        for backend in ["docker", "firecracker", "microsandbox", " microsandbox "] {
+            assert!(
+                validate_sandbox_backend(Some(backend)).is_ok(),
+                "{backend:?} must be accepted"
+            );
+        }
+        for backend in ["local", "libkrun", ""] {
+            let problem = validate_sandbox_backend(Some(backend))
+                .expect_err("non-public backends must be rejected");
+            assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+        }
+    }
 
     #[test]
     fn partial_settings_updates_preserve_omitted_fields_and_respect_explicit_values() {

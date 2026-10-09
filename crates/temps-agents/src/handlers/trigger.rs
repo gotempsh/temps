@@ -438,6 +438,9 @@ pub struct SandboxStatusResponse {
     pub image_name: String,
     pub error: Option<String>,
     pub firecracker_available: bool,
+    /// Experimental microsandbox microVM backend (ADR-050). Always present:
+    /// when not configured it carries the reason and where to set it up.
+    pub microsandbox: crate::sandbox::microsandbox::MicrosandboxCapability,
 }
 
 #[utoipa::path(
@@ -488,6 +491,9 @@ pub async fn get_sandbox_status(
         image_name,
         error,
         firecracker_available: false,
+        microsandbox: crate::sandbox::microsandbox::microsandbox_capability(
+            &crate::sandbox::microsandbox::host_data_dir(),
+        ),
     }))
 }
 
@@ -532,6 +538,7 @@ pub async fn get_global_sandbox_status(
         });
     let firecracker_available =
         crate::sandbox::firecracker::is_firecracker_available(&data_dir).await;
+    let microsandbox = crate::sandbox::microsandbox::microsandbox_capability(&data_dir);
 
     Ok(Json(SandboxStatusResponse {
         docker_available,
@@ -539,6 +546,7 @@ pub async fn get_global_sandbox_status(
         image_name,
         error,
         firecracker_available,
+        microsandbox,
     }))
 }
 

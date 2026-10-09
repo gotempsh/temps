@@ -155,6 +155,19 @@ impl SandboxRegistry {
             .await
     }
 
+    /// Bring a run's sandbox work dir back into its host checkout
+    /// (see [`SandboxProvider::sync_workspace_to_host`]).
+    pub async fn sync_workspace_to_host(
+        &self,
+        run_id: i32,
+        host_dir: &std::path::Path,
+    ) -> Result<(), AgentError> {
+        let handle = self.get(run_id).await?;
+        self.provider
+            .sync_workspace_to_host(&handle, host_dir)
+            .await
+    }
+
     /// Execute a command in a run's sandbox.
     pub async fn exec(
         &self,

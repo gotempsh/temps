@@ -29,6 +29,10 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { useSettings, useUpdateSettings } from '@/hooks/useSettings'
 import { SandboxNodesCard } from '@/components/sandboxes/SandboxNodesCard'
+import {
+  MicrosandboxBackendOption,
+  type MicrosandboxCapability,
+} from '@/components/sandboxes/MicrosandboxBackendOption'
 
 interface SandboxStatus {
   docker_available: boolean
@@ -36,6 +40,7 @@ interface SandboxStatus {
   image_name: string
   error: string | null
   firecracker_available: boolean
+  microsandbox: MicrosandboxCapability
 }
 
 const RUNTIME_PRESETS = [
@@ -448,12 +453,13 @@ export function AgentSandboxSandboxPage() {
             <CardTitle className="text-base">Isolation Backend</CardTitle>
             <CardDescription>
               Default sandbox isolation technology for new workflow runs.
-              Firecracker provides stronger isolation via KVM microVMs; Docker
-              is the standard default.
+              Firecracker provides stronger isolation via KVM microVMs;
+              microsandbox is an experimental microVM backend that also runs on
+              Apple Silicon Macs; Docker is the standard default.
             </CardDescription>
           </CardHeader>
           <CardContent>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
               <button
                 onClick={() => {
                   setSandboxBackend('docker')
@@ -503,6 +509,14 @@ export function AgentSandboxSandboxPage() {
                   </p>
                 </button>
               </div>
+              <MicrosandboxBackendOption
+                capability={sandboxStatus?.microsandbox}
+                selected={sandboxBackend === 'microsandbox'}
+                onSelect={() => {
+                  setSandboxBackend('microsandbox')
+                  setIsDirty(true)
+                }}
+              />
             </div>
           </CardContent>
         </Card>

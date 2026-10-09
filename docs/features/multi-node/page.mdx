@@ -464,7 +464,7 @@ These features only work for sandboxes on the control plane for now. On a worker
 - snapshots, both taking and restoring them
 - preview URLs (the sandbox page explains why there is none)
 - disk resize and workspace volumes
-- the Firecracker backend, and the git, model and harness relays
+- the Firecracker and microsandbox backends, and the git, model and harness relays
 
 Create the sandbox with `--node control-plane` when you need one of them.
 
@@ -704,7 +704,7 @@ node's native architecture automatically.
 Multi-node is functional but still evolving. Known limitations:
 
 - **No bin-packing** — placement is least-loaded plus anti-affinity, not full bin-packing across resource dimensions.
-- **Worker sandboxes are a subset** — sandboxes on worker nodes have no terminal, agent runtime (Fleet), snapshots, preview URLs, disk resize, workspace volumes or Firecracker backend yet. See [Sandboxes on worker nodes](#sandboxes).
+- **Worker sandboxes are a subset** — sandboxes on worker nodes have no terminal, agent runtime (Fleet), snapshots, preview URLs, disk resize, workspace volumes or Firecracker/microsandbox backends yet. See [Sandboxes on worker nodes](#sandboxes).
 - **Sandboxes don't move** — a sandbox stays on the node it was created on. Draining a node does not move its sandboxes; [evict them](#sandboxes) before removing the node.
 - **Sandboxes need a `full`-profile control plane** — a control plane started with `--profile control-plane` serves no sandbox API, so it cannot place sandboxes on workers either.
 

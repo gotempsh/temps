@@ -523,11 +523,13 @@ pub struct CreateSandboxBody {
     /// extra round-trip.
     #[serde(default)]
     pub ports: Vec<u16>,
-    /// Isolation backend: `"docker"` (default) or `"firecracker"` (ADR-029,
+    /// Isolation backend: `"docker"` (default), `"firecracker"` (ADR-029,
     /// hardware-virtualized microVM — requires a host provisioned with
-    /// `temps firecracker setup`). Omit for the platform default; existing
-    /// clients are unaffected. Requesting an unavailable backend fails with
-    /// 400 rather than silently downgrading isolation.
+    /// `temps firecracker setup`) or `"microsandbox"` (ADR-050, experimental
+    /// libkrun microVM — requires `temps microsandbox setup`). Omit for the
+    /// platform default; existing clients are unaffected. Requesting an
+    /// unavailable backend fails with 400 rather than silently downgrading
+    /// isolation.
     #[serde(default)]
     pub backend: Option<String>,
     /// Lifecycle class (ADR-036, temps-native): `"ephemeral"` (default) or
@@ -656,7 +658,7 @@ pub struct SandboxInner {
     // temps-native extras — the SDK ignores fields it doesn't know about.
     pub name: String,
     pub image: Option<String>,
-    /// Isolation backend: "docker" | "firecracker". `None` on legacy rows
+    /// Isolation backend: "docker" | "firecracker" | "microsandbox". `None` on legacy rows
     /// created before the backend was recorded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,

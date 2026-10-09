@@ -140,9 +140,11 @@ fn filter_agents_for_trigger(
 /// isolation, no resource limits, and no capability dropping — it is safe
 /// only for single-developer machines. We require an explicit opt-in via
 /// Assemble the sandbox provider registered for the whole server (ADR-029
-/// §2/§3). Docker is always present at this point; Firecracker joins when
-/// `temps firecracker setup` has provisioned this host and its smoke test
-/// passed. With both live, consumers get the routing provider — still one
+/// §2/§3, ADR-050). Docker is always present at this point; Firecracker
+/// joins when `temps firecracker setup` has provisioned this host and its
+/// smoke test passed; microsandbox joins when its runtime is installed
+/// (`temps microsandbox setup`) and the host has a usable hypervisor. With
+/// more than one live, consumers get the routing provider — still one
 /// `Arc<dyn SandboxProvider>`, per ADR-010. Registration is passive: this
 /// probes, it never downloads or mutates the host.
 async fn build_sandbox_provider(
@@ -154,33 +156,104 @@ async fn build_sandbox_provider(
     use crate::sandbox::routing::RoutingSandboxProvider;
     use crate::sandbox::SandboxBackend;
 
-    let data_dir = std::env::var("TEMPS_DATA_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
-                .join(".temps")
-        });
+    let data_dir = crate::sandbox::microsandbox::host_data_dir();
+    let mut backends: std::collections::HashMap<SandboxBackend, Arc<dyn SandboxProvider>> =
+        std::collections::HashMap::new();
+
     let firecracker = Arc::new(FirecrackerSandboxProvider::new(
-        FirecrackerSandboxConfig::from_data_dir(data_dir),
+        FirecrackerSandboxConfig::from_data_dir(data_dir.clone()),
         docker,
     ));
-    if !firecracker.is_available().await {
+    if firecracker.is_available().await {
+        backends.insert(SandboxBackend::Firecracker, firecracker);
+    }
+    if let Some(microsandbox) = microsandbox_provider(&data_dir) {
+        backends.insert(SandboxBackend::Microsandbox, microsandbox);
+    }
+    // Resolved before the Docker-only return so a configured-but-unavailable
+    // microVM default is still logged on hosts where only Docker is live.
+    let default = default_sandbox_backend(settings.sandbox_backend.as_deref(), |backend| {
+        backends.contains_key(&backend)
+    });
+    if backends.is_empty() {
         return docker_provider;
     }
 
-    let default = match settings.sandbox_backend.as_deref() {
-        Some("firecracker") => SandboxBackend::Firecracker,
-        _ => SandboxBackend::Docker,
-    };
-    let mut backends: std::collections::HashMap<SandboxBackend, Arc<dyn SandboxProvider>> =
-        std::collections::HashMap::new();
     backends.insert(SandboxBackend::Docker, docker_provider);
-    backends.insert(SandboxBackend::Firecracker, firecracker);
+    let mut available: Vec<String> = backends.keys().map(|b| b.to_string()).collect();
+    available.sort();
     tracing::info!(
-        "Firecracker sandbox backend available; routing provider active (default: {})",
+        "sandbox backends available: {}; routing provider active (default: {})",
+        available.join(", "),
         default
     );
     Arc::new(RoutingSandboxProvider::new(backends, default))
+}
+
+/// The host-default backend from the platform setting. Docker unless the
+/// operator picked a microVM backend that is actually registered on this
+/// host. A configured-but-unavailable microsandbox default is logged with
+/// the reason so it isn't a silent downgrade; per-sandbox explicit
+/// requests for it still fail closed in `temps-sandbox`.
+fn default_sandbox_backend(
+    configured: Option<&str>,
+    registered: impl Fn(crate::sandbox::SandboxBackend) -> bool,
+) -> crate::sandbox::SandboxBackend {
+    use crate::sandbox::SandboxBackend;
+    match configured {
+        Some("firecracker") if registered(SandboxBackend::Firecracker) => {
+            SandboxBackend::Firecracker
+        }
+        Some("microsandbox") if registered(SandboxBackend::Microsandbox) => {
+            SandboxBackend::Microsandbox
+        }
+        Some("microsandbox") => {
+            tracing::warn!(
+                "default sandbox backend is set to 'microsandbox' but it is not available on \
+                 this host; agent runs use docker until it is installed (see {})",
+                crate::sandbox::microsandbox::SETUP_PATH
+            );
+            SandboxBackend::Docker
+        }
+        _ => SandboxBackend::Docker,
+    }
+}
+
+/// The microsandbox backend (ADR-050) if this host can run it right now.
+#[cfg(not(target_env = "musl"))]
+fn microsandbox_provider(data_dir: &std::path::Path) -> Option<Arc<dyn SandboxProvider>> {
+    use crate::sandbox::microsandbox::{MicrosandboxSandboxConfig, MicrosandboxSandboxProvider};
+
+    let provider = match MicrosandboxSandboxProvider::new(MicrosandboxSandboxConfig::from_data_dir(
+        data_dir.to_path_buf(),
+    )) {
+        Ok(provider) => provider,
+        Err(error) => {
+            tracing::warn!("microsandbox sandbox backend not registered: {}", error);
+            return None;
+        }
+    };
+    match provider.probe() {
+        Ok(()) => {
+            tracing::info!("microsandbox sandbox backend available (experimental, ADR-050)");
+            Some(Arc::new(provider))
+        }
+        Err(reason) => {
+            tracing::debug!("microsandbox sandbox backend not registered: {}", reason);
+            None
+        }
+    }
+}
+
+/// musl builds don't link the microsandbox SDK; the status API reports why.
+#[cfg(target_env = "musl")]
+fn microsandbox_provider(data_dir: &std::path::Path) -> Option<Arc<dyn SandboxProvider>> {
+    let capability = crate::sandbox::microsandbox::microsandbox_capability(data_dir);
+    tracing::debug!(
+        "microsandbox sandbox backend not registered: {}",
+        capability.reason.unwrap_or_default()
+    );
+    None
 }
 
 /// `TEMPS_ALLOW_LOCAL_SANDBOX=1` so production deployments that temporarily
@@ -867,6 +940,41 @@ mod tests {
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase, Value};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn default_backend_honours_only_registered_microvm_backends() {
+        use crate::sandbox::SandboxBackend;
+        let all = |_: SandboxBackend| true;
+        let none = |_: SandboxBackend| false;
+
+        assert_eq!(default_sandbox_backend(None, all), SandboxBackend::Docker);
+        assert_eq!(
+            default_sandbox_backend(Some("docker"), all),
+            SandboxBackend::Docker
+        );
+        assert_eq!(
+            default_sandbox_backend(Some("firecracker"), all),
+            SandboxBackend::Firecracker
+        );
+        assert_eq!(
+            default_sandbox_backend(Some("microsandbox"), all),
+            SandboxBackend::Microsandbox
+        );
+        // A default that isn't registered on this host can't be routed to.
+        assert_eq!(
+            default_sandbox_backend(Some("firecracker"), none),
+            SandboxBackend::Docker
+        );
+        assert_eq!(
+            default_sandbox_backend(Some("microsandbox"), none),
+            SandboxBackend::Docker
+        );
+        // Registering microsandbox doesn't let it capture a firecracker default.
+        assert_eq!(
+            default_sandbox_backend(Some("firecracker"), |b| b == SandboxBackend::Microsandbox),
+            SandboxBackend::Docker
+        );
+    }
     use temps_entities::project_agents;
 
     #[test]
