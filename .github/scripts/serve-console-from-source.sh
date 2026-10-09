@@ -148,10 +148,20 @@ EOF
 # INT/TERM become an exit so the trap runs for them too. (SIGKILL cannot be
 # trapped -- callers that can kill this script also stop nginx via its pid
 # file, $WORK/nginx.pid.)
+#
+# Signalling alone is not enough: nginx shuts down asynchronously, and the
+# port stays bound until the master has reaped its workers and exited. Wait
+# for that (up to 10s, then SIGKILL) so the port is free when this returns.
 stop_nginx() {
-  "$NGINX" -q -p "$WORK" -e "$WORK/error.log" -c "$WORK/nginx.conf" -s stop 2>/dev/null \
-    || { [[ -f "$WORK/nginx.pid" ]] && kill "$(cat "$WORK/nginx.pid")" 2>/dev/null; } \
-    || true
+  local pid
+  pid=$(cat "$WORK/nginx.pid" 2>/dev/null) || return 0
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+  kill -TERM "$pid" 2>/dev/null || return 0
+  for _ in $(seq 1 100); do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.1
+  done
+  kill -KILL "$pid" 2>/dev/null || true
 }
 trap stop_nginx EXIT
 trap 'exit 130' INT TERM
