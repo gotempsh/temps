@@ -71,6 +71,14 @@ mod route_table_tests {
         restarted.load_routes().await?;
         assert_eq!(restarted.current_generation(), 43);
 
+        // A process that could not read the persisted value numbers from 1,
+        // but must not write that over the durable generation.
+        let unseeded = CachedPeerTable::new(db.clone());
+        unseeded.skip_generation_seed_for_test();
+        unseeded.load_routes().await?;
+        assert_eq!(unseeded.current_generation(), 1);
+        assert_eq!(current(db.clone()).await?, 43);
+
         Ok(())
     }
 

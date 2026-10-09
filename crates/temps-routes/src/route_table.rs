@@ -855,6 +855,14 @@ impl CachedPeerTable {
         }
     }
 
+    /// Behave as if the persisted generation had already been read, so a test
+    /// can stand in for a process whose startup read failed.
+    #[cfg(test)]
+    pub(crate) fn skip_generation_seed_for_test(&self) {
+        self.generation_seeded
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
     /// Current in-memory route table generation. Bumped on every
     /// successful `load_routes()`. Workers poll this via the sync
     /// endpoint to know when to refetch.
@@ -2659,10 +2667,16 @@ impl CachedPeerTable {
         // Best-effort — a transient DB error here doesn't block the
         // route table itself, and the next successful reload will
         // overwrite the stale value.
+        //
+        // Never lower it: when the startup read of the persisted value
+        // failed, this process numbers from 1 until a later reload can seed
+        // it, and writing that over the durable value would make every
+        // node's earlier ACK look ahead of the routes it actually has.
         let new_gen_i64: i64 = new_gen.try_into().unwrap_or(i64::MAX);
         let stmt = sea_orm::Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "UPDATE route_generation SET current = $1, updated_at = now() WHERE id = 1",
+            "UPDATE route_generation SET current = GREATEST(current, $1), updated_at = now() \
+             WHERE id = 1",
             [new_gen_i64.into()],
         );
         if let Err(e) = sea_orm::ConnectionTrait::execute(self.db.as_ref(), stmt).await {

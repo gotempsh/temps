@@ -49,8 +49,9 @@ pub struct CompiledWorkspaceApp {
 /// The selected Go module or Cargo crate when it needs sibling directories of
 /// the repository at `root`; `None` when building it alone is enough.
 ///
-/// An application that also has a `package.json` is left to the JavaScript
-/// workspace handling.
+/// A `package.json` beside the manifest (frontend tooling, for example) does
+/// not change this: callers decide which language builds the application,
+/// and a JavaScript workspace is resolved before this is consulted.
 pub fn compiled_workspace_app(
     root: &Path,
     selected: &Path,
@@ -67,9 +68,6 @@ pub fn compiled_workspace_app(
             .any(|component| !matches!(component, Component::Normal(_)))
     {
         return Err("Application directory escapes the source repository".to_string());
-    }
-    if is_regular_file(&selected.join("package.json")) {
-        return Ok(None);
     }
     let (language, ignore_go_work) = if is_regular_file(&selected.join("go.mod")) {
         match go_needs_repository(root, relative)? {
@@ -245,7 +243,9 @@ fn is_go_local_path(path: &str) -> bool {
 
 /// `Some(ignore_go_work)` when the Go module at `relative` needs the
 /// repository: a local `replace` outside the module, or a `go.work` above or
-/// at it that lists it.
+/// at it that lists it alongside other modules or carries `replace`
+/// directives -- building the module alone would drop that `go.work`, and
+/// its replacements with it.
 fn go_needs_repository(root: &Path, relative: &Path) -> Result<Option<bool>, String> {
     let go_mod = relative.join("go.mod");
     let contents = read_manifest(root, &go_mod)?.unwrap_or_default();
@@ -280,8 +280,27 @@ fn go_needs_repository(root: &Path, relative: &Path) -> Result<Option<bool>, Str
                 member |= resolved == relative;
                 outside |= !resolved.starts_with(relative);
             }
+            let replaces = go_directive_lines(&work, "replace");
             if member {
-                needs |= outside;
+                // Replacements in go.work apply to every member and resolve
+                // relative to the go.work, which is outside a module-only
+                // build. Local targets must exist inside the repository.
+                for replace in &replaces {
+                    let Some((_, target)) = replace.split_once("=>") else {
+                        continue;
+                    };
+                    let target = go_path_token(target);
+                    if Path::new(target).is_absolute() {
+                        return Err(escapes(target, &go_work));
+                    }
+                    if !is_go_local_path(target) {
+                        continue;
+                    }
+                    let resolved =
+                        resolve(&current, target).ok_or_else(|| escapes(target, &go_work))?;
+                    require_dependency(root, &resolved, "go.mod", target, &go_work)?;
+                }
+                needs |= outside || !replaces.is_empty();
             } else {
                 ignore_go_work = true;
             }
@@ -582,13 +601,75 @@ mod tests {
             "[package]\nname = \"qa-api\"\nversion = \"0.1.0\"\n[[bin]]\nname = \"qa-api\"\npath = \"../../src/main.rs\"\n[dependencies]\nserde = \"1\"\n",
         )]);
         assert_eq!(app(&root), Ok(None));
-        // A package.json leaves the decision to the JavaScript handling.
+    }
+
+    /// Frontend tooling beside a Go module or Cargo crate (a package.json for
+    /// CSS or asset builds) must not hide its sibling dependencies.
+    #[test]
+    fn a_package_json_beside_the_manifest_keeps_sibling_dependencies() {
         let root = repository(&[
-            ("apps/api/package.json", "{}"),
+            ("apps/api/package.json", "{\"scripts\":{\"css\":\"tailwindcss\"}}"),
             ("apps/api/go.mod", "module a\nreplace b => ../../packages/shared\n"),
             SHARED_GO,
         ]);
+        assert_eq!(
+            app(&root).unwrap().map(|app| app.language),
+            Some(CompiledLanguage::Go)
+        );
+        let root = repository(&[
+            ("apps/api/package.json", "{}"),
+            (
+                "apps/api/Cargo.toml",
+                "[package]\nname = \"qa-api\"\nversion = \"0.1.0\"\n[dependencies]\nqa-shared = { path = \"../../packages/shared\" }\n",
+            ),
+            SHARED_CARGO,
+        ]);
+        assert_eq!(
+            app(&root).unwrap().map(|app| app.language),
+            Some(CompiledLanguage::Cargo)
+        );
+    }
+
+    /// A go.work's `replace` directives apply to its members and resolve from
+    /// the go.work, so a member module that builds alone would lose them.
+    #[test]
+    fn go_work_replacements_keep_the_repository_in_the_build() {
+        let root = repository(&[
+            (
+                "go.work",
+                "go 1.22\nuse ./apps/api\nreplace example.test/qa/shared => ./packages/shared\n",
+            ),
+            ("apps/api/go.mod", "module example.test/qa/api\n"),
+            SHARED_GO,
+        ]);
+        let selected = app(&root).unwrap().expect("needs the repository");
+        assert_eq!(selected.language, CompiledLanguage::Go);
+        assert!(!selected.ignore_go_work);
+
+        // A version replacement is lost the same way.
+        let root = repository(&[
+            (
+                "go.work",
+                "go 1.22\nuse ./apps/api\nreplace (\n\tgithub.com/example/lib => github.com/fork/lib v1.0.1\n)\n",
+            ),
+            ("apps/api/go.mod", "module example.test/qa/api\n"),
+        ]);
+        assert!(app(&root).unwrap().is_some());
+
+        // A go.work that lists only the module and replaces nothing changes
+        // nothing about building it alone.
+        let root = repository(&[
+            ("go.work", "go 1.22\nuse ./apps/api\n"),
+            ("apps/api/go.mod", "module example.test/qa/api\n"),
+        ]);
         assert_eq!(app(&root), Ok(None));
+
+        // A local go.work replacement must stay inside the repository.
+        let root = repository(&[
+            ("go.work", "go 1.22\nuse ./apps/api\nreplace b => ../outside\n"),
+            ("apps/api/go.mod", "module example.test/qa/api\n"),
+        ]);
+        assert!(app(&root).is_err());
     }
 
     #[test]

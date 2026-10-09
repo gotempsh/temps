@@ -1180,17 +1180,7 @@ fn missing_directory_reason(repo_dir: &std::path::Path, normalized: &str) -> Str
                 found.join("/")
             );
         }
-        let mut directories: Vec<String> = std::fs::read_dir(&current)
-            .map(|entries| {
-                entries
-                    .filter_map(Result::ok)
-                    .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
-                    .filter_map(|entry| entry.file_name().into_string().ok())
-                    .filter(|name| name != ".git")
-                    .collect()
-            })
-            .unwrap_or_default();
-        directories.sort();
+        let listing = list_directories(&current, component);
         let parent = if found.is_empty() {
             "the repository root".to_string()
         } else {
@@ -1199,22 +1189,26 @@ fn missing_directory_reason(repo_dir: &std::path::Path, normalized: &str) -> Str
         let mut reason = format!(
             "'{normalized}' is not in the checked-out source: {parent} has no '{component}'"
         );
-        if let Some(near) = directories
-            .iter()
-            .find(|name| name.eq_ignore_ascii_case(component))
-        {
+        if let Some(near) = &listing.near_miss {
             let mut suggestion = found.clone();
             suggestion.push(near.as_str());
             reason.push_str(&format!(" (did you mean '{}'?)", suggestion.join("/")));
         }
-        if directories.is_empty() {
+        if listing.first.is_empty() {
             reason.push_str(" and contains no directories");
         } else {
-            let more = directories.len().saturating_sub(MAX_LISTED_DIRECTORIES);
-            directories.truncate(MAX_LISTED_DIRECTORIES);
-            reason.push_str(&format!("; it contains {}", directories.join(", ")));
-            if more > 0 {
-                reason.push_str(&format!(" and {more} more"));
+            let names: Vec<&str> = listing.first.iter().map(String::as_str).collect();
+            reason.push_str(&format!("; it contains {}", names.join(", ")));
+            if listing.truncated {
+                reason.push_str(&format!(
+                    " and {}{} more",
+                    if listing.scan_stopped {
+                        "at least "
+                    } else {
+                        ""
+                    },
+                    listing.total - listing.first.len()
+                ));
             }
         }
         return reason;
@@ -1222,6 +1216,63 @@ fn missing_directory_reason(repo_dir: &std::path::Path, normalized: &str) -> Str
     // Every component exists, so the final one is not a directory (for
     // example a dangling symbolic link).
     format!("'{normalized}' is not a directory in the checked-out source")
+}
+
+/// Entries examined at most when listing one directory of a checkout.
+const MAX_SCANNED_ENTRIES: usize = 10_000;
+
+/// The directories in one checkout directory, for an explanation.
+struct DirectoryListing {
+    /// The alphabetically first [`MAX_LISTED_DIRECTORIES`] names.
+    first: std::collections::BTreeSet<String>,
+    /// Directories seen in total (a lower bound when `scan_stopped`).
+    total: usize,
+    truncated: bool,
+    /// More than [`MAX_SCANNED_ENTRIES`] entries: the rest were not read.
+    scan_stopped: bool,
+    /// A directory whose name differs from `wanted` only in case.
+    near_miss: Option<String>,
+}
+
+/// List `directory` in constant memory and bounded time: a checkout may hold
+/// any number of entries, and only a few names are ever shown.
+fn list_directories(directory: &std::path::Path, wanted: &str) -> DirectoryListing {
+    let mut listing = DirectoryListing {
+        first: std::collections::BTreeSet::new(),
+        total: 0,
+        truncated: false,
+        scan_stopped: false,
+        near_miss: None,
+    };
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return listing;
+    };
+    for (scanned, entry) in entries.filter_map(Result::ok).enumerate() {
+        if scanned >= MAX_SCANNED_ENTRIES {
+            listing.scan_stopped = true;
+            listing.truncated = true;
+            break;
+        }
+        if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if name == ".git" {
+            continue;
+        }
+        listing.total += 1;
+        if listing.near_miss.is_none() && name.eq_ignore_ascii_case(wanted) {
+            listing.near_miss = Some(name.clone());
+        }
+        listing.first.insert(name);
+        if listing.first.len() > MAX_LISTED_DIRECTORIES {
+            listing.first.pop_last();
+            listing.truncated = true;
+        }
+    }
+    listing
 }
 
 /// The `.gitmodules` path containing (or equal to) `normalized`, if any.
@@ -2301,6 +2352,24 @@ mod tests {
 
         let reason = verify_project_directory(checkout.path(), "../outside").unwrap_err();
         assert!(reason.contains("not a relative path"), "{reason}");
+    }
+
+    /// A directory with many entries lists only the alphabetically first
+    /// names and counts the rest, without holding them all.
+    #[test]
+    fn a_large_directory_lists_the_first_names_and_counts_the_rest() {
+        let checkout = tempfile::tempdir().unwrap();
+        for index in 0..45 {
+            std::fs::create_dir(checkout.path().join(format!("svc-{index:02}"))).unwrap();
+        }
+        std::fs::write(checkout.path().join("README.md"), "files are not listed").unwrap();
+
+        let reason = verify_project_directory(checkout.path(), "svc-99").unwrap_err();
+
+        assert!(reason.contains("it contains svc-00, svc-01"), "{reason}");
+        assert!(reason.contains("svc-19 and 25 more"), "{reason}");
+        assert!(!reason.contains("svc-20"), "{reason}");
+        assert!(!reason.contains("README"), "{reason}");
     }
 
     #[test]

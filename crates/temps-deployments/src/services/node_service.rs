@@ -37,6 +37,86 @@ fn deployment_has_finished(state: &str) -> bool {
     )
 }
 
+/// The containers recorded on a node, split by what removing the node must
+/// do with them.
+#[derive(Debug, Default)]
+pub struct NodeContainerInventory {
+    /// Live rows of a current or still-running deployment. Moving them is a
+    /// drain's job; the node cannot be removed while any remain.
+    pub serving: Vec<deployment_containers::Model>,
+    /// Rows no deployment needs that are not confirmed gone, with the project
+    /// that owns each.
+    pub leftovers: Vec<(deployment_containers::Model, i32)>,
+    /// Rows recorded as removed, with the owning project.
+    pub recorded_removed: Vec<(deployment_containers::Model, i32)>,
+}
+
+/// What [`NodeService::remove_leftover_containers`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct LeftoverRemoval {
+    /// Containers removed from the node now.
+    pub removed: usize,
+    /// Recorded containers the node no longer has.
+    pub confirmed_gone: usize,
+    /// One line per container that may still exist on the node.
+    pub unremoved: Vec<String>,
+}
+
+/// Whether two Docker container IDs name the same container: equal, or one
+/// the (at least 12 character) prefix of the other, as short and full IDs are.
+fn same_container_id(a: &str, b: &str) -> bool {
+    a == b || (a.len().min(b.len()) >= 12 && (a.starts_with(b) || b.starts_with(a)))
+}
+
+/// Remove one recorded container from a node, but only if Docker still says
+/// it belongs to `project_id`. `Ok` means Temps confirmed it is gone (removed
+/// now, or already absent); `Err` explains why it is left in place.
+pub async fn remove_owned_container(
+    deployer: &dyn temps_deployer::ContainerDeployer,
+    container_id: &str,
+    project_id: i32,
+) -> Result<(), String> {
+    match deployer.get_container_info(container_id).await {
+        Ok(info) => {
+            let expected_project = project_id.to_string();
+            if info.labels.get("sh.temps.managed").map(String::as_str) != Some("true")
+                || info.labels.get("sh.temps.project_id") != Some(&expected_project)
+            {
+                return Err(format!(
+                    "its labels do not show it belongs to project {project_id}, so it was left in place"
+                ));
+            }
+        }
+        Err(temps_deployer::DeployerError::ContainerNotFound(_)) => return Ok(()),
+        Err(error) => return Err(format!("could not inspect it: {error}")),
+    }
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        deployer.remove_container(container_id),
+    )
+    .await
+    {
+        Ok(Ok(())) | Ok(Err(temps_deployer::DeployerError::ContainerNotFound(_))) => Ok(()),
+        Ok(Err(error)) => Err(format!("removal failed: {error}")),
+        Err(_) => Err("removal timed out after 30 seconds".to_string()),
+    }
+}
+
+/// One line per container a node removal could not confirm is gone.
+pub fn describe_unremoved_container(
+    container: &deployment_containers::Model,
+    project_id: i32,
+    reason: &str,
+) -> String {
+    format!(
+        "container '{}' ({}) of deployment {} in project {project_id}, status {}: {reason}",
+        container.container_name,
+        container.container_id,
+        container.deployment_id,
+        container.status.as_deref().unwrap_or("unknown"),
+    )
+}
+
 /// The `error_message` recorded on a container orphaned by removing its node,
 /// so the placement survives the `node_id` being cleared.
 fn orphaned_container_note(node_name: &str, node_id: i32) -> String {
@@ -65,6 +145,17 @@ pub enum NodeError {
         node_id: i32,
         node_name: String,
         count: u64,
+    },
+
+    #[error(
+        "Node '{node_name}' (id {node_id}) still has {count} container(s) of current or \
+         in-progress deployments; drain it with POST /internal/nodes/{node_id}/drain and wait \
+         for its redeploys to finish before removing it"
+    )]
+    StillServing {
+        node_id: i32,
+        node_name: String,
+        count: usize,
     },
 
     #[error("Invalid node configuration: {message}")]
@@ -1602,6 +1693,23 @@ impl NodeService {
                 count: live_sandboxes,
             });
         }
+        // Checked again under the lock: a deployment may have placed a
+        // container here since the caller looked. A container insert takes a
+        // KEY SHARE lock on this row through `deployment_containers.node_id`,
+        // so it is either committed and seen here, or waits and then fails
+        // the foreign key once the node is gone. Never orphan a container a
+        // deployment is using.
+        let serving = Self::node_container_inventory_on(&txn, node_id)
+            .await?
+            .serving
+            .len();
+        if serving > 0 {
+            return Err(NodeError::StillServing {
+                node_id,
+                node_name: locked.name,
+                count: serving,
+            });
+        }
 
         // `deployment_containers.node_id` is `ON DELETE SET NULL`, and NULL
         // means "the local Docker daemon". Any container not confirmed gone
@@ -1659,29 +1767,26 @@ impl NodeService {
             )
     }
 
-    /// Containers on a node that no deployment needs any more but that Temps
-    /// has not confirmed are gone from the node's Docker daemon. That is every
-    /// row out of routing (`deleted_at` set: stopped, retired while the node
-    /// was offline, or interrupted mid-removal), plus every row still marked
-    /// live whose deployment has finished and is not its environment's current
-    /// one — a superseded container whose teardown could not reach the node,
-    /// which otherwise stays "running" for as long as the node is unreachable.
-    /// Containers of current or still-running deployments are never included.
-    /// Each comes with the project that owns it, so the caller can verify
-    /// ownership before removing it. Removing the node first would lose track
-    /// of them.
-    pub async fn unconfirmed_containers_for_node(
-        &self,
+    /// Every container recorded on a node that Temps still accounts for
+    /// (anything not already orphaned), split by what removing the node has
+    /// to do with it. Three queries regardless of how many rows there are.
+    async fn node_container_inventory_on<C: sea_orm::ConnectionTrait>(
+        db: &C,
         node_id: i32,
-    ) -> Result<Vec<(deployment_containers::Model, i32)>, NodeError> {
+    ) -> Result<NodeContainerInventory, NodeError> {
+        let mut inventory = NodeContainerInventory::default();
         let containers = deployment_containers::Entity::find()
             .filter(deployment_containers::Column::NodeId.eq(node_id))
-            .filter(Self::not_confirmed_gone())
+            .filter(
+                Condition::any()
+                    .add(deployment_containers::Column::Status.is_null())
+                    .add(deployment_containers::Column::Status.ne(CONTAINER_STATUS_ORPHANED)),
+            )
             .order_by_asc(deployment_containers::Column::Id)
-            .all(self.db.as_ref())
+            .all(db)
             .await?;
         if containers.is_empty() {
-            return Ok(Vec::new());
+            return Ok(inventory);
         }
         let deployment_ids: Vec<i32> = containers
             .iter()
@@ -1692,7 +1797,7 @@ impl NodeService {
         let owners: std::collections::HashMap<i32, deployments::Model> =
             deployments::Entity::find()
                 .filter(deployments::Column::Id.is_in(deployment_ids))
-                .all(self.db.as_ref())
+                .all(db)
                 .await?
                 .into_iter()
                 .map(|deployment| (deployment.id, deployment))
@@ -1705,21 +1810,176 @@ impl NodeService {
             .collect();
         let current: HashSet<i32> = environments::Entity::find()
             .filter(environments::Column::Id.is_in(environment_ids))
-            .all(self.db.as_ref())
+            .all(db)
             .await?
             .into_iter()
             .filter_map(|environment| environment.current_deployment_id)
             .collect();
-        Ok(containers
-            .into_iter()
-            .filter_map(|container| {
-                let deployment = owners.get(&container.deployment_id)?;
-                let needed = container.deleted_at.is_none()
-                    && (current.contains(&deployment.id)
-                        || !deployment_has_finished(&deployment.state));
-                (!needed).then_some((container, deployment.project_id))
-            })
-            .collect())
+        for container in containers {
+            let Some(deployment) = owners.get(&container.deployment_id) else {
+                continue;
+            };
+            let project_id = deployment.project_id;
+            if container.status.as_deref() == Some(CONTAINER_STATUS_REMOVED) {
+                inventory.recorded_removed.push((container, project_id));
+            } else if container.deleted_at.is_none()
+                && (current.contains(&deployment.id) || !deployment_has_finished(&deployment.state))
+            {
+                inventory.serving.push(container);
+            } else {
+                inventory.leftovers.push((container, project_id));
+            }
+        }
+        Ok(inventory)
+    }
+
+    /// The containers recorded on a node, split as [`NodeContainerInventory`]
+    /// describes.
+    pub async fn node_container_inventory(
+        &self,
+        node_id: i32,
+    ) -> Result<NodeContainerInventory, NodeError> {
+        Self::node_container_inventory_on(self.db.as_ref(), node_id).await
+    }
+
+    /// Before a node is removed, remove the containers Temps left on it that
+    /// no deployment needs, so nothing is lost track of once the node row is
+    /// gone. Refuses with [`NodeError::StillServing`] while a current or
+    /// in-progress deployment still has containers there.
+    ///
+    /// With a reachable agent the recorded rows are reconciled against what
+    /// the node actually holds, in one listing: a container that is not there
+    /// is confirmed gone, and one that is there is removed after its labels
+    /// confirm the owning project. That includes rows already recorded as
+    /// removed, because releases before this one recorded drained containers
+    /// as removed after only stopping them. Without an agent, every leftover
+    /// is reported back unremoved; rows recorded as removed cannot be checked
+    /// and are left as recorded.
+    pub async fn remove_leftover_containers(
+        &self,
+        node: &nodes::Model,
+        deployer: Option<&dyn temps_deployer::ContainerDeployer>,
+    ) -> Result<LeftoverRemoval, NodeError> {
+        let inventory = self.node_container_inventory(node.id).await?;
+        if !inventory.serving.is_empty() {
+            return Err(NodeError::StillServing {
+                node_id: node.id,
+                node_name: node.name.clone(),
+                count: inventory.serving.len(),
+            });
+        }
+        let mut outcome = LeftoverRemoval::default();
+        if inventory.leftovers.is_empty() && inventory.recorded_removed.is_empty() {
+            return Ok(outcome);
+        }
+
+        let present = match deployer {
+            Some(deployer) => match deployer.list_containers().await {
+                Ok(listed) => Ok(listed
+                    .into_iter()
+                    .map(|container| container.container_id)
+                    .collect::<Vec<_>>()),
+                Err(error) => Err(format!("listing the node's containers failed: {error}")),
+            },
+            None => Err("the node's agent cannot be reached".to_string()),
+        };
+        let present = match present {
+            Ok(present) => present,
+            Err(reason) => {
+                outcome.unremoved = inventory
+                    .leftovers
+                    .iter()
+                    .map(|(container, project_id)| {
+                        describe_unremoved_container(container, *project_id, &reason)
+                    })
+                    .collect();
+                if !inventory.recorded_removed.is_empty() {
+                    tracing::warn!(
+                        node_id = node.id,
+                        unverified = inventory.recorded_removed.len(),
+                        "Containers recorded as removed on this node could not be verified: {}",
+                        reason
+                    );
+                }
+                return Ok(outcome);
+            }
+        };
+        let deployer = deployer.ok_or_else(|| NodeError::Validation {
+            message: format!(
+                "node {} listed its containers without a deployer to remove them",
+                node.id
+            ),
+        })?;
+
+        let on_node = |container_id: &str| {
+            present
+                .iter()
+                .any(|listed| same_container_id(listed, container_id))
+        };
+        let candidates = inventory
+            .leftovers
+            .iter()
+            .map(|entry| (entry, false))
+            .chain(inventory.recorded_removed.iter().map(|entry| (entry, true)));
+        for ((container, project_id), recorded_removed) in candidates {
+            if !on_node(&container.container_id) {
+                if !recorded_removed {
+                    self.mark_container_removed(container.id).await?;
+                }
+                outcome.confirmed_gone += 1;
+                continue;
+            }
+            match remove_owned_container(deployer, &container.container_id, *project_id).await {
+                Ok(()) => {
+                    self.mark_container_removed(container.id).await?;
+                    outcome.removed += 1;
+                    tracing::info!(
+                        node_id = node.id,
+                        container_id = %container.container_id,
+                        deployment_id = container.deployment_id,
+                        "Removed leftover container before removing node"
+                    );
+                }
+                Err(reason) => {
+                    // A row recorded as removed whose container is still
+                    // here is not removed: record it as retired, so a forced
+                    // removal orphans it instead of forgetting it.
+                    if recorded_removed {
+                        self.mark_container_retired(container.id).await?;
+                    }
+                    tracing::warn!(
+                        node_id = node.id,
+                        container_id = %container.container_id,
+                        deployment_id = container.deployment_id,
+                        "Could not remove leftover container before removing node: {}",
+                        reason
+                    );
+                    outcome.unremoved.push(describe_unremoved_container(
+                        container,
+                        *project_id,
+                        &reason,
+                    ));
+                }
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Record a container as out of routing but possibly still on its node.
+    pub async fn mark_container_retired(&self, container_row_id: i32) -> Result<(), NodeError> {
+        deployment_containers::Entity::update_many()
+            .col_expr(
+                deployment_containers::Column::Status,
+                Expr::value(CONTAINER_STATUS_RETIRED),
+            )
+            .col_expr(
+                deployment_containers::Column::DeletedAt,
+                Expr::cust("COALESCE(deleted_at, now())"),
+            )
+            .filter(deployment_containers::Column::Id.eq(container_row_id))
+            .exec(self.db.as_ref())
+            .await?;
+        Ok(())
     }
 
     pub async fn mark_container_removed(&self, container_row_id: i32) -> Result<(), NodeError> {
@@ -2326,6 +2586,8 @@ mod tests {
                 "num_items".to_string(),
                 sea_orm::Value::BigInt(Some(0)),
             )])]])
+            // nothing serving on the node under the lock
+            .append_query_results(vec![Vec::<deployment_containers::Model>::new()])
             // orphan any unconfirmed containers (none here)
             .append_exec_results(vec![sea_orm::MockExecResult {
                 last_insert_id: 0,
@@ -2339,6 +2601,39 @@ mod tests {
         let service = NodeService::new(Arc::new(db));
 
         service.remove(1).await.unwrap();
+    }
+
+    /// A deployment that placed a container on the node after the caller
+    /// checked must not have it orphaned: the check is repeated under the
+    /// node lock and refuses.
+    #[tokio::test]
+    async fn test_remove_refuses_a_container_placed_after_the_check() {
+        let mut running = sample_deployment(30, 100, 200);
+        running.state = "running".to_string();
+        let db = with_no_dns_records(MockDatabase::new(DatabaseBackend::Postgres))
+            .append_query_results(vec![vec![sample_node()]]) // FOR UPDATE lock
+            .append_query_results(vec![vec![std::collections::BTreeMap::from([(
+                "num_items".to_string(),
+                sea_orm::Value::BigInt(Some(0)),
+            )])]])
+            .append_query_results(vec![vec![sample_container(9, 30, 1)]])
+            .append_query_results(vec![vec![running]])
+            .append_query_results(vec![vec![sample_environment(200, 100, Some(10))]])
+            .into_connection();
+        let service = NodeService::new(Arc::new(db));
+
+        let err = service.remove(1).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                NodeError::StillServing {
+                    node_id: 1,
+                    count: 1,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
@@ -3681,47 +3976,297 @@ mod tests {
         );
     }
 
-    /// Node removal must account for every container no deployment needs —
-    /// including one still marked live because the redeploy that superseded
-    /// it could not reach the node to tear it down — but never for the
-    /// containers of a current or still-running deployment.
-    #[tokio::test]
-    async fn unconfirmed_containers_include_superseded_live_rows_but_not_needed_ones() {
+    /// The rows the inventory below is built from: a current deployment's
+    /// live container, a superseded one whose teardown never reached the
+    /// node, a still-running deployment's, a retired failed one, and one
+    /// recorded as removed.
+    fn inventory_database(extra: impl FnOnce(MockDatabase) -> MockDatabase) -> MockDatabase {
         let current = sample_container(1, 10, 5);
-        let superseded = sample_container(2, 20, 5);
+        let mut superseded = sample_container(2, 20, 5);
+        superseded.container_id = "c-superseded".to_string();
         let in_progress = sample_container(3, 30, 5);
         let mut retired = sample_container(4, 40, 5);
+        retired.container_id = "c-retired".to_string();
         retired.deleted_at = Some(chrono::Utc::now());
         retired.status = Some(CONTAINER_STATUS_RETIRED.to_string());
+        let mut recorded_removed = sample_container(5, 50, 5);
+        recorded_removed.container_id = "c-recorded-removed".to_string();
+        recorded_removed.deleted_at = Some(chrono::Utc::now());
+        recorded_removed.status = Some(CONTAINER_STATUS_REMOVED.to_string());
 
         let mut running = sample_deployment(30, 101, 201);
         running.state = "running".to_string();
         let mut failed = sample_deployment(40, 101, 201);
         failed.state = "failed".to_string();
 
-        let db = MockDatabase::new(DatabaseBackend::Postgres)
-            // rows on the node not confirmed gone
-            .append_query_results(vec![vec![current, superseded, in_progress, retired]])
-            .append_query_results(vec![vec![
-                sample_deployment(10, 100, 200),
-                sample_deployment(20, 100, 200),
-                running,
-                failed,
-            ]])
-            .append_query_results(vec![vec![
-                sample_environment(200, 100, Some(10)),
-                sample_environment(201, 101, None),
-            ]])
-            .into_connection();
-        let service = NodeService::new(Arc::new(db));
+        extra(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![
+                    current,
+                    superseded,
+                    in_progress,
+                    retired,
+                    recorded_removed,
+                ]])
+                .append_query_results(vec![vec![
+                    sample_deployment(10, 100, 200),
+                    sample_deployment(20, 100, 200),
+                    running,
+                    failed,
+                    sample_deployment(50, 102, 202),
+                ]])
+                .append_query_results(vec![vec![
+                    sample_environment(200, 100, Some(10)),
+                    sample_environment(201, 101, None),
+                    sample_environment(202, 102, None),
+                ]]),
+        )
+    }
 
-        let leftovers = service.unconfirmed_containers_for_node(5).await.unwrap();
+    /// Node removal accounts for every container no deployment needs —
+    /// including one still marked live because the redeploy that superseded
+    /// it could not reach the node — but never for the containers of a
+    /// current or still-running deployment.
+    #[tokio::test]
+    async fn node_container_inventory_splits_rows_by_what_removal_must_do() {
+        let service = NodeService::new(Arc::new(inventory_database(|db| db).into_connection()));
 
-        let found: Vec<(i32, i32)> = leftovers
-            .iter()
-            .map(|(container, project_id)| (container.id, *project_id))
-            .collect();
-        assert_eq!(found, vec![(2, 100), (4, 101)]);
+        let inventory = service.node_container_inventory(5).await.unwrap();
+
+        let ids = |rows: &[(deployment_containers::Model, i32)]| {
+            rows.iter()
+                .map(|(container, project_id)| (container.id, *project_id))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            inventory.serving.iter().map(|c| c.id).collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert_eq!(ids(&inventory.leftovers), vec![(2, 100), (4, 101)]);
+        assert_eq!(ids(&inventory.recorded_removed), vec![(5, 102)]);
+    }
+
+    mod leftover_removal {
+        use super::*;
+        use mockall::mock;
+        use std::collections::HashMap;
+
+        mock! {
+            Deployer {}
+            #[async_trait::async_trait]
+            impl temps_deployer::ContainerDeployer for Deployer {
+                async fn deploy_container(&self, request: temps_deployer::DeployRequest) -> Result<temps_deployer::DeployResult, temps_deployer::DeployerError>;
+                async fn start_container(&self, container_id: &str) -> Result<(), temps_deployer::DeployerError>;
+                async fn stop_container(&self, container_id: &str) -> Result<(), temps_deployer::DeployerError>;
+                async fn pause_container(&self, container_id: &str) -> Result<(), temps_deployer::DeployerError>;
+                async fn resume_container(&self, container_id: &str) -> Result<(), temps_deployer::DeployerError>;
+                async fn remove_container(&self, container_id: &str) -> Result<(), temps_deployer::DeployerError>;
+                async fn get_container_info(&self, container_id: &str) -> Result<temps_deployer::ContainerInfo, temps_deployer::DeployerError>;
+                async fn get_container_stats(&self, container_id: &str) -> Result<temps_deployer::ContainerStats, temps_deployer::DeployerError>;
+                async fn list_containers(&self) -> Result<Vec<temps_deployer::ContainerInfo>, temps_deployer::DeployerError>;
+                async fn get_container_logs(&self, container_id: &str) -> Result<String, temps_deployer::DeployerError>;
+                async fn stream_container_logs(&self, container_id: &str) -> Result<Box<dyn futures::Stream<Item = String> + Unpin + Send>, temps_deployer::DeployerError>;
+                async fn image_exists(&self, image_name: &str) -> Result<bool, temps_deployer::DeployerError>;
+            }
+        }
+
+        fn on_node(container_id: &str, project_id: &str) -> temps_deployer::ContainerInfo {
+            temps_deployer::ContainerInfo {
+                container_id: container_id.to_string(),
+                labels: HashMap::from([
+                    ("sh.temps.managed".to_string(), "true".to_string()),
+                    ("sh.temps.project_id".to_string(), project_id.to_string()),
+                ]),
+                ..Default::default()
+            }
+        }
+
+        fn updated() -> sea_orm::MockExecResult {
+            sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }
+        }
+
+        /// Only containers no deployment needs, plus one recorded as
+        /// removed, so removal can proceed.
+        fn removable_database(extra: impl FnOnce(MockDatabase) -> MockDatabase) -> MockDatabase {
+            let mut superseded = sample_container(2, 20, 5);
+            superseded.container_id = "c-superseded".to_string();
+            let mut retired = sample_container(4, 40, 5);
+            retired.container_id = "c-retired".to_string();
+            retired.deleted_at = Some(chrono::Utc::now());
+            retired.status = Some(CONTAINER_STATUS_RETIRED.to_string());
+            let mut recorded_removed = sample_container(5, 50, 5);
+            recorded_removed.container_id = "c-recorded-removed".to_string();
+            recorded_removed.deleted_at = Some(chrono::Utc::now());
+            recorded_removed.status = Some(CONTAINER_STATUS_REMOVED.to_string());
+            let mut failed = sample_deployment(40, 101, 201);
+            failed.state = "failed".to_string();
+            extra(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results(vec![vec![superseded, retired, recorded_removed]])
+                    .append_query_results(vec![vec![
+                        sample_deployment(20, 100, 200),
+                        failed,
+                        sample_deployment(50, 102, 202),
+                    ]])
+                    .append_query_results(vec![vec![
+                        sample_environment(200, 100, Some(10)),
+                        sample_environment(201, 101, None),
+                        sample_environment(202, 102, None),
+                    ]]),
+            )
+        }
+
+        fn node() -> nodes::Model {
+            let mut node = sample_node();
+            node.id = 5;
+            node
+        }
+
+        #[tokio::test]
+        async fn removal_is_refused_while_a_deployment_uses_the_node() {
+            let service = NodeService::new(Arc::new(inventory_database(|db| db).into_connection()));
+            let mut deployer = MockDeployer::new();
+            deployer.expect_list_containers().never();
+            deployer.expect_remove_container().never();
+
+            let err = service
+                .remove_leftover_containers(&node(), Some(&deployer))
+                .await
+                .unwrap_err();
+
+            assert!(
+                matches!(
+                    err,
+                    NodeError::StillServing {
+                        node_id: 5,
+                        count: 2,
+                        ..
+                    }
+                ),
+                "{err:?}"
+            );
+        }
+
+        /// With the agent reachable, recorded rows are reconciled against
+        /// what the node holds in one listing: what is gone is confirmed,
+        /// what is there is removed -- including a container recorded as
+        /// removed that an earlier release only stopped.
+        #[tokio::test]
+        async fn a_reachable_node_is_reconciled_against_its_own_listing() {
+            let db = removable_database(|db| {
+                db.append_exec_results(vec![updated(), updated(), updated()])
+            });
+            let service = NodeService::new(Arc::new(db.into_connection()));
+            let mut deployer = MockDeployer::new();
+            deployer.expect_list_containers().times(1).returning(|| {
+                Ok(vec![
+                    on_node("c-superseded", "100"),
+                    on_node("c-recorded-removed", "102"),
+                ])
+            });
+            deployer
+                .expect_get_container_info()
+                .returning(|id| match id {
+                    "c-superseded" => Ok(on_node(id, "100")),
+                    _ => Ok(on_node(id, "102")),
+                });
+            deployer
+                .expect_remove_container()
+                .withf(|id| id == "c-superseded" || id == "c-recorded-removed")
+                .times(2)
+                .returning(|_| Ok(()));
+
+            let outcome = service
+                .remove_leftover_containers(&node(), Some(&deployer))
+                .await
+                .unwrap();
+
+            assert_eq!(
+                outcome,
+                LeftoverRemoval {
+                    removed: 2,
+                    confirmed_gone: 1,
+                    unremoved: Vec::new(),
+                }
+            );
+        }
+
+        /// A container recorded as removed that is still on the node and
+        /// cannot be removed is reported, and recorded as retired so a forced
+        /// removal orphans it instead of forgetting it.
+        #[tokio::test]
+        async fn a_recorded_removal_that_is_still_there_is_not_forgotten() {
+            let db = removable_database(|db| {
+                // c-retired confirmed gone, c-superseded removed, then the
+                // recorded-removed row is set back to retired.
+                db.append_exec_results(vec![updated(), updated(), updated()])
+            });
+            let service = NodeService::new(Arc::new(db.into_connection()));
+            let mut deployer = MockDeployer::new();
+            deployer.expect_list_containers().returning(|| {
+                Ok(vec![
+                    on_node("c-superseded", "100"),
+                    on_node("c-recorded-removed", "999"),
+                ])
+            });
+            deployer
+                .expect_get_container_info()
+                .returning(|id| match id {
+                    "c-superseded" => Ok(on_node(id, "100")),
+                    _ => Ok(on_node(id, "999")),
+                });
+            deployer
+                .expect_remove_container()
+                .withf(|id| id == "c-superseded")
+                .times(1)
+                .returning(|_| Ok(()));
+
+            let outcome = service
+                .remove_leftover_containers(&node(), Some(&deployer))
+                .await
+                .unwrap();
+
+            assert_eq!(outcome.removed, 1);
+            assert_eq!(outcome.confirmed_gone, 1);
+            assert_eq!(outcome.unremoved.len(), 1);
+            assert!(
+                outcome.unremoved[0].contains("c-recorded-removed")
+                    && outcome.unremoved[0].contains("project 102"),
+                "{:?}",
+                outcome.unremoved
+            );
+        }
+
+        /// Without an agent nothing is confirmed: every leftover is reported
+        /// and no row is rewritten.
+        #[tokio::test]
+        async fn an_unreachable_node_reports_every_leftover() {
+            let service = NodeService::new(Arc::new(removable_database(|db| db).into_connection()));
+
+            let outcome = service
+                .remove_leftover_containers(&node(), None)
+                .await
+                .unwrap();
+
+            assert_eq!(outcome.removed, 0);
+            assert_eq!(outcome.confirmed_gone, 0);
+            assert_eq!(outcome.unremoved.len(), 2);
+            assert!(outcome
+                .unremoved
+                .iter()
+                .all(|line| line.contains("cannot be reached")));
+        }
+
+        #[test]
+        fn short_and_full_container_ids_match() {
+            assert!(same_container_id("abcdef123456", "abcdef1234567890"));
+            assert!(same_container_id("abcdef1234567890", "abcdef1234567890"));
+            assert!(!same_container_id("abc", "abcdef1234567890"));
+            assert!(!same_container_id("abcdef123456", "abcdef654321"));
+        }
     }
 
     #[test]

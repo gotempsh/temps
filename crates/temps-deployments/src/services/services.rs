@@ -119,8 +119,8 @@ struct PipelineTriggerOptions {
 }
 
 /// What a node drain or failover redeploy rebuilds a deployment from.
-#[derive(Debug, PartialEq, Eq)]
-enum RedeploySource {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RedeploySource {
     /// A pre-built image, pulled again (imports, `deployFromImage`).
     Image {
         image_ref: String,
@@ -255,31 +255,41 @@ pub(crate) fn is_unique_violation(err: &sea_orm::DbErr) -> bool {
 /// Why owner cleanup may skip a container whose runtime cannot be resolved,
 /// or `None` when the failure must stop the deletion.
 ///
-/// Only two cases qualify, both where retrying could never succeed: a row
-/// already recorded as removed, and a row with no node on a process that has
-/// no local Docker daemon. `deployment_containers.node_id` is cleared when a
-/// node is removed, so on a control plane that runs no containers such a row
-/// was placed on a worker that is gone; there is no daemon Temps could ask.
+/// Only a row already recorded as removed qualifies: an unreachable runtime
+/// cannot contradict that. Anything else may still exist, so the deletion
+/// stops and says where -- including a row that records no node on a
+/// process with no Docker daemon, which may be a container this server ran
+/// itself before it was restarted without workloads.
 fn unreachable_container_skip(
     container: &deployment_containers::Model,
     error: &DeploymentError,
 ) -> Option<String> {
-    if container.status.as_deref() == Some(CONTAINER_STATUS_REMOVED) {
-        return Some(format!(
+    (container.status.as_deref() == Some(CONTAINER_STATUS_REMOVED)).then(|| {
+        format!(
             "Skipping container already recorded as removed; its runtime cannot be checked: {error}"
-        ));
-    }
+        )
+    })
+}
+
+/// The reason a deletion stops on a container whose runtime cannot be
+/// resolved, with the remedy for the one case operators cannot infer: a row
+/// with no node on a process that has no Docker daemon.
+fn unreachable_container_reason(
+    container: &deployment_containers::Model,
+    error: &DeploymentError,
+) -> String {
     if container.node_id.is_none() && matches!(error, DeploymentError::DockerUnavailable(_)) {
-        return Some(format!(
-            "Skipping container '{}' (status {}) that records no node: this process runs no local \
-             Docker daemon, so it was placed on a worker that has since been removed from the \
-             cluster. Temps cannot reach it; if that host still exists, remove it there with \
-             `docker rm -f`",
+        format!(
+            "{error}. Container '{}' (status {}) records no node, so it is either a local \
+             container from when this server ran workloads -- start it with a profile that runs \
+             workloads and delete again -- or it was left on a worker removed before Temps \
+             recorded such containers; remove it on that host with `docker rm -f`",
             container.container_name,
             container.status.as_deref().unwrap_or("unknown")
-        ));
+        )
+    } else {
+        error.to_string()
     }
-    None
 }
 
 fn confined_archive_path(
@@ -1002,7 +1012,7 @@ impl DeploymentService {
                         environment_id: container_environment_id,
                         container_id,
                         node_id,
-                        reason: error.to_string(),
+                        reason: unreachable_container_reason(&original, &error),
                     });
                 }
             };
@@ -2257,43 +2267,120 @@ impl DeploymentService {
     }
 
     /// Confirm that [`Self::redeploy_environment`] can rebuild this deployment
-    /// somewhere else, without queuing anything. Node drain runs this for
-    /// every workload it would have to move *before* it marks the node
-    /// draining, so a workload with nothing to rebuild from is refused up
-    /// front instead of leaving the node draining forever.
+    /// somewhere else, without queuing anything.
     pub async fn check_redeployable(
         &self,
         project_id: i32,
         environment_id: i32,
         deployment_id: i32,
     ) -> Result<(), DeploymentError> {
-        self.resolve_redeploy_source(project_id, environment_id, deployment_id)
-            .await
+        self.plan_redeploys(&[(project_id, environment_id, deployment_id)])
+            .await?
+            .pop()
+            .unwrap_or_else(|| {
+                Err(DeploymentError::Other(format!(
+                    "No redeploy plan was produced for deployment {deployment_id}"
+                )))
+            })
             .map(|_| ())
     }
 
-    async fn resolve_redeploy_source(
+    /// What each `(project_id, environment_id, deployment_id)` would be rebuilt
+    /// from, in order, without queuing anything. Node drain plans every
+    /// workload it has to move *before* it marks the node draining, so a
+    /// workload with nothing to rebuild from is refused up front instead of
+    /// leaving the node draining forever, and then redeploys from these plans
+    /// with [`Self::redeploy_environment_from`]. Two queries however many
+    /// workloads there are; the outer `Err` is a database failure.
+    pub async fn plan_redeploys(
         &self,
-        project_id: i32,
-        environment_id: i32,
-        deployment_id: i32,
-    ) -> Result<RedeploySource, DeploymentError> {
-        // Use the deployment that owns the affected containers. Selecting the
-        // newest row can race a concurrent failed/cancelled deploy and restore
-        // the wrong workload during failover.
-        let deploy = deployments::Entity::find_by_id(deployment_id)
-            .filter(deployments::Column::ProjectId.eq(project_id))
-            .filter(deployments::Column::EnvironmentId.eq(environment_id))
-            .one(self.db.as_ref())
+        targets: &[(i32, i32, i32)],
+    ) -> Result<Vec<Result<RedeploySource, DeploymentError>>, DeploymentError> {
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let deployment_ids: Vec<i32> = targets.iter().map(|(_, _, id)| *id).collect();
+        let loaded: HashMap<i32, deployments::Model> = deployments::Entity::find()
+            .filter(deployments::Column::Id.is_in(deployment_ids.clone()))
+            .all(self.db.as_ref())
             .await
-            .map_err(|e| DeploymentError::Other(format!(
-                "Failed to load deployment {deployment_id} for project {project_id}, environment {environment_id}: {e}"
-            )))?
-            .ok_or_else(|| {
-                DeploymentError::NotFound(format!(
-                    "Deployment {deployment_id} was not found in project {project_id}, environment {environment_id}"
+            .map_err(|e| {
+                DeploymentError::Other(format!(
+                    "Failed to load deployments {deployment_ids:?} to plan their redeploys: {e}"
                 ))
-            })?;
+            })?
+            .into_iter()
+            .map(|deployment| (deployment.id, deployment))
+            .collect();
+        // Only Git rebuilds need the project row.
+        let project_ids: Vec<i32> = targets
+            .iter()
+            .filter(|(_, _, id)| {
+                loaded
+                    .get(id)
+                    .is_some_and(|deploy| !Self::rebuilds_from_metadata(deploy))
+            })
+            .map(|(project_id, _, _)| *project_id)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let projects: HashMap<i32, projects::Model> = if project_ids.is_empty() {
+            HashMap::new()
+        } else {
+            projects::Entity::find()
+                .filter(projects::Column::Id.is_in(project_ids.clone()))
+                .filter(projects::Column::IsDeleted.eq(false))
+                .all(self.db.as_ref())
+                .await
+                .map_err(|e| {
+                    DeploymentError::Other(format!(
+                        "Failed to load projects {project_ids:?} to plan their redeploys: {e}"
+                    ))
+                })?
+                .into_iter()
+                .map(|project| (project.id, project))
+                .collect()
+        };
+
+        let mut plans = Vec::with_capacity(targets.len());
+        for &(project_id, environment_id, deployment_id) in targets {
+            // Use the deployment that owns the affected containers. Selecting
+            // the newest row can race a concurrent failed/cancelled deploy and
+            // restore the wrong workload during failover.
+            let Some(deploy) = loaded.get(&deployment_id).filter(|deploy| {
+                deploy.project_id == project_id && deploy.environment_id == environment_id
+            }) else {
+                plans.push(Err(DeploymentError::NotFound(format!(
+                    "Deployment {deployment_id} was not found in project {project_id}, environment {environment_id}"
+                ))));
+                continue;
+            };
+            plans.push(
+                self.redeploy_source_for(deploy, projects.get(&project_id))
+                    .await,
+            );
+        }
+        Ok(plans)
+    }
+
+    /// Whether a deployment's own metadata names what to rebuild it from (an
+    /// image, or an uploaded source bundle); otherwise it rebuilds from Git.
+    fn rebuilds_from_metadata(deploy: &deployments::Model) -> bool {
+        deploy.metadata.as_ref().is_some_and(|metadata| {
+            metadata.external_image_ref.is_some()
+                || super::job_processor::source_bundle_lineage(Some(metadata)).is_some()
+        })
+    }
+
+    /// What `deploy` would be rebuilt from. `project` is only consulted for a
+    /// Git rebuild, and is `None` when the project is gone.
+    async fn redeploy_source_for(
+        &self,
+        deploy: &deployments::Model,
+        project: Option<&projects::Model>,
+    ) -> Result<RedeploySource, DeploymentError> {
+        let (project_id, environment_id, deployment_id) =
+            (deploy.project_id, deploy.environment_id, deploy.id);
 
         // Git-less deployments (docker_image source, e.g. imports or
         // `deployFromImage`) have no branch/tag/commit to rebuild from —
@@ -2344,15 +2431,7 @@ impl DeploymentService {
             };
         }
 
-        let project = projects::Entity::find_by_id(project_id)
-            .filter(projects::Column::IsDeleted.eq(false))
-            .one(self.db.as_ref())
-            .await
-            .map_err(|e| {
-                DeploymentError::Other(format!(
-                "Failed to load project {project_id} to redeploy deployment {deployment_id}: {e}"
-            ))
-            })?
+        let project = project
             .ok_or_else(|| DeploymentError::NotFound(format!("project {project_id} not found")))?;
         if project.repo_owner.is_empty() || project.repo_name.is_empty() {
             return Err(DeploymentError::InvalidDeploymentState(format!(
@@ -2371,6 +2450,19 @@ impl DeploymentService {
         })
     }
 
+    /// Redeploy a workload from a source [`Self::plan_redeploys`] resolved,
+    /// without looking it up again.
+    pub async fn redeploy_environment_from(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        deployment_id: i32,
+        source: RedeploySource,
+    ) -> Result<(), DeploymentError> {
+        self.dispatch_redeploy(project_id, environment_id, deployment_id, None, source)
+            .await
+    }
+
     async fn redeploy_environment_inner(
         &self,
         project_id: i32,
@@ -2378,10 +2470,34 @@ impl DeploymentService {
         deployment_id: i32,
         recovery_of_deployment_id: Option<i32>,
     ) -> Result<(), DeploymentError> {
-        match self
-            .resolve_redeploy_source(project_id, environment_id, deployment_id)
+        let source = self
+            .plan_redeploys(&[(project_id, environment_id, deployment_id)])
             .await?
-        {
+            .pop()
+            .unwrap_or_else(|| {
+                Err(DeploymentError::Other(format!(
+                    "No redeploy plan was produced for deployment {deployment_id}"
+                )))
+            })?;
+        self.dispatch_redeploy(
+            project_id,
+            environment_id,
+            deployment_id,
+            recovery_of_deployment_id,
+            source,
+        )
+        .await
+    }
+
+    async fn dispatch_redeploy(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        deployment_id: i32,
+        recovery_of_deployment_id: Option<i32>,
+        source: RedeploySource,
+    ) -> Result<(), DeploymentError> {
+        match source {
             RedeploySource::Image {
                 image_ref,
                 health_check_path,
@@ -7588,63 +7704,88 @@ mod tests {
         Ok(())
     }
 
-    /// A worker hosting a failed deployment's container was removed. Its rows
-    /// lost their `node_id` (`ON DELETE SET NULL`), and the control plane runs
-    /// no Docker daemon. Deleting the project must not try to remove them
-    /// from a local daemon that never had them, and must not fail.
+    /// Rows Temps knows are gone or no longer manages -- removed, or
+    /// orphaned by a node removal -- never block a project deletion, even on
+    /// a control plane with no Docker daemon. A row with no node that may
+    /// still exist does block it, and the error names both places it can be:
+    /// a local container from when this server ran workloads, or a worker
+    /// removed before Temps recorded orphaned containers.
     #[tokio::test]
-    async fn cleanup_skips_containers_of_a_removed_worker_on_a_control_plane(
+    async fn cleanup_on_a_control_plane_skips_only_rows_known_to_be_gone(
     ) -> Result<(), Box<dyn std::error::Error>> {
         if !database_integration_tests_available().await {
-            eprintln!("Docker unavailable; skipping removed-worker cleanup integration test");
+            eprintln!("Docker unavailable; skipping control-plane cleanup integration test");
             return Ok(());
         }
 
-        // Arrange: one row per state a removed worker can leave behind.
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
         let (project, _environment, _deployment, container) = setup_test_deployment(&db).await?;
-        let mut rows = Vec::new();
-        for (suffix, status) in [
-            ("retired", "retired"),
-            ("removed", CONTAINER_STATUS_REMOVED),
-            ("orphaned", CONTAINER_STATUS_ORPHANED),
-        ] {
+        let insert_row = |suffix: &'static str, status: &'static str| {
             let mut row: deployment_containers::ActiveModel = container.clone().into();
             row.id = sea_orm::ActiveValue::NotSet;
             row.container_id = Set(format!("{}-{suffix}", container.container_id));
             row.status = Set(Some(status.to_string()));
             row.deleted_at = Set(Some(Utc::now()));
             row.node_id = Set(None);
-            rows.push(row.insert(db.as_ref()).await?);
+            row
+        };
+        let mut known_gone = Vec::new();
+        for (suffix, status) in [
+            ("removed", CONTAINER_STATUS_REMOVED),
+            ("orphaned", CONTAINER_STATUS_ORPHANED),
+        ] {
+            known_gone.push(insert_row(suffix, status).insert(db.as_ref()).await?);
         }
         deployment_containers::Entity::delete_by_id(container.id)
             .exec(db.as_ref())
             .await?;
-        let mut deployer = MockContainerDeployer::new();
-        deployer.expect_list_containers().returning(|| Ok(vec![]));
-        deployer.expect_get_container_info().never();
-        deployer.expect_remove_container().never();
-        let mut service = create_cleanup_service_for_test(db.clone(), Arc::new(deployer));
-        service.docker_handle = Arc::new(temps_core::DockerHandle::disabled(
-            "control-plane",
-            "started with --profile control-plane",
-        ));
+        let control_plane = |db: Arc<temps_database::DbConnection>| {
+            let mut deployer = MockContainerDeployer::new();
+            deployer.expect_list_containers().returning(|| Ok(vec![]));
+            deployer.expect_get_container_info().never();
+            deployer.expect_remove_container().never();
+            let mut service = create_cleanup_service_for_test(db, Arc::new(deployer));
+            service.docker_handle = Arc::new(temps_core::DockerHandle::disabled(
+                "control-plane",
+                "started with --profile control-plane",
+            ));
+            service
+        };
 
-        // Act
+        // Only rows known to be gone: nothing removed, nothing failed.
         let removed = temps_core::DeploymentContainerCleaner::cleanup_project_containers(
-            &service, project.id,
+            &control_plane(db.clone()),
+            project.id,
         )
         .await?;
-
-        // Assert: nothing was removed, nothing failed, no row was rewritten.
         assert_eq!(removed, 0);
-        for row in rows {
+        for row in &known_gone {
             let unchanged = deployment_containers::Entity::find_by_id(row.id)
                 .one(db.as_ref())
                 .await?
                 .expect("row remains until the project cascade");
             assert_eq!(unchanged.status, row.status);
+        }
+
+        // A row that may still exist stops the deletion and explains why.
+        insert_row("retired", "retired").insert(db.as_ref()).await?;
+        let result = temps_core::DeploymentContainerCleaner::cleanup_project_containers(
+            &control_plane(db.clone()),
+            project.id,
+        )
+        .await;
+        match result {
+            Err(temps_core::ContainerCleanupError::Removal {
+                node_id: None,
+                reason,
+                ..
+            }) => {
+                assert!(reason.contains("records no node"), "{reason}");
+                assert!(reason.contains("profile that runs workloads"), "{reason}");
+                assert!(reason.contains("docker rm -f"), "{reason}");
+            }
+            other => panic!("expected the deletion to stop, got {other:?}"),
         }
         Ok(())
     }
