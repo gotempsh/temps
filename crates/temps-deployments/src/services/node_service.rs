@@ -77,37 +77,83 @@ const LEFTOVER_PAGE_SIZE: u64 = 100;
 /// rest are only counted.
 pub const MAX_DESCRIBED_UNREMOVED: usize = 50;
 
+/// Why [`remove_owned_container`] left a container in place.
+#[derive(Error, Debug)]
+pub enum ContainerRemovalError {
+    #[error(
+        "container {container_id} was left in place: its labels do not show it belongs to \
+         project {project_id}"
+    )]
+    NotOwned {
+        container_id: String,
+        project_id: i32,
+    },
+
+    #[error("could not inspect container {container_id}: {source}")]
+    Inspect {
+        container_id: String,
+        source: temps_deployer::DeployerError,
+    },
+
+    #[error("removing container {container_id} failed: {source}")]
+    Remove {
+        container_id: String,
+        source: temps_deployer::DeployerError,
+    },
+
+    #[error("removing container {container_id} timed out after {timeout_secs} seconds")]
+    Timeout {
+        container_id: String,
+        timeout_secs: u64,
+    },
+}
+
+/// How long one container removal on a node may take.
+const CONTAINER_REMOVAL_TIMEOUT_SECS: u64 = 30;
+
 /// Remove one recorded container from a node, but only if Docker still says
 /// it belongs to `project_id`. `Ok` means Temps confirmed it is gone (removed
-/// now, or already absent); `Err` explains why it is left in place.
+/// now, or already absent); an error says why it was left in place.
 pub async fn remove_owned_container(
     deployer: &dyn temps_deployer::ContainerDeployer,
     container_id: &str,
     project_id: i32,
-) -> Result<(), String> {
+) -> Result<(), ContainerRemovalError> {
     match deployer.get_container_info(container_id).await {
         Ok(info) => {
             let expected_project = project_id.to_string();
             if info.labels.get("sh.temps.managed").map(String::as_str) != Some("true")
                 || info.labels.get("sh.temps.project_id") != Some(&expected_project)
             {
-                return Err(format!(
-                    "its labels do not show it belongs to project {project_id}, so it was left in place"
-                ));
+                return Err(ContainerRemovalError::NotOwned {
+                    container_id: container_id.to_string(),
+                    project_id,
+                });
             }
         }
         Err(temps_deployer::DeployerError::ContainerNotFound(_)) => return Ok(()),
-        Err(error) => return Err(format!("could not inspect it: {error}")),
+        Err(source) => {
+            return Err(ContainerRemovalError::Inspect {
+                container_id: container_id.to_string(),
+                source,
+            })
+        }
     }
     match tokio::time::timeout(
-        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(CONTAINER_REMOVAL_TIMEOUT_SECS),
         deployer.remove_container(container_id),
     )
     .await
     {
         Ok(Ok(())) | Ok(Err(temps_deployer::DeployerError::ContainerNotFound(_))) => Ok(()),
-        Ok(Err(error)) => Err(format!("removal failed: {error}")),
-        Err(_) => Err("removal timed out after 30 seconds".to_string()),
+        Ok(Err(source)) => Err(ContainerRemovalError::Remove {
+            container_id: container_id.to_string(),
+            source,
+        }),
+        Err(_) => Err(ContainerRemovalError::Timeout {
+            container_id: container_id.to_string(),
+            timeout_secs: CONTAINER_REMOVAL_TIMEOUT_SECS,
+        }),
     }
 }
 
@@ -1909,16 +1955,18 @@ impl NodeService {
                         self.mark_container_removed(container.id).await?;
                         outcome.confirmed_gone += 1;
                     }
-                    Err(reason) => {
+                    Err(error) => {
                         tracing::warn!(
                             node_id = node.id,
                             container_id = %container.container_id,
                             deployment_id = container.deployment_id,
                             "Could not remove leftover container before removing node: {}",
-                            reason
+                            error
                         );
                         outcome.record_unremoved(describe_unremoved_container(
-                            &container, project_id, &reason,
+                            &container,
+                            project_id,
+                            &error.to_string(),
                         ));
                     }
                 }
@@ -4110,7 +4158,7 @@ mod tests {
             assert!(
                 unremoved[1].contains("c-retired")
                     && unremoved[1].contains("project 101")
-                    && unremoved[1].contains("could not inspect it"),
+                    && unremoved[1].contains("could not inspect container c-retired"),
                 "{unremoved:?}"
             );
         }

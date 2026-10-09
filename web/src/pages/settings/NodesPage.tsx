@@ -37,6 +37,7 @@ import {
   canAddWorkerNode,
   shouldPromptForFirstWorkerNode,
   unremovedNodeContainers,
+  type UnremovedNodeContainers,
   WORKER_NODES_URL,
 } from '@/lib/worker-nodes'
 import {
@@ -919,9 +920,8 @@ function NodeDetail({
   const [removePending, setRemovePending] = useState(false)
   // Containers a removal could not confirm are gone. While set, the remove
   // dialog lists them and offers to remove the node anyway.
-  const [unremovedContainers, setUnremovedContainers] = useState<
-    string[] | null
-  >(null)
+  const [unremovedContainers, setUnremovedContainers] =
+    useState<UnremovedNodeContainers | null>(null)
   const [undrainPending, setUndrainPending] = useState(false)
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
@@ -1054,7 +1054,8 @@ function NodeDetail({
         (resp.data as RemoveNodeResponse | undefined)?.orphaned_containers ?? []
       if (orphaned.length > 0) {
         toast.warning('Node removed', {
-          description: `${orphaned.length} container(s) could not be removed and were recorded as orphaned. If the host still exists, remove them there with docker rm -f.`,
+          description:
+            'Some containers could not be removed and were recorded as orphaned. If the host still exists, remove them there with docker rm -f.',
         })
       } else {
         toast.success('Node removed')
@@ -1246,13 +1247,13 @@ function NodeDetail({
             <AlertDialogTitle>Remove node “{node.name}”?</AlertDialogTitle>
             <AlertDialogDescription>
               {unremovedContainers
-                ? `Temps could not confirm that ${unremovedContainers.length} container(s) it placed on this node are gone, so the node was not removed. Start the agent on the node and try again, or remove them on that host with docker rm -f. If the host is gone for good, remove the node anyway: these containers are then recorded as orphaned and never touched again.`
+                ? `Temps could not confirm that ${unremovedContainers.count} container(s) it placed on this node are gone, so the node was not removed. Start the agent on the node and try again, or remove them on that host with docker rm -f. If the host is gone for good, remove the node anyway: these containers are then recorded as orphaned and never touched again.`
                 : 'This will permanently remove the node from the cluster. This action cannot be undone. The node must be drained first (no active containers) and host no sandboxes. Containers Temps left on it are removed first.'}
             </AlertDialogDescription>
           </AlertDialogHeader>
           {unremovedContainers && (
             <ul className="max-h-48 space-y-1 overflow-y-auto rounded-md border p-2 font-mono text-xs break-all">
-              {unremovedContainers.map((container) => (
+              {unremovedContainers.lines.map((container) => (
                 <li key={container}>{container}</li>
               ))}
             </ul>

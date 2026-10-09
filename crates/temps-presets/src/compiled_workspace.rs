@@ -248,12 +248,101 @@ fn go_directive_lines<'a>(contents: &'a str, directive: &str) -> Vec<&'a str> {
     found
 }
 
-/// A Go path argument: the first token, unquoted.
-fn go_path_token(text: &str) -> &str {
-    text.split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .trim_matches(|c| c == '"' || c == '`')
+/// A Go path argument: the first token, with Go string quoting removed so a
+/// quoted path keeps its spaces. `None` for an empty or unterminated token,
+/// which Go itself rejects.
+fn go_path_token(text: &str) -> Option<String> {
+    let text = text.trim_start();
+    if let Some(raw) = text.strip_prefix('`') {
+        return raw.split_once('`').map(|(path, _)| path.to_string());
+    }
+    if let Some(quoted) = text.strip_prefix('"') {
+        let mut path = String::new();
+        let mut chars = quoted.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '"' => return Some(path),
+                '\\' => path.push(chars.next()?),
+                c => path.push(c),
+            }
+        }
+        return None;
+    }
+    text.split_whitespace().next().map(str::to_string)
+}
+
+/// A `replace` directive's replaced module path and its target.
+fn go_replacement(directive: &str) -> Option<(String, String)> {
+    let (module, target) = directive.split_once("=>")?;
+    Some((go_path_token(module)?, go_path_token(target)?))
+}
+
+/// Check a local `replace` target declared in `manifest`, which sits in
+/// `base`: it must stay inside the repository and hold a module. Returns
+/// where it resolves to, or `None` for a module-path (non-local) target.
+fn go_local_replacement(
+    root: &Path,
+    base: &Path,
+    target: &str,
+    manifest: &Path,
+) -> Result<Option<PathBuf>, String> {
+    if Path::new(target).is_absolute() {
+        return Err(escapes(target, manifest));
+    }
+    if !is_go_local_path(target) {
+        return Ok(None);
+    }
+    let resolved = resolve(base, target).ok_or_else(|| escapes(target, manifest))?;
+    require_dependency(root, &resolved, "go.mod", target, manifest)?;
+    Ok(Some(resolved))
+}
+
+/// The `go.work` Go uses for the module at `relative`: the nearest one at or
+/// above its directory.
+struct GoWork {
+    directory: PathBuf,
+    path: PathBuf,
+    /// Its `use` directives list the module.
+    member: bool,
+    /// It also lists a module outside the selected one.
+    outside: bool,
+    replaces: Vec<(String, String)>,
+}
+
+fn nearest_go_work(root: &Path, relative: &Path) -> Result<Option<GoWork>, String> {
+    let mut directory = Some(relative.to_path_buf());
+    while let Some(current) = directory {
+        let path = current.join("go.work");
+        if let Some(work) = read_manifest(root, &path)? {
+            let mut member = false;
+            let mut outside = false;
+            for entry in go_directive_lines(&work, "use") {
+                let Some(target) = go_path_token(entry) else {
+                    continue;
+                };
+                let resolved = resolve(&current, &target).ok_or_else(|| escapes(&target, &path))?;
+                member |= resolved == relative;
+                outside |= !resolved.starts_with(relative);
+            }
+            let replaces = go_directive_lines(&work, "replace")
+                .into_iter()
+                .filter_map(go_replacement)
+                .collect();
+            return Ok(Some(GoWork {
+                directory: current,
+                path,
+                member,
+                outside,
+                replaces,
+            }));
+        }
+        directory = if current.as_os_str().is_empty() {
+            None
+        } else {
+            Some(current.parent().map(Path::to_path_buf).unwrap_or_default())
+        };
+    }
+    Ok(None)
 }
 
 fn is_go_local_path(path: &str) -> bool {
@@ -269,67 +358,32 @@ fn go_needs_repository(root: &Path, relative: &Path) -> Result<Option<bool>, Str
     let go_mod = relative.join("go.mod");
     let contents = read_manifest(root, &go_mod)?.unwrap_or_default();
     let mut needs = false;
-    for replace in go_directive_lines(&contents, "replace") {
-        let Some((_, target)) = replace.split_once("=>") else {
-            continue;
-        };
-        let target = go_path_token(target);
-        if Path::new(target).is_absolute() {
-            return Err(escapes(target, &go_mod));
-        }
-        if !is_go_local_path(target) {
-            continue;
-        }
-        let resolved = resolve(relative, target).ok_or_else(|| escapes(target, &go_mod))?;
-        require_dependency(root, &resolved, "go.mod", target, &go_mod)?;
-        needs |= !resolved.starts_with(relative);
-    }
-
-    // Go uses the nearest go.work at or above the module's directory.
     let mut ignore_go_work = false;
-    let mut directory = Some(relative.to_path_buf());
-    while let Some(current) = directory {
-        let go_work = current.join("go.work");
-        if let Some(work) = read_manifest(root, &go_work)? {
-            let mut member = false;
-            let mut outside = false;
-            for entry in go_directive_lines(&work, "use") {
-                let target = go_path_token(entry);
-                let resolved = resolve(&current, target).ok_or_else(|| escapes(target, &go_work))?;
-                member |= resolved == relative;
-                outside |= !resolved.starts_with(relative);
+    // Replacements in the go.work apply to every member, override the
+    // module's own replacement of the same module, and resolve relative to
+    // the go.work, which is outside a module-only build.
+    let mut overridden = std::collections::HashSet::new();
+    match nearest_go_work(root, relative)? {
+        Some(work) if work.member => {
+            for (module, target) in &work.replaces {
+                go_local_replacement(root, &work.directory, target, &work.path)?;
+                overridden.insert(module.clone());
             }
-            let replaces = go_directive_lines(&work, "replace");
-            if member {
-                // Replacements in go.work apply to every member and resolve
-                // relative to the go.work, which is outside a module-only
-                // build. Local targets must exist inside the repository.
-                for replace in &replaces {
-                    let Some((_, target)) = replace.split_once("=>") else {
-                        continue;
-                    };
-                    let target = go_path_token(target);
-                    if Path::new(target).is_absolute() {
-                        return Err(escapes(target, &go_work));
-                    }
-                    if !is_go_local_path(target) {
-                        continue;
-                    }
-                    let resolved =
-                        resolve(&current, target).ok_or_else(|| escapes(target, &go_work))?;
-                    require_dependency(root, &resolved, "go.mod", target, &go_work)?;
-                }
-                needs |= outside || !replaces.is_empty();
-            } else {
-                ignore_go_work = true;
-            }
-            break;
+            needs |= work.outside || !work.replaces.is_empty();
         }
-        directory = if current.as_os_str().is_empty() {
-            None
-        } else {
-            Some(current.parent().map(Path::to_path_buf).unwrap_or_default())
+        Some(_) => ignore_go_work = true,
+        None => {}
+    }
+    for directive in go_directive_lines(&contents, "replace") {
+        let Some((module, target)) = go_replacement(directive) else {
+            continue;
         };
+        if overridden.contains(&module) {
+            continue;
+        }
+        if let Some(resolved) = go_local_replacement(root, relative, &target, &go_mod)? {
+            needs |= !resolved.starts_with(relative);
+        }
     }
     Ok(needs.then_some(ignore_go_work))
 }
@@ -523,23 +577,30 @@ fn cargo_needs_repository(root: &Path, relative: &Path) -> Result<bool, String> 
     {
         return Ok(true);
     }
-    if path_dependency_outside || explicit.is_some() {
-        // Built inside the repository, Cargo would refuse a crate under a
-        // workspace that neither lists nor excludes it.
-        return Err(format!(
-            "'{}' is inside the Cargo workspace at '{}' but is not one of its members. Add \
-             '{}' to [workspace] members or exclude in '{}'",
-            relative.display(),
-            if workspace_root.as_os_str().is_empty() {
-                "the repository root".to_string()
-            } else {
-                workspace_root.display().to_string()
-            },
-            member.display(),
-            workspace_manifest.display()
-        ));
+    // Not listed, but Cargo also makes every in-repository path dependency
+    // of a member a member. Whether this crate is one depends on the whole
+    // workspace graph, so when it needs the workspace (a sibling dependency,
+    // an explicit `package.workspace`, or inherited `workspace = true`
+    // settings) build from the repository and let Cargo decide: an automatic
+    // member builds, and a crate that is neither gets Cargo's own error
+    // naming the workspace and how to list or exclude it.
+    Ok(path_dependency_outside || explicit.is_some() || inherits_from_workspace(&manifest))
+}
+
+/// Whether a manifest takes any setting from its workspace
+/// (`version.workspace = true`, `serde = { workspace = true }`,
+/// `[lints] workspace = true`, ...), which only resolves inside it.
+fn inherits_from_workspace(manifest: &toml::Table) -> bool {
+    fn inherits(value: &toml::Value, depth: usize) -> bool {
+        match value {
+            toml::Value::Table(table) => {
+                table.get("workspace").and_then(toml::Value::as_bool) == Some(true)
+                    || (depth < 4 && table.values().any(|value| inherits(value, depth + 1)))
+            }
+            _ => false,
+        }
     }
-    Ok(false)
+    manifest.iter().any(|(key, value)| key != "workspace" && inherits(value, 0))
 }
 
 #[cfg(test)]
@@ -770,19 +831,100 @@ mod tests {
         assert_eq!(app(&root), Ok(None));
     }
 
+    /// Cargo makes a member's in-repository path dependencies members too,
+    /// so a crate the workspace does not list may still belong to it. When
+    /// it needs the workspace it is built from the repository and Cargo
+    /// decides; only a crate that needs nothing outside it builds alone.
     #[test]
-    fn cargo_non_member_with_sibling_dependency_is_refused_with_a_remedy() {
+    fn unlisted_crates_that_need_the_workspace_build_from_the_repository() {
         let root = repository(&[
-            ("Cargo.toml", "[workspace]\nmembers = [\"packages/*\"]\n"),
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"packages/server\"]\n",
+            ),
+            (
+                "packages/server/Cargo.toml",
+                "[package]\nname = \"server\"\nversion = \"0.1.0\"\n[dependencies]\nqa-api = { path = \"../../apps/api\" }\n",
+            ),
             (
                 "apps/api/Cargo.toml",
                 "[package]\nname = \"qa-api\"\nversion = \"0.1.0\"\n[dependencies]\nqa-shared = { path = \"../../packages/shared\" }\n",
             ),
             SHARED_CARGO,
         ]);
-        let error = app(&root).unwrap_err();
-        assert!(error.contains("not one of its members"), "{error}");
-        assert!(error.contains("apps/api"), "{error}");
+        assert_eq!(app(&root).unwrap().unwrap().relative, "apps/api");
+
+        // Inherited settings only resolve inside the workspace.
+        let root = repository(&[
+            ("Cargo.toml", "[workspace]\nmembers = [\"packages/*\"]\n[workspace.package]\nversion = \"0.1.0\"\n"),
+            (
+                "apps/api/Cargo.toml",
+                "[package]\nname = \"qa-api\"\nversion.workspace = true\n",
+            ),
+        ]);
+        assert!(app(&root).unwrap().is_some());
+
+        // Needing nothing from the workspace, it still builds alone.
+        let root = repository(&[
+            ("Cargo.toml", "[workspace]\nmembers = [\"packages/*\"]\n"),
+            ("apps/api/Cargo.toml", "[package]\nname = \"qa-api\"\nversion = \"0.1.0\"\n"),
+        ]);
+        assert_eq!(app(&root), Ok(None));
+    }
+
+    /// Go string quoting is honoured, so a quoted path keeps its spaces.
+    #[test]
+    fn quoted_go_paths_keep_their_spaces() {
+        assert_eq!(
+            go_path_token(r#""../../packages/my shared" v1.0.0"#).as_deref(),
+            Some("../../packages/my shared")
+        );
+        assert_eq!(
+            go_path_token("`../my shared`").as_deref(),
+            Some("../my shared")
+        );
+        assert_eq!(go_path_token(r#""a\"b""#).as_deref(), Some("a\"b"));
+        assert_eq!(go_path_token(r#""unterminated"#), None);
+        assert_eq!(go_path_token("  ../shared v1").as_deref(), Some("../shared"));
+
+        let root = repository(&[
+            (
+                "apps/api/go.mod",
+                "module a\nreplace example.test/shared => \"../../packages/my shared\"\n",
+            ),
+            ("packages/my shared/go.mod", "module example.test/shared\n"),
+        ]);
+        assert!(app(&root).unwrap().is_some());
+    }
+
+    /// A go.work replacement overrides the member's own replacement of the
+    /// same module, so a stale module-level target that no longer exists
+    /// does not block a workspace that redirects it.
+    #[test]
+    fn go_work_replacements_override_the_modules_own() {
+        let root = repository(&[
+            (
+                "go.work",
+                "go 1.22\nuse ./apps/api\nreplace example.test/qa/shared => ./packages/shared\n",
+            ),
+            (
+                "apps/api/go.mod",
+                "module example.test/qa/api\nreplace example.test/qa/shared => ./shared\n",
+            ),
+            SHARED_GO,
+        ]);
+        assert!(app(&root).unwrap().is_some());
+
+        // Not overridden, the missing target is still refused.
+        let root = repository(&[
+            ("go.work", "go 1.22\nuse ./apps/api\nreplace example.test/other => ./packages/shared\n"),
+            (
+                "apps/api/go.mod",
+                "module example.test/qa/api\nreplace example.test/qa/shared => ./shared\n",
+            ),
+            SHARED_GO,
+        ]);
+        assert!(app(&root).unwrap_err().contains("has no go.mod"));
     }
 
     #[test]

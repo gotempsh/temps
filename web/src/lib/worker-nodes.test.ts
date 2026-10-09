@@ -149,14 +149,28 @@ describe('node removal refused for unconfirmed containers', () => {
     expect(
       unremovedNodeContainers({
         title: 'Node Still Holds Containers',
+        unremoved_count: 1,
         unremoved_containers: containers,
       })
-    ).toEqual(containers)
+    ).toEqual({ count: 1, lines: containers })
     expect(
       unremovedNodeContainers({
         extensions: { unremoved_containers: containers },
       })
-    ).toEqual(containers)
+    ).toEqual({ count: 1, lines: containers })
+  })
+
+  test('counts every container, not the bounded description list', () => {
+    const lines = [
+      "container 'app-1' (abc) of deployment 4 in project 2",
+      'and 119 more container(s) not listed here',
+    ]
+    expect(
+      unremovedNodeContainers({
+        unremoved_count: 120,
+        unremoved_containers: lines,
+      })
+    ).toEqual({ count: 120, lines })
   })
 
   test('is undefined for any other refusal', () => {

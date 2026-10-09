@@ -118,6 +118,18 @@ struct PipelineTriggerOptions {
     recovery_of_deployment_id: Option<i32>,
 }
 
+/// Most redeploys [`DeploymentService::plan_redeploys`] plans in one call.
+pub const MAX_REDEPLOY_PLAN_BATCH: usize = 100;
+
+fn check_redeploy_plan_batch(targets: usize) -> Result<(), DeploymentError> {
+    if targets > MAX_REDEPLOY_PLAN_BATCH {
+        return Err(DeploymentError::InvalidInput(format!(
+            "Cannot plan {targets} redeploys at once: plan at most {MAX_REDEPLOY_PLAN_BATCH} per call"
+        )));
+    }
+    Ok(())
+}
+
 /// What a node drain or failover redeploy rebuilds a deployment from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RedeploySource {
@@ -2290,8 +2302,10 @@ impl DeploymentService {
     /// workload it has to move *before* it marks the node draining, so a
     /// workload with nothing to rebuild from is refused up front instead of
     /// leaving the node draining forever, and then redeploys from these plans
-    /// with [`Self::redeploy_environment_from`]. Two queries however many
-    /// workloads there are; the outer `Err` is a database failure.
+    /// with [`Self::redeploy_environment_from`]. Two queries per call; the
+    /// outer `Err` is a database failure, or more than
+    /// [`MAX_REDEPLOY_PLAN_BATCH`] targets (callers plan in batches, so
+    /// memory does not grow with the number of workloads).
     pub async fn plan_redeploys(
         &self,
         targets: &[(i32, i32, i32)],
@@ -2299,6 +2313,7 @@ impl DeploymentService {
         if targets.is_empty() {
             return Ok(Vec::new());
         }
+        check_redeploy_plan_batch(targets.len())?;
         let deployment_ids: Vec<i32> = targets.iter().map(|(_, _, id)| *id).collect();
         let loaded: HashMap<i32, deployments::Model> = deployments::Entity::find()
             .filter(deployments::Column::Id.is_in(deployment_ids.clone()))
@@ -7710,6 +7725,20 @@ mod tests {
     /// still exist does block it, and the error names both places it can be:
     /// a local container from when this server ran workloads, or a worker
     /// removed before Temps recorded orphaned containers.
+    /// Redeploy planning works in bounded batches: an oversized request is
+    /// refused before anything is loaded.
+    #[test]
+    fn redeploy_planning_is_limited_to_one_batch() {
+        assert!(check_redeploy_plan_batch(0).is_ok());
+        assert!(check_redeploy_plan_batch(MAX_REDEPLOY_PLAN_BATCH).is_ok());
+        let error = check_redeploy_plan_batch(MAX_REDEPLOY_PLAN_BATCH + 1).unwrap_err();
+        assert!(
+            matches!(&error, DeploymentError::InvalidInput(message)
+                if message.contains(&format!("{}", MAX_REDEPLOY_PLAN_BATCH + 1))),
+            "{error:?}"
+        );
+    }
+
     #[tokio::test]
     async fn cleanup_on_a_control_plane_skips_only_rows_known_to_be_gone(
     ) -> Result<(), Box<dyn std::error::Error>> {
