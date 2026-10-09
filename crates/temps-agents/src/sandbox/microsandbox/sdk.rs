@@ -628,6 +628,13 @@ impl MicrosandboxSandboxProvider {
     /// materialized on the host, and a host symlink is never written
     /// through, replaced or removed — seeding skipped them, so they are not
     /// the agent's.
+    ///
+    /// `.git` entries are never copied, replaced or removed, at any depth.
+    /// The host runs `git` in this checkout afterwards; a guest-written Git
+    /// config could name a command for it to run (`core.fsmonitor`, hooks,
+    /// filter drivers). The agent's work still arrives: its edits and any
+    /// commits it made land in the working tree, which host `git diff` /
+    /// `ls-files` read against the untouched host repository.
     async fn mirror_workspace(
         &self,
         name: &str,
@@ -653,6 +660,9 @@ impl MicrosandboxSandboxProvider {
                     continue;
                 };
                 present.insert(std::ffi::OsString::from(file_name));
+                if file_name == GIT_DIR_NAME {
+                    continue;
+                }
                 let guest_path = format!("{}/{}", guest_dir, file_name);
                 let local_path = local_dir.join(file_name);
                 let local_meta = std::fs::symlink_metadata(&local_path).ok();
@@ -684,7 +694,7 @@ impl MicrosandboxSandboxProvider {
             // What the guest no longer has, the agent deleted.
             for local in std::fs::read_dir(&local_dir)? {
                 let local = local?;
-                if present.contains(&local.file_name()) {
+                if present.contains(&local.file_name()) || local.file_name() == GIT_DIR_NAME {
                     continue;
                 }
                 let meta = local.path().symlink_metadata()?;
@@ -1264,6 +1274,10 @@ fn set_dir_private(path: &Path) {
         tracing::warn!("failed to 0700 {}: {}", path.display(), e);
     }
 }
+
+/// Git repository metadata — never synced from a guest; see
+/// [`MicrosandboxSandboxProvider::mirror_workspace`].
+const GIT_DIR_NAME: &str = ".git";
 
 /// The final component of a guest directory-listing path, if it is a
 /// plain name. Guest-reported names are untrusted: anything that could
@@ -1935,6 +1949,10 @@ mod tests {
         // Never copied in, so never the agent's to remove.
         std::os::unix::fs::symlink(outside.path().join("target"), host.path().join("host-link"))
             .unwrap();
+        // The host repository the server will run `git` in.
+        std::fs::create_dir_all(host.path().join(".git/hooks")).unwrap();
+        let host_git_config = b"[core]\n\trepositoryformatversion = 0\n".to_vec();
+        std::fs::write(host.path().join(".git/config"), &host_git_config).unwrap();
 
         let mut config = e2e_config("sync", "none");
         config.host_work_dir = host.path().to_path_buf();
@@ -1950,7 +1968,11 @@ mod tests {
                      && rm src/nested/lib.rs && rm -r old-dir \
                      && printf '#!/bin/sh\\n' > tool.sh && chmod 755 tool.sh \
                      && head -c 1000000 /dev/urandom > blob.bin \
-                     && ln -s /etc/passwd guest-link"
+                     && ln -s /etc/passwd guest-link \
+                     && printf '[core]\\n\\tfsmonitor = ./tool.sh\\n' >> .git/config \
+                     && mkdir -p .git/hooks && printf '#!/bin/sh\\n' > .git/hooks/post-checkout \
+                     && mkdir -p vendor/dep/.git && printf 'x' > vendor/dep/.git/config \
+                     && printf 'dep\\n' > vendor/dep/lib.txt"
                 );
                 let edit = sh(provider, &handle, &script).await;
                 assert_eq!(edit.exit_code, 0, "{}", edit.stderr);
@@ -2001,6 +2023,21 @@ mod tests {
                     .unwrap()
                     .file_type()
                     .is_symlink());
+                // Guest Git metadata never reaches the host repository.
+                assert_eq!(
+                    std::fs::read(host_dir.join(".git/config")).unwrap(),
+                    host_git_config,
+                    "host git config untouched"
+                );
+                assert!(!host_dir.join(".git/hooks/post-checkout").exists());
+                assert!(
+                    !host_dir.join("vendor/dep/.git").exists(),
+                    "nested .git skipped"
+                );
+                assert_eq!(
+                    std::fs::read(host_dir.join("vendor/dep/lib.txt")).unwrap(),
+                    b"dep\n"
+                );
             }
         })
         .await;
