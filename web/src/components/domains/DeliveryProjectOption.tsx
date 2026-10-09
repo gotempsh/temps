@@ -1,9 +1,11 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { getCloudflareProjectCapability } from '@/api/client'
-import { useQuery } from '@tanstack/react-query'
 import { Link } from 'react-router'
+import {
+  defaultDeliveryChoice,
+  useDeliveryProjectCapability,
+} from './delivery-capability'
 import {
   DeliveryProviderChoice,
   type DeliveryProviderChoiceValue,
@@ -17,22 +19,8 @@ export function DeliveryProjectOption({
   value: DeliveryProviderChoiceValue | undefined
   onChange: (value: DeliveryProviderChoiceValue) => void
 }) {
-  const capability = useQuery({
-    queryKey: ['cloudflare-project-capability'],
-    queryFn: async () => {
-      const response = await getCloudflareProjectCapability()
-      if (response.error || !response.data)
-        throw new Error('Could not load Cloudflare availability')
-      return response.data
-    },
-  })
-  const selected =
-    value ??
-    (capability.data?.default_enabled
-      ? 'cloudflare'
-      : capability.data?.bunny_default_enabled
-        ? 'bunny'
-        : 'none')
+  const capability = useDeliveryProjectCapability()
+  const selected = value ?? defaultDeliveryChoice(capability.data)
   return (
     <div className="space-y-3">
       <div>

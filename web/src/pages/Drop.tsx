@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { DeliveryProjectOption } from '@/components/domains/DeliveryProjectOption'
 import {
   createProject,
   deleteProject,
@@ -14,6 +13,7 @@ import {
   type EnvironmentResponse,
   type ProjectResponse,
 } from '@/api/client'
+import { DropDeliveryRow } from '@/components/drop/DropDeliveryRow'
 import { DropZone } from '@/components/drop/DropZone'
 import { DropEnvironmentVariables } from '@/components/drop/DropEnvironmentVariables'
 import { DetectedPresetCard } from '@/components/drop/DetectedPresetCard'
@@ -50,6 +50,7 @@ import {
   prepareAndInspectDrop,
   presetConfigForDropCandidate,
 } from '@/lib/drop-preset-detection'
+import type { DropDeliveryChoice } from '@/lib/drop-delivery'
 import { ensureDropProjectName } from '@/lib/drop-project-name'
 import { cn } from '@/lib/utils'
 import {
@@ -108,7 +109,7 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
   const [files, setFiles] = useState<DropFile[]>([])
   const [projectName, setProjectName] = useState('')
   const [deliveryProvider, setDeliveryProvider] = useState<
-    'none' | 'cloudflare' | 'bunny' | undefined
+    DropDeliveryChoice | undefined
   >(undefined)
   const [nameWasEdited, setNameWasEdited] = useState(false)
   const [rootPage, setRootPage] = useState('')
@@ -507,10 +508,6 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
               </div>
 
               <div className="flex-1 space-y-6 py-6">
-                <DeliveryProjectOption
-                  value={deliveryProvider}
-                  onChange={setDeliveryProvider}
-                />
                 <div className="space-y-2">
                   <Label htmlFor="drop-name">Project name</Label>
                   <Input
@@ -606,6 +603,11 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
                     </span>
                     <span className="font-medium">None</span>
                   </div>
+                  <DropDeliveryRow
+                    value={deliveryProvider}
+                    onChange={setDeliveryProvider}
+                    disabled={isBusy}
+                  />
                   <div className="mt-3 flex items-center justify-between gap-3">
                     <span className="text-muted-foreground">
                       Environment variables
