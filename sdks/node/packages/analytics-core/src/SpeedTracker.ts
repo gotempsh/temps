@@ -17,8 +17,10 @@ type LoadMetricName = "ttfb" | "fcp" | "lcp" | "fid";
  * Subscribes to Web Vitals and forwards metrics to the Temps analytics endpoint.
  *
  * Load metrics (TTFB, FCP, LCP) go out in one "speed" request as soon as all
- * three are known, or when the page is hidden, whichever comes first. They
- * never wait for an interaction: FID only exists for visitors who click or
+ * three are known, or when the page is hidden, whichever comes first; a
+ * value that is only reported after that hide-flush is sent on its own, so
+ * a visitor who switches tabs early still gets an LCP. They never wait for
+ * an interaction: FID only exists for visitors who click or
  * type, so gating on it dropped every visitor who just read the page and
  * left. FID rides along when it already arrived, and is otherwise sent on its
  * own. Late metrics (CLS, INP) are sent individually as they stabilize.
@@ -36,6 +38,8 @@ export class SpeedTracker {
   private readonly query: string = "";
   private loadMetrics: Partial<Record<LoadMetricName, number>> = {};
   private loadSent = false;
+  /** Load metrics already delivered, so none is ever sent twice. */
+  private readonly sentLoadMetrics = new Set<LoadMetricName>();
   private stopped = false;
 
   private readonly handleVisibilityChange = (): void => {
@@ -71,7 +75,15 @@ export class SpeedTracker {
   }
 
   private recordLoad(name: Exclude<LoadMetricName, "fid">, value: number): void {
-    if (this.stopped || this.loadSent) return;
+    if (this.stopped || this.sentLoadMetrics.has(name)) return;
+    if (this.loadSent) {
+      // The load beacon already went out without this value (the page was
+      // hidden before it was reported, e.g. LCP after the visitor came back).
+      // Send just the missing value rather than dropping it.
+      this.sentLoadMetrics.add(name);
+      this.send({ [name]: value });
+      return;
+    }
     this.loadMetrics[name] = value;
     const { ttfb, fcp, lcp } = this.loadMetrics;
     if (ttfb !== undefined && fcp !== undefined && lcp !== undefined) {
@@ -80,9 +92,10 @@ export class SpeedTracker {
   }
 
   private recordFid(value: number): void {
-    if (this.stopped) return;
+    if (this.stopped || this.sentLoadMetrics.has("fid")) return;
     if (this.loadSent) {
-      this.sendLate("fid", value);
+      this.sentLoadMetrics.add("fid");
+      this.send({ fid: value });
       return;
     }
     this.loadMetrics.fid = value;
@@ -96,6 +109,9 @@ export class SpeedTracker {
       return;
     }
     this.loadSent = true;
+    for (const [name, value] of Object.entries(this.loadMetrics)) {
+      if (value !== undefined) this.sentLoadMetrics.add(name as LoadMetricName);
+    }
     this.send({
       ttfb: ttfb ?? null,
       lcp: lcp ?? null,

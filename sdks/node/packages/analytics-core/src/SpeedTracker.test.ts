@@ -146,10 +146,46 @@ describe("SpeedTracker load beacon", () => {
       pathname: "/pricing",
     });
 
-    // A later LCP report for the same page must not produce a second row.
-    report("LCP", 950);
+    tracker.destroy();
+  });
+
+  it("still sends LCP when it is reported after a hide-flush, without resending the rest", () => {
+    const tracker = new SpeedTracker({ basePath: "/_temps" });
+    report("TTFB", 150);
+    report("FCP", 500);
+    setVisibility("hidden");
     expect(beaconMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock).not.toHaveBeenCalled();
+
+    // The visitor comes back and LCP is reported afterwards.
+    setVisibility("visible");
+    report("LCP", 950);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const late = fetchBodies()[0];
+    expect(late).toMatchObject({ lcp: 950, pathname: "/pricing", query: "?plan=pro" });
+    expect(late).not.toHaveProperty("ttfb");
+    expect(late).not.toHaveProperty("fcp");
+
+    // Re-reports of values already delivered are ignored, and the late value
+    // itself is only sent once.
+    report("LCP", 1200);
+    report("TTFB", 160);
+    report("FCP", 520);
+    setVisibility("hidden");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(beaconMock).toHaveBeenCalledTimes(1);
+    tracker.destroy();
+  });
+
+  it("sends a late FID only once", () => {
+    const tracker = new SpeedTracker({ basePath: "/_temps" });
+    report("TTFB", 120);
+    report("FCP", 400);
+    report("LCP", 900);
+    report("FID", 12);
+    report("FID", 30);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchBodies()[1]).toMatchObject({ fid: 12 });
     tracker.destroy();
   });
 
