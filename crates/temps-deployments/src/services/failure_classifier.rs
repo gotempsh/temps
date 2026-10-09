@@ -39,7 +39,11 @@ use utoipa::ToSchema;
 /// never classified as a build's base-image pull; containerd-style registry
 /// errors are recognised, and unreachable registries and unrecognised pull
 /// failures get their own codes.
-pub const FAILURE_CLASSIFIER_VERSION: u8 = 3;
+///
+/// v4: a worker refusing a build's inputs (build arguments, registry
+/// credentials, cache imports) is a configuration failure, not an invalid
+/// Dockerfile.
+pub const FAILURE_CLASSIFIER_VERSION: u8 = 4;
 
 /// Marker Compose deployments put before embedded container log tails.
 const CONTAINER_LOGS_MARKER: &str = "container logs for unhealthy/stopped services:";
@@ -934,6 +938,12 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
             make(S::Configuration, C::InvalidConfiguration)
         };
     }
+    // A worker refused the build's inputs before building anything (build
+    // arguments, registry credentials, cache imports). That is a placement
+    // limit with a remedy in the message, not an unparsable Dockerfile.
+    if contains_any(r, &["worker builds cannot", "worker builds do not support"]) {
+        return make(S::Configuration, C::InvalidConfiguration);
+    }
 
     // ── Resources ───────────────────────────────────────────────────────
     if contains_any(r, &["out of memory", "oomkilled", "exit code 137"]) || contains_word(r, "oom")
@@ -1657,6 +1667,50 @@ mod tests {
             "Build plan failed for preset 'autopack': autopack could not plan this application: python: no start command found; the image was not found to timeout. Select the preset that matches the application in the project's build settings, add a start command, or commit a Dockerfile.",
         );
         assert_class(&unplannable, S::Configuration, C::InvalidConfiguration);
+
+        let worker_inlined = wrapped(
+            "build_image",
+            "Build plan failed for preset 'vite': this build runs on worker node 7, which does not receive project variables yet, but VITE_API_URL is inlined into the application at build time and would be empty.",
+        );
+        assert_class(&worker_inlined, S::Configuration, C::InvalidConfiguration);
+    }
+
+    /// A worker refusing its build inputs is not an invalid Dockerfile: the
+    /// user may not even have written one.
+    #[test]
+    fn worker_build_input_refusals_are_configuration_not_dockerfile() {
+        for detail in [
+            "Failed to build image for linux/arm64: Invalid context: Worker builds cannot pass build-argument values yet, but 'Dockerfile' declares ARG TOKEN for a project variable that the build would silently lose. Build on the control plane, or remove the ARG",
+            "Failed to build image for linux/arm64: Invalid context: Worker builds cannot use Dockerfile ARG instructions until build-argument credential handling is reviewed",
+            "Failed to build image: Invalid context: Worker builds do not support cache_from image imports; use a local builder or remove cache_from",
+        ] {
+            assert_class(
+                &wrapped("build_image", detail),
+                S::Configuration,
+                C::InvalidConfiguration,
+            );
+        }
+    }
+
+    /// A configured root directory the checkout lacks is a configuration
+    /// problem, at the source stage or (defensively) at the build stage.
+    #[test]
+    fn missing_project_directory_is_invalid_configuration() {
+        let download = wrapped(
+            "download_repo",
+            "Job validation failed: Invalid configuration: the project's root directory 'examples/starters/python/flask' is not in the checked-out source: 'examples/starters' has no 'python'; it contains go, node. Checked qa/app at main. Change the root directory in the project's Git settings, or deploy a ref that contains it.",
+        );
+        assert_class(&download, S::Configuration, C::InvalidConfiguration);
+        let submodule = wrapped(
+            "download_repo",
+            "Job validation failed: Invalid configuration: the project's root directory 'services/api' is inside Git submodule 'services/api', a separate repository whose files are not fetched with this one. Deploy the submodule's own repository instead, or commit its files into this one. Checked qa/app at main.",
+        );
+        assert_class(&submodule, S::Configuration, C::InvalidConfiguration);
+        let build = wrapped(
+            "build_image",
+            "Job validation failed: Invalid configuration: build context 'examples/starters/go/gin' is not in the checked-out source at '/tmp/temps-deployments/deployment-1-1/repository'. Check the project's root directory and build context settings",
+        );
+        assert_class(&build, S::Configuration, C::InvalidConfiguration);
     }
 
     #[test]

@@ -1449,14 +1449,15 @@ WHERE project.id = $2
             0
         };
 
-        let active_nodes: Vec<i32> = nodes::Entity::find()
+        let active_node_names: Vec<(i32, String)> = nodes::Entity::find()
             .filter(nodes::Column::Status.eq("active"))
             .all(db)
             .await
             .map_err(|e| format!("listing active nodes: {e}"))?
             .into_iter()
-            .map(|n| n.id)
+            .map(|n| (n.id, n.name))
             .collect();
+        let active_nodes: Vec<i32> = active_node_names.iter().map(|(id, _)| *id).collect();
 
         if active_nodes.is_empty() {
             return Ok(());
@@ -1510,6 +1511,19 @@ WHERE project.id = $2
                             .filter(|s| s.applied_generation < route_gen)
                             .count();
                     reason.push_str(&format!(" — {lagging} node(s) behind on route_gen"));
+                    let details = describe_lagging_route_nodes(
+                        &active_node_names,
+                        &route_states,
+                        route_gen,
+                        chrono::Utc::now(),
+                    );
+                    if !details.is_empty() {
+                        reason.push_str(&format!(
+                            " ({}). Check that `temps agent` is running on each lagging node and \
+                             can reach the control plane, then redeploy",
+                            details.join("; ")
+                        ));
+                    }
                 }
                 if cluster_dns_enabled && !dns_ok {
                     let never_acked = active_nodes.len() - dns_states.len();
@@ -2751,6 +2765,75 @@ impl MarkDeploymentCompleteJobBuilder {
 impl Default for MarkDeploymentCompleteJobBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// One line per active node that has not ACKed `target` route generation:
+/// its name and id, the generation it last ACKed and how long ago, so an
+/// operator knows which agent to look at.
+fn describe_lagging_route_nodes(
+    nodes: &[(i32, String)],
+    states: &[temps_entities::node_route_state::Model],
+    target: i64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<String> {
+    nodes
+        .iter()
+        .filter_map(|(id, name)| {
+            let state = states.iter().find(|state| state.node_id == *id);
+            match state {
+                None => Some(format!(
+                    "node '{name}' (id {id}) has never ACKed a route generation"
+                )),
+                Some(state) if state.applied_generation < target => {
+                    let age = state
+                        .last_sync_at
+                        .map(|at| format!(", last ACK {}s ago", (now - at).num_seconds().max(0)))
+                        .unwrap_or_default();
+                    Some(format!(
+                        "node '{name}' (id {id}) at route_gen {}{age}",
+                        state.applied_generation
+                    ))
+                }
+                Some(_) => None,
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod lagging_node_tests {
+    use super::*;
+
+    #[test]
+    fn lagging_route_nodes_are_named_with_generation_and_ack_age() {
+        let now = chrono::Utc::now();
+        let state = |node_id: i32, applied_generation: i64, ago: Option<i64>| {
+            temps_entities::node_route_state::Model {
+                node_id,
+                applied_generation,
+                last_sync_at: ago.map(|seconds| now - chrono::Duration::seconds(seconds)),
+                health: "healthy".to_string(),
+            }
+        };
+        let nodes = vec![
+            (1, "worker-a".to_string()),
+            (2, "worker-b".to_string()),
+            (3, "worker-c".to_string()),
+        ];
+        let details = describe_lagging_route_nodes(
+            &nodes,
+            &[state(1, 10, Some(1)), state(2, 9, Some(12))],
+            10,
+            now,
+        );
+        assert_eq!(
+            details,
+            vec![
+                "node 'worker-b' (id 2) at route_gen 9, last ACK 12s ago".to_string(),
+                "node 'worker-c' (id 3) has never ACKed a route generation".to_string(),
+            ]
+        );
     }
 }
 

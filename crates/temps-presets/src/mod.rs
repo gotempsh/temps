@@ -6,6 +6,7 @@ use std::{fmt, path::Path};
 
 mod autopack_preset;
 mod build_system;
+mod compiled_workspace;
 mod docker;
 pub mod docker_compose;
 mod docker_custom;
@@ -40,6 +41,7 @@ pub mod providers;
 pub use autopack_preset::{python_app_directory, AutopackPreset};
 use build_system::BuildSystem;
 pub use build_system::MonorepoTool;
+pub use compiled_workspace::{compiled_workspace_app, CompiledLanguage, CompiledWorkspaceApp};
 use docker::DockerfilePreset;
 use docker_custom::DockerCustomPreset;
 use docusaurus::Docusaurus;
@@ -427,9 +429,11 @@ pub trait Preset: fmt::Display + Send + Sync {
 
     /// Whether this preset generates its Dockerfile with Autopack.
     ///
-    /// Autopack declares project variables as `ARG`s in its build step. A
-    /// worker build never receives build-argument values and refuses a
-    /// Dockerfile that declares one, so the build job leaves them out there.
+    /// A worker build never receives build-argument values, so the build job
+    /// renders every generated Dockerfile without its `ARG`s there. Other
+    /// presets refuse a worker build that would lose a variable the framework
+    /// inlines at build time; Autopack has always built without them and only
+    /// warns.
     fn uses_autopack(&self) -> bool {
         false
     }

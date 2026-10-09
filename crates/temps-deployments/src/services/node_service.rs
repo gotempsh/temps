@@ -4,13 +4,48 @@
 //! Node management service — CRUD operations for the `nodes` table.
 
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, TransactionTrait,
+    sea_query::Expr, ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition,
+    DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
+    TransactionTrait,
 };
+use std::collections::HashSet;
 use std::sync::Arc;
 use thiserror::Error;
 
 use temps_entities::{deployment_containers, deployments, environments, nodes, sandboxes};
+
+/// `deployment_containers.status` for a container Temps confirmed is gone from
+/// Docker. Nothing needs to be cleaned up for it any more.
+pub const CONTAINER_STATUS_REMOVED: &str = "removed";
+/// `deployment_containers.status` for a container taken out of routing whose
+/// removal was not confirmed (its node was offline, or the agent did not
+/// answer). The container may still exist on its node, so cleanup still has
+/// to remove it there.
+pub const CONTAINER_STATUS_RETIRED: &str = "retired";
+/// `deployment_containers.status` for a container left on a node that was
+/// removed from the cluster before Temps could confirm the container was
+/// gone. Temps no longer manages that host, so cleanup skips it;
+/// `error_message` records which node it was on.
+pub const CONTAINER_STATUS_ORPHANED: &str = "orphaned";
+
+/// Whether a deployment has reached a final state, so its containers can no
+/// longer become the ones its environment serves.
+fn deployment_has_finished(state: &str) -> bool {
+    matches!(
+        state,
+        "cancelled" | "stopped" | "completed" | "deployed" | "failed"
+    )
+}
+
+/// The `error_message` recorded on a container orphaned by removing its node,
+/// so the placement survives the `node_id` being cleared.
+fn orphaned_container_note(node_name: &str, node_id: i32) -> String {
+    format!(
+        "Left on node '{node_name}' (id {node_id}) when the node was removed from the cluster \
+         before Temps confirmed this container was gone. Temps no longer manages that host; if \
+         it still exists, remove the container there with `docker rm -f`."
+    )
+}
 
 #[derive(Error, Debug)]
 pub enum NodeError {
@@ -1567,15 +1602,139 @@ impl NodeService {
                 count: live_sandboxes,
             });
         }
+
+        // `deployment_containers.node_id` is `ON DELETE SET NULL`, and NULL
+        // means "the local Docker daemon". Any container not confirmed gone
+        // would therefore be re-homed to this process, and a later project
+        // deletion would try to remove it from a daemon that never had it.
+        // Record it as orphaned on this node instead, so cleanup skips it and
+        // anyone reading the row can see where it was left.
+        let orphaned = deployment_containers::Entity::update_many()
+            .col_expr(
+                deployment_containers::Column::Status,
+                Expr::value(CONTAINER_STATUS_ORPHANED),
+            )
+            .col_expr(
+                deployment_containers::Column::DeletedAt,
+                Expr::cust("COALESCE(deleted_at, now())"),
+            )
+            .col_expr(
+                deployment_containers::Column::ErrorMessage,
+                Expr::value(orphaned_container_note(&locked.name, node_id)),
+            )
+            .filter(deployment_containers::Column::NodeId.eq(node_id))
+            .filter(Self::not_confirmed_gone())
+            .exec(&txn)
+            .await?
+            .rows_affected;
+
         nodes::Entity::delete_by_id(node_id).exec(&txn).await?;
         txn.commit().await?;
 
+        if orphaned > 0 {
+            tracing::warn!(
+                node_id = node_id,
+                node_name = %locked.name,
+                orphaned_containers = orphaned,
+                "Node removed with containers Temps could not confirm were removed; recorded as orphaned"
+            );
+        }
         tracing::info!(
             node_id = node_id,
             removed_dns_endpoints = removed_endpoints,
             "Node removed from cluster"
         );
 
+        Ok(())
+    }
+
+    /// Rows for containers that may still exist in Docker: anything not
+    /// confirmed removed and not already recorded as orphaned.
+    fn not_confirmed_gone() -> Condition {
+        Condition::any()
+            .add(deployment_containers::Column::Status.is_null())
+            .add(
+                deployment_containers::Column::Status
+                    .is_not_in([CONTAINER_STATUS_REMOVED, CONTAINER_STATUS_ORPHANED]),
+            )
+    }
+
+    /// Containers on a node that no deployment needs any more but that Temps
+    /// has not confirmed are gone from the node's Docker daemon. That is every
+    /// row out of routing (`deleted_at` set: stopped, retired while the node
+    /// was offline, or interrupted mid-removal), plus every row still marked
+    /// live whose deployment has finished and is not its environment's current
+    /// one — a superseded container whose teardown could not reach the node,
+    /// which otherwise stays "running" for as long as the node is unreachable.
+    /// Containers of current or still-running deployments are never included.
+    /// Each comes with the project that owns it, so the caller can verify
+    /// ownership before removing it. Removing the node first would lose track
+    /// of them.
+    pub async fn unconfirmed_containers_for_node(
+        &self,
+        node_id: i32,
+    ) -> Result<Vec<(deployment_containers::Model, i32)>, NodeError> {
+        let containers = deployment_containers::Entity::find()
+            .filter(deployment_containers::Column::NodeId.eq(node_id))
+            .filter(Self::not_confirmed_gone())
+            .order_by_asc(deployment_containers::Column::Id)
+            .all(self.db.as_ref())
+            .await?;
+        if containers.is_empty() {
+            return Ok(Vec::new());
+        }
+        let deployment_ids: Vec<i32> = containers
+            .iter()
+            .map(|container| container.deployment_id)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let owners: std::collections::HashMap<i32, deployments::Model> =
+            deployments::Entity::find()
+                .filter(deployments::Column::Id.is_in(deployment_ids))
+                .all(self.db.as_ref())
+                .await?
+                .into_iter()
+                .map(|deployment| (deployment.id, deployment))
+                .collect();
+        let environment_ids: Vec<i32> = owners
+            .values()
+            .map(|deployment| deployment.environment_id)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let current: HashSet<i32> = environments::Entity::find()
+            .filter(environments::Column::Id.is_in(environment_ids))
+            .all(self.db.as_ref())
+            .await?
+            .into_iter()
+            .filter_map(|environment| environment.current_deployment_id)
+            .collect();
+        Ok(containers
+            .into_iter()
+            .filter_map(|container| {
+                let deployment = owners.get(&container.deployment_id)?;
+                let needed = container.deleted_at.is_none()
+                    && (current.contains(&deployment.id)
+                        || !deployment_has_finished(&deployment.state));
+                (!needed).then_some((container, deployment.project_id))
+            })
+            .collect())
+    }
+
+    pub async fn mark_container_removed(&self, container_row_id: i32) -> Result<(), NodeError> {
+        deployment_containers::Entity::update_many()
+            .col_expr(
+                deployment_containers::Column::Status,
+                Expr::value(CONTAINER_STATUS_REMOVED),
+            )
+            .col_expr(
+                deployment_containers::Column::DeletedAt,
+                Expr::cust("COALESCE(deleted_at, now())"),
+            )
+            .filter(deployment_containers::Column::Id.eq(container_row_id))
+            .exec(self.db.as_ref())
+            .await?;
         Ok(())
     }
 
@@ -1778,12 +1937,16 @@ impl NodeService {
     }
 
     /// Soft-delete all active containers on a specific node for a given deployment.
-    /// Sets `deleted_at` and `status = "removed"` so the proxy stops routing to them.
+    /// Sets `deleted_at` so the proxy stops routing to them. Containers whose
+    /// Docker container ID is in `confirmed_removed` get status `removed`;
+    /// the rest get `retired`, because they may still exist on the node and
+    /// cleanup must still remove them there.
     /// Returns the number of containers retired.
     pub async fn retire_containers_on_node(
         &self,
         node_id: i32,
         deployment_id: i32,
+        confirmed_removed: &HashSet<String>,
     ) -> Result<usize, NodeError> {
         let containers = deployment_containers::Entity::find()
             .filter(deployment_containers::Column::NodeId.eq(node_id))
@@ -1794,9 +1957,14 @@ impl NodeService {
 
         let count = containers.len();
         for container in containers {
+            let status = if confirmed_removed.contains(&container.container_id) {
+                CONTAINER_STATUS_REMOVED
+            } else {
+                CONTAINER_STATUS_RETIRED
+            };
             let mut active: deployment_containers::ActiveModel = container.into();
             active.deleted_at = Set(Some(chrono::Utc::now()));
-            active.status = Set(Some("removed".to_string()));
+            active.status = Set(Some(status.to_string()));
             active.update(self.db.as_ref()).await?;
         }
 
@@ -2158,6 +2326,11 @@ mod tests {
                 "num_items".to_string(),
                 sea_orm::Value::BigInt(Some(0)),
             )])]])
+            // orphan any unconfirmed containers (none here)
+            .append_exec_results(vec![sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }])
             .append_exec_results(vec![sea_orm::MockExecResult {
                 last_insert_id: 0,
                 rows_affected: 1,
@@ -3508,6 +3681,59 @@ mod tests {
         );
     }
 
+    /// Node removal must account for every container no deployment needs —
+    /// including one still marked live because the redeploy that superseded
+    /// it could not reach the node to tear it down — but never for the
+    /// containers of a current or still-running deployment.
+    #[tokio::test]
+    async fn unconfirmed_containers_include_superseded_live_rows_but_not_needed_ones() {
+        let current = sample_container(1, 10, 5);
+        let superseded = sample_container(2, 20, 5);
+        let in_progress = sample_container(3, 30, 5);
+        let mut retired = sample_container(4, 40, 5);
+        retired.deleted_at = Some(chrono::Utc::now());
+        retired.status = Some(CONTAINER_STATUS_RETIRED.to_string());
+
+        let mut running = sample_deployment(30, 101, 201);
+        running.state = "running".to_string();
+        let mut failed = sample_deployment(40, 101, 201);
+        failed.state = "failed".to_string();
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // rows on the node not confirmed gone
+            .append_query_results(vec![vec![current, superseded, in_progress, retired]])
+            .append_query_results(vec![vec![
+                sample_deployment(10, 100, 200),
+                sample_deployment(20, 100, 200),
+                running,
+                failed,
+            ]])
+            .append_query_results(vec![vec![
+                sample_environment(200, 100, Some(10)),
+                sample_environment(201, 101, None),
+            ]])
+            .into_connection();
+        let service = NodeService::new(Arc::new(db));
+
+        let leftovers = service.unconfirmed_containers_for_node(5).await.unwrap();
+
+        let found: Vec<(i32, i32)> = leftovers
+            .iter()
+            .map(|(container, project_id)| (container.id, *project_id))
+            .collect();
+        assert_eq!(found, vec![(2, 100), (4, 101)]);
+    }
+
+    #[test]
+    fn only_final_deployment_states_count_as_finished() {
+        for state in ["cancelled", "stopped", "completed", "deployed", "failed"] {
+            assert!(deployment_has_finished(state), "{state}");
+        }
+        for state in ["pending", "running", "creating", "built", ""] {
+            assert!(!deployment_has_finished(state), "{state}");
+        }
+    }
+
     #[tokio::test]
     async fn test_affected_deployments_empty() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
@@ -3543,7 +3769,10 @@ mod tests {
             .into_connection();
         let service = NodeService::new(Arc::new(db));
 
-        let count = service.retire_containers_on_node(5, 10).await.unwrap();
+        let count = service
+            .retire_containers_on_node(5, 10, &HashSet::new())
+            .await
+            .unwrap();
         assert_eq!(count, 2);
     }
 
@@ -3812,7 +4041,10 @@ mod tests {
             .into_connection();
         let service = NodeService::new(Arc::new(db));
 
-        let count = service.retire_containers_on_node(5, 10).await.unwrap();
+        let count = service
+            .retire_containers_on_node(5, 10, &HashSet::new())
+            .await
+            .unwrap();
         assert_eq!(count, 0);
     }
 

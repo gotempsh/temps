@@ -111,6 +111,23 @@ export function problemErrorCode(error: unknown): string | undefined {
   return typeof extension === 'string' ? extension : undefined
 }
 
+/**
+ * The containers a node removal could not confirm are gone, when the API
+ * refused it for that reason (409 "Node Still Holds Containers"). Only then
+ * is retrying with `force=true` the operator's call to make.
+ */
+export function unremovedNodeContainers(error: unknown): string[] | undefined {
+  if (!error || typeof error !== 'object') return undefined
+  const problem = error as {
+    unremoved_containers?: unknown
+    extensions?: { unremoved_containers?: unknown } | null
+  }
+  const list =
+    problem.unremoved_containers ?? problem.extensions?.unremoved_containers
+  if (!Array.isArray(list) || list.length === 0) return undefined
+  return list.filter((item): item is string => typeof item === 'string')
+}
+
 /** True when a failed request failed because no worker node can run it. */
 export function isWorkerNodeRequiredProblem(error: unknown): boolean {
   return problemErrorCode(error) === WORKER_NODE_REQUIRED_ERROR_CODE

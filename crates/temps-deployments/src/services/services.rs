@@ -25,6 +25,7 @@ pub type ContainerLogStream =
 use super::container_operations::{
     ContainerOperations, LocalContainerOperations, RemoteContainerOperations,
 };
+use crate::services::node_service::{CONTAINER_STATUS_ORPHANED, CONTAINER_STATUS_REMOVED};
 use crate::services::types::{
     Deployment, DeploymentDomain, DeploymentEnvironment, DeploymentListResponse,
     LatestDeploymentMedia,
@@ -115,6 +116,25 @@ struct PipelineTriggerOptions {
     commit: Option<String>,
     rollback_from_deployment_id: Option<i32>,
     recovery_of_deployment_id: Option<i32>,
+}
+
+/// What a node drain or failover redeploy rebuilds a deployment from.
+#[derive(Debug, PartialEq, Eq)]
+enum RedeploySource {
+    /// A pre-built image, pulled again (imports, `deployFromImage`).
+    Image {
+        image_ref: String,
+        health_check_path: Option<String>,
+        command: Option<Vec<String>>,
+    },
+    /// The uploaded source archive the deployment was built from.
+    SourceBundle,
+    /// The project's repository at the deployment's ref.
+    Git {
+        branch: Option<String>,
+        tag: Option<String>,
+        commit: Option<String>,
+    },
 }
 
 #[derive(Error, Debug)]
@@ -230,6 +250,36 @@ impl From<sea_orm::DbErr> for DeploymentError {
 pub(crate) fn is_unique_violation(err: &sea_orm::DbErr) -> bool {
     err.sql_err()
         .is_some_and(|e| matches!(e, sea_orm::SqlErr::UniqueConstraintViolation(_)))
+}
+
+/// Why owner cleanup may skip a container whose runtime cannot be resolved,
+/// or `None` when the failure must stop the deletion.
+///
+/// Only two cases qualify, both where retrying could never succeed: a row
+/// already recorded as removed, and a row with no node on a process that has
+/// no local Docker daemon. `deployment_containers.node_id` is cleared when a
+/// node is removed, so on a control plane that runs no containers such a row
+/// was placed on a worker that is gone; there is no daemon Temps could ask.
+fn unreachable_container_skip(
+    container: &deployment_containers::Model,
+    error: &DeploymentError,
+) -> Option<String> {
+    if container.status.as_deref() == Some(CONTAINER_STATUS_REMOVED) {
+        return Some(format!(
+            "Skipping container already recorded as removed; its runtime cannot be checked: {error}"
+        ));
+    }
+    if container.node_id.is_none() && matches!(error, DeploymentError::DockerUnavailable(_)) {
+        return Some(format!(
+            "Skipping container '{}' (status {}) that records no node: this process runs no local \
+             Docker daemon, so it was placed on a worker that has since been removed from the \
+             cluster. Temps cannot reach it; if that host still exists, remove it there with \
+             `docker rm -f`",
+            container.container_name,
+            container.status.as_deref().unwrap_or("unknown")
+        ));
+    }
+    None
 }
 
 fn confined_archive_path(
@@ -918,6 +968,45 @@ impl DeploymentService {
                     ),
                 })?;
 
+            // Left on a node that was removed from the cluster: Temps no
+            // longer manages that host, so there is nothing it may remove.
+            if original.status.as_deref() == Some(CONTAINER_STATUS_ORPHANED) {
+                warn!(
+                    project_id,
+                    environment_id = container_environment_id,
+                    container_id,
+                    note = original
+                        .error_message
+                        .as_deref()
+                        .unwrap_or("no placement recorded"),
+                    "Skipping container orphaned by a removed node; it is not removed by Temps"
+                );
+                continue;
+            }
+
+            // Resolve where the container lives before touching its row.
+            let deployer = match self.deployer_for_node(node_id).await {
+                Ok(deployer) => deployer,
+                Err(error) => {
+                    if let Some(skip) = unreachable_container_skip(&original, &error) {
+                        warn!(
+                            project_id,
+                            environment_id = container_environment_id,
+                            container_id,
+                            "{skip}"
+                        );
+                        continue;
+                    }
+                    return Err(temps_core::ContainerCleanupError::Removal {
+                        project_id,
+                        environment_id: container_environment_id,
+                        container_id,
+                        node_id,
+                        reason: error.to_string(),
+                    });
+                }
+            };
+
             // Hide intentional teardown from routing and health monitoring before
             // Docker observes the removal. The distinct `removing` state makes a
             // process crash retryable instead of turning the row into a false
@@ -938,30 +1027,6 @@ impl DeploymentService {
                         reason: error.to_string(),
                     }
                 })?
-            };
-
-            let deployer = match self.deployer_for_node(node_id).await {
-                Ok(deployer) => deployer,
-                Err(error) => {
-                    let reason = self
-                        .restore_cleanup_marker(&original, already_prepared)
-                        .await
-                        .map_or_else(
-                            |restore_error| {
-                                format!(
-                                    "{error}; additionally failed to restore the container record: {restore_error}"
-                                )
-                            },
-                            |()| error.to_string(),
-                        );
-                    return Err(temps_core::ContainerCleanupError::Removal {
-                        project_id,
-                        environment_id: container_environment_id,
-                        container_id,
-                        node_id,
-                        reason,
-                    });
-                }
             };
 
             let runtime_container_absent = match deployer.get_container_info(&container_id).await {
@@ -991,6 +1056,19 @@ impl DeploymentService {
                     let _ = self
                         .restore_cleanup_marker(&original, already_prepared)
                         .await;
+                    // Already recorded as removed: an unreachable node cannot
+                    // contradict that, so it must not block the deletion.
+                    if original.status.as_deref() == Some(CONTAINER_STATUS_REMOVED) {
+                        warn!(
+                            project_id,
+                            environment_id = container_environment_id,
+                            container_id,
+                            ?node_id,
+                            %error,
+                            "Skipping container already recorded as removed; its node could not confirm it"
+                        );
+                        continue;
+                    }
                     return Err(temps_core::ContainerCleanupError::Removal {
                         project_id,
                         environment_id: container_environment_id,
@@ -2178,13 +2256,28 @@ impl DeploymentService {
         .await
     }
 
-    async fn redeploy_environment_inner(
+    /// Confirm that [`Self::redeploy_environment`] can rebuild this deployment
+    /// somewhere else, without queuing anything. Node drain runs this for
+    /// every workload it would have to move *before* it marks the node
+    /// draining, so a workload with nothing to rebuild from is refused up
+    /// front instead of leaving the node draining forever.
+    pub async fn check_redeployable(
         &self,
         project_id: i32,
         environment_id: i32,
         deployment_id: i32,
-        recovery_of_deployment_id: Option<i32>,
     ) -> Result<(), DeploymentError> {
+        self.resolve_redeploy_source(project_id, environment_id, deployment_id)
+            .await
+            .map(|_| ())
+    }
+
+    async fn resolve_redeploy_source(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        deployment_id: i32,
+    ) -> Result<RedeploySource, DeploymentError> {
         // Use the deployment that owns the affected containers. Selecting the
         // newest row can race a concurrent failed/cancelled deploy and restore
         // the wrong workload during failover.
@@ -2212,19 +2305,94 @@ impl DeploymentService {
             .as_ref()
             .and_then(|m| m.external_image_ref.clone())
         {
-            return self
-                .trigger_image_deployment_inner(
+            return Ok(RedeploySource::Image {
+                image_ref,
+                health_check_path: deploy
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.health_check_path.clone()),
+                command: deploy
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.command.clone()),
+            });
+        }
+
+        // Uploaded-source deployments have no repository either; their only
+        // lineage is the archive the user uploaded, which is retained on this
+        // server until the project is deleted. Rebuild from it, but only if
+        // it is still there: a redeploy that would fail in
+        // `PrepareSourceBundleJob` must be refused while the caller can
+        // still act on it.
+        if let Some((_, bundle_path)) =
+            super::job_processor::source_bundle_lineage(deploy.metadata.as_ref())
+        {
+            let archive = confined_archive_path(&self.config_service.data_dir(), &bundle_path)?;
+            return match tokio::fs::try_exists(&archive).await {
+                Ok(true) => Ok(RedeploySource::SourceBundle),
+                Ok(false) => Err(DeploymentError::InvalidDeploymentState(format!(
+                    "Deployment {deployment_id} of project {project_id}, environment {environment_id} \
+                     was built from uploaded source '{bundle_path}', which is no longer retained on \
+                     this server. Upload the source again so it is built on an eligible node"
+                ))),
+                Err(error) => Err(DeploymentError::Other(format!(
+                    "Could not check the uploaded source '{bundle_path}' of deployment \
+                     {deployment_id} (project {project_id}, environment {environment_id}) at \
+                     {}: {error}",
+                    archive.display()
+                ))),
+            };
+        }
+
+        let project = projects::Entity::find_by_id(project_id)
+            .filter(projects::Column::IsDeleted.eq(false))
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| {
+                DeploymentError::Other(format!(
+                "Failed to load project {project_id} to redeploy deployment {deployment_id}: {e}"
+            ))
+            })?
+            .ok_or_else(|| DeploymentError::NotFound(format!("project {project_id} not found")))?;
+        if project.repo_owner.is_empty() || project.repo_name.is_empty() {
+            return Err(DeploymentError::InvalidDeploymentState(format!(
+                "Deployment {deployment_id} of project '{}' ({project_id}), environment \
+                 {environment_id} cannot be rebuilt elsewhere: it records no Git repository, \
+                 image reference or uploaded source bundle. Deploy it again from its source so \
+                 it runs on an eligible node",
+                project.slug
+            )));
+        }
+
+        Ok(RedeploySource::Git {
+            branch: deploy.branch_ref.clone(),
+            tag: deploy.tag_ref.clone(),
+            commit: deploy.commit_sha.clone(),
+        })
+    }
+
+    async fn redeploy_environment_inner(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        deployment_id: i32,
+        recovery_of_deployment_id: Option<i32>,
+    ) -> Result<(), DeploymentError> {
+        match self
+            .resolve_redeploy_source(project_id, environment_id, deployment_id)
+            .await?
+        {
+            RedeploySource::Image {
+                image_ref,
+                health_check_path,
+                command,
+            } => {
+                self.trigger_image_deployment_inner(
                     project_id,
                     Some(environment_id),
                     image_ref,
-                    deploy
-                        .metadata
-                        .as_ref()
-                        .and_then(|metadata| metadata.health_check_path.clone()),
-                    deploy
-                        .metadata
-                        .as_ref()
-                        .and_then(|metadata| metadata.command.clone()),
+                    health_check_path,
+                    command,
                     recovery_of_deployment_id,
                     // ADR 045: node drain and failover redeploy the workload
                     // that is already there, from the deployment's own stored
@@ -2233,27 +2401,51 @@ impl DeploymentService {
                     // its node died.
                     temps_core::docker_socket_grant::DeployCaller::Platform,
                 )
-                .await;
-        }
-
-        let (branch, tag, commit) = (
-            deploy.branch_ref.clone(),
-            deploy.tag_ref.clone(),
-            deploy.commit_sha.clone(),
-        );
-
-        self.trigger_pipeline_inner(
-            project_id,
-            environment_id,
-            PipelineTriggerOptions {
+                .await
+            }
+            RedeploySource::SourceBundle => {
+                info!(
+                    project_id,
+                    environment_id,
+                    deployment_id,
+                    "Redeploying uploaded-source deployment from its retained source bundle"
+                );
+                self.queue_service
+                    .send(temps_core::Job::RedeploySourceBundleRequested(
+                        temps_core::RedeploySourceBundleRequestedJob {
+                            project_id,
+                            environment_id,
+                            source_deployment_id: deployment_id,
+                            recovery_of_deployment_id,
+                        },
+                    ))
+                    .await
+                    .map_err(|e| {
+                        DeploymentError::QueueError(format!(
+                            "Failed to queue the uploaded-source redeploy of deployment \
+                             {deployment_id} (project {project_id}, environment {environment_id}): {e}"
+                        ))
+                    })
+            }
+            RedeploySource::Git {
                 branch,
                 tag,
                 commit,
-                rollback_from_deployment_id: None,
-                recovery_of_deployment_id,
-            },
-        )
-        .await
+            } => {
+                self.trigger_pipeline_inner(
+                    project_id,
+                    environment_id,
+                    PipelineTriggerOptions {
+                        branch,
+                        tag,
+                        commit,
+                        rollback_from_deployment_id: None,
+                        recovery_of_deployment_id,
+                    },
+                )
+                .await
+            }
+        }
     }
 
     /// Refuse a deployment of a project this control plane declares as
@@ -7396,6 +7588,131 @@ mod tests {
         Ok(())
     }
 
+    /// A worker hosting a failed deployment's container was removed. Its rows
+    /// lost their `node_id` (`ON DELETE SET NULL`), and the control plane runs
+    /// no Docker daemon. Deleting the project must not try to remove them
+    /// from a local daemon that never had them, and must not fail.
+    #[tokio::test]
+    async fn cleanup_skips_containers_of_a_removed_worker_on_a_control_plane(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping removed-worker cleanup integration test");
+            return Ok(());
+        }
+
+        // Arrange: one row per state a removed worker can leave behind.
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, _environment, _deployment, container) = setup_test_deployment(&db).await?;
+        let mut rows = Vec::new();
+        for (suffix, status) in [
+            ("retired", "retired"),
+            ("removed", CONTAINER_STATUS_REMOVED),
+            ("orphaned", CONTAINER_STATUS_ORPHANED),
+        ] {
+            let mut row: deployment_containers::ActiveModel = container.clone().into();
+            row.id = sea_orm::ActiveValue::NotSet;
+            row.container_id = Set(format!("{}-{suffix}", container.container_id));
+            row.status = Set(Some(status.to_string()));
+            row.deleted_at = Set(Some(Utc::now()));
+            row.node_id = Set(None);
+            rows.push(row.insert(db.as_ref()).await?);
+        }
+        deployment_containers::Entity::delete_by_id(container.id)
+            .exec(db.as_ref())
+            .await?;
+        let mut deployer = MockContainerDeployer::new();
+        deployer.expect_list_containers().returning(|| Ok(vec![]));
+        deployer.expect_get_container_info().never();
+        deployer.expect_remove_container().never();
+        let mut service = create_cleanup_service_for_test(db.clone(), Arc::new(deployer));
+        service.docker_handle = Arc::new(temps_core::DockerHandle::disabled(
+            "control-plane",
+            "started with --profile control-plane",
+        ));
+
+        // Act
+        let removed = temps_core::DeploymentContainerCleaner::cleanup_project_containers(
+            &service, project.id,
+        )
+        .await?;
+
+        // Assert: nothing was removed, nothing failed, no row was rewritten.
+        assert_eq!(removed, 0);
+        for row in rows {
+            let unchanged = deployment_containers::Entity::find_by_id(row.id)
+                .one(db.as_ref())
+                .await?
+                .expect("row remains until the project cascade");
+            assert_eq!(unchanged.status, row.status);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cleanup_still_fails_for_an_unreachable_container_not_known_to_be_gone(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping unreachable-node cleanup integration test");
+            return Ok(());
+        }
+
+        // Arrange: the container's worker still exists but cannot be reached.
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, _environment, _deployment, container) = setup_test_deployment(&db).await?;
+        // No agent token, so the node can never be dialled.
+        let node = nodes::ActiveModel {
+            name: Set("worker-unreachable".to_string()),
+            token_hash: Set("unused".to_string()),
+            token_encrypted: Set(None),
+            address: Set("https://127.0.0.1:1".to_string()),
+            private_address: Set("127.0.0.1".to_string()),
+            role: Set("worker".to_string()),
+            status: Set("offline".to_string()),
+            labels: Set(serde_json::json!({})),
+            capacity: Set(serde_json::json!({})),
+            dns_resolver_consecutive_failures: Set(0),
+            public_ingress_enabled: Set(false),
+            public_ingress_unsupported_reasons: Set(serde_json::json!([])),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        let mut active: deployment_containers::ActiveModel = container.clone().into();
+        active.node_id = Set(Some(node.id));
+        active.status = Set(Some("retired".to_string()));
+        active.deleted_at = Set(Some(Utc::now()));
+        active.update(db.as_ref()).await?;
+        let mut deployer = MockContainerDeployer::new();
+        deployer.expect_list_containers().returning(|| Ok(vec![]));
+        deployer.expect_remove_container().never();
+        let service = create_cleanup_service_for_test(db.clone(), Arc::new(deployer));
+
+        // Act
+        let result = temps_core::DeploymentContainerCleaner::cleanup_project_containers(
+            &service, project.id,
+        )
+        .await;
+
+        // Assert: it may still exist on that node, so deletion must stop and
+        // say which container and node.
+        match result {
+            Err(temps_core::ContainerCleanupError::Removal {
+                container_id,
+                node_id,
+                ..
+            }) => {
+                assert_eq!(container_id, container.container_id);
+                assert_eq!(node_id, Some(node.id));
+            }
+            other => panic!("expected a removal failure, got {other:?}"),
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn cancel_all_project_deployments_is_project_scoped(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -10732,6 +11049,194 @@ mod tests {
         assert_eq!(job.target_environment_id, Some(environment.id));
         assert_eq!(job.image_ref, "registry.example/app:known-good");
         assert_eq!(job.recovery_of_deployment_id, Some(deployment.id));
+        Ok(())
+    }
+
+    /// Point the service's data directory at `data_dir` so uploaded-source
+    /// archives can be staged without touching the real one.
+    fn with_test_data_dir(
+        mut service: DeploymentService,
+        db: Arc<temps_database::DbConnection>,
+        data_dir: &std::path::Path,
+    ) -> Result<DeploymentService, Box<dyn std::error::Error>> {
+        let mut config = temps_config::ServerConfig::new(
+            "127.0.0.1:3000".to_string(),
+            "postgresql://test_user:test_password@localhost:5432/test_db".to_string(),
+            None,
+            Some("127.0.0.1:3001".to_string()),
+        )?;
+        config.data_dir = data_dir.to_path_buf();
+        service.config_service = Arc::new(temps_config::ConfigService::new(Arc::new(config), db));
+        Ok(service)
+    }
+
+    /// Turn the fixture into an uploaded-source project (no repository) whose
+    /// deployment records `bundle_path` as its source.
+    async fn make_uploaded_source(
+        db: &temps_database::DbConnection,
+        project: &projects::Model,
+        deployment: &deployments::Model,
+        bundle_path: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut active_project: projects::ActiveModel = project.clone().into();
+        active_project.repo_owner = Set(String::new());
+        active_project.repo_name = Set(String::new());
+        active_project.source_type = Set(temps_entities::source_type::SourceType::UploadedSource);
+        active_project.update(db).await?;
+        let mut active: deployments::ActiveModel = deployment.clone().into();
+        active.metadata = Set(Some(temps_entities::deployments::DeploymentMetadata {
+            source_bundle_id: Some(41),
+            source_bundle_path: Some(bundle_path.to_string()),
+            source_bundle_content_type: Some("application/zip".to_string()),
+            deployment_source_type: Some(temps_entities::source_type::SourceType::UploadedSource),
+            ..Default::default()
+        }));
+        active.update(db).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn uploaded_source_redeploy_rebuilds_from_the_retained_bundle_not_git(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping uploaded-source redeploy integration test");
+            return Ok(());
+        }
+
+        // Arrange: an uploaded-source project has no repository, which made
+        // drain fail with "Project repo_owner is missing".
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, deployment, _) = setup_test_deployment(&db).await?;
+        let bundle_path = "source-bundles/drain-fixture/source.zip";
+        make_uploaded_source(db.as_ref(), &project, &deployment, bundle_path).await?;
+        let data_dir = tempfile::tempdir()?;
+        std::fs::create_dir_all(data_dir.path().join("source-bundles/drain-fixture"))?;
+        std::fs::write(data_dir.path().join(bundle_path), b"PK\x05\x06")?;
+        let service = with_test_data_dir(
+            create_deployment_service_for_test(db.clone()),
+            db,
+            data_dir.path(),
+        )?;
+        let mut receiver = service.queue_service.subscribe();
+
+        // Act
+        service
+            .check_redeployable(project.id, environment.id, deployment.id)
+            .await?;
+        service
+            .redeploy_environment_for_failover(project.id, environment.id, deployment.id)
+            .await?;
+
+        // Assert: the bundle lineage is redeployed, not the Git pipeline.
+        let job = loop {
+            match receiver.recv().await {
+                Ok(temps_core::Job::RedeploySourceBundleRequested(job)) => break job,
+                Ok(temps_core::Job::GitPushEvent(job)) => {
+                    panic!("uploaded source was sent down the Git path: {job:?}")
+                }
+                Ok(_) => continue,
+                Err(e) => panic!("queue closed before RedeploySourceBundleRequested arrived: {e}"),
+            }
+        };
+        assert_eq!(job.project_id, project.id);
+        assert_eq!(job.environment_id, environment.id);
+        assert_eq!(job.source_deployment_id, deployment.id);
+        assert_eq!(job.recovery_of_deployment_id, Some(deployment.id));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn uploaded_source_redeploy_without_its_archive_is_refused_before_queueing(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping uploaded-source redeploy integration test");
+            return Ok(());
+        }
+
+        // Arrange: the deployment records a bundle the server no longer has.
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, deployment, _) = setup_test_deployment(&db).await?;
+        make_uploaded_source(
+            db.as_ref(),
+            &project,
+            &deployment,
+            "source-bundles/drain-fixture/missing.zip",
+        )
+        .await?;
+        let data_dir = tempfile::tempdir()?;
+        let mut service = with_test_data_dir(
+            create_deployment_service_for_test(db.clone()),
+            db,
+            data_dir.path(),
+        )?;
+        let mut queue = MockQueueService::new();
+        queue.expect_send().times(0);
+        service.queue_service = Arc::new(queue);
+
+        // Act
+        let checked = service
+            .check_redeployable(project.id, environment.id, deployment.id)
+            .await;
+        let redeployed = service
+            .redeploy_environment(project.id, environment.id, deployment.id)
+            .await;
+
+        // Assert: both name the deployment and the missing archive.
+        for result in [checked, redeployed] {
+            match result {
+                Err(DeploymentError::InvalidDeploymentState(message)) => {
+                    assert!(
+                        message.contains(&format!("Deployment {}", deployment.id)),
+                        "{message}"
+                    );
+                    assert!(message.contains("missing.zip"), "{message}");
+                    assert!(message.contains("no longer retained"), "{message}");
+                }
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn redeploy_with_no_source_lineage_is_refused_before_queueing(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping redeploy lineage integration test");
+            return Ok(());
+        }
+
+        // Arrange: no repository, no image, no uploaded bundle.
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, deployment, _) = setup_test_deployment(&db).await?;
+        let mut active_project: projects::ActiveModel = project.clone().into();
+        active_project.repo_owner = Set(String::new());
+        active_project.repo_name = Set(String::new());
+        active_project.update(db.as_ref()).await?;
+        let mut active: deployments::ActiveModel = deployment.clone().into();
+        active.metadata = Set(Some(deployments::DeploymentMetadata::default()));
+        active.update(db.as_ref()).await?;
+        let mut service = create_deployment_service_for_test(db);
+        let mut queue = MockQueueService::new();
+        queue.expect_send().times(0);
+        service.queue_service = Arc::new(queue);
+
+        // Act
+        let result = service
+            .check_redeployable(project.id, environment.id, deployment.id)
+            .await;
+
+        // Assert
+        match result {
+            Err(DeploymentError::InvalidDeploymentState(message)) => {
+                assert!(message.contains("records no Git repository"), "{message}");
+                assert!(message.contains(&project.slug), "{message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
         Ok(())
     }
 

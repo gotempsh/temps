@@ -348,6 +348,22 @@ pub struct DrainNodeResponse {
 pub struct RemoveNodeResponse {
     pub id: i32,
     pub message: String,
+    /// Containers Temps could not confirm were removed from the node before
+    /// it was removed (only with `force=true`). They are recorded as
+    /// orphaned; remove them on that host by hand if it still exists.
+    #[serde(default)]
+    pub orphaned_containers: Vec<String>,
+}
+
+/// Query parameters for removing a node.
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct RemoveNodeQuery {
+    /// Remove the node even if containers Temps placed on it could not be
+    /// confirmed removed (e.g. the host is gone for good). Those containers
+    /// are recorded as orphaned instead of being re-homed.
+    #[serde(default)]
+    pub force: bool,
 }
 
 /// Progress of a node drain operation.
@@ -2783,6 +2799,122 @@ async fn create_remote_deployer(
     Some(Arc::new(deployer))
 }
 
+/// Remove one recorded container from a node, but only if Docker still says
+/// it belongs to `project_id`. `Ok` means Temps confirmed it is gone (removed
+/// now, or already absent); `Err` explains why it is left in place.
+async fn remove_owned_container(
+    deployer: &dyn ContainerDeployer,
+    container_id: &str,
+    project_id: i32,
+) -> Result<(), String> {
+    match deployer.get_container_info(container_id).await {
+        Ok(info) => {
+            let expected_project = project_id.to_string();
+            if info.labels.get("sh.temps.managed").map(String::as_str) != Some("true")
+                || info.labels.get("sh.temps.project_id") != Some(&expected_project)
+            {
+                return Err(format!(
+                    "its labels do not show it belongs to project {project_id}, so it was left in place"
+                ));
+            }
+        }
+        Err(temps_deployer::DeployerError::ContainerNotFound(_)) => return Ok(()),
+        Err(error) => return Err(format!("could not inspect it: {error}")),
+    }
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        deployer.remove_container(container_id),
+    )
+    .await
+    {
+        Ok(Ok(())) | Ok(Err(temps_deployer::DeployerError::ContainerNotFound(_))) => Ok(()),
+        Ok(Err(error)) => Err(format!("removal failed: {error}")),
+        Err(_) => Err("removal timed out after 30 seconds".to_string()),
+    }
+}
+
+/// One line per container a node removal could not confirm is gone.
+fn describe_unremoved_container(
+    container: &temps_entities::deployment_containers::Model,
+    project_id: i32,
+    reason: &str,
+) -> String {
+    format!(
+        "container '{}' ({}) of deployment {} in project {project_id}, status {}: {reason}",
+        container.container_name,
+        container.container_id,
+        container.deployment_id,
+        container.status.as_deref().unwrap_or("unknown"),
+    )
+}
+
+/// 409 for a node removal refused because containers Temps placed on it may
+/// still exist there, and removing the node would lose track of them.
+fn node_holds_containers_problem(node_id: i32, node_name: &str, unremoved: &[String]) -> Problem {
+    problemdetails::new(StatusCode::CONFLICT)
+        .with_title("Node Still Holds Containers")
+        .with_detail(format!(
+            "Node '{node_name}' was not removed: Temps could not confirm that {} container(s) it \
+             placed there are gone ({}). Start `temps agent` on the node so Temps can remove them, \
+             or remove them on that host with `docker rm -f`, then retry. If the host is gone for \
+             good, retry with DELETE /internal/nodes/{node_id}?force=true: the containers are then \
+             recorded as orphaned on '{node_name}' and are not touched again.",
+            unremoved.len(),
+            unremoved.join("; ")
+        ))
+        .with_value("node_id", node_id)
+        .with_value("node_name", node_name.to_string())
+        .with_value("unremoved_containers", unremoved.to_vec())
+}
+
+/// 409 for a drain refused before it changed anything, because at least one
+/// workload that only runs on this node has nothing to be rebuilt from.
+fn drain_refused_problem(node_name: &str, unmovable: &[String]) -> Problem {
+    problemdetails::new(StatusCode::CONFLICT)
+        .with_title("Node Cannot Be Drained")
+        .with_detail(format!(
+            "Node '{node_name}' was not drained and is unchanged: {} workload(s) running only on \
+             it cannot be redeployed to another node: {}. Move or delete these workloads, then \
+             drain again.",
+            unmovable.len(),
+            unmovable.join("; ")
+        ))
+        .with_value("node_name", node_name.to_string())
+        .with_value("unmovable_workloads", unmovable.to_vec())
+}
+
+/// 500 for a drain whose redeploys could not all be queued after the
+/// pre-check passed. States exactly what already happened, so the operator
+/// does not have to guess whether to retry.
+fn drain_incomplete_problem(
+    node_id: i32,
+    node_name: &str,
+    failed_redeploys: &[String],
+    retired_count: usize,
+    redeployed_count: usize,
+    reactivated: bool,
+) -> Problem {
+    let node_state = if reactivated {
+        "The node was set back to active; retry the drain once the cause is fixed.".to_string()
+    } else {
+        format!(
+            "The node remains draining; undrain it (DELETE /internal/nodes/{node_id}/drain) and \
+             retry once the cause is fixed."
+        )
+    };
+    problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+        .with_title("Node Drain Incomplete")
+        .with_detail(format!(
+            "Drain of node '{node_name}' did not complete: {} redeploy(s) could not be queued, so \
+             those workloads are still on the node ({}). {redeployed_count} environment(s) were \
+             redeployed and {retired_count} container(s) retired before the failure. {node_state}",
+            failed_redeploys.len(),
+            failed_redeploys.join("; ")
+        ))
+        .with_value("node_name", node_name.to_string())
+        .with_value("failed_redeploys", failed_redeploys.to_vec())
+}
+
 /// Drain a node: mark it as "draining" so no new replicas are scheduled on it,
 /// and trigger redeployment of all affected environments so their containers
 /// are rescheduled to healthy nodes.
@@ -2797,7 +2929,8 @@ async fn create_remote_deployer(
         (status = 200, description = "Node drain initiated", body = DrainNodeResponse),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Node not found"),
-        (status = 500, description = "Internal server error")
+        (status = 409, description = "Node already draining, or a workload only on this node cannot be redeployed elsewhere; the node is unchanged"),
+        (status = 500, description = "Internal server error, or a redeploy could not be queued (the response says what already happened)")
     ),
     security(("bearer_auth" = []))
 )]
@@ -2833,6 +2966,32 @@ async fn admin_drain_node(
         .await
         .map_err(Problem::from)?;
 
+    // Every workload that has to move must be rebuildable somewhere else.
+    // Check them all before changing anything: a drain that cannot move a
+    // workload would otherwise stay "draining" forever with the container
+    // still on the node, after reporting success.
+    let mut unmovable = Vec::new();
+    for dep in affected.iter().filter(|dep| dep.needs_redeploy()) {
+        if let Err(e) = app_state
+            .deployment_service
+            .check_redeployable(dep.project_id, dep.environment_id, dep.deployment_id)
+            .await
+        {
+            warn!(
+                node_id,
+                project_id = dep.project_id,
+                environment_id = dep.environment_id,
+                deployment_id = dep.deployment_id,
+                "Drain refused: workload cannot be redeployed elsewhere: {}",
+                e
+            );
+            unmovable.push(e.to_string());
+        }
+    }
+    if !unmovable.is_empty() {
+        return Err(drain_refused_problem(&node.name, &unmovable));
+    }
+
     // Mark the node as draining — scheduler will exclude it from new assignments
     app_state
         .node_service
@@ -2843,6 +3002,7 @@ async fn admin_drain_node(
     let mut retired_count = 0usize;
     let mut redeployed_count = 0usize;
     let mut redeployed_environments = HashSet::new();
+    let mut failed_redeploys = Vec::new();
 
     for dep in &affected {
         if dep.is_current && dep.needs_redeploy() {
@@ -2883,19 +3043,24 @@ async fn admin_drain_node(
                         "Drain: failed to trigger redeploy: {}",
                         e
                     );
+                    failed_redeploys.push(e.to_string());
                 }
             }
         } else {
-            // Historical deployments are never redeployed. Current deployments
-            // reach this branch only when another node still has a healthy
-            // replica. In both cases, stop and retire this node's containers.
-            // First, stop containers on the agent (best-effort)
+            // Historical deployments (including failed ones whose container
+            // still exists) are never redeployed. Current deployments reach
+            // this branch only when another node still has a healthy replica.
+            // In both cases, remove and retire this node's containers. Only a
+            // removal the agent confirmed is recorded as `removed`; anything
+            // else stays `retired` so cleanup still knows it may exist on
+            // this node.
             let containers = app_state
                 .node_service
                 .list_containers_for_node_deployment(node_id, dep.deployment_id)
                 .await
                 .unwrap_or_default();
 
+            let mut confirmed_removed = HashSet::new();
             if let Some(remote_deployer) = create_remote_deployer(
                 &node,
                 &app_state.config_service,
@@ -2904,15 +3069,22 @@ async fn admin_drain_node(
             .await
             {
                 for container in &containers {
-                    if let Err(e) = remote_deployer
-                        .stop_container(&container.container_id)
-                        .await
+                    match remove_owned_container(
+                        remote_deployer.as_ref(),
+                        &container.container_id,
+                        dep.project_id,
+                    )
+                    .await
                     {
-                        warn!(
+                        Ok(()) => {
+                            confirmed_removed.insert(container.container_id.clone());
+                        }
+                        Err(reason) => warn!(
                             node_id,
                             container_id = %container.container_id,
-                            "Drain: failed to stop container on agent (will still retire): {}", e
-                        );
+                            "Drain: could not remove container on agent (retiring it; cleanup will retry): {}",
+                            reason
+                        ),
                     }
                 }
             }
@@ -2920,7 +3092,7 @@ async fn admin_drain_node(
             // Then soft-delete in DB so the proxy stops routing to them
             match app_state
                 .node_service
-                .retire_containers_on_node(node_id, dep.deployment_id)
+                .retire_containers_on_node(node_id, dep.deployment_id, &confirmed_removed)
                 .await
             {
                 Ok(count) => {
@@ -2948,6 +3120,33 @@ async fn admin_drain_node(
                 }
             }
         }
+    }
+
+    if !failed_redeploys.is_empty() {
+        // The pre-check passed, so this is a transient failure (queue,
+        // database). Put an active node back so the drain can simply be
+        // retried; leaving it "draining" would strand the workloads that never
+        // moved. Any other prior status (e.g. offline) is not restored to
+        // "active" here — the operator undrains it explicitly.
+        let reactivated = node.status == "active"
+            && match app_state.node_service.mark_active(node_id).await {
+                Ok(()) => true,
+                Err(e) => {
+                    error!(
+                        node_id,
+                        "Drain: failed to reactivate node after a failed redeploy: {}", e
+                    );
+                    false
+                }
+            };
+        return Err(drain_incomplete_problem(
+            node_id,
+            &node.name,
+            &failed_redeploys,
+            retired_count,
+            redeployed_count,
+            reactivated,
+        ));
     }
 
     info!(
@@ -3020,21 +3219,25 @@ async fn admin_undrain_node(
     }))
 }
 
-/// Remove a node from the cluster entirely. The node should be drained first
-/// to ensure containers have been rescheduled. If the node still has active
-/// containers, it will be drained automatically before removal.
+/// Remove a node from the cluster entirely. The node must be drained first so
+/// its current containers have been rescheduled. Containers no deployment needs
+/// that may still exist on the node (a failed deployment's, ones retired while
+/// it was offline, or ones a redeploy replaced while it was unreachable) are
+/// removed first; if any cannot be, the removal is refused unless `force=true`,
+/// which records them as orphaned.
 #[utoipa::path(
     tag = "Nodes",
     delete,
     path = "/internal/nodes/{node_id}",
     params(
-        ("node_id" = i32, Path, description = "Node ID")
+        ("node_id" = i32, Path, description = "Node ID"),
+        RemoveNodeQuery
     ),
     responses(
         (status = 200, description = "Node removed", body = RemoveNodeResponse),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Node not found"),
-        (status = 409, description = "Node still has active containers or live sandboxes"),
+        (status = 409, description = "Node still has active containers, live sandboxes, or containers Temps could not confirm were removed (retry with force=true only if the host is gone)"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -3043,28 +3246,105 @@ async fn admin_remove_node(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AppState>>,
     Path(node_id): Path<i32>,
+    Query(query): Query<RemoveNodeQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
+    require_sensitive_action(
+        app_state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        SensitiveAction::RemoveNode { node_id },
+    )
+    .await?;
     let node = app_state
         .node_service
         .get_by_id(node_id)
         .await
         .map_err(Problem::from)?;
 
-    // Check if node still has active containers
-    let containers = app_state
+    // Containers no deployment needs may still exist on the node: a failed
+    // deployment's container, one retired while the node was offline, or one
+    // superseded by a redeploy whose teardown could not reach the node.
+    // Remove the ones Temps owns while the node is still reachable; after the
+    // node row is gone nothing could address them.
+    let leftovers = app_state
         .node_service
-        .list_containers_for_node(node_id)
+        .unconfirmed_containers_for_node(node_id)
         .await
         .map_err(Problem::from)?;
 
-    if !containers.is_empty() {
+    // Anything else still live on the node serves a current deployment or
+    // belongs to one still in progress: moving it is the drain's job.
+    let leftover_ids: HashSet<i32> = leftovers
+        .iter()
+        .map(|(container, _)| container.id)
+        .collect();
+    let serving = app_state
+        .node_service
+        .list_containers_for_node(node_id)
+        .await
+        .map_err(Problem::from)?
+        .into_iter()
+        .filter(|container| !leftover_ids.contains(&container.id))
+        .count();
+    if serving > 0 {
         return Err(problemdetails::new(StatusCode::CONFLICT)
             .with_title("Node Has Active Containers")
             .with_detail(format!(
-                "Node '{}' still has {} active container(s). Drain the node first with POST /internal/nodes/{}/drain",
-                node.name, containers.len(), node_id
+                "Node '{}' still has {} container(s) of current or in-progress deployments. Drain the node first with POST /internal/nodes/{}/drain and wait for its redeploys to finish",
+                node.name, serving, node_id
             )));
+    }
+    let mut unremoved = Vec::new();
+    if !leftovers.is_empty() {
+        let remote_deployer = create_remote_deployer(
+            &node,
+            &app_state.config_service,
+            &app_state.encryption_service,
+        )
+        .await;
+        for (container, project_id) in &leftovers {
+            let outcome = match remote_deployer.as_ref() {
+                Some(deployer) => {
+                    remove_owned_container(deployer.as_ref(), &container.container_id, *project_id)
+                        .await
+                }
+                None => Err("the node's agent cannot be reached".to_string()),
+            };
+            match outcome {
+                Ok(()) => {
+                    app_state
+                        .node_service
+                        .mark_container_removed(container.id)
+                        .await
+                        .map_err(Problem::from)?;
+                    info!(
+                        node_id,
+                        container_id = %container.container_id,
+                        deployment_id = container.deployment_id,
+                        "Removed leftover container before removing node"
+                    );
+                }
+                Err(reason) => {
+                    warn!(
+                        node_id,
+                        container_id = %container.container_id,
+                        deployment_id = container.deployment_id,
+                        "Could not remove leftover container before removing node: {}",
+                        reason
+                    );
+                    unremoved.push(describe_unremoved_container(
+                        container,
+                        *project_id,
+                        &reason,
+                    ));
+                }
+            }
+        }
+    }
+    if !unremoved.is_empty() && !query.force {
+        return Err(node_holds_containers_problem(
+            node_id, &node.name, &unremoved,
+        ));
     }
 
     let node_name = node.name.clone();
@@ -3075,11 +3355,29 @@ async fn admin_remove_node(
         .await
         .map_err(Problem::from)?;
 
-    info!(node_id, node_name = %node_name, "Node removed from cluster");
+    info!(
+        node_id,
+        node_name = %node_name,
+        orphaned_containers = unremoved.len(),
+        "Node removed from cluster"
+    );
 
+    let message = if unremoved.is_empty() {
+        format!("Node '{}' removed from cluster", node_name)
+    } else {
+        format!(
+            "Node '{}' removed from cluster. {} container(s) could not be removed and were \
+             recorded as orphaned on it; if the host still exists, remove them there with \
+             `docker rm -f`: {}",
+            node_name,
+            unremoved.len(),
+            unremoved.join("; ")
+        )
+    };
     Ok(Json(RemoveNodeResponse {
         id: node_id,
-        message: format!("Node '{}' removed from cluster", node_name),
+        message,
+        orphaned_containers: unremoved,
     }))
 }
 
@@ -3608,6 +3906,198 @@ mod tests {
     use sea_orm::{DatabaseBackend, MockDatabase};
     use temps_entities::{deployment_containers, nodes};
     use tower::ServiceExt;
+
+    // ── Removing containers a node removal would lose track of ──────────
+
+    mod container_removal {
+        use super::super::{
+            describe_unremoved_container, node_holds_containers_problem, remove_owned_container,
+        };
+        use axum::http::StatusCode;
+        use mockall::mock;
+        use std::collections::HashMap;
+
+        mock! {
+            Deployer {}
+            #[async_trait::async_trait]
+            impl temps_deployer::ContainerDeployer for Deployer {
+                async fn deploy_container(&self, request: temps_deployer::DeployRequest) -> Result<temps_deployer::DeployResult, temps_deployer::DeployerError>;
+                async fn start_container(&self, container_id: &str) -> Result<(), temps_deployer::DeployerError>;
+                async fn stop_container(&self, container_id: &str) -> Result<(), temps_deployer::DeployerError>;
+                async fn pause_container(&self, container_id: &str) -> Result<(), temps_deployer::DeployerError>;
+                async fn resume_container(&self, container_id: &str) -> Result<(), temps_deployer::DeployerError>;
+                async fn remove_container(&self, container_id: &str) -> Result<(), temps_deployer::DeployerError>;
+                async fn get_container_info(&self, container_id: &str) -> Result<temps_deployer::ContainerInfo, temps_deployer::DeployerError>;
+                async fn get_container_stats(&self, container_id: &str) -> Result<temps_deployer::ContainerStats, temps_deployer::DeployerError>;
+                async fn list_containers(&self) -> Result<Vec<temps_deployer::ContainerInfo>, temps_deployer::DeployerError>;
+                async fn get_container_logs(&self, container_id: &str) -> Result<String, temps_deployer::DeployerError>;
+                async fn stream_container_logs(&self, container_id: &str) -> Result<Box<dyn futures::Stream<Item = String> + Unpin + Send>, temps_deployer::DeployerError>;
+                async fn image_exists(&self, image_name: &str) -> Result<bool, temps_deployer::DeployerError>;
+            }
+        }
+
+        fn labelled(project_id: &str) -> temps_deployer::ContainerInfo {
+            temps_deployer::ContainerInfo {
+                labels: HashMap::from([
+                    ("sh.temps.managed".to_string(), "true".to_string()),
+                    ("sh.temps.project_id".to_string(), project_id.to_string()),
+                ]),
+                ..Default::default()
+            }
+        }
+
+        #[tokio::test]
+        async fn an_owned_container_is_removed() {
+            let mut deployer = MockDeployer::new();
+            deployer
+                .expect_get_container_info()
+                .returning(|_| Ok(labelled("7")));
+            deployer
+                .expect_remove_container()
+                .withf(|id| id == "failed-app")
+                .times(1)
+                .returning(|_| Ok(()));
+
+            assert_eq!(
+                remove_owned_container(&deployer, "failed-app", 7).await,
+                Ok(())
+            );
+        }
+
+        #[tokio::test]
+        async fn a_container_already_gone_counts_as_removed() {
+            let mut deployer = MockDeployer::new();
+            deployer.expect_get_container_info().returning(|id| {
+                Err(temps_deployer::DeployerError::ContainerNotFound(
+                    id.to_string(),
+                ))
+            });
+            deployer.expect_remove_container().never();
+
+            assert_eq!(remove_owned_container(&deployer, "gone", 7).await, Ok(()));
+        }
+
+        #[tokio::test]
+        async fn a_container_of_another_project_is_left_in_place() {
+            let mut deployer = MockDeployer::new();
+            deployer
+                .expect_get_container_info()
+                .returning(|_| Ok(labelled("8")));
+            deployer.expect_remove_container().never();
+
+            let reason = remove_owned_container(&deployer, "reused-id", 7)
+                .await
+                .expect_err("ownership mismatch must refuse");
+            assert!(reason.contains("project 7"), "{reason}");
+        }
+
+        #[tokio::test]
+        async fn an_unreachable_agent_is_reported_not_assumed() {
+            let mut deployer = MockDeployer::new();
+            deployer.expect_get_container_info().returning(|_| {
+                Err(temps_deployer::DeployerError::NetworkError(
+                    "connection refused".to_string(),
+                ))
+            });
+            deployer.expect_remove_container().never();
+
+            let reason = remove_owned_container(&deployer, "stranded", 7)
+                .await
+                .expect_err("an unreachable agent confirms nothing");
+            assert!(reason.contains("connection refused"), "{reason}");
+        }
+
+        #[test]
+        fn refusing_removal_names_each_container_and_both_remedies() {
+            let container = temps_entities::deployment_containers::Model {
+                id: 1,
+                deployment_id: 42,
+                container_id: "abc123".to_string(),
+                container_name: "app-42".to_string(),
+                container_port: 3000,
+                host_port: None,
+                image_name: None,
+                status: Some("retired".to_string()),
+                service_name: None,
+                created_at: chrono::Utc::now(),
+                deployed_at: chrono::Utc::now(),
+                ready_at: None,
+                deleted_at: Some(chrono::Utc::now()),
+                node_id: Some(5),
+                exit_code: None,
+                exit_reason: None,
+                oom_killed: None,
+                error_message: None,
+                finished_at: None,
+                started_at: None,
+                cpu_limit_cores: None,
+                port_bindings: None,
+            };
+            let line =
+                describe_unremoved_container(&container, 9, "the node's agent cannot be reached");
+            assert!(line.contains("'app-42' (abc123)"), "{line}");
+            assert!(line.contains("deployment 42 in project 9"), "{line}");
+            assert!(line.contains("status retired"), "{line}");
+
+            let problem = node_holds_containers_problem(5, "worker-b", std::slice::from_ref(&line));
+            assert_eq!(problem.status_code, StatusCode::CONFLICT);
+            let body = serde_json::to_string(&problem.body).unwrap();
+            assert!(body.contains("was not removed"), "{body}");
+            assert!(body.contains("temps agent"), "{body}");
+            assert!(body.contains("force=true"), "{body}");
+            assert_eq!(
+                problem.body.get("unremoved_containers"),
+                Some(&serde_json::json!([line]))
+            );
+        }
+    }
+
+    // ── Drain refusals for workloads that cannot move ───────────────────
+
+    #[test]
+    fn a_drain_with_an_unmovable_workload_is_refused_with_its_details() {
+        let reason = "Invalid deployment state: Deployment 12 of project 3, environment 4 was \
+                      built from uploaded source 'source-bundles/a.zip', which is no longer \
+                      retained on this server. Upload the source again so it is built on an \
+                      eligible node";
+        let problem = drain_refused_problem("worker-a", &[reason.to_string()]);
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        let body = serde_json::to_string(&problem.body).unwrap();
+        assert!(body.contains("was not drained and is unchanged"), "{body}");
+        assert!(
+            body.contains("Deployment 12 of project 3, environment 4"),
+            "{body}"
+        );
+        // The reason and the advice are separate sentences.
+        assert!(body.contains("eligible node. Move or delete"), "{body}");
+        assert!(body.contains("drain again"), "{body}");
+        assert_eq!(
+            problem.body.get("unmovable_workloads"),
+            Some(&serde_json::json!([reason]))
+        );
+    }
+
+    #[test]
+    fn an_incomplete_drain_says_what_happened_and_how_to_retry() {
+        let failed = vec!["Queue error: queue closed".to_string()];
+        let reactivated = drain_incomplete_problem(7, "worker-a", &failed, 2, 1, true);
+        assert_eq!(reactivated.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let body = serde_json::to_string(&reactivated.body).unwrap();
+        assert!(body.contains("1 redeploy(s) could not be queued"), "{body}");
+        assert!(
+            body.contains("1 environment(s) were redeployed and 2 container(s) retired"),
+            "{body}"
+        );
+        assert!(body.contains("set back to active"), "{body}");
+        assert!(!body.contains("Node drain initiated"), "{body}");
+
+        let still_draining = drain_incomplete_problem(7, "worker-a", &failed, 0, 0, false);
+        let body = serde_json::to_string(&still_draining.body).unwrap();
+        assert!(body.contains("remains draining"), "{body}");
+        // The undrain path names this node, not a placeholder.
+        assert!(body.contains("DELETE /internal/nodes/7/drain"), "{body}");
+        assert!(!body.contains("{node_id}"), "{body}");
+    }
 
     // ── Drain status and node removal with sandboxes (ADR-048) ──────────
 

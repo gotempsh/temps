@@ -12,6 +12,7 @@ import {
   sameOriginSetupPath,
   shouldPromptForFirstWorkerNode,
   shouldShowWorkerNodeBanner,
+  unremovedNodeContainers,
   WORKER_NODES_URL,
 } from './worker-nodes'
 
@@ -139,6 +140,33 @@ describe('worker-node Problem detection', () => {
     expect(isWorkerNodeRequiredProblem({ detail: 'boom' })).toBe(false)
     expect(isWorkerNodeRequiredProblem(null)).toBe(false)
     expect(problemErrorCode('nope')).toBeUndefined()
+  })
+})
+
+describe('node removal refused for unconfirmed containers', () => {
+  test('lists the containers from the Problem body', () => {
+    const containers = ["container 'app-1' (abc) of deployment 4 in project 2"]
+    expect(
+      unremovedNodeContainers({
+        title: 'Node Still Holds Containers',
+        unremoved_containers: containers,
+      })
+    ).toEqual(containers)
+    expect(
+      unremovedNodeContainers({
+        extensions: { unremoved_containers: containers },
+      })
+    ).toEqual(containers)
+  })
+
+  test('is undefined for any other refusal', () => {
+    expect(
+      unremovedNodeContainers({ title: 'Node Has Active Containers' })
+    ).toBeUndefined()
+    expect(
+      unremovedNodeContainers({ unremoved_containers: [] })
+    ).toBeUndefined()
+    expect(unremovedNodeContainers(null)).toBeUndefined()
   })
 })
 

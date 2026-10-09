@@ -36,6 +36,7 @@ import {
 import {
   canAddWorkerNode,
   shouldPromptForFirstWorkerNode,
+  unremovedNodeContainers,
   WORKER_NODES_URL,
 } from '@/lib/worker-nodes'
 import {
@@ -63,6 +64,7 @@ import {
 import type {
   NodeInfoResponse,
   NodeContainerResponse,
+  RemoveNodeResponse,
   WireguardMeshStatusResponse,
 } from '@/api/client/types.gen'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
@@ -915,6 +917,11 @@ function NodeDetail({
   const [showUndrainDialog, setShowUndrainDialog] = useState(false)
   const [drainPending, setDrainPending] = useState(false)
   const [removePending, setRemovePending] = useState(false)
+  // Containers a removal could not confirm are gone. While set, the remove
+  // dialog lists them and offers to remove the node anyway.
+  const [unremovedContainers, setUnremovedContainers] = useState<
+    string[] | null
+  >(null)
   const [undrainPending, setUndrainPending] = useState(false)
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
@@ -973,7 +980,12 @@ function NodeDetail({
         if (handleSensitiveActionError(resp.error, () => handleDrain())) {
           return
         }
-        toast.error('Failed to drain node')
+        toast.error('Could not drain node', {
+          description: problemDetail(
+            resp.error,
+            'Check your permissions and try again.'
+          ),
+        })
         return
       }
       toast.success(`Node is now draining`)
@@ -992,14 +1004,29 @@ function NodeDetail({
     }
   }
 
-  const handleRemove = async () => {
+  const handleRemove = async (force = false) => {
     setRemovePending(true)
+    let keepDialogOpen = false
     try {
       const resp = await client.delete({
         url: '/internal/nodes/{node_id}',
         path: { node_id: nodeId },
+        query: force ? { force: true } : undefined,
       })
       if (resp.error) {
+        if (handleSensitiveActionError(resp.error, () => handleRemove(force))) {
+          return
+        }
+        // Containers Temps placed on the node may still exist: keep the
+        // dialog open with the list so the operator decides whether the
+        // host is gone for good.
+        const unremoved = unremovedNodeContainers(resp.error)
+        if (unremoved && !force) {
+          setUnremovedContainers(unremoved)
+          keepDialogOpen = true
+          setShowRemoveDialog(true)
+          return
+        }
         // Live sandboxes block removal and draining doesn't move them:
         // point straight at the tab that can destroy them.
         const hostsSandboxes =
@@ -1023,7 +1050,15 @@ function NodeDetail({
         })
         return
       }
-      toast.success('Node removed')
+      const orphaned =
+        (resp.data as RemoveNodeResponse | undefined)?.orphaned_containers ?? []
+      if (orphaned.length > 0) {
+        toast.warning('Node removed', {
+          description: `${orphaned.length} container(s) could not be removed and were recorded as orphaned. If the host still exists, remove them there with docker rm -f.`,
+        })
+      } else {
+        toast.success('Node removed')
+      }
       queryClient.invalidateQueries({
         queryKey: adminListNodesOptions().queryKey,
       })
@@ -1033,7 +1068,10 @@ function NodeDetail({
       toast.error('Failed to remove node')
     } finally {
       setRemovePending(false)
-      setShowRemoveDialog(false)
+      if (!keepDialogOpen) {
+        setShowRemoveDialog(false)
+        setUnremovedContainers(null)
+      }
     }
   }
 
@@ -1196,29 +1234,42 @@ function NodeDetail({
       </AlertDialog>
 
       {/* Remove confirmation dialog */}
-      <AlertDialog open={showRemoveDialog} onOpenChange={setShowRemoveDialog}>
+      <AlertDialog
+        open={showRemoveDialog}
+        onOpenChange={(open) => {
+          setShowRemoveDialog(open)
+          if (!open) setUnremovedContainers(null)
+        }}
+      >
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>Remove node “{node.name}”?</AlertDialogTitle>
             <AlertDialogDescription>
-              This will permanently remove the node from the cluster. This
-              action cannot be undone. The node must be drained first (no active
-              containers) and host no sandboxes.
+              {unremovedContainers
+                ? `Temps could not confirm that ${unremovedContainers.length} container(s) it placed on this node are gone, so the node was not removed. Start the agent on the node and try again, or remove them on that host with docker rm -f. If the host is gone for good, remove the node anyway: these containers are then recorded as orphaned and never touched again.`
+                : 'This will permanently remove the node from the cluster. This action cannot be undone. The node must be drained first (no active containers) and host no sandboxes. Containers Temps left on it are removed first.'}
             </AlertDialogDescription>
           </AlertDialogHeader>
+          {unremovedContainers && (
+            <ul className="max-h-48 space-y-1 overflow-y-auto rounded-md border p-2 font-mono text-xs break-all">
+              {unremovedContainers.map((container) => (
+                <li key={container}>{container}</li>
+              ))}
+            </ul>
+          )}
           <AlertDialogFooter>
             <AlertDialogCancel disabled={removePending}>
               Cancel
             </AlertDialogCancel>
             <AlertDialogAction
-              onClick={handleRemove}
+              onClick={() => handleRemove(unremovedContainers !== null)}
               disabled={removePending}
               className="bg-destructive text-white hover:bg-destructive/90"
             >
               {removePending && (
                 <Loader2 className="h-4 w-4 animate-spin mr-1" />
               )}
-              Remove Node
+              {unremovedContainers ? 'Remove Anyway' : 'Remove Node'}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

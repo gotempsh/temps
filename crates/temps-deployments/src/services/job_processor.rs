@@ -81,10 +81,37 @@ struct CommitInfo {
     commit_json: serde_json::Value,
 }
 
+/// The uploaded-source lineage a redeploy copies from a deployment's
+/// `metadata`, and the archive path it is keyed by. Only the bundle fields are
+/// carried over, so nothing the earlier build produced (image, static bundle,
+/// runtime) leaks into the new generation: it is rebuilt from the same source
+/// the user uploaded. `None` when the deployment was not built from an uploaded bundle.
+pub(crate) fn source_bundle_lineage(
+    metadata: Option<&DeploymentMetadata>,
+) -> Option<(DeploymentMetadata, String)> {
+    let metadata = metadata?;
+    let bundle_path = metadata
+        .source_bundle_path
+        .clone()
+        .filter(|path| !path.trim().is_empty())?;
+    Some((
+        DeploymentMetadata {
+            source_bundle_id: metadata.source_bundle_id,
+            source_bundle_path: Some(bundle_path.clone()),
+            source_bundle_content_type: metadata.source_bundle_content_type.clone(),
+            deployment_source_type: Some(temps_entities::source_type::SourceType::UploadedSource),
+            ..Default::default()
+        },
+        bundle_path,
+    ))
+}
+
 enum DeploymentDuplicateKey {
     Manual,
     Commit(String),
     Image(String),
+    /// Uploaded-source redeploy, keyed by the retained archive path.
+    SourceBundle(String),
     DurableCommand(uuid::Uuid),
 }
 
@@ -315,7 +342,9 @@ impl JobProcessorService {
         let should_check_duplicate = recovery_of_deployment_id.is_some()
             || matches!(
                 &duplicate_key,
-                DeploymentDuplicateKey::Commit(_) | DeploymentDuplicateKey::DurableCommand(_)
+                DeploymentDuplicateKey::Commit(_)
+                    | DeploymentDuplicateKey::SourceBundle(_)
+                    | DeploymentDuplicateKey::DurableCommand(_)
             );
         if should_check_duplicate {
             let duplicate_query = deployments::Entity::find()
@@ -348,6 +377,18 @@ impl JobProcessorService {
                         "ready",
                     ]))
                     .filter(deployments::Column::ImageName.eq(image.clone())),
+                DeploymentDuplicateKey::SourceBundle(bundle_path) => duplicate_query
+                    .filter(deployments::Column::State.is_in(vec![
+                        "pending",
+                        "running",
+                        "deploying",
+                        "built",
+                        "ready",
+                    ]))
+                    .filter(Expr::cust_with_values(
+                        "metadata ->> 'sourceBundlePath' = $1",
+                        [bundle_path.clone()],
+                    )),
                 DeploymentDuplicateKey::DurableCommand(job_id) => {
                     duplicate_query.filter(Expr::cust_with_values(
                         "context_vars ->> 'durable_job_id' = $1",
@@ -881,6 +922,85 @@ impl JobProcessorService {
                                 drop(recovery_permit);
                             });
                         }
+                        Job::RedeploySourceBundleRequested(bundle_job) => {
+                            debug!(
+                                "🔥 Handling RedeploySourceBundleRequested job - project: {}, environment: {}, source deployment: {}",
+                                bundle_job.project_id,
+                                bundle_job.environment_id,
+                                bundle_job.source_deployment_id
+                            );
+                            let workflow_planner = Arc::clone(&self.workflow_planner);
+                            let workflow_executor = Arc::clone(&self.workflow_executor);
+                            let db = Arc::clone(&self.db);
+                            let queue = Arc::clone(&self.queue);
+                            let acknowledgement_queue = Arc::clone(&self.queue);
+                            let deployment_gate = self.deployment_gate.read().await.clone();
+                            let failover_recovery_semaphore =
+                                Arc::clone(&self.failover_recovery_semaphore);
+                            let recovery_of_deployment_id = bundle_job.recovery_of_deployment_id;
+                            let recovery_project_id = bundle_job.project_id;
+                            let recovery_environment_id = Some(bundle_job.environment_id);
+                            let durable_job_id = receipt.as_ref().map(|receipt| receipt.job_id);
+
+                            tokio::spawn(async move {
+                                let recovery_permit = match Self::acquire_failover_recovery_permit(
+                                    failover_recovery_semaphore,
+                                    recovery_of_deployment_id,
+                                    recovery_project_id,
+                                    recovery_environment_id,
+                                    "source_bundle",
+                                )
+                                .await
+                                {
+                                    Ok(permit) => permit,
+                                    Err(error) => {
+                                        error!(
+                                            project_id = recovery_project_id,
+                                            environment_id = ?recovery_environment_id,
+                                            recovery_kind = "source_bundle",
+                                            error = %error,
+                                            "Failover recovery could not acquire the dedicated deployment slot"
+                                        );
+                                        Self::settle_delivery(
+                                            &acknowledgement_queue,
+                                            receipt,
+                                            Err(error),
+                                            "RedeploySourceBundleRequested",
+                                        )
+                                        .await;
+                                        return;
+                                    }
+                                };
+
+                                let result = Self::process_redeploy_source_bundle_job(
+                                    workflow_planner,
+                                    workflow_executor,
+                                    db,
+                                    queue,
+                                    deployment_gate,
+                                    bundle_job,
+                                    durable_job_id,
+                                )
+                                .await;
+                                Self::settle_delivery(
+                                    &acknowledgement_queue,
+                                    receipt,
+                                    result,
+                                    "RedeploySourceBundleRequested",
+                                )
+                                .await;
+
+                                if recovery_of_deployment_id.is_some() {
+                                    info!(
+                                        project_id = recovery_project_id,
+                                        environment_id = ?recovery_environment_id,
+                                        recovery_kind = "source_bundle",
+                                        "Failover recovery finished; releasing the dedicated deployment slot"
+                                    );
+                                }
+                                drop(recovery_permit);
+                            });
+                        }
                         Job::DeploymentGateRecheck(recheck_job) => {
                             debug!(
                                 "🔥 Handling DeploymentGateRecheck job - deployment: {}",
@@ -1255,6 +1375,251 @@ WHERE d.id = a.deployment_id
                         return Err(e2);
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Process a `RedeploySourceBundleRequested` job: rebuild an
+    /// uploaded-source deployment from the bundle it was built from, so node
+    /// drain and failover can move it. Such a project has no repository, so
+    /// the Git redeploy path cannot serve it; the new deployment carries the
+    /// source deployment's bundle metadata and the planner prepares it with
+    /// `PrepareSourceBundleJob`, exactly like the original upload.
+    async fn process_redeploy_source_bundle_job(
+        workflow_planner: Arc<WorkflowPlanner>,
+        workflow_executor: Arc<WorkflowExecutionService>,
+        db: Arc<DbConnection>,
+        queue: Arc<dyn JobQueue>,
+        deployment_gate: Option<Arc<dyn temps_core::DeploymentGate>>,
+        job: temps_core::RedeploySourceBundleRequestedJob,
+        durable_job_id: Option<uuid::Uuid>,
+    ) -> Result<(), JobProcessorError> {
+        use chrono::Utc;
+
+        let project = match temps_entities::projects::Entity::find_by_id(job.project_id)
+            .filter(temps_entities::projects::Column::IsDeleted.eq(false))
+            .one(db.as_ref())
+            .await
+        {
+            Ok(Some(project)) => project,
+            Ok(None) => {
+                // Deleted between the request and its processing.
+                warn!(
+                    project_id = job.project_id,
+                    source_deployment_id = job.source_deployment_id,
+                    "RedeploySourceBundleRequested: project not found; nothing to redeploy"
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(JobProcessorError::DatabaseError(format!(
+                    "load project {} to redeploy source deployment {}: {error}",
+                    job.project_id, job.source_deployment_id
+                )));
+            }
+        };
+
+        let environment = match Self::resolve_image_target_environments(
+            db.as_ref(),
+            job.project_id,
+            Some(job.environment_id),
+        )
+        .await
+        {
+            Ok(mut environments) => match environments.pop() {
+                Some(environment) => environment,
+                None => {
+                    warn!(
+                        project_id = job.project_id,
+                        environment_id = job.environment_id,
+                        source_deployment_id = job.source_deployment_id,
+                        "RedeploySourceBundleRequested: environment not found; nothing to redeploy"
+                    );
+                    return Ok(());
+                }
+            },
+            Err(error) => {
+                return Err(JobProcessorError::DatabaseError(format!(
+                    "load environment {} of project {} to redeploy source deployment {}: {error}",
+                    job.environment_id, job.project_id, job.source_deployment_id
+                )));
+            }
+        };
+
+        let source = deployments::Entity::find_by_id(job.source_deployment_id)
+            .filter(deployments::Column::ProjectId.eq(project.id))
+            .filter(deployments::Column::EnvironmentId.eq(environment.id))
+            .one(db.as_ref())
+            .await
+            .map_err(|error| {
+                JobProcessorError::DatabaseError(format!(
+                    "load source deployment {} of project {}, environment {}: {error}",
+                    job.source_deployment_id, project.id, environment.id
+                ))
+            })?;
+        let Some((metadata, bundle_path)) = source
+            .as_ref()
+            .and_then(|source| source_bundle_lineage(source.metadata.as_ref()))
+        else {
+            // The request was validated when it was queued; reaching this
+            // means the row changed since. Retrying cannot help.
+            error!(
+                project_id = project.id,
+                environment_id = environment.id,
+                source_deployment_id = job.source_deployment_id,
+                "RedeploySourceBundleRequested: source deployment no longer exists or records no uploaded source bundle; nothing was redeployed"
+            );
+            return Ok(());
+        };
+
+        let merged_config = match (&project.deployment_config, &environment.deployment_config) {
+            (Some(project_config), Some(env_config)) => Some(project_config.merge(env_config)),
+            (Some(project_config), None) => Some(project_config.clone()),
+            (None, env_config) => env_config.clone(),
+        };
+        let deployment_config_snapshot = merged_config
+            .map(|config| DeploymentConfigSnapshot::from_config(&config, HashMap::new()));
+
+        let trigger = if job.recovery_of_deployment_id.is_some() {
+            "failover_recovery"
+        } else {
+            "node_drain"
+        };
+        let trigger_context = serde_json::json!({
+            "trigger": trigger,
+            "source": "uploaded_source",
+            "redeploy_of_deployment_id": job.source_deployment_id,
+            "recovery_of_deployment_id": job.recovery_of_deployment_id,
+            "bundle_id": metadata.source_bundle_id,
+            "durable_job_id": durable_job_id,
+        });
+        let new_deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set(format!(
+                "{}-{}",
+                project.slug,
+                &uuid::Uuid::new_v4().simple().to_string()[..12]
+            )),
+            state: Set("pending".to_string()),
+            metadata: Set(Some(metadata)),
+            context_vars: Set(Some(trigger_context)),
+            deployment_config: Set(deployment_config_snapshot),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+
+        let (deployment, mut post_commit_events) =
+            match Self::create_deployment_with_generation_fence(
+                db.as_ref(),
+                project.id,
+                environment.id,
+                job.recovery_of_deployment_id,
+                durable_job_id.map_or_else(
+                    || DeploymentDuplicateKey::SourceBundle(bundle_path.clone()),
+                    DeploymentDuplicateKey::DurableCommand,
+                ),
+                new_deployment,
+            )
+            .await?
+            {
+                DeploymentCreationOutcome::Created {
+                    deployment,
+                    cancellation_events,
+                } => (*deployment, cancellation_events),
+                DeploymentCreationOutcome::Duplicate {
+                    deployment_id,
+                    state,
+                } => {
+                    info!(
+                        project_id = project.id,
+                        environment_id = environment.id,
+                        deployment_id,
+                        state,
+                        source_deployment_id = job.source_deployment_id,
+                        "Uploaded-source redeploy already exists; skipping duplicate"
+                    );
+                    return Ok(());
+                }
+                DeploymentCreationOutcome::StaleRecovery {
+                    source_deployment_id,
+                    current_deployment_id,
+                    newer_deployment_id,
+                } => {
+                    info!(
+                        project_id = project.id,
+                        environment_id = environment.id,
+                        source_deployment_id,
+                        current_deployment_id = ?current_deployment_id,
+                        newer_deployment_id = ?newer_deployment_id,
+                        recovery_kind = "source_bundle",
+                        "Skipping stale failover recovery generation"
+                    );
+                    return Ok(());
+                }
+            };
+
+        info!(
+            deployment_id = deployment.id,
+            project_id = project.id,
+            environment_id = environment.id,
+            source_deployment_id = job.source_deployment_id,
+            "Created uploaded-source redeploy from the retained source bundle"
+        );
+
+        post_commit_events.push(Job::DeploymentCreated(temps_core::DeploymentCreatedJob {
+            deployment_id: deployment.id,
+            project_id: project.id,
+            environment_id: environment.id,
+            environment_name: environment.name.clone(),
+            branch: None,
+            commit_sha: None,
+        }));
+        Self::send_post_commit_events(&queue, post_commit_events).await;
+
+        // The workload being moved is the one already running, rebuilt from
+        // its own stored source: there is no caller-chosen input to authorize
+        // (ADR 045), the same reasoning as the image redeploy path.
+        match workflow_planner
+            .create_deployment_jobs(
+                deployment.id,
+                temps_core::docker_socket_grant::DeployCaller::Platform,
+            )
+            .await
+        {
+            Ok(created_jobs) => {
+                info!(
+                    "Created {} jobs for uploaded-source redeploy {}",
+                    created_jobs.len(),
+                    deployment.id
+                );
+                Self::gate_check_then_run(
+                    &db,
+                    &workflow_executor,
+                    &deployment_gate,
+                    project.id,
+                    &environment.name,
+                    deployment.id,
+                )
+                .await?;
+            }
+            Err(error) => {
+                error!(
+                    "Failed to plan uploaded-source redeploy {} of deployment {}: {}",
+                    deployment.id, job.source_deployment_id, error
+                );
+                Self::update_deployment_status_with_message(
+                    &db,
+                    deployment.id,
+                    PipelineStatus::Failed,
+                    Some(format!(
+                        "Failed to plan the redeploy of uploaded-source deployment {}: {error}",
+                        job.source_deployment_id
+                    )),
+                )
+                .await?;
             }
         }
         Ok(())
@@ -3004,6 +3369,135 @@ mod tests {
             .expect("reload source")
             .expect("source exists");
         assert_eq!(source.state, "running");
+    }
+
+    #[test]
+    fn source_bundle_lineage_copies_only_the_uploaded_source() {
+        let uploaded = DeploymentMetadata {
+            source_bundle_id: Some(7),
+            source_bundle_path: Some("source-bundles/app/source.zip".to_string()),
+            source_bundle_content_type: Some("application/zip".to_string()),
+            deployment_source_type: Some(temps_entities::source_type::SourceType::UploadedSource),
+            external_image_ref: Some("registry.example/app:built".to_string()),
+            static_bundle_path: Some("static-bundles/app.tar.gz".to_string()),
+            ..Default::default()
+        };
+
+        let (metadata, path) = source_bundle_lineage(Some(&uploaded)).expect("bundle lineage");
+
+        assert_eq!(path, "source-bundles/app/source.zip");
+        assert_eq!(
+            metadata,
+            DeploymentMetadata {
+                source_bundle_id: Some(7),
+                source_bundle_path: Some(path.clone()),
+                source_bundle_content_type: Some("application/zip".to_string()),
+                deployment_source_type: Some(
+                    temps_entities::source_type::SourceType::UploadedSource
+                ),
+                ..Default::default()
+            },
+            "only the uploaded source is carried into the rebuild"
+        );
+
+        assert!(source_bundle_lineage(Some(&DeploymentMetadata::default())).is_none());
+        let blank = DeploymentMetadata {
+            source_bundle_path: Some("  ".to_string()),
+            ..Default::default()
+        };
+        assert!(source_bundle_lineage(Some(&blank)).is_none());
+        assert!(source_bundle_lineage(None).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_in_flight_redeploy_of_the_same_source_bundle_is_a_duplicate() {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping source bundle duplicate regression test");
+            return;
+        }
+
+        // Arrange: a drain already queued a rebuild of this bundle.
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("create test database");
+        let db = test_db.connection_arc();
+        let (project_id, environment_id) = setup_git_push_test_data(db.as_ref())
+            .await
+            .expect("seed project and environment");
+        let now = Utc::now();
+        let bundle_path = "source-bundles/app/source.zip";
+        let bundle_metadata = |path: &str| DeploymentMetadata {
+            source_bundle_path: Some(path.to_string()),
+            ..Default::default()
+        };
+        let mut routed =
+            generation_model(project_id, environment_id, "routed", "completed", "a", now);
+        routed.metadata = Set(Some(bundle_metadata(bundle_path)));
+        let routed = routed.insert(db.as_ref()).await.expect("insert routed");
+        set_current_deployment(db.as_ref(), environment_id, routed.id).await;
+        let mut in_flight = generation_model(
+            project_id,
+            environment_id,
+            "in-flight-rebuild",
+            "pending",
+            "b",
+            now + chrono::Duration::seconds(1),
+        );
+        in_flight.metadata = Set(Some(bundle_metadata(bundle_path)));
+        let in_flight = in_flight
+            .insert(db.as_ref())
+            .await
+            .expect("insert in-flight");
+
+        // Act: the same bundle again, then a different bundle.
+        let mut again = generation_model(
+            project_id,
+            environment_id,
+            "second-rebuild",
+            "pending",
+            "c",
+            now + chrono::Duration::seconds(2),
+        );
+        again.metadata = Set(Some(bundle_metadata(bundle_path)));
+        let duplicate = JobProcessorService::create_deployment_with_generation_fence(
+            db.as_ref(),
+            project_id,
+            environment_id,
+            None,
+            DeploymentDuplicateKey::SourceBundle(bundle_path.to_string()),
+            again,
+        )
+        .await
+        .expect("fence same bundle");
+        let mut other = generation_model(
+            project_id,
+            environment_id,
+            "other-bundle",
+            "pending",
+            "d",
+            now + chrono::Duration::seconds(3),
+        );
+        other.metadata = Set(Some(bundle_metadata("source-bundles/app/other.zip")));
+        let created = JobProcessorService::create_deployment_with_generation_fence(
+            db.as_ref(),
+            project_id,
+            environment_id,
+            None,
+            DeploymentDuplicateKey::SourceBundle("source-bundles/app/other.zip".to_string()),
+            other,
+        )
+        .await
+        .expect("fence other bundle");
+
+        // Assert: the completed routed generation never matches; the
+        // in-flight rebuild does.
+        match duplicate {
+            DeploymentCreationOutcome::Duplicate { deployment_id, .. } => {
+                assert_eq!(deployment_id, in_flight.id)
+            }
+            _ => panic!("a second rebuild of an in-flight bundle must be a duplicate"),
+        }
+        assert!(matches!(created, DeploymentCreationOutcome::Created { .. }));
     }
 
     #[tokio::test]

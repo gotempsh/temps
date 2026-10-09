@@ -111,6 +111,9 @@ pub struct RouteSyncClient {
     /// side, so the client timeout must be a comfortable margin
     /// above that.
     pub http: reqwest::Client,
+    /// Highest generation the control plane accepted an ACK for. Starts at
+    /// the generation loaded from disk, which this process never fetched.
+    last_acked: std::sync::atomic::AtomicU64,
 }
 
 impl RouteSyncClient {
@@ -150,6 +153,7 @@ impl RouteSyncClient {
             control_plane_ca,
         )
         .build()?;
+        let last_acked = std::sync::atomic::AtomicU64::new(store.current_generation());
         Ok(Self {
             control_plane_url,
             node_id,
@@ -157,6 +161,7 @@ impl RouteSyncClient {
             store,
             shutdown,
             http,
+            last_acked,
         })
     }
 
@@ -195,6 +200,10 @@ impl RouteSyncClient {
     }
 
     async fn tick_once(&self) -> Result<(), String> {
+        // Resend an ACK that failed before parking on the next long-poll.
+        // While the generation is unchanged nothing else would resend it,
+        // and the deployment completion gate waits on exactly this ACK.
+        self.ack_if_pending().await?;
         let since = self.store.current_generation();
         let url = format!(
             "{}/api/internal/nodes/{}/routes/snapshot?since={}",
@@ -262,12 +271,22 @@ impl RouteSyncClient {
                 .map(snapshot_route_into_entry)
                 .collect();
             let applied = self.store.apply_snapshot(body.generation, routes);
-            self.ack(applied).await.ok();
+            // A failed ACK fails the round: the loop backs off briefly and
+            // the next round resends it before polling again.
+            self.ack(applied).await?;
         } else {
             debug!(generation = body.generation, "route snapshot unchanged");
         }
 
         Ok(())
+    }
+
+    async fn ack_if_pending(&self) -> Result<(), String> {
+        let applied = self.store.current_generation();
+        if applied == self.last_acked.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+        self.ack(applied).await
     }
 
     async fn ack(&self, applied_generation: u64) -> Result<(), String> {
@@ -286,6 +305,8 @@ impl RouteSyncClient {
         if !resp.status().is_success() {
             return Err(format!("CP returned {} for {url}", resp.status()));
         }
+        self.last_acked
+            .store(applied_generation, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 }
@@ -527,5 +548,86 @@ mod tests {
         let health = crate::public_ingress::health().expect("public ingress health initialized");
         assert_eq!(health.route_count, 1);
         assert_eq!(health.certificate_count, 0);
+    }
+
+    /// A failed ACK is resent before the next long-poll instead of waiting
+    /// for another route change, and an accepted ACK is not repeated.
+    #[tokio::test]
+    async fn test_failed_ack_is_resent_before_the_next_poll() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let acks = Arc::new(AtomicUsize::new(0));
+        let acked_generations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind route-sync control-plane fixture");
+        let address = listener.local_addr().expect("read fixture address");
+        let app = {
+            let acks = Arc::clone(&acks);
+            let acked_generations = Arc::clone(&acked_generations);
+            axum::Router::new()
+                .route(
+                    "/api/internal/nodes/{node_id}/routes/snapshot",
+                    axum::routing::get(|| async {
+                        axum::Json(serde_json::json!({
+                            "generation": 8,
+                            "routes": [{
+                                "host": "app.temps.local",
+                                "backends": [{"address": "10.0.0.2:8080"}]
+                            }]
+                        }))
+                    }),
+                )
+                .route(
+                    "/api/internal/nodes/{node_id}/routes/ack",
+                    axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                        let acks = Arc::clone(&acks);
+                        let acked_generations = Arc::clone(&acked_generations);
+                        async move {
+                            acked_generations
+                                .lock()
+                                .expect("ack fixture lock")
+                                .push(body["applied_generation"].as_u64());
+                            if acks.fetch_add(1, Ordering::SeqCst) == 0 {
+                                StatusCode::SERVICE_UNAVAILABLE
+                            } else {
+                                StatusCode::OK
+                            }
+                        }
+                    }),
+                )
+        };
+        let server_shutdown = Arc::new(Notify::new());
+        let task_shutdown = Arc::clone(&server_shutdown);
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move { task_shutdown.notified().await })
+                .await
+                .expect("serve route-sync fixture");
+        });
+        let snapshot_dir = TempDir::new().expect("create route snapshot directory");
+        let store = Arc::new(RouteStore::new(snapshot_dir.path().join("routes.json")));
+        store.apply_snapshot(7, vec![route("internal.temps.local")]);
+        let client = RouteSyncClient::new(
+            format!("http://{address}"),
+            7,
+            "test-token".to_string(),
+            Arc::clone(&store),
+            Arc::new(Notify::new()),
+        )
+        .expect("create route sync client");
+
+        // Generation 8 is applied, but its ACK is refused: the round fails.
+        assert!(client.tick_once().await.is_err());
+        assert_eq!(store.current_generation(), 8);
+        // The next round resends it first, then polls an unchanged generation.
+        client.tick_once().await.expect("resend ACK and poll");
+        // Nothing is pending any more.
+        client.tick_once().await.expect("poll unchanged generation");
+        assert_eq!(acks.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *acked_generations.lock().expect("ack fixture lock"),
+            vec![Some(8), Some(8)]
+        );
+        server_shutdown.notify_waiters();
     }
 }

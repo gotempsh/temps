@@ -245,6 +245,25 @@ struct OffloadBuildCandidate {
     platform: Option<String>,
 }
 
+/// A worker build receives no variable values, so a generated build that a
+/// framework inlines variables into would ship them empty. `Err` is the
+/// build-log reason it stays on the control plane; names only, never values.
+fn inlined_variables_allow_offload(inlined_build_variables: &[String]) -> Result<(), String> {
+    if inlined_build_variables.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{} {} inlined into the application at build time, and worker builds cannot \
+         receive project variables yet",
+        inlined_build_variables.join(", "),
+        if inlined_build_variables.len() == 1 {
+            "is"
+        } else {
+            "are"
+        }
+    ))
+}
+
 /// Whether a build that the control plane would run can move to a worker
 /// node without changing what it produces, and for which platform.
 ///
@@ -1172,6 +1191,23 @@ impl WorkflowExecutionService {
                 // build that needs them stays on the control plane.
                 let needs_npm_credentials =
                     crate::jobs::npmrc::plan_npmrc(&build_args_map).is_some();
+                // A worker build receives no variable values. Autopack builds
+                // there without them; any other generated build that inlines
+                // one stays here when it can (BuildImageJob refuses otherwise).
+                let inlined_build_variables = if temps_presets::get_preset_for_storage(
+                    project.preset,
+                    project.preset_config.as_ref(),
+                )
+                .ok()
+                .flatten()
+                .is_some_and(|preset| preset.uses_autopack())
+                {
+                    Vec::new()
+                } else {
+                    crate::jobs::build_image::build_inlined_variables(
+                        build_args_map.keys().map(String::as_str),
+                    )
+                };
                 if !build_args_map.is_empty() {
                     let build_args: Vec<(String, String)> = build_args_map.into_iter().collect();
                     builder = builder.build_args(build_args);
@@ -1296,6 +1332,7 @@ impl WorkflowExecutionService {
                             target_labels.as_ref(),
                             &cross_build_platforms,
                             needs_npm_credentials,
+                            &inlined_build_variables,
                         )
                         .await
                     {
@@ -2070,6 +2107,10 @@ impl WorkflowExecutionService {
                 )
                 .with_log_id(db_job.log_id.clone())
                 .with_log_service(self.log_service.clone());
+                let job = match self.builder_node_resolver() {
+                    Some(resolver) => job.with_builder_node_resolver(resolver),
+                    None => job,
+                };
 
                 Ok(Arc::new(job))
             }
@@ -2729,6 +2770,7 @@ impl WorkflowExecutionService {
     /// builds it, so that replica needs no transfer. `Err` carries the reason
     /// the build stays on the control plane, written verbatim into the build
     /// log.
+    #[allow(clippy::too_many_arguments)]
     async fn select_offload_builder(
         &self,
         deployment_id: i32,
@@ -2737,7 +2779,9 @@ impl WorkflowExecutionService {
         target_labels: Option<&serde_json::Value>,
         cross_build_platforms: &[String],
         needs_npm_credentials: bool,
+        inlined_build_variables: &[String],
     ) -> Result<SelectedNodeBuilder, String> {
+        inlined_variables_allow_offload(inlined_build_variables)?;
         let static_output_only = deployment_jobs::Entity::find()
             .filter(deployment_jobs::Column::DeploymentId.eq(deployment_id))
             .filter(deployment_jobs::Column::JobType.eq("DeployStaticJob"))
@@ -3999,6 +4043,27 @@ mod tests {
             let unknown = offload_build_candidate(false, false, &[], platform, true).unwrap_err();
             assert!(unknown.contains("platform is not known"), "{unknown}");
         }
+    }
+
+    /// A build whose framework inlines a project variable stays on the
+    /// control plane, naming the variable (never its value); platform and
+    /// runtime-only variables never keep a build there.
+    #[test]
+    fn inlined_build_variables_keep_offloaded_builds_local() {
+        use super::inlined_variables_allow_offload;
+
+        assert_eq!(inlined_variables_allow_offload(&[]), Ok(()));
+        let one = inlined_variables_allow_offload(&["VITE_API_URL".to_string()]).unwrap_err();
+        assert!(one.contains("VITE_API_URL is inlined"), "{one}");
+        let two = inlined_variables_allow_offload(&[
+            "NEXT_PUBLIC_A".to_string(),
+            "NEXT_PUBLIC_B".to_string(),
+        ])
+        .unwrap_err();
+        assert!(
+            two.contains("NEXT_PUBLIC_A, NEXT_PUBLIC_B are inlined"),
+            "{two}"
+        );
     }
 
     /// Private npm credentials are only ever written into a build context on

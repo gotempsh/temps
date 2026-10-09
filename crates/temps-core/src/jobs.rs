@@ -92,6 +92,24 @@ pub struct DeployImageRequestedJob {
     pub docker_socket_authorized: bool,
 }
 
+/// Rebuild and redeploy an uploaded-source deployment from the source bundle
+/// it was built from. The uploaded-source counterpart of
+/// [`DeployImageRequestedJob`] for node drain and failover: such a project
+/// has no repository to re-fetch, so the only lineage is the retained ZIP
+/// archive recorded in the source deployment's metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedeploySourceBundleRequestedJob {
+    pub project_id: i32,
+    pub environment_id: i32,
+    /// Deployment whose `source_bundle_path` is rebuilt. Its bundle
+    /// metadata is copied onto the new deployment.
+    pub source_deployment_id: i32,
+    /// Source deployment being recovered after its node went offline.
+    /// See [`GitPushEventJob::recovery_of_deployment_id`].
+    #[serde(default)]
+    pub recovery_of_deployment_id: Option<i32>,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct UpdateRepoFrameworkJob {
     pub repo_id: i32,
@@ -460,6 +478,9 @@ pub enum Job {
     /// Deploy a prebuilt Docker image to a project (no build) — fired by the
     /// template one-click flow when a template carries a prebuilt image.
     DeployImageRequested(DeployImageRequestedJob),
+    /// Rebuild an uploaded-source deployment from its retained bundle (node
+    /// drain / failover). See [`RedeploySourceBundleRequestedJob`].
+    RedeploySourceBundleRequested(RedeploySourceBundleRequestedJob),
     CronInvocationError(CronInvocationErrorData),
     ProjectCreated(ProjectCreatedJob),
     ProjectUpdated(ProjectUpdatedJob),
@@ -532,6 +553,7 @@ impl fmt::Display for Job {
             Job::CalculateRepositoryPreset(job) => write!(f, "CalculateRepositoryPreset(repository_id: {})", job.repository_id),
             Job::GitPushEvent(job) => write!(f, "GitPushEvent(project_id: {}, owner: {}, repo: {}, branch: {:?}, tag: {:?}, commit: {})", job.project_id, job.owner, job.repo, job.branch, job.tag, job.commit),
             Job::DeployImageRequested(job) => write!(f, "DeployImageRequested(project_id: {}, image_ref: {})", job.project_id, job.image_ref),
+            Job::RedeploySourceBundleRequested(job) => write!(f, "RedeploySourceBundleRequested(project_id: {}, environment_id: {}, source_deployment_id: {})", job.project_id, job.environment_id, job.source_deployment_id),
             Job::CronInvocationError(job) => write!(f, "CronInvocationError(cron_id: {}, env: {}, error: {})", job.cron_job_id, job.environment_id, job.error_message),
             Job::ProjectCreated(job) => write!(f, "ProjectCreated(id: {}, name: {})", job.project_id, job.project_name),
             Job::ProjectUpdated(job) => write!(f, "ProjectUpdated(id: {}, name: {})", job.project_id, job.project_name),

@@ -35,6 +35,11 @@ pub enum SensitiveAction {
     DrainNode {
         node_id: i32,
     },
+    /// Remove a node from the cluster: Temps removes the containers it left
+    /// on that host, and `force` gives up track of any it cannot confirm.
+    RemoveNode {
+        node_id: i32,
+    },
     /// Turn on the cluster's WireGuard mesh: every node's firewall and
     /// underlay change, and it cannot be turned off again from the API.
     EnableWireguardMesh,
@@ -141,6 +146,7 @@ impl SensitiveAction {
             Self::RotateApiKey { .. } => "rotate_api_key",
             Self::DeleteEnvironment { .. } => "delete_environment",
             Self::DrainNode { .. } => "drain_node",
+            Self::RemoveNode { .. } => "remove_node",
             Self::EnableWireguardMesh => "enable_wireguard_mesh",
             Self::CreateNodePairing => "create_node_pairing",
             Self::AddNodeOverSsh => "add_node_over_ssh",
@@ -259,6 +265,10 @@ mod tests {
         assert_eq!(
             SensitiveAction::DrainNode { node_id: 3 }.as_str(),
             "drain_node"
+        );
+        assert_eq!(
+            SensitiveAction::RemoveNode { node_id: 3 }.as_str(),
+            "remove_node"
         );
         assert_eq!(
             SensitiveAction::EvictNodeSandboxes {

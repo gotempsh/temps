@@ -42714,6 +42714,13 @@
           },
           "message": {
             "type": "string"
+          },
+          "orphaned_containers": {
+            "description": "Containers Temps could not confirm were removed from the node before\nit was removed (only with `force=true`). They are recorded as\norphaned; remove them on that host by hand if it still exists.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -87018,6 +87025,15 @@
               "format": "int32",
               "type": "integer"
             }
+          },
+          {
+            "description": "Remove the node even if containers Temps placed on it could not be\nconfirmed removed (e.g. the host is gone for good). Those containers\nare recorded as orphaned instead of being re-homed.",
+            "in": "query",
+            "name": "force",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
           }
         ],
         "responses": {
@@ -87038,7 +87054,7 @@
             "description": "Node not found"
           },
           "409": {
-            "description": "Node still has active containers or live sandboxes"
+            "description": "Node still has active containers, live sandboxes, or containers Temps could not confirm were removed (retry with force=true only if the host is gone)"
           },
           "500": {
             "description": "Internal server error"
@@ -87049,7 +87065,7 @@
             "bearer_auth": []
           }
         ],
-        "summary": "Remove a node from the cluster entirely. The node should be drained first\nto ensure containers have been rescheduled. If the node still has active\ncontainers, it will be drained automatically before removal.",
+        "summary": "Remove a node from the cluster entirely. The node must be drained first so\nits current containers have been rescheduled. Containers no deployment needs\nthat may still exist on the node (a failed deployment's, ones retired while\nit was offline, or ones a redeploy replaced while it was unreachable) are\nremoved first; if any cannot be, the removal is refused unless `force=true`,\nwhich records them as orphaned.",
         "tags": [
           "Nodes"
         ]
@@ -87377,8 +87393,11 @@
           "404": {
             "description": "Node not found"
           },
+          "409": {
+            "description": "Node already draining, or a workload only on this node cannot be redeployed elsewhere; the node is unchanged"
+          },
           "500": {
-            "description": "Internal server error"
+            "description": "Internal server error, or a redeploy could not be queued (the response says what already happened)"
           }
         },
         "security": [
