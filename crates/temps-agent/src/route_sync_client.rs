@@ -17,6 +17,12 @@
 //! CP's view of `applied_generation` can lag during outages — that's
 //! correct: it lets ops detect drift. ACK on success.
 //!
+//! A refusal (401/403/404: the CP reached us and does not accept this node
+//! right now, e.g. while it is draining) is not an outage. It is retried
+//! every [`REFUSED_RETRY`] instead, so a node that becomes active again
+//! (undrained, back from offline) resyncs within seconds, well inside the
+//! deployment completion gate, instead of sleeping out a 30s backoff.
+//!
 //! ## CP restart
 //!
 //! When the CP restarts its in-memory generation resets (today). Our
@@ -98,6 +104,49 @@ struct AckRequest {
     applied_generation: u64,
 }
 
+/// Retry interval while the control plane refuses this node (401/403/404).
+pub const REFUSED_RETRY: Duration = Duration::from_secs(3);
+const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Why a sync round failed.
+#[derive(Debug)]
+struct TickError {
+    message: String,
+    /// The control plane answered and refused this node (401/403/404).
+    refused: bool,
+}
+
+impl From<String> for TickError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            refused: false,
+        }
+    }
+}
+
+impl std::fmt::Display for TickError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+fn is_refusal(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 401 | 403 | 404)
+}
+
+/// How long to wait after a failed round, and the backoff for the next
+/// failure. Refusals retry on a short fixed interval and reset the backoff;
+/// everything else backs off exponentially up to [`MAX_BACKOFF`].
+fn retry_delay(backoff: Duration, refused: bool) -> (Duration, Duration) {
+    if refused {
+        (REFUSED_RETRY, INITIAL_BACKOFF)
+    } else {
+        (backoff, (backoff * 2).min(MAX_BACKOFF))
+    }
+}
+
 pub struct RouteSyncClient {
     /// Base URL of the control plane, no trailing slash.
     pub control_plane_url: String,
@@ -163,8 +212,7 @@ impl RouteSyncClient {
     /// Run forever. Returns when `shutdown` is notified.
     pub async fn run(self) {
         // Backoff state for error recovery.
-        let mut backoff = Duration::from_secs(1);
-        let max_backoff = Duration::from_secs(30);
+        let mut backoff = INITIAL_BACKOFF;
 
         loop {
             // Cooperative shutdown check before each round.
@@ -178,15 +226,16 @@ impl RouteSyncClient {
                     match res {
                         Ok(()) => {
                             // Reset backoff after any successful round.
-                            backoff = Duration::from_secs(1);
+                            backoff = INITIAL_BACKOFF;
                         }
                         Err(e) => {
-                            warn!(error = %e, ?backoff, "route sync tick failed");
+                            let (delay, next) = retry_delay(backoff, e.refused);
+                            warn!(error = %e, refused = e.refused, ?delay, "route sync tick failed");
                             tokio::select! {
                                 _ = self.shutdown.notified() => return,
-                                _ = tokio::time::sleep(backoff) => {}
+                                _ = tokio::time::sleep(delay) => {}
                             }
-                            backoff = (backoff * 2).min(max_backoff);
+                            backoff = next;
                         }
                     }
                 }
@@ -194,7 +243,7 @@ impl RouteSyncClient {
         }
     }
 
-    async fn tick_once(&self) -> Result<(), String> {
+    async fn tick_once(&self) -> Result<(), TickError> {
         let since = self.store.current_generation();
         let url = format!(
             "{}/api/internal/nodes/{}/routes/snapshot?since={}",
@@ -210,11 +259,15 @@ impl RouteSyncClient {
             .map_err(|e| format!("GET {url}: {e}"))?;
 
         if !resp.status().is_success() {
-            if matches!(resp.status().as_u16(), 401 | 403 | 404) {
+            let refused = is_refusal(resp.status());
+            if refused {
                 self.store
                     .apply_public_snapshot(PublicIngressSnapshot::default());
             }
-            return Err(format!("CP returned {} for {url}", resp.status()));
+            return Err(TickError {
+                message: format!("CP returned {} for {url}", resp.status()),
+                refused,
+            });
         }
 
         let body: SnapshotResponse = resp
@@ -488,7 +541,7 @@ mod tests {
 
             let error = client.tick_once().await.unwrap_err();
 
-            assert!(error.contains(&status.as_u16().to_string()));
+            assert!(error.message.contains(&status.as_u16().to_string()));
             assert!(store.lookup_public("app.example.test").is_none());
             assert!(store.lookup_public_tls_key("app.example.test").is_none());
             assert_eq!(store.public_ingress_runtime_status().2, 0);
@@ -527,5 +580,61 @@ mod tests {
         let health = crate::public_ingress::health().expect("public ingress health initialized");
         assert_eq!(health.route_count, 1);
         assert_eq!(health.certificate_count, 0);
+    }
+
+    /// A node the control plane refuses (e.g. while draining) retries on a
+    /// short fixed interval, so it resyncs within seconds of becoming active
+    /// again; outages keep backing off exponentially up to 30s.
+    #[test]
+    fn refusals_retry_quickly_and_outages_back_off() {
+        assert_eq!(
+            retry_delay(Duration::from_secs(16), true),
+            (REFUSED_RETRY, INITIAL_BACKOFF)
+        );
+        assert!(
+            REFUSED_RETRY < Duration::from_secs(10),
+            "inside the completion gate"
+        );
+        assert_eq!(
+            retry_delay(Duration::from_secs(1), false),
+            (Duration::from_secs(1), Duration::from_secs(2))
+        );
+        assert_eq!(
+            retry_delay(Duration::from_secs(16), false),
+            (Duration::from_secs(16), MAX_BACKOFF)
+        );
+        assert_eq!(retry_delay(MAX_BACKOFF, false), (MAX_BACKOFF, MAX_BACKOFF));
+    }
+
+    /// A 401/403/404 from the control plane is reported as a refusal; a 5xx
+    /// is an outage.
+    #[tokio::test]
+    async fn snapshot_refusal_is_distinguished_from_an_outage() {
+        for (status, refused) in [
+            (StatusCode::UNAUTHORIZED, true),
+            (StatusCode::FORBIDDEN, true),
+            (StatusCode::NOT_FOUND, true),
+            (StatusCode::INTERNAL_SERVER_ERROR, false),
+            (StatusCode::SERVICE_UNAVAILABLE, false),
+        ] {
+            let (control_plane_url, server_shutdown) =
+                spawn_snapshot_server(status, serde_json::json!({"error": "refused"})).await;
+            let snapshot_dir = TempDir::new().expect("create route snapshot directory");
+            let store = Arc::new(RouteStore::new(snapshot_dir.path().join("routes.json")));
+            let client = RouteSyncClient::new(
+                control_plane_url,
+                7,
+                "test-token".to_string(),
+                Arc::clone(&store),
+                Arc::new(Notify::new()),
+            )
+            .expect("create route sync client");
+            let error = client
+                .tick_once()
+                .await
+                .expect_err("non-2xx fails the round");
+            assert_eq!(error.refused, refused, "{status}: {error}");
+            server_shutdown.notify_waiters();
+        }
     }
 }
