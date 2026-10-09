@@ -248,6 +248,29 @@ pub trait DataImportEngine: Send + Sync {
         preparation: TargetPreparation,
     ) -> Result<(), DataImportError>;
 
+    /// Undo a [`TargetPreparation::Create`] after the import did not
+    /// succeed, so the failed run leaves nothing reserved under `database`.
+    /// Called only once the helper is confirmed stopped, and only when no
+    /// project environment linked to the service resolves to `database`.
+    ///
+    /// Returns whether anything was released. The default keeps the
+    /// database: engines where an empty leftover costs nothing do not
+    /// override it. Redis does, because its logical databases are a fixed
+    /// pool shared with provisioning.
+    async fn release_created_target(
+        &self,
+        _config: &ServiceConfig,
+        _database: &str,
+    ) -> Result<bool, DataImportError> {
+        Ok(false)
+    }
+
+    /// Whether [`Self::release_created_target`] releases anything, so the
+    /// caller skips its checks for engines that always keep the database.
+    fn releases_created_target(&self) -> bool {
+        false
+    }
+
     /// Name of the container the target service runs in.
     fn target_container(&self, config: &ServiceConfig) -> Result<String, DataImportError>;
 

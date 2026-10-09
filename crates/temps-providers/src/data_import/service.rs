@@ -859,6 +859,80 @@ impl JobOutcome {
     }
 }
 
+/// What a failure says about the target it may have partially written.
+const PARTIAL_LEFTOVER: &str =
+    "The target database may contain part of the data; run the import again with replace enabled.";
+
+/// What happened to a database a failed run created.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CreatedTargetRelease {
+    Released,
+    /// `project/environment` that resolves to the same name.
+    KeptForLinkedEnvironment(String),
+    Failed(String),
+}
+
+impl CreatedTargetRelease {
+    /// The run's message with what happened to the database it created.
+    /// A release replaces the "may contain part of the data" advice, which
+    /// no longer applies.
+    fn describe(&self, message: Option<&str>, database: &str) -> String {
+        let note = match self {
+            Self::Released => format!(
+                "The logical database it created for '{database}' was released, so nothing \
+                 is left behind."
+            ),
+            Self::KeptForLinkedEnvironment(environment) => format!(
+                "The logical database it created for '{database}' was kept, because the \
+                 linked environment {environment} resolves to it."
+            ),
+            Self::Failed(reason) => format!(
+                "Releasing the logical database it created for '{database}' failed \
+                 ({reason}); it stays reserved, and importing into '{database}' again \
+                 reuses it."
+            ),
+        };
+        match message {
+            Some(message) if *self == Self::Released && message.contains(PARTIAL_LEFTOVER) => {
+                message.replace(PARTIAL_LEFTOVER, &note)
+            }
+            Some(message) => format!("{message} {note}"),
+            None => note,
+        }
+    }
+}
+
+/// `project/environment` of a project linked to the service whose
+/// provisioned resource name is `database`, if any. Matches provisioning's
+/// default naming (`{project slug}_{environment slug}`), which is the only
+/// one available to engines that release a created target. Soft-deleted
+/// projects and environments count too: their resources may not be
+/// deprovisioned yet.
+async fn linked_environment_resolving_to<C: ConnectionTrait>(
+    db: &C,
+    service_id: i32,
+    database: &str,
+) -> Result<Option<String>, sea_orm::DbErr> {
+    let row = db
+        .query_one(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT p.slug AS project_slug, e.slug AS environment_slug \
+             FROM project_services ps \
+             JOIN projects p ON p.id = ps.project_id \
+             JOIN environments e ON e.project_id = p.id \
+             WHERE ps.service_id = $1 AND p.slug || '_' || e.slug = $2 \
+             LIMIT 1",
+            [service_id.into(), database.into()],
+        ))
+        .await?;
+    row.map(|row| {
+        let project: String = row.try_get("", "project_slug")?;
+        let environment: String = row.try_get("", "environment_slug")?;
+        Ok(format!("{project}/{environment}"))
+    })
+    .transpose()
+}
+
 /// The background half of a run. Owns everything it needs.
 struct ImportJob {
     run_id: i32,
@@ -880,6 +954,20 @@ struct ImportJob {
 
 impl ImportJob {
     async fn execute(self) -> JobOutcome {
+        let mut created_target = false;
+        let outcome = self.run(&mut created_target).await;
+        if !created_target || outcome.status == STATUS_SUCCEEDED {
+            return outcome;
+        }
+        // Every path out of `run` after the target was created settles the
+        // helper first, so nothing writes into the database any more, and
+        // the run still holds the database lock until it is finalized.
+        self.release_created_target(outcome).await
+    }
+
+    /// The import itself. Sets `created_target` once this run has created
+    /// the target database, so a failure can release what it created.
+    async fn run(&self, created_target: &mut bool) -> JobOutcome {
         let Some(engine) = self.instance.data_import() else {
             return JobOutcome::failed("the service engine no longer supports imports".to_string());
         };
@@ -911,6 +999,7 @@ impl ImportJob {
         {
             return JobOutcome::failed(scrub_secrets(&e.to_string(), &secrets));
         }
+        *created_target = preparation == TargetPreparation::Create;
 
         let plan = match engine
             .transfer_plan(
@@ -1019,6 +1108,72 @@ impl ImportJob {
         measured.with_output(output.as_deref())
     }
 
+    /// Release the database this failed run created, unless a project
+    /// environment linked to the service resolves to the same name: a
+    /// deployment of it may have started using the database while the
+    /// import ran, and releasing would empty it and hand its number to the
+    /// next resource. Whatever happens is stated in the run's message.
+    async fn release_created_target(&self, mut outcome: JobOutcome) -> JobOutcome {
+        let Some(engine) = self.instance.data_import() else {
+            return outcome;
+        };
+        if !engine.releases_created_target() {
+            return outcome;
+        }
+        let release = match linked_environment_resolving_to(
+            self.db.as_ref(),
+            self.service_id,
+            &self.database,
+        )
+        .await
+        {
+            Ok(Some(environment)) => {
+                info!(
+                    run_id = self.run_id,
+                    service_id = self.service_id,
+                    target_database = %self.database,
+                    linked_environment = %environment,
+                    "Kept the database a failed data import created: a linked environment resolves to it"
+                );
+                CreatedTargetRelease::KeptForLinkedEnvironment(environment)
+            }
+            Ok(None) => match engine
+                .release_created_target(&self.config, &self.database)
+                .await
+            {
+                Ok(true) => {
+                    info!(
+                        run_id = self.run_id,
+                        service_id = self.service_id,
+                        target_database = %self.database,
+                        "Released the database a failed data import created"
+                    );
+                    CreatedTargetRelease::Released
+                }
+                Ok(false) => return outcome,
+                Err(e) => CreatedTargetRelease::Failed(scrub_secrets(
+                    &e.to_string(),
+                    &self.source.secrets(),
+                )),
+            },
+            Err(e) => CreatedTargetRelease::Failed(format!(
+                "could not check which project environments use it: {e}"
+            )),
+        };
+        if let CreatedTargetRelease::Failed(reason) = &release {
+            warn!(
+                run_id = self.run_id,
+                service_id = self.service_id,
+                target_database = %self.database,
+                reason = %reason,
+                "Could not release the database a failed data import created"
+            );
+        }
+        outcome.error_message =
+            Some(release.describe(outcome.error_message.as_deref(), &self.database));
+        outcome
+    }
+
     /// One or two sentences: what failed, the likely cause when the engine
     /// recognises it, and what the target was left with. The tool output
     /// itself is recorded separately (`helper_output`).
@@ -1026,8 +1181,7 @@ impl ImportJob {
         let leftover = if self.atomic {
             "Nothing was committed to the target database."
         } else {
-            "The target database may contain part of the data; run the import again with \
-             replace enabled."
+            PARTIAL_LEFTOVER
         };
         let cause = outcome
             .output()
@@ -1240,6 +1394,334 @@ mod tests {
     use super::*;
     use crate::data_import::{DataImportSpec, TargetInspection, TransferPlan, TransferTarget};
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
+
+    #[test]
+    fn a_released_target_replaces_the_partial_data_advice() {
+        let message = format!("Writing into database 'sessions' failed: see the transfer output for details. {PARTIAL_LEFTOVER}");
+        let described = CreatedTargetRelease::Released.describe(Some(&message), "sessions");
+        assert!(
+            !described.contains("may contain part of the data"),
+            "{described}"
+        );
+        assert!(described.starts_with("Writing into database 'sessions' failed"));
+        assert!(described.ends_with(
+            "The logical database it created for 'sessions' was released, so nothing is left behind."
+        ));
+    }
+
+    #[test]
+    fn a_release_after_any_other_failure_is_appended() {
+        let described =
+            CreatedTargetRelease::Released.describe(Some("Cancelled on request."), "sessions");
+        assert_eq!(
+            described,
+            "Cancelled on request. The logical database it created for 'sessions' was \
+             released, so nothing is left behind."
+        );
+        let described = CreatedTargetRelease::Released.describe(None, "sessions");
+        assert!(described.starts_with("The logical database it created"));
+    }
+
+    #[test]
+    fn a_kept_or_unreleased_target_keeps_the_partial_data_advice_and_says_why() {
+        let message = format!("Reading the source database failed: x. {PARTIAL_LEFTOVER}");
+        let kept = CreatedTargetRelease::KeptForLinkedEnvironment("shop/production".to_string())
+            .describe(Some(&message), "shop_production");
+        assert!(kept.contains(PARTIAL_LEFTOVER), "{kept}");
+        assert!(
+            kept.contains("kept, because the linked environment shop/production resolves to it")
+        );
+
+        let failed = CreatedTargetRelease::Failed("Redis did not answer within 120s".to_string())
+            .describe(Some(&message), "sessions");
+        assert!(failed.contains(PARTIAL_LEFTOVER), "{failed}");
+        assert!(failed.contains("Releasing the logical database it created for 'sessions' failed (Redis did not answer within 120s); it stays reserved"));
+    }
+
+    /// Docker + PostgreSQL end-to-end through `ImportJob::execute`: a Redis
+    /// import whose source rejects its password fails after the target was
+    /// prepared. Only a target this run created is released, and only when
+    /// no linked environment resolves to its name.
+    #[tokio::test]
+    async fn a_failed_redis_import_releases_only_the_database_it_created() {
+        use crate::data_import::test_support::TestDocker;
+        use futures::FutureExt;
+        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+
+        let Some(mut docker) = TestDocker::connect().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                println!("Skipping created target release test: {error}");
+                return;
+            }
+            Err(error) => panic!("created target release test database setup failed: {error}"),
+        };
+        let result =
+            std::panic::AssertUnwindSafe(release_scenario(&mut docker, test_db.connection_arc()))
+                .catch_unwind()
+                .await;
+        docker.finish(result).await;
+    }
+
+    async fn release_scenario(
+        docker: &mut crate::data_import::test_support::TestDocker,
+        db: Arc<DatabaseConnection>,
+    ) {
+        use crate::externalsvc::redis::RedisService;
+
+        const TARGET_PASSWORD: &str = "t@rget-pass";
+        if !docker
+            .ensure_images(&["redis:7.4", "python:3.13-slim"])
+            .await
+        {
+            return;
+        }
+        let source = docker.run("redis-source", "redis:7.4", vec![], None).await;
+        let target = docker
+            .run("redis-target", "redis:7.4", vec![], Some("6379/tcp"))
+            .await;
+        for (container, password) in [
+            (&source.name, "source-pass"),
+            (&target.name, TARGET_PASSWORD),
+        ] {
+            docker
+                .wait_for(
+                    container,
+                    "redis-cli PING | grep -q PONG",
+                    vec![],
+                    Duration::from_secs(60),
+                )
+                .await;
+            let (ok, output) = docker
+                .sh(
+                    container,
+                    &format!("redis-cli CONFIG SET requirepass '{password}'"),
+                    vec![],
+                )
+                .await;
+            assert!(ok, "{output}");
+        }
+        let mapping = |name: &str| {
+            format!(
+                "redis-cli --no-auth-warning -a \"$PW\" -n 0 GET _temps:redis_db_mapping:{name}"
+            )
+        };
+        let target_env = vec![format!("PW={TARGET_PASSWORD}")];
+
+        let now = Utc::now();
+        let service = external_services::ActiveModel {
+            name: Set("cache".to_string()),
+            service_type: Set("redis".to_string()),
+            status: Set("running".to_string()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            topology: Set("standalone".to_string()),
+            consecutive_health_failures: Set(0),
+            metrics_enabled: Set(true),
+            default_backup_provisioned: Set(false),
+            ai_data_access: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert service");
+        db.execute_unprepared(&format!(
+            "INSERT INTO projects (id, name, repo_name, repo_owner, directory, main_branch, \
+                 preset, slug, created_at, updated_at) \
+             VALUES (9101, 'Shop', 'shop', 'example', '.', 'main', 'nixpacks', 'shop', now(), now()); \
+             INSERT INTO environments (id, name, slug, subdomain, host, upstreams, project_id, \
+                 created_at, updated_at) \
+             VALUES (9201, 'Production', 'production', 'shop-production', '', '[]', 9101, now(), now()); \
+             INSERT INTO project_services (project_id, service_id, database_provisioning_mode, \
+                 created_at, updated_at) \
+             VALUES (9101, {}, 'project_environment', now(), now());",
+            service.id
+        ))
+        .await
+        .expect("seed project, environment and link");
+
+        let config = ServiceConfig {
+            name: "cache".to_string(),
+            service_type: ServiceType::Redis,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": target.host_port.expect("published port").to_string(),
+                "password": TARGET_PASSWORD,
+                "docker_image": "redis:7.4",
+                "container_name": target.name,
+            }),
+        };
+        let docker_arc = Arc::new(docker.docker.clone());
+        let engine = RedisService::new("cache".to_string(), docker_arc.clone());
+        // An existing, empty target: the run uses it as is and must never
+        // release it.
+        engine
+            .data_import()
+            .expect("redis imports")
+            .prepare_target(&config, "existing_target", TargetPreparation::Create)
+            .await
+            .expect("pre-allocate");
+
+        let run_base = (std::process::id() as i32 % 10_000) * 10 + 9_100_000;
+        let mut attempt = 0;
+        let mut run_import = |database: &'static str| {
+            attempt += 1;
+            let source = RedisService::new("cache".to_string(), docker_arc.clone())
+                .data_import()
+                .expect("redis imports")
+                .parse_source(&format!("redis://:wrong-pass@{}:6379/3", source.name))
+                .expect("source");
+            ImportJob {
+                run_id: run_base + attempt,
+                service_id: service.id,
+                database: database.to_string(),
+                replace: false,
+                timeout: Duration::from_secs(120),
+                config: config.clone(),
+                source,
+                pins: vec![],
+                network: docker.network.clone(),
+                target_host: target.name.clone(),
+                target_port: "6379".to_string(),
+                atomic: false,
+                instance: Box::new(RedisService::new("cache".to_string(), docker_arc.clone())),
+                db: db.clone(),
+                docker: docker_arc.clone(),
+            }
+            .execute()
+        };
+
+        let released = run_import("abandoned_import").await;
+        assert_eq!(released.status, STATUS_FAILED);
+        let message = released.error_message.expect("message");
+        assert!(
+            message.starts_with("Reading the source database failed"),
+            "{message}"
+        );
+        assert!(
+            message.ends_with(
+                "The logical database it created for 'abandoned_import' was released, so \
+                 nothing is left behind."
+            ),
+            "{message}"
+        );
+        let (ok, out) = docker
+            .sh(
+                &target.name,
+                &mapping("abandoned_import"),
+                target_env.clone(),
+            )
+            .await;
+        assert!(ok && out.trim().is_empty(), "mapping removed: {out:?}");
+
+        let kept = run_import("shop_production").await;
+        let message = kept.error_message.expect("message");
+        assert!(message.contains(PARTIAL_LEFTOVER), "{message}");
+        assert!(
+            message.contains("kept, because the linked environment shop/production resolves to it"),
+            "{message}"
+        );
+        let (ok, out) = docker
+            .sh(
+                &target.name,
+                &mapping("shop_production"),
+                target_env.clone(),
+            )
+            .await;
+        assert!(ok && !out.trim().is_empty(), "mapping kept: {out:?}");
+
+        let existing = run_import("existing_target").await;
+        let message = existing.error_message.expect("message");
+        assert!(message.ends_with(PARTIAL_LEFTOVER), "{message}");
+        let (ok, out) = docker
+            .sh(
+                &target.name,
+                &mapping("existing_target"),
+                target_env.clone(),
+            )
+            .await;
+        assert!(
+            ok && out.trim() == "1",
+            "existing target untouched: {out:?}"
+        );
+    }
+
+    /// The query runs against the migrated schema, so a wrong table, column
+    /// or join is caught here rather than in production.
+    #[tokio::test]
+    async fn a_name_a_linked_environment_resolves_to_is_found() {
+        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                println!("Skipping linked environment test: {error}");
+                return;
+            }
+            Err(error) => panic!("linked environment test database setup failed: {error}"),
+        };
+        let db = test_db.connection_arc();
+        let now = Utc::now();
+        let mut service_ids = Vec::new();
+        for name in ["cache-linked", "cache-other"] {
+            let service = external_services::ActiveModel {
+                name: Set(name.to_string()),
+                service_type: Set("redis".to_string()),
+                status: Set("running".to_string()),
+                created_at: Set(now),
+                updated_at: Set(now),
+                topology: Set("standalone".to_string()),
+                consecutive_health_failures: Set(0),
+                metrics_enabled: Set(true),
+                default_backup_provisioned: Set(false),
+                ai_data_access: Set(false),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .expect("insert service");
+            service_ids.push(service.id);
+        }
+        let (linked, other) = (service_ids[0], service_ids[1]);
+        db.execute_unprepared(&format!(
+            "INSERT INTO projects (id, name, repo_name, repo_owner, directory, main_branch, \
+                 preset, slug, created_at, updated_at) \
+             VALUES (9101, 'Shop', 'shop', 'example', '.', 'main', 'nixpacks', 'shop', now(), now()); \
+             INSERT INTO environments (id, name, slug, subdomain, host, upstreams, project_id, \
+                 created_at, updated_at) \
+             VALUES (9201, 'Production', 'production', 'shop-production', '', '[]', 9101, now(), now()); \
+             INSERT INTO project_services (project_id, service_id, database_provisioning_mode, \
+                 created_at, updated_at) \
+             VALUES (9101, {linked}, 'project_environment', now(), now());"
+        ))
+        .await
+        .expect("seed project, environment and link");
+
+        assert_eq!(
+            linked_environment_resolving_to(db.as_ref(), linked, "shop_production")
+                .await
+                .expect("query"),
+            Some("shop/production".to_string())
+        );
+        for (service_id, name) in [
+            (linked, "shop_staging"),
+            (linked, "sessions"),
+            (other, "shop_production"),
+        ] {
+            assert_eq!(
+                linked_environment_resolving_to(db.as_ref(), service_id, name)
+                    .await
+                    .expect("query"),
+                None,
+                "service {service_id}, '{name}'"
+            );
+        }
+    }
 
     fn run(id: i32, service_id: i32, status: &str) -> service_data_imports::Model {
         let now = Utc::now();
