@@ -85,7 +85,10 @@ function extractCommandInfo(cmd: Command, parentName = ''): CommandInfo {
     description: opt.description || '',
     defaultValue:
       opt.defaultValue !== undefined ? String(opt.defaultValue) : undefined,
-    required: opt.required || opt.flags.includes('<'),
+    // `<value>` only means the value is required *when the option is
+    // supplied*; `.makeOptionMandatory()` is what makes the option itself
+    // required. Same rule as `temps docs` (src/commands/docs.ts).
+    required: opt.mandatory === true,
   }))
 
   const subcommands: CommandInfo[] = cmd.commands.map((sub: Command) =>

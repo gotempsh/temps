@@ -200,10 +200,10 @@ Stream logs in real-time to see events as they happen:
 
 Container logs stream over a WebSocket. Each message is one log line as raw text. The stream stays open while `follow=true` (the default) and closes with code `1000` when it ends normally. Code `1011` means the stream failed after it started: the close reason says why. Do not parse the message payload to detect errors, because your application's own log lines can contain JSON with an `error` field.
 
-```javascript
-// Bun or Node.js (with the `ws` package). Browsers cannot set the
-// Authorization header on a WebSocket, so the console uses its session
-// cookie instead.
+Browsers cannot set the `Authorization` header on a WebSocket (the console uses its session cookie instead), so connect from a server-side runtime:
+
+```javascript {{ title: 'Bun' }}
+// Bun's built-in WebSocket accepts request headers.
 const url =
   `wss://your-temps-instance.com/api/projects/${projectId}` +
   `/environments/${environmentId}/containers/${containerId}/logs?tail=100&follow=true`;
@@ -218,6 +218,27 @@ socket.onclose = (event) => {
     console.error(`Log stream closed (${event.code}): ${event.reason}`);
   }
 };
+```
+
+```javascript {{ title: 'Node.js' }}
+// Node's built-in WebSocket cannot send headers; use the `ws` package
+// (npm install ws).
+import WebSocket from "ws";
+
+const url =
+  `wss://your-temps-instance.com/api/projects/${projectId}` +
+  `/environments/${environmentId}/containers/${containerId}/logs?tail=100&follow=true`;
+
+const socket = new WebSocket(url, {
+  headers: { Authorization: `Bearer ${token}` },
+});
+
+socket.on("message", (data) => console.log(data.toString().trimEnd()));
+socket.on("close", (code, reason) => {
+  if (code !== 1000) {
+    console.error(`Log stream closed (${code}): ${reason.toString()}`);
+  }
+});
 ```
 
 To stream a deployment's build log while it runs, connect to `/api/projects/{project_id}/deployments/{deployment_id}/jobs/{job_id}/logs/tail` the same way.

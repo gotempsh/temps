@@ -357,7 +357,7 @@ async function listSchedules(options: { json?: boolean }): Promise<void> {
 
   if (schedules.length === 0) {
     info('No backup schedules configured')
-    info('Run: temps backups schedules create --name daily-backup --type full --schedule "0 2 * * *" --retention 30 --s3-source-id 1 -y')
+    info('Run: temps backups schedules create --name daily-backup --type full --schedule "0 0 2 * * *" --retention 30 --s3-source-id 1 -y')
     newline()
     return
   }
