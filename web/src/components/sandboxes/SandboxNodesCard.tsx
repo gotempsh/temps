@@ -298,7 +298,7 @@ function SandboxNodeRow({
         {node.dedicated && node.eligible && (
           <p className="pl-6 text-xs text-muted-foreground">
             Only takes sandboxes that request it: create with{' '}
-            <code>--node {node.name}</code> or <code>node: "{node.name}"</code>.
+            <code>--node {node.name}</code> or <code>{`node: "${node.name}"`}</code>.
           </p>
         )}
         {/* Why an allowed node still won't take sandboxes (offline, being
