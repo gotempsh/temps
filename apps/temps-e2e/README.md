@@ -1424,9 +1424,8 @@ row's status field flipped".
 4. `POST .../deployments/{A}/rollback`; assert live traffic reverts to
    `"version A"` byte-for-byte -- proves a real rollback, not just a state
    transition
-5. `POST .../deployments/{current}/pause`; assert the live URL genuinely
-   stops serving the app -- see the real-bug note below for what "paused"
-   actually renders as and why
+5. `POST .../deployments/{current}/pause`; assert the live URL returns HTTP
+   503 without the Temps console HTML
 6. `POST .../deployments/{current}/resume`; assert live traffic serves
    `"version A"` again
 7. create a second environment, `POST .../deployments/{B}/promote` into it;
@@ -1481,22 +1480,19 @@ yet to assert a body against.
    proxy kept retrying the OLD (still "valid-looking") container address and
    returned Pingora's own `503 Service Unavailable` ("Fail to connect ...
    Connection refused") -- not a clean "paused" signal, just an accident of
-   a stale cached route; the "an untested guess would reach for a 503"
-   sentence that used to be here was itself exactly that untested guess,
-   and turned out to be the pre-fix bug, not the fixed behavior. Fixed by
+   a stale cached route. Fixed by
    (a) filtering `route_table::load_routes` to `status IS NULL OR status =
    'running'`, so a stopped container's route is skipped once reloaded, and
    (b) having pause/resume publish `Job::ForceRouteReload` (the same
    in-process broadcast `mark_deployment_complete.rs` already uses after a
-   normal deploy) so the reload happens immediately. With both fixes,
-   pausing makes the route disappear entirely and the proxy falls through to
-   its existing unknown-host console-fallback response (HTTP 200,
-   `<title>Temps</title>`) -- that fallback is the real, asserted "paused"
-   behavior in step 5 above.
+   normal deploy) so the reload happens immediately. Known application
+   hosts now remain recorded as unavailable without a live backend, and the
+   proxy returns HTTP 503 instead of serving the console HTML. Step 5 asserts
+   both the status and absence of console HTML; resume must restore the exact
+   application body.
 
-Confirmed live 3x back to back (after the environment-flakiness note below),
-including that resume correctly restarts the SAME container (not a rebuild)
-and traffic recovers within ~1.5s of the resume call.
+Resume coverage requires the exact application version served before pause
+to return through the same live URL.
 
 Also worth noting for anyone re-running this: the local dev instance used to
 verify this crashed several times mid-run with no panic/error logged (just

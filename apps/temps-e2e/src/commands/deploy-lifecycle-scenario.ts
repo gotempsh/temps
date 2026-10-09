@@ -18,9 +18,8 @@
  *      EXACTLY "version A" again (byte-for-byte, over the real proxied URL,
  *      not "the deployment row's state flipped")
  *   4. POST .../pause on the now-current (rollback) deployment -- assert the
- *      live URL genuinely stops serving the app. What "paused" actually
- *      renders as is NOT assumed going in; see the real-bug note below for
- *      what it turned out to be and why.
+ *      live URL returns HTTP 503 without the Temps console HTML, proving the
+ *      known application route reports unavailability.
  *   5. POST .../resume -- assert live traffic serves "version A" again
  *   6. POST .../promote deployment B into a brand-new second environment --
  *      assert ITS live URL serves EXACTLY "version B", independent of
@@ -80,12 +79,10 @@
  *    (b) having pause/resume publish `Job::ForceRouteReload` (the same
  *    in-process broadcast `mark_deployment_complete.rs` already uses after a
  *    normal deploy) so the reload actually happens immediately instead of
- *    waiting on an unrelated route change. With both fixes, pausing makes
- *    the route disappear entirely and the proxy falls through to its
- *    existing unknown-host console-fallback response (HTTP 200,
- *    `<title>Temps</title>`) -- that fallback is therefore the real,
- *    asserted "paused" behavior in step 4 below, discovered by observing
- *    actual proxy logs, not assumed.
+ *    waiting on an unrelated route change. Known application hosts now
+ *    remain recorded as unavailable when there is no live backend, so the
+ *    proxy returns HTTP 503 rather than the console HTML. Step 4 checks that
+ *    response; resume still requires the exact version A application body.
  */
 import { createEnvironment, pauseDeployment, promoteDeployment, resumeDeployment, rollbackToDeployment } from '@temps-sdk/api'
 import { makeClient, resolveConfig, unwrap } from '../lib/client.ts'
@@ -97,7 +94,7 @@ import {
   getDeployStatus,
   waitForHttpReady,
   assertNotConsoleFallback,
-  waitForConsoleFallback,
+  waitForAppUnavailable,
   fetchBody,
   resolveLoadTarget,
   teardown,
@@ -316,7 +313,7 @@ export async function deployLifecycleScenarioCommand(
       )
     })
     await step('assert live traffic actually stopped (real paused-state behavior)', () =>
-      waitForConsoleFallback({ url: target.url, headers: target.headers, timeoutMs: 45_000 }),
+      waitForAppUnavailable({ url: target.url, headers: target.headers, timeoutMs: 45_000 }),
     )
 
     // --- 5. resume, assert traffic comes back exactly as before ---
