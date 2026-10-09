@@ -54,6 +54,11 @@ rand = { workspace = true }
 regex = { workspace = true }
 hex = "0.4"
 sha2 = { workspace = true }
+# microsandbox microVM backend (ADR-050). Pinned exactly: the SDK is pre-1.0
+# and its runtime binary + libkrunfw ABI move in lockstep with the crate.
+# Default features are off: `download-binaries` fetches the runtime from the
+# network inside build.rs, `cloud` / `keyring` are unused.
+microsandbox = { version = "=0.7.7", default-features = false, features = ["local", "net"] }
 
 tempfile = { workspace = true }
 

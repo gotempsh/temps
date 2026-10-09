@@ -174,7 +174,8 @@ pub struct CreateSandboxRequest {
     /// `metadata` JSON column and surfaced as `routes[]` in the SDK-
     /// shaped responses.
     pub ports: Vec<u16>,
-    /// Isolation backend: "docker" (default) or "firecracker". `None` →
+    /// Isolation backend: "docker" (default), "firecracker" or
+    /// "microsandbox" (ADR-050). `None` →
     /// the host's configured default (docker unless the operator changed
     /// it). Unknown values are a validation error, and requesting a
     /// backend the host doesn't have fails create rather than downgrading.
@@ -611,7 +612,8 @@ pub struct SandboxSummary {
     /// column). Empty when the sandbox was created without declaring
     /// any ports.
     pub ports: Vec<u16>,
-    /// Isolation backend the sandbox runs on ("docker" | "firecracker").
+    /// Isolation backend the sandbox runs on ("docker" | "firecracker" |
+    /// "microsandbox").
     /// `None` on rows created before the column existed.
     pub backend: Option<String>,
     /// Configured root disk size in MB (from metadata). `None` = default.
@@ -2025,23 +2027,11 @@ impl SandboxService {
         let expires_at = now + chrono::Duration::seconds(timeout as i64);
 
         // Validate the requested backend before any DB/container work.
-        // Only the two public backends are accepted — "local" is a dev
+        // Only the public backends are accepted — "local" is a dev
         // fallback, never a caller choice. `None` = host default (docker
         // unless the operator changed it), so existing clients see no
         // behavior change.
-        let backend = match req.backend.as_deref() {
-            None => None,
-            Some("docker") => Some(temps_agents::sandbox::SandboxBackend::Docker),
-            Some("firecracker") => Some(temps_agents::sandbox::SandboxBackend::Firecracker),
-            Some(other) => {
-                return Err(SandboxError::Validation {
-                    message: format!(
-                        "unknown backend '{}' (expected \"docker\" or \"firecracker\")",
-                        other
-                    ),
-                })
-            }
-        };
+        let backend = parse_requested_backend(req.backend.as_deref())?;
 
         // ADR-048: decide which node hosts the sandbox before anything is
         // created. Explicit requests are validated against the operator
@@ -2062,6 +2052,13 @@ impl SandboxService {
                         .to_string(),
                 });
             }
+            if backend == Some(temps_agents::sandbox::SandboxBackend::Microsandbox) {
+                return Err(SandboxError::Validation {
+                    message: "the microsandbox backend is not available on worker nodes \
+                              (ADR-050); use the docker backend or the control plane"
+                        .to_string(),
+                });
+            }
         }
 
         // Fail closed if the caller asked for a backend this host can't
@@ -2071,7 +2068,7 @@ impl SandboxService {
         if let (Some(b), None) = (backend, node_id) {
             if !self.registry.provider_arc().supports_backend(b) {
                 return Err(SandboxError::Validation {
-                    message: format!("backend '{}' is not available on this host", b),
+                    message: backend_unavailable_message(b),
                 });
             }
         }
@@ -5113,6 +5110,55 @@ fn source_target_restore_script() -> &'static str {
     "if [ \"$(id -u)\" -eq 0 ] && [ -d /dev/fd/9 ] && id -u temps >/dev/null 2>&1; then chown \"$(id -u temps):$(id -g temps)\" /dev/fd/9; chmod 755 /dev/fd/9; fi"
 }
 
+/// Parse the backend a create request asked for. `None` = host default.
+fn parse_requested_backend(
+    requested: Option<&str>,
+) -> Result<Option<temps_agents::sandbox::SandboxBackend>, SandboxError> {
+    use temps_agents::sandbox::SandboxBackend;
+    match requested {
+        None => Ok(None),
+        Some("docker") => Ok(Some(SandboxBackend::Docker)),
+        Some("firecracker") => Ok(Some(SandboxBackend::Firecracker)),
+        Some("microsandbox") => Ok(Some(SandboxBackend::Microsandbox)),
+        Some(other) => Err(SandboxError::Validation {
+            message: format!(
+                "unknown backend '{}' (expected \"docker\", \"firecracker\" or \"microsandbox\")",
+                other
+            ),
+        }),
+    }
+}
+
+/// Why an explicitly requested backend was rejected on this host. For
+/// microsandbox the host probe says exactly what is missing (platform,
+/// hypervisor, or runtime) and where to fix it.
+fn backend_unavailable_message(backend: temps_agents::sandbox::SandboxBackend) -> String {
+    match backend {
+        temps_agents::sandbox::SandboxBackend::Microsandbox => {
+            let capability = temps_agents::sandbox::microsandbox::microsandbox_capability(
+                &temps_agents::sandbox::microsandbox::host_data_dir(),
+            );
+            match capability.reason {
+                Some(reason) => format!(
+                    "backend 'microsandbox' is not available on this host: {} (see {})",
+                    reason,
+                    temps_agents::sandbox::microsandbox::SETUP_PATH
+                ),
+                // Ready now but not registered: the server started before
+                // the runtime was installed.
+                None => "backend 'microsandbox' is not available on this host: the runtime \
+                         was installed after the server started; restart temps to enable it"
+                    .to_string(),
+            }
+        }
+        temps_agents::sandbox::SandboxBackend::Docker
+        | temps_agents::sandbox::SandboxBackend::Firecracker
+        | temps_agents::sandbox::SandboxBackend::Local => {
+            format!("backend '{}' is not available on this host", backend)
+        }
+    }
+}
+
 fn source_import_staging_dir(
     backend: temps_agents::sandbox::SandboxBackend,
     internal_id: i32,
@@ -5120,7 +5166,8 @@ fn source_import_staging_dir(
     let private_root = match backend {
         temps_agents::sandbox::SandboxBackend::Local => "/tmp",
         temps_agents::sandbox::SandboxBackend::Docker => "/run/temps-source-import",
-        temps_agents::sandbox::SandboxBackend::Firecracker => "/root",
+        temps_agents::sandbox::SandboxBackend::Firecracker
+        | temps_agents::sandbox::SandboxBackend::Microsandbox => "/root",
     };
     format!("{private_root}/.temps-source-import-{internal_id}")
 }
@@ -5410,6 +5457,60 @@ pub(crate) mod tests {
         assert!(cleanup.contains("/workspace/projects/web/.git"));
         assert!(!cleanup.contains("/workspace/.git "));
         assert!(git_metadata_cleanup_script("/workspace/projects/web", false).is_empty());
+    }
+
+    #[test]
+    fn requested_backend_accepts_public_backends_only() {
+        use temps_agents::sandbox::SandboxBackend;
+        assert_eq!(parse_requested_backend(None).unwrap(), None);
+        assert_eq!(
+            parse_requested_backend(Some("docker")).unwrap(),
+            Some(SandboxBackend::Docker)
+        );
+        assert_eq!(
+            parse_requested_backend(Some("firecracker")).unwrap(),
+            Some(SandboxBackend::Firecracker)
+        );
+        assert_eq!(
+            parse_requested_backend(Some("microsandbox")).unwrap(),
+            Some(SandboxBackend::Microsandbox)
+        );
+        // "local" is a dev fallback, never a caller choice.
+        for rejected in ["local", "libkrun", ""] {
+            match parse_requested_backend(Some(rejected)) {
+                Err(SandboxError::Validation { message }) => {
+                    assert!(message.contains(&format!("'{rejected}'")), "{message}");
+                    assert!(message.contains("microsandbox"), "{message}");
+                }
+                other => panic!("expected validation error for {rejected:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn unavailable_microsandbox_explains_itself() {
+        let message =
+            backend_unavailable_message(temps_agents::sandbox::SandboxBackend::Microsandbox);
+        assert!(
+            message.starts_with("backend 'microsandbox' is not available on this host: "),
+            "{message}"
+        );
+        assert_eq!(
+            backend_unavailable_message(temps_agents::sandbox::SandboxBackend::Firecracker),
+            "backend 'firecracker' is not available on this host"
+        );
+    }
+
+    #[test]
+    fn microvm_backends_stage_source_imports_under_root_home() {
+        assert_eq!(
+            source_import_staging_dir(temps_agents::sandbox::SandboxBackend::Microsandbox, 42),
+            "/root/.temps-source-import-42"
+        );
+        assert_eq!(
+            source_import_staging_dir(temps_agents::sandbox::SandboxBackend::Firecracker, 42),
+            "/root/.temps-source-import-42"
+        );
     }
 
     #[test]

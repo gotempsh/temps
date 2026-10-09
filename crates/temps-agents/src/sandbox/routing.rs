@@ -327,6 +327,13 @@ impl SandboxProvider for RoutingSandboxProvider {
         Ok(None)
     }
 
+    /// Answers for exactly the backends registered on this host, so a
+    /// request for an unprovisioned one is rejected before any work starts
+    /// (the trait default is permissive).
+    fn supports_backend(&self, backend: SandboxBackend) -> bool {
+        self.backends.contains_key(&backend)
+    }
+
     fn name(&self) -> &str {
         "routing"
     }
@@ -530,6 +537,7 @@ mod tests {
             match self.backend {
                 SandboxBackend::Docker => "docker-test",
                 SandboxBackend::Firecracker => "firecracker-test",
+                SandboxBackend::Microsandbox => "microsandbox-test",
                 SandboxBackend::Local => "local-test",
             }
         }
@@ -575,6 +583,64 @@ mod tests {
         backends.insert(SandboxBackend::Docker, docker);
         backends.insert(SandboxBackend::Firecracker, firecracker);
         RoutingSandboxProvider::new(backends, SandboxBackend::Docker)
+    }
+
+    fn three_backend_router(
+        docker: Arc<RecordingProvider>,
+        firecracker: Arc<RecordingProvider>,
+        microsandbox: Arc<RecordingProvider>,
+    ) -> RoutingSandboxProvider {
+        let mut backends: HashMap<SandboxBackend, Arc<dyn SandboxProvider>> = HashMap::new();
+        backends.insert(SandboxBackend::Docker, docker);
+        backends.insert(SandboxBackend::Firecracker, firecracker);
+        backends.insert(SandboxBackend::Microsandbox, microsandbox);
+        RoutingSandboxProvider::new(backends, SandboxBackend::Docker)
+    }
+
+    #[tokio::test]
+    async fn create_dispatches_to_the_requested_microsandbox_backend() {
+        let docker = Arc::new(RecordingProvider::new(SandboxBackend::Docker));
+        let firecracker = Arc::new(RecordingProvider::new(SandboxBackend::Firecracker));
+        let microsandbox = Arc::new(RecordingProvider::new(SandboxBackend::Microsandbox));
+        let router = three_backend_router(docker, firecracker, microsandbox.clone());
+
+        let mut config = create_config();
+        config.backend = Some(SandboxBackend::Microsandbox);
+        let handle = router.create(config).await.unwrap();
+        assert_eq!(handle.backend, SandboxBackend::Microsandbox);
+
+        // Handle-based calls go to the backend stamped on the handle.
+        let contents = router
+            .read_file(&microsandbox.handle(), "/etc/hostname")
+            .await
+            .unwrap();
+        assert_eq!(contents, b"microsandbox-sandbox");
+        assert!(router.supports_backend(SandboxBackend::Microsandbox));
+    }
+
+    #[tokio::test]
+    async fn requesting_unregistered_microsandbox_fails_instead_of_downgrading() {
+        let docker = Arc::new(RecordingProvider::new(SandboxBackend::Docker));
+        let firecracker = Arc::new(RecordingProvider::new(SandboxBackend::Firecracker));
+        let router = router(docker, firecracker);
+
+        let mut config = create_config();
+        config.backend = Some(SandboxBackend::Microsandbox);
+        match router.create(config).await {
+            Err(AgentError::SandboxCreationFailed {
+                provider, reason, ..
+            }) => {
+                assert_eq!(provider, "microsandbox");
+                assert!(
+                    reason.contains("'microsandbox' is not available"),
+                    "{reason}"
+                );
+                assert!(reason.contains("docker"), "{reason}");
+            }
+            Ok(handle) => panic!("silently created on {:?}", handle.backend),
+            Err(other) => panic!("expected SandboxCreationFailed, got {other:?}"),
+        }
+        assert!(!router.supports_backend(SandboxBackend::Microsandbox));
     }
 
     #[tokio::test]

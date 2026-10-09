@@ -676,10 +676,11 @@ export type AgentSandboxSettings = {
      */
     runtime?: string;
     /**
-     * Default isolation backend for sandboxes: "docker" (default) or
-     * "firecracker" (ADR-029; requires `temps firecracker setup`). Only
-     * consulted when the Firecracker backend probes available — otherwise
-     * Docker is used regardless.
+     * Default isolation backend for sandboxes: "docker" (default),
+     * "firecracker" (ADR-029; requires `temps firecracker setup`) or
+     * "microsandbox" (ADR-050, experimental; requires `temps microsandbox
+     * setup`). Only consulted when the selected microVM backend probes
+     * available — otherwise Docker is used.
      */
     sandbox_backend?: string | null;
 };
@@ -6266,11 +6267,13 @@ export type CreateS3SourceRequest = {
 export type CreateSandboxBody = {
     _runtime?: string | null;
     /**
-     * Isolation backend: `"docker"` (default) or `"firecracker"` (ADR-029,
+     * Isolation backend: `"docker"` (default), `"firecracker"` (ADR-029,
      * hardware-virtualized microVM — requires a host provisioned with
-     * `temps firecracker setup`). Omit for the platform default; existing
-     * clients are unaffected. Requesting an unavailable backend fails with
-     * 400 rather than silently downgrading isolation.
+     * `temps firecracker setup`) or `"microsandbox"` (ADR-050, experimental
+     * libkrun microVM — requires `temps microsandbox setup`). Omit for the
+     * platform default; existing clients are unaffected. Requesting an
+     * unavailable backend fails with 400 rather than silently downgrading
+     * isolation.
      */
     backend?: string | null;
     cpu_limit?: number | null;
@@ -14518,6 +14521,34 @@ export type MfaVerificationRequest = {
 };
 
 /**
+ * Backend readiness for the settings/status API. Always reported: when the
+ * backend is not configured it says why and where to set it up, so the
+ * console can onboard instead of hiding the option.
+ */
+export type MicrosandboxCapability = {
+    /**
+     * Whether sandboxes can be created on this backend right now.
+     */
+    configured: boolean;
+    /**
+     * Why the backend is unavailable, when `configured` is false.
+     */
+    reason?: string | null;
+    /**
+     * Runtime version this build of Temps expects.
+     */
+    runtime_version: string;
+    /**
+     * Shell command that installs the runtime, when installing it is the fix.
+     */
+    setup_command?: string | null;
+    /**
+     * Console path that shows status and setup instructions.
+     */
+    setup_path?: string | null;
+};
+
+/**
  * A single step in the migration execution plan.
  *
  * Steps are presented to the user before execution so they know exactly
@@ -20735,7 +20766,7 @@ export type SandboxInner = {
      */
     agent_run_id?: number | null;
     /**
-     * Isolation backend: "docker" | "firecracker". `None` on legacy rows
+     * Isolation backend: "docker" | "firecracker" | "microsandbox". `None` on legacy rows
      * created before the backend was recorded.
      */
     backend?: string | null;
@@ -20841,6 +20872,11 @@ export type SandboxStatusResponse = {
     firecracker_available: boolean;
     image_name: string;
     image_ready: boolean;
+    /**
+     * Experimental microsandbox microVM backend (ADR-050). Always present:
+     * when not configured it carries the reason and where to set it up.
+     */
+    microsandbox: MicrosandboxCapability;
 };
 
 export type SaveAgentTokenRequest = {

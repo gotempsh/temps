@@ -1118,10 +1118,11 @@ pub struct AgentSandboxSettings {
     /// Network access level: "full" (unrestricted), "restricted" (Temps network only), "none" (no network)
     #[schema(example = "full")]
     pub network_mode: String,
-    /// Default isolation backend for sandboxes: "docker" (default) or
-    /// "firecracker" (ADR-029; requires `temps firecracker setup`). Only
-    /// consulted when the Firecracker backend probes available — otherwise
-    /// Docker is used regardless.
+    /// Default isolation backend for sandboxes: "docker" (default),
+    /// "firecracker" (ADR-029; requires `temps firecracker setup`) or
+    /// "microsandbox" (ADR-050, experimental; requires `temps microsandbox
+    /// setup`). Only consulted when the selected microVM backend probes
+    /// available — otherwise Docker is used.
     #[serde(default)]
     #[schema(example = "docker")]
     pub sandbox_backend: Option<String>,

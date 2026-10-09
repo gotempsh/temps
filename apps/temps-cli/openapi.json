@@ -1656,7 +1656,7 @@
           },
           "sandbox_backend": {
             "default": null,
-            "description": "Default isolation backend for sandboxes: \"docker\" (default) or\n\"firecracker\" (ADR-029; requires `temps firecracker setup`). Only\nconsulted when the Firecracker backend probes available — otherwise\nDocker is used regardless.",
+            "description": "Default isolation backend for sandboxes: \"docker\" (default),\n\"firecracker\" (ADR-029; requires `temps firecracker setup`) or\n\"microsandbox\" (ADR-050, experimental; requires `temps microsandbox\nsetup`). Only consulted when the selected microVM backend probes\navailable — otherwise Docker is used.",
             "example": "docker",
             "type": [
               "string",
@@ -13249,7 +13249,7 @@
             ]
           },
           "backend": {
-            "description": "Isolation backend: `\"docker\"` (default) or `\"firecracker\"` (ADR-029,\nhardware-virtualized microVM — requires a host provisioned with\n`temps firecracker setup`). Omit for the platform default; existing\nclients are unaffected. Requesting an unavailable backend fails with\n400 rather than silently downgrading isolation.",
+            "description": "Isolation backend: `\"docker\"` (default), `\"firecracker\"` (ADR-029,\nhardware-virtualized microVM — requires a host provisioned with\n`temps firecracker setup`) or `\"microsandbox\"` (ADR-050, experimental\nlibkrun microVM — requires `temps microsandbox setup`). Omit for the\nplatform default; existing clients are unaffected. Requesting an\nunavailable backend fails with 400 rather than silently downgrading\nisolation.",
             "type": [
               "string",
               "null"
@@ -31825,6 +31825,45 @@
         ],
         "type": "object"
       },
+      "MicrosandboxCapability": {
+        "description": "Backend readiness for the settings/status API. Always reported: when the\nbackend is not configured it says why and where to set it up, so the\nconsole can onboard instead of hiding the option.",
+        "properties": {
+          "configured": {
+            "description": "Whether sandboxes can be created on this backend right now.",
+            "type": "boolean"
+          },
+          "reason": {
+            "description": "Why the backend is unavailable, when `configured` is false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "runtime_version": {
+            "description": "Runtime version this build of Temps expects.",
+            "type": "string"
+          },
+          "setup_command": {
+            "description": "Shell command that installs the runtime, when installing it is the fix.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "description": "Console path that shows status and setup instructions.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "configured",
+          "runtime_version"
+        ],
+        "type": "object"
+      },
       "MigrationStep": {
         "description": "A single step in the migration execution plan.\n\nSteps are presented to the user before execution so they know exactly\nwhat will happen. During execution, each step runs in order and reports\nits outcome before proceeding to the next.",
         "properties": {
@@ -44903,7 +44942,7 @@
             ]
           },
           "backend": {
-            "description": "Isolation backend: \"docker\" | \"firecracker\". `None` on legacy rows\ncreated before the backend was recorded.",
+            "description": "Isolation backend: \"docker\" | \"firecracker\" | \"microsandbox\". `None` on legacy rows\ncreated before the backend was recorded.",
             "type": [
               "string",
               "null"
@@ -45135,13 +45174,18 @@
           },
           "image_ready": {
             "type": "boolean"
+          },
+          "microsandbox": {
+            "$ref": "#/components/schemas/MicrosandboxCapability",
+            "description": "Experimental microsandbox microVM backend (ADR-050). Always present:\nwhen not configured it carries the reason and where to set it up."
           }
         },
         "required": [
           "docker_available",
           "image_ready",
           "image_name",
-          "firecracker_available"
+          "firecracker_available",
+          "microsandbox"
         ],
         "type": "object"
       },
