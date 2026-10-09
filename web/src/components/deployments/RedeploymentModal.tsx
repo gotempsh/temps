@@ -53,12 +53,10 @@ import {
 } from 'lucide-react'
 import { BranchSelector, type ResolvedBranch } from './BranchSelector'
 import { gitProviderSetupPath, problemDetail } from '@/lib/api-problem'
-
-const COMMIT_SHA_PATTERN = /^[0-9a-f]{7,40}$/i
-
-function isValidCommitSha(commit: string) {
-  return COMMIT_SHA_PATTERN.test(commit.trim())
-}
+import {
+  isValidCommitSha,
+  redeployGitReference,
+} from '@/lib/redeploy-reference'
 
 function formatCommitDate(date: string) {
   const parsedDate = new Date(date)
@@ -518,15 +516,21 @@ export function RedeploymentModal({
         return
       }
 
-      await submit({
-        branch: defaultType === 'branch' ? defaultBranch : undefined,
-        commit:
-          defaultType === 'commit' || defaultType === 'tag'
-            ? defaultCommit
-            : undefined,
-        tag: defaultType === 'tag' ? defaultTag : undefined,
-        environmentId: defaultEnvironment,
+      // Pin the deployment's own commit: a branch alone would rebuild
+      // whatever the branch points at now, not what this deployment ran.
+      const reference = redeployGitReference({
+        type: defaultType || 'branch',
+        branch: defaultBranch,
+        commit: defaultCommit,
+        tag: defaultTag,
       })
+      if (!reference) {
+        toast.error(
+          'This deployment has no recorded commit to redeploy. Start a new deployment instead.'
+        )
+        return
+      }
+      await submit({ ...reference, environmentId: defaultEnvironment })
       return
     }
 
