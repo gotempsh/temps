@@ -1137,6 +1137,49 @@ fn entrypoint_root<'a>(directory: &'a str, names: &[&str]) -> &'a str {
     }
 }
 
+/// Whether `directory` is a `public/` folder whose parent can be a project
+/// root, so its `index.php` can root the application at that parent.
+fn is_public_dir_of_candidate(directory: &str) -> bool {
+    match directory.rsplit_once('/') {
+        Some((parent, "public")) => is_project_candidate_directory(parent),
+        None => directory == "public",
+        Some(_) => false,
+    }
+}
+
+/// Whether a static file server would hand out `path` as PHP source.
+fn is_php_source(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let Some((_, extension)) = name.rsplit_once('.') else {
+        return false;
+    };
+    let extension = extension.to_ascii_lowercase();
+    extension == "phtml"
+        || extension == "phar"
+        || extension
+            .strip_prefix("php")
+            .is_some_and(|version| version.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Every directory whose tree contains PHP source, named the way the caller
+/// names directories (`root` is the archive or repository root).
+///
+/// One pass, inserting each PHP file's ancestors, so checking a candidate is
+/// a set lookup rather than a rescan of the file list per root.
+fn directories_with_php_source<'a>(
+    paths: impl Iterator<Item = &'a str>,
+    root: &'a str,
+) -> std::collections::HashSet<&'a str> {
+    let mut directories = std::collections::HashSet::new();
+    for path in paths.filter(|path| is_php_source(path)) {
+        directories.insert(root);
+        for (index, _) in path.match_indices('/') {
+            directories.insert(&path[..index]);
+        }
+    }
+    directories
+}
+
 fn directory_depth(directory: &str) -> usize {
     if directory == "." {
         0
@@ -1195,11 +1238,21 @@ pub fn detect_project_candidates(
             Some((directory, name)) => (directory, name),
             None => (".", path.as_str()),
         };
-        if !is_project_candidate_directory(directory) {
+        // A `public/` document root may sit one level below the depth cap
+        // when its application root is at the cap; it is indexed so that
+        // root can be found, but never becomes a root itself (below).
+        if !is_project_candidate_directory(directory)
+            && !(name == "index.php" && is_public_dir_of_candidate(directory))
+        {
             continue;
         }
         by_directory.entry(directory).or_default().push(name);
     }
+    // Directories whose tree holds PHP source. Built from every archive path,
+    // including ones detection itself skips (`vendor/`, deep folders), since
+    // a static deployment publishes all of them.
+    let php_source_dirs =
+        directories_with_php_source(files.keys().map(String::as_str), ".");
 
     let has_independent_manifest =
         |names: &[&str]| names.iter().any(|name| is_project_manifest(name));
@@ -1211,6 +1264,9 @@ pub fn detect_project_candidates(
     // instead (see below).
     let mut orphan_dockerfile_dirs: Vec<&str> = Vec::new();
     for (directory, names) in &by_directory {
+        if !is_project_candidate_directory(directory) {
+            continue;
+        }
         let has_dockerfile = names.contains(&"Dockerfile");
         if *directory != "."
             && has_dockerfile
@@ -1238,7 +1294,9 @@ pub fn detect_project_candidates(
         .collect();
     entrypoint_roots.sort_by_key(|directory| (directory_depth(directory), *directory));
     for directory in entrypoint_roots {
-        if !roots.iter().any(|root| is_within(directory, root)) {
+        if is_project_candidate_directory(directory)
+            && !roots.iter().any(|root| is_within(directory, root))
+        {
             roots.insert(directory);
         }
     }
@@ -1330,9 +1388,23 @@ pub fn detect_project_candidates(
             }
             // Plain PHP needs no Composer: autopack serves `index.php` (or
             // `public/index.php`) through FrankenPHP. The static preset would
-            // publish that source as text, so it is not offered at all.
-            if has("index.php") || has_public_index_php {
+            // publish PHP source anywhere in its tree as text (`index.html`
+            // beside `api/index.php`), so it is never offered for such a tree;
+            // the PHP build serves the HTML and runs the PHP instead.
+            if php_source_dirs.contains(root)
+                && root_candidates
+                    .iter()
+                    .any(|candidate| candidate.preset == PresetType::Static)
+            {
                 root_candidates.retain(|candidate| candidate.preset != PresetType::Static);
+                offer_provider(
+                    &mut root_candidates,
+                    root,
+                    NixpacksProvider::Php,
+                    "high",
+                    "PHP source found beside the HTML (server preset, so it runs \
+                     instead of being published as text)",
+                );
             }
             if has("index.php") {
                 offer_provider(
@@ -1516,6 +1588,8 @@ pub fn detect_presets_from_file_tree(files: &[String]) -> Vec<DetectedPreset> {
             .push(path.clone());
     }
 
+    let php_source_dirs = directories_with_php_source(files.iter().map(String::as_str), "");
+
     let mut presets = Vec::new();
 
     // Check each directory for presets
@@ -1541,6 +1615,14 @@ pub fn detect_presets_from_file_tree(files: &[String]) -> Vec<DetectedPreset> {
         }
 
         let mut detected = detect_all_presets_from_files(dir_files);
+        // A static deployment of this directory would publish the PHP source
+        // in its tree as text; build it with PHP instead.
+        if php_source_dirs.contains(dir.as_str())
+            && detected.iter().any(|preset| preset.slug() == "nixpacks-static")
+        {
+            detected.retain(|preset| preset.slug() != "nixpacks-static");
+            detected.push(Box::new(NixpacksPreset::new(NixpacksProvider::Php)));
+        }
         // A compose file under `.devcontainer/`, `examples/`, a test fixture
         // directory or vendored code describes a development or sample
         // environment, not this repository's deployment.
@@ -2393,5 +2475,69 @@ mod git_tree_detection_tests {
         ] {
             assert!(names.contains(&expected), "{expected} missing from {names:?}");
         }
+    }
+
+    #[test]
+    fn php_source_anywhere_under_a_static_root_is_never_published_as_files() {
+        // `api/index.php` sits inside the static root, so it is not a root of
+        // its own; a static deployment of "." would serve its source.
+        for (paths, root) in [
+            (&["index.html", "api/index.php"][..], "."),
+            (&["site/index.html", "site/lib/view.phtml"][..], "site"),
+            // Paths detection skips are still published by a static deploy.
+            (&["index.html", "vendor/acme/Mailer.PHP"][..], "."),
+            (&["index.html", "a/b/c/d/e/f/deep.php"][..], "."),
+        ] {
+            let candidates = detect_project_candidates(&archive(paths));
+            assert!(
+                candidates
+                    .iter()
+                    .all(|candidate| candidate.preset != PresetType::Static),
+                "{paths:?}: {candidates:?}"
+            );
+            assert_eq!(candidates[0].path, root, "{paths:?}");
+            assert_eq!(candidates[0].catalog_slug(), "nixpacks-php", "{paths:?}");
+        }
+        // HTML with no PHP anywhere stays a static site, and PHP that lives
+        // outside the static root does not change it.
+        let site = detect_project_candidates(&archive(&["site/index.html", "tools/gen.php"]));
+        assert_eq!(site[0].path, "site");
+        assert_eq!(site[0].preset, PresetType::Static);
+    }
+
+    #[test]
+    fn git_detection_never_offers_static_for_a_tree_with_php_source() {
+        let files: Vec<String> = ["index.html", "api/index.php"]
+            .iter()
+            .map(|path| path.to_string())
+            .collect();
+        let root: Vec<String> = detect_presets_from_file_tree(&files)
+            .into_iter()
+            .filter(|preset| preset.path == "./")
+            .map(|preset| preset.slug)
+            .collect();
+        assert_eq!(root, vec!["nixpacks-php"]);
+        let static_only: Vec<String> = vec!["index.html".to_string(), "about.html".to_string()];
+        assert_eq!(
+            detect_presets_from_file_tree(&static_only)[0].slug,
+            "nixpacks-static"
+        );
+    }
+
+    #[test]
+    fn a_php_app_at_the_depth_cap_is_found_through_its_public_directory() {
+        let candidates = detect_project_candidates(&archive(&["a/b/c/app/public/index.php"]));
+        assert_eq!(candidates.len(), 1, "{candidates:?}");
+        assert_eq!(candidates[0].path, "a/b/c/app");
+        assert_eq!(candidates[0].catalog_slug(), "nixpacks-php");
+        // One level deeper is past the cap, like every other project.
+        assert!(detect_project_candidates(&archive(&["a/b/c/d/app/public/index.php"])).is_empty());
+        // The document root is indexed, never promoted to a root itself.
+        let deep_public = archive(&["a/b/c/app/public/index.php", "a/b/c/app/public/package.json"]);
+        assert!(detect_project_candidates(&deep_public)
+            .iter()
+            .all(|candidate| candidate.path == "a/b/c/app"));
+        // Dependency folders stay excluded even with a public/ document root.
+        assert!(detect_project_candidates(&archive(&["vendor/pkg/public/index.php"])).is_empty());
     }
 }

@@ -4780,6 +4780,22 @@ mod tests {
     }
 
     #[test]
+    fn drop_never_offers_a_static_deploy_that_would_publish_php_source() {
+        let zip = drop_test_zip(&[
+            ("index.html", "<!doctype html>"),
+            ("api/index.php", "<?php echo getenv('DB_PASSWORD');"),
+        ]);
+        let manifests = inspect_zip_manifests(zip.path()).unwrap();
+        let candidates = drop_inspection_candidates(&manifests);
+        assert!(
+            candidates.iter().all(|candidate| !candidate.is_static),
+            "{candidates:?}"
+        );
+        assert_eq!(candidates[0].directory, ".");
+        assert_eq!(candidates[0].preset, "nixpacks-php");
+    }
+
+    #[test]
     fn drop_without_a_project_says_what_to_add() {
         let zip = drop_test_zip(&[("notes.txt", "hello"), ("lib/util.ts", "export {}")]);
         let manifests = inspect_zip_manifests(zip.path()).unwrap();
