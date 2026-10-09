@@ -95,6 +95,10 @@ pub fn is_container_runtime_unavailable(error: &str) -> bool {
         "docker client is unavailable",
         "could not find docker environment",
         "docker socket",
+        // testcontainers when no daemon socket exists at the default path,
+        // e.g. Colima/Rancher Desktop without DOCKER_HOST set.
+        "failed to initialize a docker client",
+        "socket not found",
     ]
     .iter()
     .any(|marker| message.contains(marker))
@@ -1104,6 +1108,9 @@ mod tests {
         ));
         assert!(is_container_runtime_unavailable(
             "Docker daemon is unavailable: connection refused"
+        ));
+        assert!(is_container_runtime_unavailable(
+            "failed to initialize a docker client: Socket not found: /var/run/docker.sock"
         ));
         assert!(!is_container_runtime_unavailable(
             "Failed to run migrations: column does not exist"
