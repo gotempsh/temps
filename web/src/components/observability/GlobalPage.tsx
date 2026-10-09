@@ -87,6 +87,7 @@ export function GlobalPage({
   refresh,
   searchLabel,
   filters,
+  filterNotice,
   projectScopeDisabled,
   children,
 }: {
@@ -97,6 +98,8 @@ export function GlobalPage({
   refresh: () => void
   searchLabel: string
   filters?: ReactNode
+  /** Explains a filter's effect (cost, completeness) under the filter row. */
+  filterNotice?: ReactNode
   projectScopeDisabled?: boolean
   children: ReactNode
 }) {
@@ -166,6 +169,7 @@ export function GlobalPage({
           />
         </div>
       </div>
+      {filterNotice}
       {children}
     </PageContainer>
   )
