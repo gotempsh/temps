@@ -215,6 +215,8 @@ export interface PlatformSettings extends AppSettingsResponse {
   disk_space_alert: DiskSpaceAlertSettings
   ai_config: AiConfigSettings
   insecure_tls: boolean
+  /** Private networks user-configured outbound requests may reach. */
+  trusted_private_networks: string[]
   build_limits: BuildLimitsSettings
   /** Enabled, running services included in the metrics scrape cycle. */
   monitored_services_count: number | null
@@ -318,6 +320,9 @@ export function buildPlatformSettingsUpdateBody(
     security_headers: updated.security_headers,
     rate_limiting: updated.rate_limiting,
     trust_loopback_forwarded_ip: updated.trust_loopback_forwarded_ip,
+    // Edited on the Security page; the server also preserves an omitted
+    // value, but the page's own save must carry it to take effect.
+    trusted_private_networks: updated.trusted_private_networks,
     // The settings endpoint replaces the full AppSettings document. Omitting
     // this field makes serde restore DockerRegistrySettings::default(), so a
     // successful save immediately clears the registry configuration.

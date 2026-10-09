@@ -14,6 +14,17 @@ describe('buildPlatformSettingsUpdateBody', () => {
     expect(body.trust_loopback_forwarded_ip).toBe(true)
   })
 
+  test('sends the trusted private networks the Security page edits', () => {
+    const body = buildPlatformSettingsUpdateBody({
+      trusted_private_networks: ['10.0.0.0/8', 'fd12:3456::/48'],
+    } as PlatformSettings)
+
+    expect(body.trusted_private_networks).toEqual([
+      '10.0.0.0/8',
+      'fd12:3456::/48',
+    ])
+  })
+
   test('includes Docker registry configuration in the settings request', () => {
     const dockerRegistry = {
       enabled: true,

@@ -3868,6 +3868,14 @@
               "boolean",
               "null"
             ]
+          },
+          "trusted_private_networks": {
+            "default": [],
+            "description": "Private networks (CIDRs or single addresses) that user-configured\noutbound requests may reach: webhooks, notification channels, uptime\nchecks, AI gateway providers, self-hosted git, importers. Empty by\ndefault, which keeps the SSRF guard blocking every private, loopback\nand CGNAT destination. Only private ranges are accepted, and cloud\nmetadata endpoints stay blocked regardless. Published process-wide via\n`url_validation::set_trusted_private_networks`.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           }
         },
         "type": "object"
@@ -4058,6 +4066,13 @@
           "trust_loopback_forwarded_ip": {
             "description": "Database-backed opt-in; this is the sole control surface for every\nproxy process, including a standalone `temps proxy`.",
             "type": "boolean"
+          },
+          "trusted_private_networks": {
+            "description": "Private networks (normalized CIDRs) that user-configured outbound\nrequests may reach despite the SSRF guard. Empty means none.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -4087,6 +4102,7 @@
           "effective_metrics_store",
           "effective_observability_store",
           "insecure_tls",
+          "trusted_private_networks",
           "setup_complete",
           "require_mfa_for_admins",
           "on_demand_tls",

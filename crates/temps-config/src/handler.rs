@@ -26,7 +26,7 @@ use temps_core::{
     RequestMetadata, RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings,
     MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR, MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use utoipa::{OpenApi, ToSchema};
 
 pub struct SettingsState {
@@ -185,6 +185,39 @@ struct ForwardedIpTrustUpdatedAudit {
 impl AuditOperation for ForwardedIpTrustUpdatedAudit {
     fn operation_type(&self) -> String {
         "FORWARDED_IP_TRUST_UPDATED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+/// `TRUSTED_PRIVATE_NETWORKS_UPDATED` — the private networks user-configured
+/// outbound requests may reach changed.
+///
+/// A separate event from `SETTINGS_UPDATED` because this list widens the SSRF
+/// guard: every project member who can create a webhook, uptime check, or AI
+/// provider can reach addresses inside it. Both sides are recorded so the
+/// audit trail answers "who opened this network, and when".
+#[derive(Debug, Clone, serde::Serialize)]
+struct TrustedPrivateNetworksUpdatedAudit {
+    context: AuditContext,
+    previous_networks: Vec<String>,
+    new_networks: Vec<String>,
+}
+
+impl AuditOperation for TrustedPrivateNetworksUpdatedAudit {
+    fn operation_type(&self) -> String {
+        "TRUSTED_PRIVATE_NETWORKS_UPDATED".to_string()
     }
     fn user_id(&self) -> Option<i32> {
         Some(self.context.user_id)
@@ -397,6 +430,10 @@ pub struct AppSettingsResponse {
 
     // Outbound TLS verification toggle
     pub insecure_tls: bool,
+
+    /// Private networks (normalized CIDRs) that user-configured outbound
+    /// requests may reach despite the SSRF guard. Empty means none.
+    pub trusted_private_networks: Vec<String>,
 
     /// Whether `temps setup` has been run at least once. The web onboarding
     /// wizard checks this field on load and skips itself when true.
@@ -811,6 +848,7 @@ impl From<AppSettings> for AppSettingsResponse {
             observability_retention: settings.observability_retention,
             geo: GeoSettingsMasked::from(settings.geo),
             insecure_tls: settings.insecure_tls,
+            trusted_private_networks: settings.trusted_private_networks,
             setup_complete: settings.setup_complete,
             require_mfa_for_admins: settings.require_mfa_for_admins,
             on_demand_tls: settings.on_demand_tls,
@@ -2679,6 +2717,49 @@ fn validate_container_log_budgets(logs: &temps_core::ContainerLogSettings) -> Re
     Ok(())
 }
 
+/// Upper bound on trusted private network entries. A handful of CIDRs covers
+/// any real LAN/overlay layout; the cap keeps the per-request check trivial.
+const MAX_TRUSTED_PRIVATE_NETWORKS: usize = 64;
+
+/// Validate the trusted private networks and rewrite them to their canonical
+/// CIDR form (`10.1.2.3/16` becomes `10.1.0.0/16`, a bare address gets `/32`
+/// or `/128`), dropping blanks and duplicates so the stored list and the
+/// audit record show exactly what is enforced.
+fn normalize_trusted_private_networks(networks: &mut Vec<String>) -> Result<(), Problem> {
+    let parsed =
+        temps_core::url_validation::parse_trusted_private_networks(networks).map_err(|error| {
+            ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .title("Invalid Trusted Private Network")
+                .detail(format!(
+                    "trusted_private_networks: {error}. Nothing was saved."
+                ))
+                .build()
+        })?;
+
+    let mut normalized: Vec<String> = Vec::with_capacity(parsed.len());
+    for network in parsed {
+        let canonical = network.to_string();
+        if !normalized.contains(&canonical) {
+            normalized.push(canonical);
+        }
+    }
+
+    if normalized.len() > MAX_TRUSTED_PRIVATE_NETWORKS {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Too Many Trusted Private Networks")
+            .detail(format!(
+                "trusted_private_networks has {} entries; at most {} are allowed. Use \
+                 broader CIDRs (for example 10.0.0.0/8) instead of individual hosts.",
+                normalized.len(),
+                MAX_TRUSTED_PRIVATE_NETWORKS
+            ))
+            .build());
+    }
+
+    *networks = normalized;
+    Ok(())
+}
+
 fn validate_geo_settings(geo: &temps_core::GeoSettings) -> Result<(), Problem> {
     if let Some(hours) = geo.refresh_interval_hours {
         if !(temps_core::MIN_GEO_REFRESH_INTERVAL_HOURS
@@ -2877,6 +2958,7 @@ async fn update_settings(
     authorize_bulk_activation_guard_change(&auth, previous_bulk_guards, next_bulk_guards)?;
 
     let previous_trust_loopback_forwarded_ip = stored_settings.trust_loopback_forwarded_ip();
+    let previous_trusted_private_networks = stored_settings.trusted_private_networks.clone();
 
     // Whether this request asked to store, rotate, or clear the MaxMind
     // license key. Set inside the preservation block below (where the
@@ -2985,6 +3067,7 @@ async fn update_settings(
     validate_observability_retention(&settings.observability_retention)?;
     validate_container_log_budgets(&settings.container_logs)?;
     validate_geo_settings(&settings.geo)?;
+    normalize_trusted_private_networks(&mut settings.trusted_private_networks)?;
 
     settings.external_url = sanitize_optional_url("External", settings.external_url)?;
     settings.internal_url = sanitize_optional_url("Internal", settings.internal_url)?;
@@ -3038,6 +3121,7 @@ async fn update_settings(
     normalize_edge_target(&mut settings);
 
     let next_trust_loopback_forwarded_ip = settings.trust_loopback_forwarded_ip();
+    let next_trusted_private_networks = settings.trusted_private_networks.clone();
 
     match app_state
         .config_service
@@ -3143,6 +3227,33 @@ async fn update_settings(
                 {
                     error!(
                         "Failed to create the loopback forwarded-IP trust audit log: {}",
+                        e
+                    );
+                }
+            }
+
+            if next_trusted_private_networks != previous_trusted_private_networks {
+                warn!(
+                    previous_networks = ?previous_trusted_private_networks,
+                    new_networks = ?next_trusted_private_networks,
+                    "Trusted private networks for outbound requests changed"
+                );
+                let trusted_networks_audit = TrustedPrivateNetworksUpdatedAudit {
+                    context: AuditContext {
+                        user_id: auth.user_id(),
+                        ip_address: Some(metadata.ip_address.clone()),
+                        user_agent: metadata.user_agent.clone(),
+                    },
+                    previous_networks: previous_trusted_private_networks,
+                    new_networks: next_trusted_private_networks,
+                };
+                if let Err(e) = app_state
+                    .audit_service
+                    .create_audit_log(&trusted_networks_audit)
+                    .await
+                {
+                    error!(
+                        "Failed to create the trusted private networks audit log: {}",
                         e
                     );
                 }
@@ -4758,6 +4869,60 @@ mod tests {
                 Some("monitoring.retention_daily_years must be between 1 and 10")
             );
         }
+    }
+
+    #[test]
+    fn trusted_private_networks_are_normalized_and_deduplicated() {
+        let mut networks = vec![
+            " 10.1.2.3/8 ".to_string(),
+            "10.0.0.0/8".to_string(),
+            "192.168.1.20".to_string(),
+            "".to_string(),
+            "fd12:3456::1/48".to_string(),
+        ];
+        normalize_trusted_private_networks(&mut networks).expect("valid networks");
+        assert_eq!(
+            networks,
+            vec!["10.0.0.0/8", "192.168.1.20/32", "fd12:3456::/48"]
+        );
+    }
+
+    #[test]
+    fn trusted_private_networks_reject_public_or_metadata_ranges() {
+        for entry in [
+            "0.0.0.0/0",
+            "8.8.8.8",
+            "169.254.169.254",
+            "fe80::/10",
+            "nope",
+        ] {
+            let mut networks = vec![entry.to_string()];
+            let error = normalize_trusted_private_networks(&mut networks)
+                .expect_err("non-private entries must be refused");
+            assert_eq!(error.status_code, StatusCode::BAD_REQUEST, "{entry}");
+            let detail = error
+                .body
+                .get("detail")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            assert!(detail.contains(entry), "{entry}: {detail}");
+            assert_eq!(
+                networks,
+                vec![entry.to_string()],
+                "nothing is rewritten on error"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_private_networks_are_capped() {
+        let mut networks: Vec<String> = (0..=MAX_TRUSTED_PRIVATE_NETWORKS)
+            .map(|index| format!("10.0.{}.{}", index / 256, index % 256))
+            .collect();
+        let error = normalize_trusted_private_networks(&mut networks)
+            .expect_err("more than the cap must be refused");
+        assert_eq!(error.status_code, StatusCode::BAD_REQUEST);
     }
 
     // Regression: the GET /api/settings response must surface agent_sandbox,

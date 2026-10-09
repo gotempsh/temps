@@ -827,6 +827,33 @@ pub struct ConfigService {
     listener_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
+/// Publish the settings that sync call sites read from process-wide caches
+/// (TLS verification and the outbound SSRF trust list), so they never await
+/// a DB lookup. Always called under the settings-cache generation guard.
+fn publish_process_wide_settings(settings: &AppSettings) {
+    temps_core::tls::set_insecure_tls(settings.insecure_tls);
+    temps_core::url_validation::set_trusted_private_networks(trusted_networks_from_settings(
+        settings,
+    ));
+}
+
+/// Entries are validated on save; one that fails here was written around the
+/// API (a hand-edited row). Skip it rather than trusting it, and say so.
+fn trusted_networks_from_settings(
+    settings: &AppSettings,
+) -> Vec<temps_core::url_validation::IpNet> {
+    let mut networks = Vec::with_capacity(settings.trusted_private_networks.len());
+    for entry in &settings.trusted_private_networks {
+        match temps_core::url_validation::parse_trusted_private_network(entry) {
+            Ok(network) => networks.push(network),
+            Err(error) => {
+                warn!(%error, "Ignoring invalid trusted private network from AppSettings")
+            }
+        }
+    }
+    networks
+}
+
 impl ConfigService {
     pub fn new(config: Arc<ServerConfig>, db: Arc<DbConnection>) -> Self {
         Self {
@@ -1236,7 +1263,7 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         // guard as the settings snapshot. A DB read started before an
         // invalidation must not be able to restore stale TLS behavior after
         // the newer settings have become authoritative.
-        temps_core::tls::set_insecure_tls(settings.insecure_tls);
+        publish_process_wide_settings(&settings);
         cache.snapshot = Some((settings, std::time::Instant::now()));
         true
     }
@@ -1251,7 +1278,7 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             return false;
         }
         cache.generation = cache.generation.wrapping_add(1);
-        temps_core::tls::set_insecure_tls(settings.insecure_tls);
+        publish_process_wide_settings(&settings);
         cache.snapshot = Some((settings, std::time::Instant::now()));
         true
     }
@@ -1533,15 +1560,17 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             cache.generation = cache.generation.wrapping_add(1);
             cache.snapshot = None;
             // Fail closed until the authoritative row has been reloaded. This
-            // is important when the invalidated value had insecure TLS enabled.
+            // is important when the invalidated value had insecure TLS enabled
+            // or trusted private networks the operator has since removed.
             temps_core::tls::set_insecure_tls(false);
+            temps_core::url_validation::set_trusted_private_networks(Vec::new());
         }
 
         // Reload immediately so cross-process settings changes (including an
         // intentional insecure-TLS opt-in) become effective when the NOTIFY is
         // processed, rather than waiting for an unrelated future caller.
         if let Err(error) = self.get_settings().await {
-            warn!(%error, "Failed to reload AppSettings after cache invalidation; strict TLS remains enabled");
+            warn!(%error, "Failed to reload AppSettings after cache invalidation; strict TLS and the default SSRF policy remain in effect");
         }
         debug!("Invalidated AppSettings cache (settings_change NOTIFY)");
     }
@@ -4796,6 +4825,24 @@ mod tests {
             svc.get_settings().await.unwrap().preview_domain,
             "v2",
             "invalidate_settings_cache must force a fresh DB read, not serve the cached v1"
+        );
+    }
+
+    #[test]
+    fn published_trusted_networks_skip_invalid_entries() {
+        let settings = AppSettings {
+            trusted_private_networks: vec!["10.0.0.0/8".to_string(), "8.8.8.0/24".to_string()],
+            ..AppSettings::default()
+        };
+        let published: Vec<String> = trusted_networks_from_settings(&settings)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+
+        assert_eq!(
+            published,
+            vec!["10.0.0.0/8"],
+            "a hand-edited public range must never be trusted"
         );
     }
 
