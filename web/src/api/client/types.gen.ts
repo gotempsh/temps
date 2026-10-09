@@ -10488,6 +10488,7 @@ export type ExternalServiceInfo = {
      * Node ID where the service runs. Null means control plane (local).
      */
     node_id?: number | null;
+    readiness?: ServiceReadiness | null;
     service_type: ServiceTypeRoute;
     status: string;
     /**
@@ -13142,6 +13143,31 @@ export type InitAuthResponse = {
     auth_url: string;
     session_token: string;
 };
+
+/**
+ * A failed initialization, as shown to the operator.
+ */
+export type InitializationFailure = {
+    kind: InitializationFailureKind;
+    /**
+     * Container log lines that explain the failure, oldest first. Secrets
+     * are redacted. Empty when the logs could not be read.
+     */
+    log_excerpt: Array<string>;
+    /**
+     * Suggested next steps, most useful first.
+     */
+    next_actions: Array<ReadinessNextAction>;
+    /**
+     * What happened, including the last probe's typed reason.
+     */
+    reason: string;
+};
+
+/**
+ * Why the gate gave up.
+ */
+export type InitializationFailureKind = 'store_init_failed' | 'restart_loop' | 'timeout';
 
 /**
  * An anomaly insight.
@@ -19515,6 +19541,17 @@ export type ReadRowsQuery = {
     sort_order?: string | null;
 };
 
+/**
+ * What the operator can do about a failed initialization. Temps never
+ * does any of these on its own.
+ */
+export type ReadinessNextAction = 'view_logs' | 'retry' | 'try_another_image' | 'recreate_with_fresh_volumes';
+
+/**
+ * Where the gate is for a service.
+ */
+export type ReadinessPhase = 'starting' | 'failed';
+
 export type ReassignCustomDomainRequest = {
     target_environment_id: number;
     target_project_id: number;
@@ -22412,6 +22449,31 @@ export type ServicePublicUrl = {
      */
     service: string;
     url: string;
+};
+
+/**
+ * Startup readiness of a service that is `starting` or failed to start.
+ */
+export type ServiceReadiness = {
+    /**
+     * How long the gate waits before reporting failure.
+     */
+    deadline_secs: number;
+    failure?: InitializationFailure | null;
+    phase: ReadinessPhase;
+    /**
+     * Latest reason the service is not usable yet, from the engine's
+     * authenticated probe. Null before the first probe.
+     */
+    reason?: string | null;
+    /**
+     * Container restarts since the gate started.
+     */
+    restart_count: number;
+    /**
+     * When the gate started waiting (ISO 8601, UTC).
+     */
+    started_at: string;
 };
 
 /**
