@@ -4850,7 +4850,7 @@ mod tests {
                 ),
                 db.clone(),
             )),
-            screenshot_service,
+            screenshot_service.clone(),
             Arc::new(temps_core::DockerHandle::available(Arc::new(
                 bollard::Docker::connect_with_local_defaults().expect("docker"),
             ))),
@@ -4893,11 +4893,19 @@ mod tests {
             ),
         );
 
+        let external_deployment_manager =
+            Arc::new(crate::services::ExternalDeploymentManager::new());
         Arc::new(AppState {
             deployment_service,
             log_service,
             cron_service,
-            external_deployment_manager: Arc::new(crate::services::ExternalDeploymentManager::new()),
+            external_deployment_manager: external_deployment_manager.clone(),
+            screenshot_operations: Arc::new(crate::services::ScreenshotOperationService::new(
+                db.clone(),
+                screenshot_service,
+                config_service.clone(),
+                external_deployment_manager,
+            )),
             remote_deployment_service,
             db: db.clone(),
             workflow_planner,

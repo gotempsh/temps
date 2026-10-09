@@ -16,14 +16,14 @@ use axum::{
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
-use temps_core::problemdetails::{self, Problem};
+use temps_core::problemdetails::{self, Problem, ProblemDetails};
 use temps_core::{AuditContext, RequestMetadata, UtcDateTime};
 use tracing::{debug, error, info};
 use utoipa::OpenApi;
 
 use crate::services::{
-    DeploymentOperation, ExternalImage, OperationResult, PushImageRequest,
-    PushedExternalImageResponse,
+    DeploymentOperation, ExternalImage, OperationResult, OperationStatus, PushImageRequest,
+    PushedExternalImageResponse, ScreenshotOperationError, SCREENSHOT_SETTINGS_PATH,
 };
 
 #[derive(OpenApi)]
@@ -41,7 +41,8 @@ use crate::services::{
         PushedExternalImageResponse,
         ExecuteOperationRequest,
         OperationResultResponse,
-        OperationResultsResponse
+        OperationResultsResponse,
+        OperationStatus
     )),
     info(
         title = "External Images API",
@@ -61,6 +62,11 @@ pub struct ExecuteOperationRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct OperationResultResponse {
     pub operation: String,
+    /// `pending` while background work (a screenshot capture) runs, then
+    /// `completed` or `failed`. Poll
+    /// `GET …/operations/{operation_type}` for the outcome.
+    pub status: OperationStatus,
+    /// `true` only when `status` is `completed`.
     pub success: bool,
     pub message: String,
     pub data: Option<serde_json::Value>,
@@ -72,6 +78,7 @@ impl From<OperationResult> for OperationResultResponse {
     fn from(result: OperationResult) -> Self {
         Self {
             operation: result.operation.to_string(),
+            status: result.status,
             success: result.success,
             message: result.message,
             data: result.data,
@@ -247,12 +254,14 @@ pub async fn get_external_image(
     path = "/projects/{project_id}/deployments/{deployment_id}/operations",
     request_body = ExecuteOperationRequest,
     responses(
-        (status = 202, description = "Operation executed", body = OperationResultResponse),
-        (status = 400, description = "Invalid operation"),
+        (status = 202, description = "Operation accepted. `take_screenshot` returns `status: pending`; poll the operation status for `completed` (with `screenshot_location`) or `failed` (with the reason)", body = OperationResultResponse),
+        (status = 400, description = "Invalid operation or deployment ID", body = ProblemDetails),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
-        (status = 404, description = "Deployment not found"),
-        (status = 500, description = "Internal server error")
+        (status = 404, description = "Deployment not found in this project", body = ProblemDetails),
+        (status = 409, description = "Screenshots are disabled (see `setup_path`), or a capture of this deployment is already running", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails),
+        (status = 503, description = "The screenshot provider is unavailable; `detail` gives the reason and `setup_path` where to change it", body = ProblemDetails)
     ),
     security(("bearer_auth" = []))
 )]
@@ -284,29 +293,25 @@ pub async fn execute_deployment_operation(
         }
     };
 
-    // Execute the operation
-    let result = OperationResult {
-        operation,
-        success: true,
-        message: "Operation executed successfully".to_string(),
-        data: Some(serde_json::json!({
-            "deployment_id": deployment_id,
-            "project_id": project_id,
-            "timestamp": Utc::now()
-        })),
-        executed_at: Utc::now(),
+    let result = if operation == DeploymentOperation::TakeScreenshot {
+        let deployment_number: i32 = deployment_id.parse().map_err(|_| {
+            problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid Deployment ID")
+                .with_detail(format!(
+                    "Deployment ID '{}' in project {} is not a number",
+                    deployment_id, project_id
+                ))
+        })?;
+        // Starts the capture in the background; the response is `pending`.
+        state
+            .screenshot_operations
+            .start(project_id, deployment_number)
+            .await?
+    } else {
+        let result = legacy_operation_record(operation, project_id, &deployment_id);
+        record_legacy_operation(&state, &deployment_id, &result)?;
+        result
     };
-
-    // Record the operation
-    if let Err(err) = state
-        .external_deployment_manager
-        .record_operation(&deployment_id, result.clone())
-    {
-        error!("Failed to record operation: {}", err);
-        return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-            .with_title("Operation Failed")
-            .with_detail(&err));
-    }
 
     let audit = DeploymentOperationAudit {
         context: AuditContext {
@@ -331,6 +336,78 @@ pub async fn execute_deployment_operation(
         StatusCode::ACCEPTED,
         Json(OperationResultResponse::from(result)),
     ))
+}
+
+/// `deploy` and `mark_complete` only record that they were requested; they
+/// perform no work through this endpoint.
+fn legacy_operation_record(
+    operation: DeploymentOperation,
+    project_id: i32,
+    deployment_id: &str,
+) -> OperationResult {
+    OperationResult {
+        operation,
+        status: OperationStatus::Completed,
+        success: true,
+        message: "Operation executed successfully".to_string(),
+        data: Some(serde_json::json!({
+            "deployment_id": deployment_id,
+            "project_id": project_id,
+            "timestamp": Utc::now()
+        })),
+        executed_at: Utc::now(),
+    }
+}
+
+fn record_legacy_operation(
+    state: &AppState,
+    deployment_id: &str,
+    result: &OperationResult,
+) -> Result<(), Problem> {
+    state
+        .external_deployment_manager
+        .record_operation(deployment_id, result.clone())
+        .map_err(|err| {
+            error!(
+                "Failed to record operation {} for deployment {}: {}",
+                result.operation, deployment_id, err
+            );
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Operation Failed")
+                .with_detail(&err)
+        })
+}
+
+impl From<ScreenshotOperationError> for Problem {
+    fn from(error: ScreenshotOperationError) -> Self {
+        match error {
+            ScreenshotOperationError::DeploymentNotFound { .. } => {
+                problemdetails::new(StatusCode::NOT_FOUND)
+                    .with_title("Deployment Not Found")
+                    .with_detail(error.to_string())
+            }
+            ScreenshotOperationError::Disabled { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Screenshots Disabled")
+                .with_detail(error.to_string())
+                .with_value("setup_path", SCREENSHOT_SETTINGS_PATH),
+            ScreenshotOperationError::ProviderUnavailable { .. } => {
+                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .with_title("Screenshot Provider Unavailable")
+                    .with_detail(error.to_string())
+                    .with_value("setup_path", SCREENSHOT_SETTINGS_PATH)
+            }
+            ScreenshotOperationError::AlreadyRunning { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Screenshot Already In Progress")
+                    .with_detail(error.to_string())
+            }
+            ScreenshotOperationError::Record { .. } | ScreenshotOperationError::Database { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Screenshot Operation Failed")
+                    .with_detail(error.to_string())
+            }
+        }
+    }
 }
 
 /// Get all operations for a deployment

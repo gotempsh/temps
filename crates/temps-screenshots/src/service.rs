@@ -203,6 +203,12 @@ impl ScreenshotService {
 
         // Capture screenshot
         let image_data = self.provider.capture_screenshot(url).await?;
+        // Never store (and let a caller report) something that is not an image:
+        // a provider can answer with an empty body or an HTML error page.
+        validate_image_bytes(&image_data).map_err(|reason| ScreenshotError::InvalidImage {
+            url: url.to_string(),
+            reason,
+        })?;
 
         if let Some(store) = &self.durable_store {
             store
@@ -290,5 +296,86 @@ impl ScreenshotService {
     /// Check whether the provider is available, returning the reason if it is not
     pub async fn check_provider_availability(&self) -> ScreenshotResult<()> {
         self.provider.check_availability().await
+    }
+}
+
+/// Smallest byte count accepted as a real screenshot. A valid 1x1 PNG is
+/// ~67 bytes; anything shorter is a truncated or placeholder response.
+const MIN_IMAGE_BYTES: usize = 64;
+
+/// Check that `bytes` is a PNG, JPEG or WebP image rather than an empty body or
+/// an error page, returning the detected format.
+///
+/// Providers report success as soon as they get *some* bytes back; this is the
+/// one place that proves a capture actually produced an image before it is
+/// stored and recorded on a deployment.
+pub fn validate_image_bytes(bytes: &[u8]) -> Result<&'static str, String> {
+    if bytes.is_empty() {
+        return Err("the provider returned no data".to_string());
+    }
+    if bytes.len() < MIN_IMAGE_BYTES {
+        return Err(format!(
+            "the provider returned only {} bytes (expected at least {})",
+            bytes.len(),
+            MIN_IMAGE_BYTES
+        ));
+    }
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return Ok("png");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Ok("jpeg");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Ok("webp");
+    }
+    let preview: String = String::from_utf8_lossy(&bytes[..bytes.len().min(32)])
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    Err(format!(
+        "the provider returned {} bytes that are not a PNG, JPEG or WebP image (starts with \"{}\")",
+        bytes.len(),
+        preview.trim()
+    ))
+}
+
+#[cfg(test)]
+mod image_validation_tests {
+    use super::*;
+
+    fn png(len: usize) -> Vec<u8> {
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        bytes.resize(len, 0);
+        bytes
+    }
+
+    #[test]
+    fn accepts_png_jpeg_and_webp() {
+        assert_eq!(validate_image_bytes(&png(128)), Ok("png"));
+
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0];
+        jpeg.resize(128, 0);
+        assert_eq!(validate_image_bytes(&jpeg), Ok("jpeg"));
+
+        let mut webp = b"RIFF\0\0\0\0WEBPVP8 ".to_vec();
+        webp.resize(128, 0);
+        assert_eq!(validate_image_bytes(&webp), Ok("webp"));
+    }
+
+    #[test]
+    fn rejects_empty_and_truncated_data() {
+        assert!(validate_image_bytes(&[]).unwrap_err().contains("no data"));
+        assert!(validate_image_bytes(&png(16))
+            .unwrap_err()
+            .contains("only 16 bytes"));
+    }
+
+    #[test]
+    fn rejects_html_error_page_and_names_what_came_back() {
+        let html = b"<!DOCTYPE html><html><body>502 Bad Gateway</body></html>".repeat(2);
+        let reason = validate_image_bytes(&html).unwrap_err();
+        assert!(reason.contains("not a PNG, JPEG or WebP image"), "{reason}");
+        assert!(reason.contains("<!DOCTYPE html>"), "{reason}");
     }
 }

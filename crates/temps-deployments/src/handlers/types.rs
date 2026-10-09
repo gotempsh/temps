@@ -18,6 +18,9 @@ pub struct AppState {
     pub log_service: Arc<temps_logs::LogService>,
     pub cron_service: Arc<DatabaseCronConfigService>,
     pub external_deployment_manager: Arc<ExternalDeploymentManager>,
+    /// Starts on-demand screenshot captures (`take_screenshot` operation)
+    /// and records their pending/completed/failed outcome.
+    pub screenshot_operations: Arc<crate::services::ScreenshotOperationService>,
     pub remote_deployment_service: Arc<RemoteDeploymentService>,
     // Services for remote deployments
     pub db: Arc<DatabaseConnection>,

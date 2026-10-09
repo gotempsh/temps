@@ -22,7 +22,7 @@ pub use noop_provider::NoopScreenshotProvider;
 pub use plugin::ScreenshotsPlugin;
 pub use provider::ScreenshotProvider;
 pub use remote_provider::RemoteScreenshotProvider;
-pub use service::ScreenshotService;
+pub use service::{validate_image_bytes, ScreenshotService};
 
 /// Trait for screenshot service operations (used for dependency injection and testing)
 #[async_trait::async_trait]

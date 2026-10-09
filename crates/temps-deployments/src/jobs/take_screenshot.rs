@@ -7,7 +7,6 @@
 
 use async_trait::async_trait;
 use sea_orm::{ActiveModelTrait, EntityTrait, Set};
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_config::ConfigService;
 use temps_core::{JobResult, UtcDateTime, WorkflowContext, WorkflowError, WorkflowTask};
@@ -15,12 +14,6 @@ use temps_database::DbConnection;
 use temps_entities::{deployments, prelude::*};
 use temps_logs::{LogLevel, LogService};
 use temps_screenshots::ScreenshotServiceTrait;
-
-/// Output from TakeScreenshotJob
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScreenshotOutput {
-    pub captured_at: UtcDateTime,
-}
 
 /// Job for capturing screenshots of deployed applications
 pub struct TakeScreenshotJob {
@@ -105,46 +98,112 @@ impl TakeScreenshotJob {
             LogLevel::Info
         }
     }
+}
 
-    /// Capture screenshot using the screenshot service and save to disk
-    async fn capture_screenshot(
-        &self,
-        deployment_url: &str,
-        filename: &str,
-    ) -> Result<ScreenshotOutput, WorkflowError> {
-        self.log(format!("Capturing screenshot of: {}", deployment_url))
-            .await?;
+/// Why capturing a deployment's screenshot failed.
+#[derive(Debug, thiserror::Error)]
+pub enum DeploymentScreenshotError {
+    #[error("Failed to resolve the public URL of deployment {deployment_id}: {reason}")]
+    Url { deployment_id: i32, reason: String },
 
-        // Generate screenshot path with timestamp structure
-        let now = chrono::Utc::now();
+    #[error("Screenshot provider '{provider}' failed to capture deployment {deployment_id} at {url}: {source}")]
+    Capture {
+        deployment_id: i32,
+        provider: &'static str,
+        url: String,
+        #[source]
+        source: temps_screenshots::ScreenshotError,
+    },
 
-        self.log(format!(
-            "Using screenshot service: {}",
-            self.screenshot_service.provider_name()
-        ))
-        .await?;
+    #[error("Screenshot of deployment {deployment_id} did not finish within {timeout_secs}s")]
+    TimedOut {
+        deployment_id: i32,
+        timeout_secs: u64,
+    },
 
-        // Capture and save screenshot using the screenshot service
-        let screenshot_path = self
-            .screenshot_service
-            .capture_and_save(deployment_url, filename)
-            .await
-            .map_err(|e| {
-                WorkflowError::JobExecutionFailed(format!("Failed to capture screenshot: {}", e))
-            })?;
+    #[error("Deployment {deployment_id} no longer exists; its screenshot was not recorded")]
+    DeploymentNotFound { deployment_id: i32 },
 
-        // Log relative path for cleaner output
-        let static_dir = self.config_service.static_dir();
-        let relative_display = screenshot_path
-            .strip_prefix(&static_dir)
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| screenshot_path.display().to_string());
+    #[error("Failed to record screenshot location for deployment {deployment_id}: {source}")]
+    Database {
+        deployment_id: i32,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+}
 
-        self.log(format!("Screenshot saved to: {}", relative_display))
-            .await?;
+/// A screenshot that was captured, validated as an image, stored, and
+/// recorded on the deployment.
+#[derive(Debug, Clone)]
+pub struct CapturedScreenshot {
+    pub url: String,
+    /// Path relative to the static directory, as stored on the deployment.
+    pub screenshot_location: String,
+    pub captured_at: UtcDateTime,
+}
 
-        Ok(ScreenshotOutput { captured_at: now })
-    }
+/// Capture the deployment's public URL, store the image and point
+/// `deployments.screenshot_location` at it.
+///
+/// Returns only after all three happened: the screenshot service rejects
+/// anything that is not an image before storing it, and the location is
+/// written last, so `Ok` means a real image is readable at the recorded path.
+pub async fn capture_deployment_screenshot(
+    deployment_id: i32,
+    screenshot_service: &dyn ScreenshotServiceTrait,
+    config_service: &ConfigService,
+    db: &DbConnection,
+) -> Result<CapturedScreenshot, DeploymentScreenshotError> {
+    let url = config_service
+        .get_deployment_url(deployment_id)
+        .await
+        .map_err(|e| DeploymentScreenshotError::Url {
+            deployment_id,
+            reason: e.to_string(),
+        })?;
+
+    let captured_at = chrono::Utc::now();
+    let screenshot_location = format!(
+        "screenshots/deployment-{}-{}.png",
+        deployment_id,
+        captured_at.format("%Y%m%d-%H%M%S")
+    );
+
+    screenshot_service
+        .capture_and_save(&url, &screenshot_location)
+        .await
+        .map_err(|source| DeploymentScreenshotError::Capture {
+            deployment_id,
+            provider: screenshot_service.provider_name(),
+            url: url.clone(),
+            source,
+        })?;
+
+    let deployment = Deployments::find_by_id(deployment_id)
+        .one(db)
+        .await
+        .map_err(|source| DeploymentScreenshotError::Database {
+            deployment_id,
+            source,
+        })?
+        .ok_or(DeploymentScreenshotError::DeploymentNotFound { deployment_id })?;
+
+    let mut active_deployment: deployments::ActiveModel = deployment.into();
+    active_deployment.screenshot_location = Set(Some(screenshot_location.clone()));
+    active_deployment.updated_at = Set(chrono::Utc::now());
+    active_deployment
+        .update(db)
+        .await
+        .map_err(|source| DeploymentScreenshotError::Database {
+            deployment_id,
+            source,
+        })?;
+
+    Ok(CapturedScreenshot {
+        url,
+        screenshot_location,
+        captured_at,
+    })
 }
 
 #[async_trait]
@@ -180,58 +239,26 @@ impl WorkflowTask for TakeScreenshotJob {
         ))
         .await?;
 
-        // Get deployment URL from config service using deployment_id
-        let deployment_url = self
-            .config_service
-            .get_deployment_url(self.deployment_id)
-            .await
-            .map_err(|e| {
-                WorkflowError::JobExecutionFailed(format!("Failed to get deployment URL: {}", e))
-            })?;
-
-        self.log(format!("Deployment URL: {}", deployment_url))
-            .await?;
-
-        // Generate screenshot filename with timestamp
-        let now = chrono::Utc::now();
-        let filename = format!(
-            "screenshots/deployment-{}-{}.png",
-            self.deployment_id,
-            now.format("%Y%m%d-%H%M%S")
-        );
-
-        // Capture screenshot
-        let screenshot_output = self.capture_screenshot(&deployment_url, &filename).await?;
-
-        self.log(format!("Screenshot captured: {}", filename))
-            .await?;
-
-        // Update deployment with screenshot location (relative path)
-        let deployment = Deployments::find_by_id(self.deployment_id)
-            .one(self.db.as_ref())
-            .await
-            .map_err(|e| WorkflowError::Other(format!("Failed to find deployment: {}", e)))?
-            .ok_or_else(|| {
-                WorkflowError::Other(format!("Deployment {} not found", self.deployment_id))
-            })?;
-
-        let mut active_deployment: deployments::ActiveModel = deployment.into();
-        active_deployment.screenshot_location = Set(Some(filename.clone()));
-        active_deployment.updated_at = Set(chrono::Utc::now());
-
-        active_deployment
-            .update(self.db.as_ref())
-            .await
-            .map_err(|e| {
-                WorkflowError::Other(format!(
-                    "Failed to update deployment screenshot_location: {}",
-                    e
-                ))
-            })?;
-
         self.log(format!(
-            "Updated deployment screenshot_location: {}",
-            filename
+            "Using screenshot service: {}",
+            self.screenshot_service.provider_name()
+        ))
+        .await?;
+
+        let captured = capture_deployment_screenshot(
+            self.deployment_id,
+            self.screenshot_service.as_ref(),
+            self.config_service.as_ref(),
+            self.db.as_ref(),
+        )
+        .await
+        .map_err(|e| WorkflowError::JobExecutionFailed(e.to_string()))?;
+
+        self.log(format!("Deployment URL: {}", captured.url))
+            .await?;
+        self.log(format!(
+            "Screenshot captured: {}",
+            captured.screenshot_location
         ))
         .await?;
 
@@ -239,10 +266,14 @@ impl WorkflowTask for TakeScreenshotJob {
         context.set_output(
             &self.job_id,
             "captured_at",
-            screenshot_output.captured_at.timestamp(),
+            captured.captured_at.timestamp(),
         )?;
         context.set_output(&self.job_id, "deployment_id", self.deployment_id)?;
-        context.set_output(&self.job_id, "screenshot_location", filename)?;
+        context.set_output(
+            &self.job_id,
+            "screenshot_location",
+            captured.screenshot_location,
+        )?;
 
         Ok(JobResult::success(context))
     }

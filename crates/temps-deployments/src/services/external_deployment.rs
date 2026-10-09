@@ -36,10 +36,26 @@ impl std::fmt::Display for DeploymentOperation {
     }
 }
 
+/// Where an operation is in its lifecycle.
+///
+/// An operation that does its work in the background (a screenshot capture)
+/// is recorded as `Pending` when it starts and replaced by a `Completed` or
+/// `Failed` record when it ends, so a caller can poll for the outcome instead
+/// of being told it succeeded before anything ran.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationStatus {
+    Pending,
+    Completed,
+    Failed,
+}
+
 /// Result of an executed operation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperationResult {
     pub operation: DeploymentOperation,
+    pub status: OperationStatus,
+    /// `true` only for a `Completed` operation.
     pub success: bool,
     pub message: String,
     pub data: Option<serde_json::Value>,
@@ -87,6 +103,9 @@ impl From<ExternalImage> for PushedExternalImageResponse {
         }
     }
 }
+
+/// Operation records kept per deployment; older ones are dropped first.
+const MAX_OPERATIONS_PER_DEPLOYMENT: usize = 50;
 
 /// In-memory store for external images and operation results
 /// This keeps external images and operations in memory without database changes
@@ -174,9 +193,49 @@ impl ExternalDeploymentManager {
         let deployment_ops = operations
             .entry(deployment_id.to_string())
             .or_insert_with(Vec::new);
+        if deployment_ops.len() >= MAX_OPERATIONS_PER_DEPLOYMENT {
+            let excess = deployment_ops.len() + 1 - MAX_OPERATIONS_PER_DEPLOYMENT;
+            deployment_ops.drain(0..excess);
+        }
         deployment_ops.push(result);
 
         Ok(())
+    }
+
+    /// Record `pending` for `deployment_id` unless the latest record of the
+    /// same operation is still pending, in which case that record is returned
+    /// and nothing is recorded. Check and insert happen under one write lock,
+    /// so two concurrent requests cannot both start the same background work.
+    pub fn begin_operation(
+        &self,
+        deployment_id: &str,
+        pending: OperationResult,
+    ) -> Result<Result<(), OperationResult>, String> {
+        let mut operations = self.operations.write().map_err(|e| {
+            format!(
+                "Failed to acquire write lock to start {} for deployment {}: {}",
+                pending.operation, deployment_id, e
+            )
+        })?;
+        let deployment_ops = operations
+            .entry(deployment_id.to_string())
+            .or_insert_with(Vec::new);
+        if let Some(running) = deployment_ops
+            .iter()
+            .rev()
+            .find(|op| op.operation == pending.operation)
+            .filter(|op| op.status == OperationStatus::Pending)
+        {
+            return Ok(Err(running.clone()));
+        }
+        // Keep per-deployment history bounded: repeated captures must not grow
+        // this in-memory map without limit.
+        if deployment_ops.len() >= MAX_OPERATIONS_PER_DEPLOYMENT {
+            let excess = deployment_ops.len() + 1 - MAX_OPERATIONS_PER_DEPLOYMENT;
+            deployment_ops.drain(0..excess);
+        }
+        deployment_ops.push(pending);
+        Ok(Ok(()))
     }
 
     /// Get all operations for a deployment
@@ -281,6 +340,7 @@ mod tests {
 
         let result = OperationResult {
             operation: DeploymentOperation::Deploy,
+            status: OperationStatus::Completed,
             success: true,
             message: "Deployment successful".to_string(),
             data: Some(serde_json::json!({"containers": ["app-0", "app-1"]})),
@@ -304,6 +364,7 @@ mod tests {
 
         let failed_result = OperationResult {
             operation: DeploymentOperation::Deploy,
+            status: OperationStatus::Failed,
             success: false,
             message: "Failed to deploy".to_string(),
             data: None,
@@ -318,6 +379,7 @@ mod tests {
 
         let success_result = OperationResult {
             operation: DeploymentOperation::Deploy,
+            status: OperationStatus::Completed,
             success: true,
             message: "Deployment successful".to_string(),
             data: None,
@@ -329,5 +391,63 @@ mod tests {
             .unwrap();
 
         assert!(manager.has_completed_operation(deployment_id, &DeploymentOperation::Deploy));
+    }
+
+    fn screenshot_record(status: OperationStatus) -> OperationResult {
+        OperationResult {
+            operation: DeploymentOperation::TakeScreenshot,
+            status,
+            success: status == OperationStatus::Completed,
+            message: format!("{:?}", status),
+            data: None,
+            executed_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_begin_operation_refuses_while_same_operation_is_pending() {
+        let manager = ExternalDeploymentManager::new();
+
+        assert!(manager
+            .begin_operation("7", screenshot_record(OperationStatus::Pending))
+            .unwrap()
+            .is_ok());
+
+        let running = manager
+            .begin_operation("7", screenshot_record(OperationStatus::Pending))
+            .unwrap()
+            .expect_err("a second capture must not start while one is pending");
+        assert_eq!(running.status, OperationStatus::Pending);
+        assert_eq!(manager.get_operations("7").len(), 1);
+
+        // Once it finishes, a new capture may start.
+        manager
+            .record_operation("7", screenshot_record(OperationStatus::Failed))
+            .unwrap();
+        assert!(manager
+            .begin_operation("7", screenshot_record(OperationStatus::Pending))
+            .unwrap()
+            .is_ok());
+        assert_eq!(
+            manager
+                .get_latest_operation("7", &DeploymentOperation::TakeScreenshot)
+                .unwrap()
+                .status,
+            OperationStatus::Pending
+        );
+    }
+
+    #[test]
+    fn test_operation_history_is_bounded_per_deployment() {
+        let manager = ExternalDeploymentManager::new();
+        for _ in 0..(MAX_OPERATIONS_PER_DEPLOYMENT + 10) {
+            manager
+                .record_operation("7", screenshot_record(OperationStatus::Failed))
+                .unwrap();
+        }
+        assert_eq!(
+            manager.get_operations("7").len(),
+            MAX_OPERATIONS_PER_DEPLOYMENT
+        );
     }
 }

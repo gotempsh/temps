@@ -50,6 +50,9 @@ pub use database_metric_alert_service::*;
 pub mod external_deployment;
 pub use external_deployment::*;
 
+pub mod screenshot_operation;
+pub use screenshot_operation::*;
+
 pub mod docker_cleanup_service;
 pub use docker_cleanup_service::*;
 
