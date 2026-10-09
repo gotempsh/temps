@@ -42,6 +42,7 @@ import {
 } from '@/lib/drop-archive'
 import {
   dropArchiveErrorDetails,
+  dropArchiveErrorReason,
   dropErrorMessage,
   inferredProjectName,
 } from '@/lib/drop-files'
@@ -125,6 +126,9 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
   const [archiveErrorDetails, setArchiveErrorDetails] = useState<string | null>(
     null
   )
+  const [archiveErrorReason, setArchiveErrorReason] = useState<
+    string | undefined
+  >()
   // Files Temps looks for, once inspection found nothing it can build.
   const [detectionGap, setDetectionGap] = useState<string[] | null>(null)
   const [project, setProject] = useState<ProjectResponse | null>(null)
@@ -188,6 +192,7 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
     detectionAbortRef.current = controller
     try {
       setArchiveErrorDetails(null)
+      setArchiveErrorReason(undefined)
       setStage('packing')
       const result = await prepareAndInspectDrop(
         nextFiles,
@@ -206,6 +211,7 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
 
       setPreparedArchive(result.archive)
       setArchiveErrorDetails(null)
+      setArchiveErrorReason(undefined)
       setInspection(result.inspection)
       setSelectedCandidateIndex('0')
       if (!nameWasEdited) {
@@ -216,6 +222,7 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
       if (detectionRunRef.current !== runId) return
       setError(dropErrorMessage(caught))
       setArchiveErrorDetails(dropArchiveErrorDetails(caught))
+      setArchiveErrorReason(dropArchiveErrorReason(caught))
       setDetectionGap(dropDetectionGap(caught))
       setPreparedArchive(null)
       setInspection(null)
@@ -234,6 +241,7 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
     setFiles(nextFiles)
     setError(null)
     setArchiveErrorDetails(null)
+    setArchiveErrorReason(undefined)
     setDetectionGap(null)
     setProject(null)
     setEnvironment(null)
@@ -278,6 +286,7 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
     setStage('idle')
     setError(null)
     setArchiveErrorDetails(null)
+    setArchiveErrorReason(undefined)
     setProject(null)
     setDetectionGap(null)
     setEnvironment(null)
@@ -297,6 +306,7 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
     setProjectName(normalizedProjectName)
     setError(null)
     setArchiveErrorDetails(null)
+    setArchiveErrorReason(undefined)
     try {
       const archive = preparedArchive
       const detected = inspection
@@ -653,7 +663,10 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
                 </div>
 
                 {archiveErrorDetails !== null ? (
-                  <DropInvalidArchive details={archiveErrorDetails} />
+                  <DropInvalidArchive
+                    details={archiveErrorDetails}
+                    reason={archiveErrorReason}
+                  />
                 ) : detectionGap ? (
                   <DropNoProjectFound supportedFiles={detectionGap} />
                 ) : (

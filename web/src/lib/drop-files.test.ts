@@ -2,7 +2,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
-import { dropArchiveErrorDetails, filesFromDrop } from './drop-files'
+import {
+  dropArchiveErrorDetails,
+  dropArchiveErrorReason,
+  filesFromDrop,
+} from './drop-files'
 
 type FakeEntry = {
   isFile: boolean
@@ -179,3 +183,16 @@ describe('archive rejection feedback', () => {
     }
   })
 })
+
+for (const [title, instruction] of [
+  ['Invalid ZIP Entry', 'original project files'],
+  ['Unsafe ZIP Entry', 'inside that folder'],
+  ['Sensitive ZIP Entry', 'Remove environment files'],
+  ['Unsupported ZIP Entry', 'Replace links with the actual project files'],
+]) {
+  test(`${title} requires replacement and explains how to correct its entries`, () => {
+    const error = { title, detail: 'The server rejected a project entry' }
+    expect(dropArchiveErrorDetails(error)).toBe(error.detail)
+    expect(dropArchiveErrorReason(error)).toContain(instruction)
+  })
+}

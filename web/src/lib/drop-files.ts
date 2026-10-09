@@ -185,8 +185,28 @@ export function dropErrorMessage(
 export function dropArchiveErrorDetails(error: unknown): string | null {
   if (!error || typeof error !== 'object') return null
   const problem = error as { title?: unknown; detail?: unknown }
-  if (problem.title !== 'Invalid ZIP Archive') return null
+  if (!dropArchiveErrorReason(error)) return null
   return typeof problem.detail === 'string' && problem.detail.trim()
     ? problem.detail
     : 'Archive validation rejected this file.'
+}
+
+/** Explain the permanent intake rejection without exposing parser jargon. */
+export function dropArchiveErrorReason(error: unknown): string | undefined {
+  if (!error || typeof error !== 'object') return undefined
+  const problem = error as { title?: unknown }
+  switch (problem.title) {
+    case 'Invalid ZIP Archive':
+      return 'The selected file is not a valid or supported ZIP archive.'
+    case 'Invalid ZIP Entry':
+      return 'Some files in this ZIP could not be read. Recreate the archive from the original project files.'
+    case 'Unsafe ZIP Entry':
+      return 'The ZIP includes a file outside the project folder. Keep every archive entry inside that folder.'
+    case 'Sensitive ZIP Entry':
+      return 'Remove environment files, private keys, and credentials from the project archive before uploading it.'
+    case 'Unsupported ZIP Entry':
+      return 'Symbolic links are not supported. Replace links with the actual project files before creating the new ZIP.'
+    default:
+      return undefined
+  }
 }

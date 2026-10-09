@@ -18,3 +18,15 @@ test('explains archive replacement and preserves expandable diagnostics', () => 
   expect(html).toContain('Technical details')
   expect(html).toContain('ZIP end-of-central-directory record not found')
 })
+
+test('shows the entry correction before expandable technical details', () => {
+  const reason =
+    'Symbolic links are not supported. Replace links with actual files.'
+  const html = renderToStaticMarkup(
+    <DropInvalidArchive
+      details="Symbolic link entry is not allowed"
+      reason={reason}
+    />
+  )
+  expect(html.indexOf(reason)).toBeLessThan(html.indexOf('<details>'))
+})
