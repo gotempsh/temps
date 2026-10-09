@@ -20,6 +20,8 @@ import {
   targetNodesToPayload,
 } from '@/lib/environment-placement'
 import { projectHasGitRepo } from '@/lib/project-git'
+import { nodeSchedulingRole, targetNodesHint } from '@/lib/node-role'
+import { NodeRoleBadge } from '@/components/nodes/NodeRoleBadge'
 import {
   BUILD_LOCATION_LABELS,
   buildLocationToPayload,
@@ -813,11 +815,12 @@ export function EnvironmentConfigurationCard({
               </Select>
             </div>
             <p className="text-xs text-muted-foreground">
-              A node labelled <code>temps.sh/role=builder</code> is preferred.
-              When no worker can take a build (none joined, none of the right
-              architecture, multi-architecture builds), it runs on the control
-              plane and the build log says why. Worker builds do not receive
-              build arguments.
+              A node labelled <code>temps.sh/role=builder</code> is preferred. A{' '}
+              <code>temps.sh/role=dedicated</code> node builds only for
+              environments that select it in Target Nodes. When no worker can
+              take a build (none joined, none of the right architecture,
+              multi-architecture builds), it runs on the control plane and the
+              build log says why. Worker builds do not receive build arguments.
             </p>
             {nodesQuery.isSuccess && activeNodes.length === 0 && (
               <p className="text-xs text-muted-foreground">
@@ -884,8 +887,7 @@ export function EnvironmentConfigurationCard({
               <div>
                 <Label className="text-sm font-medium">Target Nodes</Label>
                 <p className="text-xs text-muted-foreground mb-2">
-                  Restrict deployments to specific nodes. Leave empty to use all
-                  active nodes.
+                  {targetNodesHint(activeNodes)}
                 </p>
                 <div className="space-y-2">
                   {activeNodes.map((node) => {
@@ -915,7 +917,17 @@ export function EnvironmentConfigurationCard({
                           <span className="text-xs text-muted-foreground ml-2">
                             {node.private_address}
                           </span>
+                          {nodeSchedulingRole(node.labels) === 'dedicated' && (
+                            <p className="text-xs text-muted-foreground">
+                              Dedicated: only runs environments that select it
+                              here.
+                            </p>
+                          )}
                         </div>
+                        <NodeRoleBadge
+                          labels={node.labels}
+                          className="text-[10px] shrink-0"
+                        />
                         <Badge
                           variant="secondary"
                           className="text-[10px] shrink-0"
@@ -949,7 +961,8 @@ export function EnvironmentConfigurationCard({
                 <Label className="text-sm font-medium">Label Selectors</Label>
                 <p className="text-xs text-muted-foreground mb-2">
                   Only deploy to nodes matching these labels. All keys must
-                  match (AND logic).
+                  match (AND logic). Labels never select a dedicated node; pick
+                  it in Target Nodes instead.
                 </p>
 
                 {/* Existing labels */}

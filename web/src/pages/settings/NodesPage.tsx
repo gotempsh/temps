@@ -16,6 +16,8 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { WorkerNodeRequiredAlert } from '@/components/nodes/WorkerNodeRequiredBanner'
 import { WorkerIngressCard } from '@/components/nodes/WorkerIngressCard'
 import { NodeSandboxesPanel } from '@/components/nodes/NodeSandboxesPanel'
+import { NodeRoleBadge } from '@/components/nodes/NodeRoleBadge'
+import { NODE_ROLE_BADGE, nodeSchedulingRole } from '@/lib/node-role'
 import { NODE_HOSTS_SANDBOXES_TYPE } from '@/components/nodes/node-eviction'
 import { canManageSandboxPlacement } from '@/components/sandboxes/helpers'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
@@ -497,6 +499,17 @@ function JoinTokenSection() {
   )
 }
 
+/** One line under the node detail header saying what its role changes. */
+function NodeRoleDescription({ labels }: { labels: unknown }) {
+  const role = nodeSchedulingRole(labels)
+  if (!role) return null
+  return (
+    <p className="text-xs text-muted-foreground mt-1">
+      {NODE_ROLE_BADGE[role].description}
+    </p>
+  )
+}
+
 // ── Node Table ──
 
 function NodeTable({
@@ -540,12 +553,15 @@ function NodeTable({
                       <span className="font-medium truncate max-w-[200px] block">
                         {node.name}
                       </span>
-                      <Badge
-                        variant="outline"
-                        className="text-[10px] capitalize mt-0.5"
-                      >
-                        {node.role}
-                      </Badge>
+                      <div className="flex flex-wrap items-center gap-1 mt-0.5">
+                        <Badge
+                          variant="outline"
+                          className="text-[10px] capitalize"
+                        >
+                          {node.role}
+                        </Badge>
+                        <NodeRoleBadge labels={node.labels} />
+                      </div>
                     </div>
                   </div>
                 </TableCell>
@@ -1096,11 +1112,13 @@ function NodeDetail({
             <h3 className="text-lg font-semibold truncate">{node.name}</h3>
             <StatusBadge status={node.status} />
             <NodeArchitecture architecture={node.architecture} />
+            <NodeRoleBadge labels={node.labels} />
           </div>
           <p className="text-sm text-muted-foreground mt-0.5">
             {node.private_address} &middot; {node.role} &middot; Last heartbeat{' '}
             {formatRelativeTime(node.last_heartbeat)}
           </p>
+          <NodeRoleDescription labels={node.labels} />
         </div>
         <div className="flex items-center gap-2 shrink-0">
           {canDrain && (
