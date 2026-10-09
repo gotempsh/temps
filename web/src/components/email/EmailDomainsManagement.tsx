@@ -13,6 +13,7 @@ import {
   type EmailProviderResponse,
 } from '@/api/client'
 import { Badge } from '@/components/ui/badge'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
 import { CopyButton } from '@/components/ui/copy-button'
@@ -450,15 +451,17 @@ export function EmailDomainsManagement() {
   const queryClient = useQueryClient()
   const navigate = useNavigate()
 
-  const { data: domains, isLoading: isLoadingDomains } = useQuery({
+  const domainsQuery = useQuery({
     queryKey: ['email-domains'],
     queryFn: listEmailDomains,
   })
 
-  const { data: providers, isLoading: isLoadingProviders } = useQuery({
+  const providersQuery = useQuery({
     queryKey: ['email-providers'],
     queryFn: listEmailProviders,
   })
+  const { data: domains, isLoading: isLoadingDomains } = domainsQuery
+  const { data: providers, isLoading: isLoadingProviders } = providersQuery
 
   const verifyMutation = useMutation({
     mutationFn: verifyEmailDomain,
@@ -535,16 +538,53 @@ export function EmailDomainsManagement() {
   const hasDomains = domains && domains.length > 0
   const hasProviders = providers && providers.length > 0
   const isLoading = isLoadingDomains || isLoadingProviders
+  const loadFailed = domainsQuery.isError || providersQuery.isError
+  const uncachedFailure =
+    (domainsQuery.isError && domains === undefined) ||
+    (providersQuery.isError && providers === undefined)
+  const retrying = domainsQuery.isFetching || providersQuery.isFetching
 
   return (
     <div className="space-y-4">
+      {loadFailed && (
+        <Alert role="alert">
+          <AlertCircle className="size-4" />
+          <AlertTitle>Email data unavailable</AlertTitle>
+          <AlertDescription className="space-y-3">
+            <p>
+              Could not load email providers or domains. Try again.
+              {!uncachedFailure && ' Showing last-known data.'}
+            </p>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={retrying}
+              onClick={() => {
+                void Promise.all([
+                  domainsQuery.refetch(),
+                  providersQuery.refetch(),
+                ])
+              }}
+            >
+              {retrying ? 'Retrying…' : 'Retry email data'}
+            </Button>
+          </AlertDescription>
+        </Alert>
+      )}
       {isLoading ? (
         <LoadingSkeleton />
-      ) : !hasProviders ? (
+      ) : uncachedFailure ? null : !hasProviders ? (
         <EmptyState
+          size="compact"
           icon={Globe}
           title="No email providers configured"
-          description="You need to configure an email provider before adding domains. Go to the Providers tab to add one."
+          description="Add an email provider to verify a domain and start sending email."
+          action={
+            <CreateActionButton
+              to="/email/providers/new"
+              label="Add provider"
+            />
+          }
         />
       ) : !hasDomains ? (
         <EmptyState

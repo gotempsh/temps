@@ -11,6 +11,7 @@ import { PlatformAccessContext } from '@/contexts/PlatformAccessContext-shared'
 import {
   getDomainByIdOptions,
   getDomainOrderOptions,
+  listDnsProvidersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { DomainDetail } from './DomainDetail'
 
@@ -200,3 +201,80 @@ for (const status of ['active', 'active_renewal_failed']) {
     }
   }
 }
+
+function dnsChallengeClient() {
+  const client = createClient()
+  client.setQueryData(domainKey, domain)
+  client.setQueryData(orderKey, {
+    id: 2,
+    domain_id: 1,
+    status: 'pending',
+    identifiers: [],
+    authorizations: {
+      challenge_type: 'dns-01',
+      dns_txt_records: [
+        { name: '_acme-challenge.app.example.test', value: 'challenge-value' },
+      ],
+    },
+    order_url: 'https://acme.example.test/order/2',
+    email: 'operator@example.test',
+    created_at: domain.created_at,
+    updated_at: domain.updated_at,
+  })
+  return client
+}
+const providersKey = listDnsProvidersOptions().queryKey
+
+test('DNS challenge with no provider onboards and preserves the manual steps', () => {
+  const client = dnsChallengeClient()
+  client.setQueryData(providersKey, [])
+  const html = render(client)
+  expect(html).toContain('Auto-provision records')
+  expect(html).toContain('No DNS provider is configured')
+  expect(html).toContain('href="/dns-providers"')
+  expect(html).toContain('Add DNS provider')
+  expect(html).toContain('challenge-value')
+  expect(html).toContain('Verify &amp; finalize')
+  client.clear()
+})
+
+test('DNS provider loading is distinct from missing configuration', () => {
+  const client = dnsChallengeClient()
+  const html = render(client)
+  expect(html).toContain('Loading DNS providers')
+  expect(html).not.toContain('No DNS provider is configured')
+  client.clear()
+})
+
+test('DNS provider failure offers retry instead of implying no configuration', () => {
+  const client = dnsChallengeClient()
+  fail(client, providersKey, new TypeError('Failed to fetch'))
+  const html = render(client)
+  expect(html).toContain('Could not load DNS providers')
+  expect(html).toContain('Retry DNS providers')
+  expect(html).not.toContain('No DNS provider is configured')
+  expect(html).toContain('challenge-value')
+  client.clear()
+})
+
+test('DNS provider refresh failure retains the configured provider and retry', () => {
+  const client = dnsChallengeClient()
+  client.setQueryData(providersKey, [
+    {
+      id: 1,
+      name: 'Configured DNS',
+      provider_type: 'cloudflare',
+      credentials: {},
+      flat_hostnames_supported: true,
+      is_active: true,
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
+    },
+  ])
+  fail(client, providersKey, new TypeError('Failed to fetch'))
+  const html = render(client)
+  expect(html).toContain('Auto-create')
+  expect(html).toContain('Retry DNS providers')
+  expect(html).not.toContain('No DNS provider is configured')
+  client.clear()
+})
