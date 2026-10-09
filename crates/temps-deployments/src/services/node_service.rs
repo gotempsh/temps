@@ -84,6 +84,17 @@ pub enum NodeError {
     },
 
     #[error(
+        "No eligible node for this deployment: {excluded}. A dedicated node only runs \
+         environments that list its ID in target_nodes — pin the environment to it, or join a \
+         node without the temps.sh/role=dedicated label to take unpinned deployments"
+    )]
+    DedicatedNodesNotPinned {
+        /// Every node dropped from the pool, formatted as
+        /// `node <id> (<name>) <reason>`; at least one is a dedicated node.
+        excluded: String,
+    },
+
+    #[error(
         "This control plane does not run application containers (serve profile \
          'control-plane'), and no eligible worker node is available for the \
          {requested_replicas} requested replica(s). Join a worker node with \

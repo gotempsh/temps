@@ -3516,6 +3516,9 @@ impl From<NodeError> for Problem {
                     .with_title("Placement Constraints Unsatisfied")
                     .with_detail(error.to_string())
             }
+            NodeError::DedicatedNodesNotPinned { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Only Dedicated Nodes Available")
+                .with_detail(error.to_string()),
             // Reuses the platform's existing worker-node problem rather than
             // inventing a second "nowhere to put this" shape: the remedy is
             // the same page, and the console already renders this error code
