@@ -50,6 +50,9 @@ pub enum RestoreError {
     #[error("Validation error: {message}")]
     Validation { message: String },
 
+    #[error("Cannot reserve restored service name '{name}': {reason}")]
+    ServiceNameConflict { name: String, reason: String },
+
     #[error("Restore mode '{mode}' not supported by service type '{service_type}'")]
     UnsupportedMode { mode: String, service_type: String },
 
@@ -2525,7 +2528,8 @@ async fn run_restore_inner(
     // the run. The template is the TARGET service (we're provisioning a
     // sibling of it), not the backup's origin service.
     let target_service_id = if let Some((new_name, result)) = new_service_parameters {
-        let new_id = persist_new_service(&db, &enc, &target_service, new_name, &result).await?;
+        let new_id =
+            persist_new_service(&db, &enc, &target_service, run_id, new_name, &result).await?;
         Some(new_id)
     } else {
         // In-place / PITR-in-place: the target's stored config password is
@@ -2855,6 +2859,23 @@ async fn insert_restore_run(
     }
 }
 
+async fn reserve_restore_service_name(
+    txn: &sea_orm::DatabaseTransaction,
+    name: &str,
+    owning_run: Option<i32>,
+) -> Result<(), RestoreError> {
+    use temps_providers::services::ServiceIdentityReservationError as E;
+    temps_providers::services::reserve_service_identity(txn, name, None, owning_run)
+        .await
+        .map_err(|error| match error {
+            E::Database(error) => RestoreError::Database(error),
+            E::Registered { .. } | E::Restoring { .. } => RestoreError::ServiceNameConflict {
+                name: name.to_string(),
+                reason: error.to_string(),
+            },
+        })
+}
+
 /// The checks and insert of [`insert_restore_run`], inside its transaction.
 async fn lock_and_insert_restore_run(
     transaction: &sea_orm::DatabaseTransaction,
@@ -2863,6 +2884,13 @@ async fn lock_and_insert_restore_run(
     target_service_id: i32,
     destructive: bool,
 ) -> Result<temps_entities::restore_runs::Model, RestoreError> {
+    // Admission durably reserves the clone's name under the same short
+    // lock used by create/import/rename, before any Docker operation starts.
+    if let Set(Some(name)) | sea_orm::ActiveValue::Unchanged(Some(name)) =
+        &run_active.target_service_name
+    {
+        reserve_restore_service_name(transaction, name, None).await?;
+    }
     if let Some(backup_id) = resolved_backup_id {
         let backup = temps_entities::backups::Entity::find_by_id(backup_id)
             .lock_exclusive()
@@ -2873,17 +2901,19 @@ async fn lock_and_insert_restore_run(
             return Err(RestoreError::BackupDeleting { backup_id });
         }
     }
+    // Deletion takes this same short source lock and refuses active runs,
+    // so its cascade cannot remove a clone's durable name reservation.
+    temps_entities::external_services::Entity::find_by_id(target_service_id)
+        .lock_exclusive()
+        .one(transaction)
+        .await?
+        .ok_or(RestoreError::ServiceNotFound {
+            service_id: target_service_id,
+        })?;
     if destructive {
         // Serialize destructive restores per target: the row lock makes
         // the check below race-free for PITR-in-place too, which the
         // partial unique index (in_place only) does not cover.
-        temps_entities::external_services::Entity::find_by_id(target_service_id)
-            .lock_exclusive()
-            .one(transaction)
-            .await?
-            .ok_or(RestoreError::ServiceNotFound {
-                service_id: target_service_id,
-            })?;
         if let Some(active) = find_active_destructive_run(transaction, target_service_id).await? {
             return Err(RestoreError::RestoreAlreadyActive {
                 service_id: target_service_id,
@@ -3171,6 +3201,7 @@ async fn persist_new_service(
     db: &DatabaseConnection,
     enc: &Arc<temps_core::EncryptionService>,
     source: &temps_entities::external_services::Model,
+    run_id: i32,
     new_name: String,
     result: &temps_providers::externalsvc::NewServiceRestoreResult,
 ) -> Result<i32, RestoreError> {
@@ -3203,7 +3234,31 @@ async fn persist_new_service(
         ..Default::default()
     };
 
-    let inserted = model.insert(db).await?;
+    let txn = db.begin().await?;
+    reserve_restore_service_name(&txn, &new_name, Some(run_id)).await?;
+    let run = temps_entities::restore_runs::Entity::find_by_id(run_id)
+        .lock_exclusive()
+        .one(&txn)
+        .await?
+        .ok_or(RestoreError::RestoreRunNotFound {
+            restore_run_id: run_id,
+        })?;
+    if run.target_service_name.as_deref() != Some(new_name.as_str())
+        || run.source_service_id != source.id
+        || !ACTIVE_RESTORE_STATUSES.contains(&run.status.as_str())
+        || run.target_service_id.is_some()
+        || run.cancel_requested_at.is_some()
+    {
+        return Err(RestoreError::ServiceNameConflict {
+            name: new_name,
+            reason: format!("restore run {run_id} no longer owns this name; its provisioned resources were left unchanged for inspection"),
+        });
+    }
+    let inserted = model.insert(&txn).await?;
+    let mut run: temps_entities::restore_runs::ActiveModel = run.into();
+    run.target_service_id = Set(Some(inserted.id));
+    run.update(&txn).await?;
+    txn.commit().await?;
     info!(
         "Persisted restored service '{}' (id={}) from source '{}' (id={})",
         inserted.name, inserted.id, source.name, source.id
@@ -5888,6 +5943,66 @@ mod tests {
             }
             Ok(Default::default())
         }
+    }
+
+    #[tokio::test]
+    async fn clone_name_admission_refuses_a_registered_service_before_inserting_run() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .append_query_results([vec![crashed_run_service()]])
+            .into_connection();
+        let mut run: temps_entities::restore_runs::ActiveModel = crashed_run_row().into();
+        run.target_service_name = Set(Some("cache".to_string()));
+        let txn = db.begin().await.unwrap();
+        let error = lock_and_insert_restore_run(&txn, run, None, 3, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, RestoreError::ServiceNameConflict { .. }));
+        txn.rollback().await.unwrap();
+        assert!(db.into_transaction_log()[0]
+            .statements()
+            .iter()
+            .all(|s| !s.sql.contains("INSERT")));
+    }
+
+    #[tokio::test]
+    async fn clone_registration_refuses_a_run_that_no_longer_owns_the_name() {
+        let mut run = crashed_run_row();
+        run.target_service_name = Some("expected".to_string());
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .append_query_results([Vec::<temps_entities::external_services::Model>::new()])
+            .append_query_results([Vec::<temps_entities::restore_runs::Model>::new()])
+            .append_query_results([vec![run]])
+            .into_connection();
+        let enc = Arc::new(temps_core::EncryptionService::new_from_password(
+            "owned-registration-fixture",
+        ));
+        let result = temps_providers::externalsvc::NewServiceRestoreResult {
+            parameters: Default::default(),
+            connection_info: "owned-fixture".to_string(),
+        };
+        let error = persist_new_service(
+            &db,
+            &enc,
+            &crashed_run_service(),
+            11,
+            "different".to_string(),
+            &result,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, RestoreError::ServiceNameConflict { .. }));
+        assert!(db.into_transaction_log()[0]
+            .statements()
+            .iter()
+            .all(|s| !s.sql.contains("INSERT")));
     }
 
     fn crashed_run_row() -> temps_entities::restore_runs::Model {

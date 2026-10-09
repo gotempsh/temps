@@ -85,6 +85,13 @@ pub enum PostgresUpgradeRejected {
     MajorVersionChange { from: u32, to: u32 },
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("Failed to verify WAL archiving for PostgreSQL service '{service_name}': {reason}. Check this service's logs and retry this operation")]
+struct PostgresArchiveVerificationError {
+    service_name: String,
+    reason: String,
+}
+
 /// Builds the `pg_isready` healthcheck command pinned to the configured
 /// username/database. Without `-d`, `pg_isready` (via libpq) defaults the
 /// target database to the username, so any service where `database !=
@@ -249,6 +256,15 @@ pub struct PostgresConfig {
     /// `PostgresInputConfig::container_name`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_name: Option<String>,
+}
+
+impl PostgresConfig {
+    /// A new managed service must never inherit an imported workload's
+    /// physical container identity. Its own name identifies its new resources.
+    fn for_managed_clone(mut self) -> Self {
+        self.container_name = None;
+        self
+    }
 }
 
 impl From<PostgresInputConfig> for PostgresConfig {
@@ -700,7 +716,7 @@ impl PostgresService {
                 all: true,
                 filters: Some(HashMap::from([(
                     "name".to_string(),
-                    vec![container_name.to_string()],
+                    vec![super::exact_container_name_filter(&container_name)],
                 )])),
                 ..Default::default()
             }))
@@ -1153,7 +1169,7 @@ impl PostgresService {
     ///
     /// This is the credential file `archive_command = wal-g wal-push %p`
     /// relies on when continuous WAL archiving is enabled. Called from
-    /// `enable_wal_archiving` after the first successful backup.
+    /// `enable_wal_archiving` before a recoverable WAL-G backup.
     ///
     /// Idempotent — overwrites any existing file. Writes with 0600 perms.
     async fn write_walg_env_file(&self, container_name: &str, walg_env: &[String]) -> Result<()> {
@@ -1279,6 +1295,17 @@ impl PostgresService {
     ) -> Result<()> {
         use bollard::exec::{CreateExecOptions, StartExecOptions};
 
+        if postgres_config.container_name.is_some() {
+            let (mode, _) = self.archive_settings(postgres_config, None).await?;
+            if mode == "off" {
+                return Err(PostgresArchiveVerificationError {
+                    service_name: self.name.clone(),
+                    reason: "the imported database has archive_mode off. Enable archiving in its external startup configuration and restart it, or back up a new managed service; the imported container and data have not been changed".to_string(),
+                }
+                .into());
+            }
+        }
+
         // Step 1: write walg.env onto the volume. This is the durable truth
         // source `compute_desired_enable_archiving` reads on every start.
         self.write_walg_env_file(container_name, walg_env).await?;
@@ -1342,13 +1369,40 @@ impl PostgresService {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
 
+        // Marker presence describes configured credentials, not active
+        // PostgreSQL settings. Verify the reload before deciding whether a
+        // postmaster restart is required; an ordinary backup must not cause
+        // downtime when archiving already works.
+        let (mode, command) = self
+            .active_archive_settings(postgres_config, &archive_command)
+            .await?;
+        if matches!(mode.as_str(), "on" | "always") && command != archive_command {
+            return Err(PostgresArchiveVerificationError {
+                service_name: self.name.clone(),
+                reason: "the WAL-G archive command did not apply after reload".to_string(),
+            }
+            .into());
+        }
+        if mode == "on" || mode == "always" {
+            return Ok(());
+        }
+        // An operator can restart an imported workload while the settings
+        // reload is in flight. Its physical container must never enter the
+        // managed recreation path, regardless of either settings snapshot.
+        if postgres_config.container_name.is_some() {
+            return Err(PostgresArchiveVerificationError {
+                service_name: self.name.clone(),
+                reason: "the imported database now has archive_mode off. Enable archiving and restart it using its external lifecycle before retrying; Temps will not recreate this imported container".to_string(),
+            }
+            .into());
+        }
         info!(
             "Wrote walg.env + archive_command in container '{}'. Recreating container so archive_mode=on lands in CMD.",
             container_name
         );
 
         // Step 3: recreate so archive_mode=on lands in CMD args. We go through
-        // `stop()` → `docker.remove_container` → `create_container(.., true)`
+        // `stop()` → `docker.remove_container` → `create_container_once(.., true)`
         // → `docker.start_container` → `wait_for_container_health`. Same path
         // `start()`'s reconcile branch uses.
         self.stop().await?;
@@ -1370,11 +1424,10 @@ impl PostgresService {
             })?;
 
         let limits = self.resource_limits.read().await.clone();
-        // `postgres_config` is a caller-owned `&PostgresConfig` here (used
-        // only for this recreate, not persisted afterward), so retry port
-        // changes are applied to a local clone rather than threaded further.
-        let mut recreate_config = postgres_config.clone();
-        self.create_container(&self.docker, &mut recreate_config, &limits, true)
+        // A backup's provider has no persistence path for a new published
+        // port. Preserve this registered endpoint instead of silently choosing
+        // a different port on a bind conflict; its data volume remains intact.
+        self.create_container_once(&self.docker, postgres_config, &limits, true)
             .await?;
         self.docker
             .start_container(
@@ -1392,12 +1445,141 @@ impl PostgresService {
         self.wait_for_container_health(&self.docker, container_name)
             .await?;
 
+        let (mode, command) = self
+            .active_archive_settings(postgres_config, &archive_command)
+            .await?;
+        if !matches!(mode.as_str(), "on" | "always") || command != archive_command {
+            return Err(PostgresArchiveVerificationError {
+                service_name: self.name.clone(),
+                reason: "the service restarted without active WAL-G archiving".to_string(),
+            }
+            .into());
+        }
+
         info!(
             "Recreated container '{}' with archive_mode=on. WAL-G archiving active.",
             container_name
         );
 
         Ok(())
+    }
+
+    /// Read settings from PostgreSQL itself, rather than inferring them
+    /// from a credential file. Bounded control-plane work before a backup.
+    async fn active_archive_settings(
+        &self,
+        config: &PostgresConfig,
+        expected_command: &str,
+    ) -> std::result::Result<(String, String), PostgresArchiveVerificationError> {
+        self.archive_settings(config, Some(expected_command)).await
+    }
+
+    async fn archive_settings(
+        &self,
+        config: &PostgresConfig,
+        expected_command: Option<&str>,
+    ) -> std::result::Result<(String, String), PostgresArchiveVerificationError> {
+        let failure = |reason: String| PostgresArchiveVerificationError {
+            service_name: self.name.clone(),
+            reason,
+        };
+        let connection = format!(
+            "postgres://{}:{}@{}:{}/{}?sslmode={}",
+            urlencoding::encode(&config.username),
+            urlencoding::encode(&config.password),
+            config.host,
+            config.port,
+            urlencoding::encode(&config.database),
+            urlencoding::encode(config.ssl_mode.as_deref().unwrap_or("disable")),
+        );
+        let pool = tokio::time::timeout(
+            Duration::from_secs(5),
+            sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(Duration::from_secs(5))
+                .connect(&connection),
+        )
+        .await
+        .map_err(|_| failure("database connection timed out after 5 seconds".to_string()))?
+        .map_err(|error| failure(error.to_string()))?;
+        // pg_reload_conf signals the postmaster asynchronously. Wait for
+        // its reload to become visible before taking the setting snapshot.
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let settings: (String, String) = sqlx::query_as(
+                    "SELECT current_setting('archive_mode'), current_setting('archive_command')",
+                )
+                .fetch_one(&pool)
+                .await?;
+                // PostgreSQL's archive_command show hook returns "(disabled)"
+                // while archive_mode is off, even after ALTER SYSTEM and reload
+                // applied the command. Return the disabled policy so the caller
+                // can perform the postmaster restart; verify the visible command
+                // once archiving is active.
+                if settings.0 == "off"
+                    || expected_command.is_none_or(|command| settings.1 == command)
+                {
+                    return Ok::<_, sqlx::Error>(settings);
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+        pool.close().await;
+        result
+            .map_err(|_| {
+                failure("the expected archive command did not apply within 5 seconds".to_string())
+            })?
+            .map_err(|error| failure(error.to_string()))
+    }
+
+    /// Ask the running database whether startup arguments override its
+    /// archiving policy. Entrypoint wrappers can hide PostgreSQL arguments
+    /// from Docker's CMD; reject them before fetching or replacing data.
+    async fn imported_archive_mode_source(
+        &self,
+        config: &PostgresConfig,
+    ) -> std::result::Result<bool, PostgresArchiveVerificationError> {
+        let failure = |reason: String| {
+            PostgresArchiveVerificationError {
+            service_name: self.name.clone(),
+            reason: format!(
+                "Cannot verify the imported container's startup archive policy before restore: {reason}; the original database has not been changed"
+            ),
+        }
+        };
+        let connection = format!(
+            "postgres://{}:{}@{}:{}/{}?sslmode={}",
+            urlencoding::encode(&config.username),
+            urlencoding::encode(&config.password),
+            config.host,
+            config.port,
+            urlencoding::encode(&config.database),
+            urlencoding::encode(config.ssl_mode.as_deref().unwrap_or("disable")),
+        );
+        let pool = tokio::time::timeout(
+            Duration::from_secs(5),
+            sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(Duration::from_secs(5))
+                .connect(&connection),
+        )
+        .await
+        .map_err(|_| failure("database connection timed out after 5 seconds".to_string()))?
+        .map_err(|error| failure(error.to_string()))?;
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT setting, source FROM pg_settings WHERE name = 'archive_mode'",
+            )
+            .fetch_one(&pool),
+        )
+        .await;
+        pool.close().await;
+        let (mode, source) = result
+            .map_err(|_| failure("settings query timed out after 5 seconds".to_string()))?
+            .map_err(|error| failure(error.to_string()))?;
+        Ok(imported_archive_mode_is_command_line(&mode, &source))
     }
 
     /// Compute the desired `archive_mode` for this service's container CMD.
@@ -1435,7 +1617,7 @@ impl PostgresService {
                 all: true,
                 filters: Some(HashMap::from([(
                     "name".to_string(),
-                    vec![container_name.to_string()],
+                    vec![super::exact_container_name_filter(container_name)],
                 )])),
                 ..Default::default()
             }))
@@ -2086,8 +2268,44 @@ impl PostgresService {
     ) -> Result<()> {
         use bollard::exec::CreateExecOptions;
 
-        let postgres_config = self.get_postgres_config(service_config)?;
+        let postgres_config = self.get_postgres_config(service_config.clone())?;
         let container_name = self.get_live_container_name(&postgres_config);
+        if postgres_config.container_name.is_some() {
+            let container = self
+                .docker
+                .inspect_container(
+                    &container_name,
+                    None::<bollard::query_parameters::InspectContainerOptions>,
+                )
+                .await
+                .map_err(|error| PostgresArchiveVerificationError {
+                    service_name: self.name.clone(),
+                    reason: format!(
+                        "could not verify the imported container's startup policy: {error}"
+                    ),
+                })?;
+            let startup = container
+                .config
+                .as_ref()
+                .map(|config| {
+                    config
+                        .entrypoint
+                        .iter()
+                        .flatten()
+                        .chain(config.cmd.iter().flatten())
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let command_line_archiving =
+                self.imported_archive_mode_source(&postgres_config).await?;
+            if postgres_cmd_pins_archive_mode_on(&startup) || command_line_archiving {
+                return Err(PostgresArchiveVerificationError {
+                    service_name: self.name.clone(),
+                    reason: "the imported container's startup command pins archive_mode on. Change its startup setting to off, or restore into a new managed service before retrying; the original database has not been changed".to_string(),
+                }.into());
+            }
+        }
 
         info!(
             "Restoring PostgreSQL from WAL-G backup (prefix: {}) in container '{}'",
@@ -2377,7 +2595,7 @@ impl PostgresService {
         info!("Swapping PGDATA via ephemeral container");
         let pgdata_path = Self::get_pgdata_path(&postgres_config.docker_image)?;
         let swap_script = format!(
-            "rm -rf {pgdata}/* && cp -a {restore_temp}/* {pgdata}/ && rm -rf {restore_temp}",
+            "rm -rf {pgdata}/* && cp -a {restore_temp}/* {pgdata}/ && rm -rf {restore_temp} && rm -f /var/lib/postgresql/walg.env",
             pgdata = pgdata_path,
             restore_temp = restore_temp,
         );
@@ -2459,35 +2677,72 @@ impl PostgresService {
             }
         }
 
-        // Step 5: Re-enable restart policy and start the original container.
-        // The entrypoint will detect existing PGDATA and start PostgreSQL,
-        // which will enter recovery mode due to recovery.signal.
-        info!("Re-enabling restart policy and starting container with restored PGDATA");
-        self.docker
-            .update_container(
-                &container_name,
-                bollard::models::ContainerUpdateBody {
-                    restart_policy: Some(bollard::models::RestartPolicy {
-                        name: Some(bollard::models::RestartPolicyNameEnum::ALWAYS),
-                        maximum_retry_count: None,
+        // Restored PGDATA deliberately suspends continuous archiving. The
+        // committed swap removes only the target's write credential marker;
+        // recovery still uses its separate read-only source credentials.
+        // Reconcile the managed container CMD now so archive_mode=off survives
+        // restarts. A later full backup explicitly restores the pinned write
+        // destination and verifies active archiving before it can succeed.
+        if postgres_config.container_name.is_some() {
+            // Imported containers keep their external lifecycle; start() will
+            // not recreate them, so restore the policy disabled for the swap.
+            self.docker
+                .update_container(
+                    &container_name,
+                    bollard::models::ContainerUpdateBody {
+                        restart_policy: Some(bollard::models::RestartPolicy {
+                            name: Some(bollard::models::RestartPolicyNameEnum::ALWAYS),
+                            maximum_retry_count: None,
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|error| PostgresArchiveVerificationError {
+                    service_name: self.name.clone(),
+                    reason: format!(
+                        "could not restore the imported container's restart policy: {error}"
+                    ),
+                })?;
+        }
+        if postgres_config.container_name.is_some() {
+            self.force_recreate(service_config).await?;
+        } else {
+            // Restore orchestration does not persist a replacement host port.
+            // Recreate at the registered endpoint, retaining PGDATA if that
+            // endpoint cannot bind, instead of silently changing its address.
+            let limits = ServiceResourceLimits::from_parameters(&service_config.parameters);
+            limits
+                .validate()
+                .map_err(|reason| PostgresArchiveVerificationError {
+                    service_name: self.name.clone(),
+                    reason: format!("invalid restored service resource limits: {reason}"),
+                })?;
+            self.docker
+                .remove_container(
+                    &container_name,
+                    Some(bollard::query_parameters::RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
                     }),
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to re-enable restart policy: {}", e))?;
-
-        self.docker
-            .start_container(
-                &container_name,
-                None::<bollard::query_parameters::StartContainerOptions>,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to start container after restore: {}", e))?;
-
-        // Wait for PostgreSQL to become healthy
-        self.wait_for_container_health(&self.docker, &container_name)
+                )
+                .await
+                .map_err(|error| PostgresArchiveVerificationError {
+                    service_name: self.name.clone(),
+                    reason: format!("could not recreate the restored managed container: {error}"),
+                })?;
+            self.create_container_once(&self.docker, &postgres_config, &limits, false)
+                .await?;
+        }
+        let (mode, _) = self
+            .active_archive_settings(&postgres_config, "/bin/true")
             .await?;
+        if mode != "off" {
+            return Err(PostgresArchiveVerificationError {
+                service_name: self.name.clone(),
+                reason: "the restored database did not suspend WAL archiving. Check the container's startup command and PostgreSQL configuration before retrying; restore into a new managed service if the imported container's policy cannot be changed safely".to_string(),
+            }.into());
+        }
 
         info!("PostgreSQL WAL-G restore completed successfully");
         Ok(())
@@ -2577,7 +2832,7 @@ impl PostgresService {
     /// WAL-G uploads the backup directly to S3 from within the container — zero data flows
     /// through the Temps process, keeping memory usage flat regardless of database size.
     ///
-    /// After a successful backup, this method also:
+    /// Before pushing a backup, this method also:
     /// 1. Writes WAL-G S3 credentials to `/var/lib/postgresql/walg.env` on the shared volume
     /// 2. Enables continuous WAL archiving via `ALTER SYSTEM SET archive_command`
     /// 3. Calls `pg_reload_conf()` so PostgreSQL picks up the change without restart
@@ -2595,7 +2850,7 @@ impl PostgresService {
         use chrono::Utc;
         use sea_orm::*;
 
-        let postgres_config = self.get_postgres_config(service_config)?;
+        let postgres_config = self.get_postgres_config(service_config.clone())?;
         let container_name = self.get_live_container_name(&postgres_config);
 
         let metadata = serde_json::json!({
@@ -2606,6 +2861,8 @@ impl PostgresService {
 
         let backup_record = external_service_backups::ActiveModel {
             service_id: Set(external_service.id),
+            service_name_snapshot: Set(Some(external_service.name.clone())),
+            service_type_snapshot: Set(Some(external_service.service_type.clone())),
             backup_id: Set(backup.id),
             backup_type: Set("full".to_string()),
             state: Set("running".to_string()),
@@ -2630,17 +2887,24 @@ impl PostgresService {
 
         // Run the backup, then either persist success or mark failure. Any
         // `?` propagation in the inner block lands in the failure branch.
-        let result = self
-            .run_walg_backup_push(
+        let result = async {
+            // Legacy callers need the same pre-backup policy and resource
+            // verification as the v2 engine. Persist any refusal as a failed
+            // child rather than completing an unrestorable base backup.
+            self.write_wal_archiving_config(service_config, s3_credentials, &walg_s3_prefix)
+                .await?;
+            self.run_walg_backup_push(
                 &container_name,
                 &walg_s3_prefix,
                 s3_credentials,
                 &postgres_config,
             )
-            .await;
+            .await
+        }
+        .await;
 
         match result {
-            Ok(walg_env) => {
+            Ok(_) => {
                 // Compute size by listing S3. WAL-G streams chunks; we
                 // don't see them locally.
                 let size_bytes = match super::s3_util::list_total_size(
@@ -2672,19 +2936,6 @@ impl PostgresService {
                     "PostgreSQL WAL-G backup completed successfully (prefix: {}, size: {:?})",
                     walg_s3_prefix, size_bytes
                 );
-
-                // Enable continuous WAL archiving.
-                // Failures here are logged but do NOT fail the backup.
-                if let Err(e) = self
-                    .enable_wal_archiving(&container_name, &walg_env, &postgres_config)
-                    .await
-                {
-                    error!(
-                        "Failed to enable WAL archiving in container '{}': {}. \
-                         Base backup succeeded but continuous WAL archiving is not active.",
-                        container_name, e
-                    );
-                }
 
                 Ok(super::BackupOutcome::new(walg_s3_prefix, size_bytes))
             }
@@ -3170,6 +3421,24 @@ pub(crate) fn postgres_container_name(name: &str) -> String {
     format!("postgres-{}", name)
 }
 
+fn imported_archive_mode_is_command_line(mode: &str, source: &str) -> bool {
+    matches!(mode, "on" | "always") && source == "command line"
+}
+
+fn postgres_cmd_pins_archive_mode_on(command: &[String]) -> bool {
+    command
+        .iter()
+        .flat_map(|part| part.split_whitespace())
+        .filter_map(|part| {
+            let part = part.trim_start_matches("--").trim_start_matches("-c");
+            let (key, value) = part.split_once('=')?;
+            (key.replace('-', "_").eq_ignore_ascii_case("archive_mode"))
+                .then(|| value.trim_matches(['\'', '"']).to_ascii_lowercase())
+        })
+        .next_back()
+        .is_some_and(|mode| matches!(mode.as_str(), "on" | "always" | "true" | "yes" | "1"))
+}
+
 /// Data volumes of a service named `name`, as `remove()` deletes them.
 pub(crate) fn postgres_volume_names(name: &str) -> [String; 1] {
     [format!("postgres-{}_data", name)]
@@ -3212,7 +3481,7 @@ impl ExternalService for PostgresService {
     ///
     /// Detects whether the container has WAL-G installed:
     /// - **WAL-G available**: Uses `wal-g backup-push` inside the container. Zero data flows
-    ///   through the Temps process. After success, enables continuous WAL archiving for PITR.
+    ///   through the Temps process. Before the base backup, verifies continuous WAL archiving for PITR.
     /// - **WAL-G not available** (legacy images like `postgres:18-alpine`): Falls back to
     ///   pg_dump via a sidecar container, streaming to a temp file and uploading to S3.
     async fn backup_to_s3(
@@ -3562,7 +3831,7 @@ impl ExternalService for PostgresService {
                     all: true,
                     filters: Some(HashMap::from([(
                         "name".to_string(),
-                        vec![container_name.clone()],
+                        vec![super::exact_container_name_filter(&container_name)],
                     )])),
                     ..Default::default()
                 }))
@@ -3609,7 +3878,7 @@ impl ExternalService for PostgresService {
                 all: true,
                 filters: Some(HashMap::from([(
                     "name".to_string(),
-                    vec![container_name.clone()],
+                    vec![super::exact_container_name_filter(&container_name)],
                 )])),
                 ..Default::default()
             }))
@@ -3754,16 +4023,9 @@ impl ExternalService for PostgresService {
         s3_credentials: &super::S3Credentials,
         walg_prefix: &str,
     ) -> Result<()> {
-        // Already active from a prior backup on this service (truth source:
-        // `walg.env` on the volume, see `compute_desired_enable_archiving`).
-        // Skip the container-recreating dance entirely — this method is
-        // called before every backup, and archive_mode is postmaster-context
-        // (a live reload can't flip it), so redoing this would mean a brief
-        // outage on every single backup instead of just the first.
-        if self.compute_desired_enable_archiving().await {
-            return Ok(());
-        }
-
+        // Every backup reconciles the explicit, pinned write destination.
+        // enable_wal_archiving verifies the actual command and recreates only
+        // when PostgreSQL's archive_mode needs a postmaster restart.
         self.write_wal_archiving_config(service_config, s3_credentials, walg_prefix)
             .await
     }
@@ -3785,7 +4047,7 @@ impl ExternalService for PostgresService {
                 all: true,
                 filters: Some(HashMap::from([(
                     "name".to_string(),
-                    vec![container_name.clone()],
+                    vec![super::exact_container_name_filter(&container_name)],
                 )])),
                 ..Default::default()
             }))
@@ -3821,7 +4083,7 @@ impl ExternalService for PostgresService {
                 all: true,
                 filters: Some(HashMap::from([(
                     "name".to_string(),
-                    vec![container_name.clone()],
+                    vec![super::exact_container_name_filter(&container_name)],
                 )])),
                 ..Default::default()
             }))
@@ -4321,7 +4583,9 @@ impl ExternalService for PostgresService {
         );
 
         // Start from the source service's parameters, then apply caller overrides.
-        let mut source_config = self.get_postgres_config(ctx.source_config.clone())?;
+        let mut source_config = self
+            .get_postgres_config(ctx.source_config.clone())?
+            .for_managed_clone();
 
         // Allocate a fresh host port (source's port is taken).
         let new_port = find_available_port(5432)
@@ -4465,7 +4729,9 @@ impl ExternalService for PostgresService {
             // Clone the source's config onto a fresh container+port, like
             // restore_to_new_service does, then run WAL-G fetch with the PITR
             // target configuration.
-            let mut source_config = self.get_postgres_config(ctx.source_config.clone())?;
+            let mut source_config = self
+                .get_postgres_config(ctx.source_config.clone())?
+                .for_managed_clone();
             let new_port = find_available_port(5432)
                 .ok_or_else(|| anyhow::anyhow!("No available ports for new PostgreSQL service"))?
                 .to_string();
@@ -4546,17 +4812,12 @@ impl ExternalService for PostgresService {
 
 impl PostgresService {
     /// Point continuous WAL-G archiving at `s3_credentials`/`walg_prefix`
-    /// unconditionally — the container-recreating dance
-    /// `enable_continuous_archiving` normally skips once `walg.env` already
-    /// exists on the volume, because that check is presence-only and can't
-    /// tell "already active, no need to redo this" apart from "active, but
-    /// pointed at a source we no longer want".
+    /// explicitly. The normal backup path uses the pinned destination;
+    /// repointing accepts a different destination after an audited decision.
     ///
     /// Only the explicit, operator-initiated WAL archive source repoint
     /// (`ExternalServiceManager::repoint_continuous_archive_source`) should call
-    /// this — it accepts the brief archiving outage a container recreate
-    /// causes, in exchange for actually moving where WAL segments land, not
-    /// just updating a database record that no longer matches reality.
+    /// this. Ordinary backups are guarded by the persisted archive source pin.
     pub async fn force_reenable_continuous_archiving(
         &self,
         service_config: ServiceConfig,
@@ -4573,6 +4834,17 @@ impl PostgresService {
         s3_credentials: &super::S3Credentials,
         walg_prefix: &str,
     ) -> Result<()> {
+        // Backup engines construct a fresh provider. Hydrate its limits from
+        // the registered service before an off-policy managed recreation so
+        // enabling archiving cannot remove the workload's resource bounds.
+        let limits = ServiceResourceLimits::from_parameters(&service_config.parameters);
+        limits
+            .validate()
+            .map_err(|reason| PostgresArchiveVerificationError {
+                service_name: self.name.clone(),
+                reason: format!("invalid WAL archive service resource limits: {reason}"),
+            })?;
+        *self.resource_limits.write().await = limits;
         let postgres_config = self.get_postgres_config(service_config)?;
         let container_name = self.get_live_container_name(&postgres_config);
 
@@ -4607,6 +4879,197 @@ mod data_import;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A private, run-owned PostgreSQL fixture exercises PostgreSQL's real
+    /// archive_command show hook. The fixture supplies separate off/on servers;
+    /// this test only reads their settings and never changes their workloads.
+    #[tokio::test]
+    async fn archive_settings_handles_postgres_disabled_command_display() {
+        let Some(fixture_path) = std::env::var_os("TEMPS_TEST_ARCHIVE_SETTINGS_FIXTURE") else {
+            eprintln!(
+                "Skipping archive settings integration regression: no owned fixture supplied"
+            );
+            return;
+        };
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            off: PostgresConfig,
+            on: PostgresConfig,
+        }
+        let fixture: Fixture = serde_json::from_slice(
+            &std::fs::read(fixture_path).expect("read private owned PostgreSQL fixture"),
+        )
+        .expect("parse private owned PostgreSQL fixture");
+        let docker = Arc::new(Docker::connect_with_local_defaults().expect("Docker configuration"));
+        let service = PostgresService::new("archive-settings-regression".to_string(), docker);
+        let off = service
+            .active_archive_settings(&fixture.off, "/bin/true")
+            .await
+            .expect("off policy must not wait for a command hidden by PostgreSQL");
+        assert_eq!(off, ("off".to_string(), "(disabled)".to_string()));
+        assert!(fixture.off.container_name.is_some());
+        let refusal = service
+            .enable_wal_archiving(
+                fixture.off.container_name.as_deref().unwrap(),
+                &["WALG_S3_PREFIX=s3://test-bucket/unused".to_string()],
+                &fixture.off,
+            )
+            .await
+            .expect_err("an imported off-policy container must never be recreated");
+        assert!(refusal
+            .to_string()
+            .contains("imported database has archive_mode off"));
+        assert_eq!(
+            service
+                .active_archive_settings(&fixture.off, "/bin/true")
+                .await
+                .expect("the refused imported workload remains usable"),
+            off
+        );
+        let on = service
+            .active_archive_settings(&fixture.on, "/bin/true")
+            .await
+            .expect("on policy must expose the exact configured command");
+        assert_eq!(on, ("on".to_string(), "/bin/true".to_string()));
+        let error = service
+            .active_archive_settings(&fixture.on, "wal-g wal-push %p")
+            .await
+            .expect_err("active archiving must reject a different command");
+        assert!(error
+            .reason
+            .contains("expected archive command did not apply"));
+    }
+
+    #[test]
+    fn imported_restore_clone_uses_only_its_new_managed_container() {
+        let source = PostgresConfig {
+            host: "localhost".to_string(),
+            port: "5432".to_string(),
+            database: "app".to_string(),
+            username: "app".to_string(),
+            password: "test-password".to_string(),
+            max_connections: 42,
+            ssl_mode: Some("disable".to_string()),
+            docker_image: "gotempsh/postgres-walg:18-bookworm".to_string(),
+            container_name: Some("operator-owned-imported-workload".to_string()),
+        };
+        let clone = source.clone().for_managed_clone();
+        let service = PostgresService::new(
+            "new-managed".to_string(),
+            Arc::new(
+                Docker::connect_with_http("http://127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION)
+                    .unwrap(),
+            ),
+        );
+        assert_eq!(
+            service.get_live_container_name(&source),
+            "operator-owned-imported-workload"
+        );
+        assert_eq!(
+            service.get_live_container_name(&clone),
+            "postgres-new-managed"
+        );
+        assert_eq!(
+            source.container_name.as_deref(),
+            Some("operator-owned-imported-workload")
+        );
+        assert_eq!(clone.password, source.password);
+        assert_eq!(clone.max_connections, source.max_connections);
+        assert_eq!(clone.database, source.database);
+        assert!(serde_json::to_value(clone)
+            .unwrap()
+            .get("container_name")
+            .is_none());
+    }
+
+    #[test]
+    fn imported_restore_rejects_effective_command_line_archive_policy() {
+        assert!(imported_archive_mode_is_command_line("on", "command line"));
+        assert!(imported_archive_mode_is_command_line(
+            "always",
+            "command line"
+        ));
+        assert!(!imported_archive_mode_is_command_line(
+            "off",
+            "command line"
+        ));
+        assert!(!imported_archive_mode_is_command_line(
+            "on",
+            "configuration file"
+        ));
+    }
+
+    #[test]
+    fn imported_restore_detects_startup_archive_mode_override() {
+        let command = |args: &[&str]| {
+            args.iter()
+                .map(|arg| String::from(*arg))
+                .collect::<Vec<_>>()
+        };
+        assert!(postgres_cmd_pins_archive_mode_on(&command(&[
+            "postgres",
+            "-c",
+            "archive_mode=on"
+        ])));
+        assert!(postgres_cmd_pins_archive_mode_on(&command(&[
+            "postgres",
+            "-carchive_mode=always"
+        ])));
+        assert!(postgres_cmd_pins_archive_mode_on(&command(&[
+            "postgres",
+            "--archive_mode=on"
+        ])));
+        assert!(!postgres_cmd_pins_archive_mode_on(&command(&[
+            "postgres",
+            "-c",
+            "archive_mode=off"
+        ])));
+        assert!(!postgres_cmd_pins_archive_mode_on(&command(&[
+            "postgres",
+            "-c",
+            "archive_mode=on",
+            "-c",
+            "archive_mode=off"
+        ])));
+        assert!(!postgres_cmd_pins_archive_mode_on(&command(&[
+            "postgres",
+            "-c",
+            "archive_command=/bin/true"
+        ])));
+        assert!(postgres_cmd_pins_archive_mode_on(&command(&[
+            "postgres",
+            "-c",
+            "ARCHIVE_MODE=ON"
+        ])));
+        assert!(postgres_cmd_pins_archive_mode_on(&command(&[
+            "postgres",
+            "-cARCHIVE_MODE=ALWAYS"
+        ])));
+        assert!(!postgres_cmd_pins_archive_mode_on(&command(&[
+            "postgres",
+            "-c",
+            "ARCHIVE_MODE=on",
+            "-c",
+            "archive_mode=off"
+        ])));
+        assert!(postgres_cmd_pins_archive_mode_on(&command(&[
+            "postgres",
+            "-c",
+            "archive_mode=off",
+            "-c",
+            "ARCHIVE_MODE=always"
+        ])));
+
+        assert!(postgres_cmd_pins_archive_mode_on(&command(&[
+            "postgres",
+            "--archive-mode=on"
+        ])));
+        assert!(!postgres_cmd_pins_archive_mode_on(&command(&[
+            "postgres",
+            "--ARCHIVE-MODE=always",
+            "--archive_mode=off"
+        ])));
+    }
 
     #[test]
     fn walg_fetch_abort_script_kills_the_recorded_fetch_and_removes_staged_data() {
@@ -6500,6 +6963,74 @@ mod tests {
         assert_eq!(rows[2].1, "test3");
         assert_eq!(rows[2].2, 300);
         println!("✓ Verified all data values match original");
+
+        // A completed row restore does not establish continuous recovery
+        // coverage. The restored service must stay safely disabled until an
+        // explicit backup destination is configured again.
+        let mode: String = sqlx::query_scalar("SHOW archive_mode")
+            .fetch_one(&db_pool)
+            .await
+            .unwrap();
+        assert_eq!(mode, "off", "restore must suspend WAL pushes durably");
+        db_pool.close().await;
+        pg_service.stop().await.unwrap();
+        pg_service.start().await.unwrap();
+        pg_service
+            .enable_continuous_archiving(pg_config.clone(), &s3_creds, &backup_location)
+            .await
+            .expect("a subsequent backup must repair active WAL archiving");
+        let db_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&connection_string)
+            .await
+            .unwrap();
+        let settings: (String, String) = sqlx::query_as(
+            "SELECT current_setting('archive_mode'), current_setting('archive_command')",
+        )
+        .fetch_one(&db_pool)
+        .await
+        .unwrap();
+        assert_eq!(settings.0, "on");
+        assert!(settings.1.contains("wal-g wal-push"), "{:?}", settings);
+        let segment: String = sqlx::query_scalar("SELECT pg_walfile_name(pg_current_wal_lsn())")
+            .fetch_one(&db_pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO test_backup (name, value) VALUES ('post-restore-wal', 400)")
+            .execute(&db_pool)
+            .await
+            .unwrap();
+        sqlx::query("SELECT pg_switch_wal()")
+            .execute(&db_pool)
+            .await
+            .unwrap();
+        let wal_key = backup_location
+            .strip_prefix("s3://backups/")
+            .unwrap()
+            .trim_end_matches('/');
+        let prefix = format!("{wal_key}/wal_005/{segment}");
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let objects = minio
+                    .s3_client
+                    .list_objects_v2()
+                    .bucket("backups")
+                    .prefix(&prefix)
+                    .send()
+                    .await
+                    .unwrap();
+                if objects
+                    .contents()
+                    .iter()
+                    .any(|object| object.size().unwrap_or(0) > 0)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        })
+        .await
+        .expect("post-restore writes must emit a WAL object at the selected destination");
 
         // Cleanup
         db_pool.close().await;

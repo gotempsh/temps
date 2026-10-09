@@ -8,6 +8,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use utoipa::ToSchema;
 
+/// Docker interprets name filters as regular-expression substring matches.
+/// Anchor and escape a single resource identity before listing containers.
+pub(crate) fn exact_container_name_filter(name: &str) -> String {
+    format!("^/{}$", regex::escape(name.trim_start_matches('/')))
+}
+
 /// Return the Docker summary whose name exactly matches `expected_name`.
 ///
 /// Docker's `name` list filter is substring-based: filtering for `redis-cache`
@@ -61,6 +67,15 @@ mod runtime_provisioning_tests {
         validate_runtime_target, HealthProbeResult, RuntimeProvisioningError, ServiceConfig,
         ServiceHealthProbeError, ServiceType,
     };
+
+    #[test]
+    fn exact_container_filter_does_not_match_a_sibling_or_regex_metacharacters() {
+        let filter =
+            regex::Regex::new(&super::exact_container_name_filter("/postgres-app.db")).unwrap();
+        assert!(filter.is_match("/postgres-app.db"));
+        assert!(!filter.is_match("/postgres-app.db-sibling"));
+        assert!(!filter.is_match("/postgres-appXdb"));
+    }
 
     #[test]
     fn docker_substring_name_match_is_not_treated_as_the_requested_container() {

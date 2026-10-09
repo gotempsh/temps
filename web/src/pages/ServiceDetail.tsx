@@ -993,6 +993,7 @@ export function ServiceDetail() {
                 serviceId={parseInt(id!)}
                 serviceType={service.service.service_type}
                 onUpgrade={() => setIsUpgradeDialogOpen(true)}
+                onBackup={() => setIsBackupDialogOpen(true)}
               />
             ) : null}
 
