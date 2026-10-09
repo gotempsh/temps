@@ -241,12 +241,45 @@ pub trait DataImportEngine: Send + Sync {
     /// Create, or drop and re-create, `database` exactly the way the engine's
     /// project provisioning creates it (same owner, same grants), so a
     /// deployment linked later finds it and uses it.
+    ///
+    /// `release_claim` is the import run's id when the run may release the
+    /// database if it creates it: engines that release record that this run
+    /// created it (see [`Self::release_created_target`]). `None` means the
+    /// database is kept whatever happens, so nothing may release it.
     async fn prepare_target(
         &self,
         config: &ServiceConfig,
         database: &str,
         preparation: TargetPreparation,
+        release_claim: Option<i32>,
     ) -> Result<(), DataImportError>;
+
+    /// Undo a [`TargetPreparation::Create`] after the import did not
+    /// succeed, so the failed run leaves nothing reserved under `database`.
+    /// Called only once the helper is confirmed stopped, and only when no
+    /// project environment linked to the service resolves to `database`.
+    ///
+    /// Returns whether anything was released. The default keeps the
+    /// database: engines where an empty leftover costs nothing do not
+    /// override it. Redis does, because its logical databases are a fixed
+    /// pool shared with provisioning.
+    /// Must be safe however late it runs: if anything else started using
+    /// `database` since run `run_id` created it, it releases nothing and
+    /// returns `false`.
+    async fn release_created_target(
+        &self,
+        _config: &ServiceConfig,
+        _database: &str,
+        _run_id: i32,
+    ) -> Result<bool, DataImportError> {
+        Ok(false)
+    }
+
+    /// Whether [`Self::release_created_target`] releases anything, so the
+    /// caller skips its checks for engines that always keep the database.
+    fn releases_created_target(&self) -> bool {
+        false
+    }
 
     /// Name of the container the target service runs in.
     fn target_container(&self, config: &ServiceConfig) -> Result<String, DataImportError>;

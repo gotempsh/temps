@@ -331,6 +331,7 @@ impl DataImportEngine for MongodbService {
         config: &ServiceConfig,
         database: &str,
         preparation: TargetPreparation,
+        _release_claim: Option<i32>,
     ) -> Result<(), DataImportError> {
         self.validate_target_database(database)?;
         if preparation == TargetPreparation::UseExisting {
@@ -646,7 +647,7 @@ mod tests {
                 assert_eq!(preparation, TargetPreparation::Recreate);
             }
             engine
-                .prepare_target(&config, "shop_production", preparation)
+                .prepare_target(&config, "shop_production", preparation, None)
                 .await
                 .expect("prepare");
             let parsed = engine.parse_source(&source_url).expect("source");

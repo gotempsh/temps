@@ -736,7 +736,18 @@ impl RedisService {
     }
 
     fn database_owner_key(db_number: u8) -> String {
-        format!("_temps:redis_db_owner:{}", db_number)
+        format!("{}{}", Self::DATABASE_OWNER_KEY_PREFIX, db_number)
+    }
+
+    const DATABASE_OWNER_KEY_PREFIX: &'static str = "_temps:redis_db_owner:";
+
+    /// Set by a data import that created the resource's logical database,
+    /// to `"{run_id}:{db_number}"`. The import may release that database
+    /// after a failure only while its claim is still there; anything else
+    /// that starts using the resource (provisioning, another import)
+    /// removes the claim first. See [`Self::allocate_database`].
+    fn import_claim_key(resource_name: &str) -> String {
+        format!("_temps:redis_import_claim:{}", resource_name)
     }
 
     /// Owner value recorded for a logical DB that already held data when we
@@ -785,7 +796,27 @@ impl RedisService {
     /// allocate/drop for the same resource aren't expected to run
     /// concurrently (provision and deprovision are serialized per resource
     /// at the caller).
+    ///
+    /// Provisioning *adopts* the resource: it removes a failed data import's
+    /// claim on it and reads the mapping in one atomic step, so an import
+    /// releasing the database it created either finishes before (and the
+    /// mapping is gone) or finds its claim gone and releases nothing.
     async fn allocate_database(&self, resource_name: &str) -> Result<u8> {
+        self.allocate_database_for(resource_name, None).await
+    }
+
+    /// [`Self::allocate_database`] on behalf of `import_run`, when set: the
+    /// import that holds a pending claim on the resource (`"{run}:pending"`)
+    /// allocates without adopting, and if this call creates the mapping it
+    /// confirms the claim as `"{run}:{db}"` in the same atomic step. A run
+    /// that reuses a mapping, or whose pending claim was adopted meanwhile,
+    /// ends up with no confirmed claim and can never release.
+    pub(super) async fn allocate_database_for(
+        &self,
+        resource_name: &str,
+        import_run: Option<i32>,
+    ) -> Result<u8> {
+        let adopt = import_run.is_none();
         let mut conn = self.get_connection().await?;
         redis::cmd("SELECT")
             .arg(0)
@@ -794,7 +825,12 @@ impl RedisService {
             .map_err(|e| anyhow::anyhow!("Failed to select Redis metadata DB 0: {}", e))?;
 
         let mapping_key = Self::resource_mapping_key(resource_name);
-        let existing: Option<u8> = conn.get(&mapping_key).await.map_err(|e| {
+        let existing: Option<u8> = if adopt {
+            Self::adopt_resource(&mut conn, resource_name).await
+        } else {
+            conn.get(&mapping_key).await
+        }
+        .map_err(|e| {
             anyhow::anyhow!(
                 "Failed to read Redis DB mapping for resource '{}': {}",
                 resource_name,
@@ -878,16 +914,32 @@ impl RedisService {
                     continue;
                 }
 
-                conn.set::<_, _, ()>(&mapping_key, db_number)
+                let stored = match import_run {
+                    None => conn.set::<_, _, ()>(&mapping_key, db_number).await,
+                    Some(run) => redis::Script::new(
+                        "redis.call('SET', KEYS[1], ARGV[1]) \
+                             if redis.call('GET', KEYS[2]) == ARGV[2] then \
+                               redis.call('SET', KEYS[2], ARGV[3]) \
+                             end \
+                             return 1",
+                    )
+                    .key(&mapping_key)
+                    .key(Self::import_claim_key(resource_name))
+                    .arg(db_number)
+                    .arg(format!("{run}:pending"))
+                    .arg(format!("{run}:{db_number}"))
+                    .invoke_async::<i64>(&mut conn)
                     .await
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "Failed to store Redis DB {} mapping for resource '{}': {}",
-                            db_number,
-                            resource_name,
-                            e
-                        )
-                    })?;
+                    .map(|_| ()),
+                };
+                stored.map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to store Redis DB {} mapping for resource '{}': {}",
+                        db_number,
+                        resource_name,
+                        e
+                    )
+                })?;
                 return Ok(db_number);
             }
 
@@ -918,6 +970,22 @@ impl RedisService {
             "No Redis logical databases are available for resource '{}'; DB 0 is reserved for metadata and DBs 1-15 are already allocated or hold unattributable data",
             resource_name
         ))
+    }
+
+    /// Remove a data import's claim on `resource_name` and read its mapping,
+    /// atomically (one script). `conn` must have DB 0 selected.
+    pub(super) async fn adopt_resource(
+        conn: &mut redis::aio::ConnectionManager,
+        resource_name: &str,
+    ) -> redis::RedisResult<Option<u8>> {
+        redis::Script::new(
+            "redis.call('DEL', KEYS[1]) \
+             return redis.call('GET', KEYS[2])",
+        )
+        .key(Self::import_claim_key(resource_name))
+        .key(Self::resource_mapping_key(resource_name))
+        .invoke_async(conn)
+        .await
     }
 
     async fn drop_database(&self, resource_name: &str) -> Result<()> {
@@ -974,13 +1042,16 @@ impl RedisService {
             .query_async::<()>(&mut conn)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to reselect Redis metadata DB 0: {}", e))?;
-        conn.del::<_, ()>(&mapping_key).await.map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to delete Redis DB mapping for resource '{}': {}",
-                resource_name,
-                e
-            )
-        })?;
+        // A data import's claim goes with the mapping it refers to.
+        conn.del::<_, ()>(&[mapping_key.clone(), Self::import_claim_key(resource_name)])
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to delete Redis DB mapping for resource '{}': {}",
+                    resource_name,
+                    e
+                )
+            })?;
         conn.del::<_, ()>(Self::database_owner_key(db_number))
             .await
             .map_err(|e| {

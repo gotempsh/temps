@@ -18,11 +18,14 @@
 //!
 //! Not atomic: a failed import can leave part of the keys behind.
 
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
+use tracing::{info, warn};
 
 use super::{RedisConfig, RedisService};
 use crate::data_import::source::{parse_source_url, scrub_secrets, SourceUrlRules};
@@ -54,6 +57,23 @@ const SOURCE_RULES: SourceUrlRules<'static> = SourceUrlRules {
     default_database: Some("0"),
 };
 
+/// Release the logical database of resource `ARGV[2]` for import run
+/// `ARGV[1]`: only while the claim (`KEYS[1]`) is `"{run}:{db}"` for the db
+/// the mapping (`KEYS[2]`) points to and the db's owner key (`ARGV[3]` +
+/// db) is still the resource. Flushes the db and removes mapping, owner and
+/// claim, all in one atomic step. Returns 1 when it released.
+const RELEASE_SCRIPT: &str = "\
+    local db = redis.call('GET', KEYS[2]) \
+    if not db then return 0 end \
+    if redis.call('GET', KEYS[1]) ~= ARGV[1] .. ':' .. db then return 0 end \
+    local owner = ARGV[3] .. db \
+    if redis.call('GET', owner) ~= ARGV[2] then return 0 end \
+    redis.call('DEL', KEYS[1], KEYS[2], owner) \
+    redis.call('SELECT', tonumber(db)) \
+    redis.call('FLUSHDB') \
+    redis.call('SELECT', 0) \
+    return 1";
+
 const PRODUCER: &str = "python3 -I -c \"$TEMPS_IMPORT_REDIS_SCRIPT\" produce";
 const CONSUMER: &str = "python3 -I -c \"$TEMPS_IMPORT_REDIS_SCRIPT\" consume";
 
@@ -83,7 +103,8 @@ impl RedisService {
     }
 
     /// Allocate (or find) the logical database of `resource`, exactly as
-    /// provisioning does.
+    /// provisioning does; `import_run` is set when the run holds a pending
+    /// claim on it (see [`RedisService::allocate_database_for`]).
     ///
     /// The allocation claims a DB (`SETNX` on its owner key) and then records
     /// the resource's mapping in separate commands; dropping it between the
@@ -91,43 +112,153 @@ impl RedisService {
     /// another allocation nor `drop_database` would ever release. So it runs
     /// to completion in its own task — on a dedicated engine instance holding
     /// the same configuration — and only the import's wait for it is
-    /// bounded. If the wait runs out, the allocation still finishes
-    /// consistently in the background, and a retry of the import reuses the
-    /// DB it allocated.
+    /// bounded, by `wait`.
+    ///
+    /// If the import stops waiting and the allocation later completes, the
+    /// task gives the database back itself while the run's claim is still
+    /// there: the import has already failed and nobody else uses it. A
+    /// handshake on `state` makes sure exactly one side — the waiter or the
+    /// task — handles a completion that races the timeout.
     async fn import_allocate(
         &self,
         service: &str,
         redis: &RedisConfig,
         resource: &str,
+        import_run: Option<i32>,
+        wait: Duration,
     ) -> Result<u8, DataImportError> {
+        const RUNNING: u8 = 0;
+        const DONE: u8 = 1;
+        const ABANDONED: u8 = 2;
+
         let operation = format!("allocate a logical database for '{resource}'");
-        let allocator = RedisService::new(self.name.clone(), self.docker.clone());
-        *allocator.config.write().await = Some(redis.clone());
+        let worker = RedisService::new(self.name.clone(), self.docker.clone());
+        *worker.config.write().await = Some(redis.clone());
+        let state = Arc::new(AtomicU8::new(RUNNING));
+        let task_state = state.clone();
         let owned_resource = resource.to_string();
-        let allocation =
-            tokio::spawn(async move { allocator.allocate_database(&owned_resource).await });
-        match tokio::time::timeout(TARGET_STEP_TIMEOUT, allocation).await {
-            Ok(Ok(Ok(db_number))) => Ok(db_number),
-            Ok(Ok(Err(e))) => Err(DataImportError::target(
+        let mut task = tokio::spawn(async move {
+            let allocated = worker
+                .allocate_database_for(&owned_resource, import_run)
+                .await;
+            let abandoned = task_state
+                .compare_exchange(RUNNING, DONE, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err();
+            if let (true, Ok(db_number), Some(run_id)) = (abandoned, &allocated, import_run) {
+                match tokio::time::timeout(
+                    ADMIN_TIMEOUT,
+                    worker.release_claimed(&owned_resource, run_id),
+                )
+                .await
+                {
+                    Ok(Ok(true)) => info!(
+                        run_id,
+                        resource = %owned_resource,
+                        db_number,
+                        "Released the Redis DB an abandoned import allocation created"
+                    ),
+                    Ok(Ok(false)) => {}
+                    Ok(Err(e)) => warn!(
+                        run_id,
+                        resource = %owned_resource,
+                        error = %e,
+                        "Could not release the Redis DB an abandoned import allocation created"
+                    ),
+                    Err(_) => warn!(
+                        run_id,
+                        resource = %owned_resource,
+                        "Releasing the Redis DB an abandoned import allocation created timed out"
+                    ),
+                }
+            }
+            allocated
+        });
+        let joined = match tokio::time::timeout(wait, &mut task).await {
+            Ok(joined) => joined,
+            Err(_) => {
+                if state
+                    .compare_exchange(RUNNING, ABANDONED, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    let after = if import_run.is_some() {
+                        "the allocation keeps running and gives the database back if it \
+                         completes, so run the import again once Redis responds"
+                    } else {
+                        "the allocation keeps running and completes on its own, so run the \
+                         import again once Redis responds"
+                    };
+                    return Err(DataImportError::target(
+                        service,
+                        &operation,
+                        format!("Redis did not answer within {}s; {after}", wait.as_secs()),
+                    ));
+                }
+                // The allocation finished just as the wait ran out: its
+                // result is ready, and it is the import's to use.
+                task.await
+            }
+        };
+        match joined {
+            Ok(Ok(db_number)) => Ok(db_number),
+            Ok(Err(e)) => Err(DataImportError::target(
                 service,
                 &operation,
                 scrub_secrets(&e.to_string(), std::slice::from_ref(&redis.password)),
             )),
-            Ok(Err(join_error)) => Err(DataImportError::target(
+            Err(join_error) => Err(DataImportError::target(
                 service,
                 &operation,
                 format!("the allocation task stopped unexpectedly: {join_error}"),
             )),
-            Err(_) => Err(DataImportError::target(
-                service,
-                &operation,
-                format!(
-                    "Redis did not answer within {}s; the allocation keeps running and \
-                     completes on its own, so run the import again once Redis responds",
-                    TARGET_STEP_TIMEOUT.as_secs()
-                ),
-            )),
         }
+    }
+
+    /// Allocate a new logical database for `resource` on behalf of import
+    /// run `run_id`. The claim is set to `"{run_id}:pending"` *before*
+    /// allocating; the allocation confirms it atomically with the mapping it
+    /// creates. Provisioning (or another import) adopting the name at any
+    /// point removes it, so the run never holds a confirmed claim on a
+    /// database something else uses.
+    async fn create_claimed(
+        &self,
+        service: &str,
+        redis: &RedisConfig,
+        resource: &str,
+        run_id: i32,
+    ) -> Result<(), DataImportError> {
+        let claim_key = RedisService::import_claim_key(resource);
+        let pending = format!("{run_id}:pending");
+        let mut conn = self.import_connection(service, redis).await?;
+        bounded(service, &format!("claim '{resource}'"), redis, async {
+            redis::cmd("SELECT")
+                .arg(0)
+                .query_async::<()>(&mut conn)
+                .await?;
+            conn.set::<_, _, ()>(&claim_key, &pending).await
+        })
+        .await?;
+        self.import_allocate(service, redis, resource, Some(run_id), TARGET_STEP_TIMEOUT)
+            .await?;
+        Ok(())
+    }
+
+    /// Run [`RELEASE_SCRIPT`] for `resource` and import run `run_id`.
+    /// Returns whether it released anything.
+    async fn release_claimed(&self, resource: &str, run_id: i32) -> anyhow::Result<bool> {
+        let mut conn = self.get_connection().await?;
+        redis::cmd("SELECT")
+            .arg(0)
+            .query_async::<()>(&mut conn)
+            .await?;
+        let released: i64 = redis::Script::new(RELEASE_SCRIPT)
+            .key(RedisService::import_claim_key(resource))
+            .key(RedisService::resource_mapping_key(resource))
+            .arg(run_id)
+            .arg(resource)
+            .arg(RedisService::DATABASE_OWNER_KEY_PREFIX)
+            .invoke_async(&mut conn)
+            .await?;
+        Ok(released == 1)
     }
 
     /// Logical database allocated to `resource`, if any.
@@ -283,20 +414,55 @@ impl DataImportEngine for RedisService {
         })
     }
 
+    /// Besides allocating the logical database, this keeps the claim that
+    /// lets [`Self::release_created_target`] give it back after a failure
+    /// consistent: only a run that created the mapping holds a claim, and
+    /// every other use of the name removes it.
     async fn prepare_target(
         &self,
         config: &ServiceConfig,
         database: &str,
         preparation: TargetPreparation,
+        release_claim: Option<i32>,
     ) -> Result<(), DataImportError> {
         self.validate_target_database(database)?;
-        if preparation == TargetPreparation::UseExisting {
-            return Ok(());
-        }
         let service = config.name.as_str();
         let redis = self.import_hydrate(config).await?;
-        let db_number = self.import_allocate(service, &redis, database).await?;
-        if preparation == TargetPreparation::Recreate {
+        if preparation == TargetPreparation::UseExisting {
+            // Adopt it like provisioning does: an earlier failed run whose
+            // release is still pending can no longer release it.
+            let mut conn = self.import_connection(service, &redis).await?;
+            let adopted = bounded(service, &format!("adopt '{database}'"), &redis, async {
+                redis::cmd("SELECT")
+                    .arg(0)
+                    .query_async::<()>(&mut conn)
+                    .await?;
+                RedisService::adopt_resource(&mut conn, database).await
+            })
+            .await?;
+            if adopted.is_none() {
+                return Err(DataImportError::target(
+                    service,
+                    format!("use the logical database of '{database}'"),
+                    "it was released after this import was planned; run the import again"
+                        .to_string(),
+                ));
+            }
+            return Ok(());
+        }
+        if preparation == TargetPreparation::Create {
+            if let Some(run_id) = release_claim {
+                return self.create_claimed(service, &redis, database, run_id).await;
+            }
+            // Kept whatever happens: allocate like provisioning, unclaimed.
+            self.import_allocate(service, &redis, database, None, TARGET_STEP_TIMEOUT)
+                .await?;
+            return Ok(());
+        }
+        let db_number = self
+            .import_allocate(service, &redis, database, None, TARGET_STEP_TIMEOUT)
+            .await?;
+        {
             let mut conn = self.import_connection(service, &redis).await?;
             let operation = format!("flush '{database}' (DB {db_number})");
             bounded(service, &operation, &redis, async {
@@ -309,6 +475,40 @@ impl DataImportEngine for RedisService {
             .await?;
         }
         Ok(())
+    }
+
+    /// One atomic script: release only while this run's claim still names
+    /// the database the resource maps to and the database is still owned by
+    /// the resource. Atomicity is what makes a late release harmless — one
+    /// that runs after the import stopped waiting for it (and a retry or a
+    /// deployment adopted the name) finds the claim gone and does nothing.
+    async fn release_created_target(
+        &self,
+        config: &ServiceConfig,
+        database: &str,
+        run_id: i32,
+    ) -> Result<bool, DataImportError> {
+        self.validate_target_database(database)?;
+        let service = config.name.as_str();
+        let redis = self.import_hydrate(config).await?;
+        let operation = format!("release the logical database of '{database}'");
+        match tokio::time::timeout(ADMIN_TIMEOUT, self.release_claimed(database, run_id)).await {
+            Ok(Ok(released)) => Ok(released),
+            Ok(Err(e)) => Err(DataImportError::target(
+                service,
+                &operation,
+                scrub_secrets(&e.to_string(), std::slice::from_ref(&redis.password)),
+            )),
+            Err(_) => Err(DataImportError::target(
+                service,
+                &operation,
+                format!("timed out after {}s", ADMIN_TIMEOUT.as_secs()),
+            )),
+        }
+    }
+
+    fn releases_created_target(&self) -> bool {
+        true
     }
 
     fn target_container(&self, config: &ServiceConfig) -> Result<String, DataImportError> {
@@ -604,7 +804,7 @@ mod tests {
                 target_cli(docker, &target.name, "-n 1 SET stale 1").await;
             }
             engine
-                .prepare_target(&config, "storefront_production", preparation)
+                .prepare_target(&config, "storefront_production", preparation, Some(1))
                 .await
                 .expect("prepare");
             let parsed = engine.parse_source(&source_url).expect("source");
@@ -739,6 +939,324 @@ mod tests {
                 .failure_hint(&output)
                 .is_some_and(|hint| hint.contains("user name or password")),
             "{output}"
+        );
+
+        // A failed import that created its target gives the logical DB back:
+        // flushed, unmapped and unclaimed, so the pool shared with
+        // provisioning does not shrink with every failed attempt.
+        assert!(engine.releases_created_target());
+        let inspection = engine
+            .inspect_target(&config, "abandoned_import")
+            .await
+            .expect("inspect");
+        assert_eq!(
+            plan_target_preparation(1, "abandoned_import", inspection, false, "key").expect("plan"),
+            TargetPreparation::Create
+        );
+        engine
+            .prepare_target(
+                &config,
+                "abandoned_import",
+                TargetPreparation::Create,
+                Some(1),
+            )
+            .await
+            .expect("prepare");
+        assert_eq!(
+            target_cli(
+                docker,
+                &target.name,
+                "-n 0 GET _temps:redis_db_mapping:abandoned_import"
+            )
+            .await,
+            "2"
+        );
+        target_cli(docker, &target.name, "-n 2 SET partial 1").await;
+        assert!(engine
+            .release_created_target(&config, "abandoned_import", 1)
+            .await
+            .expect("release"));
+        assert_eq!(
+            target_cli(
+                docker,
+                &target.name,
+                "-n 0 EXISTS _temps:redis_db_mapping:abandoned_import"
+            )
+            .await,
+            "0"
+        );
+        assert_eq!(
+            target_cli(docker, &target.name, "-n 0 EXISTS _temps:redis_db_owner:2").await,
+            "0"
+        );
+        assert_eq!(target_cli(docker, &target.name, "-n 2 DBSIZE").await, "0");
+        assert!(
+            !engine
+                .inspect_target(&config, "abandoned_import")
+                .await
+                .expect("inspect")
+                .exists
+        );
+        // The imported database next to it is untouched.
+        assert_eq!(
+            target_cli(docker, &target.name, "-n 1 DBSIZE").await,
+            "5006"
+        );
+        assert_eq!(
+            target_cli(
+                docker,
+                &target.name,
+                "-n 0 GET _temps:redis_db_mapping:storefront_production"
+            )
+            .await,
+            "1"
+        );
+        // The freed number is handed out again.
+        engine
+            .prepare_target(&config, "next_import", TargetPreparation::Create, Some(1))
+            .await
+            .expect("prepare");
+        assert_eq!(
+            target_cli(
+                docker,
+                &target.name,
+                "-n 0 GET _temps:redis_db_mapping:next_import"
+            )
+            .await,
+            "2"
+        );
+
+        // A release that arrives late (after the import stopped waiting for
+        // it) must not touch a database something else adopted meanwhile.
+        // `next_import` was created by run 1 and holds its claim.
+        let mapping = |name: &str| format!("-n 0 GET _temps:redis_db_mapping:{name}");
+
+        // 1. A retry of the import adopts the name (UseExisting): the old
+        //    run's release finds its claim gone.
+        engine
+            .prepare_target(&config, "next_import", TargetPreparation::UseExisting, None)
+            .await
+            .expect("retry adopts");
+        target_cli(docker, &target.name, "-n 2 SET retry-data 1").await;
+        assert!(!engine
+            .release_created_target(&config, "next_import", 1)
+            .await
+            .expect("late release"));
+        assert_eq!(
+            target_cli(docker, &target.name, &mapping("next_import")).await,
+            "2"
+        );
+        assert_eq!(
+            target_cli(docker, &target.name, "-n 2 GET retry-data").await,
+            "1"
+        );
+
+        // 2. Provisioning adopts a name a run created.
+        engine
+            .prepare_target(
+                &config,
+                "deployed_meanwhile",
+                TargetPreparation::Create,
+                Some(3),
+            )
+            .await
+            .expect("prepare");
+        let adopted = engine
+            .allocate_database("deployed_meanwhile")
+            .await
+            .expect("provisioning allocation");
+        target_cli(
+            docker,
+            &target.name,
+            &format!("-n {adopted} SET app-data 1"),
+        )
+        .await;
+        assert!(!engine
+            .release_created_target(&config, "deployed_meanwhile", 3)
+            .await
+            .expect("release"));
+        assert_eq!(
+            target_cli(docker, &target.name, &format!("-n {adopted} GET app-data")).await,
+            "1"
+        );
+
+        // 3. A name provisioning mapped before the run allocated it: the run
+        //    reused the mapping, so it never holds a claim.
+        let provisioned = engine
+            .allocate_database("provisioned_first")
+            .await
+            .expect("provisioning allocation");
+        engine
+            .prepare_target(
+                &config,
+                "provisioned_first",
+                TargetPreparation::Create,
+                Some(4),
+            )
+            .await
+            .expect("prepare");
+        assert_eq!(
+            target_cli(
+                docker,
+                &target.name,
+                "-n 0 GET _temps:redis_import_claim:provisioned_first"
+            )
+            .await,
+            "4:pending",
+            "a reused mapping never confirms the claim"
+        );
+        assert!(!engine
+            .release_created_target(&config, "provisioned_first", 4)
+            .await
+            .expect("release"));
+        assert_eq!(
+            target_cli(docker, &target.name, &mapping("provisioned_first")).await,
+            provisioned.to_string()
+        );
+
+        // 4. Another run's id never releases; the run's own does.
+        engine
+            .prepare_target(&config, "someone_elses", TargetPreparation::Create, Some(5))
+            .await
+            .expect("prepare");
+        assert!(!engine
+            .release_created_target(&config, "someone_elses", 6)
+            .await
+            .expect("release"));
+        assert!(engine
+            .release_created_target(&config, "someone_elses", 5)
+            .await
+            .expect("release"));
+
+        // 5. A retry planned (UseExisting) before the old run's release went
+        //    through fails cleanly instead of writing into an unmapped
+        //    database.
+        engine
+            .prepare_target(
+                &config,
+                "released_under_retry",
+                TargetPreparation::Create,
+                Some(7),
+            )
+            .await
+            .expect("prepare");
+        assert!(engine
+            .release_created_target(&config, "released_under_retry", 7)
+            .await
+            .expect("release"));
+        let refused = engine
+            .prepare_target(
+                &config,
+                "released_under_retry",
+                TargetPreparation::UseExisting,
+                None,
+            )
+            .await
+            .expect_err("nothing to adopt");
+        assert!(
+            refused.to_string().contains("run the import again"),
+            "{refused}"
+        );
+
+        // 6. An allocation the import stopped waiting for (Redis stalled)
+        //    gives its database back once it completes. FLUSHDB only runs
+        //    inside the release script, so its call count proves the release
+        //    ran rather than the allocation never happening.
+        let flush_calls = |stats: String| -> u64 {
+            stats
+                .lines()
+                .find_map(|line| line.strip_prefix("cmdstat_flushdb:calls="))
+                .and_then(|rest| rest.split(',').next())
+                .and_then(|calls| calls.parse().ok())
+                .unwrap_or(0)
+        };
+        let flushes_before =
+            flush_calls(target_cli(docker, &target.name, "INFO commandstats").await);
+        target_cli(
+            docker,
+            &target.name,
+            "-n 0 SET _temps:redis_import_claim:abandoned_wait 9:pending",
+        )
+        .await;
+        let redis_config = engine.import_hydrate(&config).await.expect("hydrate");
+        docker
+            .docker
+            .pause_container(&target.name)
+            .await
+            .expect("pause target");
+        let gave_up = engine
+            .import_allocate(
+                "e2e",
+                &redis_config,
+                "abandoned_wait",
+                Some(9),
+                Duration::from_secs(1),
+            )
+            .await;
+        docker
+            .docker
+            .unpause_container(&target.name)
+            .await
+            .expect("unpause target");
+        let error = gave_up.expect_err("the wait runs out while Redis is paused");
+        assert!(
+            error.to_string().contains("gives the database back"),
+            "{error}"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let flushes = flush_calls(target_cli(docker, &target.name, "INFO commandstats").await);
+            let mapped = target_cli(docker, &target.name, &mapping("abandoned_wait")).await;
+            if flushes > flushes_before && mapped.is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "abandoned allocation was not released (flushes {flushes_before} -> {flushes}, mapping {mapped:?})"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        assert_eq!(
+            target_cli(
+                docker,
+                &target.name,
+                "-n 0 EXISTS _temps:redis_import_claim:abandoned_wait"
+            )
+            .await,
+            "0"
+        );
+
+        // 7. A run that must keep what it creates (a linked environment
+        //    resolves to the name) creates it unclaimed: nothing, not even
+        //    the run itself, can release it.
+        engine
+            .prepare_target(
+                &config,
+                "kept_for_environment",
+                TargetPreparation::Create,
+                None,
+            )
+            .await
+            .expect("prepare");
+        assert_eq!(
+            target_cli(
+                docker,
+                &target.name,
+                "-n 0 EXISTS _temps:redis_import_claim:kept_for_environment"
+            )
+            .await,
+            "0"
+        );
+        for run_id in [0, 1, 10] {
+            assert!(!engine
+                .release_created_target(&config, "kept_for_environment", run_id)
+                .await
+                .expect("release"));
+        }
+        assert!(
+            !target_cli(docker, &target.name, &mapping("kept_for_environment"))
+                .await
+                .is_empty()
         );
     }
 }
