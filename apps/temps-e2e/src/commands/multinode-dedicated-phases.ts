@@ -21,7 +21,7 @@
  *      the dedicated exclusion does not turn into an anti-affinity shortfall.
  *   4. a SELECTOR-ONLY deployment (`target_labels` matching the worker's
  *      labels, no `target_nodes`) fails with the dedicated-node error instead
- *      of landing on the worker
+ *      of landing on the worker, before any of its jobs runs
  *   5. the same environment PINNED to the worker (`target_nodes`, selector
  *      kept) lands on the worker's own Docker, not the control plane's
  *   6. sandbox placement lists the worker as dedicated; with the allow-list
@@ -93,9 +93,22 @@ const RELABEL_TIMEOUT_MS = 15 * 60_000
 const DEPLOY_TIMEOUT_MS = 5 * 60_000
 const DEDICATED_EXCLUSION = `is dedicated (${NODE_ROLE_LABEL}=${DEDICATED_NODE_ROLE})`
 
-/** jq program that adds the dedicated role to an agent config, keeping every other label. */
-export function dedicatedLabelJq(): string {
-  return `.labels = ((.labels // {}) + {"${NODE_ROLE_LABEL}": "${DEDICATED_NODE_ROLE}"})`
+/**
+ * `agent.json` with the dedicated role added to its labels, every other key
+ * and label kept. Throws rather than guessing on anything that is not an
+ * agent config, so a bad file fails the step instead of being overwritten.
+ */
+export function withDedicatedRole(agentJson: string): string {
+  const config: unknown = JSON.parse(agentJson)
+  if (!config || typeof config !== 'object' || Array.isArray(config)) {
+    throw new Error(`agent.json is not a JSON object: ${agentJson.slice(0, 200)}`)
+  }
+  const { labels } = config as { labels?: unknown }
+  if (labels !== undefined && labels !== null && (typeof labels !== 'object' || Array.isArray(labels))) {
+    throw new Error(`agent.json "labels" is not an object: ${JSON.stringify(labels)}`)
+  }
+  const merged = { ...((labels as Record<string, unknown> | null | undefined) ?? {}), [NODE_ROLE_LABEL]: DEDICATED_NODE_ROLE }
+  return `${JSON.stringify({ ...config, labels: merged }, null, 2)}\n`
 }
 
 /** Whether a node's labels (as returned by GET /internal/nodes) carry the dedicated role. */
@@ -109,11 +122,37 @@ export function projectContainers(names: readonly string[], projectSlug: string)
   return names.filter((name) => name.includes(projectSlug))
 }
 
+export interface TrackedResources {
+  deployments: { projectId: number; deploymentId: number }[]
+  projectIds: number[]
+}
+
+/**
+ * Tear `tracked` down with `run`, forgetting the resources only when that
+ * succeeds. A failed teardown leaves every record in place for the next
+ * attempt, which re-runs it in full (removing something already gone is
+ * reported, not fatal).
+ */
+export async function teardownTracked(
+  tracked: TrackedResources,
+  run: (resources: TrackedResources) => Promise<{ errors: string[] }>,
+): Promise<string[]> {
+  if (tracked.deployments.length === 0 && tracked.projectIds.length === 0) return []
+  const { errors } = await run({ deployments: [...tracked.deployments], projectIds: [...tracked.projectIds] })
+  if (errors.length === 0) {
+    tracked.deployments.length = 0
+    tracked.projectIds.length = 0
+  }
+  return errors
+}
+
 export async function runMultinodeDedicatedPhases(ctx: DedicatedPhaseContext): Promise<void> {
   const { client, step, log, runCaptured, workerNodeId, workerName, dockerPsNames } = ctx
   const api = new SandboxApi(ctx.cfg)
   const projectIds: number[] = []
   const deployments: { projectId: number; deploymentId: number }[] = []
+  const tracked: TrackedResources = { deployments, projectIds }
+  const teardownAll = () => teardownTracked(tracked, (resources) => teardown(client, resources))
   const straySandboxes: string[] = []
   let placementTouched = false
 
@@ -192,17 +231,20 @@ export async function runMultinodeDedicatedPhases(ctx: DedicatedPhaseContext): P
       `mark '${workerName}' dedicated: add ${NODE_ROLE_LABEL}=${DEDICATED_NODE_ROLE} to its agent.json labels and restart its agent`,
       async () => {
         const before = (await workerNode())?.last_heartbeat ?? ''
-        const edit = await runCaptured([
-          'docker',
-          'exec',
-          ctx.workerContainer,
-          'sh',
-          '-ec',
-          // Rewrite in place (cat >) so the file keeps its owner and 0600 mode.
-          `jq '${dedicatedLabelJq()}' /root/.temps/agent.json > /root/.temps/agent.json.dedicated && cat /root/.temps/agent.json.dedicated > /root/.temps/agent.json && rm /root/.temps/agent.json.dedicated`,
-        ])
-        if (edit.code !== 0) {
-          throw new Error(`could not add the dedicated label to ${workerName}'s agent.json: ${edit.stderr.trim() || edit.stdout.trim()}`)
+        const agentJson = '/root/.temps/agent.json'
+        const read = await runCaptured(['docker', 'exec', ctx.workerContainer, 'cat', agentJson])
+        if (read.code !== 0) {
+          throw new Error(`could not read ${workerName}'s ${agentJson}: ${read.stderr.trim() || read.stdout.trim()}`)
+        }
+        // Rewrite in place (cat >) so the file keeps its owner and 0600 mode.
+        const write = Bun.spawn(['docker', 'exec', '-i', ctx.workerContainer, 'sh', '-c', `cat > ${agentJson}`], {
+          stdin: new Blob([withDedicatedRole(read.stdout)]),
+          stdout: 'pipe',
+          stderr: 'pipe',
+        })
+        const [writeCode, writeErr] = await Promise.all([write.exited, new Response(write.stderr).text()])
+        if (writeCode !== 0) {
+          throw new Error(`could not write the dedicated label to ${workerName}'s ${agentJson}: ${writeErr.trim()}`)
         }
         const restart = await runCaptured(['docker', 'restart', '-t', '20', ctx.workerContainer])
         if (restart.code !== 0) {
@@ -318,9 +360,21 @@ export async function runMultinodeDedicatedPhases(ctx: DedicatedPhaseContext): P
       if (!text.includes('No eligible node for this deployment') || !text.includes(expected)) {
         throw new Error(`deployment ${deploymentId} failed ("${status.state}") without the dedicated-node error naming "${expected}":\n${text.slice(-1500)}`)
       }
+      // Placement is checked as the workflow is assembled, so the image is
+      // never pulled or built for a deployment that has nowhere to run.
+      const jobs = unwrap(
+        await getDeploymentJobs({ client, path: { project_id: selected.project.id, deployment_id: deploymentId } }),
+        `getDeploymentJobs(${deploymentId})`,
+      ).jobs
+      const started = jobs.filter((job) => job.status !== 'cancelled')
+      if (jobs.length === 0 || started.length > 0) {
+        throw new Error(
+          `deployment ${deploymentId} must fail before any job runs; jobs: ${JSON.stringify(jobs.map((job) => [job.job_id, job.status]))}`,
+        )
+      }
       const worker = projectContainers(await dockerPsNames(ctx.workerContainer), selected.project.slug)
       if (worker.length > 0) throw new Error(`a container still landed on the worker: [${worker.join(', ')}]`)
-      log(`  failed as expected: ...${expected}...`)
+      log(`  failed as expected before ${jobs.length} job(s) ran: ...${expected}...`)
     })
 
     await step(`pin the same environment to '${workerName}' (target_nodes=[${workerNodeId}], selector kept)`, async () => {
@@ -376,8 +430,9 @@ export async function runMultinodeDedicatedPhases(ctx: DedicatedPhaseContext): P
     })
 
     await step(`tear the dedicated-phase applications down and drain '${workerName}' again for removal`, async () => {
-      const cleanup = await teardown(client, { deployments: deployments.splice(0), projectIds: projectIds.splice(0) })
-      if (cleanup.errors.length) throw new Error(cleanup.errors.join('; '))
+      // On failure the records stay, and the cleanup below retries them.
+      const errors = await teardownAll()
+      if (errors.length) throw new Error(errors.join('; '))
       await waitForPlacement(selected.project.slug, (p) => p.worker.length === 0, `the pinned container to leave ${workerName}`)
       unwrap(await adminDrainNode({ client, path: { node_id: workerNodeId } }), 'adminDrainNode')
       await pollUntil(
@@ -404,9 +459,6 @@ export async function runMultinodeDedicatedPhases(ctx: DedicatedPhaseContext): P
       const res = await api.setPlacement(null)
       if (res.status !== 200) log(`    ! cleanup: restore sandbox allow-list to null: ${describeResult(res)}`)
     }
-    if (deployments.length || projectIds.length) {
-      const cleanup = await teardown(client, { deployments, projectIds })
-      for (const error of cleanup.errors) log(`    ! cleanup: ${error}`)
-    }
+    for (const error of await teardownAll()) log(`    ! cleanup: ${error}`)
   }
 }

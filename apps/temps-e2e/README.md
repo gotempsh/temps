@@ -1361,7 +1361,8 @@ tears the whole thing down at the end. It does NOT accept `--url`/
     - a **selector-only** application (`target_labels`
       `temps.sh/role=dedicated`, no `target_nodes`) must fail with `No
       eligible node for this deployment: node <id> (worker-1) is dedicated
-      ...` and start nothing on the worker.
+      ...` before any of its jobs runs (every job `cancelled`, so nothing is
+      pulled or built) and start nothing on the worker.
     - the same environment **pinned** with `target_nodes: [worker]` (selector
       kept) must land on the worker and not on the control plane.
     - `GET /v1/sandboxes/placement` lists the worker with `dedicated: true`;
@@ -1370,7 +1371,8 @@ tears the whole thing down at the end. It does NOT accept `--url`/
     - tear those applications down and drain the worker again.
 
     Cleanup always restores the sandbox allow-list to `null` and removes the
-    applications this phase created.
+    applications this phase created, retrying any the last step failed to
+    remove.
 15. remove the worker node (`DELETE /internal/nodes/{id}`); confirm it's
     gone from `GET /internal/nodes`.
 16. teardown (in a `finally`, same discipline as every other scenario):
