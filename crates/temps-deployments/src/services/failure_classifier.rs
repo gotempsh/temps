@@ -1659,6 +1659,27 @@ mod tests {
         assert_class(&unplannable, S::Configuration, C::InvalidConfiguration);
     }
 
+    /// A configured root directory the checkout lacks is a configuration
+    /// problem, at the source stage or (defensively) at the build stage.
+    #[test]
+    fn missing_project_directory_is_invalid_configuration() {
+        let download = wrapped(
+            "download_repo",
+            "Job validation failed: Invalid configuration: the project's root directory 'examples/starters/python/flask' is not in the checked-out source: 'examples/starters' has no 'python'; it contains go, node. Checked qa/app at main. Change the root directory in the project's Git settings, or deploy a ref that contains it.",
+        );
+        assert_class(&download, S::Configuration, C::InvalidConfiguration);
+        let submodule = wrapped(
+            "download_repo",
+            "Job validation failed: Invalid configuration: the project's root directory 'services/api' is inside Git submodule 'services/api', a separate repository whose files are not fetched with this one. Deploy the submodule's own repository instead, or commit its files into this one. Checked qa/app at main.",
+        );
+        assert_class(&submodule, S::Configuration, C::InvalidConfiguration);
+        let build = wrapped(
+            "build_image",
+            "Job validation failed: Invalid configuration: build context 'examples/starters/go/gin' is not in the checked-out source at '/tmp/temps-deployments/deployment-1-1/repository'. Check the project's root directory and build context settings",
+        );
+        assert_class(&build, S::Configuration, C::InvalidConfiguration);
+    }
+
     #[test]
     fn compose_service_build_specific_cause_wins() {
         let reason = wrapped(

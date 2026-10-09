@@ -1194,9 +1194,19 @@ impl BuildImageJob {
             .repo_dir
             .canonicalize()
             .map_err(WorkflowError::IoError)?;
-        let canonical_context = build_context
-            .canonicalize()
-            .map_err(WorkflowError::IoError)?;
+        let canonical_context = build_context.canonicalize().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                // Name the path instead of a bare "No such file or directory".
+                WorkflowError::JobValidationFailed(format!(
+                    "Invalid configuration: build context '{}' is not in the checked-out source \
+                     at '{}'. Check the project's root directory and build context settings",
+                    self.build_config.build_context.as_deref().unwrap_or("."),
+                    repo_output.repo_dir.display()
+                ))
+            } else {
+                WorkflowError::IoError(error)
+            }
+        })?;
         if !canonical_context.starts_with(&canonical_root) {
             return Err(WorkflowError::JobValidationFailed(format!(
                 "Build context '{}' escapes source root '{}'",
@@ -2968,6 +2978,32 @@ mod tests {
 
         let error = job.build_image(&repo, &context).await.unwrap_err();
         assert!(matches!(error, WorkflowError::JobValidationFailed(_)));
+    }
+
+    /// A configured nested directory missing from the checkout names the
+    /// path and the setting to fix, not a bare "No such file or directory".
+    #[tokio::test]
+    async fn missing_build_context_names_the_configured_directory() {
+        let builder = Arc::new(RecordingImageBuilder::default());
+        let job = BuildImageJobBuilder::new()
+            .job_id("build".to_string())
+            .download_job_id("download_repo".to_string())
+            .image_tag("myapp:latest".to_string())
+            .build_context("examples/starters/go/gin".to_string())
+            .build(builder.clone())
+            .unwrap();
+        let (_dir, repo) = repo_with_dockerfile();
+        let context = crate::test_utils::create_test_context("wf".to_string(), 1, 1, 1);
+
+        let error = job.build_image(&repo, &context).await.unwrap_err();
+        let message = error.to_string();
+        assert!(
+            matches!(error, WorkflowError::JobValidationFailed(_)),
+            "{message}"
+        );
+        assert!(message.contains("examples/starters/go/gin"), "{message}");
+        assert!(message.contains("Invalid configuration"), "{message}");
+        assert!(builder.builds().is_empty());
     }
 
     #[cfg(unix)]

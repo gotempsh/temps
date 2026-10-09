@@ -44,6 +44,8 @@ By default, Temps clones the entire repository and uses your specified directory
 
 If the app does not need files outside that subdirectory (no workspace lockfile, no shared packages, no repository-root files), enable **Pull only the root directory** on Git settings. Deploy then sparse-checkouts that path only. Leave it off when the build still needs the rest of the tree — Turborepo, pnpm workspaces, root lockfiles, and Dockerfiles that `COPY` sibling packages all do.
 
+If the deployed branch or commit does not contain the root directory, the deployment stops at **Download Repository** and says which part of the path is missing and which directories exist there (for example a case mismatch, or a directory that is a Git submodule, which is not fetched).
+
 ---
 
 ## Monorepo tool detection {{ anchor: true, id: 'tool-detection' }}
