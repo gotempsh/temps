@@ -319,7 +319,7 @@ export const ProtectedLayout = ({
               <span>
                 Still not working? Check the{' '}
                 <a
-                  href="https://docs.temps.sh"
+                  href="https://temps.sh/docs"
                   target="_blank"
                   rel="noreferrer"
                   className="inline-flex items-center gap-1 font-medium text-foreground underline-offset-4 hover:underline"

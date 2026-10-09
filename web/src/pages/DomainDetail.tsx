@@ -99,7 +99,7 @@ import {
   XCircle,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { useNavigate, useParams } from 'react-router'
+import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 
 type ChallengeData = {
@@ -268,7 +268,7 @@ export function DomainDetail() {
         domain?.status === 'pending_http'),
   })
 
-  const { data: dnsProviders } = useQuery({
+  const dnsProvidersQuery = useQuery({
     ...listProvidersOptions(),
     enabled:
       !!domain &&
@@ -757,7 +757,11 @@ export function DomainDetail() {
                         records={dnsTxtRecords}
                       />
                       <DnsAutoProvision
-                        providers={dnsProviders ?? []}
+                        providers={dnsProvidersQuery.data ?? []}
+                        loading={dnsProvidersQuery.isLoading}
+                        failed={dnsProvidersQuery.isError}
+                        retrying={dnsProvidersQuery.isFetching}
+                        onRetry={() => dnsProvidersQuery.refetch()}
                         selectedProvider={selectedDnsProvider}
                         onProviderChange={setSelectedDnsProvider}
                         onSetup={handleSetupDnsRecords}
@@ -1492,6 +1496,10 @@ function DnsRecordsList({
 
 function DnsAutoProvision({
   providers,
+  loading,
+  failed,
+  retrying,
+  onRetry,
   selectedProvider,
   onProviderChange,
   onSetup,
@@ -1499,16 +1507,18 @@ function DnsAutoProvision({
   canManage,
 }: {
   providers: DnsProviderResponse[]
+  loading: boolean
+  failed: boolean
+  retrying: boolean
+  onRetry: () => void
   selectedProvider: string
   onProviderChange: (value: string) => void
   onSetup: () => void
   pending: boolean
   canManage: boolean
 }) {
-  if (providers.length === 0) return null
-
   return (
-    <div className="flex flex-col gap-3 rounded-lg border border-gray-950/10 bg-muted/40 p-4 sm:flex-row sm:items-center">
+    <div className="flex flex-col gap-3 rounded-md bg-muted/40 p-4 sm:flex-row sm:items-center">
       <div className="flex flex-1 items-start gap-3">
         <div className="shrink-0 rounded-md bg-primary/10 p-2">
           <Wand2 className="size-4 text-primary" />
@@ -1520,38 +1530,83 @@ function DnsAutoProvision({
           </p>
         </div>
       </div>
-      <div className="flex flex-col gap-2 sm:shrink-0 sm:flex-row">
-        <Select value={selectedProvider} onValueChange={onProviderChange}>
-          <SelectTrigger className="w-full sm:w-[200px]">
-            <SelectValue placeholder="Select provider" />
-          </SelectTrigger>
-          <SelectContent>
-            {providers.map((provider) => (
-              <SelectItem key={provider.id} value={provider.id.toString()}>
-                {provider.name} ({provider.provider_type})
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-        <Button
-          size="sm"
-          variant="outline"
-          onClick={onSetup}
-          disabled={!selectedProvider || pending || !canManage}
-        >
-          {pending ? (
-            <>
-              <Loader2 className="mr-2 size-4 animate-spin" />
-              Creating…
-            </>
-          ) : (
-            <>
-              <Wand2 className="mr-2 size-4" />
-              Auto-create
-            </>
+      {loading && providers.length === 0 ? (
+        <Skeleton
+          className="h-8 w-full sm:w-48"
+          aria-label="Loading DNS providers"
+        />
+      ) : failed && providers.length === 0 ? (
+        <div className="space-y-2">
+          <p role="alert" className="text-sm text-destructive">
+            Could not load DNS providers. Try again.
+          </p>
+          <Button
+            size="sm"
+            variant="outline"
+            aria-disabled={retrying}
+            onClick={() => {
+              if (!retrying) onRetry()
+            }}
+          >
+            {retrying ? 'Retrying…' : 'Retry DNS providers'}
+          </Button>
+        </div>
+      ) : providers.length === 0 ? (
+        <div className="space-y-2">
+          <p className="text-sm text-muted-foreground">
+            No DNS provider is configured. Add one to create these TXT records
+            automatically.
+          </p>
+          <Button size="sm" variant="outline" asChild>
+            <Link to="/dns-providers">Add DNS provider</Link>
+          </Button>
+        </div>
+      ) : (
+        <div className="flex flex-col gap-2 sm:shrink-0 sm:flex-row">
+          {failed && (
+            <Button
+              size="sm"
+              variant="outline"
+              aria-disabled={retrying}
+              onClick={() => {
+                if (!retrying) onRetry()
+              }}
+            >
+              {retrying ? 'Retrying…' : 'Retry DNS providers'}
+            </Button>
           )}
-        </Button>
-      </div>
+          <Select value={selectedProvider} onValueChange={onProviderChange}>
+            <SelectTrigger className="w-full sm:w-[200px]">
+              <SelectValue placeholder="Select provider" />
+            </SelectTrigger>
+            <SelectContent>
+              {providers.map((provider) => (
+                <SelectItem key={provider.id} value={provider.id.toString()}>
+                  {provider.name} ({provider.provider_type})
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={onSetup}
+            disabled={!selectedProvider || pending || !canManage}
+          >
+            {pending ? (
+              <>
+                <Loader2 className="mr-2 size-4 animate-spin" />
+                Creating…
+              </>
+            ) : (
+              <>
+                <Wand2 className="mr-2 size-4" />
+                Auto-create
+              </>
+            )}
+          </Button>
+        </div>
+      )}
     </div>
   )
 }

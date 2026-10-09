@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useState } from 'react'
+import { Link } from 'react-router'
 import { ChevronDown, ChevronRight, Terminal } from 'lucide-react'
 
 import {
@@ -127,6 +128,19 @@ interface CreateSandboxDocsProps {
   variant?: Variant
 }
 
+export function SandboxRestIntro() {
+  return (
+    <p className="text-xs text-muted-foreground">
+      Authenticate with a personal access token (create one under{' '}
+      <Link to="/settings/keys" className="underline">
+        API Keys
+      </Link>
+      ). Full schema is in the OpenAPI spec at{' '}
+      <code className="bg-muted px-1 rounded">/api/openapi.json</code>.
+    </p>
+  )
+}
+
 export function CreateSandboxDocs({
   variant = 'full',
 }: CreateSandboxDocsProps) {
@@ -161,14 +175,7 @@ export function CreateSandboxDocs({
         <CodeBlock code={SANDBOX_WORKSPACE_EXAMPLE} language="bash" />
       </TabsContent>
       <TabsContent value="rest" className="space-y-2">
-        <p className="text-xs text-muted-foreground">
-          Authenticate with a personal access token (create one under{' '}
-          <a href="/keys" className="underline">
-            API Keys
-          </a>
-          ). Full schema is in the OpenAPI spec at{' '}
-          <code className="bg-muted px-1 rounded">/api/openapi.json</code>.
-        </p>
+        <SandboxRestIntro />
         <CodeBlock code={SANDBOX_REST_EXAMPLE} language="bash" />
       </TabsContent>
       <TabsContent value="sdk" className="space-y-2">
