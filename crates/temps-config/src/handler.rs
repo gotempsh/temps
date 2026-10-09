@@ -3,7 +3,7 @@
 
 use crate::disk_status::DiskSpaceCheckResult;
 use crate::service::preserve_provider_credential_proof;
-use crate::{ConfigService, EffectiveTelemetryPolicies};
+use crate::{ConfigService, EffectiveTelemetryPolicies, TrustedPrivateNetworksIntent};
 use axum::{
     extract::{Extension, State},
     http::{header, StatusCode},
@@ -2860,6 +2860,8 @@ async fn update_settings(
     // Dedicated SystemAdmin plugin endpoint owns this consent. Strip it from
     // generic SettingsWrite requests, including full-document round trips.
     discard_plugin_reporting_consent(&mut body);
+    // Capture presence before omitted fields are filled from the cached GET.
+    let trusted_private_networks_sent = body.get("trusted_private_networks").is_some();
     let cloud_fields_sent = CloudFieldsSent::from_settings_body(&body);
     let node_failover_sent =
         SettingsWritePresence::from_settings_body(&body).node_failover_after_secs_sent();
@@ -2958,7 +2960,6 @@ async fn update_settings(
     authorize_bulk_activation_guard_change(&auth, previous_bulk_guards, next_bulk_guards)?;
 
     let previous_trust_loopback_forwarded_ip = stored_settings.trust_loopback_forwarded_ip();
-    let previous_trusted_private_networks = stored_settings.trusted_private_networks.clone();
 
     // Whether this request asked to store, rotate, or clear the MaxMind
     // license key. Set inside the preservation block below (where the
@@ -3121,14 +3122,24 @@ async fn update_settings(
     normalize_edge_target(&mut settings);
 
     let next_trust_loopback_forwarded_ip = settings.trust_loopback_forwarded_ip();
-    let next_trusted_private_networks = settings.trusted_private_networks.clone();
+    let trusted_private_networks_intent = if trusted_private_networks_sent {
+        TrustedPrivateNetworksIntent::Replace(settings.trusted_private_networks.clone())
+    } else {
+        TrustedPrivateNetworksIntent::Unchanged
+    };
 
     match app_state
         .config_service
-        .update_settings_with_geo_intent(settings, geo_license_key_intent)
+        .update_settings_with_intents(
+            settings,
+            geo_license_key_intent,
+            trusted_private_networks_intent,
+        )
         .await
     {
-        Ok(_) => {
+        Ok(saved) => {
+            let previous_trusted_private_networks = saved.previous_trusted_private_networks;
+            let next_trusted_private_networks = saved.trusted_private_networks;
             let audit = SettingsUpdatedAudit {
                 context: AuditContext {
                     user_id: auth.user_id(),
