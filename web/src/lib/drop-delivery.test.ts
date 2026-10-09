@@ -3,7 +3,10 @@
 
 import { describe, expect, test } from 'bun:test'
 import type { CloudflareProjectCapability } from '@/api/client'
-import { dropDeliveryChoices } from './drop-delivery'
+import {
+  dropDeliveryChoices,
+  effectiveDropDeliveryDefault,
+} from './drop-delivery'
 
 const unconfigured: CloudflareProjectCapability = {
   configured: false,
@@ -36,9 +39,66 @@ describe('dropDeliveryChoices', () => {
     ).toEqual(['none', 'bunny'])
   })
 
-  test('keeps the server default selectable', () => {
+  test('never offers a provider that is only enabled as the default', () => {
     expect(
-      dropDeliveryChoices({ ...unconfigured, default_enabled: true })
-    ).toEqual(['none', 'cloudflare'])
+      dropDeliveryChoices({
+        ...unconfigured,
+        default_enabled: true,
+        bunny_default_enabled: true,
+      })
+    ).toEqual(['none'])
+  })
+})
+
+describe('effectiveDropDeliveryDefault', () => {
+  test('is No CDN when no default is enabled', () => {
+    expect(effectiveDropDeliveryDefault(undefined)).toBe('none')
+    expect(
+      effectiveDropDeliveryDefault({
+        ...unconfigured,
+        configured: true,
+        bunny_configured: true,
+      })
+    ).toBe('none')
+  })
+
+  test('is the default provider when it is ready', () => {
+    expect(
+      effectiveDropDeliveryDefault({
+        ...unconfigured,
+        configured: true,
+        default_enabled: true,
+      })
+    ).toBe('cloudflare')
+    expect(
+      effectiveDropDeliveryDefault({
+        ...unconfigured,
+        bunny_configured: true,
+        bunny_default_enabled: true,
+      })
+    ).toBe('bunny')
+  })
+
+  test('is No CDN when the default provider is not ready', () => {
+    expect(
+      effectiveDropDeliveryDefault({ ...unconfigured, default_enabled: true })
+    ).toBe('none')
+    expect(
+      effectiveDropDeliveryDefault({
+        ...unconfigured,
+        bunny_default_enabled: true,
+      })
+    ).toBe('none')
+  })
+
+  test('lets the Cloudflare default win over Bunny, like project creation', () => {
+    expect(
+      effectiveDropDeliveryDefault({
+        ...unconfigured,
+        default_enabled: true,
+        bunny_configured: true,
+        bunny_default_enabled: true,
+      })
+    ).toBe('none')
   })
 })

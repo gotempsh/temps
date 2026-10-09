@@ -1,10 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import {
-  defaultDeliveryChoice,
-  useDeliveryProjectCapability,
-} from '@/components/domains/delivery-capability'
+import { useDeliveryProjectCapability } from '@/components/domains/delivery-capability'
 import {
   Select,
   SelectContent,
@@ -16,9 +13,11 @@ import { Skeleton } from '@/components/ui/skeleton'
 import {
   DROP_DELIVERY_LABELS,
   dropDeliveryChoices,
+  effectiveDropDeliveryDefault,
   type DropDeliveryChoice,
 } from '@/lib/drop-delivery'
 import { ExternalLink } from 'lucide-react'
+import { useEffect } from 'react'
 import { Link } from 'react-router'
 
 /**
@@ -32,12 +31,20 @@ export function DropDeliveryRow({
   disabled = false,
 }: {
   value: DropDeliveryChoice | undefined
-  onChange: (value: DropDeliveryChoice) => void
+  onChange: (value: DropDeliveryChoice | undefined) => void
   disabled?: boolean
 }) {
   const capability = useDeliveryProjectCapability()
   const choices = dropDeliveryChoices(capability.data)
-  const selected = value ?? defaultDeliveryChoice(capability.data)
+  const selected = value ?? effectiveDropDeliveryDefault(capability.data)
+  const overrideUnavailable =
+    capability.isSuccess && value !== undefined && !choices.includes(value)
+
+  // A provider can stop being ready while the card is open. Sending it as an
+  // explicit choice would fail project creation, so fall back to the default.
+  useEffect(() => {
+    if (overrideUnavailable) onChange(undefined)
+  }, [overrideUnavailable, onChange])
 
   return (
     <div className="mt-3 flex items-center justify-between gap-3">
@@ -45,7 +52,9 @@ export function DropDeliveryRow({
       {capability.isPending ? (
         <Skeleton className="h-4 w-20" />
       ) : capability.isError ? (
-        <span className="font-medium">Project default</span>
+        <span className="font-medium">
+          {value ? DROP_DELIVERY_LABELS[value] : 'Project default'}
+        </span>
       ) : choices.length > 1 ? (
         <Select
           value={selected}
