@@ -250,6 +250,12 @@ impl ExternalServiceHealthMonitor {
                     // from before, so the first real probe after `running`
                     // is the first one the UI shows.
                     self.clear_health_verdict(service).await;
+                    // A `starting` service waits on a readiness watch, which
+                    // a restart of Temps loses; pick it back up so the
+                    // service still reaches `running` or `failed`.
+                    if service.status == crate::readiness::STARTING_STATUS {
+                        self.manager.resume_readiness_watch(service).await;
+                    }
                     return Ok(());
                 }
                 LifecycleProbe::Down => (

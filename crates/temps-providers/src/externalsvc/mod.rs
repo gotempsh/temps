@@ -1885,6 +1885,18 @@ pub trait ExternalService: Send + Sync {
         None
     }
 
+    /// Startup readiness gate (see [`crate::readiness`]). Engines whose
+    /// container accepts connections before it can serve a real request
+    /// return a target here, and the manager keeps the service `starting`
+    /// until the target reports a usable answer. `None` (the default) marks
+    /// the service `running` as soon as its container starts.
+    fn readiness_target(
+        &self,
+        _service_config: &ServiceConfig,
+    ) -> Option<Box<dyn crate::readiness::ReadinessTarget>> {
+        None
+    }
+
     fn get_environment_variables(
         &self,
         parameters: &HashMap<String, String>,

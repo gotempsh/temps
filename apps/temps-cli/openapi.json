@@ -22484,6 +22484,17 @@
               "null"
             ]
           },
+          "readiness": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ServiceReadiness",
+                "description": "Startup readiness while `status` is `starting` (the container is up\nbut the service has not yet served an authenticated request), or why\ninitialization failed when `status` is `failed`. Absent otherwise."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "service_type": {
             "$ref": "#/components/schemas/ServiceTypeRoute"
           },
@@ -28353,6 +28364,48 @@
           "session_token"
         ],
         "type": "object"
+      },
+      "InitializationFailure": {
+        "description": "A failed initialization, as shown to the operator.",
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/InitializationFailureKind"
+          },
+          "log_excerpt": {
+            "description": "Container log lines that explain the failure, oldest first. Secrets\nare redacted. Empty when the logs could not be read.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "next_actions": {
+            "description": "Suggested next steps, most useful first.",
+            "items": {
+              "$ref": "#/components/schemas/ReadinessNextAction"
+            },
+            "type": "array"
+          },
+          "reason": {
+            "description": "What happened, including the last probe's typed reason.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "reason",
+          "log_excerpt",
+          "next_actions"
+        ],
+        "type": "object"
+      },
+      "InitializationFailureKind": {
+        "description": "Why the gate gave up.",
+        "enum": [
+          "store_init_failed",
+          "restart_loop",
+          "timeout"
+        ],
+        "type": "string"
       },
       "Insight": {
         "description": "An anomaly insight.",
@@ -41751,6 +41804,24 @@
         },
         "type": "object"
       },
+      "ReadinessNextAction": {
+        "description": "What the operator can do about a failed initialization. Temps never\ndoes any of these on its own.",
+        "enum": [
+          "view_logs",
+          "retry",
+          "try_another_image",
+          "recreate_with_fresh_volumes"
+        ],
+        "type": "string"
+      },
+      "ReadinessPhase": {
+        "description": "Where the gate is for a service.",
+        "enum": [
+          "starting",
+          "failed"
+        ],
+        "type": "string"
+      },
       "ReassignCustomDomainRequest": {
         "properties": {
           "target_environment_id": {
@@ -47525,6 +47596,54 @@
           "service",
           "port",
           "url"
+        ],
+        "type": "object"
+      },
+      "ServiceReadiness": {
+        "description": "Startup readiness of a service that is `starting` or failed to start.",
+        "properties": {
+          "deadline_secs": {
+            "description": "How long the gate waits before reporting failure.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "failure": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/InitializationFailure",
+                "description": "Set when `phase` is `failed`."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "phase": {
+            "$ref": "#/components/schemas/ReadinessPhase"
+          },
+          "reason": {
+            "description": "Latest reason the service is not usable yet, from the engine's\nauthenticated probe. Null before the first probe.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "restart_count": {
+            "description": "Container restarts since the gate started.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "started_at": {
+            "description": "When the gate started waiting (ISO 8601, UTC).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "phase",
+          "started_at",
+          "deadline_secs",
+          "restart_count"
         ],
         "type": "object"
       },

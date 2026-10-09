@@ -315,6 +315,11 @@ pub struct ExternalServiceInfo {
     /// flow rather than an explicit repoint.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub continuous_archive_pinned_at: Option<String>,
+    /// Startup readiness while `status` is `starting` (the container is up
+    /// but the service has not yet served an authenticated request), or why
+    /// initialization failed when `status` is `failed`. Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<crate::readiness::ServiceReadiness>,
 }
 
 /// Public info about a cluster member.
