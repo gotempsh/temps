@@ -15821,10 +15821,38 @@ mod tests {
         let service = result.expect("Failed to create S3 service");
         assert_eq!(service.name, "test-s3");
         assert_eq!(service.service_type, ServiceType::S3);
-        assert_eq!(service.status, "running");
+        // RustFS answers /health before its storage layer can serve S3, so
+        // the readiness gate holds the service `starting` until an
+        // authenticated ListBuckets succeeds, then promotes it in the
+        // background.
+        assert_eq!(service.status, readiness::STARTING_STATUS);
 
-        // Cleanup
+        // Wait for the gate's verdict, bounded by its own 180s deadline plus
+        // a margin for the final probe and write.
+        let wait_limit = std::time::Duration::from_secs(200);
+        let started = std::time::Instant::now();
+        let settled = loop {
+            let current = manager
+                .get_service(service.id)
+                .await
+                .expect("Failed to read S3 service while waiting for readiness");
+            if current.status != readiness::STARTING_STATUS || started.elapsed() >= wait_limit {
+                break current;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        };
+
+        // Cleanup before asserting, so a failed gate does not leak the container
         let _ = manager.delete_service(service.id).await;
+
+        assert_eq!(
+            settled.status,
+            "running",
+            "S3 service {} did not become ready within {:?}: error_message={:?}",
+            service.id,
+            wait_limit,
+            settled.error_message
+        );
     }
 
     #[cfg(feature = "docker-tests")]
