@@ -1848,6 +1848,16 @@ export type AppSettings = {
      * This is the sole control surface — there is no CLI/env override.
      */
     trust_loopback_forwarded_ip?: boolean | null;
+    /**
+     * Private networks (CIDRs or single addresses) that user-configured
+     * outbound requests may reach: webhooks, notification channels, uptime
+     * checks, AI gateway providers, self-hosted git, importers. Empty by
+     * default, which keeps the SSRF guard blocking every private, loopback
+     * and CGNAT destination. Only private ranges are accepted, and cloud
+     * metadata endpoints stay blocked regardless. Published process-wide via
+     * `url_validation::set_trusted_private_networks`.
+     */
+    trusted_private_networks?: Array<string>;
 };
 
 /**
@@ -2016,6 +2026,11 @@ export type AppSettingsResponse = {
      * proxy process, including a standalone `temps proxy`.
      */
     trust_loopback_forwarded_ip: boolean;
+    /**
+     * Private networks (normalized CIDRs) that user-configured outbound
+     * requests may reach despite the SSRF guard. Empty means none.
+     */
+    trusted_private_networks: Array<string>;
 };
 
 export type ApplicationGitConnectionsResponse = {

@@ -293,10 +293,9 @@ impl reqwest::dns::Resolve for ExternalOnlyResolver {
                 return Err(format!("hostname '{host}' resolved to no addresses").into());
             }
             for address in &addresses {
-                let result = match address.ip() {
-                    std::net::IpAddr::V4(ip) => temps_core::url_validation::validate_ipv4(&ip),
-                    std::net::IpAddr::V6(ip) => temps_core::url_validation::validate_ipv6(&ip),
-                };
+                // Honours the operator's trusted private networks, so a
+                // self-hosted model server on the LAN can be allowed.
+                let result = temps_core::url_validation::validate_outbound_ip(address.ip());
                 if result.is_err() {
                     return Err(format!(
                         "hostname '{host}' resolved to a blocked internal address"

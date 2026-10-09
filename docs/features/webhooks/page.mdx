@@ -617,6 +617,12 @@ def webhook():
 5. **Process asynchronously** - Queue long-running tasks instead of processing them in the webhook handler
 6. **Handle retries idempotently** - Failed deliveries may be retried, so use the `event_id` to deduplicate
 
+### Private network receivers
+
+By default Temps refuses webhook URLs that point at private (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), loopback, CGNAT (`100.64.0.0/10`) or link-local addresses, including hostnames that resolve to them. This stops anyone who can create a webhook from using Temps to probe your internal network. Plain `http://` URLs to public hosts are accepted.
+
+To deliver to a receiver on your own network, such as an internal automation server, an administrator can list its network under **Settings → Security → Trusted private networks** (for example `10.0.0.0/8` or a single host such as `192.168.1.20`). The same list applies to every other feature that sends requests to a user-supplied URL, including notification webhooks, uptime checks, AI gateway providers, self-hosted Git, OIDC providers and importers. Only private ranges can be trusted, and cloud metadata endpoints such as `169.254.169.254` stay blocked. See [Trust private networks for outbound requests](/docs/howto/production-hardening#outbound-private-networks) before enabling it.
+
 ## Testing Webhooks
 
 ### Error Messages
