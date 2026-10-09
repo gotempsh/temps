@@ -40,7 +40,7 @@ export function DropDeliveryRow({
   const selected = value ?? defaultDeliveryChoice(capability.data)
 
   return (
-    <div className="mt-3 flex min-h-8 items-center justify-between gap-3">
+    <div className="mt-3 flex items-center justify-between gap-3">
       <span className="text-muted-foreground">CDN delivery</span>
       {capability.isPending ? (
         <Skeleton className="h-4 w-20" />
@@ -54,7 +54,7 @@ export function DropDeliveryRow({
         >
           <SelectTrigger
             aria-label="CDN delivery"
-            className="h-8 w-auto min-w-[8.5rem] bg-background"
+            className="-my-1 h-7 w-auto min-w-[8.5rem] bg-background"
           >
             <SelectValue />
           </SelectTrigger>
