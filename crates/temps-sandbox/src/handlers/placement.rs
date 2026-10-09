@@ -722,6 +722,7 @@ mod tests {
             eligible: true,
             reason: None,
             live_sandboxes: 1,
+            dedicated: false,
         }
     }
 

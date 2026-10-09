@@ -182,6 +182,12 @@ impl From<SandboxError> for Problem {
                 .with_type("https://temps.sh/probs/sandbox-no-placement-node")
                 .with_title("No Node Available For Sandboxes")
                 .with_detail(error.to_string()),
+            SandboxError::DedicatedNodesOnly { .. } => {
+                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
+                    .with_type("https://temps.sh/probs/sandbox-dedicated-node-only")
+                    .with_title("Only Dedicated Nodes Available For Sandboxes")
+                    .with_detail(error.to_string())
+            }
             SandboxError::RuntimeEnvironmentNotFound { .. } => {
                 problemdetails::new(StatusCode::NOT_FOUND)
                     .with_title("Sandbox Runtime Environment Not Found")
@@ -2882,6 +2888,12 @@ mod tests {
             ),
             (
                 SandboxError::NoPlacementNode,
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                SandboxError::DedicatedNodesOnly {
+                    nodes: "node 7 (gpu-1) is dedicated".into(),
+                },
                 StatusCode::UNPROCESSABLE_ENTITY,
             ),
             (
