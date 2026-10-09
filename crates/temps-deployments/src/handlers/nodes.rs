@@ -2804,7 +2804,12 @@ async fn create_remote_deployer(
 
 /// 409 for a node removal refused because containers Temps placed on it may
 /// still exist there, and removing the node would lose track of them.
-fn node_holds_containers_problem(node_id: i32, node_name: &str, unremoved: &[String]) -> Problem {
+fn node_holds_containers_problem(
+    node_id: i32,
+    node_name: &str,
+    unremoved_count: usize,
+    unremoved: &[String],
+) -> Problem {
     problemdetails::new(StatusCode::CONFLICT)
         .with_title("Node Still Holds Containers")
         .with_detail(format!(
@@ -2813,11 +2818,12 @@ fn node_holds_containers_problem(node_id: i32, node_name: &str, unremoved: &[Str
              or remove them on that host with `docker rm -f`, then retry. If the host is gone for \
              good, retry with DELETE /internal/nodes/{node_id}?force=true: the containers are then \
              recorded as orphaned on '{node_name}' and are not touched again.",
-            unremoved.len(),
+            unremoved_count,
             unremoved.join("; ")
         ))
         .with_value("node_id", node_id)
         .with_value("node_name", node_name.to_string())
+        .with_value("unremoved_count", unremoved_count)
         .with_value("unremoved_containers", unremoved.to_vec())
 }
 
@@ -3253,15 +3259,19 @@ async fn admin_remove_node(
         &app_state.encryption_service,
     )
     .await;
-    let unremoved = app_state
+    let leftovers = app_state
         .node_service
         .remove_leftover_containers(&node, remote_deployer.as_deref())
         .await
-        .map_err(Problem::from)?
-        .unremoved;
-    if !unremoved.is_empty() && !query.force {
+        .map_err(Problem::from)?;
+    let unremoved_count = leftovers.unremoved_count;
+    let unremoved = leftovers.unremoved_report();
+    if unremoved_count > 0 && !query.force {
         return Err(node_holds_containers_problem(
-            node_id, &node.name, &unremoved,
+            node_id,
+            &node.name,
+            unremoved_count,
+            &unremoved,
         ));
     }
 
@@ -3276,11 +3286,11 @@ async fn admin_remove_node(
     info!(
         node_id,
         node_name = %node_name,
-        orphaned_containers = unremoved.len(),
+        orphaned_containers = unremoved_count,
         "Node removed from cluster"
     );
 
-    let message = if unremoved.is_empty() {
+    let message = if unremoved_count == 0 {
         format!("Node '{}' removed from cluster", node_name)
     } else {
         format!(
@@ -3288,7 +3298,7 @@ async fn admin_remove_node(
              recorded as orphaned on it; if the host still exists, remove them there with \
              `docker rm -f`: {}",
             node_name,
-            unremoved.len(),
+            unremoved_count,
             unremoved.join("; ")
         )
     };
@@ -3966,7 +3976,8 @@ mod tests {
             assert!(line.contains("deployment 42 in project 9"), "{line}");
             assert!(line.contains("status retired"), "{line}");
 
-            let problem = node_holds_containers_problem(5, "worker-b", std::slice::from_ref(&line));
+            let problem =
+                node_holds_containers_problem(5, "worker-b", 1, std::slice::from_ref(&line));
             assert_eq!(problem.status_code, StatusCode::CONFLICT);
             let body = serde_json::to_string(&problem.body).unwrap();
             assert!(body.contains("was not removed"), "{body}");

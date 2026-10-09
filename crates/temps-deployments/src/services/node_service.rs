@@ -5,8 +5,8 @@
 
 use sea_orm::{
     sea_query::Expr, ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition,
-    DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
-    TransactionTrait,
+    DatabaseConnection, EntityTrait, JoinType, PaginatorTrait, QueryFilter, QueryOrder,
+    QuerySelect, RelationTrait, TransactionTrait,
 };
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -28,38 +28,54 @@ pub const CONTAINER_STATUS_RETIRED: &str = "retired";
 /// `error_message` records which node it was on.
 pub const CONTAINER_STATUS_ORPHANED: &str = "orphaned";
 
-/// Whether a deployment has reached a final state, so its containers can no
-/// longer become the ones its environment serves.
-fn deployment_has_finished(state: &str) -> bool {
-    matches!(
-        state,
-        "cancelled" | "stopped" | "completed" | "deployed" | "failed"
-    )
-}
-
-/// The containers recorded on a node, split by what removing the node must
-/// do with them.
-#[derive(Debug, Default)]
-pub struct NodeContainerInventory {
-    /// Live rows of a current or still-running deployment. Moving them is a
-    /// drain's job; the node cannot be removed while any remain.
-    pub serving: Vec<deployment_containers::Model>,
-    /// Rows no deployment needs that are not confirmed gone, with the project
-    /// that owns each.
-    pub leftovers: Vec<(deployment_containers::Model, i32)>,
-}
+/// Deployment states after which a deployment never runs again, so its
+/// containers can no longer become the ones its environment serves.
+const FINISHED_DEPLOYMENT_STATES: [&str; 5] =
+    ["cancelled", "stopped", "completed", "deployed", "failed"];
 
 /// What [`NodeService::remove_leftover_containers`] did.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct LeftoverRemoval {
     /// Leftover containers removed now, or confirmed already gone.
     pub confirmed_gone: usize,
-    /// One line per container that may still exist on the node.
+    /// Containers that may still exist on the node.
+    pub unremoved_count: usize,
+    /// One line for each of the first [`MAX_DESCRIBED_UNREMOVED`] of them.
     pub unremoved: Vec<String>,
+}
+
+impl LeftoverRemoval {
+    fn record_unremoved(&mut self, line: String) {
+        self.unremoved_count += 1;
+        if self.unremoved.len() < MAX_DESCRIBED_UNREMOVED {
+            self.unremoved.push(line);
+        }
+    }
+
+    /// The described containers, followed by a line counting any that were
+    /// left out to keep the report bounded.
+    pub fn unremoved_report(&self) -> Vec<String> {
+        let mut lines = self.unremoved.clone();
+        let undescribed = self.unremoved_count.saturating_sub(lines.len());
+        if undescribed > 0 {
+            lines.push(format!(
+                "and {undescribed} more container(s) not listed here"
+            ));
+        }
+        lines
+    }
 }
 
 /// Leftover containers inspected or removed at once before a node removal.
 const LEFTOVER_REMOVAL_CONCURRENCY: usize = 8;
+
+/// Leftover container rows read per query, so node removal uses the same
+/// memory however much container history the node has.
+const LEFTOVER_PAGE_SIZE: u64 = 100;
+
+/// Unremoved containers described one by one in a node removal's report; the
+/// rest are only counted.
+pub const MAX_DESCRIBED_UNREMOVED: usize = 50;
 
 /// Remove one recorded container from a node, but only if Docker still says
 /// it belongs to `project_id`. `Ok` means Temps confirmed it is gone (removed
@@ -1692,10 +1708,7 @@ impl NodeService {
         // so it is either committed and seen here, or waits and then fails
         // the foreign key once the node is gone. Never orphan a container a
         // deployment is using.
-        let serving = Self::node_container_inventory_on(&txn, node_id)
-            .await?
-            .serving
-            .len();
+        let serving = Self::serving_container_count_on(&txn, node_id).await?;
         if serving > 0 {
             return Err(NodeError::StillServing {
                 node_id,
@@ -1760,74 +1773,79 @@ impl NodeService {
             )
     }
 
-    /// Every container recorded on a node that may still exist there (not
-    /// confirmed removed, not already orphaned), split by what removing the
-    /// node has to do with it. Three queries regardless of how many rows
-    /// there are.
-    async fn node_container_inventory_on<C: sea_orm::ConnectionTrait>(
-        db: &C,
-        node_id: i32,
-    ) -> Result<NodeContainerInventory, NodeError> {
-        let mut inventory = NodeContainerInventory::default();
-        let containers = deployment_containers::Entity::find()
+    /// Containers recorded on `node_id` that may still exist there (not
+    /// confirmed removed, not already orphaned), joined to their deployment
+    /// and that deployment's environment.
+    fn node_containers_query(node_id: i32) -> sea_orm::Select<deployment_containers::Entity> {
+        deployment_containers::Entity::find()
+            .join(
+                JoinType::InnerJoin,
+                deployment_containers::Relation::Deployment.def(),
+            )
+            .join(JoinType::LeftJoin, deployments::Relation::Environment.def())
             .filter(deployment_containers::Column::NodeId.eq(node_id))
             .filter(Self::not_confirmed_gone())
-            .order_by_asc(deployment_containers::Column::Id)
-            .all(db)
-            .await?;
-        if containers.is_empty() {
-            return Ok(inventory);
-        }
-        let deployment_ids: Vec<i32> = containers
-            .iter()
-            .map(|container| container.deployment_id)
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        let owners: std::collections::HashMap<i32, deployments::Model> =
-            deployments::Entity::find()
-                .filter(deployments::Column::Id.is_in(deployment_ids))
-                .all(db)
-                .await?
-                .into_iter()
-                .map(|deployment| (deployment.id, deployment))
-                .collect();
-        let environment_ids: Vec<i32> = owners
-            .values()
-            .map(|deployment| deployment.environment_id)
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        let current: HashSet<i32> = environments::Entity::find()
-            .filter(environments::Column::Id.is_in(environment_ids))
-            .all(db)
-            .await?
-            .into_iter()
-            .filter_map(|environment| environment.current_deployment_id)
-            .collect();
-        for container in containers {
-            let Some(deployment) = owners.get(&container.deployment_id) else {
-                continue;
-            };
-            let project_id = deployment.project_id;
-            if container.deleted_at.is_none()
-                && (current.contains(&deployment.id) || !deployment_has_finished(&deployment.state))
-            {
-                inventory.serving.push(container);
-            } else {
-                inventory.leftovers.push((container, project_id));
-            }
-        }
-        Ok(inventory)
     }
 
-    /// The containers recorded on a node, split as [`NodeContainerInventory`]
-    /// describes.
-    pub async fn node_container_inventory(
+    /// A live row of the deployment its environment serves, or of one still
+    /// in progress. Moving these is a drain's job; a node holding any cannot
+    /// be removed. Never NULL, so its negation selects exactly the rest.
+    fn serving_condition() -> Condition {
+        let current_deployment = (
+            environments::Entity,
+            environments::Column::CurrentDeploymentId,
+        );
+        Condition::all()
+            .add(deployment_containers::Column::DeletedAt.is_null())
+            .add(
+                Condition::any()
+                    .add(
+                        Condition::all()
+                            .add(Expr::col(current_deployment).is_not_null())
+                            .add(
+                                Expr::col(current_deployment)
+                                    .equals((deployments::Entity, deployments::Column::Id)),
+                            ),
+                    )
+                    .add(deployments::Column::State.is_not_in(FINISHED_DEPLOYMENT_STATES)),
+            )
+    }
+
+    /// How many containers on the node a deployment still uses. One COUNT,
+    /// whatever the node's history.
+    async fn serving_container_count_on<C: sea_orm::ConnectionTrait>(
+        db: &C,
+        node_id: i32,
+    ) -> Result<usize, NodeError> {
+        let count = Self::node_containers_query(node_id)
+            .filter(Self::serving_condition())
+            .count(db)
+            .await?;
+        Ok(usize::try_from(count).unwrap_or(usize::MAX))
+    }
+
+    /// The next [`LEFTOVER_PAGE_SIZE`] containers on the node that no
+    /// deployment needs but that may still exist, after `after_id`, with the
+    /// project that owns each.
+    async fn leftover_container_page(
         &self,
         node_id: i32,
-    ) -> Result<NodeContainerInventory, NodeError> {
-        Self::node_container_inventory_on(self.db.as_ref(), node_id).await
+        after_id: i32,
+    ) -> Result<Vec<(deployment_containers::Model, i32)>, NodeError> {
+        let rows = Self::node_containers_query(node_id)
+            .filter(Self::serving_condition().not())
+            .filter(deployment_containers::Column::Id.gt(after_id))
+            .order_by_asc(deployment_containers::Column::Id)
+            .limit(LEFTOVER_PAGE_SIZE)
+            .select_also(deployments::Entity)
+            .all(self.db.as_ref())
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(container, deployment)| {
+                deployment.map(|deployment| (container, deployment.project_id))
+            })
+            .collect())
     }
 
     /// Before a node is removed, remove the containers Temps left on it that
@@ -1839,7 +1857,8 @@ impl NodeService {
     /// only proof a container is gone (a listing can omit one it failed to
     /// inspect), and one that is there is removed after its labels confirm
     /// the owning project. Without an agent, every leftover is reported back
-    /// unremoved.
+    /// unremoved. Rows are read a page at a time and results are handled as
+    /// they arrive, so memory does not grow with the node's history.
     pub async fn remove_leftover_containers(
         &self,
         node: &nodes::Model,
@@ -1847,59 +1866,65 @@ impl NodeService {
     ) -> Result<LeftoverRemoval, NodeError> {
         use futures::StreamExt;
 
-        let inventory = self.node_container_inventory(node.id).await?;
-        if !inventory.serving.is_empty() {
+        let serving = Self::serving_container_count_on(self.db.as_ref(), node.id).await?;
+        if serving > 0 {
             return Err(NodeError::StillServing {
                 node_id: node.id,
                 node_name: node.name.clone(),
-                count: inventory.serving.len(),
+                count: serving,
             });
         }
         let mut outcome = LeftoverRemoval::default();
-        let Some(deployer) = deployer else {
-            outcome.unremoved = inventory
-                .leftovers
-                .iter()
-                .map(|(container, project_id)| {
-                    describe_unremoved_container(
+        let mut after_id = 0;
+        loop {
+            let page = self.leftover_container_page(node.id, after_id).await?;
+            let Some((last, _)) = page.last() else {
+                break;
+            };
+            after_id = last.id;
+            let last_page = (page.len() as u64) < LEFTOVER_PAGE_SIZE;
+            let Some(deployer) = deployer else {
+                for (container, project_id) in &page {
+                    outcome.record_unremoved(describe_unremoved_container(
                         container,
                         *project_id,
                         "the node's agent cannot be reached",
-                    )
-                })
-                .collect();
-            return Ok(outcome);
-        };
-
-        // A node that ran for a long time can hold many unconfirmed rows;
-        // check them a few at a time rather than one by one or all at once.
-        let checked: Vec<_> = futures::stream::iter(inventory.leftovers)
-            .map(|(container, project_id)| async move {
-                let result =
-                    remove_owned_container(deployer, &container.container_id, project_id).await;
-                (container, project_id, result)
-            })
-            .buffer_unordered(LEFTOVER_REMOVAL_CONCURRENCY)
-            .collect()
-            .await;
-        for (container, project_id, result) in checked {
-            match result {
-                Ok(()) => {
-                    self.mark_container_removed(container.id).await?;
-                    outcome.confirmed_gone += 1;
-                }
-                Err(reason) => {
-                    tracing::warn!(
-                        node_id = node.id,
-                        container_id = %container.container_id,
-                        deployment_id = container.deployment_id,
-                        "Could not remove leftover container before removing node: {}",
-                        reason
-                    );
-                    outcome.unremoved.push(describe_unremoved_container(
-                        &container, project_id, &reason,
                     ));
                 }
+                if last_page {
+                    break;
+                }
+                continue;
+            };
+            let mut checks = futures::stream::iter(page)
+                .map(|(container, project_id)| async move {
+                    let result =
+                        remove_owned_container(deployer, &container.container_id, project_id).await;
+                    (container, project_id, result)
+                })
+                .buffer_unordered(LEFTOVER_REMOVAL_CONCURRENCY);
+            while let Some((container, project_id, result)) = checks.next().await {
+                match result {
+                    Ok(()) => {
+                        self.mark_container_removed(container.id).await?;
+                        outcome.confirmed_gone += 1;
+                    }
+                    Err(reason) => {
+                        tracing::warn!(
+                            node_id = node.id,
+                            container_id = %container.container_id,
+                            deployment_id = container.deployment_id,
+                            "Could not remove leftover container before removing node: {}",
+                            reason
+                        );
+                        outcome.record_unremoved(describe_unremoved_container(
+                            &container, project_id, &reason,
+                        ));
+                    }
+                }
+            }
+            if last_page {
+                break;
             }
         }
         if outcome.confirmed_gone > 0 {
@@ -2386,6 +2411,14 @@ mod tests {
         assert_eq!(node_address_host("10.100.0.2"), "10.100.0.2");
     }
 
+    /// The single row a paginator COUNT returns.
+    fn count_row(count: i64) -> std::collections::BTreeMap<String, sea_orm::Value> {
+        std::collections::BTreeMap::from([(
+            "num_items".to_string(),
+            sea_orm::Value::BigInt(Some(count)),
+        )])
+    }
+
     fn sample_node() -> nodes::Model {
         nodes::Model {
             architecture: None,
@@ -2517,7 +2550,7 @@ mod tests {
                 sea_orm::Value::BigInt(Some(0)),
             )])]])
             // nothing serving on the node under the lock
-            .append_query_results(vec![Vec::<deployment_containers::Model>::new()])
+            .append_query_results(vec![vec![count_row(0)]])
             // orphan any unconfirmed containers (none here)
             .append_exec_results(vec![sea_orm::MockExecResult {
                 last_insert_id: 0,
@@ -2538,17 +2571,10 @@ mod tests {
     /// node lock and refuses.
     #[tokio::test]
     async fn test_remove_refuses_a_container_placed_after_the_check() {
-        let mut running = sample_deployment(30, 100, 200);
-        running.state = "running".to_string();
         let db = with_no_dns_records(MockDatabase::new(DatabaseBackend::Postgres))
             .append_query_results(vec![vec![sample_node()]]) // FOR UPDATE lock
-            .append_query_results(vec![vec![std::collections::BTreeMap::from([(
-                "num_items".to_string(),
-                sea_orm::Value::BigInt(Some(0)),
-            )])]])
-            .append_query_results(vec![vec![sample_container(9, 30, 1)]])
-            .append_query_results(vec![vec![running]])
-            .append_query_results(vec![vec![sample_environment(200, 100, Some(10))]])
+            .append_query_results(vec![vec![count_row(0)]]) // no live sandboxes
+            .append_query_results(vec![vec![count_row(1)]]) // one serving container
             .into_connection();
         let service = NodeService::new(Arc::new(db));
 
@@ -3906,63 +3932,6 @@ mod tests {
         );
     }
 
-    /// The rows the inventory below is built from: a current deployment's
-    /// live container, a superseded one whose teardown never reached the
-    /// node, a still-running deployment's, and a retired failed one. Rows
-    /// confirmed removed are filtered out by the query itself.
-    fn inventory_database(extra: impl FnOnce(MockDatabase) -> MockDatabase) -> MockDatabase {
-        let current = sample_container(1, 10, 5);
-        let mut superseded = sample_container(2, 20, 5);
-        superseded.container_id = "c-superseded".to_string();
-        let in_progress = sample_container(3, 30, 5);
-        let mut retired = sample_container(4, 40, 5);
-        retired.container_id = "c-retired".to_string();
-        retired.deleted_at = Some(chrono::Utc::now());
-        retired.status = Some(CONTAINER_STATUS_RETIRED.to_string());
-
-        let mut running = sample_deployment(30, 101, 201);
-        running.state = "running".to_string();
-        let mut failed = sample_deployment(40, 101, 201);
-        failed.state = "failed".to_string();
-
-        extra(
-            MockDatabase::new(DatabaseBackend::Postgres)
-                .append_query_results(vec![vec![current, superseded, in_progress, retired]])
-                .append_query_results(vec![vec![
-                    sample_deployment(10, 100, 200),
-                    sample_deployment(20, 100, 200),
-                    running,
-                    failed,
-                ]])
-                .append_query_results(vec![vec![
-                    sample_environment(200, 100, Some(10)),
-                    sample_environment(201, 101, None),
-                ]]),
-        )
-    }
-
-    /// Node removal accounts for every container no deployment needs —
-    /// including one still marked live because the redeploy that superseded
-    /// it could not reach the node — but never for the containers of a
-    /// current or still-running deployment.
-    #[tokio::test]
-    async fn node_container_inventory_splits_rows_by_what_removal_must_do() {
-        let service = NodeService::new(Arc::new(inventory_database(|db| db).into_connection()));
-
-        let inventory = service.node_container_inventory(5).await.unwrap();
-
-        let ids = |rows: &[(deployment_containers::Model, i32)]| {
-            rows.iter()
-                .map(|(container, project_id)| (container.id, *project_id))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(
-            inventory.serving.iter().map(|c| c.id).collect::<Vec<_>>(),
-            vec![1, 3]
-        );
-        assert_eq!(ids(&inventory.leftovers), vec![(2, 100), (4, 101)]);
-    }
-
     mod leftover_removal {
         use super::*;
         use mockall::mock;
@@ -4005,8 +3974,10 @@ mod tests {
             }
         }
 
-        /// Only containers no deployment needs, so removal can proceed: a
-        /// superseded one still marked live and a retired failed one.
+        /// Nothing serving, and one page holding the containers no
+        /// deployment needs: a superseded one still marked live and a
+        /// retired failed one. Which rows qualify is the query's job, tested
+        /// against Postgres in `removal_reads_the_node_in_bounded_pages`.
         fn removable_database(extra: impl FnOnce(MockDatabase) -> MockDatabase) -> MockDatabase {
             let mut superseded = sample_container(2, 20, 5);
             superseded.container_id = "c-superseded".to_string();
@@ -4018,11 +3989,10 @@ mod tests {
             failed.state = "failed".to_string();
             extra(
                 MockDatabase::new(DatabaseBackend::Postgres)
-                    .append_query_results(vec![vec![superseded, retired]])
-                    .append_query_results(vec![vec![sample_deployment(20, 100, 200), failed]])
+                    .append_query_results(vec![vec![count_row(0)]])
                     .append_query_results(vec![vec![
-                        sample_environment(200, 100, Some(10)),
-                        sample_environment(201, 101, None),
+                        (superseded, sample_deployment(20, 100, 200)),
+                        (retired, failed),
                     ]]),
             )
         }
@@ -4039,7 +4009,10 @@ mod tests {
 
         #[tokio::test]
         async fn removal_is_refused_while_a_deployment_uses_the_node() {
-            let service = NodeService::new(Arc::new(inventory_database(|db| db).into_connection()));
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![count_row(2)]])
+                .into_connection();
+            let service = NodeService::new(Arc::new(db));
             let mut deployer = MockDeployer::new();
             deployer.expect_get_container_info().never();
             deployer.expect_remove_container().never();
@@ -4093,6 +4066,7 @@ mod tests {
                 outcome,
                 LeftoverRemoval {
                     confirmed_gone: 2,
+                    unremoved_count: 0,
                     unremoved: Vec::new(),
                 }
             );
@@ -4123,6 +4097,7 @@ mod tests {
                 .unwrap();
 
             assert_eq!(outcome.confirmed_gone, 0);
+            assert_eq!(outcome.unremoved_count, 2);
             let mut unremoved = outcome.unremoved.clone();
             unremoved.sort();
             assert_eq!(unremoved.len(), 2, "{unremoved:?}");
@@ -4137,6 +4112,231 @@ mod tests {
                     && unremoved[1].contains("project 101")
                     && unremoved[1].contains("could not inspect it"),
                 "{unremoved:?}"
+            );
+        }
+
+        async fn seed_deployment(
+            db: &sea_orm::DatabaseConnection,
+            project_id: i32,
+            environment_id: i32,
+            slug: &str,
+            state: &str,
+        ) -> deployments::Model {
+            deployments::ActiveModel {
+                project_id: Set(project_id),
+                environment_id: Set(environment_id),
+                slug: Set(slug.to_string()),
+                state: Set(state.to_string()),
+                metadata: Set(Some(deployments::DeploymentMetadata::default())),
+                created_at: Set(chrono::Utc::now()),
+                updated_at: Set(chrono::Utc::now()),
+                ..Default::default()
+            }
+            .insert(db)
+            .await
+            .unwrap()
+        }
+
+        fn container_row(
+            deployment_id: i32,
+            node_id: i32,
+            container_id: &str,
+            status: &str,
+            retired: bool,
+        ) -> deployment_containers::ActiveModel {
+            deployment_containers::ActiveModel {
+                deployment_id: Set(deployment_id),
+                node_id: Set(Some(node_id)),
+                container_id: Set(container_id.to_string()),
+                container_name: Set(container_id.to_string()),
+                container_port: Set(8080),
+                status: Set(Some(status.to_string())),
+                deleted_at: Set(retired.then(chrono::Utc::now)),
+                created_at: Set(chrono::Utc::now()),
+                deployed_at: Set(chrono::Utc::now()),
+                ..Default::default()
+            }
+        }
+
+        /// Against Postgres: which rows count as serving and which as
+        /// leftovers is decided in SQL, leftovers are read a page at a time
+        /// until none are left, and the report stays bounded however many
+        /// containers cannot be confirmed.
+        #[tokio::test]
+        async fn removal_reads_the_node_in_bounded_pages() {
+            use temps_entities::{preset::Preset, projects, upstream_config::UpstreamList};
+
+            let Some(test_db) = migrated_test_db().await else {
+                return;
+            };
+            let db = test_db.connection_arc();
+            let service = NodeService::new(db.clone());
+            let node = service
+                .register(register_req("worker-1", "hash", "https://10.100.0.2:3100"))
+                .await
+                .unwrap();
+            let mut other_request = register_req("worker-2", "hash-2", "https://10.100.0.3:3100");
+            other_request.private_address = "10.100.0.3".to_string();
+            let other_node = service.register(other_request).await.unwrap();
+
+            let project = projects::ActiveModel {
+                name: Set("Node Removal".to_string()),
+                slug: Set("node-removal".to_string()),
+                repo_owner: Set("owner".to_string()),
+                repo_name: Set("repo".to_string()),
+                main_branch: Set("main".to_string()),
+                preset: Set(Preset::NextJs),
+                directory: Set("/".to_string()),
+                created_at: Set(chrono::Utc::now()),
+                updated_at: Set(chrono::Utc::now()),
+                is_deleted: Set(false),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+            let environment = environments::ActiveModel {
+                project_id: Set(project.id),
+                name: Set("prod".to_string()),
+                slug: Set("prod".to_string()),
+                host: Set("app.example.test".to_string()),
+                subdomain: Set("app.example.test".to_string()),
+                upstreams: Set(UpstreamList::default()),
+                created_at: Set(chrono::Utc::now()),
+                updated_at: Set(chrono::Utc::now()),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+            let (p, e) = (project.id, environment.id);
+            let current = seed_deployment(db.as_ref(), p, e, "current", "completed").await;
+            let running = seed_deployment(db.as_ref(), p, e, "running", "running").await;
+            let superseded = seed_deployment(db.as_ref(), p, e, "superseded", "completed").await;
+            let failed = seed_deployment(db.as_ref(), p, e, "failed", "failed").await;
+            let mut serving_environment: environments::ActiveModel = environment.into();
+            serving_environment.current_deployment_id = Set(Some(current.id));
+            let environment = serving_environment.update(db.as_ref()).await.unwrap();
+
+            let n = node.id;
+            deployment_containers::Entity::insert_many([
+                container_row(current.id, n, "c-current", "running", false),
+                container_row(
+                    current.id,
+                    n,
+                    "c-current-old",
+                    CONTAINER_STATUS_RETIRED,
+                    true,
+                ),
+                container_row(running.id, n, "c-running", "running", false),
+                container_row(superseded.id, n, "c-superseded", "running", false),
+                container_row(failed.id, n, "c-failed", CONTAINER_STATUS_RETIRED, true),
+                container_row(failed.id, n, "c-removed", CONTAINER_STATUS_REMOVED, true),
+                container_row(failed.id, n, "c-orphaned", CONTAINER_STATUS_ORPHANED, true),
+                container_row(
+                    superseded.id,
+                    other_node.id,
+                    "c-elsewhere",
+                    "running",
+                    false,
+                ),
+            ])
+            .exec(db.as_ref())
+            .await
+            .unwrap();
+
+            // The current deployment's live container and the running one's
+            // block removal; nothing is inspected.
+            let mut deployer = MockDeployer::new();
+            deployer.expect_get_container_info().never();
+            let err = service
+                .remove_leftover_containers(&node, Some(&deployer))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, NodeError::StillServing { count: 2, .. }),
+                "{err:?}"
+            );
+
+            // Once neither is serving, every unconfirmed row is a leftover:
+            // five recorded above plus enough to need a second page.
+            let mut idle_environment: environments::ActiveModel = environment.into();
+            idle_environment.current_deployment_id = Set(None);
+            idle_environment.update(db.as_ref()).await.unwrap();
+            let mut finished: deployments::ActiveModel = running.into();
+            finished.state = Set("failed".to_string());
+            finished.update(db.as_ref()).await.unwrap();
+            let bulk = LEFTOVER_PAGE_SIZE as usize + 20;
+            deployment_containers::Entity::insert_many((0..bulk).map(|i| {
+                container_row(
+                    failed.id,
+                    n,
+                    &format!("c-bulk-{i}"),
+                    CONTAINER_STATUS_RETIRED,
+                    true,
+                )
+            }))
+            .exec(db.as_ref())
+            .await
+            .unwrap();
+
+            let inspected = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut deployer = MockDeployer::new();
+            deployer.expect_get_container_info().returning({
+                let inspected = inspected.clone();
+                move |id| {
+                    if let Ok(mut seen) = inspected.lock() {
+                        seen.push(id.to_string());
+                    }
+                    Err(not_found(id))
+                }
+            });
+            deployer.expect_remove_container().never();
+            let outcome = service
+                .remove_leftover_containers(&node, Some(&deployer))
+                .await
+                .unwrap();
+            assert_eq!(outcome.confirmed_gone, 5 + bulk);
+            assert_eq!(outcome.unremoved_count, 0);
+            let seen = inspected.lock().unwrap().clone();
+            assert_eq!(seen.len(), 5 + bulk, "each leftover inspected once");
+            for skipped in ["c-removed", "c-orphaned", "c-elsewhere"] {
+                assert!(!seen.iter().any(|id| id == skipped), "{skipped} inspected");
+            }
+            let unconfirmed = deployment_containers::Entity::find()
+                .filter(deployment_containers::Column::NodeId.eq(n))
+                .filter(NodeService::not_confirmed_gone())
+                .count(db.as_ref())
+                .await
+                .unwrap();
+            assert_eq!(unconfirmed, 0, "every confirmed row is recorded as removed");
+
+            // Without an agent, every leftover is counted but only the first
+            // ones are described.
+            let unreachable = MAX_DESCRIBED_UNREMOVED + 10;
+            deployment_containers::Entity::insert_many((0..unreachable).map(|i| {
+                container_row(
+                    failed.id,
+                    n,
+                    &format!("c-late-{i}"),
+                    CONTAINER_STATUS_RETIRED,
+                    true,
+                )
+            }))
+            .exec(db.as_ref())
+            .await
+            .unwrap();
+            let outcome = service
+                .remove_leftover_containers(&node, None)
+                .await
+                .unwrap();
+            assert_eq!(outcome.unremoved_count, unreachable);
+            assert_eq!(outcome.unremoved.len(), MAX_DESCRIBED_UNREMOVED);
+            let report = outcome.unremoved_report();
+            assert_eq!(report.len(), MAX_DESCRIBED_UNREMOVED + 1);
+            assert_eq!(
+                report.last().map(String::as_str),
+                Some("and 10 more container(s) not listed here")
             );
         }
 
@@ -4157,16 +4357,6 @@ mod tests {
                 .unremoved
                 .iter()
                 .all(|line| line.contains("cannot be reached")));
-        }
-    }
-
-    #[test]
-    fn only_final_deployment_states_count_as_finished() {
-        for state in ["cancelled", "stopped", "completed", "deployed", "failed"] {
-            assert!(deployment_has_finished(state), "{state}");
-        }
-        for state in ["pending", "running", "creating", "built", ""] {
-            assert!(!deployment_has_finished(state), "{state}");
         }
     }
 
