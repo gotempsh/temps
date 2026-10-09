@@ -297,7 +297,10 @@ function ServiceStatusDot({ status }: { status: string }) {
       ? 'bg-success'
       : status === 'error' || status === 'failed'
         ? 'bg-destructive'
-        : status === 'pending' || status === 'initializing'
+        : status === 'pending' ||
+            status === 'initializing' ||
+            status === 'creating' ||
+            status === 'starting'
           ? 'bg-warning'
           : 'bg-muted-foreground/40'
   return (

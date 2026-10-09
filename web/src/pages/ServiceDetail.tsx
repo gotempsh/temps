@@ -82,6 +82,8 @@ import { Label } from '@/components/ui/label'
 import { ServiceLogo } from '@/components/ui/service-logo'
 import { Skeleton } from '@/components/ui/skeleton'
 import { TimeAgo } from '@/components/utils/TimeAgo'
+import { ServiceReadinessPanel } from '@/components/storage/ServiceReadinessPanel'
+import { isServiceSettling } from '@/lib/service-readiness'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
@@ -183,6 +185,11 @@ function formatShortDuration(ms: number): string {
   return remMinutes ? `${hours}h ${remMinutes}m` : `${hours}h`
 }
 
+/** A running service, or one still waiting on its readiness check, can be stopped. */
+function isStoppable(status: string): boolean {
+  return status === 'running' || status === 'starting'
+}
+
 function memberDisplayRole(member: {
   role: string
   live_state?: string | null
@@ -245,10 +252,8 @@ export function ServiceDetail() {
       path: { id: parseInt(id!) },
     }),
     enabled: !!id,
-    refetchInterval: (query) => {
-      const status = query.state.data?.service?.status
-      return status === 'creating' ? 2000 : false
-    },
+    refetchInterval: (query) =>
+      isServiceSettling(query.state.data?.service?.status) ? 2000 : false,
   })
   const parameterRevealScope = `${id}:${location.key}:${service?.service.updated_at ?? 'loading'}`
 
@@ -434,17 +439,22 @@ export function ServiceDetail() {
       ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
   }, [serviceLoaded, location.hash])
 
-  // Notify when cluster creation completes or fails
+  // Notify when cluster creation or a readiness-gated start settles
   useEffect(() => {
     const currentStatus = service?.service?.status
     const prevStatus = prevStatusRef.current
+    const name = service?.service?.name ?? 'Service'
     if (prevStatus === 'creating' && currentStatus === 'running') {
       toast.success('Cluster created successfully')
     } else if (prevStatus === 'creating' && currentStatus === 'failed') {
       toast.error('Cluster creation failed')
+    } else if (prevStatus === 'starting' && currentStatus === 'running') {
+      toast.success(`${name} is ready and accepting requests`)
+    } else if (prevStatus === 'starting' && currentStatus === 'failed') {
+      toast.error(`${name} failed to initialize`)
     }
     prevStatusRef.current = currentStatus
-  }, [service?.service?.status])
+  }, [service?.service?.status, service?.service?.name])
 
   const startService = useMutation({
     ...startServiceMutation(),
@@ -600,9 +610,12 @@ export function ServiceDetail() {
   const handleServiceAction = async () => {
     if (!service) return
 
-    if (service.service.status === 'running') {
+    if (isStoppable(service.service.status)) {
       setIsStopDialogOpen(true)
-    } else if (service.service.status === 'stopped') {
+    } else if (
+      service.service.status === 'stopped' ||
+      service.service.status === 'failed'
+    ) {
       // Start can take 5–15s for Postgres (reconcile + recreate path).
       // toast.promise surfaces all three states without blocking the UI,
       // matching the rollback/promote patterns elsewhere in the app.
@@ -681,6 +694,7 @@ export function ServiceDetail() {
     stopped: { tone: 'idle', label: 'Stopped' },
     pending: { tone: 'running', label: 'Pending' },
     creating: { tone: 'running', label: 'Creating' },
+    starting: { tone: 'running', label: 'Starting' },
     failed: { tone: 'error', label: 'Failed' },
   }
   const verdict = SERVICE_STATUS_VERDICT[service.service.status] ?? {
@@ -939,18 +953,18 @@ export function ServiceDetail() {
                   }
                   className={cn(
                     'min-h-12 sm:min-h-8',
-                    service.service.status === 'running' &&
+                    isStoppable(service.service.status) &&
                       'text-destructive focus:text-destructive'
                   )}
                 >
                   {startService.isPending || stopService.isPending ? (
                     <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                  ) : service.service.status === 'running' ? (
+                  ) : isStoppable(service.service.status) ? (
                     <AlertCircle className="h-4 w-4 mr-2" />
                   ) : (
                     <RefreshCcw className="h-4 w-4 mr-2" />
                   )}
-                  {service.service.status === 'running'
+                  {isStoppable(service.service.status)
                     ? 'Stop'
                     : service.service.status === 'creating'
                       ? 'Creating...'
@@ -973,6 +987,20 @@ export function ServiceDetail() {
             {error ? <Callout tone="error">{error}</Callout> : null}
 
             <ActiveRestoreBanner serviceId={service.service.id} />
+
+            {/*
+              Why a service is still starting, or why it failed to
+              initialize and what to do next. Renders nothing otherwise.
+            */}
+            <ServiceReadinessPanel
+              serviceId={service.service.id}
+              status={service.service.status}
+              readiness={service.service.readiness}
+              onRetry={handleServiceAction}
+              retryPending={startService.isPending}
+              onTryAnotherImage={() => setIsUpgradeDialogOpen(true)}
+              onRecreate={() => setIsDeleteDialogOpen(true)}
+            />
 
             {/*
               Health is the highest-signal block on this page, so it sits
