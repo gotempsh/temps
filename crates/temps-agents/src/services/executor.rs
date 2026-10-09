@@ -196,11 +196,12 @@ pub struct AgentExecutor {
 /// - Model and MCP-tool traffic go through bridge-scoped relays
 ///   (`/api/ai/sandbox-models`, `/api/ai/sandbox-tools`) that authenticate
 ///   per run without this token.
-/// - Git does not use this token either, but it does not go through a relay
+/// - Git does not use this token either, and it does not go through a relay
 ///   yet: every provider's `git_relay_base_url` refuses (the Docker sidecar
-///   fails closed until it has capability authentication), so
-///   `prepare_sandbox_workspace` still seeds the connection's provider token
-///   into `~/.git-credentials` and the `gh`/`glab` config.
+///   fails closed until it has capability authentication). The sandbox
+///   holds at most a read-only token for the project's repository (see
+///   [`SandboxGitCredential`]); clone, push and the pull request run on
+///   the control plane.
 /// - The workflow-memory script installed in every sandbox is the only
 ///   consumer of `TEMPS_API_TOKEN`, and its HTTP API has no in-tree
 ///   implementation (see `temps-memory`), so it needs no permission.
@@ -212,6 +213,118 @@ pub struct AgentExecutor {
 pub(crate) fn run_token_permissions(
 ) -> Vec<temps_entities::deployment_tokens::DeploymentTokenPermission> {
     Vec::new()
+}
+
+/// The git credential a run's sandbox holds for the AI's own `git`/`gh` use.
+///
+/// The platform's git work never needs it: the clone, the branch push and the
+/// pull request all run on the control plane with the connection's token.
+/// So the sandbox only ever gets a credential that cannot outlive the run or
+/// reach beyond the project's repository, and nothing at all when the
+/// connection cannot mint one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SandboxGitCredential {
+    /// A GitHub App installation token minted for the project's repository
+    /// only, with `contents: read` and no other permission, expiring within
+    /// an hour.
+    RepoScopedRead {
+        token: String,
+        expires_at: Option<chrono::DateTime<Utc>>,
+    },
+    /// No credential. Never replaced by the connection's own token: a PAT or
+    /// OAuth token is long-lived and reaches every repository its owner can.
+    Withheld { reason: String },
+}
+
+/// Decide the sandbox git credential for a run of a project connected
+/// through `connection_id` to `owner/repo`.
+///
+/// Only a GitHub App installation can narrow a token to one repository and
+/// one permission. Every other connection (PAT, OAuth, GitLab, Gitea,
+/// Bitbucket) reports `ScopedTokensUnsupported`, and its token stays on the
+/// control plane.
+pub(crate) async fn sandbox_git_credential(
+    git: &dyn GitProviderManagerTrait,
+    connection_id: i32,
+    owner: &str,
+    repo: &str,
+) -> SandboxGitCredential {
+    use temps_git::services::git_provider_manager_trait::GitProviderManagerError;
+
+    if owner.is_empty() || repo.is_empty() {
+        return SandboxGitCredential::Withheld {
+            reason: format!(
+                "the project has no repository recorded for git connection {connection_id}"
+            ),
+        };
+    }
+    match git
+        .mint_scoped_repo_token(connection_id, owner, repo, temps_git::ScopedTokenOp::Fetch)
+        .await
+    {
+        // The token is written into a quoted heredoc and a credential file,
+        // so only accept the characters provider tokens are made of.
+        Ok(grant) if !is_plain_token(&grant.password) => SandboxGitCredential::Withheld {
+            reason: format!(
+                "the read-only token minted for {owner}/{repo} on git connection \
+                 {connection_id} is empty or has unexpected characters"
+            ),
+        },
+        Ok(grant) => SandboxGitCredential::RepoScopedRead {
+            token: grant.password,
+            expires_at: grant.expires_at,
+        },
+        Err(GitProviderManagerError::ScopedTokensUnsupported { reason, .. }) => {
+            SandboxGitCredential::Withheld {
+                reason: format!(
+                    "git connection {connection_id} cannot mint a token limited to \
+                     {owner}/{repo} ({reason}), and its own token is not handed to sandboxes"
+                ),
+            }
+        }
+        Err(e) => SandboxGitCredential::Withheld {
+            reason: format!(
+                "minting a read-only token for {owner}/{repo} on git connection \
+                 {connection_id} failed: {e}"
+            ),
+        },
+    }
+}
+
+fn is_plain_token(token: &str) -> bool {
+    !token.is_empty()
+        && token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+/// Shell script that installs a repo-scoped GitHub token for `git` (HTTPS
+/// credential store) and `gh` inside the sandbox. `token` must satisfy
+/// [`is_plain_token`].
+fn sandbox_git_credential_script(token: &str) -> String {
+    const HOST: &str = "github.com";
+    let mut script = String::from("set -e\n");
+    script.push_str("mkdir -p /home/temps\n");
+    script.push_str("git config --global init.defaultBranch main\n");
+    script.push_str("git config --global pull.rebase false\n");
+    script.push_str(&format!(
+        "umask 077 && printf 'https://x-access-token:%s@%s\\n' '{token}' '{HOST}' > /home/temps/.git-credentials\n",
+    ));
+    script.push_str("git config --global credential.helper store\n");
+    script.push_str(&format!(
+        "git config --global url.'https://{HOST}/'.insteadOf 'git@{HOST}:'\n",
+    ));
+    script.push_str("mkdir -p /home/temps/.config/gh\n");
+    script.push_str(&format!(
+        "umask 077 && cat > /home/temps/.config/gh/hosts.yml <<'EOF'\n\
+         {HOST}:\n\
+         \x20\x20oauth_token: {token}\n\
+         \x20\x20user: x-access-token\n\
+         \x20\x20git_protocol: https\n\
+         EOF\n",
+    ));
+    script.push_str("chown -R temps:temps /home/temps/.git-credentials /home/temps/.gitconfig /home/temps/.config 2>/dev/null || true\n");
+    script
 }
 
 impl AgentExecutor {
@@ -466,16 +579,13 @@ impl AgentExecutor {
         } = params;
 
         // ADR 045: refuse *before* the sandbox is ever built, not only before
-        // the executor's own push step. This sandbox is about to be seeded
-        // with a push-capable git credential for `project`'s repository
-        // (`inject_config_repos_and_secrets` writes `.git-credentials` /
-        // `gh`/`glab` config below) on a full-network sandbox by default --
-        // an AI process holding that credential can `git push` directly,
-        // which is strictly stronger than the PR-branch push
-        // `refuse_granted_project_push`'s other call site blocks, and would
-        // otherwise reach it ungated. This is the one call every run path
-        // (the executor and the autofixer) makes to get a container at all,
-        // so refusing here is a required chokepoint rather than one more
+        // the executor's own push step. The sandbox's own git credential is
+        // read-only and scoped to `project`'s repository (see
+        // `SandboxGitCredential`), but the run still ends in the
+        // control-plane push + PR that `refuse_granted_project_push`'s other
+        // call site blocks. This is the one call every run path (the
+        // executor and the autofixer) makes to get a container at all, so
+        // refusing here keeps a required chokepoint rather than one more
         // call site to remember.
         refuse_granted_project_push(
             temps_core::docker_socket_grant::process_grant(),
@@ -609,38 +719,18 @@ impl AgentExecutor {
             self.run_token_ids.write().await.insert(run_id, token_id);
         }
 
-        let connection_id = project.git_provider_connection_id;
-        let mut git_creds: Option<(String, String)> = None;
-        if let Some(conn_id) = connection_id {
-            match self
-                .git_provider_manager
-                .get_connection_access_token(conn_id)
-                .await
-            {
-                Ok((token, provider_type)) => match provider_type.as_str() {
-                    "github" | "gitlab" => {
-                        git_creds = Some((token, provider_type));
-                    }
-                    other => {
-                        tracing::debug!(
-                            "Run {}: git provider '{}' has no known credential layout; \
-                             skipping credential injection",
-                            run_id,
-                            other
-                        );
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!(
-                        "Run {}: failed to fetch git provider token for connection {}: {}. \
-                         Agent will run without push/PR credentials.",
-                        run_id,
-                        conn_id,
-                        e
-                    );
-                }
-            }
-        }
+        let git_credential = match project.git_provider_connection_id {
+            Some(connection_id) => Some(
+                sandbox_git_credential(
+                    self.git_provider_manager.as_ref(),
+                    connection_id,
+                    &project.repo_owner,
+                    &project.repo_name,
+                )
+                .await,
+            ),
+            None => None,
+        };
 
         // Per-run overrides from the ephemeral YAML take precedence over globals.
         let (yaml_cpu, yaml_mem): (Option<f64>, Option<u64>) = ephemeral_yaml
@@ -815,97 +905,69 @@ impl AgentExecutor {
             tracing::debug!("Installed memory script for run {}", run_id);
         }
 
-        // Git credential helper + gh/glab config.
-        if let Some((ref token, ref provider_name)) = git_creds {
-            let host = match provider_name.as_str() {
-                "github" => "github.com",
-                "gitlab" => "gitlab.com",
-                _ => "github.com",
-            };
-            let shell_quote = |v: &str| v.replace('\'', "'\\''");
-            let mut script = String::from("set -e\n");
-            script.push_str("mkdir -p /home/temps\n");
-            script.push_str("git config --global init.defaultBranch main\n");
-            script.push_str("git config --global pull.rebase false\n");
-            script.push_str(&format!(
-                "umask 077 && printf 'https://x-access-token:%s@%s\\n' '{}' '{}' > /home/temps/.git-credentials\n",
-                shell_quote(token),
-                host,
-            ));
-            script.push_str("git config --global credential.helper store\n");
-            script.push_str(&format!(
-                "git config --global url.'https://{host}/'.insteadOf 'git@{host}:'\n",
-                host = host,
-            ));
-
-            match provider_name.as_str() {
-                "github" => {
-                    script.push_str("mkdir -p /home/temps/.config/gh\n");
-                    script.push_str(&format!(
-                        "umask 077 && cat > /home/temps/.config/gh/hosts.yml <<'EOF'\n\
-                         github.com:\n\
-                         \x20\x20oauth_token: {}\n\
-                         \x20\x20user: x-access-token\n\
-                         \x20\x20git_protocol: https\n\
-                         EOF\n",
-                        shell_quote(token),
-                    ));
+        // Repo-scoped, read-only git credential for the AI's own `git`/`gh`.
+        match &git_credential {
+            Some(SandboxGitCredential::RepoScopedRead { token, expires_at }) => {
+                if let Err(e) = self
+                    .sandbox_registry
+                    .exec(
+                        run_id,
+                        vec![
+                            "sh".to_string(),
+                            "-c".to_string(),
+                            sandbox_git_credential_script(token),
+                        ],
+                        std::collections::HashMap::new(),
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        "Run {}: failed to install the read-only git credential for {}/{}: {}",
+                        run_id,
+                        project.repo_owner,
+                        project.repo_name,
+                        e
+                    );
+                } else {
+                    let expiry = expires_at
+                        .map(|at| format!(", expires {}", at.to_rfc3339()))
+                        .unwrap_or_default();
+                    self.run_service
+                        .append_log(
+                            run_id,
+                            "info",
+                            &format!(
+                                "Injected a read-only GitHub token for {}/{} only (git fetch + \
+                                 gh reads{}); the branch push and pull request run on the \
+                                 control plane",
+                                project.repo_owner, project.repo_name, expiry
+                            ),
+                            None,
+                        )
+                        .await?;
                 }
-                "gitlab" => {
-                    script.push_str("mkdir -p /home/temps/.config/glab-cli\n");
-                    script.push_str(&format!(
-                        "umask 077 && cat > /home/temps/.config/glab-cli/config.yml <<'EOF'\n\
-                         hosts:\n\
-                         \x20\x20gitlab.com:\n\
-                         \x20\x20\x20\x20token: {}\n\
-                         \x20\x20\x20\x20git_protocol: https\n\
-                         EOF\n",
-                        shell_quote(token),
-                    ));
-                }
-                _ => {}
             }
-
-            script.push_str("chown -R temps:temps /home/temps/.git-credentials /home/temps/.gitconfig /home/temps/.config 2>/dev/null || true\n");
-
-            if let Err(e) = self
-                .sandbox_registry
-                .exec(
+            Some(SandboxGitCredential::Withheld { reason }) => {
+                tracing::info!(
+                    "Run {}: no git credential in the sandbox: {}",
                     run_id,
-                    vec!["sh".to_string(), "-c".to_string(), script],
-                    std::collections::HashMap::new(),
-                    None,
-                )
-                .await
-            {
-                tracing::warn!(
-                    "Run {}: failed to install git credential helper: {}",
-                    run_id,
-                    e
-                );
-            } else {
-                tracing::debug!(
-                    "Run {}: installed git credentials for {} provider",
-                    run_id,
-                    provider_name
+                    reason
                 );
                 self.run_service
                     .append_log(
                         run_id,
                         "info",
                         &format!(
-                            "Injected {} credentials (git push + {} CLI auth, no env vars)",
-                            provider_name,
-                            if provider_name == "github" {
-                                "gh"
-                            } else {
-                                "glab"
-                            }
+                            "No git credential in the sandbox: {reason}. The repository is \
+                             already cloned, and the branch push and pull request run on \
+                             the control plane."
                         ),
                         None,
                     )
                     .await?;
             }
+            None => {}
         }
 
         // Inject config repos, secrets, MCP, and skills.
@@ -927,7 +989,7 @@ impl AgentExecutor {
                 run_id,
                 config_for_injection,
                 project.id,
-                connection_id,
+                project.git_provider_connection_id,
             )
             .await
         {
@@ -5953,5 +6015,197 @@ mod tests {
             skipped_overlay_entries_message("global", "acme", "agent-config", &skipped).unwrap();
         assert!(message.contains("and 5 more"), "{message}");
         assert!(!message.contains(&format!("link-{}", MAX_SKIPPED_OVERLAY_ENTRIES_LISTED)));
+    }
+
+    /// Git provider whose only allowed call is `mint_scoped_repo_token`:
+    /// every other method panics, so a test fails if the sandbox path ever
+    /// reaches for the connection's own token again.
+    struct ScopedOnlyGitProvider {
+        mint: Mutex<Option<Result<temps_git::ScopedTokenGrant, GitProviderManagerError>>>,
+        minted: Mutex<Vec<(i32, String, String, temps_git::ScopedTokenOp)>>,
+    }
+
+    impl ScopedOnlyGitProvider {
+        fn new(result: Result<temps_git::ScopedTokenGrant, GitProviderManagerError>) -> Self {
+            Self {
+                mint: Mutex::new(Some(result)),
+                minted: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl GitProviderManagerTrait for ScopedOnlyGitProvider {
+        async fn get_connection_access_token(
+            &self,
+            connection_id: i32,
+        ) -> Result<(String, String), GitProviderManagerError> {
+            panic!("connection {connection_id}'s own token must never be fetched for a sandbox")
+        }
+        async fn clone_repository(
+            &self,
+            _: i32,
+            _: &str,
+            _: &str,
+            _: &std::path::Path,
+            _: Option<&str>,
+        ) -> Result<(), GitProviderManagerError> {
+            unreachable!()
+        }
+        async fn get_repository_info(
+            &self,
+            _: i32,
+            _: &str,
+            _: &str,
+        ) -> Result<RepositoryInfo, GitProviderManagerError> {
+            unreachable!()
+        }
+        async fn download_archive(
+            &self,
+            _: i32,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &std::path::Path,
+            _: Option<&temps_git::ArchiveProgressSender>,
+        ) -> Result<(), GitProviderManagerError> {
+            unreachable!()
+        }
+        async fn push_files_and_create_pr(
+            &self,
+            _: i32,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: Vec<(String, Vec<u8>)>,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<PullRequest, GitProviderManagerError> {
+            unreachable!()
+        }
+        async fn mint_scoped_repo_token(
+            &self,
+            connection_id: i32,
+            owner: &str,
+            repo: &str,
+            operation: temps_git::ScopedTokenOp,
+        ) -> Result<temps_git::ScopedTokenGrant, GitProviderManagerError> {
+            self.minted.lock().unwrap().push((
+                connection_id,
+                owner.to_string(),
+                repo.to_string(),
+                operation,
+            ));
+            self.mint.lock().unwrap().take().expect("one mint per run")
+        }
+    }
+
+    fn installation_grant(password: &str) -> temps_git::ScopedTokenGrant {
+        temps_git::ScopedTokenGrant {
+            username: "x-access-token".to_string(),
+            password: password.to_string(),
+            expires_at: Some(Utc::now() + chrono::Duration::minutes(60)),
+        }
+    }
+
+    #[tokio::test]
+    async fn sandbox_gets_a_read_only_token_for_the_project_repository_only() {
+        let git = ScopedOnlyGitProvider::new(Ok(installation_grant("ghs_scopedRead123")));
+
+        let credential = sandbox_git_credential(&git, 7, "acme", "shop").await;
+
+        assert!(matches!(
+            credential,
+            SandboxGitCredential::RepoScopedRead { ref token, expires_at: Some(_) }
+                if token == "ghs_scopedRead123"
+        ));
+        let minted = git.minted.lock().unwrap();
+        assert_eq!(minted.len(), 1);
+        let (connection_id, owner, repo, operation) = &minted[0];
+        assert_eq!(
+            (*connection_id, owner.as_str(), repo.as_str()),
+            (7, "acme", "shop")
+        );
+        assert!(
+            matches!(operation, temps_git::ScopedTokenOp::Fetch),
+            "the sandbox must not receive a push-capable token: {operation:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pat_and_oauth_connections_give_the_sandbox_no_token() {
+        let git =
+            ScopedOnlyGitProvider::new(Err(GitProviderManagerError::ScopedTokensUnsupported {
+                connection_id: 7,
+                reason: "Connection 7 is not backed by a GitHub App installation".to_string(),
+            }));
+
+        let credential = sandbox_git_credential(&git, 7, "acme", "shop").await;
+
+        let SandboxGitCredential::Withheld { reason } = credential else {
+            panic!("a connection that cannot scope its token must not seed one: {credential:?}");
+        };
+        assert!(
+            reason.contains("git connection 7")
+                && reason.contains("acme/shop")
+                && reason.contains("not handed to sandboxes"),
+            "{reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_mint_gives_the_sandbox_no_token() {
+        let git = ScopedOnlyGitProvider::new(Err(GitProviderManagerError::Other(
+            "GitHub returned 422: repository not accessible to the installation".to_string(),
+        )));
+
+        let credential = sandbox_git_credential(&git, 9, "acme", "shop").await;
+
+        let SandboxGitCredential::Withheld { reason } = credential else {
+            panic!("a failed mint must not fall back to any token: {credential:?}");
+        };
+        assert!(
+            reason.contains("git connection 9") && reason.contains("422"),
+            "{reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_project_without_a_repository_mints_nothing() {
+        let git = ScopedOnlyGitProvider::new(Ok(installation_grant("ghs_unused")));
+
+        let credential = sandbox_git_credential(&git, 3, "", "shop").await;
+
+        assert!(matches!(credential, SandboxGitCredential::Withheld { .. }));
+        assert!(git.minted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_minted_token_with_shell_or_yaml_metacharacters_is_refused() {
+        for bad in ["", "ghs_ok\nhost: evil", "ghs_'$(id)'", "ghs ok"] {
+            let git = ScopedOnlyGitProvider::new(Ok(installation_grant(bad)));
+            let credential = sandbox_git_credential(&git, 3, "acme", "shop").await;
+            assert!(
+                matches!(credential, SandboxGitCredential::Withheld { .. }),
+                "{bad:?} must not be written into the sandbox"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_git_credential_script_configures_git_and_gh_for_github_only() {
+        let script = sandbox_git_credential_script("ghs_scopedRead123");
+
+        assert!(script.contains(
+            "printf 'https://x-access-token:%s@%s\\n' 'ghs_scopedRead123' 'github.com' > /home/temps/.git-credentials"
+        ));
+        assert!(script.contains("oauth_token: ghs_scopedRead123"));
+        assert!(script.contains("umask 077"));
+        assert!(
+            !script.contains("glab"),
+            "only GitHub App connections can mint a scoped token"
+        );
     }
 }
