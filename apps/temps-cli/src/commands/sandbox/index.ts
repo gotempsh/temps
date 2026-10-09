@@ -405,6 +405,10 @@ export function registerSandboxCommands(program: Command): void {
       '--node <name|id>',
       "Node to run the sandbox on (name, id, or 'control-plane'). Omit to let Temps place it; see `sandbox nodes`",
     )
+    .option(
+      '--backend <backend>',
+      `Isolation backend: ${SANDBOX_BACKENDS.join(', ')}. Omit for the host default. An unavailable backend fails instead of downgrading`,
+    )
     .option('--json', 'Output as JSON')
     .action(createAction)
 
@@ -683,7 +687,26 @@ interface CreateOptions {
   newBranch?: string
   fromSnapshot?: string
   node?: string
+  backend?: string
   json?: boolean
+}
+
+/** Isolation backends a sandbox can request (ADR-029, ADR-050). */
+export const SANDBOX_BACKENDS = ['docker', 'firecracker', 'microsandbox'] as const
+
+/**
+ * Validate `--backend` locally so a typo fails before any request. Whether
+ * the backend is available on the host is still the server's call.
+ */
+export function parseSandboxBackend(value: string): (typeof SANDBOX_BACKENDS)[number] {
+  const backend = value.trim().toLowerCase()
+  const known = SANDBOX_BACKENDS.find((candidate) => candidate === backend)
+  if (!known) {
+    throw new Error(
+      `Unknown --backend '${value}'. Expected one of: ${SANDBOX_BACKENDS.join(', ')}`,
+    )
+  }
+  return known
 }
 
 /**
@@ -767,6 +790,7 @@ async function createAction(options: CreateOptions): Promise<void> {
   const body: Record<string, unknown> = {}
   if (options.fromSnapshot) body.from_snapshot = options.fromSnapshot
   if (options.node) body.node = options.node
+  if (options.backend !== undefined) body.backend = parseSandboxBackend(options.backend)
   if (options.image) body.image = options.image
   if (options.name) body.name = options.name
   if (options.timeout !== undefined) body.timeout_secs = Number(options.timeout)

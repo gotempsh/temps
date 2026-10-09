@@ -9,7 +9,6 @@ import {
   Box,
   ChevronDown,
   ChevronRight,
-  Cpu,
   ExternalLink,
   GitBranch,
   HardDrive,
@@ -32,6 +31,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Skeleton } from '@/components/ui/skeleton'
+import { SandboxBackendLabel } from '@/components/sandboxes/SandboxBackendLabel'
 import {
   Button,
   CopyAction,
@@ -476,25 +476,7 @@ export default function SandboxDetail() {
     {
       label: 'Backend',
       value: sandbox.backend ? (
-        <span
-          className="inline-flex items-center gap-1"
-          title={
-            sandbox.backend === 'firecracker'
-              ? 'Hardware-virtualized microVM (KVM)'
-              : 'Namespaced container'
-          }
-        >
-          {sandbox.backend === 'firecracker' ? (
-            <Cpu className="h-3 w-3" />
-          ) : (
-            <Box className="h-3 w-3" />
-          )}
-          {sandbox.backend === 'firecracker'
-            ? 'Firecracker'
-            : sandbox.backend === 'docker'
-              ? 'Docker'
-              : sandbox.backend}
-        </span>
+        <SandboxBackendLabel backend={sandbox.backend} />
       ) : (
         '—'
       ),
