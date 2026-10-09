@@ -144,7 +144,7 @@ temps join <url> <token> --private-address 10.0.0.5 \
 ```
 
 - `--name` — A friendly name for this node (defaults to the hostname)
-- `--labels` — Key-value pairs for scheduling hints (e.g., `region=us-east,tier=production`)
+- `--labels` — Key-value pairs for scheduling hints (e.g., `region=us-east,tier=production`). The `temps.sh/role` key is reserved: `temps.sh/role=builder` makes a [build-only node](#control-plane-builds) and `temps.sh/role=dedicated` makes a [dedicated node](#dedicated-nodes)
 - `--agent-address` — The address the agent server listens on (default: `0.0.0.0:3100`)
 
 After joining, the node is registered and the agent config is saved to `~/.temps/agent.json`. Start the agent separately:
@@ -408,13 +408,60 @@ A node is considered **active** if it has sent a heartbeat within the last 90 se
 When you deploy an application with multiple replicas, the **node scheduler** decides which node each replica lands on:
 
 1. It starts from every node with `status = "active"` and a heartbeat within the last 90 seconds, plus the control plane itself (node `0`). If no active worker nodes exist, all replicas run locally on the control plane — unless it was started with [`--profile control-plane`](#control-plane-profile), in which case the deployment fails with an explanation instead.
-2. **Target nodes** and **label selectors**, if set in the environment's or project's deployment settings, narrow the pool first. A label selector matches a node only if every key matches (a list of values matches any of them). The control plane has no labels, so a label selector never places replicas on it; target node `0` selects it explicitly. If these constraints leave no eligible node, the deployment fails with an error instead of ignoring them.
+2. **Target nodes** and **label selectors**, if set in the environment's or project's deployment settings, narrow the pool first. A label selector matches a node only if every key matches (a list of values matches any of them). The control plane has no labels, so a label selector never places replicas on it; target node `0` selects it explicitly. If these constraints leave no eligible node, the deployment fails with an error instead of ignoring them. Build-only nodes (`temps.sh/role=builder`) never take replicas, and [dedicated nodes](#dedicated-nodes) (`temps.sh/role=dedicated`) take them only when the target nodes list names them.
 3. **Architecture compatibility** narrows it further: a node is only eligible if this deployment has a built image for the platform its agent last reported (`linux/amd64`, `linux/arm64`, ...) — otherwise the container would pull the image, start, and immediately fail with `exec format error`. A node that hasn't reported its architecture yet (e.g. mid-upgrade) is kept in the pool with a warning instead of being dropped. Either way, the deploy log says so, e.g. `Skipping node 'worker-2' runs linux/arm64, and this deployment only has images for [linux/amd64]`. This filter needs to know which platforms the image exists for, either from a cross-architecture build or by inspecting the image on the control plane. When it can't tell (for example, the image isn't in the control plane's local image store, or the control plane has no local Docker daemon), the filter is skipped: every node stays eligible, and the deploy log doesn't mention it.
 4. From what's left, replicas are placed with **least-loaded** scheduling by default — each replica goes to the node with the lowest load score (60% CPU, 40% memory usage, from the node's last heartbeat), falling back to round-robin when no node reports capacity data. The control plane doesn't report capacity, so it (like any node without capacity data) counts as 50% loaded. Nodes at or above a 90% load score are skipped unless every remaining node is over that threshold, in which case the threshold is relaxed rather than failing the deployment.
 5. **Anti-affinity** (on by default) tries to give each replica its own node. When there are simply fewer nodes than replicas, replicas wrap around and share nodes. But if nodes were excluded for a lasting reason — for example, an architecture mismatch — and that leaves too few eligible nodes, the deployment fails with an error naming the excluded nodes instead of silently stacking replicas on the same node.
 6. Each container records which node it was assigned to in the database.
 
 The deployment job creates a `RemoteNodeDeployer` for each remote assignment, which communicates with the worker's agent API to deploy, stop, and manage containers.
+
+---
+
+## Dedicated nodes {{ anchor: true, id: 'dedicated-nodes' }}
+
+Some hosts should only run workloads you put there on purpose: a machine with GPUs or KVM, a host isolated for one team, or any server you don't want the scheduler to fill with unrelated deployments. Join such a host with the `dedicated` role:
+
+```bash
+temps join <url> <token> --private-address 10.0.0.7 \
+  --name gpu-1 \
+  --labels temps.sh/role=dedicated,gpu=true
+```
+
+A dedicated node runs an environment **only if that environment lists the node's ID in its target nodes**. Everything else passes it over:
+
+- **Unpinned deployments** (no target nodes) never land on it.
+- **Label selectors alone never select it**, even when every label matches — `gpu=true` matches a kind of machine, a target node ID names this one. A selector combined with a target node list that includes the node still works: both have to match.
+- **Worker builds** (build location *Worker node*, or a control plane without Docker) run on it only for an environment that pins it.
+- **Sandboxes** are never placed on it automatically; a sandbox that requests it by ID or name (`--node gpu-1`, `"node": "gpu-1"`) still runs there, subject to the sandbox node allow-list.
+- **Cross-architecture builds** skip its architecture unless an environment being deployed pins it.
+
+To pin an environment, open the project's **Settings > Environments**, pick the environment, and select the node under **Node scheduling > Target Nodes**. The console marks dedicated nodes with a *Dedicated* badge there and in **Settings > Nodes**. Over the API, set `target_nodes` in the environment settings:
+
+```bash
+curl -X PUT https://temps.example.com/api/projects/{project_id}/environments/{env_id}/settings \
+  -H "Authorization: Bearer $TEMPS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"target_nodes": [7]}'
+```
+
+Pinning other nodes alongside it (`[7, 3]`) spreads that environment over both. Node `0` is the control plane.
+
+When an unpinned deployment has nowhere else to go — every worker is dedicated and the control plane cannot take it — the deployment fails, naming the nodes it passed over. If that is clear from the configuration alone (the control plane runs with `--profile control-plane`, or a label selector excludes it), it fails as it starts: no job runs, and the source is never downloaded or built. If it depends on the image (the control plane cannot run the architecture that was built), it can only be known once the build has finished, so it fails at the deploy step, before anything is transferred to a node. Either way the error reads:
+
+```
+No eligible node for this deployment: node 7 (gpu-1) is dedicated (temps.sh/role=dedicated) and only runs environments that pin it in target_nodes. ...
+```
+
+If the control plane can run the workload, unpinned deployments simply stay on it, and the deploy log notes `Skipping node 'gpu-1' is dedicated ...`. A dedicated node is not counted when anti-affinity decides whether there are enough nodes: marking a node dedicated never makes an unpinned multi-replica deployment fail where it previously wrapped around.
+
+**Changing an existing node's role.** The agent reports its labels on every heartbeat, from the `labels` object in the `~/.temps/agent.json` that `temps join` wrote. To make an existing node dedicated, add `"temps.sh/role": "dedicated"` there and restart `temps agent`; the control plane picks it up on the next heartbeat (within 30 seconds), and the scheduler reads it at every placement decision. Workloads already running on a node when it becomes dedicated are **not moved or stopped** — they keep running until their next deployment, which is then placed under the new rules (so an unpinned environment moves off the node on its next deploy). Sandboxes already on the node keep running too. To stop using the node for something now, redeploy that environment or drain the node.
+
+A node has one role: `builder` and `dedicated` are mutually exclusive values of the same `temps.sh/role` label. A build-only node never hosts replicas, pinned or not.
+
+Like every label, the role is reported by the node itself, so it is a placement policy you set on hosts you control, not an isolation boundary against a compromised worker.
+
+Filtering dedicated nodes is a check over the active node list the scheduler already loads for each placement; it adds no queries and no per-request work.
 
 ---
 
@@ -425,7 +472,7 @@ Sandboxes can run on any node: the control plane or a worker joined with `temps 
 ### Where a new sandbox goes
 
 - **No node requested, control plane allowed** (the default): the sandbox runs on the control plane. A single-node install behaves exactly as before.
-- **No node requested, control plane not allowed**: the sandbox goes to the allowed, active worker with the fewest live sandboxes.
+- **No node requested, control plane not allowed**: the sandbox goes to the allowed, active worker with the fewest live sandboxes. [Dedicated nodes](#dedicated-nodes) are skipped; if only dedicated nodes are left, the request fails and names them.
 - **A node requested**: the sandbox runs there or the request fails. It never falls back to another node.
 
 ```bash
@@ -599,7 +646,9 @@ on the control plane is involved at any point.
 
 The build runs on a node joined with `--labels temps.sh/role=builder` of the
 target architecture when there is one — such nodes build but never host
-replicas — and otherwise on a worker eligible to run the deployment.
+replicas — and otherwise on a worker eligible to run the deployment. A
+[dedicated node](#dedicated-nodes) is only eligible for an environment that
+pins it in its target nodes.
 
 **Static sites** (Vite, Create React App, Astro, ...) build the same way. The
 control plane then fetches only the output directory (for example `/app/dist`)

@@ -1103,7 +1103,13 @@ function printPlacement(data: SandboxPlacementResponse): void {
     { header: 'Sandboxes', accessor: (n) => String(n.live_sandboxes) },
     {
       header: 'Note',
-      accessor: (n) => n.reason ?? (n.eligible ? 'accepts new sandboxes' : ''),
+      accessor: (n) =>
+        n.reason ??
+        (n.eligible
+          ? n.dedicated
+            ? 'dedicated: only sandboxes created with --node'
+            : 'accepts new sandboxes'
+          : ''),
       color: (v) => colors.muted(v),
     },
   ]

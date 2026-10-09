@@ -104,6 +104,25 @@ describe('SandboxNodesCard', () => {
     expect(html).not.toContain('The control plane will not take new sandboxes')
   })
 
+  test('marks a dedicated node and says how to use it', () => {
+    const html = renderCard({
+      allowed_node_ids: null,
+      nodes: [controlPlane, { ...worker, dedicated: true }],
+    })
+    expect(html).toContain('Dedicated')
+    expect(html).toContain('Only takes sandboxes that request it')
+    expect(html).toContain('--node worker-1')
+  })
+
+  test('an ordinary worker carries no dedicated badge', () => {
+    const html = renderCard({
+      allowed_node_ids: null,
+      nodes: [controlPlane, worker],
+    })
+    expect(html).not.toContain('Only takes sandboxes that request it')
+    expect(html).not.toContain('>Dedicated<')
+  })
+
   test('shows why a node does not take new sandboxes', () => {
     const html = renderCard({
       allowed_node_ids: null,

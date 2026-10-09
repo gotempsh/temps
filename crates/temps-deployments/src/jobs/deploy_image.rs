@@ -2632,6 +2632,12 @@ impl DeployImageJob {
                     | crate::services::node_service::NodeError::PlacementConstraintsUnsatisfied {
                         ..
                     }
+                    // Only dedicated nodes could take it and none is pinned.
+                    // Degrading to Local would either start an image the
+                    // control plane cannot run or ignore a label selector.
+                    | crate::services::node_service::NodeError::DedicatedNodesNotPinned {
+                        ..
+                    }
                     | crate::services::node_service::NodeError::Validation {
                         ..
                     }

@@ -261,6 +261,16 @@ pub enum SandboxError {
     #[error("No node can run sandboxes: every allowed node is offline or the allow-list is empty. Allow a node under AI Workflows → Sandbox (/agent-sandbox/sandbox) or with `bunx @temps-sdk/cli sandbox nodes allow`.")]
     NoPlacementNode,
 
+    /// Automatic placement found only dedicated nodes
+    /// (`temps.sh/role=dedicated`), which take a sandbox only when it asks
+    /// for them by id or name.
+    #[error("No node can take this sandbox automatically: {nodes}. Request a dedicated node explicitly by passing its id or name as `node`, or allow a node without the temps.sh/role=dedicated label under AI Workflows → Sandbox (/agent-sandbox/sandbox) or with `bunx @temps-sdk/cli sandbox nodes allow`.")]
+    DedicatedNodesOnly {
+        /// The dedicated nodes passed over, formatted as
+        /// `node <id> (<name>) is dedicated …`.
+        nodes: String,
+    },
+
     /// The sandbox is attached to a project but that project has no active
     /// environment from which scoped service credentials can be issued.
     #[error("Project {project_id} attached to sandbox {sandbox_id} has no active environment")]

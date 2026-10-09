@@ -17235,6 +17235,12 @@ export type PlacementNode = {
      */
     allowed: boolean;
     /**
+     * Labelled `temps.sh/role=dedicated`: automatic placement never picks
+     * it, but a sandbox that requests it by id or name may still run there
+     * when it is `eligible`. Always `false` for the control plane.
+     */
+    dedicated?: boolean;
+    /**
      * Can take a new sandbox right now (allowed and active).
      */
     eligible: boolean;

@@ -37751,6 +37751,10 @@
             "description": "Allowed by the operator's sandbox placement settings.",
             "type": "boolean"
           },
+          "dedicated": {
+            "description": "Labelled `temps.sh/role=dedicated`: automatic placement never picks\nit, but a sandbox that requests it by id or name may still run there\nwhen it is `eligible`. Always `false` for the control plane.",
+            "type": "boolean"
+          },
           "eligible": {
             "description": "Can take a new sandbox right now (allowed and active).",
             "type": "boolean"
