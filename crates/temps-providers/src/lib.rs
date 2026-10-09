@@ -15,6 +15,7 @@ pub mod pg_stat_statements;
 pub mod postgres_lifecycle;
 pub mod postgres_upgrade_service;
 pub mod query_service;
+pub mod readiness;
 pub mod remote_service_client;
 pub mod service_dns;
 pub mod services;

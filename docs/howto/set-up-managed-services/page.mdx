@@ -247,6 +247,20 @@ curl -X POST "https://your-temps-instance/api/external-services/{id}/start" \
 
 Stopping a service does not delete any data — the Docker volume persists. Applications linked to a stopped service will fail to connect until the service is started again.
 
+### Starting and initialization failures (S3/RustFS)
+
+A RustFS container can accept connections before its storage layer is ready. So after you create, start or upgrade an S3, Blob or RustFS service, it shows as **Starting** until an authenticated `ListBuckets` call made with the service's own credentials succeeds. Only then does it become **Running**. A `/health` response alone does not count. While it is starting, the service page shows the latest probe result, such as `HTTP 503: ... storage layer is not ready`, and how many times the container has restarted.
+
+If the service never becomes ready, its status changes to **Failed** and the service page explains why:
+
+- **Storage initialization failed**: the container logged an initialization error that RustFS does not recover from (for example `store init failed: init retry budget exhausted`).
+- **The container keeps restarting**: it restarted 3 times without answering an authenticated request.
+- **The service did not become ready in time**: it never answered within 180 seconds.
+
+The page shows the reason, the matching container log lines (with credentials masked) and what you can do next: view the logs, start it again, switch to another image version with **Upgrade**, or delete the service and create it again on fresh volumes. Temps never does any of these for you, and it does not stop, recreate or delete the container or its volumes. The same information is in `service.readiness` from `GET /api/external-services/{id}` while `status` is `starting` or `failed`.
+
+If Temps restarts while a service is starting, it resumes the check and keeps the original deadline. Services that were already running are not affected.
+
 ### Health check
 
 ```bash
