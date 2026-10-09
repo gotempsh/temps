@@ -1326,17 +1326,14 @@ pub fn detect_project_candidates(
                 .iter()
                 .any(|name| *name != "index.html" && is_project_manifest(name))
             || names.contains(&"Dockerfile")
+            || names.iter().any(|name| is_entrypoint_file(name))
         {
             return true;
         }
-        let mut ancestor = *root;
-        while let Some((parent, name)) = ancestor.rsplit_once('/') {
-            if name == "src" && rsbuild_roots.contains(parent) {
-                return false;
-            }
-            ancestor = parent;
-        }
-        !(ancestor == "src" && rsbuild_roots.contains("."))
+        // Only the conventional direct src/index.html is claimed. Descendant
+        // sites can belong to independent apps, including public/ document roots.
+        let (parent, name) = root.rsplit_once('/').unwrap_or((".", *root));
+        !(name == "src" && rsbuild_roots.contains(parent))
     });
 
     let mut candidates = Vec::new();
@@ -1796,6 +1793,43 @@ mod uploaded_source_detection_tests {
             assert!(detect_project_candidates(&files).iter().any(|c| {
                 c.path == format!("{prefix}src/independent") && c.preset == PresetType::NodeJs
             }));
+        }
+    }
+
+    #[test]
+    fn rsbuild_source_filter_preserves_independent_html_and_server_entrypoints() {
+        let base = BTreeMap::from([
+            (
+                "web/package.json".to_string(),
+                r#"{"devDependencies":{"@rsbuild/core":"1.3.22"}}"#.to_string(),
+            ),
+            (
+                "web/src/index.html".to_string(),
+                "<div id='root'></div>".to_string(),
+            ),
+            (
+                "web/src/independent/package.json".to_string(),
+                r#"{"scripts":{"start":"node server.js"}}"#.to_string(),
+            ),
+            (
+                "web/src/independent/public/index.html".to_string(),
+                "<h1>Independent</h1>".to_string(),
+            ),
+        ]);
+        let candidates = detect_project_candidates(&base);
+        assert!(!candidates.iter().any(|c| c.path == "web/src"));
+        assert!(candidates
+            .iter()
+            .any(|c| c.path == "web/src/independent/public" && c.preset == PresetType::Static));
+        for (entry, provider) in [
+            ("index.php", NixpacksProvider::Php),
+            ("main.ts", NixpacksProvider::Deno),
+        ] {
+            let mut files = base.clone();
+            files.insert(format!("web/src/{entry}"), "server entrypoint".to_string());
+            assert!(detect_project_candidates(&files)
+                .iter()
+                .any(|c| c.path == "web/src" && c.build_provider == Some(provider)));
         }
     }
 
