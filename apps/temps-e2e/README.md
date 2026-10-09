@@ -1347,9 +1347,33 @@ tears the whole thing down at the end. It does NOT accept `--url`/
 
     Cleanup always unpauses the worker, destroys leftover sandboxes and
     restores `allowed_node_ids` to `null`.
-14. remove the worker node (`DELETE /internal/nodes/{id}`); confirm it's
+14. dedicated nodes (`src/commands/multinode-dedicated-phases.ts`). The
+    drained worker hosts nothing at this point, so its agent can be
+    restarted safely:
+    - add `temps.sh/role=dedicated` to the worker's `/root/.temps/agent.json`
+      labels and `docker restart` it; wait until `GET /internal/nodes`
+      reports the label on a fresh heartbeat, then reactivate the worker.
+    - an **unpinned** application with 2 replicas and anti-affinity: both
+      replicas must be on the control plane's `docker ps` and none on the
+      worker's (without the role, anti-affinity would put one replica on the
+      worker), and the deploy log must say `'worker-1' is dedicated
+      (temps.sh/role=dedicated)`.
+    - a **selector-only** application (`target_labels`
+      `temps.sh/role=dedicated`, no `target_nodes`) must fail with `No
+      eligible node for this deployment: node <id> (worker-1) is dedicated
+      ...` and start nothing on the worker.
+    - the same environment **pinned** with `target_nodes: [worker]` (selector
+      kept) must land on the worker and not on the control plane.
+    - `GET /v1/sandboxes/placement` lists the worker with `dedicated: true`;
+      with the allow-list set to `[worker]`, a sandbox created without `node`
+      is refused with `422 sandbox-dedicated-node-only`.
+    - tear those applications down and drain the worker again.
+
+    Cleanup always restores the sandbox allow-list to `null` and removes the
+    applications this phase created.
+15. remove the worker node (`DELETE /internal/nodes/{id}`); confirm it's
     gone from `GET /internal/nodes`.
-15. teardown (in a `finally`, same discipline as every other scenario):
+16. teardown (in a `finally`, same discipline as every other scenario):
     `docker compose down` (no `-v`, so the cargo-registry/cargo-git/
     workspace-target cache volumes survive for a near-instant re-run), then
     explicitly `docker volume rm` the identity/state volumes (postgres

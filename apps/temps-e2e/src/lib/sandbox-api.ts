@@ -35,6 +35,7 @@ export const SANDBOX_PROBLEM_TYPES = {
   nodeOffline: 'https://temps.sh/probs/sandbox-node-offline',
   nodeUnreachable: 'https://temps.sh/probs/sandbox-node-unreachable',
   noPlacementNode: 'https://temps.sh/probs/sandbox-no-placement-node',
+  dedicatedNodeOnly: 'https://temps.sh/probs/sandbox-dedicated-node-only',
   snapshotOnWorkerNode: 'https://temps.sh/probs/sandbox-snapshot-on-worker-node',
   unsupportedOnWorkerNode: 'https://temps.sh/probs/sandbox-unsupported-on-worker-node',
 } as const
@@ -69,6 +70,8 @@ export interface PlacementNode {
   eligible: boolean
   reason: string | null
   live_sandboxes: number
+  /** `temps.sh/role=dedicated`: only taken by a sandbox that requests it. */
+  dedicated?: boolean
 }
 
 export interface SandboxPlacement {
