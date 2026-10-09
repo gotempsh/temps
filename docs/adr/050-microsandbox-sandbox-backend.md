@@ -52,6 +52,7 @@ The spike (adding the crate to `temps-agents` and running `cargo check`):
 - **Size:** `Cargo.lock` grows by 100 packages (1259 → 1359). `temps-agents`' normal (non-dev) dependency graph grows by 76 unique packages (916 → 992, +8%): the `microsandbox-*` crates, the second sea-orm stack, `oci-client`/`oci-spec`, and libkrun device crates (`msb_krun_*`, `vmm-sys-util`, `kvm-*`/`hvf`) pulled in through `microsandbox-filesystem`.
 - **Compile:** no new native build tools. `cmake` and `protoc` are pre-existing workspace requirements (pingora's `zlib-ng`, `temps-otel`), not added by this crate.
 - **Edition:** the crate is Rust 2024. Our toolchain (1.99) builds it; the workspace stays on 2021.
+- **Targets:** the crate does not build for musl. Its VMM crate (`msb_krun_vmm` 0.1.40, unchanged in 0.1.41) moves a `pthread_t` into a `Send + Sync` closure; musl defines `pthread_t` as a raw pointer. The dependency is therefore declared under `cfg(not(target_env = "musl"))` and the provider compiles only there. The glibc Linux and macOS release binaries carry the backend. The musl build — the Alpine container image — reports it unavailable with that reason and offers no setup command. Running microVMs inside that container would also need `/dev/kvm` passed through, so the image loses little.
 
 Option (b) would avoid the second ORM, but trades it for a stringly-typed process interface, a separately-installed CLI whose flags must stay compatible, and output parsing for exec/fs streams. The duplicated ORM is a compile-time and binary-size cost, not a runtime or correctness risk, so (a) wins.
 
@@ -148,7 +149,7 @@ Deferred (required before this backend could be recommended for untrusted multi-
 
 Landed with this ADR:
 
-1. `sandbox/microsandbox.rs`: provider, availability probe (`MicrosandboxUnavailable` typed reasons), `MicrosandboxCapability`, network/resource mapping, unit tests, and e2e tests that boot real VMs and skip at runtime when the hypervisor or runtime is absent.
+1. `sandbox/microsandbox/`: `mod.rs` holds the target-independent parts — availability probe (`MicrosandboxUnavailable` typed reasons), `MicrosandboxCapability`, configuration; `sdk.rs` holds the SDK-backed provider, network/resource mapping, unit tests, and e2e tests that boot real VMs and skip at runtime when the hypervisor or runtime is absent.
 2. `SandboxBackend::Microsandbox`; routing registration in `plugin.rs`; `RoutingSandboxProvider::supports_backend`.
 3. `temps-sandbox`: accepts `"microsandbox"`, rejects it on worker nodes, explains unavailability.
 4. `temps-config`: settings validation accepts `"microsandbox"`.
@@ -169,9 +170,10 @@ Landed with this ADR:
 
 E2E tests (`TEMPS_DATA_DIR=<dir with runtime> cargo test --lib -p temps-agents sandbox::microsandbox::tests::e2e -- --nocapture`) boot real VMs. They cover create, exec (split streams, exit codes, env layering, root exec), file write/read with mode, bounded reads, stop/start persistence, recovery by label, destroy, `none` (no routes, no egress), `restricted` (routed, public egress denied) and `full` (public egress allowed). The guest kernel always creates an inert `dummy0` device, so "no network" is asserted on the routing table, not the interface list.
 
-### Known limitation
+### Known limitations
 
-The backend registers only on the path where Docker is reachable (the same place Firecracker registers). A host without Docker still falls back to the `TEMPS_ALLOW_LOCAL_SANDBOX` path unchanged. Making microsandbox a Docker-less default (e.g. a Mac without Docker) is a follow-up, because it changes what a Docker-less startup does today.
+- **musl builds** (the container image) don't include the backend; see §2.
+- The backend registers only on the path where Docker is reachable (the same place Firecracker registers). A host without Docker still falls back to the `TEMPS_ALLOW_LOCAL_SANDBOX` path unchanged. Making microsandbox a Docker-less default (e.g. a Mac without Docker) is a follow-up, because it changes what a Docker-less startup does today.
 
 ## References
 

@@ -220,6 +220,7 @@ fn default_sandbox_backend(
 }
 
 /// The microsandbox backend (ADR-050) if this host can run it right now.
+#[cfg(not(target_env = "musl"))]
 fn microsandbox_provider(data_dir: &std::path::Path) -> Option<Arc<dyn SandboxProvider>> {
     use crate::sandbox::microsandbox::{MicrosandboxSandboxConfig, MicrosandboxSandboxProvider};
 
@@ -242,6 +243,17 @@ fn microsandbox_provider(data_dir: &std::path::Path) -> Option<Arc<dyn SandboxPr
             None
         }
     }
+}
+
+/// musl builds don't link the microsandbox SDK; the status API reports why.
+#[cfg(target_env = "musl")]
+fn microsandbox_provider(data_dir: &std::path::Path) -> Option<Arc<dyn SandboxProvider>> {
+    let capability = crate::sandbox::microsandbox::microsandbox_capability(data_dir);
+    tracing::debug!(
+        "microsandbox sandbox backend not registered: {}",
+        capability.reason.unwrap_or_default()
+    );
+    None
 }
 
 /// `TEMPS_ALLOW_LOCAL_SANDBOX=1` so production deployments that temporarily
