@@ -16,7 +16,8 @@ use crate::externalsvc::{
 };
 use crate::parameter_strategies;
 use crate::readiness::{
-    self, DbReadinessSink, ReadinessPhase, ReadinessTarget, ServiceReadiness, WatchRegistration,
+    self, AttemptStatus, DbReadinessSink, ReadinessAttempt, ReadinessPhase, ReadinessTarget,
+    ServiceReadiness, WatchRegistration,
 };
 use crate::remote_service_client::{
     RemotePortMapping, RemoteServiceClient, RemoteServiceCreateParams,
@@ -3438,8 +3439,8 @@ impl ExternalServiceManager {
         service_update.updated_at = Set(Utc::now());
         self.persist_service_config(service_id, service_update)
             .await?;
-        if let (Some(gate), Some(readiness)) = (gate, readiness) {
-            self.spawn_readiness_watch(service_id, gate, readiness, true);
+        if let (Some(gate), Some(attempt)) = (gate, readiness) {
+            self.spawn_readiness_watch(service_id, gate, attempt, true);
         }
 
         self.get_service_info(service_id).await
@@ -6815,35 +6816,37 @@ echo "[restore] Pre-seed complete"
 
     /// Set the post-start lifecycle status on `update`: `running`, or
     /// `starting` with a fresh readiness snapshot when `gate` must confirm
-    /// it first. Returns the snapshot to hand to [`Self::spawn_readiness_watch`]
-    /// once the row is written.
+    /// it first. Returns the snapshot and the id of this start attempt, to
+    /// hand to [`Self::spawn_readiness_watch`] once the row is written.
     fn apply_started_status(
         service: &external_services::Model,
         update: &mut external_services::ActiveModel,
         gate: Option<&dyn ReadinessTarget>,
-    ) -> Option<ServiceReadiness> {
+    ) -> Option<(ServiceReadiness, ReadinessAttempt)> {
         let Some(gate) = gate else {
             update.status = Set("running".to_string());
             return None;
         };
         let readiness = ServiceReadiness::starting(Utc::now(), &gate.policy());
+        let attempt = ReadinessAttempt::new();
         update.status = Set(readiness::STARTING_STATUS.to_string());
         update.error_message = Set(None);
         update.health_metadata = Set(readiness::with_readiness_metadata(
             service.health_metadata.as_ref(),
-            Some(&readiness),
+            Some((&readiness, &attempt)),
         ));
-        Some(readiness)
+        Some((readiness, attempt))
     }
 
     /// Watch a `starting` service in the background until its readiness
     /// gate promotes it to `running` or reports why it failed. A fresh start
     /// (`supersede`) takes over from any older watch on the same service.
+    /// The watch only ever writes for `attempt`; see [`ReadinessAttempt`].
     fn spawn_readiness_watch(
         &self,
         service_id: i32,
         target: Box<dyn ReadinessTarget>,
-        readiness: ServiceReadiness,
+        (readiness, attempt): (ServiceReadiness, ReadinessAttempt),
         supersede: bool,
     ) {
         let Some(registration) = WatchRegistration::claim(service_id, supersede) else {
@@ -6852,6 +6855,7 @@ echo "[restore] Pre-seed complete"
         let sink = DbReadinessSink {
             db: self.db.clone(),
             service_id,
+            attempt,
         };
         info!(
             "Service {} is starting; waiting up to {}s for it to serve a real request",
@@ -6905,14 +6909,33 @@ echo "[restore] Pre-seed complete"
                 return;
             }
         };
-        let readiness = ServiceReadiness::from_health_metadata(service.health_metadata.as_ref())
-            .filter(|r| r.phase == ReadinessPhase::Starting)
-            .unwrap_or_else(|| ServiceReadiness::starting(service.updated_at, &gate.policy()));
+        let stored_attempt =
+            ReadinessAttempt::from_health_metadata(service.health_metadata.as_ref());
+        let stored = ServiceReadiness::from_health_metadata(service.health_metadata.as_ref())
+            .filter(|r| r.phase == ReadinessPhase::Starting);
+        let resumed = match (stored, stored_attempt.clone()) {
+            (Some(readiness), Some(attempt)) => (readiness, attempt),
+            _ => {
+                // No usable snapshot to continue: start a new attempt from
+                // the row's last update, and take the row over only if it
+                // is still exactly as read.
+                let readiness = ServiceReadiness::starting(service.updated_at, &gate.policy());
+                let sink = DbReadinessSink {
+                    db: self.db.clone(),
+                    service_id: service.id,
+                    attempt: ReadinessAttempt::new(),
+                };
+                match sink.adopt(stored_attempt.as_ref(), &readiness).await {
+                    AttemptStatus::Current => (readiness, sink.attempt),
+                    AttemptStatus::Gone | AttemptStatus::Unavailable => return,
+                }
+            }
+        };
         info!(
             "Resuming the readiness watch for service {} ('{}'), started at {}",
-            service.id, service.name, readiness.started_at
+            service.id, service.name, resumed.0.started_at
         );
-        self.spawn_readiness_watch(service.id, gate, readiness, false);
+        self.spawn_readiness_watch(service.id, gate, resumed, false);
     }
 
     /// Build the readiness gate for a stored service from its parameters.
@@ -7040,8 +7063,8 @@ echo "[restore] Pre-seed complete"
         let readiness = Self::apply_started_status(&service, &mut service_update, gate.as_deref());
         service_update.updated_at = Set(Utc::now());
         service_update.update(self.db.as_ref()).await?;
-        if let (Some(gate), Some(readiness)) = (gate, readiness) {
-            self.spawn_readiness_watch(service_id, gate, readiness, true);
+        if let (Some(gate), Some(attempt)) = (gate, readiness) {
+            self.spawn_readiness_watch(service_id, gate, attempt, true);
         }
 
         // Attach to the overlay and publish `<service>.temps.local` so apps
@@ -10443,8 +10466,8 @@ echo "[restore] Pre-seed complete"
         let readiness = Self::apply_started_status(&service, &mut service_update, gate.as_deref());
         service_update.updated_at = Set(Utc::now());
         service_update.update(self.db.as_ref()).await?;
-        if let (Some(gate), Some(readiness)) = (gate, readiness) {
-            self.spawn_readiness_watch(service_id, gate, readiness, true);
+        if let (Some(gate), Some(attempt)) = (gate, readiness) {
+            self.spawn_readiness_watch(service_id, gate, attempt, true);
         }
 
         // Refresh the WAL health snapshot immediately for Postgres services.
@@ -13825,7 +13848,8 @@ mod tests {
             max_restarts: 3,
         };
         let starting = ServiceReadiness::starting(Utc::now(), &policy);
-        let starting_meta = with_readiness_metadata(None, Some(&starting));
+        let attempt = crate::readiness::ReadinessAttempt::new();
+        let starting_meta = with_readiness_metadata(None, Some((&starting, &attempt)));
         let mut failed = starting.clone();
         failed.phase = ReadinessPhase::Failed;
         failed.failure = Some(InitializationFailure {
@@ -13834,7 +13858,7 @@ mod tests {
             log_excerpt: vec![],
             next_actions: vec![],
         });
-        let failed_meta = with_readiness_metadata(None, Some(&failed));
+        let failed_meta = with_readiness_metadata(None, Some((&failed, &attempt)));
 
         assert_eq!(
             reported_readiness("starting", starting_meta.as_ref()),

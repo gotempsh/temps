@@ -282,15 +282,57 @@ impl RestartCounter {
     }
 }
 
-/// Where the gate records what it sees. Every method reports whether the
-/// service is still waiting on this gate; `false` (stopped, deleted, or
-/// restarted by someone else) ends the watch without a verdict.
+/// Identifies one start of a service. Stored next to its readiness
+/// snapshot, and every write a watch makes is conditional on it, so a watch
+/// left over from an earlier start can never record progress or a verdict
+/// for a later one, however its writes interleave with the new start's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReadinessAttempt(String);
+
+impl ReadinessAttempt {
+    pub(crate) fn new() -> Self {
+        Self(uuid::Uuid::new_v4().to_string())
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The attempt that owns the readiness snapshot in `metadata`, if any.
+    pub(crate) fn from_health_metadata(metadata: Option<&serde_json::Value>) -> Option<Self> {
+        metadata?
+            .get(READINESS_METADATA_KEY)?
+            .get(ATTEMPT_FIELD)?
+            .as_str()
+            .map(|attempt| Self(attempt.to_string()))
+    }
+}
+
+/// Field of the stored readiness snapshot holding its [`ReadinessAttempt`].
+/// Internal bookkeeping: it is not part of the API's `ServiceReadiness`.
+const ATTEMPT_FIELD: &str = "attempt";
+
+/// What the sink knows about the start attempt a watch belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttemptStatus {
+    /// The service is still `starting` under this attempt. For a write: the
+    /// write landed.
+    Current,
+    /// The service was stopped, deleted, or started again under a newer
+    /// attempt. For a write: nothing was written. The watch must end.
+    Gone,
+    /// The database could not answer. Nothing is known to have been
+    /// written; the watch retries on its next poll.
+    Unavailable,
+}
+
+/// Where the gate records what it sees, scoped to one start attempt.
 #[async_trait]
 pub(crate) trait ReadinessSink: Send + Sync {
-    async fn still_starting(&self) -> bool;
-    async fn starting(&self, readiness: &ServiceReadiness) -> bool;
-    async fn ready(&self) -> bool;
-    async fn failed(&self, readiness: &ServiceReadiness) -> bool;
+    async fn check(&self) -> AttemptStatus;
+    async fn starting(&self, readiness: &ServiceReadiness) -> AttemptStatus;
+    async fn ready(&self) -> AttemptStatus;
+    async fn failed(&self, readiness: &ServiceReadiness) -> AttemptStatus;
 }
 
 /// How a watch ended.
@@ -298,7 +340,7 @@ pub(crate) trait ReadinessSink: Send + Sync {
 pub(crate) enum ReadinessOutcome {
     Ready,
     Failed(ServiceReadiness),
-    /// The service left `starting` for another reason, or a newer watch
+    /// The service left `starting` for another reason, or a newer start
     /// took over.
     Abandoned,
 }
@@ -306,6 +348,10 @@ pub(crate) enum ReadinessOutcome {
 /// Poll `target` until it is ready or the policy gives up, reporting every
 /// change to `sink`. `prior` resumes a watch interrupted by a restart of
 /// Temps, so its start time and restart count carry over.
+///
+/// A write the sink could not make (`Unavailable`) is never treated as
+/// made: a verdict is re-evaluated and written again on the next poll, and
+/// progress is re-sent until it lands.
 pub(crate) async fn drive_readiness(
     target: &dyn ReadinessTarget,
     sink: &dyn ReadinessSink,
@@ -319,7 +365,7 @@ pub(crate) async fn drive_readiness(
     let mut recorded: Option<(Option<String>, i64)> = None;
 
     loop {
-        if superseded() || !sink.still_starting().await {
+        if superseded() || sink.check().await == AttemptStatus::Gone {
             return ReadinessOutcome::Abandoned;
         }
 
@@ -328,38 +374,41 @@ pub(crate) async fn drive_readiness(
         let restart_total = restarts.observe(observation.restart_count);
 
         match evaluate(&policy, elapsed, restart_total, &observation) {
-            ReadinessVerdict::Ready => {
-                return if sink.ready().await {
-                    ReadinessOutcome::Ready
-                } else {
-                    ReadinessOutcome::Abandoned
-                };
-            }
+            ReadinessVerdict::Ready => match sink.ready().await {
+                AttemptStatus::Current => return ReadinessOutcome::Ready,
+                AttemptStatus::Gone => return ReadinessOutcome::Abandoned,
+                AttemptStatus::Unavailable => {}
+            },
             ReadinessVerdict::Failed(mut failure) => {
                 if failure.log_excerpt.is_empty() {
                     failure.log_excerpt = target.log_excerpt().await;
                 }
-                readiness.phase = ReadinessPhase::Failed;
-                readiness.reason = observation.not_ready_reason;
-                readiness.restart_count = restart_total;
-                readiness.failure = Some(failure);
-                return if sink.failed(&readiness).await {
-                    ReadinessOutcome::Failed(readiness)
-                } else {
-                    ReadinessOutcome::Abandoned
+                let failed = ServiceReadiness {
+                    phase: ReadinessPhase::Failed,
+                    reason: observation.not_ready_reason,
+                    restart_count: restart_total,
+                    failure: Some(failure),
+                    ..readiness.clone()
                 };
+                match sink.failed(&failed).await {
+                    AttemptStatus::Current => return ReadinessOutcome::Failed(failed),
+                    AttemptStatus::Gone => return ReadinessOutcome::Abandoned,
+                    AttemptStatus::Unavailable => {}
+                }
             }
             ReadinessVerdict::Starting => {
                 // Write only on change: a healthy start writes once or twice,
-                // not once per poll.
+                // not once per poll. An unsaved write is not recorded, so it
+                // is sent again next poll even if nothing changed.
                 let snapshot = (observation.not_ready_reason.clone(), restart_total);
                 if recorded.as_ref() != Some(&snapshot) {
                     readiness.reason = observation.not_ready_reason;
                     readiness.restart_count = restart_total;
-                    if !sink.starting(&readiness).await {
-                        return ReadinessOutcome::Abandoned;
+                    match sink.starting(&readiness).await {
+                        AttemptStatus::Current => recorded = Some(snapshot),
+                        AttemptStatus::Gone => return ReadinessOutcome::Abandoned,
+                        AttemptStatus::Unavailable => {}
                     }
-                    recorded = Some(snapshot);
                 }
             }
         }
@@ -423,43 +472,54 @@ impl Drop for WatchRegistration {
 }
 
 /// [`ReadinessSink`] backed by the service's `external_services` row. Every
-/// write is conditional on `status = 'starting'`, so a stop, delete or
-/// restart that lands mid-watch always wins over a late verdict.
+/// write is a single `UPDATE` conditional on `status = 'starting'` *and*
+/// on the stored attempt id, so a stop, delete or newer start that lands
+/// mid-watch always wins over this watch's late writes.
 pub(crate) struct DbReadinessSink {
     pub db: Arc<DatabaseConnection>,
     pub service_id: i32,
+    pub attempt: ReadinessAttempt,
+}
+
+/// SQL predicate: the stored readiness snapshot belongs to `attempt`.
+fn attempt_matches(attempt: Option<&ReadinessAttempt>) -> sea_orm::sea_query::SimpleExpr {
+    const STORED: &str = "(health_metadata -> 'readiness' ->> 'attempt')";
+    match attempt {
+        Some(attempt) => {
+            Expr::cust_with_values(format!("{STORED} = $1"), [attempt.as_str().to_string()])
+        }
+        None => Expr::cust(format!("{STORED} IS NULL")),
+    }
 }
 
 impl DbReadinessSink {
-    async fn current(&self) -> Option<external_services::Model> {
-        match external_services::Entity::find_by_id(self.service_id)
+    /// Write `status` + the readiness snapshot if the row is still
+    /// `starting` under `expected` (this sink's attempt, unless adopting).
+    async fn update_if_current(
+        &self,
+        expected: Option<&ReadinessAttempt>,
+        status: &str,
+        error_message: Option<String>,
+        readiness: Option<(&ServiceReadiness, &ReadinessAttempt)>,
+    ) -> AttemptStatus {
+        // Read for the sibling `health_metadata` keys this write preserves.
+        // The UPDATE below re-checks status and attempt atomically, so a
+        // change between this read and that write makes it a no-op.
+        let row = match external_services::Entity::find_by_id(self.service_id)
             .one(self.db.as_ref())
             .await
         {
-            Ok(row) => row,
+            Ok(Some(row)) => row,
+            Ok(None) => return AttemptStatus::Gone,
             Err(e) => {
                 warn!(
-                    "Readiness watch for service {} could not read its row: {}",
-                    self.service_id, e
+                    "Readiness watch for service {} could not read its row before recording \
+                     status '{}' (will retry): {}",
+                    self.service_id, status, e
                 );
-                None
+                return AttemptStatus::Unavailable;
             }
-        }
-    }
-
-    /// Conditionally update the row; `true` when it was still `starting`.
-    async fn update_if_starting(
-        &self,
-        status: &str,
-        error_message: Option<String>,
-        readiness: Option<&ServiceReadiness>,
-    ) -> bool {
-        let Some(row) = self.current().await else {
-            return false;
         };
-        if row.status != STARTING_STATUS {
-            return false;
-        }
         let metadata = with_readiness_metadata(row.health_metadata.as_ref(), readiness);
         let result = external_services::Entity::update_many()
             .col_expr(external_services::Column::Status, Expr::value(status))
@@ -477,72 +537,132 @@ impl DbReadinessSink {
             )
             .filter(external_services::Column::Id.eq(self.service_id))
             .filter(external_services::Column::Status.eq(STARTING_STATUS))
+            .filter(attempt_matches(expected))
             .exec(self.db.as_ref())
             .await;
         match result {
-            Ok(res) => res.rows_affected > 0,
+            Ok(res) if res.rows_affected > 0 => AttemptStatus::Current,
+            Ok(_) => AttemptStatus::Gone,
             Err(e) => {
                 warn!(
-                    "Readiness watch for service {} could not record status '{}': {}",
+                    "Readiness watch for service {} could not record status '{}' (will retry): {}",
                     self.service_id, status, e
                 );
-                // Keep watching: the next poll retries the write.
-                true
+                AttemptStatus::Unavailable
             }
         }
+    }
+
+    /// Take over a `starting` row that has no live attempt to resume (no
+    /// snapshot, or one this process cannot use), by storing `readiness`
+    /// under this sink's attempt. `Gone` when the row changed meanwhile.
+    pub(crate) async fn adopt(
+        &self,
+        previous: Option<&ReadinessAttempt>,
+        readiness: &ServiceReadiness,
+    ) -> AttemptStatus {
+        self.update_if_current(
+            previous,
+            STARTING_STATUS,
+            None,
+            Some((readiness, &self.attempt)),
+        )
+        .await
     }
 }
 
 #[async_trait]
 impl ReadinessSink for DbReadinessSink {
-    async fn still_starting(&self) -> bool {
-        self.current()
+    async fn check(&self) -> AttemptStatus {
+        match external_services::Entity::find_by_id(self.service_id)
+            .one(self.db.as_ref())
             .await
-            .is_some_and(|row| row.status == STARTING_STATUS)
+        {
+            Ok(Some(row))
+                if row.status == STARTING_STATUS
+                    && ReadinessAttempt::from_health_metadata(row.health_metadata.as_ref())
+                        .as_ref()
+                        == Some(&self.attempt) =>
+            {
+                AttemptStatus::Current
+            }
+            Ok(_) => AttemptStatus::Gone,
+            Err(e) => {
+                warn!(
+                    "Readiness watch for service {} could not read its row (will retry): {}",
+                    self.service_id, e
+                );
+                AttemptStatus::Unavailable
+            }
+        }
     }
 
-    async fn starting(&self, readiness: &ServiceReadiness) -> bool {
-        self.update_if_starting(STARTING_STATUS, None, Some(readiness))
-            .await
+    async fn starting(&self, readiness: &ServiceReadiness) -> AttemptStatus {
+        self.update_if_current(
+            Some(&self.attempt),
+            STARTING_STATUS,
+            None,
+            Some((readiness, &self.attempt)),
+        )
+        .await
     }
 
-    async fn ready(&self) -> bool {
-        let ready = self.update_if_starting("running", None, None).await;
-        if ready {
+    async fn ready(&self) -> AttemptStatus {
+        let status = self
+            .update_if_current(Some(&self.attempt), "running", None, None)
+            .await;
+        if status == AttemptStatus::Current {
             info!(
                 "Service {} passed its readiness check and is now running",
                 self.service_id
             );
         }
-        ready
+        status
     }
 
-    async fn failed(&self, readiness: &ServiceReadiness) -> bool {
+    async fn failed(&self, readiness: &ServiceReadiness) -> AttemptStatus {
         let reason = readiness
             .failure
             .as_ref()
             .map(|f| f.reason.clone())
             .unwrap_or_else(|| "Initialization failed".to_string());
-        warn!(
-            "Service {} failed its readiness check: {}",
-            self.service_id, reason
-        );
-        self.update_if_starting("failed", Some(reason), Some(readiness))
-            .await
+        let status = self
+            .update_if_current(
+                Some(&self.attempt),
+                "failed",
+                Some(reason.clone()),
+                Some((readiness, &self.attempt)),
+            )
+            .await;
+        if status == AttemptStatus::Current {
+            warn!(
+                "Service {} failed its readiness check: {}",
+                self.service_id, reason
+            );
+        }
+        status
     }
 }
 
-/// `health_metadata` with the readiness key set to `readiness`, or removed
-/// when `None`. Sibling keys are preserved.
+/// `health_metadata` with the readiness key set to `readiness` (stored with
+/// its attempt id), or removed when `None`. Sibling keys are preserved.
 pub(crate) fn with_readiness_metadata(
     existing: Option<&serde_json::Value>,
-    readiness: Option<&ServiceReadiness>,
+    readiness: Option<(&ServiceReadiness, &ReadinessAttempt)>,
 ) -> Option<serde_json::Value> {
     let mut map = match existing {
         Some(serde_json::Value::Object(map)) => map.clone(),
         _ => serde_json::Map::new(),
     };
-    match readiness.and_then(|r| serde_json::to_value(r).ok()) {
+    let stored = readiness.and_then(|(readiness, attempt)| {
+        let mut value = serde_json::to_value(readiness).ok()?;
+        value.as_object_mut()?.insert(
+            ATTEMPT_FIELD.to_string(),
+            serde_json::Value::String(attempt.as_str().to_string()),
+        );
+        Some(value)
+    });
+    match stored {
         Some(value) => {
             map.insert(READINESS_METADATA_KEY.to_string(), value);
         }
@@ -565,27 +685,52 @@ pub(crate) mod test_support {
         pub ready: Mutex<bool>,
         pub failed: Mutex<Option<ServiceReadiness>>,
         pub stop_after_starting_reports: Option<usize>,
+        /// How many upcoming writes fail with `Unavailable`.
+        pub unavailable_writes: Mutex<usize>,
+        /// Every write attempted, in order: "starting" | "ready" | "failed".
+        pub write_attempts: Mutex<Vec<&'static str>>,
+    }
+
+    impl RecordingSink {
+        fn attempt_write(&self, kind: &'static str) -> bool {
+            self.write_attempts.lock().unwrap().push(kind);
+            let mut unavailable = self.unavailable_writes.lock().unwrap();
+            if *unavailable > 0 {
+                *unavailable -= 1;
+                return false;
+            }
+            true
+        }
     }
 
     #[async_trait]
     impl ReadinessSink for RecordingSink {
-        async fn still_starting(&self) -> bool {
+        async fn check(&self) -> AttemptStatus {
             match self.stop_after_starting_reports {
-                Some(limit) => self.starting.lock().unwrap().len() < limit,
-                None => true,
+                Some(limit) if self.starting.lock().unwrap().len() >= limit => AttemptStatus::Gone,
+                _ => AttemptStatus::Current,
             }
         }
-        async fn starting(&self, readiness: &ServiceReadiness) -> bool {
+        async fn starting(&self, readiness: &ServiceReadiness) -> AttemptStatus {
+            if !self.attempt_write("starting") {
+                return AttemptStatus::Unavailable;
+            }
             self.starting.lock().unwrap().push(readiness.clone());
-            true
+            AttemptStatus::Current
         }
-        async fn ready(&self) -> bool {
+        async fn ready(&self) -> AttemptStatus {
+            if !self.attempt_write("ready") {
+                return AttemptStatus::Unavailable;
+            }
             *self.ready.lock().unwrap() = true;
-            true
+            AttemptStatus::Current
         }
-        async fn failed(&self, readiness: &ServiceReadiness) -> bool {
+        async fn failed(&self, readiness: &ServiceReadiness) -> AttemptStatus {
+            if !self.attempt_write("failed") {
+                return AttemptStatus::Unavailable;
+            }
             *self.failed.lock().unwrap() = Some(readiness.clone());
-            true
+            AttemptStatus::Current
         }
     }
 }
@@ -714,11 +859,18 @@ mod tests {
     fn readiness_metadata_round_trips_and_keeps_siblings() {
         let existing = serde_json::json!({ "postgres_wal": { "warnings": [] } });
         let readiness = ServiceReadiness::starting(Utc::now(), &policy());
-        let merged = with_readiness_metadata(Some(&existing), Some(&readiness)).unwrap();
+        let attempt = ReadinessAttempt::new();
+        let merged =
+            with_readiness_metadata(Some(&existing), Some((&readiness, &attempt))).unwrap();
         assert!(merged.get("postgres_wal").is_some());
+        // The attempt id is stored, but is not part of the API snapshot.
         assert_eq!(
             ServiceReadiness::from_health_metadata(Some(&merged)),
             Some(readiness)
+        );
+        assert_eq!(
+            ReadinessAttempt::from_health_metadata(Some(&merged)),
+            Some(attempt)
         );
         let cleared = with_readiness_metadata(Some(&merged), None).unwrap();
         assert!(cleared.get(READINESS_METADATA_KEY).is_none());
@@ -880,5 +1032,180 @@ mod tests {
         assert!(second.is_current());
         drop(second);
         assert!(WatchRegistration::claim(-9001, false).is_some());
+    }
+
+    #[tokio::test]
+    async fn driver_retries_writes_the_database_did_not_take() {
+        // 503, 503, then usable: two progress reports and a verdict, with
+        // the first progress write and the first verdict write failing.
+        let target = ScriptedTarget {
+            policy: fast_policy(),
+            script: Mutex::new(vec![
+                not_ready("HTTP 503"),
+                not_ready("HTTP 503"),
+                ReadinessObservation::default(),
+            ]),
+        };
+        let sink = RecordingSink::default();
+        *sink.unavailable_writes.lock().unwrap() = 1;
+        let prior = ServiceReadiness::starting(Utc::now(), &target.policy);
+
+        let first = drive_readiness(&target, &sink, prior.clone(), || false);
+        let outcome = tokio::time::timeout(Duration::from_secs(5), first)
+            .await
+            .unwrap();
+        assert_eq!(outcome, ReadinessOutcome::Ready);
+        // The unsaved progress report was sent again although nothing changed.
+        assert_eq!(
+            *sink.write_attempts.lock().unwrap(),
+            vec!["starting", "starting", "ready"]
+        );
+        assert_eq!(sink.starting.lock().unwrap().len(), 1);
+
+        // A verdict the database did not take is written again, not dropped.
+        let target = ScriptedTarget {
+            policy: fast_policy(),
+            script: Mutex::new(vec![ReadinessObservation::default()]),
+        };
+        let sink = RecordingSink::default();
+        *sink.unavailable_writes.lock().unwrap() = 2;
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            drive_readiness(&target, &sink, prior, || false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, ReadinessOutcome::Ready);
+        assert_eq!(
+            *sink.write_attempts.lock().unwrap(),
+            vec!["ready", "ready", "ready"]
+        );
+        assert!(*sink.ready.lock().unwrap());
+    }
+
+    /// Against a real Postgres: a watch from an earlier start cannot record
+    /// progress or a verdict once a newer start owns the row, and the
+    /// current attempt's writes land.
+    #[tokio::test]
+    async fn a_stale_attempt_cannot_write_over_a_newer_start() {
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                println!("Skipping readiness attempt test: {error}");
+                return;
+            }
+            Err(error) => panic!("readiness attempt test database setup failed: {error}"),
+        };
+        let db = test_db.connection_arc();
+
+        let snapshot = ServiceReadiness::starting(Utc::now(), &policy());
+        let older = ReadinessAttempt::new();
+        let newer = ReadinessAttempt::new();
+        let row = external_services::ActiveModel {
+            name: Set("readiness-attempt-test".to_string()),
+            service_type: Set("rustfs".to_string()),
+            status: Set(STARTING_STATUS.to_string()),
+            health_metadata: Set(with_readiness_metadata(None, Some((&snapshot, &newer)))),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert starting service");
+        let sink = |attempt: &ReadinessAttempt| DbReadinessSink {
+            db: db.clone(),
+            service_id: row.id,
+            attempt: attempt.clone(),
+        };
+        let reload = || async {
+            external_services::Entity::find_by_id(row.id)
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .unwrap()
+        };
+
+        let stale = sink(&older);
+        let mut failed = snapshot.clone();
+        failed.phase = ReadinessPhase::Failed;
+        assert_eq!(stale.check().await, AttemptStatus::Gone);
+        assert_eq!(stale.starting(&snapshot).await, AttemptStatus::Gone);
+        assert_eq!(stale.failed(&failed).await, AttemptStatus::Gone);
+        assert_eq!(stale.ready().await, AttemptStatus::Gone);
+        let untouched = reload().await;
+        assert_eq!(untouched.status, STARTING_STATUS);
+        assert_eq!(
+            ReadinessAttempt::from_health_metadata(untouched.health_metadata.as_ref()),
+            Some(newer.clone())
+        );
+
+        let current = sink(&newer);
+        assert_eq!(current.check().await, AttemptStatus::Current);
+        let mut progress = snapshot.clone();
+        progress.reason = Some("HTTP 503".to_string());
+        assert_eq!(current.starting(&progress).await, AttemptStatus::Current);
+        assert_eq!(
+            ServiceReadiness::from_health_metadata(reload().await.health_metadata.as_ref())
+                .and_then(|r| r.reason),
+            Some("HTTP 503".to_string())
+        );
+        assert_eq!(current.ready().await, AttemptStatus::Current);
+        let running = reload().await;
+        assert_eq!(running.status, "running");
+        assert!(ServiceReadiness::from_health_metadata(running.health_metadata.as_ref()).is_none());
+        // Once running, even the current attempt has nothing left to write.
+        assert_eq!(current.ready().await, AttemptStatus::Gone);
+    }
+
+    #[tokio::test]
+    async fn adopting_a_starting_row_requires_it_unchanged() {
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                println!("Skipping readiness adopt test: {error}");
+                return;
+            }
+            Err(error) => panic!("readiness adopt test database setup failed: {error}"),
+        };
+        let db = test_db.connection_arc();
+        // A `starting` row with no readiness snapshot at all.
+        let row = external_services::ActiveModel {
+            name: Set("readiness-adopt-test".to_string()),
+            service_type: Set("rustfs".to_string()),
+            status: Set(STARTING_STATUS.to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert starting service");
+        let snapshot = ServiceReadiness::starting(row.updated_at, &policy());
+
+        let first = DbReadinessSink {
+            db: db.clone(),
+            service_id: row.id,
+            attempt: ReadinessAttempt::new(),
+        };
+        assert_eq!(first.adopt(None, &snapshot).await, AttemptStatus::Current);
+        assert_eq!(first.check().await, AttemptStatus::Current);
+
+        // A second process that read the row before the first adopted it
+        // must not take it over.
+        let second = DbReadinessSink {
+            db: db.clone(),
+            service_id: row.id,
+            attempt: ReadinessAttempt::new(),
+        };
+        assert_eq!(second.adopt(None, &snapshot).await, AttemptStatus::Gone);
+        assert_eq!(first.check().await, AttemptStatus::Current);
+        assert_eq!(second.check().await, AttemptStatus::Gone);
     }
 }
