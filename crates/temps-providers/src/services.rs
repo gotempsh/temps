@@ -1325,6 +1325,46 @@ fn is_role_monitor(s: &str) -> bool {
     role_from_str(s) == Some(crate::ClusterRole::Monitor)
 }
 
+/// Cluster parameter recording how far the cluster's authentication has
+/// converged (absent on clusters created before SCRAM auth).
+const CLUSTER_AUTH_VERSION_KEY: &str = "_cluster_scram_auth_version";
+
+/// Every member authenticates pg_auto_failover's infrastructure roles
+/// (`autoctl_node`, `pgautofailover_replicator`) with SCRAM. This is what a
+/// new member needs from the existing ones.
+const CLUSTER_INFRA_AUTH_VERSION: u64 = 1;
+
+/// Current version: additionally, every data node has decided its
+/// application catch-all rules (`scram-sha-256` once no login role stores an
+/// MD5 hash). Clusters marked 1 converged before that decision ran during the
+/// upgrade, so they only re-run the data-node step instead of waiting for
+/// each member to restart.
+const CLUSTER_AUTH_VERSION: u64 = 2;
+
+fn cluster_auth_version(parameters: &HashMap<String, serde_json::Value>) -> u64 {
+    parameters
+        .get(CLUSTER_AUTH_VERSION_KEY)
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+}
+
+/// The upgrade steps that bring a cluster at `version` to
+/// [`CLUSTER_AUTH_VERSION`], in the order they must run.
+fn cluster_auth_upgrade_steps(
+    version: u64,
+) -> &'static [crate::externalsvc::postgres_cluster::AuthUpgradeStep] {
+    use crate::externalsvc::postgres_cluster::AuthUpgradeStep;
+    if version >= CLUSTER_AUTH_VERSION {
+        &[]
+    } else if version >= CLUSTER_INFRA_AUTH_VERSION {
+        // Re-applies the (idempotent) replicator rules, then the
+        // application-rule decision.
+        &[AuthUpgradeStep::NodeEnforce]
+    } else {
+        &AuthUpgradeStep::ORDER
+    }
+}
+
 fn is_role_primary(s: &str) -> bool {
     role_from_str(s) == Some(crate::ClusterRole::Primary)
 }
@@ -6421,14 +6461,10 @@ echo "[restore] Pre-seed complete"
                 };
                 let mut parameters = parse(proposed)?;
                 auth.insert_into(&mut parameters);
-                if stored
-                    .get("_cluster_scram_auth_version")
-                    .and_then(|v| v.as_u64())
-                    .is_some_and(|v| v >= 1)
-                {
+                if cluster_auth_version(&stored) >= CLUSTER_INFRA_AUTH_VERSION {
                     parameters.insert(
-                        "_cluster_scram_auth_version".to_string(),
-                        stored["_cluster_scram_auth_version"].clone(),
+                        CLUSTER_AUTH_VERSION_KEY.to_string(),
+                        stored[CLUSTER_AUTH_VERSION_KEY].clone(),
                     );
                 }
                 let json = serde_json::to_string(&parameters).map_err(|e| {
@@ -6544,20 +6580,52 @@ echo "[restore] Pre-seed complete"
     /// legacy entrypoint of a container restarted after this upgrade leaves
     /// the rewritten rules alone (its patchers only add rules when no
     /// `0.0.0.0/0` rule for the role exists).
+    ///
+    /// A cluster that already converged at [`CLUSTER_INFRA_AUTH_VERSION`]
+    /// only re-runs the data-node step, which switches its application rules
+    /// to SCRAM once no login role stores an MD5 hash.
     pub async fn upgrade_cluster_auth(&self, service_id: i32) -> Result<(), ExternalServiceError> {
         let parameters = self.get_service_parameters(service_id).await?;
-        if parameters
-            .get("_cluster_scram_auth_version")
-            .and_then(|v| v.as_u64())
-            .is_some_and(|v| v >= 1)
-        {
+        let version = cluster_auth_version(&parameters);
+        let steps = cluster_auth_upgrade_steps(version);
+        if steps.is_empty() {
             return Ok(());
         }
         // The staged rewrite is idempotent and every caller reuses the same
         // row-locked credentials. Do not hold a pooled database connection
         // across remote operations or nested database reads.
-        self.apply_cluster_auth_upgrade(service_id).await?;
+        self.apply_cluster_auth_upgrade(service_id, version, steps)
+            .await?;
         self.mark_cluster_auth_completed(service_id).await
+    }
+
+    /// Bring a cluster's authentication up to date before a member is added.
+    ///
+    /// The new member is SCRAM-native, so the existing members must
+    /// authenticate the infrastructure roles with SCRAM first; that failure is
+    /// returned. The application-rule step of a cluster that is already past
+    /// that point is not needed by the new member, and it cannot run while a
+    /// data node is down — which is often why a member is being added — so
+    /// its failure is logged and retried on the next start.
+    async fn prepare_cluster_auth_for_new_member(
+        &self,
+        service_id: i32,
+    ) -> Result<(), ExternalServiceError> {
+        let Err(error) = self.upgrade_cluster_auth(service_id).await else {
+            return Ok(());
+        };
+        let version = cluster_auth_version(&self.get_service_parameters(service_id).await?);
+        if version < CLUSTER_INFRA_AUTH_VERSION {
+            return Err(error);
+        }
+        warn!(
+            service_id,
+            auth_version = version,
+            error = %error,
+            "Adding a member without switching the cluster's application pg_hba rules \
+             to SCRAM; the switch is retried on the next start"
+        );
+        Ok(())
     }
 
     async fn mark_cluster_auth_completed(
@@ -6585,9 +6653,10 @@ echo "[restore] Pre-seed complete"
             })?;
         // Merge only the marker into the latest locked configuration, never a
         // pre-upgrade copy that can erase a concurrent settings update.
+        let version = cluster_auth_version(&parameters).max(CLUSTER_AUTH_VERSION);
         parameters.insert(
-            "_cluster_scram_auth_version".to_string(),
-            serde_json::json!(1),
+            CLUSTER_AUTH_VERSION_KEY.to_string(),
+            serde_json::json!(version),
         );
         let json = serde_json::to_string(&parameters).map_err(|e| {
             ExternalServiceError::InternalError {
@@ -6613,36 +6682,50 @@ echo "[restore] Pre-seed complete"
     async fn apply_cluster_auth_upgrade(
         &self,
         service_id: i32,
+        version: u64,
+        steps: &[crate::externalsvc::postgres_cluster::AuthUpgradeStep],
     ) -> Result<(), ExternalServiceError> {
-        use crate::externalsvc::postgres_cluster::{AuthUpgradeStep, PostgresClusterService};
+        use crate::externalsvc::postgres_cluster::PostgresClusterService;
 
         let (_, auth, _) = self.ensure_cluster_auth_secrets(service_id).await?;
         let members = self.get_service_members(service_id).await?;
-        if members.is_empty() {
+        let targeted = |member: &ServiceMemberInfo| {
+            steps
+                .iter()
+                .any(|step| is_role_monitor(&member.role) == step.targets_monitor())
+        };
+        if !members.iter().any(targeted) {
             return Ok(());
         }
-        if let Some(not_running) = members.iter().find(|m| m.status != "running") {
+        if let Some(not_running) = members
+            .iter()
+            .find(|m| targeted(m) && m.status != "running")
+        {
             // Another caller can complete convergence and add a SCRAM-native
             // member after this caller's initial marker read.
             let latest = self.get_service_parameters(service_id).await?;
-            if latest
-                .get("_cluster_scram_auth_version")
-                .and_then(|v| v.as_u64())
-                .is_some_and(|v| v >= 1)
-            {
+            if cluster_auth_version(&latest) >= CLUSTER_AUTH_VERSION {
                 return Ok(());
             }
-            return Err(ExternalServiceError::InternalError {
-                reason: format!(
+            let reason = if version >= CLUSTER_INFRA_AUTH_VERSION {
+                format!(
+                    "Cannot switch the application pg_hba rules of cluster service {} to \
+                     SCRAM: member '{}' is '{}', not running. Every data node decides its \
+                     own rules; the switch is retried on the next start.",
+                    service_id, not_running.container_name, not_running.status
+                )
+            } else {
+                format!(
                     "Cannot upgrade cluster service {} to SCRAM auth: member '{}' is '{}', not \
                      running. Every member must receive the new credentials before the \
                      trust rules are removed; the upgrade is retried on the next start.",
                     service_id, not_running.container_name, not_running.status
-                ),
-            });
+                )
+            };
+            return Err(ExternalServiceError::InternalError { reason });
         }
 
-        for step in AuthUpgradeStep::ORDER {
+        for &step in steps {
             for member in members
                 .iter()
                 .filter(|m| is_role_monitor(&m.role) == step.targets_monitor())
@@ -6673,7 +6756,10 @@ echo "[restore] Pre-seed complete"
         info!(
             service_id,
             members = members.len(),
-            "Cluster infrastructure roles now authenticate with SCRAM"
+            from_auth_version = version,
+            to_auth_version = CLUSTER_AUTH_VERSION,
+            "Cluster authentication converged: infrastructure roles use SCRAM and every \
+             data node decided its application pg_hba rules"
         );
         Ok(())
     }
@@ -8429,7 +8515,7 @@ echo "[restore] Pre-seed complete"
         // would have no password for it. Upgrade the running members first.
         let (parameters, cluster_auth, _) = self.ensure_cluster_auth_secrets(service_id).await?;
         // Stored credentials alone do not prove an interrupted upgrade converged.
-        self.upgrade_cluster_auth(service_id).await?;
+        self.prepare_cluster_auth_for_new_member(service_id).await?;
         let service_config = ServiceConfig {
             name: service.name.clone(),
             service_type,
@@ -13531,6 +13617,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cluster_auth_version_reads_the_marker_and_defaults_to_legacy() {
+        let mut parameters = HashMap::new();
+        assert_eq!(cluster_auth_version(&parameters), 0);
+        parameters.insert(CLUSTER_AUTH_VERSION_KEY.to_string(), serde_json::json!("1"));
+        assert_eq!(cluster_auth_version(&parameters), 0, "only integers count");
+        parameters.insert(CLUSTER_AUTH_VERSION_KEY.to_string(), serde_json::json!(1));
+        assert_eq!(cluster_auth_version(&parameters), 1);
+    }
+
+    #[test]
+    fn cluster_auth_upgrade_steps_rerun_only_the_data_node_step_after_infra_convergence() {
+        use crate::externalsvc::postgres_cluster::AuthUpgradeStep;
+        assert_eq!(cluster_auth_upgrade_steps(0), &AuthUpgradeStep::ORDER);
+        assert_eq!(
+            cluster_auth_upgrade_steps(CLUSTER_INFRA_AUTH_VERSION),
+            &[AuthUpgradeStep::NodeEnforce]
+        );
+        assert!(cluster_auth_upgrade_steps(CLUSTER_AUTH_VERSION).is_empty());
+        assert!(cluster_auth_upgrade_steps(CLUSTER_AUTH_VERSION + 1).is_empty());
+        // The data-node step is the one that decides the application rules,
+        // and the full upgrade includes it, so both paths end at the same
+        // version.
+        assert!(AuthUpgradeStep::ORDER.contains(&AuthUpgradeStep::NodeEnforce));
+        assert!(!AuthUpgradeStep::NodeEnforce.targets_monitor());
+    }
+
+    #[test]
     fn creator_claim_is_one_time_and_cannot_reappear_after_unlink() {
         assert!(validate_creator_claim(7, Some(42), false, 42).is_ok());
         assert!(matches!(
@@ -17746,8 +17859,8 @@ mod tests {
             Some(&serde_json::json!("changed"))
         );
         assert_eq!(
-            persisted.get("_cluster_scram_auth_version"),
-            Some(&serde_json::json!(1))
+            persisted.get(CLUSTER_AUTH_VERSION_KEY),
+            Some(&serde_json::json!(CLUSTER_AUTH_VERSION))
         );
         let old_null = manager.encryption_service.encrypt_string("null").unwrap();
         let legacy = external_services::ActiveModel {
@@ -17781,6 +17894,149 @@ mod tests {
                 .unwrap()
                 == results[0].1
         );
+    }
+
+    /// Insert a cluster whose credentials exist, at the given authentication
+    /// version, with members given as `(role, status)`.
+    #[cfg(feature = "docker-tests")]
+    async fn insert_cluster_at_auth_version(
+        manager: &ExternalServiceManager,
+        name: &str,
+        version: Option<u64>,
+        members: &[(&str, &str)],
+    ) -> i32 {
+        let mut parameters = HashMap::new();
+        crate::externalsvc::postgres_cluster::ClusterAuthSecrets::generate()
+            .insert_into(&mut parameters);
+        if let Some(version) = version {
+            parameters.insert(
+                CLUSTER_AUTH_VERSION_KEY.to_string(),
+                serde_json::json!(version),
+            );
+        }
+        let config = manager
+            .encryption_service
+            .encrypt_string(&serde_json::to_string(&parameters).unwrap())
+            .unwrap();
+        let service = external_services::ActiveModel {
+            name: Set(name.to_string()),
+            service_type: Set("postgres".to_string()),
+            status: Set("running".to_string()),
+            topology: Set("cluster".to_string()),
+            config: Set(Some(config)),
+            ..Default::default()
+        }
+        .insert(manager.db.as_ref())
+        .await
+        .unwrap();
+        for (ordinal, (role, status)) in members.iter().enumerate() {
+            service_members::ActiveModel {
+                service_id: Set(service.id),
+                role: Set(role.to_string()),
+                container_name: Set(format!("postgres-{name}-{ordinal}")),
+                status: Set(status.to_string()),
+                ordinal: Set(ordinal as i32),
+                created_at: Set(Utc::now()),
+                updated_at: Set(Utc::now()),
+                ..Default::default()
+            }
+            .insert(manager.db.as_ref())
+            .await
+            .unwrap();
+        }
+        service.id
+    }
+
+    #[cfg(feature = "docker-tests")]
+    async fn stored_auth_version(manager: &ExternalServiceManager, service_id: i32) -> u64 {
+        cluster_auth_version(&manager.get_service_parameters(service_id).await.unwrap())
+    }
+
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn infra_converged_cluster_retries_app_rules_while_a_data_node_is_down() {
+        let (manager, _test_db) = setup_test_manager_or_skip!();
+        let service_id = insert_cluster_at_auth_version(
+            &manager,
+            "auth-v1-node-down",
+            Some(CLUSTER_INFRA_AUTH_VERSION),
+            &[("monitor", "running"), ("replica", "stopped")],
+        )
+        .await;
+
+        // A version-1 cluster is no longer treated as converged: it needs the
+        // data-node step, which cannot reach the stopped replica.
+        let error = manager.upgrade_cluster_auth(service_id).await.unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("application pg_hba rules")
+                && message.contains(&service_id.to_string())
+                && message.contains("postgres-auth-v1-node-down-1")
+                && message.contains("stopped"),
+            "{message}"
+        );
+        assert_eq!(
+            stored_auth_version(&manager, service_id).await,
+            CLUSTER_INFRA_AUTH_VERSION,
+            "a cluster whose data node never ran the step must not be marked converged"
+        );
+
+        // Replacing that node must still be possible: the new member only
+        // needs SCRAM for the infrastructure roles, which version 1 proves.
+        manager
+            .prepare_cluster_auth_for_new_member(service_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_auth_version(&manager, service_id).await,
+            CLUSTER_INFRA_AUTH_VERSION
+        );
+    }
+
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn legacy_cluster_with_a_member_down_still_blocks_adding_a_member() {
+        let (manager, _test_db) = setup_test_manager_or_skip!();
+        let service_id = insert_cluster_at_auth_version(
+            &manager,
+            "auth-v0-node-down",
+            None,
+            &[("monitor", "running"), ("primary", "stopped")],
+        )
+        .await;
+
+        let error = manager
+            .prepare_cluster_auth_for_new_member(service_id)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("trust rules are removed"),
+            "{error}"
+        );
+        assert_eq!(stored_auth_version(&manager, service_id).await, 0);
+    }
+
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn infra_converged_cluster_without_data_nodes_is_marked_current() {
+        let (manager, _test_db) = setup_test_manager_or_skip!();
+        // The data-node step has nothing to run on, and a stopped monitor is
+        // not touched by it.
+        let service_id = insert_cluster_at_auth_version(
+            &manager,
+            "auth-v1-monitor-only",
+            Some(CLUSTER_INFRA_AUTH_VERSION),
+            &[("monitor", "stopped")],
+        )
+        .await;
+
+        manager.upgrade_cluster_auth(service_id).await.unwrap();
+        assert_eq!(
+            stored_auth_version(&manager, service_id).await,
+            CLUSTER_AUTH_VERSION
+        );
+        // Converged clusters return without reading members again.
+        manager.upgrade_cluster_auth(service_id).await.unwrap();
     }
 
     #[cfg(feature = "docker-tests")]

@@ -2826,6 +2826,56 @@ mod scram_docker_tests {
                 .await;
             fx.wait_for(&monitor, &n1, "secondary", Duration::from_secs(180))
                 .await;
+
+            // A cluster marked converged at auth version 1 still has `md5`
+            // application rules until each member restarts. The version-2
+            // upgrade re-runs only `NodeEnforce`; on a running member with no
+            // MD5 hash that alone must switch them, on primary and standby.
+            let app_rules = "grep -E '^host(ssl)? all all (0\\.0\\.0\\.0/0|::/0) ' \
+                             /var/lib/postgresql/pgdata/pg_hba.conf";
+            for node in [&n1, &n2] {
+                let (code, out) = fx
+                    .sh(
+                        node,
+                        "sed -i -E 's#^(host(ssl)? all all (0\\.0\\.0\\.0/0|::/0) )scram-sha-256#\\1md5#' \
+                         /var/lib/postgresql/pgdata/pg_hba.conf \
+                         && gosu postgres pg_ctl reload -D /var/lib/postgresql/pgdata",
+                    )
+                    .await;
+                assert_eq!(code, 0, "{node}: put app rules back to md5: {out}");
+                let (_, before) = fx.sh(node, app_rules).await;
+                assert!(
+                    before.lines().count() == 4 && before.lines().all(|l| l.ends_with(" md5")),
+                    "{node}: expected four md5 app rules before the upgrade: {before}"
+                );
+
+                let (code, out) = fx
+                    .exec(
+                        node,
+                        PostgresClusterService::auth_upgrade_command(AuthUpgradeStep::NodeEnforce),
+                        &auth.env(),
+                    )
+                    .await;
+                assert_eq!(code, 0, "{node}: NodeEnforce: {out}");
+                let (_, after) = fx.sh(node, app_rules).await;
+                assert!(
+                    after.lines().count() == 4
+                        && after.lines().all(|l| l.ends_with(" scram-sha-256")),
+                    "{node}: app rules must switch to scram-sha-256: {after}"
+                );
+            }
+            // The application user still authenticates over TCP afterwards.
+            let (code, out) = fx
+                .sh(
+                    &n2,
+                    &format!(
+                        "PGPASSWORD=AppUserSecret123 psql -X -At \
+                         \"host={n2} port=5432 user=appuser dbname=appdb sslmode=require\" \
+                         -c 'SELECT 1'"
+                    ),
+                )
+                .await;
+            assert!(code == 0 && out.contains('1'), "app user login after upgrade: {out}");
         })
         .catch_unwind()
         .await;
