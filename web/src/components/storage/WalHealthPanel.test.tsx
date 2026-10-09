@@ -11,7 +11,7 @@ import type {
 } from '@/api/client/types.gen'
 import { WalHealthPanel } from './WalHealthPanel'
 
-function renderPanel(settings: Partial<PostgresWalHealth>) {
+function renderPanel(settings: Partial<PostgresWalHealth>, isImported = false) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, staleTime: Infinity } },
   })
@@ -47,6 +47,7 @@ function renderPanel(settings: Partial<PostgresWalHealth>) {
         serviceId={7}
         serviceType="postgres"
         onBackup={() => {}}
+        isImported={isImported}
       />
     </QueryClientProvider>
   )
@@ -59,6 +60,17 @@ describe('post-restore WAL archiving guidance', () => {
     expect(markup).toContain('protect its source backup')
     expect(markup).toContain('Restarting alone keeps archiving disabled')
     expect(markup).toContain('Create full backup')
+  })
+
+  test('an imported disabled policy requires external startup changes instead of a failed repair', () => {
+    const markup = renderPanel({ archive_mode: 'off', warnings: [] }, true)
+    expect(markup).toContain('Continuous WAL archiving is disabled')
+    expect(markup).toContain('startup settings are managed outside Temps')
+    expect(markup).toContain('Enable archive_mode')
+    expect(markup).toContain('restart it before creating a full backup')
+    expect(markup).toContain('restore into a new managed service')
+    expect(markup).not.toContain('Create full backup')
+    expect(markup).not.toContain('Restarting alone keeps archiving disabled')
   })
 
   test('a no-op command explains discarded WAL instead of disk backlog', () => {

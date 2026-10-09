@@ -994,6 +994,7 @@ export function ServiceDetail() {
                 serviceType={service.service.service_type}
                 onUpgrade={() => setIsUpgradeDialogOpen(true)}
                 onBackup={() => setIsBackupDialogOpen(true)}
+                isImported={!!service.current_parameters?.container_name}
               />
             ) : null}
 

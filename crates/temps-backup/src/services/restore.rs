@@ -2016,6 +2016,8 @@ async fn run_restore_inner(
             reason: e.to_string(),
         })?;
 
+    let live_target_config = source_config.clone();
+
     let origin_service_id: Option<i32> = temps_entities::external_service_backups::Entity::find()
         .filter(temps_entities::external_service_backups::Column::BackupId.eq(backup_model.id))
         .one(db.as_ref())
@@ -2075,7 +2077,7 @@ async fn run_restore_inner(
     //   `mysql.user` — and therefore its password — completely untouched.
     //   Merging origin credentials there is actively harmful: the engine
     //   would authenticate the dump load with the WRONG password, and the
-    //   post-restore `patch_service_password` would overwrite the target's
+    //   post-restore `patch_service_credentials` would overwrite the target's
     //   stored password with the origin's even though nothing on the target
     //   changed, locking the operator out of the real credentials via the
     //   UI/CLI. So MariaDB is gated on the backup FORMAT, matching the
@@ -2098,8 +2100,7 @@ async fn run_restore_inner(
     let (engine_preserves_source_credentials, engine_wants_pre_restore_credential_merge) =
         credential_propagation_gates(&target_service.service_type, &backup_model.s3_location);
 
-    let mut origin_password_for_post_restore_patch: Option<String> = None;
-    let mut origin_root_password_for_post_restore_patch: Option<String> = None;
+    let mut origin_credentials_for_post_restore_patch = None;
     if engine_preserves_source_credentials {
         if let Some(origin_id) = origin_service_id {
             if origin_id != target_service.id {
@@ -2155,27 +2156,14 @@ async fn run_restore_inner(
                                 target_service.service_type
                             );
                         }
-                        // Always remember the origin password for the
-                        // post-restore patch — mongo's admin.system.users
-                        // becomes the source's after mongorestore, so we
-                        // need to reflect that in the stored config.
-                        origin_password_for_post_restore_patch = origin_cfg
-                            .parameters
-                            .get("password")
-                            .and_then(|v| v.as_str())
-                            .map(String::from);
-                        // MariaDB keeps a SECOND credential in its config, the
-                        // `root_password` used for every admin operation
-                        // (backup, binlog replay, SQL exec). It lives in the
-                        // restored `mysql.user` table too, so leaving the
-                        // stored copy stale would break the next backup — the
-                        // failure would surface hours later, far from this
-                        // restore. Absent for every other engine.
-                        origin_root_password_for_post_restore_patch = origin_cfg
-                            .parameters
-                            .get("root_password")
-                            .and_then(|v| v.as_str())
-                            .map(String::from);
+                        // Physical PostgreSQL backups carry the origin role and
+                        // database as well as its password. Preserve the target's
+                        // physical settings while reconciling that restored login.
+                        origin_credentials_for_post_restore_patch =
+                            RestoredServiceCredentials::from_origin(
+                                &target_service.service_type,
+                                &origin_cfg.parameters,
+                            );
                     }
                     Err(e) => {
                         warn!(
@@ -2369,6 +2357,7 @@ async fn run_restore_inner(
         backup_location: &backup_model.s3_location,
         source_service: &target_service,
         source_config: source_config.clone(),
+        live_target_config,
         pool: db.as_ref(),
         gate: &gate,
     };
@@ -2532,30 +2521,23 @@ async fn run_restore_inner(
             persist_new_service(&db, &enc, &target_service, run_id, new_name, &result).await?;
         Some(new_id)
     } else {
-        // In-place / PITR-in-place: the target's stored config password is
-        // now wrong — pg_authid (or equivalent) has the origin's password
-        // hashes. Overwrite the target's `external_services.config.password`
-        // with the origin's plaintext value so the UI/env vars/CLI reflect
-        // the credentials that actually work post-restore.
-        if let Some(new_password) = origin_password_for_post_restore_patch.as_ref() {
-            if let Err(e) = patch_service_password(
-                &db,
-                &enc,
-                target_service.id,
-                new_password,
-                origin_root_password_for_post_restore_patch.as_deref(),
-            )
-            .await
+        // In-place / PITR-in-place: the restored auth catalog carries the
+        // origin's credentials. PostgreSQL also inherits its role/database.
+        // Reconcile the encrypted login while retaining the target's endpoint
+        // and physical ownership so UI/env vars/CLI match restored data.
+        if let Some(credentials) = origin_credentials_for_post_restore_patch.as_ref() {
+            if let Err(e) =
+                patch_service_credentials(&db, &enc, target_service.id, credentials).await
             {
                 // Don't fail the restore over a config patch — data is
                 // restored, user can reset password manually. Log loudly.
                 error!(
-                    "Restore on service {} succeeded but patching stored password failed; the service's UI-shown credentials will be stale until someone updates them. Error: {}",
+                    "Restore on service {} succeeded but patching stored credentials failed; the service's UI-shown credentials will be stale until someone updates them. Error: {}",
                     target_service.id, e
                 );
             } else {
                 info!(
-                    "Updated target service {} config password to match restored data",
+                    "Updated target service {} config credentials to match restored data",
                     target_service.id
                 );
             }
@@ -2724,24 +2706,72 @@ async fn cancel_new_service(
     }
 }
 
-/// Rewrite the target service's encrypted `config.password` (and, when the
-/// engine has one, `config.root_password`) field.
-///
-/// Called after an in-place restore so the credentials stored in the Temps
-/// DB match what's actually in the restored cluster (which carries the
-/// origin service's password hashes). Everything else about the config
-/// — image, port, volume, container name — stays the target's.
-///
-/// `new_root_password` is `Some` only for engines that keep a separate admin
-/// credential inside the restored auth catalog (MariaDB's `mysql.user` root
-/// row). Postgres and MongoDB pass `None`, leaving their configs untouched
-/// apart from `password`.
-async fn patch_service_password(
+/// Credentials inherited from a restored authentication catalog. PostgreSQL
+/// physical backups also carry the origin's role and database; other engines
+/// retain their existing login-identity behavior.
+struct RestoredServiceCredentials {
+    password: String,
+    root_password: Option<String>,
+    username: Option<String>,
+    database: Option<String>,
+}
+
+impl RestoredServiceCredentials {
+    fn from_origin(service_type: &str, parameters: &serde_json::Value) -> Option<Self> {
+        let postgres = service_type == "postgres";
+        Some(Self {
+            password: parameters.get("password")?.as_str()?.to_string(),
+            root_password: parameters
+                .get("root_password")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            username: postgres
+                .then(|| {
+                    parameters
+                        .get("username")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                })
+                .flatten(),
+            database: postgres
+                .then(|| {
+                    parameters
+                        .get("database")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                })
+                .flatten(),
+        })
+    }
+
+    fn apply(&self, parameters: &mut serde_json::Map<String, serde_json::Value>) {
+        parameters.insert(
+            "password".to_string(),
+            serde_json::Value::String(self.password.clone()),
+        );
+        if parameters.contains_key("root_password") {
+            if let Some(password) = &self.root_password {
+                parameters.insert(
+                    "root_password".to_string(),
+                    serde_json::Value::String(password.clone()),
+                );
+            }
+        }
+        for (key, value) in [("username", &self.username), ("database", &self.database)] {
+            if let Some(value) = value {
+                parameters.insert(key.to_string(), serde_json::Value::String(value.clone()));
+            }
+        }
+    }
+}
+
+/// Reconcile encrypted credentials after in-place restore without changing the
+/// target's image, endpoint, resource limits, volume or imported container name.
+async fn patch_service_credentials(
     db: &DatabaseConnection,
     enc: &Arc<temps_core::EncryptionService>,
     service_id: i32,
-    new_password: &str,
-    new_root_password: Option<&str>,
+    credentials: &RestoredServiceCredentials,
 ) -> Result<(), RestoreError> {
     use sea_orm::{ActiveModelTrait, ActiveValue::Set};
 
@@ -2771,21 +2801,7 @@ async fn patch_service_password(
             ),
         })?;
 
-    params.insert(
-        "password".to_string(),
-        serde_json::Value::String(new_password.to_string()),
-    );
-    // Only overwrite `root_password` when the caller actually resolved one and
-    // the target config already has the key — never introduce a credential
-    // field an engine doesn't understand.
-    if let Some(root_password) = new_root_password {
-        if params.contains_key("root_password") {
-            params.insert(
-                "root_password".to_string(),
-                serde_json::Value::String(root_password.to_string()),
-            );
-        }
-    }
+    credentials.apply(&mut params);
 
     let re_serialized = serde_json::to_string(&params).map_err(|e| RestoreError::Internal {
         reason: format!("Failed to re-serialize patched config: {}", e),
@@ -4128,6 +4144,164 @@ mod tests {
     }
 
     // ---- MariaDB restore plan -------------------------------------------
+
+    #[test]
+    fn postgres_restored_login_keeps_target_physical_configuration() {
+        let origin = serde_json::json!({
+            "password": "synthetic-origin-password",
+            "username": "origin_role",
+            "database": "origin_db",
+            "container_name": "origin-container",
+            "host": "origin-host",
+            "port": "10001"
+        });
+        let mut target = serde_json::json!({
+            "password": "synthetic-target-password",
+            "username": "target_role",
+            "database": "target_db",
+            "container_name": "operator-owned-target",
+            "host": "target-host",
+            "port": "10002",
+            "docker_image": "retained-image",
+            "memory_limit_mb": 256
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let before = target.clone();
+        RestoredServiceCredentials::from_origin("postgres", &origin)
+            .unwrap()
+            .apply(&mut target);
+        for field in ["password", "username", "database"] {
+            assert_ne!(before[field], origin[field]);
+            assert_eq!(target[field], origin[field]);
+        }
+        for field in [
+            "container_name",
+            "host",
+            "port",
+            "docker_image",
+            "memory_limit_mb",
+        ] {
+            assert_eq!(target[field], before[field]);
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_restored_login_is_encrypted_in_the_registered_target() {
+        let enc = Arc::new(temps_core::EncryptionService::new_from_password(
+            "synthetic-restore-test-key",
+        ));
+        let mut service = crashed_run_service();
+        service.service_type = "postgres".to_string();
+        service.config = Some(
+            enc.encrypt_string(
+                &serde_json::json!({
+                    "password": "synthetic-target-password",
+                    "username": "target_role",
+                    "database": "target_db",
+                    "container_name": "operator-owned-target",
+                    "port": "10002"
+                })
+                .to_string(),
+            )
+            .unwrap(),
+        );
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![service.clone()], vec![service.clone()]])
+            .into_connection();
+        let credentials = RestoredServiceCredentials::from_origin(
+            "postgres",
+            &serde_json::json!({
+                "password": "synthetic-origin-password",
+                "username": "origin_role",
+                "database": "origin_db"
+            }),
+        )
+        .unwrap();
+        patch_service_credentials(&db, &enc, service.id, &credentials)
+            .await
+            .unwrap();
+        let transactions = db.into_transaction_log();
+        let update = transactions[1].statements().first().unwrap();
+        // The only new bind is an encrypted config; no credential is stored
+        // in plaintext, and the original imported physical identity survives.
+        let ciphertext = update
+            .values
+            .as_ref()
+            .unwrap()
+            .0
+            .iter()
+            .find_map(|value| {
+                if let sea_orm::Value::String(Some(value)) = value {
+                    enc.decrypt_string(value).ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let parameters: serde_json::Value = serde_json::from_str(&ciphertext).unwrap();
+        assert_eq!(parameters["password"], credentials.password);
+        assert_eq!(parameters["username"], "origin_role");
+        assert_eq!(parameters["database"], "origin_db");
+        assert_eq!(parameters["container_name"], "operator-owned-target");
+        assert_eq!(parameters["port"], "10002");
+    }
+
+    #[test]
+    fn non_postgres_restored_login_keeps_existing_identity_policy() {
+        let origin = serde_json::json!({
+            "password": "synthetic-origin-password",
+            "root_password": "synthetic-origin-root-password",
+            "username": "origin_role",
+            "database": "origin_db"
+        });
+        for engine in ["mongodb", "mariadb"] {
+            let mut target = serde_json::json!({
+                "password": "synthetic-target-password",
+                "root_password": "synthetic-target-root-password",
+                "username": "target_role",
+                "database": "target_db"
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+            RestoredServiceCredentials::from_origin(engine, &origin)
+                .unwrap()
+                .apply(&mut target);
+            assert_eq!(target["password"], origin["password"]);
+            assert_eq!(target["root_password"], origin["root_password"]);
+            assert_eq!(target["username"], "target_role");
+            assert_eq!(target["database"], "target_db");
+        }
+    }
+
+    #[test]
+    fn missing_origin_login_fields_do_not_overwrite_target_defaults() {
+        assert!(
+            RestoredServiceCredentials::from_origin("postgres", &serde_json::json!({})).is_none()
+        );
+        let mut target = serde_json::json!({
+            "password": "synthetic-target-password",
+            "username": "target_role",
+            "database": "target_db"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        RestoredServiceCredentials::from_origin(
+            "postgres",
+            &serde_json::json!({
+                "password": "synthetic-origin-password",
+                "root_password": "synthetic-origin-root-password"
+            }),
+        )
+        .unwrap()
+        .apply(&mut target);
+        assert_eq!(target["username"], "target_role");
+        assert_eq!(target["database"], "target_db");
+        assert!(!target.contains_key("root_password"));
+    }
 
     #[test]
     fn engine_container_name_matches_mariadb_provider_convention() {

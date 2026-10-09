@@ -1475,6 +1475,10 @@ pub struct RestoreContext<'a> {
     /// unchanged from the target's config and the caller is warned that
     /// the password is whatever the backup's original credentials were.
     pub source_config: ServiceConfig,
+    /// The target's live settings before origin credentials are merged.
+    /// Pre-restore SQL probes must authenticate with these settings; restored
+    /// data and new managed clones use `source_config` instead.
+    pub live_target_config: ServiceConfig,
     pub pool: &'a temps_database::DbConnection,
     /// Cancellation and write-boundary hooks for this restore. Engines poll
     /// [`RestoreGate::is_cancelled`] while they fetch the backup and call

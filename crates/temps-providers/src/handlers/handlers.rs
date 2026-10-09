@@ -76,7 +76,44 @@ pub(crate) fn worker_node_required(
         E::LocalWorkloadsDisabled { .. } => {
             Some(temps_core::worker_node_required_problem(error.to_string()))
         }
-        _ => None,
+        E::ServiceNameConflict { .. }
+        | E::ServiceNameRestoreConflict { .. }
+        | E::ServiceContainerRestoreConflict { .. }
+        | E::AmbiguousServiceName { .. }
+        | E::ServiceResourceConflict { .. }
+        | E::ServiceContainerConflict { .. }
+        | E::ServiceNotFound { .. }
+        | E::ServiceNotFoundByName { .. }
+        | E::ServiceNotFoundBySlug { .. }
+        | E::InitializationFailed { .. }
+        | E::UpgradeRejected { .. }
+        | E::EncryptionFailed { .. }
+        | E::DecryptionFailed { .. }
+        | E::InvalidServiceType { .. }
+        | E::ServiceNotLinkedToProject { .. }
+        | E::ServiceClaimDenied { .. }
+        | E::InvalidDatabaseProvisioning { .. }
+        | E::ProjectNotFound { .. }
+        | E::EnvironmentNotFound { .. }
+        | E::DatabaseError { .. }
+        | E::ArchiveSourceDesynced { .. }
+        | E::ParameterValidationFailed { .. }
+        | E::StartFailed { .. }
+        | E::UpgradeInProgress { .. }
+        | E::StopFailed { .. }
+        | E::DeletionFailed { .. }
+        | E::ServiceHasLinkedProjects { .. }
+        | E::EnvironmentVariableNotFound { .. }
+        | E::ParameterNotFound { .. }
+        | E::ParameterNotSensitive { .. }
+        | E::EncryptedVariableAccessDenied { .. }
+        | E::DockerError { .. }
+        | E::DuplicateServiceType { .. }
+        | E::InternalError { .. }
+        | E::ControlPlaneAddressRequired { .. }
+        | E::ControlPlaneMemberUnreachable { .. }
+        | E::ClusterPortsUnavailable { .. }
+        | E::ClusterMemberLimitExceeded { .. } => None,
     }
 }
 
@@ -114,7 +151,41 @@ fn service_name_problem(error: &crate::services::ExternalServiceError) -> Option
                 .value("error_code", "SERVICE_NAME_CONFLICT")
                 .build(),
         ),
-        _ => None,
+        // Other conditions retain the worker, placement or handler classification.
+        E::ServiceNotFound { .. }
+        | E::ServiceNotFoundByName { .. }
+        | E::ServiceNotFoundBySlug { .. }
+        | E::InitializationFailed { .. }
+        | E::UpgradeRejected { .. }
+        | E::EncryptionFailed { .. }
+        | E::DecryptionFailed { .. }
+        | E::InvalidServiceType { .. }
+        | E::ServiceNotLinkedToProject { .. }
+        | E::ServiceClaimDenied { .. }
+        | E::InvalidDatabaseProvisioning { .. }
+        | E::ProjectNotFound { .. }
+        | E::EnvironmentNotFound { .. }
+        | E::DatabaseError { .. }
+        | E::ArchiveSourceDesynced { .. }
+        | E::ParameterValidationFailed { .. }
+        | E::StartFailed { .. }
+        | E::UpgradeInProgress { .. }
+        | E::StopFailed { .. }
+        | E::DeletionFailed { .. }
+        | E::ServiceHasLinkedProjects { .. }
+        | E::EnvironmentVariableNotFound { .. }
+        | E::ParameterNotFound { .. }
+        | E::ParameterNotSensitive { .. }
+        | E::EncryptedVariableAccessDenied { .. }
+        | E::DockerError { .. }
+        | E::DuplicateServiceType { .. }
+        | E::InternalError { .. }
+        | E::DockerUnavailable(_)
+        | E::LocalWorkloadsDisabled { .. }
+        | E::ControlPlaneAddressRequired { .. }
+        | E::ControlPlaneMemberUnreachable { .. }
+        | E::ClusterPortsUnavailable { .. }
+        | E::ClusterMemberLimitExceeded { .. } => None,
     }
 }
 

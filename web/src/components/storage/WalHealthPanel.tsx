@@ -28,6 +28,7 @@ interface Props {
   serviceType: string
   onUpgrade?: () => void
   onBackup?: () => void
+  isImported?: boolean
 }
 
 export function WalHealthPanel({
@@ -35,6 +36,7 @@ export function WalHealthPanel({
   serviceType,
   onUpgrade,
   onBackup,
+  isImported = false,
 }: Props) {
   // Only Postgres services produce WAL health snapshots. Bail out early so
   // we don't spam the API with 404s for Redis / Mongo / S3 services.
@@ -128,13 +130,25 @@ export function WalHealthPanel({
                 Continuous WAL archiving is disabled
               </p>
               <p className="mt-1 text-xs text-muted-foreground">
-                A restore disables WAL pushes to protect its source backup.
-                Point-in-time recovery needs a new full backup to configure and
-                verify this service’s pinned archive destination. Restarting
-                alone keeps archiving disabled.
+                {isImported ? (
+                  <>
+                    This imported database’s startup settings are managed outside
+                    Temps. Enable archive_mode in its external PostgreSQL startup
+                    settings and restart it before creating a full backup.
+                    Alternatively, restore into a new managed service. Temps
+                    cannot change the imported container’s startup command.
+                  </>
+                ) : (
+                  <>
+                    A restore disables WAL pushes to protect its source backup.
+                    Point-in-time recovery needs a new full backup to configure and
+                    verify this service’s pinned archive destination. Restarting
+                    alone keeps archiving disabled.
+                  </>
+                )}
               </p>
             </div>
-            {onBackup ? (
+            {onBackup && !isImported ? (
               <Button size="sm" onClick={onBackup}>
                 Create full backup
               </Button>

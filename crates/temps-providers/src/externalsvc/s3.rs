@@ -4296,6 +4296,7 @@ mod tests {
             backup_location: &outcome.location,
             source_service: &external_service,
             source_config: s3_config.clone(),
+            live_target_config: s3_config.clone(),
             pool: &mock_db,
             gate: &super::super::NoopRestoreGate,
         };

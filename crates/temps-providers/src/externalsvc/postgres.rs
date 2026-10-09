@@ -2257,11 +2257,13 @@ impl PostgresService {
     ///
     /// WAL-G restore requires stopping PostgreSQL, clearing PGDATA, fetching the backup,
     /// and restarting. This is done via `docker exec` commands.
+    #[allow(clippy::too_many_arguments)]
     async fn restore_from_walg(
         &self,
         s3_credentials: &super::S3Credentials,
         walg_s3_prefix: &str,
         service_config: ServiceConfig,
+        live_target_config: Option<&ServiceConfig>,
         recovery_target: Option<&super::RecoveryTarget>,
         target_user_data: Option<&str>,
         gate: &dyn super::RestoreGate,
@@ -2297,8 +2299,13 @@ impl PostgresService {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            let command_line_archiving =
-                self.imported_archive_mode_source(&postgres_config).await?;
+            // The data swap inherits the backup origin's login, but this
+            // running imported target still authenticates with its own login.
+            let live_config = live_target_config
+                .map(|config| self.get_postgres_config(config.clone()))
+                .transpose()?
+                .unwrap_or_else(|| postgres_config.clone());
+            let command_line_archiving = self.imported_archive_mode_source(&live_config).await?;
             if postgres_cmd_pins_archive_mode_on(&startup) || command_line_archiving {
                 return Err(PostgresArchiveVerificationError {
                     service_name: self.name.clone(),
@@ -4204,6 +4211,7 @@ impl ExternalService for PostgresService {
                 service_config,
                 None,
                 None,
+                None,
                 &super::NoopRestoreGate,
             )
             .await
@@ -4245,6 +4253,7 @@ impl ExternalService for PostgresService {
                 ctx.s3_credentials,
                 ctx.backup_location,
                 ctx.source_config,
+                Some(&ctx.live_target_config),
                 None,
                 target_user_data.as_deref(),
                 ctx.gate,
@@ -4656,6 +4665,7 @@ impl ExternalService for PostgresService {
                     ctx.backup_location,
                     new_service_config,
                     None,
+                    None,
                     target_user_data.as_deref(),
                     ctx.gate,
                 )
@@ -4762,6 +4772,7 @@ impl ExternalService for PostgresService {
                     ctx.s3_credentials,
                     ctx.backup_location,
                     new_service_config,
+                    None,
                     Some(&target),
                     target_user_data.as_deref(),
                     ctx.gate,
@@ -4800,6 +4811,7 @@ impl ExternalService for PostgresService {
                 ctx.s3_credentials,
                 ctx.backup_location,
                 ctx.source_config.clone(),
+                Some(&ctx.live_target_config),
                 Some(&target),
                 target_user_data.as_deref(),
                 ctx.gate,
@@ -7596,6 +7608,7 @@ mod tests {
             backup: &backup,
             backup_location: &legacy_location,
             source_service: &source_service,
+            live_target_config: cfg.clone(),
             source_config: cfg,
             pool: &mock_db,
             gate: &crate::externalsvc::NoopRestoreGate,
