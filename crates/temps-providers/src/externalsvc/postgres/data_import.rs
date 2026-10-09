@@ -346,6 +346,7 @@ impl DataImportEngine for PostgresService {
         config: &ServiceConfig,
         database: &str,
         preparation: TargetPreparation,
+        _run_id: i32,
     ) -> Result<(), DataImportError> {
         bounded_step(
             &config.name,
@@ -747,7 +748,7 @@ mod tests {
             .expect("plan");
         assert_eq!(preparation, TargetPreparation::Create);
         engine
-            .prepare_target(&config, "shop_production", preparation)
+            .prepare_target(&config, "shop_production", preparation, 1)
             .await
             .expect("prepare");
         let run_base = (std::process::id() as i32 % 10_000) * 10;
@@ -792,7 +793,7 @@ mod tests {
 
         // …and replaced, not duplicated, with it.
         engine
-            .prepare_target(&config, "shop_production", TargetPreparation::Recreate)
+            .prepare_target(&config, "shop_production", TargetPreparation::Recreate, 1)
             .await
             .expect("recreate");
         let outcome = transfer(
@@ -813,7 +814,7 @@ mod tests {
         // 3. A source that refuses the login fails on the source side, its
         //    password never shows, and nothing is committed.
         engine
-            .prepare_target(&config, "shop_production", TargetPreparation::Recreate)
+            .prepare_target(&config, "shop_production", TargetPreparation::Recreate, 1)
             .await
             .expect("recreate");
         let bad_source = format!("postgres://postgres:wrong-pass@{}:5432/shop", source.name);

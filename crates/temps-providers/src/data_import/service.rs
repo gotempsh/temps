@@ -869,6 +869,8 @@ enum CreatedTargetRelease {
     Released,
     /// `project/environment` that resolves to the same name.
     KeptForLinkedEnvironment(String),
+    /// A deployment or another import started using the name meanwhile.
+    KeptInUse,
     Failed(String),
 }
 
@@ -886,10 +888,15 @@ impl CreatedTargetRelease {
                 "The logical database it created for '{database}' was kept, because the \
                  linked environment {environment} resolves to it."
             ),
+            Self::KeptInUse => format!(
+                "The logical database it created for '{database}' was kept, because a \
+                 deployment or another import started using that name."
+            ),
             Self::Failed(reason) => format!(
-                "Releasing the logical database it created for '{database}' failed \
-                 ({reason}); it stays reserved, and importing into '{database}' again \
-                 reuses it."
+                "Releasing the logical database it created for '{database}' did not \
+                 complete ({reason}). Importing into '{database}' again is safe either \
+                 way: it reuses that database, or allocates a new one if Redis completed \
+                 the release after all."
             ),
         };
         match message {
@@ -994,7 +1001,7 @@ impl ImportJob {
             return JobOutcome::cancelled();
         }
         if let Err(e) = engine
-            .prepare_target(&self.config, &self.database, preparation)
+            .prepare_target(&self.config, &self.database, preparation, self.run_id)
             .await
         {
             return JobOutcome::failed(scrub_secrets(&e.to_string(), &secrets));
@@ -1138,7 +1145,7 @@ impl ImportJob {
                 CreatedTargetRelease::KeptForLinkedEnvironment(environment)
             }
             Ok(None) => match engine
-                .release_created_target(&self.config, &self.database)
+                .release_created_target(&self.config, &self.database, self.run_id)
                 .await
             {
                 Ok(true) => {
@@ -1150,7 +1157,15 @@ impl ImportJob {
                     );
                     CreatedTargetRelease::Released
                 }
-                Ok(false) => return outcome,
+                Ok(false) => {
+                    info!(
+                        run_id = self.run_id,
+                        service_id = self.service_id,
+                        target_database = %self.database,
+                        "Kept the database a failed data import created: something else started using it"
+                    );
+                    CreatedTargetRelease::KeptInUse
+                }
                 Err(e) => CreatedTargetRelease::Failed(scrub_secrets(
                     &e.to_string(),
                     &self.source.secrets(),
@@ -1435,7 +1450,13 @@ mod tests {
         let failed = CreatedTargetRelease::Failed("Redis did not answer within 120s".to_string())
             .describe(Some(&message), "sessions");
         assert!(failed.contains(PARTIAL_LEFTOVER), "{failed}");
-        assert!(failed.contains("Releasing the logical database it created for 'sessions' failed (Redis did not answer within 120s); it stays reserved"));
+        assert!(failed.contains("Releasing the logical database it created for 'sessions' did not complete (Redis did not answer within 120s). Importing into 'sessions' again is safe either way"));
+
+        let in_use = CreatedTargetRelease::KeptInUse.describe(Some(&message), "sessions");
+        assert!(in_use.contains(PARTIAL_LEFTOVER), "{in_use}");
+        assert!(in_use.ends_with(
+            "was kept, because a deployment or another import started using that name."
+        ));
     }
 
     /// Docker + PostgreSQL end-to-end through `ImportJob::execute`: a Redis
@@ -1563,7 +1584,7 @@ mod tests {
         engine
             .data_import()
             .expect("redis imports")
-            .prepare_target(&config, "existing_target", TargetPreparation::Create)
+            .prepare_target(&config, "existing_target", TargetPreparation::Create, 1)
             .await
             .expect("pre-allocate");
 
@@ -2124,6 +2145,7 @@ mod tests {
             _config: &ServiceConfig,
             _database: &str,
             _preparation: TargetPreparation,
+            _run_id: i32,
         ) -> Result<(), DataImportError> {
             Ok(())
         }

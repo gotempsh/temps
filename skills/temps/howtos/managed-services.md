@@ -62,7 +62,8 @@ to raw API calls.
    of the data, and the fix is to run again with `--replace`. The exception is
    a failed Redis import into a name that had no logical database yet: it
    releases the one it allocated, unless a linked environment resolves to that
-   name, and the run's message says which happened.
+   name or a deployment started using it meanwhile, and the run's message says
+   which happened.
 5. **Report from the run, not from assumptions:**
 
    ```bash

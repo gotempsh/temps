@@ -241,11 +241,15 @@ pub trait DataImportEngine: Send + Sync {
     /// Create, or drop and re-create, `database` exactly the way the engine's
     /// project provisioning creates it (same owner, same grants), so a
     /// deployment linked later finds it and uses it.
+    ///
+    /// `run_id` identifies the import run, for engines that record which
+    /// run created a database (see [`Self::release_created_target`]).
     async fn prepare_target(
         &self,
         config: &ServiceConfig,
         database: &str,
         preparation: TargetPreparation,
+        run_id: i32,
     ) -> Result<(), DataImportError>;
 
     /// Undo a [`TargetPreparation::Create`] after the import did not
@@ -257,10 +261,14 @@ pub trait DataImportEngine: Send + Sync {
     /// database: engines where an empty leftover costs nothing do not
     /// override it. Redis does, because its logical databases are a fixed
     /// pool shared with provisioning.
+    /// Must be safe however late it runs: if anything else started using
+    /// `database` since run `run_id` created it, it releases nothing and
+    /// returns `false`.
     async fn release_created_target(
         &self,
         _config: &ServiceConfig,
         _database: &str,
+        _run_id: i32,
     ) -> Result<bool, DataImportError> {
         Ok(false)
     }
