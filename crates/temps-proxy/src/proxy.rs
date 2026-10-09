@@ -2215,23 +2215,6 @@ impl LoadBalancer {
         self.is_tls_connection(session)
     }
 
-    /// Whether the end client used HTTPS, believing the forwarded scheme only
-    /// from a verified Cloudflare peer or an opted-in loopback proxy. Used for
-    /// the HTTP→HTTPS redirect decision; see `forwarded_proto`.
-    fn client_used_https(&self, session: &PingoraSession) -> bool {
-        let peer = session
-            .client_addr()
-            .and_then(|addr| addr.as_inet())
-            .map(|addr| addr.ip());
-        crate::forwarded_proto::client_used_https(
-            peer,
-            &session.req_header().headers,
-            self.is_tls_connection(session),
-            self.trust_loopback_forwarded_ip.load(Ordering::Relaxed),
-            |ip| crate::cloudflare_ips::CLOUDFLARE_TRUST.is_cloudflare(ip),
-        )
-    }
-
     /// Check if the connection is a TLS connection by checking for SSL digest
     fn is_tls_connection(&self, session: &PingoraSession) -> bool {
         session
@@ -6243,17 +6226,9 @@ impl ProxyHttp for LoadBalancer {
         // Exactly one of these can be set: `console_force_https` is only
         // computed when no environment resolved.
         let force_https = env_force_https.or(console_force_https);
-        // What the visitor used, not what reached us: behind Cloudflare (or an
-        // opted-in local proxy) the hop to Temps can be TLS for an http://
-        // visitor (Full mode — previously never redirected) or plain HTTP for
-        // an https:// visitor (Flexible mode — a redirect here would loop).
-        // Only trusted peers' forwarded scheme is believed; see
-        // `forwarded_proto`. With redirects globally off both decisions below
-        // are `false` regardless, so the lookup is skipped.
-        let client_https = self.disable_https_redirect || self.client_used_https(session);
         let production_https = if should_apply_production_https_default(
             self.disable_https_redirect,
-            client_https,
+            self.is_tls_connection(session),
             &ctx.path,
             force_https,
             ctx.environment.is_some(),
@@ -6273,7 +6248,7 @@ impl ProxyHttp for LoadBalancer {
         };
         let needs_redirect = should_redirect_to_https(
             self.disable_https_redirect,
-            client_https,
+            self.is_tls_connection(session),
             &ctx.path,
             force_https,
             // Lock-free ArcSwap snapshot read, and only reached when the
