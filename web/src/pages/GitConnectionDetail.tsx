@@ -59,10 +59,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import { ReadFailure } from '@/components/ui/read-failure'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useDebounce } from '@/hooks/useDebounce'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { isVerifiedNotFound } from '@/lib/read-failure'
 import { getRepositoryUrl } from '@/lib/repository-url'
 import {
   REPOSITORY_PAGE_SIZE_OPTIONS,
@@ -327,13 +329,43 @@ export default function GitConnectionDetail() {
     )
   }
 
+  // Only a verified 404 proves the connection (or its provider) is gone. A
+  // refused or failed read says nothing about it, so it gets the
+  // read-failure state -- never "not found".
+  const verifiedMissing =
+    isVerifiedNotFound(connectionQuery.error) ||
+    isVerifiedNotFound(providerQuery.error)
+  const unreadable: {
+    resource: string
+    query: typeof connectionQuery | typeof providerQuery
+  }[] = []
+  if (connectionQuery.error && !connection)
+    unreadable.push({ resource: 'Git connection', query: connectionQuery })
+  if (providerQuery.error && !provider)
+    unreadable.push({ resource: 'Git provider', query: providerQuery })
+  if (validIds && !verifiedMissing && unreadable.length > 0) {
+    return (
+      <div className="space-y-4 p-4 sm:p-6">
+        {unreadable.map(({ resource, query }) => (
+          <ReadFailure
+            key={resource}
+            resource={resource}
+            error={query.error}
+            onRetry={() => query.refetch()}
+            retrying={query.isFetching}
+          />
+        ))}
+        {backAction}
+      </div>
+    )
+  }
+
   // The connection must belong to the provider in the URL; anything else is
   // a stale or hand-edited link, not a page to render.
   if (
     !validIds ||
-    connectionQuery.error ||
+    verifiedMissing ||
     !connection ||
-    providerQuery.error ||
     !provider ||
     connection.provider_id !== provider.id
   ) {
@@ -342,7 +374,7 @@ export default function GitConnectionDetail() {
         variant="failed"
         icon={AlertTriangle}
         title="Git Connection Not Found"
-        description="This connection doesn't exist under this provider, or you don't have access to it."
+        description="This connection doesn't exist under this provider, or was deleted."
         action={backAction}
       />
     )
@@ -624,6 +656,24 @@ export default function GitConnectionDetail() {
       facts={facts}
       main={
         <div className="space-y-4">
+          {connectionQuery.error && (
+            <ReadFailure
+              resource="Git connection"
+              error={connectionQuery.error}
+              cached
+              onRetry={() => connectionQuery.refetch()}
+              retrying={connectionQuery.isFetching}
+            />
+          )}
+          {providerQuery.error && (
+            <ReadFailure
+              resource="Git provider"
+              error={providerQuery.error}
+              cached
+              onRetry={() => providerQuery.refetch()}
+              retrying={providerQuery.isFetching}
+            />
+          )}
           <ConnectionProblems
             connection={connection}
             providerId={provider.id}

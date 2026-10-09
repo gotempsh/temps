@@ -15,6 +15,8 @@ import {
 } from '@/components/ui/card'
 import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
+import { ReadFailure } from '@/components/ui/read-failure'
+import { isVerifiedNotFound } from '@/lib/read-failure'
 import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { Link as RouterLink } from 'react-router'
@@ -151,7 +153,8 @@ export function ProxyLogDetail({
     }),
     enabled: !isLegacyNumericId,
   })
-  const { data: log, isLoading, error } = isLegacyNumericId ? byId : byRequestId
+  const activeQuery = isLegacyNumericId ? byId : byRequestId
+  const { data: log, isLoading, error } = activeQuery
 
   if (isLoading) {
     return (
@@ -163,7 +166,9 @@ export function ProxyLogDetail({
     )
   }
 
-  if (error || !log) {
+  // Only a verified 404 proves the log row is gone. A failed or refused read
+  // (5xx, network, 401/403) says nothing about it and must not claim so.
+  if (error && isVerifiedNotFound(error)) {
     return (
       <Card>
         <CardContent className="flex flex-col items-center justify-center py-12">
@@ -175,6 +180,17 @@ export function ProxyLogDetail({
           </p>
         </CardContent>
       </Card>
+    )
+  }
+
+  if (!log) {
+    return (
+      <ReadFailure
+        resource="Proxy log"
+        error={error}
+        onRetry={() => activeQuery.refetch()}
+        retrying={activeQuery.isFetching}
+      />
     )
   }
 
@@ -201,6 +217,15 @@ export function ProxyLogDetail({
 
   return (
     <div className="space-y-6">
+      {error && (
+        <ReadFailure
+          resource="Proxy log"
+          error={error}
+          cached
+          onRetry={() => activeQuery.refetch()}
+          retrying={activeQuery.isFetching}
+        />
+      )}
       {/* Overview Card */}
       <Card>
         <CardHeader>

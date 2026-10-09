@@ -13,6 +13,7 @@ import {
 } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Label } from '@/components/ui/label'
+import { ReadFailure } from '@/components/ui/read-failure'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   AlertDialog,
@@ -26,14 +27,14 @@ import {
   AlertDialogTrigger,
 } from '@/components/ui/alert-dialog'
 import {
-  getApiKey,
-  deleteApiKey,
-  activateApiKey,
-  deactivateApiKey,
-} from '@/api/client'
-import { listApiKeysQueryKey } from '@/api/client/@tanstack/react-query.gen'
+  getApiKeyOptions,
+  getApiKeyQueryKey,
+} from '@/api/client/@tanstack/react-query.gen'
+import { deleteApiKey, activateApiKey, deactivateApiKey } from '@/api/client'
 import { useApiKeyPermissions } from '@/components/api-keys/useApiKeyPermissions'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { isVerifiedNotFound } from '@/lib/read-failure'
+import { listApiKeysQueryKey } from '@/api/client/@tanstack/react-query.gen'
 import {
   Button,
   Callout,
@@ -45,15 +46,7 @@ import {
   type DetailFact,
   type StatusTone,
 } from '@temps-sdk/ds'
-import {
-  AlertCircle,
-  ArrowLeft,
-  Check,
-  Key,
-  Shield,
-  Trash2,
-  X,
-} from 'lucide-react'
+import { ArrowLeft, Check, Key, Shield, Trash2, X } from 'lucide-react'
 import { toast } from 'sonner'
 
 // Helper component to display permissions with show more/less functionality
@@ -181,20 +174,23 @@ export default function ApiKeyDetail() {
   const { id } = useParams<{ id: string }>()
   const queryClient = useQueryClient()
 
+  const apiKeyId = Number(id)
+  const validId = Number.isInteger(apiKeyId) && apiKeyId > 0
+  // The generated options throw the server's Problem Details on a non-2xx
+  // response. A hand-written queryFn returning `response.data` resolved to
+  // `undefined` instead, and react-query replaced the server's reason with
+  // its own "data is undefined" error.
+  const apiKeyKey = getApiKeyQueryKey({ path: { id: apiKeyId } })
+  const apiKeyQuery = useQuery({
+    ...getApiKeyOptions({ path: { id: apiKeyId } }),
+    enabled: validId,
+  })
   const {
     data: apiKey,
     isLoading,
     error: apiKeyError,
     refetch: refetchApiKey,
-  } = useQuery({
-    queryKey: ['apiKey', id],
-    queryFn: async () => {
-      if (!id) throw new Error('API Key ID is required')
-      const response = await getApiKey({ path: { id: parseInt(id) } })
-      return response.data
-    },
-    enabled: !!id,
-  })
+  } = apiKeyQuery
 
   useEffect(() => {
     if (apiKey && apiKeyError) {
@@ -223,7 +219,7 @@ export default function ApiKeyDetail() {
       errorTitle: 'Failed to activate API key',
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['apiKey', id] })
+      queryClient.invalidateQueries({ queryKey: apiKeyKey })
       queryClient.invalidateQueries({ queryKey: listApiKeysQueryKey() })
       toast.success('API key activated')
     },
@@ -235,7 +231,7 @@ export default function ApiKeyDetail() {
       errorTitle: 'Failed to deactivate API key',
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['apiKey', id] })
+      queryClient.invalidateQueries({ queryKey: apiKeyKey })
       queryClient.invalidateQueries({ queryKey: listApiKeysQueryKey() })
       toast.success('API key deactivated')
     },
@@ -256,30 +252,17 @@ export default function ApiKeyDetail() {
     return <ApiKeyDetailSkeleton backAction={backAction} />
   }
 
-  const isNotFound =
-    (apiKeyError as any)?.status === 404 ||
-    (apiKeyError as any)?.title === 'API Key Not Found'
-
-  if (!apiKey && apiKeyError && !isNotFound) {
+  if (!apiKey && apiKeyError && !isVerifiedNotFound(apiKeyError)) {
     return (
-      <PageState
-        variant="failed"
-        icon={AlertCircle}
-        title="Failed to load API key"
-        description={
-          apiKeyError instanceof Error
-            ? apiKeyError.message
-            : 'An unexpected error occurred. Please try again.'
-        }
-        action={
-          <div className="flex gap-2">
-            <Button variant="outline" onClick={() => void refetchApiKey()}>
-              Retry
-            </Button>
-            {backAction}
-          </div>
-        }
-      />
+      <div className="space-y-4">
+        <ReadFailure
+          resource="API key"
+          error={apiKeyError}
+          onRetry={() => void refetchApiKey()}
+          retrying={apiKeyQuery.isFetching}
+        />
+        {backAction}
+      </div>
     )
   }
 
@@ -289,7 +272,7 @@ export default function ApiKeyDetail() {
         variant="empty"
         icon={Key}
         title="API key not found"
-        description="This API key may have been deleted, or you may not have permission to view it."
+        description="This API key does not exist or has been deleted."
         action={backAction}
       />
     )
