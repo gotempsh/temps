@@ -643,6 +643,10 @@ impl MicrosandboxSandboxProvider {
         let sandbox = self.connected(name).await?;
         let fs = sandbox.fs();
         let (mut copied, mut removed) = (0usize, 0usize);
+        // The host repository's identity, so a guest name the host
+        // filesystem folds onto it (`.GIT` on a case-insensitive volume) is
+        // recognised whatever spelling reached it.
+        let host_git = file_identity(&host_dir.join(GIT_DIR_NAME));
         let mut stack = vec![(WORK_DIR.to_string(), host_dir.to_path_buf())];
         while let Some((guest_dir, local_dir)) = stack.pop() {
             let entries = fs.list(&guest_dir).await.map_err(|e| {
@@ -660,7 +664,7 @@ impl MicrosandboxSandboxProvider {
                     continue;
                 };
                 present.insert(std::ffi::OsString::from(file_name));
-                if file_name == GIT_DIR_NAME {
+                if is_git_metadata_name(file_name) {
                     continue;
                 }
                 let guest_path = format!("{}/{}", guest_dir, file_name);
@@ -670,6 +674,9 @@ impl MicrosandboxSandboxProvider {
                     .as_ref()
                     .is_some_and(|m| m.file_type().is_symlink())
                 {
+                    continue;
+                }
+                if host_git.is_some() && file_identity(&local_path) == host_git {
                     continue;
                 }
                 match entry.kind {
@@ -694,7 +701,9 @@ impl MicrosandboxSandboxProvider {
             // What the guest no longer has, the agent deleted.
             for local in std::fs::read_dir(&local_dir)? {
                 let local = local?;
-                if present.contains(&local.file_name()) || local.file_name() == GIT_DIR_NAME {
+                if present.contains(&local.file_name())
+                    || is_git_metadata_name(&local.file_name().to_string_lossy())
+                {
                     continue;
                 }
                 let meta = local.path().symlink_metadata()?;
@@ -1278,6 +1287,32 @@ fn set_dir_private(path: &Path) {
 /// Git repository metadata — never synced from a guest; see
 /// [`MicrosandboxSandboxProvider::mirror_workspace`].
 const GIT_DIR_NAME: &str = ".git";
+
+/// Whether a host filesystem could resolve `name` to `.git`. The guest is
+/// case-sensitive Linux; the host may not be. Mirrors Git's own guards
+/// (`is_hfs_dotgit` / `is_ntfs_dotgit`): ASCII case folding, code points
+/// HFS+ ignores, trailing dots and spaces, and the 8.3 short name.
+fn is_git_metadata_name(name: &str) -> bool {
+    let visible: String = name.chars().filter(|c| !is_hfs_ignorable(*c)).collect();
+    let folded = visible.trim_end_matches(['.', ' ']).to_ascii_lowercase();
+    folded == GIT_DIR_NAME || folded == "git~1"
+}
+
+/// Code points HFS+ drops when comparing names.
+fn is_hfs_ignorable(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200C}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{206A}'..='\u{206F}' | '\u{FEFF}'
+    )
+}
+
+/// (device, inode) of `path` without following a final symlink.
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path)
+        .ok()
+        .map(|m| (m.dev(), m.ino()))
+}
 
 /// The final component of a guest directory-listing path, if it is a
 /// plain name. Guest-reported names are untrusted: anything that could
@@ -1923,6 +1958,31 @@ mod tests {
     }
 
     #[test]
+    fn git_metadata_names_cover_host_folding_rules() {
+        for name in [
+            ".git",
+            ".GIT",
+            ".Git",
+            ".git.",
+            ".git ",
+            ".git. .",
+            "GIT~1",
+            "git~1",
+            ".g\u{200C}it",
+            "\u{FEFF}.git",
+            ".gi\u{206F}t",
+        ] {
+            assert!(
+                is_git_metadata_name(name),
+                "{name:?} must be treated as .git"
+            );
+        }
+        for name in [".github", ".gitignore", "git", ".git-hooks", "x.git", ".gt"] {
+            assert!(!is_git_metadata_name(name), "{name:?} is an ordinary entry");
+        }
+    }
+
+    #[test]
     fn guest_entry_names_must_be_plain_components() {
         assert_eq!(guest_entry_name("/workspace/src/lib.rs"), Some("lib.rs"));
         assert_eq!(guest_entry_name("README.md"), Some("README.md"));
@@ -1971,6 +2031,9 @@ mod tests {
                      && ln -s /etc/passwd guest-link \
                      && printf '[core]\\n\\tfsmonitor = ./tool.sh\\n' >> .git/config \
                      && mkdir -p .git/hooks && printf '#!/bin/sh\\n' > .git/hooks/post-checkout \
+                     && mkdir -p .GIT && printf '[core]\\n\\tfsmonitor = ./tool.sh\\n' > .GIT/config \
+                     && mkdir -p .Git/hooks && printf '#!/bin/sh\\n' > .Git/hooks/pre-commit \
+                     && mkdir -p \"$(printf '.g\\342\\200\\214it')\" \
                      && mkdir -p vendor/dep/.git && printf 'x' > vendor/dep/.git/config \
                      && printf 'dep\\n' > vendor/dep/lib.txt"
                 );
@@ -2030,6 +2093,13 @@ mod tests {
                     "host git config untouched"
                 );
                 assert!(!host_dir.join(".git/hooks/post-checkout").exists());
+                assert!(!host_dir.join(".git/hooks/pre-commit").exists());
+                let leaked: Vec<String> = std::fs::read_dir(&host_dir)
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .filter(|n| n != ".git" && is_git_metadata_name(n))
+                    .collect();
+                assert!(leaked.is_empty(), "case/Unicode variants of .git synced: {leaked:?}");
                 assert!(
                     !host_dir.join("vendor/dep/.git").exists(),
                     "nested .git skipped"
