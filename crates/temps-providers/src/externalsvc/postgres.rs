@@ -92,6 +92,45 @@ struct PostgresArchiveVerificationError {
     reason: String,
 }
 
+fn postgres_startup_error_is_transient(error: &sqlx::Error) -> bool {
+    match error {
+        sqlx::Error::Io(error) => matches!(
+            error.kind(),
+            std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::TimedOut
+        ),
+        sqlx::Error::Database(error) => {
+            matches!(error.code().as_deref(), Some("57P01" | "57P02" | "57P03"))
+        }
+        _ => false,
+    }
+}
+
+/// Called under the restore's readiness deadline. A running imported container
+/// may have no Docker healthcheck and still be starting or replaying WAL.
+async fn wait_for_restored_postgres<F, Fut>(
+    mut probe: F,
+    delay: Duration,
+) -> Result<(), sqlx::Error>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<bool, sqlx::Error>>,
+{
+    loop {
+        match probe().await {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) if postgres_startup_error_is_transient(&error) => {}
+            Err(error) => return Err(error),
+        }
+        sleep(delay).await;
+    }
+}
+
 /// Builds the `pg_isready` healthcheck command pinned to the configured
 /// username/database. Without `-d`, `pg_isready` (via libpq) defaults the
 /// target database to the username, so any service where `database !=
@@ -1474,6 +1513,58 @@ impl PostgresService {
         self.archive_settings(config, Some(expected_command)).await
     }
 
+    async fn wait_for_restored_database(
+        &self,
+        config: &PostgresConfig,
+    ) -> std::result::Result<(), PostgresArchiveVerificationError> {
+        use sqlx::Connection;
+
+        let connection = format!(
+            "postgres://{}:{}@{}:{}/{}?sslmode={}",
+            urlencoding::encode(&config.username),
+            urlencoding::encode(&config.password),
+            config.host,
+            config.port,
+            urlencoding::encode(&config.database),
+            urlencoding::encode(config.ssl_mode.as_deref().unwrap_or("disable")),
+        );
+        let result = tokio::time::timeout(
+            Duration::from_secs(90),
+            wait_for_restored_postgres(
+                || async {
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        let mut database = sqlx::PgConnection::connect(&connection).await?;
+                        let ready = sqlx::query_scalar::<_, bool>("SELECT NOT pg_is_in_recovery()")
+                            .fetch_one(&mut database)
+                            .await;
+                        let _ = database.close().await;
+                        ready
+                    })
+                    .await
+                    .map_err(|_| {
+                        sqlx::Error::Io(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "restored PostgreSQL readiness probe timed out",
+                        ))
+                    })?
+                },
+                Duration::from_millis(500),
+            ),
+        )
+        .await;
+        result
+            .map_err(|_| PostgresArchiveVerificationError {
+                service_name: self.name.clone(),
+                reason:
+                    "the restored database did not finish starting and recovering within 90 seconds"
+                        .to_string(),
+            })?
+            .map_err(|error| PostgresArchiveVerificationError {
+                service_name: self.name.clone(),
+                reason: format!("could not verify the restored database's readiness: {error}"),
+            })
+    }
+
     async fn archive_settings(
         &self,
         config: &PostgresConfig,
@@ -2741,6 +2832,10 @@ impl PostgresService {
             self.create_container_once(&self.docker, &postgres_config, &limits, false)
                 .await?;
         }
+        // Docker's running state alone is not SQL readiness for an imported
+        // container without a healthcheck. Authenticate with the restored login
+        // and wait for recovery before checking policy or reporting success.
+        self.wait_for_restored_database(&postgres_config).await?;
         let (mode, _) = self
             .active_archive_settings(&postgres_config, "/bin/true")
             .await?;
@@ -4891,6 +4986,52 @@ mod data_import;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn restored_postgres_readiness_retries_transport_and_recovery() {
+        let mut answers = std::collections::VecDeque::from([
+            Err(sqlx::Error::Io(std::io::Error::from(
+                std::io::ErrorKind::UnexpectedEof,
+            ))),
+            Ok(false),
+            Ok(true),
+        ]);
+        wait_for_restored_postgres(
+            || std::future::ready(answers.pop_front().unwrap()),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        assert!(answers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn restored_postgres_readiness_rejects_permanent_errors_without_retry() {
+        let mut attempts = 0;
+        let error = wait_for_restored_postgres(
+            || {
+                attempts += 1;
+                std::future::ready(Err(sqlx::Error::Configuration(
+                    "invalid database configuration".into(),
+                )))
+            },
+            Duration::ZERO,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, sqlx::Error::Configuration(_)));
+        assert_eq!(attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn restored_postgres_readiness_stops_at_its_deadline() {
+        let result = tokio::time::timeout(
+            Duration::from_millis(20),
+            wait_for_restored_postgres(|| std::future::ready(Ok(false)), Duration::from_millis(1)),
+        )
+        .await;
+        assert!(result.is_err());
+    }
 
     /// A private, run-owned PostgreSQL fixture exercises PostgreSQL's real
     /// archive_command show hook. The fixture supplies separate off/on servers;
