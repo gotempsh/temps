@@ -1301,6 +1301,44 @@ pub fn detect_project_candidates(
         }
     }
 
+    // Rsbuild's src/index.html is an input template. Claim that conventional
+    // source directory from its enclosing buildable app; independent nested
+    // manifests and sibling static sites still receive their own candidates.
+    let rsbuild_roots: BTreeSet<&str> = roots
+        .iter()
+        .copied()
+        .filter(|root| {
+            let manifest = if *root == "." {
+                "package.json".to_string()
+            } else {
+                format!("{root}/package.json")
+            };
+            files
+                .get(&manifest)
+                .and_then(|contents| detect_package_json_preset(contents))
+                .is_some_and(|(preset, _, _)| preset == PresetType::Rsbuild)
+        })
+        .collect();
+    roots.retain(|root| {
+        let names = by_directory.get(root).map(Vec::as_slice).unwrap_or(&[]);
+        if !names.contains(&"index.html")
+            || names
+                .iter()
+                .any(|name| *name != "index.html" && is_project_manifest(name))
+            || names.contains(&"Dockerfile")
+        {
+            return true;
+        }
+        let mut ancestor = *root;
+        while let Some((parent, name)) = ancestor.rsplit_once('/') {
+            if name == "src" && rsbuild_roots.contains(parent) {
+                return false;
+            }
+            ancestor = parent;
+        }
+        !(ancestor == "src" && rsbuild_roots.contains("."))
+    });
+
     let mut candidates = Vec::new();
     for root in roots {
         let at_root = |name: &str| {
@@ -1523,6 +1561,8 @@ fn detect_package_json_preset(content: &str) -> Option<(PresetType, &'static str
         (PresetType::NodeJs, "@react-router/dev")
     } else if has_dependency("@builder.io/qwik-city") {
         (PresetType::NodeJs, "@builder.io/qwik-city")
+    } else if has_dependency("@rsbuild/core") {
+        (PresetType::Rsbuild, "@rsbuild/core")
     } else if has_dependency("vite") {
         (PresetType::Vite, "vite")
     } else {
@@ -1726,6 +1766,36 @@ mod uploaded_source_detection_tests {
             image_ref: "quay.io/keycloak/keycloak:26.7.2".to_string(),
             command: Some(vec!["start".to_string()]),
             health_check_path: Some("/realms/master".to_string()),
+        }
+    }
+
+    #[test]
+    fn rsbuild_is_a_buildable_static_preset_and_source_html_is_not_a_candidate() {
+        for prefix in ["", "apps/web/"] {
+            let package = format!("{prefix}package.json");
+            let source = format!("{prefix}src/index.html");
+            let mut files = BTreeMap::from([(package, r#"{"scripts":{"build":"rsbuild build"},"devDependencies":{"@rsbuild/core":"1.3.22","@rsbuild/plugin-react":"1.3.2"}}"#.to_string()), (source, r#"<div id="root"></div>"#.to_string())]);
+            files.insert("docs/index.html".to_string(), "<h1>Docs</h1>".to_string());
+            let candidates = detect_project_candidates(&files);
+            let root = if prefix.is_empty() { "." } else { "apps/web" };
+            assert!(candidates.iter().any(|c| c.path == root
+                && c.preset == PresetType::Rsbuild
+                && c.confidence == "high"));
+            assert!(!candidates.iter().any(|c| c.path == format!("{prefix}src")));
+            assert!(candidates
+                .iter()
+                .any(|c| c.path == "docs" && c.preset == PresetType::Static));
+            files.insert(
+                format!("{prefix}src/independent/package.json"),
+                r#"{"scripts":{"start":"node server.js"}}"#.to_string(),
+            );
+            files.insert(
+                format!("{prefix}src/independent/index.html"),
+                "<h1>Independent</h1>".to_string(),
+            );
+            assert!(detect_project_candidates(&files).iter().any(|c| {
+                c.path == format!("{prefix}src/independent") && c.preset == PresetType::NodeJs
+            }));
         }
     }
 
