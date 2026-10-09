@@ -9813,3 +9813,243 @@ mod proxy_failure_kind_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod stopped_app_tests {
+    use super::LoadBalancer;
+    use crate::config::ProxyConfig;
+    use crate::services::{ProjectContextResolverImpl, UpstreamResolverImpl};
+    use crate::test_utils::*;
+    use crate::traits::{ProjectContextResolver, UpstreamResolver};
+    use anyhow::Result;
+    use pingora::upstreams::peer::Peer;
+    use std::sync::Arc;
+    use temps_database::test_utils::TestDatabase;
+    use temps_routes::CachedPeerTable;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn create_crypto_cookie_crypto() -> Arc<temps_core::CookieCrypto> {
+        let encryption_key = "default-32-byte-key-for-testing!";
+        Arc::new(
+            temps_core::CookieCrypto::new(encryption_key).expect("Failed to create cookie crypto"),
+        )
+    }
+
+    fn create_test_config_service(
+        db: Arc<sea_orm::DatabaseConnection>,
+    ) -> Arc<temps_config::ConfigService> {
+        let config = temps_config::ServerConfig::new(
+            "127.0.0.1:3000".to_string(),
+            "postgresql://test@localhost/test".to_string(),
+            None,
+            None,
+        )
+        .expect("Failed to create test ServerConfig");
+
+        Arc::new(temps_config::ConfigService::new(Arc::new(config), db))
+    }
+
+    fn create_mock_ip_service(
+        db: Arc<sea_orm::DatabaseConnection>,
+    ) -> Arc<temps_geo::IpAddressService> {
+        // Force mock mode for tests by setting environment variable
+        std::env::set_var("TEMPS_GEO_MOCK", "true");
+
+        let geoip_service =
+            Arc::new(temps_geo::GeoIpService::new().expect("Failed to create GeoIpService"));
+        Arc::new(temps_geo::IpAddressService::new(db, geoip_service))
+    }
+
+    /// Stand-in for the console: answers every request with the console's
+    /// SPA shell and HTTP 200, as the real console does for any path.
+    async fn start_console_stand_in() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut request = [0u8; 4096];
+                    let _ = stream.read(&mut request).await;
+                    let body = "<!DOCTYPE html><html><head><title>Temps</title></head>\
+                                <body><div id=\"root\"></div></body></html>";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        address
+    }
+
+    /// Issue #1334: a request to an app whose containers are all down must
+    /// get the proxy's 503 page, never the console. Before the fix the host
+    /// vanished from the route table, the request fell through to the console
+    /// and was answered with the console SPA and HTTP 200, so uptime monitors
+    /// reported the stopped app as operational.
+    ///
+    /// Drives the real `ProxyHttp` hooks over an in-memory HTTP/1.1 session,
+    /// in the order Pingora calls them.
+    #[tokio::test]
+    async fn test_stopped_app_gets_503_instead_of_the_console() -> Result<()> {
+        use pingora_proxy::{ProxyHttp, Session};
+        use sea_orm::{ActiveModelTrait, Set};
+
+        let test_db_mock = match TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Skipping stopped-app proxy test: Docker runtime unavailable");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let db = test_db_mock.connection_arc().clone();
+        let test_db = TestDBMockOperations::new(db.clone()).await.unwrap();
+
+        let host = "stopped-app.example.com";
+        let (project, environment, deployment) = test_db
+            .create_test_project_with_domain(host)
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        // The request below is plain HTTP. A resolved production environment
+        // is redirected to HTTPS by default, exactly as a running app would
+        // be; opt out so the request reaches upstream selection.
+        temps_entities::environments::ActiveModel {
+            id: Set(environment.id),
+            force_https: Set(Some(false)),
+            ..Default::default()
+        }
+        .update(db.as_ref())
+        .await?;
+        temps_entities::deployment_containers::ActiveModel {
+            deployment_id: Set(deployment.id),
+            container_id: Set("stopped-app-container".to_string()),
+            container_name: Set("stopped-app-container".to_string()),
+            container_port: Set(3000),
+            host_port: Set(None),
+            status: Set(Some("exited".to_string())),
+            deployed_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let route_table = Arc::new(CachedPeerTable::new(db.clone()));
+        route_table.load_routes().await?;
+
+        // The console is a live server: if the request reached it, the test
+        // would see its 200 instead of the 503.
+        let console_addr = start_console_stand_in().await;
+        let upstream_resolver = Arc::new(UpstreamResolverImpl::new(
+            Arc::new(ProxyConfig {
+                console_address: console_addr,
+                ..ProxyConfig::default()
+            }),
+            Arc::new(crate::service::lb_service::LbService::new(db.clone())),
+            route_table.clone(),
+        )) as Arc<dyn UpstreamResolver>;
+        let project_context_resolver = Arc::new(ProjectContextResolverImpl::new(route_table))
+            as Arc<dyn ProjectContextResolver>;
+
+        let ip_service = create_mock_ip_service(db.clone());
+        let proxy_log_storage: Arc<dyn crate::storage::ProxyLogStorage> = Arc::new(
+            crate::storage::TimescaleDbProxyLogStore::new(db.clone(), ip_service.clone()),
+        );
+        let (proxy_log_handle, tracking_handle, _proxy_log_writer) =
+            crate::service::proxy_log_batch_writer::ProxyLogBatchWriter::new(
+                db.clone(),
+                ip_service,
+                proxy_log_storage,
+            );
+        let lb = LoadBalancer::new(
+            upstream_resolver,
+            proxy_log_handle,
+            tracking_handle,
+            project_context_resolver,
+            create_crypto_cookie_crypto(),
+            db.clone(),
+            create_test_config_service(db.clone()),
+            Arc::new(
+                crate::service::ip_access_control_service::IpAccessControlService::new(db.clone()),
+            ),
+            Arc::new(temps_core::OpenIpGate),
+            Arc::new(crate::service::challenge_service::ChallengeService::new(
+                db.clone(),
+            )),
+            Arc::new(crate::service::cert_host_cache::CertHostCache::new(
+                db.clone(),
+            )),
+            false,
+        );
+
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        client
+            .write_all(
+                format!(
+                    "GET / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Temps-Status-Monitor/1.0\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await?;
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        assert!(session.read_request().await?, "request must parse");
+
+        let mut ctx = lb.new_ctx();
+        lb.early_request_filter(&mut session, &mut ctx).await?;
+        assert!(
+            !lb.request_filter(&mut session, &mut ctx).await?,
+            "nothing in request_filter may answer for the stopped app (answered as {})",
+            ctx.routing_status
+        );
+        assert_eq!(
+            ctx.project.as_ref().map(|project| project.id),
+            Some(project.id),
+            "the failed request is attributed to the app's project"
+        );
+
+        let error = match lb.upstream_peer(&mut session, &mut ctx).await {
+            Ok(peer) => panic!("stopped app was proxied to {}", peer.address()),
+            Err(error) => error,
+        };
+        let outcome = lb.fail_to_proxy(&mut session, &error, &mut ctx).await;
+        assert_eq!(outcome.error_code, 503);
+        drop(session);
+
+        let mut raw = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_to_end(&mut raw),
+        )
+        .await??;
+        let response = String::from_utf8_lossy(&raw).to_string();
+        let (head, body) = response
+            .split_once("\r\n\r\n")
+            .unwrap_or_else(|| panic!("malformed response: {response:?}"));
+        assert!(
+            head.starts_with("HTTP/1.1 503"),
+            "a stopped app must answer 503: {head}"
+        );
+        assert!(
+            head.lines()
+                .any(|line| line.eq_ignore_ascii_case("cache-control: private, no-store")),
+            "the outage page must not be cached: {head}"
+        );
+        assert!(
+            body.contains("<title>Service Unavailable</title>"),
+            "{body}"
+        );
+        assert!(
+            !body.contains("<title>Temps</title>"),
+            "the console must never answer for an application host: {body}"
+        );
+
+        Ok(())
+    }
+}

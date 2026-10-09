@@ -709,16 +709,39 @@ impl ContainerHealthMonitor {
         // Persist runtime metadata (started_at, cpu_limit_cores) once they're
         // observed. These don't change while a container is running, so the
         // diff check in persist_runtime_info skips writes after the first hit.
-        match self.persist_runtime_info(container, info).await {
-            Ok(()) => self
-                .log_state
-                .report_op_success(container, ContainerOp::PersistRuntimeInfo),
+        let runtime_persisted = match self.persist_runtime_info(container, info).await {
+            Ok(()) => {
+                self.log_state
+                    .report_op_success(container, ContainerOp::PersistRuntimeInfo);
+                true
+            }
             Err(error) => {
                 self.log_state.report_op_failure(
                     container,
                     ContainerOp::PersistRuntimeInfo,
                     &error,
                 );
+                false
+            }
+        };
+
+        // A crashed (or `docker stop`ped) container that runs again must be
+        // made routable again, otherwise the route table keeps excluding it
+        // and its app stays down for good. Only once its current published
+        // port is recorded: restoring it after a failed runtime write would
+        // reload routes onto the stale port. The next poll retries both.
+        if runtime_persisted && Self::needs_running_status_restore(container, info) {
+            match self.restore_running_status(container).await {
+                Ok(_) => self
+                    .log_state
+                    .report_op_success(container, ContainerOp::RestoreRunningStatus),
+                Err(error) => {
+                    self.log_state.report_op_failure(
+                        container,
+                        ContainerOp::RestoreRunningStatus,
+                        &error,
+                    );
+                }
             }
         }
 
@@ -1011,32 +1034,22 @@ impl ContainerHealthMonitor {
                 // the earlier intentional stop and never alarm.
                 self.clear_user_stop_marker(container).await;
             }
-            temps_deployer::ContainerStatus::Running
-                if container
-                    .status
-                    .as_deref()
-                    .is_some_and(|status| UNINTENDED_EXIT_STATUSES.contains(&status)) =>
-            {
-                self.note_container_up(container);
-                // The container crashed (or was `docker stop`ped) and runs
-                // again. Make it routable again: otherwise the route table
-                // keeps excluding it and its app stays down for good.
-                match self.restore_running_status(container).await {
-                    Ok(_) => self
-                        .log_state
-                        .report_op_success(container, ContainerOp::RestoreRunningStatus),
-                    Err(error) => {
-                        self.log_state.report_op_failure(
-                            container,
-                            ContainerOp::RestoreRunningStatus,
-                            &error,
-                        );
-                    }
-                }
-            }
             temps_deployer::ContainerStatus::Running => self.note_container_up(container),
             _ => {}
         }
+    }
+
+    /// Whether Docker reports `container` running while its row still holds
+    /// a non-intentional exit status (`"exited"`/`"dead"`).
+    fn needs_running_status_restore(
+        container: &deployment_containers::Model,
+        info: &temps_deployer::ContainerInfo,
+    ) -> bool {
+        matches!(info.status, temps_deployer::ContainerStatus::Running)
+            && container
+                .status
+                .as_deref()
+                .is_some_and(|status| UNINTENDED_EXIT_STATUSES.contains(&status))
     }
 
     /// Replace an `"exited"`/`"dead"` status with `"running"` and reload the
@@ -2187,6 +2200,89 @@ mod tests {
         assert!(
             !sql.contains("pg_notify"),
             "nothing changed, so routes need no reload: {sql}"
+        );
+    }
+
+    /// Docker info for a running container now published on host port 32001.
+    async fn running_info_on_new_port() -> temps_deployer::ContainerInfo {
+        let deployer = MockDeployer::new(0, ContainerStatus::Running);
+        let mut info = deployer.get_container_info("abc123").await.unwrap();
+        info.ports = vec![temps_deployer::PortMapping {
+            host_port: 32001,
+            container_port: 3000,
+            protocol: temps_deployer::Protocol::Tcp,
+            host_ip: None,
+        }];
+        info
+    }
+
+    #[tokio::test]
+    async fn failed_runtime_write_does_not_restore_routing_onto_the_stale_port() {
+        let mut container = make_container_model(1);
+        container.status = Some("exited".to_string());
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors([DbErr::Custom("connection reset".to_string())])
+                .into_connection(),
+        );
+        let monitor = ContainerHealthMonitor::new(
+            db.clone(),
+            Arc::new(MockDeployer::new(0, ContainerStatus::Running)),
+            make_alarm_service(db.clone()),
+            ContainerHealthConfig::default(),
+        );
+        let info = running_info_on_new_port().await;
+
+        monitor
+            .process_container_info(&container, &make_deployment_model(), &info)
+            .await;
+
+        drop(monitor);
+        let sql = format!("{:?}", Arc::try_unwrap(db).unwrap().into_transaction_log());
+        assert!(sql.contains("32001"), "the port write was attempted: {sql}");
+        assert!(
+            !sql.contains("running") && !sql.contains("pg_notify"),
+            "routes must not be restored while the old port is still recorded: {sql}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovered_container_records_its_port_before_routing_is_restored() {
+        let mut container = make_container_model(1);
+        container.status = Some("exited".to_string());
+        let mut updated = container.clone();
+        updated.host_port = Some(32001);
+        let exec_ok = || sea_orm::MockExecResult {
+            last_insert_id: 0,
+            rows_affected: 1,
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[updated]])
+                .append_exec_results([exec_ok(), exec_ok(), exec_ok()])
+                .into_connection(),
+        );
+        let monitor = ContainerHealthMonitor::new(
+            db.clone(),
+            Arc::new(MockDeployer::new(0, ContainerStatus::Running)),
+            make_alarm_service(db.clone()),
+            ContainerHealthConfig::default(),
+        );
+        let info = running_info_on_new_port().await;
+
+        monitor
+            .process_container_info(&container, &make_deployment_model(), &info)
+            .await;
+
+        drop(monitor);
+        let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
+        assert_eq!(transactions.len(), 2, "{transactions:?}");
+        let port_write = format!("{:?}", transactions[0]);
+        let restore = format!("{:?}", transactions[1]);
+        assert!(port_write.contains("32001"), "{port_write}");
+        assert!(
+            restore.contains("running") && restore.contains("pg_notify"),
+            "the status is restored only after the new port is recorded: {restore}"
         );
     }
 
