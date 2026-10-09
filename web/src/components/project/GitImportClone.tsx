@@ -14,6 +14,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { Card, CardContent } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
+import { ReadFailure } from '@/components/ui/read-failure'
 import {
   Select,
   SelectTrigger,
@@ -57,6 +58,7 @@ import {
   templateBelongsToSource,
   templateSource,
 } from '@/lib/template-source-selection'
+import { newProjectLandingSource } from './newProjectLanding'
 
 const SOURCE_VALUES: ProjectSource[] = [
   'templates',
@@ -251,9 +253,14 @@ export function GitImportClone({
     [mode, updateSearchParams]
   )
 
-  const { data: connections } = useQuery({
+  const connectionsQuery = useQuery({
     ...listConnectionsOptions(),
   })
+  const connections = connectionsQuery.data
+  // A failed read is not "no connections": it must neither land on the
+  // template gallery as if nothing were connected nor spin forever.
+  const connectionsReadFailed =
+    connectionsQuery.isError && connections === undefined
 
   // Providers list lets us pick the right icon per connection (a GitLab
   // connection should not render the GitHub mark).
@@ -291,8 +298,8 @@ export function GitImportClone({
   // connection). The Repositories pill keeps the connect path reachable.
   useEffect(() => {
     if (selectedSource !== null) return
-    if (!connections) return
-    const landing = connections.connections.length > 0 ? 'browse' : 'templates'
+    const landing = newProjectLandingSource(connections)
+    if (!landing) return
     if (mode === 'navigation') {
       setSearchParams(
         (prev) => {
@@ -725,7 +732,18 @@ export function GitImportClone({
 
   const sourceContentEl = (
     <>
-      {!selectedSource && !connections && (
+      {connectionsQuery.isError &&
+        (selectedSource === null || selectedSource === 'browse') && (
+          <ReadFailure
+            resource="Git connections"
+            error={connectionsQuery.error}
+            cached={connections !== undefined}
+            onRetry={() => void connectionsQuery.refetch()}
+            retrying={connectionsQuery.isFetching}
+          />
+        )}
+
+      {!selectedSource && !connections && !connectionsReadFailed && (
         <div className="space-y-3">
           <Skeleton className="h-10 w-full" />
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">

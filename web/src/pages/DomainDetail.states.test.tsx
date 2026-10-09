@@ -73,7 +73,11 @@ for (const error of [
     const client = createClient()
     fail(client, domainKey, error)
     const html = render(client)
-    expect(html).toContain('Domain unavailable')
+    expect(html).toContain(
+      error instanceof TypeError || error.status === 500
+        ? 'Domain unavailable'
+        : 'Domain: access denied'
+    )
     expect(html).not.toContain('Domain not found')
     expect(html).toContain('Retry')
     expect(html).toContain('Back to Domains')
@@ -108,7 +112,7 @@ test('cached domain and order survive failed refreshes without offering a new or
   fail(client, orderKey, { title: 'Forbidden', status: 403 })
   const html = render(client)
   expect(html).toContain('app.example.test')
-  expect(html).toContain('Certificate order unavailable')
+  expect(html).toContain('Certificate order: access denied')
   expect(html).toContain('Showing last-known data')
   expect(html).toContain('ACME order')
   expect(html).not.toContain('Create new order')

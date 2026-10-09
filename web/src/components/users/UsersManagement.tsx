@@ -43,6 +43,7 @@ import {
 import { EmptyState } from '@/components/ui/empty-state'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { Label } from '@/components/ui/label'
+import { ReadFailure } from '@/components/ui/read-failure'
 import { useAuth } from '@/contexts/AuthContext'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
@@ -77,6 +78,10 @@ const availableRoles = [
 interface UsersManagementProps {
   users?: RouteUserWithRoles[]
   isLoading: boolean
+  /** The user list read's error. A failed read is never an empty list. */
+  error?: unknown
+  /** Whether the user list is being re-read (drives the Retry button). */
+  retrying?: boolean
   reloadUsers: () => void
   onEditUser: (user: { id: number; name: string; email: string }) => void
 }
@@ -84,6 +89,8 @@ interface UsersManagementProps {
 export function UsersManagement({
   users,
   isLoading,
+  error,
+  retrying = false,
   reloadUsers,
   onEditUser,
 }: UsersManagementProps) {
@@ -97,6 +104,9 @@ export function UsersManagement({
   const navigate = useNavigate()
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
+  // Checked before the empty branch: a refused or failed read must not tell
+  // the operator there are no users and invite them to create one.
+  const readFailed = error != null
 
   const deleteUser = useMutation({
     ...deleteUserMutation(),
@@ -364,6 +374,16 @@ export function UsersManagement({
         </DialogContent>
       </Dialog>
 
+      {readFailed && !!users?.length && (
+        <ReadFailure
+          resource="Users"
+          error={error}
+          cached
+          onRetry={reloadUsers}
+          retrying={retrying}
+        />
+      )}
+
       {isLoading ? (
         <Card>
           <div className="p-4 space-y-4">
@@ -384,6 +404,13 @@ export function UsersManagement({
             ))}
           </div>
         </Card>
+      ) : readFailed && !users?.length ? (
+        <ReadFailure
+          resource="Users"
+          error={error}
+          onRetry={reloadUsers}
+          retrying={retrying}
+        />
       ) : !users?.length ? (
         <EmptyState
           icon={UserPlus}

@@ -10,12 +10,15 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { CreateActionButton } from '@/components/ui/create-action-button'
 import { toast } from 'sonner'
 import {
-  listApiKeys,
   deleteApiKey,
   activateApiKey,
   deactivateApiKey,
   type ApiKeyResponse,
 } from '@/api/client'
+import {
+  listApiKeysOptions,
+  listApiKeysQueryKey,
+} from '@/api/client/@tanstack/react-query.gen'
 import { ApiKeyTable, ApiKeyDeleteModal } from '@/components/api-keys'
 import { usePageTitle } from '@/hooks/usePageTitle'
 
@@ -26,16 +29,13 @@ export default function ApiKeys() {
   const [selectedKey, setSelectedKey] = useState<ApiKeyResponse | null>(null)
   const queryClient = useQueryClient()
 
-  // Fetch API keys
-  const { data: apiKeysData, isLoading } = useQuery({
-    queryKey: ['apiKeys'],
-    queryFn: async () => {
-      const response = await listApiKeys({
-        query: { page: 1, page_size: 100 },
-      })
-      return response.data
-    },
+  // The generated options throw the server's Problem Details on a non-2xx
+  // response, so a refused or failed read reaches react-query as an error
+  // instead of resolving to `undefined` and looking like an empty list.
+  const apiKeysQuery = useQuery({
+    ...listApiKeysOptions({ query: { page: 1, page_size: 100 } }),
   })
+  const { data: apiKeysData, isLoading } = apiKeysQuery
 
   const apiKeys = apiKeysData?.api_keys
 
@@ -46,7 +46,7 @@ export default function ApiKeys() {
       errorTitle: 'Failed to delete API key',
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['apiKeys'] })
+      queryClient.invalidateQueries({ queryKey: listApiKeysQueryKey() })
       setDeleteModalOpen(false)
       setSelectedKey(null)
       toast.success('API key deleted successfully')
@@ -60,7 +60,7 @@ export default function ApiKeys() {
       errorTitle: 'Failed to activate API key',
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['apiKeys'] })
+      queryClient.invalidateQueries({ queryKey: listApiKeysQueryKey() })
       toast.success('API key activated')
     },
   })
@@ -72,7 +72,7 @@ export default function ApiKeys() {
       errorTitle: 'Failed to deactivate API key',
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['apiKeys'] })
+      queryClient.invalidateQueries({ queryKey: listApiKeysQueryKey() })
       toast.success('API key deactivated')
     },
   })
@@ -167,6 +167,9 @@ export default function ApiKeys() {
           <ApiKeyTable
             apiKeys={apiKeys}
             isLoading={isLoading}
+            error={apiKeysQuery.isError ? apiKeysQuery.error : undefined}
+            onRetry={() => apiKeysQuery.refetch()}
+            retrying={apiKeysQuery.isFetching}
             onView={handleView}
             onEdit={handleEdit}
             onDelete={handleDelete}

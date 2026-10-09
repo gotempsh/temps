@@ -153,6 +153,12 @@ import {
   updateAiSummaryPreferenceMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { useSettings } from '@/hooks/useSettings'
+import { ReadFailure } from '@/components/ui/read-failure'
+import {
+  aiProviderRowStatus,
+  providerKeysUnknown,
+  shouldPromptForFirstProviderKey,
+} from './aiGatewayProviderStatus'
 import { useProjects } from '@/contexts/ProjectsContext'
 import {
   AI_PROVIDERS,
@@ -3901,16 +3907,21 @@ export function AiGatewayPage() {
   const externalUrl = settings?.external_url || window.location.origin
   const gatewayEndpoint = `${externalUrl}/api/ai/v1`
 
-  // Fetch provider keys
-  const { data: keysData, isLoading } = useQuery({
+  // Fetch provider keys. `throwOnError` is what lets react-query see a
+  // failed read at all: without it the SDK resolves `{ error }`, the query
+  // "succeeds" with `undefined`, and every provider looks unconfigured.
+  const keysQuery = useQuery({
     queryKey: ['providerKeys'],
     queryFn: async () => {
-      const response = await listProviderKeys()
+      const response = await listProviderKeys({ throwOnError: true })
       return response.data
     },
   })
+  const { data: keysData, isLoading } = keysQuery
 
   const keys = keysData ?? []
+  const keysRead = { keys: keysData, isError: keysQuery.isError }
+  const keysUnknown = providerKeysUnknown(keysRead)
 
   const { data: providerPreference } = useQuery(getAiProviderStatusOptions())
   const summaryStatus = providerPreference as
@@ -4165,7 +4176,10 @@ console.log(response.choices[0].message.content);`,
                 <Button size="sm" asChild>
                   <Link to="/ai-gateway/setup">View code examples</Link>
                 </Button>
-                {!firstConfiguredProvider && (
+                {shouldPromptForFirstProviderKey(
+                  keysRead,
+                  SUPPORTED_PROVIDERS.map((p) => p.id)
+                ) && (
                   <Button
                     size="sm"
                     variant="outline"
@@ -4248,7 +4262,7 @@ console.log(response.choices[0].message.content);`,
             onClick={() => {
               refreshAllGatewayModelsMutation.mutate()
             }}
-            disabled={refreshAllGatewayModelsMutation.isPending}
+            disabled={refreshAllGatewayModelsMutation.isPending || keysUnknown}
           >
             <RefreshCw
               className={`mr-2 h-4 w-4 ${
@@ -4258,6 +4272,15 @@ console.log(response.choices[0].message.content);`,
             Refresh auth &amp; models
           </Button>
         </div>
+        {keysQuery.isError && (
+          <ReadFailure
+            resource="AI provider keys"
+            error={keysQuery.error}
+            cached={keysData !== undefined}
+            onRetry={() => void keysQuery.refetch()}
+            retrying={keysQuery.isFetching}
+          />
+        )}
         {isLoading ? (
           <div className="space-y-2">
             {[1, 2, 3, 4].map((i) => (
@@ -4285,9 +4308,8 @@ console.log(response.choices[0].message.content);`,
                   const providerKeys = keys.filter(
                     (k) => k.provider === provider.id
                   )
-                  const activeKey = providerKeys.find((k) => k.is_active)
                   const hasAnyKey = providerKeys.length > 0
-                  const configured = !!activeKey
+                  const status = aiProviderRowStatus(provider.id, keysRead)
                   const expanded = expandedProvider === provider.id && hasAnyKey
 
                   return (
@@ -4342,11 +4364,19 @@ console.log(response.choices[0].message.content);`,
                           </span>
                         </TableCell>
                         <TableCell className="hidden sm:table-cell py-2">
-                          {configured ? (
+                          {status === 'unknown' ? (
+                            <Badge
+                              variant="outline"
+                              className="justify-center whitespace-nowrap text-muted-foreground"
+                              title="Provider keys could not be loaded"
+                            >
+                              Unknown
+                            </Badge>
+                          ) : status === 'active' ? (
                             <Badge className="justify-center whitespace-nowrap bg-green-500/15 text-green-600 dark:text-green-400 hover:bg-green-500/25">
                               Active
                             </Badge>
-                          ) : hasAnyKey ? (
+                          ) : status === 'disabled' ? (
                             <Badge
                               variant="secondary"
                               className="justify-center whitespace-nowrap"
@@ -4367,7 +4397,11 @@ console.log(response.choices[0].message.content);`,
                           onClick={(e) => e.stopPropagation()}
                         >
                           <Button
-                            variant={hasAnyKey ? 'outline' : 'default'}
+                            variant={
+                              status === 'not-configured'
+                                ? 'default'
+                                : 'outline'
+                            }
                             size="sm"
                             onClick={() => {
                               setNewProvider(provider.id)
@@ -4380,7 +4414,9 @@ console.log(response.choices[0].message.content);`,
                             }}
                           >
                             <Plus className="mr-1.5 h-3.5 w-3.5" />
-                            {hasAnyKey ? 'Add key' : 'Configure'}
+                            {status === 'not-configured'
+                              ? 'Configure'
+                              : 'Add key'}
                           </Button>
                         </TableCell>
                       </TableRow>

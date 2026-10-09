@@ -8,10 +8,10 @@ import { PageHeader } from '@/components/layout/PageContainer'
 
 import {
   deleteS3SourceMutation,
+  listS3SourcesOptions,
   runBackupForSourceMutation,
   updateS3SourceMutation,
 } from '@/api/client/@tanstack/react-query.gen'
-import { listS3Sources } from '@/api/client/sdk.gen'
 import { S3SourceResponse } from '@/api/client/types.gen'
 import {
   AlertDialog,
@@ -36,6 +36,7 @@ import {
 import { EmptyState } from '@/components/ui/empty-state'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { ReadFailure } from '@/components/ui/read-failure'
 import { setDefaultS3Source, testS3SourceConnection } from '@/lib/s3-sources'
 import { cn } from '@/lib/utils'
 import { shouldShowS3SourceHeaderAction } from '@/lib/s3-source-presentation'
@@ -220,17 +221,22 @@ export function S3SourcesManagement() {
     null
   )
 
+  // The generated options throw the server's Problem Details on a non-2xx
+  // response. The bare SDK call resolved with `{ error }`, so a refused or
+  // failed read used to look like a successful read of zero sources.
   const {
     data: sources = [],
     refetch,
     isLoading,
+    isError,
+    error,
+    isFetching,
   } = useQuery({
-    queryKey: ['s3Sources'],
-    queryFn: async () => {
-      const { data } = await listS3Sources()
-      return data
-    },
+    ...listS3SourcesOptions(),
   })
+  // Checked before the empty branch: an unreadable list must not claim no
+  // sources are configured and invite the operator to add one.
+  const readFailed = isError
 
   const setDefaultMutation = useMutation({
     mutationFn: (id: number) => setDefaultS3Source(id),
@@ -414,6 +420,16 @@ export function S3SourcesManagement() {
         </DialogContent>
       </Dialog>
 
+      {readFailed && sources.length > 0 && (
+        <ReadFailure
+          resource="S3 sources"
+          error={error}
+          cached
+          onRetry={() => refetch()}
+          retrying={isFetching}
+        />
+      )}
+
       {isLoading ? (
         <div className="divide-y rounded-lg border">
           {Array.from({ length: 3 }).map((_, i) => (
@@ -429,6 +445,13 @@ export function S3SourcesManagement() {
             </div>
           ))}
         </div>
+      ) : readFailed && sources.length === 0 ? (
+        <ReadFailure
+          resource="S3 sources"
+          error={error}
+          onRetry={() => refetch()}
+          retrying={isFetching}
+        />
       ) : sources.length === 0 ? (
         <EmptyState
           icon={Database}

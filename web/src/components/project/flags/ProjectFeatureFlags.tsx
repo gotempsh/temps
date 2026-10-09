@@ -18,6 +18,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { EmptyPlaceholder } from '@/components/ui/empty-placeholder'
+import { ReadFailure } from '@/components/ui/read-failure'
 import {
   Select,
   SelectContent,
@@ -112,6 +113,10 @@ export function ProjectFeatureFlags({ project }: ProjectFeatureFlagsProps) {
   })
 
   const isLoading = flagsQuery.isPending || environmentsQuery.isPending
+  // A failed read says nothing about how many flags exist. Only a successful
+  // read with zero rows may show the "No feature flags yet" onboarding.
+  const flagsReadFailed = flagsQuery.isError && flagsQuery.data === undefined
+  const flagsStale = flagsQuery.isError && flagsQuery.data !== undefined
 
   return (
     <div className="space-y-6">
@@ -193,7 +198,34 @@ export function ProjectFeatureFlags({ project }: ProjectFeatureFlagsProps) {
             </Button>
           </div>
 
-          {isLoading ? (
+          {environmentsQuery.isError && (
+            <ReadFailure
+              resource="Environments"
+              error={environmentsQuery.error}
+              cached={environmentsQuery.data !== undefined}
+              onRetry={() => void environmentsQuery.refetch()}
+              retrying={environmentsQuery.isFetching}
+            />
+          )}
+
+          {flagsStale && (
+            <ReadFailure
+              resource="Feature flags"
+              error={flagsQuery.error}
+              cached
+              onRetry={refetchFlags}
+              retrying={flagsQuery.isFetching}
+            />
+          )}
+
+          {flagsReadFailed ? (
+            <ReadFailure
+              resource="Feature flags"
+              error={flagsQuery.error}
+              onRetry={refetchFlags}
+              retrying={flagsQuery.isFetching}
+            />
+          ) : isLoading ? (
             <FlagTableSkeleton />
           ) : flags.length === 0 ? (
             <EmptyPlaceholder

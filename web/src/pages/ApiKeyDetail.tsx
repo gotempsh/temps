@@ -31,6 +31,7 @@ import {
   activateApiKey,
   deactivateApiKey,
 } from '@/api/client'
+import { listApiKeysQueryKey } from '@/api/client/@tanstack/react-query.gen'
 import { useApiKeyPermissions } from '@/components/api-keys/useApiKeyPermissions'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
@@ -223,7 +224,7 @@ export default function ApiKeyDetail() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['apiKey', id] })
-      queryClient.invalidateQueries({ queryKey: ['apiKeys'] })
+      queryClient.invalidateQueries({ queryKey: listApiKeysQueryKey() })
       toast.success('API key activated')
     },
   })
@@ -235,7 +236,7 @@ export default function ApiKeyDetail() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['apiKey', id] })
-      queryClient.invalidateQueries({ queryKey: ['apiKeys'] })
+      queryClient.invalidateQueries({ queryKey: listApiKeysQueryKey() })
       toast.success('API key deactivated')
     },
   })

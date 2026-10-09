@@ -10,6 +10,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
 import { Badge } from '@/components/ui/badge'
+import { Skeleton } from '@/components/ui/skeleton'
 import { FeatureMaturityBadge } from '@/components/feature-maturity/FeatureMaturityBadge'
 import { ProviderLogo } from '@/components/git/ProviderLogo'
 import {
@@ -18,6 +19,7 @@ import {
   Container,
   FolderGit2,
   CheckCircle2,
+  CircleHelp,
   UploadCloud,
   Boxes,
   Activity,
@@ -51,7 +53,8 @@ export function NewProjectShell({
   onSelectSource: (source: ProjectSource) => void
   children: ReactNode
 }) {
-  const { data: connections } = useQuery({ ...listConnectionsOptions() })
+  const connectionsQuery = useQuery({ ...listConnectionsOptions() })
+  const connections = connectionsQuery.data
   const { data: gitProviders } = useQuery({ ...listGitProvidersOptions() })
 
   const providerTypeForConnectionId = (
@@ -125,7 +128,16 @@ export function NewProjectShell({
         </div>
         {activeSource !== 'monitor' && (
           <div className="flex flex-wrap items-center gap-2">
-            {connectionCount > 0 ? (
+            {connections === undefined && connectionsQuery.isError ? (
+              // The read failed, so nothing is known about connections. The
+              // import area below carries the reason and a Retry.
+              <span className="inline-flex items-center gap-1.5 text-sm text-muted-foreground">
+                <CircleHelp className="h-4 w-4 shrink-0" aria-hidden="true" />
+                Git connections unavailable
+              </span>
+            ) : connections === undefined ? (
+              <Skeleton className="h-7 w-40 rounded-full" />
+            ) : connectionCount > 0 ? (
               connections!.connections.slice(0, 3).map((conn) => (
                 <span
                   key={conn.id}

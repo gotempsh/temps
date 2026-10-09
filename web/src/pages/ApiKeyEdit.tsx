@@ -31,6 +31,7 @@ import {
 import { toast } from 'sonner'
 import { format } from 'date-fns'
 import { getApiKey, updateApiKey, type UpdateApiKeyRequest } from '@/api/client'
+import { listApiKeysQueryKey } from '@/api/client/@tanstack/react-query.gen'
 import { usePageTitle } from '@/hooks/usePageTitle'
 
 export default function ApiKeyEdit() {
@@ -89,7 +90,7 @@ export default function ApiKeyEdit() {
       errorTitle: 'Failed to update API key',
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['apiKeys'] })
+      queryClient.invalidateQueries({ queryKey: listApiKeysQueryKey() })
       queryClient.invalidateQueries({ queryKey: ['apiKey', id] })
       toast.success('API key updated successfully')
       navigate('/settings/keys')

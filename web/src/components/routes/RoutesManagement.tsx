@@ -45,6 +45,7 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import { ReadFailure } from '@/components/ui/read-failure'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation } from '@tanstack/react-query'
 import {
@@ -65,6 +66,10 @@ import { z } from 'zod'
 interface RoutesManagementProps {
   routes?: ListRoutesResponse
   isLoading: boolean
+  /** The route list read's error. A failed read is never an empty list. */
+  error?: unknown
+  /** Whether the route list is being re-read (drives the Retry button). */
+  retrying?: boolean
   reloadRoutes: () => void
 }
 
@@ -82,8 +87,13 @@ type EditRouteFormData = z.infer<typeof editRouteSchema>
 export function RoutesManagement({
   routes,
   isLoading,
+  error,
+  retrying = false,
   reloadRoutes,
 }: RoutesManagementProps) {
+  // Checked before the empty branch: a refused or failed read must not claim
+  // no routes are configured and invite the operator to add one.
+  const readFailed = error != null
   const [routeToDelete, setRouteToDelete] = useState<string | null>(null)
   const [editRoute, setEditRoute] = useState<RouteResponse | null>(null)
 
@@ -182,6 +192,16 @@ export function RoutesManagement({
         />
       </div>
 
+      {readFailed && !!routes?.length && (
+        <ReadFailure
+          resource="Routes"
+          error={error}
+          cached
+          onRetry={reloadRoutes}
+          retrying={retrying}
+        />
+      )}
+
       {isLoading ? (
         <Card>
           <div className="p-4 space-y-4">
@@ -199,6 +219,13 @@ export function RoutesManagement({
             ))}
           </div>
         </Card>
+      ) : readFailed && !routes?.length ? (
+        <ReadFailure
+          resource="Routes"
+          error={error}
+          onRetry={reloadRoutes}
+          retrying={retrying}
+        />
       ) : !routes?.length ? (
         <EmptyState
           icon={Router}
