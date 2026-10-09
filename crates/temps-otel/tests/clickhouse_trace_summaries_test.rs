@@ -1981,3 +1981,129 @@ mod global_page_first {
         );
     }
 }
+
+// ── Storage reads carry the read bounds; writes do not ──────────────────────
+
+/// `ClickHouseOtelStorage` used to build its client with no settings, so every
+/// read ran under whatever the server profile allowed. Reads now go through a
+/// client with a memory cap, spill thresholds and a time budget; inserts keep
+/// the plain client. `system.query_log` records the settings each statement
+/// actually carried, which is the only honest way to check that.
+#[tokio::test]
+async fn storage_reads_carry_the_read_bounds_and_writes_do_not() {
+    use temps_otel::storage::clickhouse::read_limits::{
+        bounded_read_client, READ_MAX_EXECUTION_TIME, READ_MAX_MEMORY_BYTES, READ_SPILL_BYTES,
+    };
+    let Some(h) = harness().await else { return };
+
+    // The helper itself: the server reports the values it was given.
+    #[derive(::clickhouse::Row, serde::Deserialize)]
+    struct Applied {
+        memory: String,
+        group_by: String,
+        sort: String,
+        seconds: String,
+    }
+    let applied = bounded_read_client(&h.probe)
+        .query(
+            "SELECT toString(getSetting('max_memory_usage')) AS memory, \
+                    toString(getSetting('max_bytes_before_external_group_by')) AS group_by, \
+                    toString(getSetting('max_bytes_before_external_sort')) AS sort, \
+                    toString(getSetting('max_execution_time')) AS seconds",
+        )
+        .fetch_one::<Applied>()
+        .await
+        .expect("read settings");
+    assert_eq!(applied.memory, READ_MAX_MEMORY_BYTES.to_string());
+    assert_eq!(applied.group_by, READ_SPILL_BYTES.to_string());
+    assert_eq!(applied.sort, READ_SPILL_BYTES.to_string());
+    assert_eq!(
+        applied.seconds,
+        READ_MAX_EXECUTION_TIME.as_secs().to_string()
+    );
+
+    // The storage: every read path the old client left unbounded.
+    h.storage.store_spans(fixture()).await.expect("write");
+    h.storage
+        .query_trace_summaries(last_hour(PROJECT))
+        .await
+        .expect("summaries");
+    h.storage
+        .count_traces(last_hour(PROJECT))
+        .await
+        .expect("count");
+    h.storage.has_traces(PROJECT).await.expect("has_traces");
+    h.storage
+        .get_trace(PROJECT, "aaaa1111")
+        .await
+        .expect("get_trace");
+    h.storage
+        .list_metric_names(PROJECT)
+        .await
+        .expect("metric names");
+
+    h.probe
+        .query("SYSTEM FLUSH LOGS")
+        .execute()
+        .await
+        .expect("flush");
+    #[derive(::clickhouse::Row, serde::Deserialize)]
+    struct Cnt {
+        cnt: u64,
+    }
+    let carried = |needle: &str, setting: &str, expect: &str| {
+        let probe = h.probe.clone();
+        let (needle, setting, expect) =
+            (needle.to_string(), setting.to_string(), expect.to_string());
+        async move {
+            probe
+                .query(&format!(
+                    "SELECT count() AS cnt FROM system.query_log \
+                     WHERE type = 'QueryFinish' AND current_database = ? \
+                       AND positionCaseInsensitive(query, ?) > 0 \
+                       AND query NOT LIKE '%system.query_log%' \
+                       AND Settings['{setting}'] {expect}"
+                ))
+                .bind(DB)
+                .bind(needle)
+                .fetch_one::<Cnt>()
+                .await
+                .expect("query_log")
+                .cnt
+        }
+    };
+    let bound = format!("= '{READ_MAX_MEMORY_BYTES}'");
+    for read in [
+        "GROUP BY trace_id",
+        "uniqExact(trace_id)",
+        "SELECT 1 AS one FROM spans",
+        "ORDER BY start_time ASC",
+        "SELECT DISTINCT metric_name",
+    ] {
+        assert!(
+            carried(read, "max_memory_usage", &bound).await >= 1,
+            "a read containing `{read}` ran without the memory cap"
+        );
+        assert!(
+            carried(read, "max_execution_time", "!= ''").await >= 1,
+            "a read containing `{read}` ran without the time budget"
+        );
+    }
+
+    // Writes keep the plain client: a batch insert is not a bounded read.
+    let inserts = carried("INSERT INTO `spans`", "max_memory_usage", "IS NOT NULL").await;
+    assert!(
+        inserts >= 1,
+        "the fixture write must be visible in query_log"
+    );
+    assert_eq!(
+        carried("INSERT INTO `spans`", "max_memory_usage", &bound).await,
+        0,
+        "inserts must not inherit the read memory cap"
+    );
+    assert_eq!(
+        carried("INSERT INTO `spans`", "max_execution_time", "!= ''").await,
+        0,
+        "inserts must not inherit the read time budget"
+    );
+}

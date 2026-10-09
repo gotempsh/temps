@@ -89,6 +89,7 @@ use super::{
     can_use_lifetime_summaries, ch_query, invalid, Bind, Facets, GlobalTraceQuery, GlobalTraceRow,
     GlobalTraceStream, MAX_LIFETIME_CANDIDATES,
 };
+use crate::storage::clickhouse::read_limits::{classify, Failure};
 use crate::{
     error::{OtelError, StorageErrorKind},
     storage::StorageResult,
@@ -513,28 +514,6 @@ pub(super) fn plan(q: &GlobalTraceQuery, lifetime: bool, facets: &Facets) -> Sto
             in_order: page_in_order,
         },
     })
-}
-
-/// A ClickHouse failure, reduced to the limits this path sets itself.
-#[derive(Debug, PartialEq)]
-enum Failure {
-    MemoryLimit,
-    Timeout,
-    Other,
-}
-
-fn classify(error: &::clickhouse::error::Error) -> Failure {
-    if matches!(error, ::clickhouse::error::Error::TimedOut) {
-        return Failure::Timeout;
-    }
-    let text = error.to_string();
-    if text.contains("MEMORY_LIMIT_EXCEEDED") || text.contains("Code: 241") {
-        Failure::MemoryLimit
-    } else if text.contains("TIMEOUT_EXCEEDED") || text.contains("Code: 159") {
-        Failure::Timeout
-    } else {
-        Failure::Other
-    }
 }
 
 fn describe(q: &GlobalTraceQuery) -> String {
