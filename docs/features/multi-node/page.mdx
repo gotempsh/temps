@@ -447,7 +447,7 @@ curl -X PUT https://temps.example.com/api/projects/{project_id}/environments/{en
 
 Pinning other nodes alongside it (`[7, 3]`) spreads that environment over both. Node `0` is the control plane.
 
-When an unpinned deployment has nowhere else to go — every worker is dedicated and the control plane cannot take it (it runs with `--profile control-plane`, cannot run the image, or a label selector excludes it) — the deployment fails before anything is built or transferred, naming the nodes it passed over:
+When an unpinned deployment has nowhere else to go — every worker is dedicated and the control plane cannot take it — the deployment fails, naming the nodes it passed over. If that is clear from the configuration alone (the control plane runs with `--profile control-plane`, or a label selector excludes it), it fails as it starts: no job runs, and the source is never downloaded or built. If it depends on the image (the control plane cannot run the architecture that was built), it can only be known once the build has finished, so it fails at the deploy step, before anything is transferred to a node. Either way the error reads:
 
 ```
 No eligible node for this deployment: node 7 (gpu-1) is dedicated (temps.sh/role=dedicated) and only runs environments that pin it in target_nodes. ...

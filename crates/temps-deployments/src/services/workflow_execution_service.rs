@@ -301,6 +301,37 @@ fn offload_build_candidate(
     })
 }
 
+/// A deployment's placement constraints: the environment's `target_nodes`
+/// and `target_labels`, each inheriting the project's when the environment
+/// does not set it. One resolver for the build, the pre-build placement check
+/// and the deploy, so all three reason about the same pool of nodes.
+fn resolve_placement_constraints(
+    environment_config: Option<&temps_entities::deployment_config::DeploymentConfig>,
+    project_config: Option<&temps_entities::deployment_config::DeploymentConfig>,
+) -> (Option<Vec<i32>>, Option<serde_json::Value>) {
+    let configs = [environment_config, project_config];
+    let target_nodes = configs
+        .iter()
+        .flatten()
+        .find_map(|config| config.configured_target_nodes().map(<[i32]>::to_vec));
+    let target_labels = configs
+        .iter()
+        .flatten()
+        .find_map(|config| config.configured_target_labels().cloned());
+    (target_nodes, target_labels)
+}
+
+/// Whether any of a deployment's jobs places replicas on nodes. Static sites
+/// and compose stacks are served or run without the node scheduler.
+fn places_replicas(db_jobs: &[deployment_jobs::Model]) -> bool {
+    db_jobs.iter().any(|job| {
+        matches!(
+            job.job_type.as_str(),
+            "DeployImageJob" | "DeployContainerJob"
+        )
+    })
+}
+
 /// Service for executing deployment workflows
 pub struct WorkflowExecutionService {
     db: Arc<DbConnection>,
@@ -777,6 +808,9 @@ impl WorkflowExecutionService {
         deployment: &deployments::Model,
         db_jobs: &[deployment_jobs::Model],
     ) -> Result<WorkflowBuilder, WorkflowExecutionError> {
+        self.preflight_dedicated_placement(project, environment, deployment, db_jobs)
+            .await?;
+
         for db_job in db_jobs {
             // Create log path for this job
             self.log_service
@@ -824,6 +858,76 @@ impl WorkflowExecutionService {
         }
 
         Ok(workflow_builder)
+    }
+
+    /// Fail a deployment whose replicas could only land on dedicated nodes it
+    /// does not pin, before its source is downloaded or built.
+    ///
+    /// Replicas are placed by `DeployImageJob`, after the build, because the
+    /// image's platforms narrow the pool. This runs that same placement now,
+    /// with no platform constraint: platforms only ever remove nodes, so a
+    /// pool that holds nothing but unpinned dedicated nodes now holds nothing
+    /// later either, and the build would be wasted. Only that answer fails
+    /// the deployment here. Every other placement outcome is still decided by
+    /// `DeployImageJob` with the image in hand, as before.
+    async fn preflight_dedicated_placement(
+        &self,
+        project: &projects::Model,
+        environment: &environments::Model,
+        deployment: &deployments::Model,
+        db_jobs: &[deployment_jobs::Model],
+    ) -> Result<(), WorkflowExecutionError> {
+        if !places_replicas(db_jobs) {
+            return Ok(());
+        }
+        let Some(scheduler) = self.node_scheduler.get() else {
+            return Ok(());
+        };
+        let (target_nodes, target_labels) = resolve_placement_constraints(
+            environment.deployment_config.as_ref(),
+            project.deployment_config.as_ref(),
+        );
+        let outcome = scheduler
+            .schedule_placement(crate::services::node_scheduler::ReplicaPlacementRequest {
+                replica_count: 1,
+                labels: target_labels.as_ref(),
+                target_node_ids: target_nodes.as_deref(),
+                anti_affinity: false,
+                exclude_node_ids: &[],
+                image_platforms: &[],
+                project_slug: Some(&project.slug),
+                exclude_control_plane: false,
+            })
+            .await;
+        match outcome {
+            Err(
+                source @ crate::services::node_service::NodeError::DedicatedNodesNotPinned {
+                    ..
+                },
+            ) => {
+                warn!(
+                    deployment_id = deployment.id,
+                    project_slug = %project.slug,
+                    environment_id = environment.id,
+                    "Failing deployment before the build: {}",
+                    source
+                );
+                Err(WorkflowExecutionError::DedicatedNodesNotPinned {
+                    deployment_id: deployment.id,
+                    source,
+                })
+            }
+            Err(error) => {
+                debug!(
+                    deployment_id = deployment.id,
+                    "Pre-build placement check inconclusive ({}); placement is decided after \
+                     the build",
+                    error
+                );
+                Ok(())
+            }
+            Ok(_) => Ok(()),
+        }
     }
 
     /// Close out the planned-but-never-started `deployment_jobs` rows when the
@@ -1125,26 +1229,10 @@ impl WorkflowExecutionService {
                     cross_builds_enabled && local_workloads_enabled,
                     self.node_scheduler.get(),
                 ) {
-                    let target_nodes = environment
-                        .deployment_config
-                        .as_ref()
-                        .and_then(|c| c.configured_target_nodes().map(<[i32]>::to_vec))
-                        .or_else(|| {
-                            project
-                                .deployment_config
-                                .as_ref()
-                                .and_then(|c| c.configured_target_nodes().map(<[i32]>::to_vec))
-                        });
-                    let target_labels = environment
-                        .deployment_config
-                        .as_ref()
-                        .and_then(|c| c.configured_target_labels().cloned())
-                        .or_else(|| {
-                            project
-                                .deployment_config
-                                .as_ref()
-                                .and_then(|c| c.configured_target_labels().cloned())
-                        });
+                    let (target_nodes, target_labels) = resolve_placement_constraints(
+                        environment.deployment_config.as_ref(),
+                        project.deployment_config.as_ref(),
+                    );
 
                     match scheduler
                         .required_build_platforms_for_project(
@@ -1196,25 +1284,10 @@ impl WorkflowExecutionService {
                     // plane. A worker build is a preference: when no worker
                     // can produce the same image the control plane would, the
                     // build stays here and the build log says why.
-                    let target_nodes = environment
-                        .deployment_config
-                        .as_ref()
-                        .and_then(|config| config.configured_target_nodes().map(|ids| ids.to_vec()))
-                        .or_else(|| {
-                            project.deployment_config.as_ref().and_then(|config| {
-                                config.configured_target_nodes().map(|ids| ids.to_vec())
-                            })
-                        });
-                    let target_labels = environment
-                        .deployment_config
-                        .as_ref()
-                        .and_then(|config| config.configured_target_labels().cloned())
-                        .or_else(|| {
-                            project
-                                .deployment_config
-                                .as_ref()
-                                .and_then(|config| config.configured_target_labels().cloned())
-                        });
+                    let (target_nodes, target_labels) = resolve_placement_constraints(
+                        environment.deployment_config.as_ref(),
+                        project.deployment_config.as_ref(),
+                    );
                     match self
                         .select_offload_builder(
                             deployment.id,
@@ -1265,25 +1338,10 @@ impl WorkflowExecutionService {
                         .is_some();
                     // No local daemon: build on a node. The image is then
                     // handed to each replica's node by DeployImageJob.
-                    let target_nodes = environment
-                        .deployment_config
-                        .as_ref()
-                        .and_then(|config| config.configured_target_nodes().map(|ids| ids.to_vec()))
-                        .or_else(|| {
-                            project.deployment_config.as_ref().and_then(|config| {
-                                config.configured_target_nodes().map(|ids| ids.to_vec())
-                            })
-                        });
-                    let target_labels = environment
-                        .deployment_config
-                        .as_ref()
-                        .and_then(|config| config.configured_target_labels().cloned())
-                        .or_else(|| {
-                            project
-                                .deployment_config
-                                .as_ref()
-                                .and_then(|config| config.configured_target_labels().cloned())
-                        });
+                    let (target_nodes, target_labels) = resolve_placement_constraints(
+                        environment.deployment_config.as_ref(),
+                        project.deployment_config.as_ref(),
+                    );
                     let selected = self
                         .select_node_builder(
                             deployment.id,
@@ -1421,29 +1479,11 @@ impl WorkflowExecutionService {
                     None
                 };
 
-                // Resolve target_nodes from environment or project config
-                let target_nodes = environment
-                    .deployment_config
-                    .as_ref()
-                    .and_then(|c| c.configured_target_nodes().map(<[i32]>::to_vec))
-                    .or_else(|| {
-                        project
-                            .deployment_config
-                            .as_ref()
-                            .and_then(|c| c.configured_target_nodes().map(<[i32]>::to_vec))
-                    });
-
-                // Resolve target_labels from environment or project config
-                let target_labels = environment
-                    .deployment_config
-                    .as_ref()
-                    .and_then(|c| c.configured_target_labels().cloned())
-                    .or_else(|| {
-                        project
-                            .deployment_config
-                            .as_ref()
-                            .and_then(|c| c.configured_target_labels().cloned())
-                    });
+                // Same constraints the pre-build placement check used
+                let (target_nodes, target_labels) = resolve_placement_constraints(
+                    environment.deployment_config.as_ref(),
+                    project.deployment_config.as_ref(),
+                );
 
                 // Resolve CPU/memory limits + requests from environment first,
                 // then project. Each field is resolved independently so an
@@ -3783,6 +3823,13 @@ pub enum WorkflowExecutionError {
 
     #[error("Validation error: {0}")]
     Validation(String),
+
+    #[error("Deployment {deployment_id} has no node to run on: {source}")]
+    DedicatedNodesNotPinned {
+        deployment_id: i32,
+        #[source]
+        source: crate::services::node_service::NodeError,
+    },
 }
 
 impl WorkflowExecutionError {
@@ -3799,7 +3846,10 @@ impl WorkflowExecutionError {
             Self::DeploymentNotFound(_)
             | Self::ProjectNotFound(_)
             | Self::EnvironmentNotFound(_)
-            | Self::Validation(_) => true,
+            | Self::Validation(_)
+            // The operator's placement configuration, recorded on the
+            // deployment as its failure reason.
+            | Self::DedicatedNodesNotPinned { .. } => true,
             Self::DatabaseError(_)
             | Self::NoJobsFound(_)
             | Self::MissingJobConfig(_)
@@ -5760,5 +5810,299 @@ mod tests {
 
         assert!(provider.is_cancelled("rollback-42").await.unwrap());
         assert!(provider.is_cancelled("promote-42").await.unwrap());
+    }
+
+    /// A worker labelled `temps.sh/role=dedicated` that answers the node
+    /// scheduler's one `list_active` query.
+    fn dedicated_scheduler(local_workloads_enabled: bool) -> Arc<crate::services::NodeScheduler> {
+        let node = temps_entities::nodes::Model {
+            architecture: Some("linux/amd64".to_string()),
+            id: 7,
+            name: "gpu-1".to_string(),
+            token_hash: "hash_7".to_string(),
+            token_encrypted: None,
+            address: "https://10.0.0.7:3100".to_string(),
+            private_address: "10.0.0.7".to_string(),
+            public_endpoint: None,
+            wg_public_key: None,
+            role: "worker".to_string(),
+            status: "active".to_string(),
+            labels: serde_json::json!({ "temps.sh/role": "dedicated", "gpu": "true" }),
+            capacity: serde_json::json!({}),
+            last_heartbeat: Some(Utc::now()),
+            edge_public_key: None,
+            compute_cidr: None,
+            underlay_address: None,
+            mesh_wg_public_key: None,
+            mesh_wg_endpoint: None,
+            mesh_wg_address: None,
+            failover_at: None,
+            dns_resolver_running: None,
+            dns_resolver_tasks_alive: None,
+            dns_resolver_last_sync_at: None,
+            dns_resolver_consecutive_failures: 0,
+            dns_resolver_last_error: None,
+            dns_resolver_record_count: None,
+            public_ingress_enabled: false,
+            public_ingress_running: None,
+            public_ingress_last_error: None,
+            public_ingress_certificate_count: None,
+            public_ingress_route_count: None,
+            public_ingress_unsupported_route_count: None,
+            public_ingress_unsupported_reasons: serde_json::json!([]),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![node]])
+            .into_connection();
+        let node_service = Arc::new(crate::services::NodeService::new(Arc::new(db)));
+        Arc::new(
+            crate::services::NodeScheduler::new(node_service)
+                .with_local_workloads_enabled(local_workloads_enabled),
+        )
+    }
+
+    fn planned_job(deployment_id: i32, job_id: &str, job_type: &str) -> deployment_jobs::Model {
+        deployment_jobs::Model {
+            id: 0,
+            deployment_id,
+            job_id: job_id.to_string(),
+            job_type: job_type.to_string(),
+            name: job_id.to_string(),
+            description: None,
+            status: JobStatus::Pending,
+            log_id: format!("deployment-{deployment_id}-job-{job_id}"),
+            job_config: Some(serde_json::json!({})),
+            outputs: None,
+            dependencies: None,
+            execution_order: None,
+            started_at: None,
+            finished_at: None,
+            error_message: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn with_placement(
+        target_nodes: Option<Vec<i32>>,
+        target_labels: Option<serde_json::Value>,
+    ) -> Option<temps_entities::deployment_config::DeploymentConfig> {
+        Some(temps_entities::deployment_config::DeploymentConfig {
+            target_nodes,
+            target_labels,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn placement_constraints_inherit_each_unset_field_from_the_project() {
+        let project = with_placement(Some(vec![3]), Some(serde_json::json!({ "gpu": "true" })));
+        assert_eq!(
+            resolve_placement_constraints(with_placement(None, None).as_ref(), project.as_ref()),
+            (Some(vec![3]), Some(serde_json::json!({ "gpu": "true" })))
+        );
+        assert_eq!(
+            resolve_placement_constraints(None, project.as_ref()),
+            (Some(vec![3]), Some(serde_json::json!({ "gpu": "true" })))
+        );
+
+        // An environment value wins field by field; an empty one is unset.
+        let environment = with_placement(Some(vec![]), Some(serde_json::json!({ "zone": "a" })));
+        assert_eq!(
+            resolve_placement_constraints(environment.as_ref(), project.as_ref()),
+            (Some(vec![3]), Some(serde_json::json!({ "zone": "a" })))
+        );
+        let environment = with_placement(Some(vec![9]), Some(serde_json::json!({})));
+        assert_eq!(
+            resolve_placement_constraints(environment.as_ref(), project.as_ref()),
+            (Some(vec![9]), Some(serde_json::json!({ "gpu": "true" })))
+        );
+
+        assert_eq!(resolve_placement_constraints(None, None), (None, None));
+    }
+
+    #[test]
+    fn only_container_deployments_are_checked_for_placement() {
+        assert!(places_replicas(&[
+            planned_job(1, "build_image", "BuildImageJob"),
+            planned_job(1, "deploy_container", "DeployImageJob"),
+        ]));
+        assert!(places_replicas(&[planned_job(
+            1,
+            "deploy",
+            "DeployContainerJob"
+        )]));
+        assert!(!places_replicas(&[
+            planned_job(1, "build_image", "BuildImageJob"),
+            planned_job(1, "deploy_static", "DeployStaticJob"),
+        ]));
+        assert!(!places_replicas(&[planned_job(
+            1,
+            "deploy_compose",
+            "DeployComposeJob"
+        )]));
+    }
+
+    /// A selector that matches only a dedicated worker cannot place a single
+    /// replica, so the deployment fails while its workflow is assembled: no
+    /// job starts, and the source is never downloaded or built.
+    #[tokio::test]
+    async fn a_deployment_only_dedicated_nodes_could_run_fails_before_any_job_runs(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return Ok(());
+        }
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (_project, environment, deployment) = create_test_data(&db).await?;
+        let mut environment: environments::ActiveModel = environment.into();
+        environment.deployment_config = Set(with_placement(
+            None,
+            Some(serde_json::json!({ "gpu": "true" })),
+        ));
+        environment.update(db.as_ref()).await?;
+
+        let mut job_ids = Vec::new();
+        for (order, (job_id, job_type)) in [
+            ("download_repo", "DownloadRepoJob"),
+            ("build_image", "BuildImageJob"),
+            ("deploy_container", "DeployImageJob"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let job = deployment_jobs::ActiveModel {
+                deployment_id: Set(deployment.id),
+                job_id: Set(job_id.to_string()),
+                job_type: Set(job_type.to_string()),
+                name: Set(job_id.to_string()),
+                status: Set(JobStatus::Pending),
+                log_id: Set(format!("deployment-{}-job-{job_id}", deployment.id)),
+                job_config: Set(Some(serde_json::json!({}))),
+                execution_order: Set(Some(order as i32)),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await?;
+            job_ids.push(job.id);
+        }
+
+        let service = service_with_docker_handle(db.clone(), disabled_docker_handle()).await?;
+        service.set_node_scheduler(dedicated_scheduler(true));
+
+        let error = service
+            .execute_deployment_workflow(deployment.id)
+            .await
+            .expect_err("a deployment with no placeable node must fail");
+        match &error {
+            WorkflowExecutionError::DedicatedNodesNotPinned {
+                deployment_id,
+                source:
+                    crate::services::node_service::NodeError::DedicatedNodesNotPinned { excluded },
+            } => {
+                assert_eq!(*deployment_id, deployment.id);
+                assert!(
+                    excluded.contains("node 7 (gpu-1) is dedicated"),
+                    "the error must name the dedicated node: {excluded}"
+                );
+            }
+            other => panic!("expected DedicatedNodesNotPinned, got {other:?}"),
+        }
+        assert!(error.is_workload_outcome());
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("Deployment {}", deployment.id)),
+            "{message}"
+        );
+        assert!(message.contains("pin the environment to it"), "{message}");
+
+        for job_id in job_ids {
+            let row = deployment_jobs::Entity::find_by_id(job_id)
+                .one(db.as_ref())
+                .await?
+                .ok_or_else(|| format!("job row {job_id} disappeared"))?;
+            assert_eq!(
+                row.status,
+                JobStatus::Cancelled,
+                "job {} must never start: {:?}",
+                row.job_id,
+                row.error_message
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Every placement the deploy step could satisfy passes the pre-build
+    /// check, and deployments that place no replicas skip it.
+    #[tokio::test]
+    async fn the_pre_build_placement_check_only_rejects_unpinned_dedicated_placement(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return Ok(());
+        }
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, mut environment, deployment) = create_test_data(&db).await?;
+        let container_jobs = [
+            planned_job(deployment.id, "build_image", "BuildImageJob"),
+            planned_job(deployment.id, "deploy_container", "DeployImageJob"),
+        ];
+        let static_jobs = [
+            planned_job(deployment.id, "build_image", "BuildImageJob"),
+            planned_job(deployment.id, "deploy_static", "DeployStaticJob"),
+        ];
+        let check = |local_workloads_enabled: bool,
+                     environment: environments::Model,
+                     jobs: &'static str| {
+            let db = db.clone();
+            let project = project.clone();
+            let deployment = deployment.clone();
+            let jobs = if jobs == "static" {
+                static_jobs.to_vec()
+            } else {
+                container_jobs.to_vec()
+            };
+            async move {
+                let service = service_with_docker_handle(db, disabled_docker_handle()).await?;
+                service.set_node_scheduler(dedicated_scheduler(local_workloads_enabled));
+                Ok::<_, Box<dyn std::error::Error>>(
+                    service
+                        .preflight_dedicated_placement(&project, &environment, &deployment, &jobs)
+                        .await,
+                )
+            }
+        };
+
+        // Pinned: the dedicated node is the placement.
+        environment.deployment_config = with_placement(Some(vec![7]), None);
+        assert!(check(false, environment.clone(), "container")
+            .await?
+            .is_ok());
+
+        // Unpinned on a control plane that runs workloads: it lands locally.
+        environment.deployment_config = None;
+        assert!(check(true, environment.clone(), "container").await?.is_ok());
+
+        // Unpinned, and the control plane runs none: nowhere to go.
+        assert!(matches!(
+            check(false, environment.clone(), "container").await?,
+            Err(WorkflowExecutionError::DedicatedNodesNotPinned { .. })
+        ));
+
+        // A static site places no replicas, whatever its selector says.
+        environment.deployment_config =
+            with_placement(None, Some(serde_json::json!({ "gpu": "true" })));
+        assert!(check(true, environment.clone(), "static").await?.is_ok());
+        assert!(matches!(
+            check(true, environment, "container").await?,
+            Err(WorkflowExecutionError::DedicatedNodesNotPinned { .. })
+        ));
+
+        Ok(())
     }
 }
