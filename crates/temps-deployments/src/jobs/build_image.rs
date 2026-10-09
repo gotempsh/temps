@@ -529,6 +529,15 @@ pub struct BuildImageJob {
     /// Node whose agent owns the image produced by this job. `None` means
     /// the historical control-plane-local builder was used.
     remote_builder_node_id: Option<i32>,
+    /// Why this build is not running where the deployment's build location
+    /// asked for, written to the build log before the build starts so a
+    /// fallback to the control plane is never silent.
+    build_location_notice: Option<String>,
+    /// For a build moved off the control plane: the control plane's own
+    /// image store, and the name of the node building the image. The image
+    /// is streamed into it after the build, because the control plane's
+    /// post-build jobs (source maps, static assets, scans) read it there.
+    control_plane_copy: Option<(Arc<dyn ImageBuilder>, String)>,
 }
 
 impl std::fmt::Debug for BuildImageJob {
@@ -563,6 +572,8 @@ impl BuildImageJob {
             registry_mirror_prefix: None,
             local_workloads_enabled: true,
             remote_builder_node_id: None,
+            build_location_notice: None,
+            control_plane_copy: None,
         }
     }
 
@@ -576,6 +587,74 @@ impl BuildImageJob {
     pub fn with_remote_builder_node_id(mut self, node_id: i32) -> Self {
         self.remote_builder_node_id = Some(node_id);
         self
+    }
+
+    pub fn with_build_location_notice(mut self, notice: Option<String>) -> Self {
+        self.build_location_notice = notice;
+        self
+    }
+
+    pub fn with_control_plane_copy(
+        mut self,
+        control_plane_copy: Option<(Arc<dyn ImageBuilder>, String)>,
+    ) -> Self {
+        self.control_plane_copy = control_plane_copy;
+        self
+    }
+
+    /// After a build moved off the control plane, stream the image into the
+    /// control plane's daemon. A failure is logged, not fatal: the image is
+    /// on its worker and can still run there, and a replica placed on the
+    /// control plane retries the copy before it starts.
+    async fn copy_image_to_control_plane(
+        &self,
+        context: &WorkflowContext,
+        image_tag: &str,
+    ) -> Result<(), WorkflowError> {
+        let Some((control_plane, node_name)) = &self.control_plane_copy else {
+            return Ok(());
+        };
+        let started = std::time::Instant::now();
+        match super::node_image::copy_node_built_image(
+            self.image_builder.as_ref(),
+            node_name,
+            control_plane.as_ref(),
+            image_tag,
+            None,
+        )
+        .await
+        {
+            Ok(super::node_image::NodeImageCopy::AlreadyPresent) => Ok(()),
+            Ok(super::node_image::NodeImageCopy::Transferred) => {
+                self.log(
+                    context,
+                    format!(
+                        "Image '{}' copied from build node '{}' to the control plane in {:.1}s",
+                        image_tag,
+                        node_name,
+                        started.elapsed().as_secs_f64()
+                    ),
+                )
+                .await
+            }
+            Err(error) => {
+                tracing::warn!(
+                    image_tag = %image_tag,
+                    node_name = %node_name,
+                    "Could not copy worker-built image to the control plane: {}",
+                    error
+                );
+                self.log(
+                    context,
+                    format!(
+                        "⚠️ Could not copy the image to the control plane: {error}. Source \
+                         maps, static assets and the vulnerability scan for this deployment \
+                         may be skipped"
+                    ),
+                )
+                .await
+            }
+        }
     }
 
     pub fn with_build_config(mut self, build_config: BuildConfig) -> Self {
@@ -1603,11 +1682,17 @@ impl WorkflowTask for BuildImageJob {
             return Err(WorkflowError::LocalWorkloadsDisabled(message));
         }
 
+        if let Some(notice) = &self.build_location_notice {
+            self.log(&context, notice.clone()).await?;
+        }
+
         // Get typed output from the download job
         let repo_output = RepositoryOutput::from_context(&context, &self.download_job_id)?;
 
         // Build the image (logs written in real-time)
         let image_output = self.build_image(&repo_output, &context).await?;
+        self.copy_image_to_control_plane(&context, &image_output.image_tag)
+            .await?;
 
         // Set typed job outputs
         context.set_output(&self.job_id, "image_tag", &image_output.image_tag)?;
@@ -1758,6 +1843,8 @@ pub struct BuildImageJobBuilder {
     registry_mirror_prefix: Option<String>,
     local_workloads_enabled: bool,
     remote_builder_node_id: Option<i32>,
+    build_location_notice: Option<String>,
+    control_plane_copy: Option<(Arc<dyn ImageBuilder>, String)>,
 }
 
 impl BuildImageJobBuilder {
@@ -1774,6 +1861,8 @@ impl BuildImageJobBuilder {
             registry_mirror_prefix: None,
             local_workloads_enabled: true,
             remote_builder_node_id: None,
+            build_location_notice: None,
+            control_plane_copy: None,
         }
     }
 
@@ -1787,6 +1876,24 @@ impl BuildImageJobBuilder {
 
     pub fn remote_builder_node_id(mut self, node_id: i32) -> Self {
         self.remote_builder_node_id = Some(node_id);
+        self
+    }
+
+    /// A line for the build log explaining where this build runs when that
+    /// differs from the configured build location.
+    pub fn build_location_notice(mut self, notice: impl Into<String>) -> Self {
+        self.build_location_notice = Some(notice.into());
+        self
+    }
+
+    /// Stream the image built on node `node_name` into `control_plane`
+    /// once the build finishes (build location `node`).
+    pub fn copy_image_to_control_plane(
+        mut self,
+        control_plane: Arc<dyn ImageBuilder>,
+        node_name: impl Into<String>,
+    ) -> Self {
+        self.control_plane_copy = Some((control_plane, node_name.into()));
         self
     }
 
@@ -1890,6 +1997,9 @@ impl BuildImageJobBuilder {
         if let Some(node_id) = self.remote_builder_node_id {
             job = job.with_remote_builder_node_id(node_id);
         }
+        job = job
+            .with_build_location_notice(self.build_location_notice)
+            .with_control_plane_copy(self.control_plane_copy);
 
         Ok(job)
     }
@@ -2262,6 +2372,170 @@ mod tests {
             }
             other => panic!("expected LocalWorkloadsDisabled, got {other:?}"),
         }
+    }
+
+    /// Captures every line a job writes to its log.
+    #[derive(Default)]
+    struct CapturingLogWriter {
+        lines: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl temps_core::LogWriter for CapturingLogWriter {
+        async fn write_log(&self, message: String) -> Result<(), WorkflowError> {
+            self.lines
+                .lock()
+                .map_err(|error| WorkflowError::Other(error.to_string()))?
+                .push(message);
+            Ok(())
+        }
+
+        fn stage_id(&self) -> i32 {
+            1
+        }
+    }
+
+    /// A build that could not go where its build location asked for says so
+    /// in the deployment's own build log, before it starts — falling back to
+    /// the control plane must never be silent.
+    #[tokio::test]
+    async fn build_location_notice_is_written_to_the_build_log() {
+        let job = BuildImageJobBuilder::new()
+            .job_id("build".to_string())
+            .download_job_id("download_repo".to_string())
+            .image_tag("myapp:latest".to_string())
+            .build_location_notice("Build location is set to 'node', but no worker is free")
+            .build(Arc::new(RecordingImageBuilder::default()))
+            .unwrap();
+
+        let writer = Arc::new(CapturingLogWriter::default());
+        let context = WorkflowContext::new("wf".to_string(), 1, 1, 1, writer.clone());
+
+        // No download output in the context, so the job stops right after the
+        // notice; what matters is that the notice came first.
+        assert!(job.execute(context).await.is_err());
+        let lines = writer.lines.lock().unwrap().clone();
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some("Build location is set to 'node', but no worker is free"),
+            "{lines:?}"
+        );
+    }
+
+    /// Without a notice nothing extra is logged.
+    #[tokio::test]
+    async fn no_build_location_notice_by_default() {
+        let job = BuildImageJobBuilder::new()
+            .job_id("build".to_string())
+            .download_job_id("download_repo".to_string())
+            .image_tag("myapp:latest".to_string())
+            .build(Arc::new(RecordingImageBuilder::default()))
+            .unwrap();
+
+        let writer = Arc::new(CapturingLogWriter::default());
+        let context = WorkflowContext::new("wf".to_string(), 1, 1, 1, writer.clone());
+
+        assert!(job.execute(context).await.is_err());
+        assert!(writer
+            .lines
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|line| !line.contains("Build location")),);
+    }
+
+    /// A build moved to a worker streams its image back to the control
+    /// plane, whose source-map, static-asset and scan jobs read it there.
+    #[tokio::test]
+    async fn node_build_copies_its_image_to_the_control_plane() {
+        use super::super::node_image::fake::FakeImageStore;
+
+        let worker = Arc::new(FakeImageStore::holding("myapp:latest", "sha256:built"));
+        let control_plane = Arc::new(FakeImageStore::default());
+        let job = BuildImageJobBuilder::new()
+            .job_id("build".to_string())
+            .download_job_id("download_repo".to_string())
+            .image_tag("myapp:latest".to_string())
+            .remote_builder_node_id(7)
+            .copy_image_to_control_plane(control_plane.clone(), "builder-1")
+            .build(worker)
+            .unwrap();
+
+        let writer = Arc::new(CapturingLogWriter::default());
+        let context = WorkflowContext::new("wf".to_string(), 1, 1, 1, writer.clone());
+        job.copy_image_to_control_plane(&context, "myapp:latest")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            control_plane.images.lock().unwrap().get("myapp:latest"),
+            Some(&"sha256:built".to_string())
+        );
+        let lines = writer.lines.lock().unwrap().clone();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("copied from build node 'builder-1'")),
+            "{lines:?}"
+        );
+    }
+
+    /// A failed copy does not fail a build that succeeded on the worker,
+    /// but the build log says what the deployment will be missing.
+    #[tokio::test]
+    async fn failed_copy_to_the_control_plane_is_logged_not_fatal() {
+        use super::super::node_image::fake::FakeImageStore;
+
+        let worker = Arc::new(FakeImageStore::default());
+        let control_plane = Arc::new(FakeImageStore::default());
+        let job = BuildImageJobBuilder::new()
+            .job_id("build".to_string())
+            .download_job_id("download_repo".to_string())
+            .image_tag("myapp:latest".to_string())
+            .remote_builder_node_id(7)
+            .copy_image_to_control_plane(control_plane.clone(), "builder-1")
+            .build(worker)
+            .unwrap();
+
+        let writer = Arc::new(CapturingLogWriter::default());
+        let context = WorkflowContext::new("wf".to_string(), 1, 1, 1, writer.clone());
+        job.copy_image_to_control_plane(&context, "myapp:latest")
+            .await
+            .unwrap();
+
+        assert!(control_plane.images.lock().unwrap().is_empty());
+        let lines = writer.lines.lock().unwrap().clone();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Could not copy the image")
+                    && line.contains("builder-1")
+                    && line.contains("Source maps")),
+            "{lines:?}"
+        );
+    }
+
+    /// A build on the control plane has nothing to copy.
+    #[tokio::test]
+    async fn control_plane_build_copies_nothing() {
+        use super::super::node_image::fake::FakeImageStore;
+
+        let builder = Arc::new(FakeImageStore::holding("myapp:latest", "sha256:built"));
+        let job = BuildImageJobBuilder::new()
+            .job_id("build".to_string())
+            .download_job_id("download_repo".to_string())
+            .image_tag("myapp:latest".to_string())
+            .build(builder.clone())
+            .unwrap();
+
+        let writer = Arc::new(CapturingLogWriter::default());
+        let context = WorkflowContext::new("wf".to_string(), 1, 1, 1, writer.clone());
+        job.copy_image_to_control_plane(&context, "myapp:latest")
+            .await
+            .unwrap();
+
+        assert!(builder.imports.lock().unwrap().is_empty());
+        assert!(writer.lines.lock().unwrap().is_empty());
     }
 
     /// The default (`local_workloads_enabled(true)`, the historical

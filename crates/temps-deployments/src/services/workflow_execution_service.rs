@@ -144,6 +144,7 @@ fn deploy_failed_telemetry_event(
 /// The node chosen to build a source image in the control-plane profile.
 struct SelectedNodeBuilder {
     node_id: i32,
+    node_name: String,
     platform: String,
     remote: Arc<dyn ImageBuilder>,
 }
@@ -232,6 +233,72 @@ impl BuilderNodeResolver for NodeBuilderResolver {
             .map_err(WorkflowError::JobExecutionFailed)?;
         Ok(Arc::new(remote.with_platform(platform)))
     }
+}
+
+/// What a worker must build for a deployment whose build location is
+/// `node` on a control plane that could also build it itself.
+#[derive(Debug, PartialEq, Eq)]
+struct OffloadBuildCandidate {
+    /// The platform the image must be built for. `None` for a static site:
+    /// its output is architecture-independent and the image never runs, so
+    /// any worker may build it.
+    platform: Option<String>,
+}
+
+/// Whether a build that the control plane would run can move to a worker
+/// node without changing what it produces, and for which platform.
+///
+/// `Err` is the reason it stays on the control plane, phrased for the build
+/// log. Every reason is a limit of worker build protocol v1 or of what this
+/// server knows, never a configuration error, so the deployment still ships.
+fn offload_build_candidate(
+    static_output_only: bool,
+    needs_npm_credentials: bool,
+    cross_build_platforms: &[String],
+    control_plane_platform: Option<&str>,
+    scheduler_available: bool,
+) -> Result<OffloadBuildCandidate, String> {
+    if !scheduler_available {
+        return Err("node scheduling is not available on this server".to_string());
+    }
+    // `.npmrc` is generated from these on the control plane only; a worker
+    // build would fail outright, and the values must not leave this host.
+    if needs_npm_credentials {
+        return Err(
+            "this build uses NPM_TOKEN or NPM_RC for private packages, and worker \
+             builds cannot receive registry credentials yet"
+                .to_string(),
+        );
+    }
+    // DeployStaticJob reads the output files from the build node, and the
+    // image itself runs nowhere.
+    if static_output_only {
+        return Ok(OffloadBuildCandidate { platform: None });
+    }
+    if cross_build_platforms.len() > 1 {
+        return Err(format!(
+            "cross-architecture builds need {} images ({}), and a worker builds exactly one. \
+             Turn off cross-architecture builds or restrict target nodes to one architecture",
+            cross_build_platforms.len(),
+            cross_build_platforms.join(", ")
+        ));
+    }
+    // One requested platform is still one image; otherwise the native build
+    // is for the control plane's own platform.
+    let platform = cross_build_platforms
+        .first()
+        .map(String::as_str)
+        .or(control_plane_platform)
+        .map(str::trim)
+        .filter(|platform| temps_deployer::platform::is_buildable_platform(platform))
+        .ok_or_else(|| {
+            "the control plane's Docker platform is not known yet, so no worker of the \
+             matching architecture can be chosen"
+                .to_string()
+        })?;
+    Ok(OffloadBuildCandidate {
+        platform: Some(temps_deployer::platform::canonicalize_platform(platform)),
+    })
 }
 
 /// Service for executing deployment workflows
@@ -997,6 +1064,10 @@ impl WorkflowExecutionService {
                     "build_args",
                 )
                 .map_err(|e| WorkflowExecutionError::InvalidJobConfig(e.to_string()))?;
+                // Worker builds cannot receive registry credentials, so a
+                // build that needs them stays on the control plane.
+                let needs_npm_credentials =
+                    crate::jobs::npmrc::plan_npmrc(&build_args_map).is_some();
                 if !build_args_map.is_empty() {
                     let build_args: Vec<(String, String)> = build_args_map.into_iter().collect();
                     builder = builder.build_args(build_args);
@@ -1047,6 +1118,9 @@ impl WorkflowExecutionService {
                     );
                 }
 
+                // The platforms a multi-arch build must cover; empty for the
+                // usual single native build.
+                let mut cross_build_platforms: Vec<String> = Vec::new();
                 if let (true, Some(scheduler)) = (
                     cross_builds_enabled && local_workloads_enabled,
                     self.node_scheduler.get(),
@@ -1086,6 +1160,7 @@ impl WorkflowExecutionService {
                                 platforms = ?platforms,
                                 "Cluster spans multiple architectures — building one image per platform"
                             );
+                            cross_build_platforms = platforms.clone();
                             builder = builder.target_platforms(platforms);
                         }
                         Ok(_) => {}
@@ -1106,8 +1181,78 @@ impl WorkflowExecutionService {
                     }
                 }
 
-                let image_builder: Arc<dyn ImageBuilder> = if local_workloads_enabled {
+                let build_location =
+                    temps_entities::deployment_config::DeploymentConfig::resolve_build_location(
+                        environment.deployment_config.as_ref(),
+                        project.deployment_config.as_ref(),
+                    );
+                let image_builder: Arc<dyn ImageBuilder> = if local_workloads_enabled
+                    && build_location
+                        == temps_entities::deployment_config::BuildLocation::ControlPlane
+                {
                     self.image_builder.clone()
+                } else if local_workloads_enabled {
+                    // The operator asked to keep this build off the control
+                    // plane. A worker build is a preference: when no worker
+                    // can produce the same image the control plane would, the
+                    // build stays here and the build log says why.
+                    let target_nodes = environment
+                        .deployment_config
+                        .as_ref()
+                        .and_then(|config| config.configured_target_nodes().map(|ids| ids.to_vec()))
+                        .or_else(|| {
+                            project.deployment_config.as_ref().and_then(|config| {
+                                config.configured_target_nodes().map(|ids| ids.to_vec())
+                            })
+                        });
+                    let target_labels = environment
+                        .deployment_config
+                        .as_ref()
+                        .and_then(|config| config.configured_target_labels().cloned())
+                        .or_else(|| {
+                            project
+                                .deployment_config
+                                .as_ref()
+                                .and_then(|config| config.configured_target_labels().cloned())
+                        });
+                    match self
+                        .select_offload_builder(
+                            deployment.id,
+                            &project.slug,
+                            target_nodes.as_deref(),
+                            target_labels.as_ref(),
+                            &cross_build_platforms,
+                            needs_npm_credentials,
+                        )
+                        .await
+                    {
+                        Ok(selected) => {
+                            // The control plane's own post-build jobs read
+                            // the image from its daemon, so the finished
+                            // image is streamed back once the build is done.
+                            builder = builder
+                                .remote_builder_node_id(selected.node_id)
+                                .target_platforms(vec![selected.platform.clone()])
+                                .copy_image_to_control_plane(
+                                    self.image_builder.clone(),
+                                    selected.node_name.clone(),
+                                );
+                            selected.remote
+                        }
+                        Err(reason) => {
+                            warn!(
+                                deployment_id = deployment.id,
+                                project_slug = %project.slug,
+                                "Build location is 'node' but building on the control plane: {}",
+                                reason
+                            );
+                            builder = builder.build_location_notice(format!(
+                                "⚠️ Build location is set to 'node', but this build runs on the \
+                                 control plane: {reason}"
+                            ));
+                            self.image_builder.clone()
+                        }
+                    }
                 } else {
                     // A static site's image is only read for its output
                     // files, which DeployStaticJob fetches from the build node
@@ -2534,6 +2679,150 @@ impl WorkflowExecutionService {
         }
     }
 
+    /// Choose a worker node to build a source image that would otherwise be
+    /// built by this control plane's own Docker (build location `node`).
+    ///
+    /// The node must produce exactly the image a local build would: the
+    /// control plane's architecture and one platform -- or, for a static
+    /// site, any architecture. A node labelled `temps.sh/role=builder` is
+    /// preferred; otherwise the worker this deployment would be placed on
+    /// builds it, so that replica needs no transfer. `Err` carries the reason
+    /// the build stays on the control plane, written verbatim into the build
+    /// log.
+    async fn select_offload_builder(
+        &self,
+        deployment_id: i32,
+        project_slug: &str,
+        target_nodes: Option<&[i32]>,
+        target_labels: Option<&serde_json::Value>,
+        cross_build_platforms: &[String],
+        needs_npm_credentials: bool,
+    ) -> Result<SelectedNodeBuilder, String> {
+        let static_output_only = deployment_jobs::Entity::find()
+            .filter(deployment_jobs::Column::DeploymentId.eq(deployment_id))
+            .filter(deployment_jobs::Column::JobType.eq("DeployStaticJob"))
+            .one(self.db.as_ref())
+            .await
+            .map_err(|error| {
+                format!("could not read the jobs of deployment {deployment_id}: {error}")
+            })?
+            .is_some();
+        let control_plane_platform = if static_output_only {
+            None
+        } else {
+            self.image_builder.ensure_platform_discovered().await
+        };
+        let scheduler = self.node_scheduler.get();
+        let candidate = offload_build_candidate(
+            static_output_only,
+            needs_npm_credentials,
+            cross_build_platforms,
+            control_plane_platform.as_deref(),
+            scheduler.is_some(),
+        )?;
+        let Some(scheduler) = scheduler else {
+            return Err("node scheduling is not available on this server".to_string());
+        };
+
+        // A dedicated builder needs no placement: one of the required
+        // platform, or of any architecture for a static site. Placement below
+        // only considers workload nodes, so this is the only way a builder-only
+        // node can take the build.
+        let dedicated = match &candidate.platform {
+            Some(platform) => scheduler
+                .select_builder_node(platform)
+                .await
+                .map(|node| node.map(|node| (node, platform.clone()))),
+            None => scheduler.select_any_builder_node().await.map(|node| {
+                node.and_then(|node| {
+                    let platform = node.architecture.as_deref().map(|architecture| {
+                        temps_deployer::platform::canonicalize_platform(architecture)
+                    })?;
+                    Some((node, platform))
+                })
+            }),
+        }
+        .map_err(|error| format!("could not list build nodes: {error}"))?;
+        if let Some((node, platform)) = dedicated {
+            return self
+                .connect_build_node(deployment_id, node, platform)
+                .await
+                .map_err(|error| error.to_string());
+        }
+
+        let required_platforms: Vec<String> = candidate.platform.iter().cloned().collect();
+        let outcome = scheduler
+            .schedule_placement(crate::services::node_scheduler::ReplicaPlacementRequest {
+                replica_count: 1,
+                labels: target_labels,
+                target_node_ids: target_nodes,
+                anti_affinity: true,
+                exclude_node_ids: &[],
+                image_platforms: &required_platforms,
+                project_slug: Some(project_slug),
+                // Only workers: the control plane is what the build is
+                // moving off, so it must never win the placement.
+                exclude_control_plane: true,
+            })
+            .await;
+        let no_worker = || {
+            let needed = candidate
+                .platform
+                .as_deref()
+                .map(|platform| format!(" runs {platform}"))
+                .unwrap_or_default();
+            format!(
+                "no active worker node{needed} for this deployment. Join one with `temps join`, \
+                 or label a node `{}={}` to dedicate it to builds",
+                crate::services::node_scheduler::NODE_ROLE_LABEL,
+                crate::services::node_scheduler::BUILDER_NODE_ROLE,
+            )
+        };
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            // An empty worker pool, with or without placement constraints.
+            Err(
+                crate::services::node_service::NodeError::NoCompatibleNode { .. }
+                | crate::services::node_service::NodeError::LocalWorkloadsDisabled { .. },
+            ) => return Err(no_worker()),
+            Err(error) => return Err(format!("could not choose a worker node: {error}")),
+        };
+        let Some(crate::services::NodeAssignment::Remote {
+            node_id: target_id,
+            node_name: target_name,
+            platform: target_platform,
+            ..
+        }) = outcome.assignments.into_iter().next()
+        else {
+            return Err(no_worker());
+        };
+
+        let platform = match candidate.platform {
+            Some(platform) => platform,
+            // A static site builds for whatever the chosen worker runs; no
+            // dedicated builder exists, or it would have been picked above.
+            None => target_platform
+                .filter(|value| temps_deployer::platform::is_buildable_platform(value))
+                .map(|value| temps_deployer::platform::canonicalize_platform(&value))
+                .ok_or_else(|| {
+                    format!(
+                        "worker '{target_name}' (id={target_id}) has not reported a \
+                         buildable architecture yet"
+                    )
+                })?,
+        };
+        let node = scheduler
+            .node_service()
+            .get_by_id(target_id)
+            .await
+            .map_err(|error| {
+                format!("could not load worker '{target_name}' (id={target_id}): {error}")
+            })?;
+        self.connect_build_node(deployment_id, node, platform)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     #[allow(dead_code)]
     /// Choose the node that builds a source image when the control plane
     /// has no Docker daemon.
@@ -2602,6 +2891,7 @@ impl WorkflowExecutionService {
                 exclude_node_ids: &[],
                 image_platforms: &required_platforms,
                 project_slug: Some(project_slug),
+                exclude_control_plane: false,
             })
             .await
             .map_err(|error| {
@@ -2651,6 +2941,16 @@ impl WorkflowExecutionService {
                     ))
                 })?,
         };
+        self.connect_build_node(deployment_id, node, platform).await
+    }
+
+    /// Open an authenticated agent client to `node` for building `platform`.
+    async fn connect_build_node(
+        &self,
+        deployment_id: i32,
+        node: temps_entities::nodes::Model,
+        platform: String,
+    ) -> Result<SelectedNodeBuilder, WorkflowExecutionError> {
         let build_only = crate::services::node_scheduler::is_build_only_node(&node);
         let encryption = self.encryption_service.get().ok_or_else(|| {
             WorkflowExecutionError::JobCreationFailed(format!(
@@ -2675,6 +2975,7 @@ impl WorkflowExecutionService {
         );
         Ok(SelectedNodeBuilder {
             node_id: node.id,
+            node_name: node.name.clone(),
             platform: platform.clone(),
             remote: Arc::new(remote.with_platform(Some(platform))),
         })
@@ -3556,6 +3857,113 @@ mod tests {
             let error = validate_worker_build_scope(42, &platforms).unwrap_err();
             assert!(error.to_string().contains("Deployment 42"));
             assert!(error.to_string().contains("target nodes/labels"));
+        }
+    }
+
+    /// Build location `node` moves a build only when a worker can produce the
+    /// same image the control plane would; anything else stays local with a
+    /// reason the build log can show.
+    #[test]
+    fn offload_build_candidate_builds_the_control_plane_platform_on_a_worker() {
+        use super::{offload_build_candidate, OffloadBuildCandidate};
+
+        assert_eq!(
+            offload_build_candidate(false, false, &[], Some("linux/amd64"), true),
+            Ok(OffloadBuildCandidate {
+                platform: Some("linux/amd64".to_string())
+            })
+        );
+        // A single requested platform is still one image, built for that
+        // platform rather than the control plane's.
+        assert_eq!(
+            offload_build_candidate(
+                false,
+                false,
+                &["linux/arm64".into()],
+                Some("linux/amd64"),
+                true
+            ),
+            Ok(OffloadBuildCandidate {
+                platform: Some("linux/arm64".to_string())
+            })
+        );
+        assert_eq!(
+            offload_build_candidate(false, false, &[], Some(" linux/amd64 "), true),
+            Ok(OffloadBuildCandidate {
+                platform: Some("linux/amd64".to_string())
+            })
+        );
+    }
+
+    /// A static site's output is read from the build node and never runs,
+    /// so any worker may build it -- even when the control plane's own
+    /// platform is unknown or the cluster spans several architectures.
+    #[test]
+    fn offload_build_candidate_lets_any_worker_build_a_static_site() {
+        use super::{offload_build_candidate, OffloadBuildCandidate};
+
+        for platform in [None, Some("linux/amd64")] {
+            assert_eq!(
+                offload_build_candidate(true, false, &[], platform, true),
+                Ok(OffloadBuildCandidate { platform: None })
+            );
+        }
+        assert_eq!(
+            offload_build_candidate(
+                true,
+                false,
+                &["linux/amd64".into(), "linux/arm64".into()],
+                Some("linux/amd64"),
+                true
+            ),
+            Ok(OffloadBuildCandidate { platform: None })
+        );
+    }
+
+    #[test]
+    fn offload_build_candidate_explains_every_reason_to_stay_local() {
+        use super::offload_build_candidate;
+
+        let multi_arch = offload_build_candidate(
+            false,
+            false,
+            &["linux/amd64".into(), "linux/arm64".into()],
+            Some("linux/amd64"),
+            true,
+        )
+        .unwrap_err();
+        assert!(multi_arch.contains("2 images"), "{multi_arch}");
+        assert!(
+            multi_arch.contains("linux/amd64, linux/arm64"),
+            "{multi_arch}"
+        );
+
+        for static_output_only in [false, true] {
+            let no_scheduler =
+                offload_build_candidate(static_output_only, false, &[], Some("linux/amd64"), false)
+                    .unwrap_err();
+            assert!(no_scheduler.contains("node scheduling"), "{no_scheduler}");
+        }
+
+        for platform in [None, Some(""), Some("not-a-platform")] {
+            let unknown = offload_build_candidate(false, false, &[], platform, true).unwrap_err();
+            assert!(unknown.contains("platform is not known"), "{unknown}");
+        }
+    }
+
+    /// Private npm credentials are only ever written into a build context on
+    /// the control plane, so such a build -- static or not -- stays there
+    /// with a reason instead of failing on the worker.
+    #[test]
+    fn offload_build_candidate_keeps_npm_credential_builds_local() {
+        use super::offload_build_candidate;
+
+        for static_output_only in [false, true] {
+            let reason =
+                offload_build_candidate(static_output_only, true, &[], Some("linux/amd64"), true)
+                    .unwrap_err();
+            assert!(reason.contains("NPM_TOKEN"), "{reason}");
+            assert!(reason.contains("NPM_RC"), "{reason}");
         }
     }
     use super::*;

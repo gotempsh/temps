@@ -4911,6 +4911,9 @@ impl ProjectService {
         if let Some(cross_architecture_builds) = config.cross_architecture_builds {
             deployment_config.cross_architecture_builds = Some(cross_architecture_builds);
         }
+        if let Some(build_location) = config.build_location {
+            deployment_config.build_location = Some(build_location);
+        }
         if let Some(request_timeout_seconds) = config.request_timeout_seconds {
             deployment_config.request_timeout_seconds = Some(request_timeout_seconds);
         }

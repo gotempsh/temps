@@ -952,6 +952,10 @@ impl EnvironmentService {
         if let Some(cross_architecture_builds) = settings.cross_architecture_builds {
             deployment_config.cross_architecture_builds = Some(cross_architecture_builds);
         }
+        // `null` clears the override so the project's build location applies.
+        if let Some(build_location) = settings.build_location {
+            deployment_config.build_location = build_location;
+        }
         if let Some(on_demand) = settings.on_demand {
             deployment_config.on_demand = on_demand;
         }
@@ -1846,6 +1850,7 @@ mod tests {
                     target_labels: None,
                     anti_affinity: None,
                     cross_architecture_builds: None,
+                    build_location: None,
                     protected: None,
                     attack_mode: None,
                     force_https: None,
@@ -1952,6 +1957,7 @@ mod tests {
                     target_labels: None,
                     anti_affinity: None,
                     cross_architecture_builds: None,
+                    build_location: None,
                     protected: None,
                     attack_mode: None,
                     force_https: None,
@@ -2008,6 +2014,7 @@ mod tests {
             target_labels: None,
             anti_affinity: None,
             cross_architecture_builds: None,
+            build_location: None,
             protected: None,
             attack_mode: None,
             force_https: None,

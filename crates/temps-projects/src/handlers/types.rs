@@ -618,6 +618,10 @@ impl ProjectResponse {
                     .deployment_config
                     .clone()
                     .and_then(|c| c.cross_architecture_builds),
+                build_location: project
+                    .deployment_config
+                    .clone()
+                    .and_then(|c| c.build_location),
             },
         }
     }
@@ -746,6 +750,12 @@ pub struct UpdateDeploymentConfigRequest {
     /// are emulated on the control plane and substantially slower, so they are
     /// opted into rather than triggered by cluster topology.
     pub cross_architecture_builds: Option<bool>,
+    /// Where source images are built: `control_plane` (the default) or
+    /// `node` to move builds onto a worker node, falling back to the control
+    /// plane when no worker can take the build. Environments inherit this
+    /// and may override it. Absent leaves the current value unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_location: Option<temps_entities::deployment_config::BuildLocation>,
     /// Project-level default timeout for regular (non-streaming) HTTP
     /// requests, in seconds (0 = no timeout, or 1-86400). Environments may
     /// override this; always clamped to the operator's global hard ceiling

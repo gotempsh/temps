@@ -6,6 +6,7 @@
 //! Deploys built container images to target environments
 
 use super::image_source::{DeployImageSource, ExpectedImageIdentity};
+use super::node_image::{copy_node_built_image, NodeImageCopy};
 use async_trait::async_trait;
 use futures::StreamExt;
 use sea_orm::{sea_query::Expr, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
@@ -1559,6 +1560,64 @@ impl DeployImageJob {
         }
     }
 
+    /// Make an image built on worker `builder_node_id` available to the
+    /// control plane's own Docker, for a replica placed on the control plane.
+    async fn ensure_node_built_image_local(
+        &self,
+        image_tag: &str,
+        expected_image_id: Option<&str>,
+        builder_node_id: i32,
+        context: &WorkflowContext,
+    ) -> Result<(), WorkflowError> {
+        let local = self.image_builder.clone().ok_or_else(|| {
+            WorkflowError::JobExecutionFailed(format!(
+                "Cannot run worker-built image '{image_tag}' on the control plane: this \
+                 control plane has no image builder to import it into"
+            ))
+        })?;
+        // The build normally copied the image here already. Accept it by id
+        // before resolving the worker at all, so a worker that has since
+        // restarted, left the cluster, or pruned the image cannot fail a
+        // replica that already has what it needs.
+        if let (Some(expected), Ok(cached)) =
+            (expected_image_id, local.inspect_image(image_tag).await)
+        {
+            if super::node_image::same_image_id(&cached.id, expected) {
+                return Ok(());
+            }
+        }
+        let owner = self.remote_deployer_for_node_id(builder_node_id).await?;
+        let owner_name = owner.node_name().to_string();
+        let started = std::time::Instant::now();
+        let copied = copy_node_built_image(
+            owner.as_ref(),
+            &owner_name,
+            local.as_ref(),
+            image_tag,
+            expected_image_id,
+        )
+        .await;
+        match copied {
+            Ok(NodeImageCopy::AlreadyPresent) => Ok(()),
+            Ok(NodeImageCopy::Transferred) => {
+                self.log(
+                    context,
+                    format!(
+                        "Image '{}' transferred from build node '{}' to the control plane in {:.1}s",
+                        image_tag,
+                        owner_name,
+                        started.elapsed().as_secs_f64()
+                    ),
+                )
+                .await
+            }
+            Err(error) => {
+                self.log(context, format!("ERROR: {}", error)).await?;
+                Err(error)
+            }
+        }
+    }
+
     /// Agent client for a node known only by id (e.g. the node that built
     /// this deployment's image).
     async fn remote_deployer_for_node_id(
@@ -2506,6 +2565,7 @@ impl DeployImageJob {
                         // place a socket-granted project on a host that does
                         // not grant it.
                         project_slug: self.config.project_slug.as_deref(),
+                        exclude_control_plane: false,
                     },
                 )
                 .await
@@ -2707,6 +2767,21 @@ impl DeployImageJob {
             // Select deployer based on node assignment
             let deployer: Arc<dyn ContainerDeployer> = match assignment {
                 crate::services::NodeAssignment::Local => {
+                    // A build moved off the control plane (build location
+                    // `node`) copies its image here when it finishes; if that
+                    // copy failed, retry it before starting the replica.
+                    if let Some(builder_id) = image_output.builder_node_id {
+                        // The recorded id belongs to the primary tag only.
+                        let expected_image_id = (replica_image_tag == image_output.image_tag)
+                            .then_some(image_output.image_id.as_str());
+                        self.ensure_node_built_image_local(
+                            &replica_image_tag,
+                            expected_image_id,
+                            builder_id,
+                            context,
+                        )
+                        .await?;
+                    }
                     // Remote replicas are checked before the image is
                     // transferred; local ones had no equivalent guard, so a
                     // mismatch here surfaced only as a container that won't

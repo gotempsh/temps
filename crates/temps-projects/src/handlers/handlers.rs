@@ -2169,6 +2169,9 @@ pub async fn update_project_deployment_config(
             "updated".to_string(),
         );
     }
+    if config.build_location.is_some() {
+        updated_fields.insert("build_location".to_string(), "updated".to_string());
+    }
     if config.request_timeout_seconds.is_some() {
         updated_fields.insert("request_timeout_seconds".to_string(), "updated".to_string());
     }

@@ -200,6 +200,10 @@ pub struct ReplicaPlacementRequest<'a> {
     /// behaviour, and the right answer for callers that are not placing an
     /// application deployment.
     pub project_slug: Option<&'a str>,
+    /// Keep the control plane out of the pool, so only worker nodes are
+    /// considered. Used to pick a worker to take a build off the control
+    /// plane; `false` for every replica placement.
+    pub exclude_control_plane: bool,
 }
 
 /// Result of a scheduling pass: where the replicas go, plus what was left out.
@@ -553,6 +557,18 @@ impl NodeScheduler {
         Ok(pick_builder_node(active_nodes, platform))
     }
 
+    /// Pick a build-only node of any buildable architecture, for builds
+    /// whose output does not depend on the architecture (a static site,
+    /// whose image never runs). Same deterministic lowest-id rule as
+    /// [`Self::select_builder_node`].
+    pub async fn select_any_builder_node(&self) -> Result<Option<nodes::Model>, NodeError> {
+        let active_nodes = self
+            .node_service
+            .list_active(self.heartbeat_threshold_secs)
+            .await?;
+        Ok(pick_builder_node_for(active_nodes, None))
+    }
+
     /// Container platforms a build must cover for this deployment to be
     /// schedulable everywhere it could land.
     ///
@@ -791,6 +807,7 @@ impl NodeScheduler {
             exclude_node_ids,
             image_platforms,
             project_slug: None,
+            exclude_control_plane: false,
         })
         .await
     }
@@ -812,6 +829,7 @@ impl NodeScheduler {
             exclude_node_ids,
             image_platforms,
             project_slug,
+            exclude_control_plane,
         } = request;
         let target_node_ids = placement_node_ids(target_node_ids);
         let targets_control_plane =
@@ -1027,12 +1045,14 @@ impl NodeScheduler {
         let has_label_constraints = selector_map.is_some_and(|map| !map.is_empty());
         let local_matches_constraints =
             !has_label_constraints && target_node_ids.is_none_or(|_| targets_control_plane);
-        // Four independent reasons Local can drop out of the pool: it cannot
-        // run the image, it does not satisfy an explicit placement constraint,
+        // Five independent reasons Local can drop out of the pool: the caller
+        // wants a worker (a build moved off the control plane), it cannot run
+        // the image, it does not satisfy an explicit placement constraint,
         // this process is not allowed to run workloads at all, or — for a
         // project granted host Docker access somewhere — this control plane's
         // own environment does not grant it (ADR 045).
-        let include_local = self.local_workloads_enabled
+        let include_local = !exclude_control_plane
+            && self.local_workloads_enabled
             && local_compatible
             && local_matches_constraints
             && local_grants_socket;
@@ -1488,6 +1508,12 @@ fn schedule_anti_affinity_least_loaded(
 /// Choose a build-only node for `platform` from `nodes` (see
 /// [`NodeScheduler::select_builder_node`]).
 fn pick_builder_node(nodes: Vec<nodes::Model>, platform: &str) -> Option<nodes::Model> {
+    pick_builder_node_for(nodes, Some(platform))
+}
+
+/// The lowest-id active build-only node whose architecture is buildable and,
+/// when `platform` is given, matches it.
+fn pick_builder_node_for(nodes: Vec<nodes::Model>, platform: Option<&str>) -> Option<nodes::Model> {
     nodes
         .into_iter()
         .filter(|node| {
@@ -1495,7 +1521,9 @@ fn pick_builder_node(nodes: Vec<nodes::Model>, platform: &str) -> Option<nodes::
                 && node.id != CONTROL_PLANE_NODE_ID
                 && node.architecture.as_deref().is_some_and(|node_platform| {
                     temps_deployer::platform::is_buildable_platform(node_platform)
-                        && temps_deployer::platform::platforms_match(node_platform, platform)
+                        && platform.is_none_or(|platform| {
+                            temps_deployer::platform::platforms_match(node_platform, platform)
+                        })
                 })
         })
         .min_by_key(|node| node.id)
@@ -1747,6 +1775,7 @@ mod tests {
                 exclude_node_ids: &[],
                 image_platforms: &[],
                 project_slug,
+                exclude_control_plane: false,
             }
         }
 
@@ -1913,6 +1942,7 @@ mod tests {
                     exclude_node_ids: &[],
                     image_platforms: &[],
                     project_slug: Some("node-daemon"),
+                    exclude_control_plane: false,
                 })
                 .await
                 .expect_err("three spread replicas cannot fit on two eligible hosts");
@@ -4231,5 +4261,74 @@ mod tests {
         let mut unknown = builder_node(1, "builder", "linux/amd64");
         unknown.architecture = None;
         assert!(pick_builder_node(vec![unknown], "linux/amd64").is_none());
+    }
+
+    /// A static site may use a dedicated builder of any architecture; one
+    /// that has not reported an architecture is still never chosen.
+    #[test]
+    fn any_architecture_builder_is_picked_for_platform_independent_builds() {
+        let arm = builder_node(4, "builder-arm", "linux/arm64");
+        let amd = builder_node(3, "builder-amd", "linux/amd64");
+        let worker = make_node(1, "worker");
+        let mut unknown = builder_node(2, "builder-unknown", "linux/amd64");
+        unknown.architecture = None;
+
+        let picked = pick_builder_node_for(vec![arm, amd, worker.clone(), unknown.clone()], None)
+            .expect("a builder of either architecture qualifies");
+        assert_eq!(picked.id, 3);
+        assert!(pick_builder_node_for(vec![worker, unknown], None).is_none());
+    }
+
+    fn build_offload_placement(exclude_control_plane: bool) -> ReplicaPlacementRequest<'static> {
+        ReplicaPlacementRequest {
+            replica_count: 1,
+            labels: None,
+            target_node_ids: None,
+            anti_affinity: true,
+            exclude_node_ids: &[],
+            image_platforms: &[],
+            project_slug: None,
+            exclude_control_plane,
+        }
+    }
+
+    /// Without capacity data the control plane comes first in the pool, so
+    /// an ordinary single-replica placement lands on it. That is right for a
+    /// replica and wrong for a build being moved off the control plane.
+    #[tokio::test]
+    async fn build_offload_placement_never_picks_the_control_plane() {
+        let ordinary = scheduler_with_nodes(vec![make_node(1, "worker-1")], "linux/amd64")
+            .schedule_placement(build_offload_placement(false))
+            .await
+            .unwrap();
+        assert!(ordinary.assignments[0].is_local());
+
+        let offload = scheduler_with_nodes(vec![make_node(1, "worker-1")], "linux/amd64")
+            .schedule_placement(build_offload_placement(true))
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                offload.assignments[0],
+                NodeAssignment::Remote { node_id: 1, .. }
+            ),
+            "{:?}",
+            offload.assignments
+        );
+    }
+
+    /// With no worker at all, excluding the control plane is an error the
+    /// caller turns into "build on the control plane, and say why" -- never a
+    /// silent `Local`.
+    #[tokio::test]
+    async fn build_offload_placement_without_workers_is_an_error() {
+        let error = scheduler_with_nodes(Vec::new(), "linux/amd64")
+            .schedule_placement(build_offload_placement(true))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, NodeError::NoCompatibleNode { .. }),
+            "{error:?}"
+        );
     }
 }

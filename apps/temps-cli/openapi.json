@@ -6241,6 +6241,14 @@
         },
         "type": "object"
       },
+      "BuildLocation": {
+        "description": "Where a source deployment's image is built.\n\nThe control plane is the default and the historical behaviour. `Node`\nmoves the build — the most CPU- and memory-hungry step of a deployment —\nonto a worker node so it stops competing with the proxy, the database\nand running workloads on the control plane. A node labelled\n`temps.sh/role=builder` is preferred; otherwise the node the deployment\nis placed on builds it.\n\n`Node` is a preference, not a requirement: when no worker can take the\nbuild (none joined, none of the right architecture, or a\nmulti-architecture build) the build runs on the control plane and the\nbuild log says why. A static site may build on a worker of any\narchitecture, since its output is read from that node and never runs.",
+        "enum": [
+          "control_plane",
+          "node"
+        ],
+        "type": "string"
+      },
       "BulkActivationEstimateResponse": {
         "description": "The quote.",
         "properties": {
@@ -14987,6 +14995,17 @@
             "type": [
               "boolean",
               "null"
+            ]
+          },
+          "buildLocation": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/BuildLocation",
+                "description": "Where source images are built. `None` inherits (environment → project)\nand resolves to [`BuildLocation::ControlPlane`]; see\n[`DeploymentConfig::resolve_build_location`].\n\nWorker builds never receive build-argument values, so a Dockerfile\nthat declares `ARG` fails on a node with an explicit error instead of\nbuilding without its inputs."
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "containerExecEnabled": {
@@ -55032,6 +55051,17 @@
               "null"
             ]
           },
+          "buildLocation": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/BuildLocation",
+                "description": "Where source images are built: `control_plane` (the default) or\n`node` to move builds onto a worker node, falling back to the control\nplane when no worker can take the build. Environments inherit this\nand may override it. Absent leaves the current value unchanged."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "cpuLimit": {
             "format": "int32",
             "type": [
@@ -55312,6 +55342,17 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "build_location": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/BuildLocation",
+                "description": "Where this environment's source images are built (overrides the\nproject-level setting): `control_plane` or `node`. Send JSON `null`\nto inherit the project's setting; absent leaves it unchanged."
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "cpu_limit": {
