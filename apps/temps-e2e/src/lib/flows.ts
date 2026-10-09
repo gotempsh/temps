@@ -623,55 +623,89 @@ export async function fetchBody(
   url: string,
   headers?: Record<string, string>,
   timeoutMs = 10_000,
-): Promise<{ status: number; body: string }> {
+): Promise<{ status: number; body: string; headers: Headers }> {
   const ctrl = new AbortController()
   const t = setTimeout(() => ctrl.abort(), timeoutMs)
   try {
     const res = await fetch(url, { headers, signal: ctrl.signal })
     const body = await res.text()
-    return { status: res.status, body }
+    return { status: res.status, body, headers: res.headers }
   } finally {
     clearTimeout(t)
   }
 }
 
 /**
- * The mirror of `assertNotConsoleFallback`: poll a target until it DOES serve
- * the Temps console SPA fallback (or times out still serving something else).
+ * Why a response is NOT the proxy's "this application is down" answer, or
+ * `null` when it is.
  *
- * Used to prove a deployment pause actually took live traffic offline: after
- * pausing, `route_table::load_routes` finds no routable container for the
- * environment (see the fix note there) and skips the route entirely, so the
- * proxy falls through to its unknown-host console fallback. A real app
- * response (or a hung/refused connection) here means pause did NOT actually
- * stop traffic.
+ * Since #1334 a host whose deployment is paused (or whose containers are all
+ * down) stays known to the route table as "unavailable", and the proxy fails
+ * the request with its own outage page: HTTP 503, `Cache-Control: private,
+ * no-store`, `<title>Service Unavailable</title>`. It must NOT fall through to
+ * the console SPA (HTTP 200, `<title>Temps</title>`), which made uptime
+ * monitors report a stopped app as operational, and it must not still serve
+ * the app's own body (`appBody`).
  */
-export async function waitForConsoleFallback(opts: {
+export function appUnavailableMismatch(
+  res: { status: number; body: string; cacheControl: string | null },
+  appBody?: string,
+): string | null {
+  if (looksLikeConsoleFallback(res.body)) {
+    return `HTTP ${res.status} served the Temps console fallback on the application's hostname`
+  }
+  if (appBody !== undefined && res.body.includes(appBody)) {
+    return `HTTP ${res.status} still served the application body`
+  }
+  if (res.status !== 503) return `expected HTTP 503, got HTTP ${res.status}`
+  if (!/<title>\s*Service Unavailable\s*<\/title>/i.test(res.body)) {
+    return 'HTTP 503 without the proxy outage page'
+  }
+  const directives = (res.cacheControl ?? '').toLowerCase().split(',').map((d) => d.trim())
+  if (!directives.includes('no-store') || !directives.includes('private')) {
+    return `HTTP 503 with Cache-Control ${JSON.stringify(res.cacheControl)}, expected "private, no-store"`
+  }
+  return null
+}
+
+/**
+ * Poll a target until the proxy answers with its outage page for it (see
+ * `appUnavailableMismatch`), or throw with the last mismatch after
+ * `timeoutMs`.
+ *
+ * Used to prove a deployment pause actually took live traffic offline. A
+ * stale cached route to the stopped container fails through the same 503
+ * page, so this alone does not prove the route table reloaded; the resume
+ * step that follows it does, by requiring the app to come back.
+ */
+export async function waitForAppUnavailable(opts: {
   url: string
   headers?: Record<string, string>
+  appBody?: string
   timeoutMs?: number
   intervalMs?: number
 }): Promise<void> {
   const timeoutMs = opts.timeoutMs ?? 30_000
   const intervalMs = opts.intervalMs ?? 1500
   const start = performance.now()
-  let body = ''
-  let status = 0
+  let mismatch = 'no response received'
   while (performance.now() - start < timeoutMs) {
     try {
       const r = await fetchBody(opts.url, opts.headers, 10_000)
-      status = r.status
-      body = r.body
-      if (looksLikeConsoleFallback(body)) return
-    } catch {
-      // transient — retry
+      const why = appUnavailableMismatch(
+        { status: r.status, body: r.body, cacheControl: r.headers.get('cache-control') },
+        opts.appBody,
+      )
+      if (why === null) return
+      mismatch = `${why} (body starts: ${JSON.stringify(r.body.slice(0, 80))})`
+    } catch (e) {
+      mismatch = `request failed: ${e instanceof Error ? e.message : String(e)}`
     }
     await sleep(intervalMs)
   }
   throw new Error(
-    `expected the paused deployment to serve the Temps console fallback, but got HTTP ${status} ` +
-      `with a non-fallback body after ${Math.round(timeoutMs / 1000)}s ` +
-      `(body starts: ${JSON.stringify(body.slice(0, 80))})`,
+    `expected the paused deployment's hostname to answer with the proxy's 503 outage page ` +
+      `within ${Math.round(timeoutMs / 1000)}s; last response: ${mismatch}`,
   )
 }
 

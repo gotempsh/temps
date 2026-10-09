@@ -80,12 +80,17 @@
  *    (b) having pause/resume publish `Job::ForceRouteReload` (the same
  *    in-process broadcast `mark_deployment_complete.rs` already uses after a
  *    normal deploy) so the reload actually happens immediately instead of
- *    waiting on an unrelated route change. With both fixes, pausing makes
- *    the route disappear entirely and the proxy falls through to its
- *    existing unknown-host console-fallback response (HTTP 200,
- *    `<title>Temps</title>`) -- that fallback is therefore the real,
- *    asserted "paused" behavior in step 4 below, discovered by observing
- *    actual proxy logs, not assumed.
+ *    waiting on an unrelated route change. With both fixes, pausing made
+ *    the route disappear entirely and the proxy fell through to its
+ *    unknown-host console fallback (HTTP 200, `<title>Temps</title>`).
+ *
+ * 4. That console fallback was itself a bug (#1334): the app's own hostname
+ *    answered HTTP 200 with the console SPA, so uptime monitors reported a
+ *    paused or stopped app as operational. The route table now keeps such
+ *    hosts as "unavailable", and the proxy answers them with its 503 outage
+ *    page (`Cache-Control: private, no-store`) instead. That 503 is the
+ *    asserted "paused" behavior in step 4 below; the console answering, or
+ *    the app body still being served, fails the step.
  */
 import { createEnvironment, pauseDeployment, promoteDeployment, resumeDeployment, rollbackToDeployment } from '@temps-sdk/api'
 import { makeClient, resolveConfig, unwrap } from '../lib/client.ts'
@@ -97,7 +102,7 @@ import {
   getDeployStatus,
   waitForHttpReady,
   assertNotConsoleFallback,
-  waitForConsoleFallback,
+  waitForAppUnavailable,
   fetchBody,
   resolveLoadTarget,
   teardown,
@@ -316,7 +321,7 @@ export async function deployLifecycleScenarioCommand(
       )
     })
     await step('assert live traffic actually stopped (real paused-state behavior)', () =>
-      waitForConsoleFallback({ url: target.url, headers: target.headers, timeoutMs: 45_000 }),
+      waitForAppUnavailable({ url: target.url, headers: target.headers, appBody: versionA, timeoutMs: 45_000 }),
     )
 
     // --- 5. resume, assert traffic comes back exactly as before ---
