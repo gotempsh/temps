@@ -2830,7 +2830,13 @@ impl DeploymentService {
             .await?
             .ok_or_else(|| DeploymentError::NotFound("Project not found".to_string()))?;
 
-        let is_static = project.preset == temps_entities::preset::Preset::Static;
+        // An uploaded static bundle may use any static-capable preset (for
+        // example Vite). Its retained artifact determines how it is reused,
+        // rather than the project's framework label.
+        let is_static = target_deployment.static_dir_location.is_some()
+            || (target_deployment.image_name.is_none()
+                && (project.source_type == temps_entities::source_type::SourceType::StaticFiles
+                    || project.preset == temps_entities::preset::Preset::Static));
         if !is_static {
             temps_presets::get_preset_for_storage(project.preset, project.preset_config.as_ref())
                 .map_err(|error| DeploymentError::InvalidInput(error.to_string()))?
@@ -3573,7 +3579,10 @@ impl DeploymentService {
             image_name.as_deref().unwrap_or("static artifact")
         );
 
-        let is_static = project.preset == temps_entities::preset::Preset::Static;
+        let is_static = source.static_dir_location.is_some()
+            || (source.image_name.is_none()
+                && (project.source_type == temps_entities::source_type::SourceType::StaticFiles
+                    || project.preset == temps_entities::preset::Preset::Static));
         if !is_static {
             temps_presets::get_preset_for_storage(project.preset, project.preset_config.as_ref())
                 .map_err(|error| DeploymentError::InvalidInput(error.to_string()))?
@@ -7749,6 +7758,25 @@ mod tests {
             .unwrap();
         assert_eq!(updated_environment.current_deployment_id, Some(result.id));
 
+        // Changing the project to static uploads must not reinterpret an
+        // older deployment that retained a container image.
+        let project = projects::Entity::find_by_id(target_deployment.project_id)
+            .one(db.as_ref())
+            .await?
+            .ok_or("rollback project disappeared")?;
+        let mut active_project: projects::ActiveModel = project.into();
+        active_project.source_type = Set(temps_entities::source_type::SourceType::StaticFiles);
+        active_project.update(db.as_ref()).await?;
+        let repeated = deployment_service
+            .rollback_to_deployment(target_deployment.project_id, target_deployment.id)
+            .await?;
+        let persisted = deployments::Entity::find_by_id(repeated.id)
+            .one(db.as_ref())
+            .await?
+            .ok_or("container rollback was not persisted")?;
+        assert_eq!(persisted.image_name, target_deployment.image_name);
+        assert_eq!(persisted.static_dir_location, None);
+
         Ok(())
     }
 
@@ -7759,6 +7787,10 @@ mod tests {
         let db = test_db.connection_arc();
 
         let (project, _source_environment, source) = setup_test_data(&db).await?;
+        // A new project source type does not change the stored image artifact.
+        let mut active_project: projects::ActiveModel = project.clone().into();
+        active_project.source_type = Set(temps_entities::source_type::SourceType::StaticFiles);
+        active_project.update(db.as_ref()).await?;
         let expected_command = vec!["start".to_string(), "--optimized".to_string()];
         let expected_health_check_path = "/realms/master".to_string();
         let mut active_source: deployments::ActiveModel = source.into();
@@ -7796,6 +7828,8 @@ mod tests {
             .one(db.as_ref())
             .await?
             .ok_or("promoted deployment was not persisted")?;
+        assert_eq!(promoted_model.image_name, source.image_name);
+        assert_eq!(promoted_model.static_dir_location, None);
         let metadata = promoted_model
             .metadata
             .ok_or("promoted deployment metadata was not persisted")?;
@@ -7805,6 +7839,73 @@ mod tests {
             Some(expected_health_check_path.as_str())
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn static_vite_rollback_reuses_bundle_without_an_image(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, target) = setup_test_data(&db).await?;
+
+        let mut active_project: projects::ActiveModel = project.clone().into();
+        active_project.source_type = Set(temps_entities::source_type::SourceType::StaticFiles);
+        active_project.preset = Set(temps_entities::preset::Preset::Vite);
+        active_project.preset_config = Set(Some(
+            temps_entities::preset::PresetConfig::default_for_preset(
+                temps_entities::preset::Preset::Vite,
+            ),
+        ));
+        active_project.update(db.as_ref()).await?;
+
+        let mut active_target: deployments::ActiveModel = target.into();
+        active_target.state = Set("stopped".to_string());
+        active_target.image_name = Set(None);
+        active_target.static_dir_location = Set(Some("cas/static/original-bundle".to_string()));
+        let target = active_target.update(db.as_ref()).await?;
+
+        let current = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("current-static-bundle".to_string()),
+            state: Set("completed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            static_dir_location: Set(Some("cas/static/replacement-bundle".to_string())),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        let mut active_environment: environments::ActiveModel = environment.into();
+        active_environment.current_deployment_id = Set(Some(current.id));
+        let environment = active_environment.update(db.as_ref()).await?;
+
+        let service = create_deployment_service_for_test(db.clone());
+        configure_test_service_for_http_readiness(&service).await?;
+        let rolled_back = service
+            .rollback_to_deployment(project.id, target.id)
+            .await?;
+
+        assert_ne!(rolled_back.id, target.id);
+        let persisted = deployments::Entity::find_by_id(rolled_back.id)
+            .one(db.as_ref())
+            .await?
+            .ok_or("static rollback was not persisted")?;
+        assert_eq!(persisted.state, "completed");
+        assert_eq!(persisted.image_name, None);
+        assert_eq!(persisted.static_dir_location, target.static_dir_location);
+        let metadata = persisted
+            .metadata
+            .ok_or("rollback metadata was not persisted")?;
+        assert!(metadata.is_rollback);
+        assert_eq!(metadata.rolled_back_from_id, Some(target.id));
+        let environment = environments::Entity::find_by_id(environment.id)
+            .one(db.as_ref())
+            .await?
+            .ok_or("static environment disappeared")?;
+        assert_eq!(environment.current_deployment_id, Some(rolled_back.id));
         Ok(())
     }
 
@@ -7861,6 +7962,46 @@ mod tests {
             .await?
             .ok_or("static target environment disappeared")?;
         assert_eq!(target_environment.current_deployment_id, Some(promoted.id));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn static_artifact_promotion_uses_bundle_when_project_preset_changes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, _environment, source) = setup_test_data(&db).await?;
+
+        // The default Node project represents a changed framework. The
+        // immutable source deployment still contains a static bundle.
+        let mut active_source: deployments::ActiveModel = source.into();
+        active_source.image_name = Set(None);
+        active_source.static_dir_location = Set(Some("cas/static/retained-bundle".to_string()));
+        let source = active_source.update(db.as_ref()).await?;
+        let target_environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("Static Target".to_string()),
+            slug: Set("static-target".to_string()),
+            host: Set("static-target.example.com".to_string()),
+            upstreams: Set(UpstreamList::default()),
+            subdomain: Set("static-target.example.com".to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let service = create_deployment_service_for_test(db.clone());
+        configure_test_service_for_http_readiness(&service).await?;
+        let promoted = service
+            .promote_deployment(project.id, source.id, target_environment.id)
+            .await?;
+        let persisted = deployments::Entity::find_by_id(promoted.id)
+            .one(db.as_ref())
+            .await?
+            .ok_or("static promotion was not persisted")?;
+        assert_eq!(persisted.state, "completed");
+        assert_eq!(persisted.image_name, None);
+        assert_eq!(persisted.static_dir_location, source.static_dir_location);
         Ok(())
     }
 
