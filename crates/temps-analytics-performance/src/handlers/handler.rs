@@ -303,7 +303,7 @@ pub(crate) fn public_ingest_cors() -> CorsLayer {
         ("deployment_id" = Option<i32>, Query, description = "Deployment ID (optional)"),
         ("device_type" = Option<String>, Query, description = "Device type filter: desktop or mobile (optional)"),
         ("include_bots" = Option<bool>, Query, description = "Include crawler/datacenter bot samples (default false)"),
-        ("filter_path" = Option<String>, Query, description = "Filter to one page pathname (optional)"),
+        ("filter_path" = Option<String>, Query, description = "Filter to one page pathname, exact match (optional). `path` is accepted as an alias."),
         ("filter_country" = Option<String>, Query, description = "Filter to one country (optional)"),
         ("filter_region" = Option<String>, Query, description = "Filter to one region (optional)"),
         ("filter_city" = Option<String>, Query, description = "Filter to one city (optional)"),
@@ -367,7 +367,7 @@ async fn get_performance_metrics(
         ("deployment_id" = Option<i32>, Query, description = "Deployment ID (optional)"),
         ("device_type" = Option<String>, Query, description = "Device type filter: desktop or mobile (optional)"),
         ("include_bots" = Option<bool>, Query, description = "Include crawler/datacenter bot samples (default false)"),
-        ("filter_path" = Option<String>, Query, description = "Filter to one page pathname (optional)"),
+        ("filter_path" = Option<String>, Query, description = "Filter to one page pathname, exact match (optional). `path` is accepted as an alias."),
         ("filter_country" = Option<String>, Query, description = "Filter to one country (optional)"),
         ("filter_region" = Option<String>, Query, description = "Filter to one region (optional)"),
         ("filter_city" = Option<String>, Query, description = "Filter to one city (optional)"),
@@ -432,7 +432,7 @@ async fn get_metrics_over_time(
         ("group_by" = String, Query, description = "Group by: path, country, region, city, device_type, browser, operating_system"),
         ("device_type" = Option<String>, Query, description = "Device type filter: desktop or mobile (optional)"),
         ("include_bots" = Option<bool>, Query, description = "Include crawler/datacenter bot samples (default false)"),
-        ("filter_path" = Option<String>, Query, description = "Filter to one page pathname (optional)"),
+        ("filter_path" = Option<String>, Query, description = "Filter to one page pathname, exact match (optional). `path` is accepted as an alias."),
         ("filter_country" = Option<String>, Query, description = "Filter to one country (optional)"),
         ("filter_region" = Option<String>, Query, description = "Filter to one region (optional)"),
         ("filter_city" = Option<String>, Query, description = "Filter to one city (optional)"),
@@ -1878,5 +1878,58 @@ mod tests {
                 .any(|name| name == "retry-after"),
             "Retry-After must be in access-control-expose-headers, got {exposed:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod query_tests {
+    use super::*;
+    use axum::http::Uri;
+
+    fn grouped(query: &str) -> GroupedPageMetricsQuery {
+        let uri: Uri = format!("/performance/page-metrics?{query}")
+            .parse()
+            .unwrap();
+        Query::<GroupedPageMetricsQuery>::try_from_uri(&uri)
+            .map(|Query(q)| q)
+            .unwrap_or_else(|e| panic!("query {query:?} failed to parse: {e}"))
+    }
+
+    const RANGE: &str =
+        "start_date=2026-10-01T00:00:00Z&end_date=2026-10-08T00:00:00Z&project_id=5";
+
+    #[test]
+    fn grouped_query_reads_filter_path_alongside_typed_fields() {
+        let q = grouped(&format!(
+            "{RANGE}&environment_id=3&include_bots=true&group_by=operating_system&filter_path=%2Fpricing"
+        ));
+        assert_eq!(q.project_id, 5);
+        assert_eq!(q.environment_id, Some(3));
+        assert_eq!(q.include_bots, Some(true));
+        assert_eq!(q.group_by, "operating_system");
+        assert_eq!(q.segment.filter_path.as_deref(), Some("/pricing"));
+    }
+
+    #[test]
+    fn grouped_query_accepts_path_alias() {
+        let q = grouped(&format!(
+            "{RANGE}&group_by=country&path=%2Fdocs%2Fquickstart"
+        ));
+        assert_eq!(q.segment.filter_path.as_deref(), Some("/docs/quickstart"));
+    }
+
+    #[test]
+    fn grouped_query_without_path_filter_is_unfiltered() {
+        let q = grouped(&format!("{RANGE}&group_by=path"));
+        assert_eq!(q.segment.filter_path, None);
+    }
+
+    #[test]
+    fn metrics_query_accepts_path_alias() {
+        let uri: Uri = format!("/performance/metrics?{RANGE}&path=%2Fpricing")
+            .parse()
+            .unwrap();
+        let Query(q) = Query::<PerformanceMetricsQuery>::try_from_uri(&uri).unwrap();
+        assert_eq!(q.segment.filter_path.as_deref(), Some("/pricing"));
     }
 }
