@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ::microsandbox::sandbox::{
-    DeploymentProfile, FsSetAttrs, RlimitResource, SandboxHandle as MsbSandboxHandle,
+    DeploymentProfile, FsEntryKind, FsSetAttrs, RlimitResource, SandboxHandle as MsbSandboxHandle,
     SandboxStatus, SecurityProfile,
 };
 use ::microsandbox::setup::{InstallOptions, ResolvedRuntime};
@@ -587,6 +587,121 @@ impl MicrosandboxSandboxProvider {
             })
     }
 
+    /// Stream one guest file to `host_path` chunk by chunk, so host memory
+    /// stays at one chunk however large the file is.
+    async fn download_file(
+        &self,
+        name: &str,
+        guest_path: &str,
+        host_path: &Path,
+        mode: u32,
+    ) -> Result<(), AgentError> {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::AsyncWriteExt;
+        let operation = format!("download '{}' to '{}'", guest_path, host_path.display());
+        let sandbox = self.connected(name).await?;
+        let mut stream = sandbox.fs().read_stream(guest_path).await.map_err(|e| {
+            self.evict(name);
+            Self::err(name, &operation, e)
+        })?;
+        let mut file = tokio::fs::File::create(host_path)
+            .await
+            .map_err(|e| Self::err(name, &operation, e))?;
+        while let Some(chunk) = stream.recv().await.map_err(|e| {
+            self.evict(name);
+            Self::err(name, &operation, e)
+        })? {
+            file.write_all(&chunk)
+                .await
+                .map_err(|e| Self::err(name, &operation, e))?;
+        }
+        file.flush()
+            .await
+            .map_err(|e| Self::err(name, &operation, e))?;
+        tokio::fs::set_permissions(host_path, std::fs::Permissions::from_mode(mode))
+            .await
+            .map_err(|e| Self::err(name, &operation, e))
+    }
+
+    /// Mirror the guest work dir into `host_dir`; returns (files copied,
+    /// entries removed). Guest symlinks and special files are never
+    /// materialized on the host, and a host symlink is never written
+    /// through, replaced or removed — seeding skipped them, so they are not
+    /// the agent's.
+    async fn mirror_workspace(
+        &self,
+        name: &str,
+        host_dir: &Path,
+    ) -> Result<(usize, usize), AgentError> {
+        let sandbox = self.connected(name).await?;
+        let fs = sandbox.fs();
+        let (mut copied, mut removed) = (0usize, 0usize);
+        let mut stack = vec![(WORK_DIR.to_string(), host_dir.to_path_buf())];
+        while let Some((guest_dir, local_dir)) = stack.pop() {
+            let entries = fs.list(&guest_dir).await.map_err(|e| {
+                self.evict(name);
+                Self::err(name, &format!("list '{}'", guest_dir), e)
+            })?;
+            let mut present = std::collections::HashSet::new();
+            for entry in entries {
+                let Some(file_name) = guest_entry_name(&entry.path) else {
+                    tracing::warn!(
+                        sandbox = %name,
+                        entry = %entry.path,
+                        "skipping guest entry with an unsafe name during workspace sync"
+                    );
+                    continue;
+                };
+                present.insert(std::ffi::OsString::from(file_name));
+                let guest_path = format!("{}/{}", guest_dir, file_name);
+                let local_path = local_dir.join(file_name);
+                let local_meta = std::fs::symlink_metadata(&local_path).ok();
+                if local_meta
+                    .as_ref()
+                    .is_some_and(|m| m.file_type().is_symlink())
+                {
+                    continue;
+                }
+                match entry.kind {
+                    FsEntryKind::Directory => {
+                        if local_meta.as_ref().is_some_and(|m| !m.is_dir()) {
+                            std::fs::remove_file(&local_path)?;
+                        }
+                        std::fs::create_dir_all(&local_path)?;
+                        stack.push((guest_path, local_path));
+                    }
+                    FsEntryKind::File => {
+                        if local_meta.as_ref().is_some_and(|m| m.is_dir()) {
+                            std::fs::remove_dir_all(&local_path)?;
+                        }
+                        self.download_file(name, &guest_path, &local_path, entry.mode & 0o777)
+                            .await?;
+                        copied += 1;
+                    }
+                    FsEntryKind::Symlink | FsEntryKind::Other => {}
+                }
+            }
+            // What the guest no longer has, the agent deleted.
+            for local in std::fs::read_dir(&local_dir)? {
+                let local = local?;
+                if present.contains(&local.file_name()) {
+                    continue;
+                }
+                let meta = local.path().symlink_metadata()?;
+                if meta.file_type().is_symlink() {
+                    continue;
+                }
+                if meta.is_dir() {
+                    std::fs::remove_dir_all(local.path())?;
+                } else {
+                    std::fs::remove_file(local.path())?;
+                }
+                removed += 1;
+            }
+        }
+        Ok((copied, removed))
+    }
+
     /// Stream one host file into the guest in fixed-size chunks, so host
     /// memory stays at one chunk however large the file is.
     async fn upload_file(
@@ -907,6 +1022,39 @@ impl SandboxProvider for MicrosandboxSandboxProvider {
         Ok(())
     }
 
+    async fn sync_workspace_to_host(
+        &self,
+        handle: &SandboxHandle,
+        host_dir: &Path,
+    ) -> Result<(), AgentError> {
+        // The guest copy is authoritative after a run: Docker would have
+        // written these edits straight into `host_dir` through its bind mount.
+        let name = handle.sandbox_name.as_str();
+        let started = Instant::now();
+        let (copied, removed) = self.mirror_workspace(name, host_dir).await.map_err(|e| {
+            AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: name.to_string(),
+                reason: format!(
+                    "{} syncing {} back to {}: {}",
+                    PROVIDER_NAME,
+                    WORK_DIR,
+                    host_dir.display(),
+                    e
+                ),
+            }
+        })?;
+        tracing::info!(
+            sandbox = %name,
+            host_dir = %host_dir.display(),
+            copied,
+            removed,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "microsandbox workspace synced to host"
+        );
+        Ok(())
+    }
+
     async fn kill_processes(
         &self,
         handle: &SandboxHandle,
@@ -1115,6 +1263,14 @@ fn set_dir_private(path: &Path) {
     if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)) {
         tracing::warn!("failed to 0700 {}: {}", path.display(), e);
     }
+}
+
+/// The final component of a guest directory-listing path, if it is a
+/// plain name. Guest-reported names are untrusted: anything that could
+/// address outside the directory being mirrored is refused.
+fn guest_entry_name(path: &str) -> Option<&str> {
+    let name = path.rsplit('/').next()?;
+    (!name.is_empty() && name != "." && name != ".." && !name.contains('\0')).then_some(name)
 }
 
 /// Whether `dir` is an existing directory with at least one entry — i.e.
@@ -1750,6 +1906,108 @@ mod tests {
             }
         })
         .await;
+    }
+
+    #[test]
+    fn guest_entry_names_must_be_plain_components() {
+        assert_eq!(guest_entry_name("/workspace/src/lib.rs"), Some("lib.rs"));
+        assert_eq!(guest_entry_name("README.md"), Some("README.md"));
+        assert_eq!(guest_entry_name("/workspace/.git"), Some(".git"));
+        assert_eq!(guest_entry_name("/workspace/.."), None);
+        assert_eq!(guest_entry_name("/workspace/."), None);
+        assert_eq!(guest_entry_name("/workspace/"), None);
+        assert_eq!(guest_entry_name("/workspace/a\0b"), None);
+    }
+
+    #[tokio::test]
+    async fn e2e_sync_workspace_mirrors_guest_edits_to_host() {
+        let Some(provider) = e2e_provider() else {
+            return;
+        };
+        let host = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("target"), b"untouched").unwrap();
+        std::fs::create_dir_all(host.path().join("src/nested")).unwrap();
+        std::fs::create_dir_all(host.path().join("old-dir/inner")).unwrap();
+        std::fs::write(host.path().join("README.md"), b"before\n").unwrap();
+        std::fs::write(host.path().join("src/nested/lib.rs"), b"pub fn f() {}\n").unwrap();
+        std::fs::write(host.path().join("old-dir/inner/x"), b"x").unwrap();
+        // Never copied in, so never the agent's to remove.
+        std::os::unix::fs::symlink(outside.path().join("target"), host.path().join("host-link"))
+            .unwrap();
+
+        let mut config = e2e_config("sync", "none");
+        config.host_work_dir = host.path().to_path_buf();
+        let host_dir = host.path().to_path_buf();
+        with_sandbox(&provider, config, |handle| {
+            let provider = &provider;
+            async move {
+                // What an agent does: edit, add, delete, chmod, and write a
+                // file larger than one stream chunk.
+                let script = format!(
+                    "cd {WORK_DIR} && printf 'after\\n' > README.md \
+                     && mkdir -p src/new && printf 'added\\n' > src/new/added.txt \
+                     && rm src/nested/lib.rs && rm -r old-dir \
+                     && printf '#!/bin/sh\\n' > tool.sh && chmod 755 tool.sh \
+                     && head -c 1000000 /dev/urandom > blob.bin \
+                     && ln -s /etc/passwd guest-link"
+                );
+                let edit = sh(provider, &handle, &script).await;
+                assert_eq!(edit.exit_code, 0, "{}", edit.stderr);
+                let blob = provider
+                    .read_file(&handle, &format!("{WORK_DIR}/blob.bin"))
+                    .await
+                    .unwrap();
+
+                provider
+                    .sync_workspace_to_host(&handle, &host_dir)
+                    .await
+                    .unwrap();
+
+                assert_eq!(
+                    std::fs::read(host_dir.join("README.md")).unwrap(),
+                    b"after\n"
+                );
+                assert_eq!(
+                    std::fs::read(host_dir.join("src/new/added.txt")).unwrap(),
+                    b"added\n"
+                );
+                assert!(
+                    !host_dir.join("src/nested/lib.rs").exists(),
+                    "deletion mirrored"
+                );
+                assert!(host_dir.join("src/nested").is_dir());
+                assert!(
+                    !host_dir.join("old-dir").exists(),
+                    "directory deletion mirrored"
+                );
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode = std::fs::metadata(host_dir.join("tool.sh"))
+                        .unwrap()
+                        .permissions()
+                        .mode();
+                    assert_eq!(mode & 0o777, 0o755);
+                }
+                assert!(
+                    std::fs::read(host_dir.join("blob.bin")).unwrap() == blob,
+                    "multi-chunk file copied back byte-for-byte"
+                );
+                assert!(
+                    std::fs::symlink_metadata(host_dir.join("guest-link")).is_err(),
+                    "guest symlinks are not materialized on the host"
+                );
+                assert!(std::fs::symlink_metadata(host_dir.join("host-link"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink());
+            }
+        })
+        .await;
+        assert_eq!(
+            std::fs::read(outside.path().join("target")).unwrap(),
+            b"untouched"
+        );
     }
 
     #[tokio::test]

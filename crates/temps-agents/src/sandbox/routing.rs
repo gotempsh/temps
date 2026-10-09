@@ -234,6 +234,16 @@ impl SandboxProvider for RoutingSandboxProvider {
             .await
     }
 
+    async fn sync_workspace_to_host(
+        &self,
+        handle: &SandboxHandle,
+        host_dir: &std::path::Path,
+    ) -> Result<(), AgentError> {
+        self.owner_of(handle)
+            .sync_workspace_to_host(handle, host_dir)
+            .await
+    }
+
     async fn kill_processes(
         &self,
         handle: &SandboxHandle,
@@ -399,6 +409,7 @@ mod tests {
         snapshots: AtomicUsize,
         restores: AtomicUsize,
         image_deletes: AtomicUsize,
+        syncs: AtomicUsize,
     }
 
     impl RecordingProvider {
@@ -408,6 +419,7 @@ mod tests {
                 snapshots: AtomicUsize::new(0),
                 restores: AtomicUsize::new(0),
                 image_deletes: AtomicUsize::new(0),
+                syncs: AtomicUsize::new(0),
             }
         }
 
@@ -427,6 +439,15 @@ mod tests {
     impl SandboxProvider for RecordingProvider {
         async fn create(&self, _config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
             Ok(self.handle())
+        }
+
+        async fn sync_workspace_to_host(
+            &self,
+            _handle: &SandboxHandle,
+            _host_dir: &std::path::Path,
+        ) -> Result<(), AgentError> {
+            self.syncs.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
 
         async fn exec(
@@ -616,6 +637,23 @@ mod tests {
             .unwrap();
         assert_eq!(contents, b"microsandbox-sandbox");
         assert!(router.supports_backend(SandboxBackend::Microsandbox));
+    }
+
+    #[tokio::test]
+    async fn workspace_sync_goes_to_the_handle_backend_only() {
+        let docker = Arc::new(RecordingProvider::new(SandboxBackend::Docker));
+        let firecracker = Arc::new(RecordingProvider::new(SandboxBackend::Firecracker));
+        let microsandbox = Arc::new(RecordingProvider::new(SandboxBackend::Microsandbox));
+        let router =
+            three_backend_router(docker.clone(), firecracker.clone(), microsandbox.clone());
+
+        router
+            .sync_workspace_to_host(&microsandbox.handle(), std::path::Path::new("/tmp/run-1"))
+            .await
+            .unwrap();
+        assert_eq!(microsandbox.syncs.load(Ordering::SeqCst), 1);
+        assert_eq!(docker.syncs.load(Ordering::SeqCst), 0);
+        assert_eq!(firecracker.syncs.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

@@ -262,6 +262,17 @@ impl SandboxProvider for NodeRoutingSandboxProvider {
             .await
     }
 
+    async fn sync_workspace_to_host(
+        &self,
+        handle: &SandboxHandle,
+        host_dir: &std::path::Path,
+    ) -> Result<(), AgentError> {
+        self.owner_of(handle)
+            .await?
+            .sync_workspace_to_host(handle, host_dir)
+            .await
+    }
+
     async fn kill_processes(
         &self,
         handle: &SandboxHandle,

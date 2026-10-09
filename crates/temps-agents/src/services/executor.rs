@@ -2770,6 +2770,15 @@ impl AgentExecutor {
             return Ok(());
         }
 
+        // A microVM backend keeps the agent's edits in its guest; bring them
+        // into `work_dir` before changes are read from it. A no-op for
+        // Docker, whose work dir is this directory.
+        if self.sandbox_registry.has_sandbox(run_id).await {
+            self.sandbox_registry
+                .sync_workspace_to_host(run_id, work_dir)
+                .await?;
+        }
+
         // Step 14: Detect changes.
         // If the AI provider reported which files it changed, use that list.
         // Otherwise fall back to `git diff` (works when work_dir is a real git repo).

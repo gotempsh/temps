@@ -678,6 +678,22 @@ pub trait SandboxProvider: Send + Sync {
         target_path: &str,
     ) -> Result<(), AgentError>;
 
+    /// Bring the sandbox's work dir back into `host_dir`, the host checkout
+    /// it was created from, so callers that read a run's results from the
+    /// host (change detection, PR file collection) see the agent's edits.
+    ///
+    /// The default does nothing: it is correct for backends whose work dir
+    /// *is* `host_dir` (Docker bind-mounts it). Backends that copy the
+    /// workspace into a guest override it.
+    async fn sync_workspace_to_host(
+        &self,
+        handle: &SandboxHandle,
+        host_dir: &std::path::Path,
+    ) -> Result<(), AgentError> {
+        let _ = (handle, host_dir);
+        Ok(())
+    }
+
     /// Kill processes inside the sandbox matching a pgrep/pkill pattern.
     ///
     /// `signal` is constrained to [`KillSignal`] — only SIGTERM/SIGKILL are
