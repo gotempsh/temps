@@ -882,6 +882,8 @@ enum CreatedTargetRelease {
     KeptForLinkedEnvironment(String),
     /// A deployment or another import started using the name meanwhile.
     KeptInUse,
+    /// Linked environments could not be checked, so it was never claimed.
+    KeptUnchecked(String),
     Failed(String),
 }
 
@@ -898,6 +900,10 @@ impl CreatedTargetRelease {
             Self::KeptForLinkedEnvironment(environment) => format!(
                 "The logical database it created for '{database}' was kept, because the \
                  linked environment {environment} resolves to it."
+            ),
+            Self::KeptUnchecked(reason) => format!(
+                "The logical database it created for '{database}' was kept, because \
+                 checking which project environments use that name failed ({reason})."
             ),
             Self::KeptInUse => format!(
                 "The logical database it created for '{database}' was kept, because a \
@@ -973,20 +979,27 @@ struct ImportJob {
 impl ImportJob {
     async fn execute(self) -> JobOutcome {
         let mut creation = TargetCreation::None;
-        let outcome = self.run(&mut creation).await;
+        let mut kept = None;
+        let outcome = self.run(&mut creation, &mut kept).await;
         if creation == TargetCreation::None || outcome.status == STATUS_SUCCEEDED {
             return outcome;
         }
         // Every path out of `run` after the target was created settles the
         // helper first, so nothing writes into the database any more, and
         // the run still holds the database lock until it is finalized.
-        self.release_created_target(outcome, creation).await
+        self.release_created_target(outcome, creation, kept).await
     }
 
     /// The import itself. Records in `creation` that this run set out to
     /// create the target database, so a failure can release what it created
     /// — including when preparing it failed after the database was allocated.
-    async fn run(&self, creation: &mut TargetCreation) -> JobOutcome {
+    /// `kept` says why a database it creates must be kept, decided before
+    /// anything is claimed.
+    async fn run(
+        &self,
+        creation: &mut TargetCreation,
+        kept: &mut Option<CreatedTargetRelease>,
+    ) -> JobOutcome {
         let Some(engine) = self.instance.data_import() else {
             return JobOutcome::failed("the service engine no longer supports imports".to_string());
         };
@@ -1012,11 +1025,17 @@ impl ImportJob {
         if self.cancel_requested().await {
             return JobOutcome::cancelled();
         }
+        let release_claim =
+            if preparation == TargetPreparation::Create && engine.releases_created_target() {
+                self.release_claim(kept).await
+            } else {
+                None
+            };
         if preparation == TargetPreparation::Create {
             *creation = TargetCreation::Attempted;
         }
         if let Err(e) = engine
-            .prepare_target(&self.config, &self.database, preparation, self.run_id)
+            .prepare_target(&self.config, &self.database, preparation, release_claim)
             .await
         {
             return JobOutcome::failed(scrub_secrets(&e.to_string(), &secrets));
@@ -1132,19 +1151,20 @@ impl ImportJob {
         measured.with_output(output.as_deref())
     }
 
-    /// Release the database this failed run created, unless a project
-    /// environment linked to the service resolves to the same name: a
-    /// deployment of it may have started using the database while the
-    /// import ran, and releasing would empty it and hand its number to the
-    /// next resource. Whatever happens is stated in the run's message.
+    /// Release the database this failed run created, unless the run decided
+    /// to keep it before creating it (`kept`, see [`Self::release_claim`]).
+    /// The engine releases only while the run's claim is intact, so a
+    /// database a deployment or another import adopted meanwhile is kept.
+    /// Whatever happens is stated in the run's message.
     ///
     /// After an `Attempted` creation (preparing the target failed) the run
-    /// may or may not have allocated it; the engine releases only what this
-    /// run provably created, and the message is left alone when nothing was.
+    /// may or may not have allocated it; only a release that happened is
+    /// added to the message.
     async fn release_created_target(
         &self,
         mut outcome: JobOutcome,
         creation: TargetCreation,
+        kept: Option<CreatedTargetRelease>,
     ) -> JobOutcome {
         let Some(engine) = self.instance.data_import() else {
             return outcome;
@@ -1152,24 +1172,9 @@ impl ImportJob {
         if !engine.releases_created_target() {
             return outcome;
         }
-        let release = match linked_environment_resolving_to(
-            self.db.as_ref(),
-            self.service_id,
-            &self.database,
-        )
-        .await
-        {
-            Ok(Some(environment)) => {
-                info!(
-                    run_id = self.run_id,
-                    service_id = self.service_id,
-                    target_database = %self.database,
-                    linked_environment = %environment,
-                    "Kept the database a failed data import created: a linked environment resolves to it"
-                );
-                CreatedTargetRelease::KeptForLinkedEnvironment(environment)
-            }
-            Ok(None) => match engine
+        let release = match kept {
+            Some(kept) => kept,
+            None => match engine
                 .release_created_target(&self.config, &self.database, self.run_id)
                 .await
             {
@@ -1182,7 +1187,6 @@ impl ImportJob {
                     );
                     CreatedTargetRelease::Released
                 }
-                Ok(false) if creation == TargetCreation::Attempted => return outcome,
                 Ok(false) => {
                     info!(
                         run_id = self.run_id,
@@ -1192,32 +1196,66 @@ impl ImportJob {
                     );
                     CreatedTargetRelease::KeptInUse
                 }
-                Err(e) => CreatedTargetRelease::Failed(scrub_secrets(
-                    &e.to_string(),
-                    &self.source.secrets(),
-                )),
+                Err(e) => {
+                    let reason = scrub_secrets(&e.to_string(), &self.source.secrets());
+                    warn!(
+                        run_id = self.run_id,
+                        service_id = self.service_id,
+                        target_database = %self.database,
+                        reason = %reason,
+                        "Could not release the database a failed data import created"
+                    );
+                    CreatedTargetRelease::Failed(reason)
+                }
             },
-            Err(e) => CreatedTargetRelease::Failed(format!(
-                "could not check which project environments use it: {e}"
-            )),
         };
-        if let CreatedTargetRelease::Failed(reason) = &release {
-            warn!(
-                run_id = self.run_id,
-                service_id = self.service_id,
-                target_database = %self.database,
-                reason = %reason,
-                "Could not release the database a failed data import created"
-            );
-            // Preparing failed too: whether anything was created is unknown,
-            // and the preparation error already explains the run.
-            if creation == TargetCreation::Attempted {
-                return outcome;
-            }
+        // Preparing failed: whether the database was created at all is
+        // unknown, so only a release that happened is worth stating; the
+        // preparation error explains the run.
+        if creation == TargetCreation::Attempted && release != CreatedTargetRelease::Released {
+            return outcome;
         }
         outcome.error_message =
             Some(release.describe(outcome.error_message.as_deref(), &self.database));
         outcome
+    }
+
+    /// The run's claim on a database it is about to create: `Some(run_id)`
+    /// when it may release it after a failure, `None` (with the reason in
+    /// `kept`) when it must keep it. Decided before anything is claimed, so
+    /// no release — including one an abandoned allocation runs in the
+    /// background — can touch a database the run keeps.
+    ///
+    /// A failed import into the name a linked project environment resolves
+    /// to keeps the database, because that environment will use it.
+    async fn release_claim(&self, kept: &mut Option<CreatedTargetRelease>) -> Option<i32> {
+        match linked_environment_resolving_to(self.db.as_ref(), self.service_id, &self.database)
+            .await
+        {
+            Ok(None) => Some(self.run_id),
+            Ok(Some(environment)) => {
+                info!(
+                    run_id = self.run_id,
+                    service_id = self.service_id,
+                    target_database = %self.database,
+                    linked_environment = %environment,
+                    "A linked environment resolves to the import target: a database the import creates is kept"
+                );
+                *kept = Some(CreatedTargetRelease::KeptForLinkedEnvironment(environment));
+                None
+            }
+            Err(e) => {
+                warn!(
+                    run_id = self.run_id,
+                    service_id = self.service_id,
+                    target_database = %self.database,
+                    error = %e,
+                    "Could not check linked environments: a database the import creates is kept"
+                );
+                *kept = Some(CreatedTargetRelease::KeptUnchecked(e.to_string()));
+                None
+            }
+        }
     }
 
     /// One or two sentences: what failed, the likely cause when the engine
@@ -1615,7 +1653,7 @@ mod tests {
         engine
             .data_import()
             .expect("redis imports")
-            .prepare_target(&config, "existing_target", TargetPreparation::Create, 1)
+            .prepare_target(&config, "existing_target", TargetPreparation::Create, None)
             .await
             .expect("pre-allocate");
 
@@ -1686,6 +1724,16 @@ mod tests {
             )
             .await;
         assert!(ok && !out.trim().is_empty(), "mapping kept: {out:?}");
+        // It was decided before anything was claimed: no release path, not
+        // even an abandoned allocation's, can touch it.
+        let (ok, out) = docker
+            .sh(
+                &target.name,
+                "redis-cli --no-auth-warning -a \"$PW\" -n 0 EXISTS _temps:redis_import_claim:shop_production",
+                target_env.clone(),
+            )
+            .await;
+        assert!(ok && out.trim() == "0", "never claimed: {out:?}");
 
         let existing = run_import("existing_target").await;
         let message = existing.error_message.expect("message");
@@ -2176,7 +2224,7 @@ mod tests {
             _config: &ServiceConfig,
             _database: &str,
             _preparation: TargetPreparation,
-            _run_id: i32,
+            _release_claim: Option<i32>,
         ) -> Result<(), DataImportError> {
             Ok(())
         }

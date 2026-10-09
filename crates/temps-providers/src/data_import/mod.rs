@@ -242,14 +242,16 @@ pub trait DataImportEngine: Send + Sync {
     /// project provisioning creates it (same owner, same grants), so a
     /// deployment linked later finds it and uses it.
     ///
-    /// `run_id` identifies the import run, for engines that record which
-    /// run created a database (see [`Self::release_created_target`]).
+    /// `release_claim` is the import run's id when the run may release the
+    /// database if it creates it: engines that release record that this run
+    /// created it (see [`Self::release_created_target`]). `None` means the
+    /// database is kept whatever happens, so nothing may release it.
     async fn prepare_target(
         &self,
         config: &ServiceConfig,
         database: &str,
         preparation: TargetPreparation,
-        run_id: i32,
+        release_claim: Option<i32>,
     ) -> Result<(), DataImportError>;
 
     /// Undo a [`TargetPreparation::Create`] after the import did not

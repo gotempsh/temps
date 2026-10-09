@@ -423,7 +423,7 @@ impl DataImportEngine for RedisService {
         config: &ServiceConfig,
         database: &str,
         preparation: TargetPreparation,
-        run_id: i32,
+        release_claim: Option<i32>,
     ) -> Result<(), DataImportError> {
         self.validate_target_database(database)?;
         let service = config.name.as_str();
@@ -451,7 +451,13 @@ impl DataImportEngine for RedisService {
             return Ok(());
         }
         if preparation == TargetPreparation::Create {
-            return self.create_claimed(service, &redis, database, run_id).await;
+            if let Some(run_id) = release_claim {
+                return self.create_claimed(service, &redis, database, run_id).await;
+            }
+            // Kept whatever happens: allocate like provisioning, unclaimed.
+            self.import_allocate(service, &redis, database, None, TARGET_STEP_TIMEOUT)
+                .await?;
+            return Ok(());
         }
         let db_number = self
             .import_allocate(service, &redis, database, None, TARGET_STEP_TIMEOUT)
@@ -798,7 +804,7 @@ mod tests {
                 target_cli(docker, &target.name, "-n 1 SET stale 1").await;
             }
             engine
-                .prepare_target(&config, "storefront_production", preparation, 1)
+                .prepare_target(&config, "storefront_production", preparation, Some(1))
                 .await
                 .expect("prepare");
             let parsed = engine.parse_source(&source_url).expect("source");
@@ -948,7 +954,12 @@ mod tests {
             TargetPreparation::Create
         );
         engine
-            .prepare_target(&config, "abandoned_import", TargetPreparation::Create, 1)
+            .prepare_target(
+                &config,
+                "abandoned_import",
+                TargetPreparation::Create,
+                Some(1),
+            )
             .await
             .expect("prepare");
         assert_eq!(
@@ -1002,7 +1013,7 @@ mod tests {
         );
         // The freed number is handed out again.
         engine
-            .prepare_target(&config, "next_import", TargetPreparation::Create, 1)
+            .prepare_target(&config, "next_import", TargetPreparation::Create, Some(1))
             .await
             .expect("prepare");
         assert_eq!(
@@ -1023,7 +1034,7 @@ mod tests {
         // 1. A retry of the import adopts the name (UseExisting): the old
         //    run's release finds its claim gone.
         engine
-            .prepare_target(&config, "next_import", TargetPreparation::UseExisting, 2)
+            .prepare_target(&config, "next_import", TargetPreparation::UseExisting, None)
             .await
             .expect("retry adopts");
         target_cli(docker, &target.name, "-n 2 SET retry-data 1").await;
@@ -1042,7 +1053,12 @@ mod tests {
 
         // 2. Provisioning adopts a name a run created.
         engine
-            .prepare_target(&config, "deployed_meanwhile", TargetPreparation::Create, 3)
+            .prepare_target(
+                &config,
+                "deployed_meanwhile",
+                TargetPreparation::Create,
+                Some(3),
+            )
             .await
             .expect("prepare");
         let adopted = engine
@@ -1071,7 +1087,12 @@ mod tests {
             .await
             .expect("provisioning allocation");
         engine
-            .prepare_target(&config, "provisioned_first", TargetPreparation::Create, 4)
+            .prepare_target(
+                &config,
+                "provisioned_first",
+                TargetPreparation::Create,
+                Some(4),
+            )
             .await
             .expect("prepare");
         assert_eq!(
@@ -1095,7 +1116,7 @@ mod tests {
 
         // 4. Another run's id never releases; the run's own does.
         engine
-            .prepare_target(&config, "someone_elses", TargetPreparation::Create, 5)
+            .prepare_target(&config, "someone_elses", TargetPreparation::Create, Some(5))
             .await
             .expect("prepare");
         assert!(!engine
@@ -1115,7 +1136,7 @@ mod tests {
                 &config,
                 "released_under_retry",
                 TargetPreparation::Create,
-                7,
+                Some(7),
             )
             .await
             .expect("prepare");
@@ -1128,7 +1149,7 @@ mod tests {
                 &config,
                 "released_under_retry",
                 TargetPreparation::UseExisting,
-                8,
+                None,
             )
             .await
             .expect_err("nothing to adopt");
@@ -1203,6 +1224,39 @@ mod tests {
             )
             .await,
             "0"
+        );
+
+        // 7. A run that must keep what it creates (a linked environment
+        //    resolves to the name) creates it unclaimed: nothing, not even
+        //    the run itself, can release it.
+        engine
+            .prepare_target(
+                &config,
+                "kept_for_environment",
+                TargetPreparation::Create,
+                None,
+            )
+            .await
+            .expect("prepare");
+        assert_eq!(
+            target_cli(
+                docker,
+                &target.name,
+                "-n 0 EXISTS _temps:redis_import_claim:kept_for_environment"
+            )
+            .await,
+            "0"
+        );
+        for run_id in [0, 1, 10] {
+            assert!(!engine
+                .release_created_target(&config, "kept_for_environment", run_id)
+                .await
+                .expect("release"));
+        }
+        assert!(
+            !target_cli(docker, &target.name, &mapping("kept_for_environment"))
+                .await
+                .is_empty()
         );
     }
 }

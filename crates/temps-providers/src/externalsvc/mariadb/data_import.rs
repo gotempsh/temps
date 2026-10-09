@@ -258,7 +258,7 @@ impl DataImportEngine for MariaDbService {
         config: &ServiceConfig,
         database: &str,
         preparation: TargetPreparation,
-        _run_id: i32,
+        _release_claim: Option<i32>,
     ) -> Result<(), DataImportError> {
         self.validate_target_database(database)?;
         let service = config.name.as_str();
@@ -621,7 +621,7 @@ mod tests {
                 plan_target_preparation(1, "shop_production", inspection, replace, "table")
                     .expect("plan");
             engine
-                .prepare_target(&config, "shop_production", preparation, 1)
+                .prepare_target(&config, "shop_production", preparation, None)
                 .await
                 .expect("prepare");
             let parsed = engine.parse_source(&source_url).expect("source");
