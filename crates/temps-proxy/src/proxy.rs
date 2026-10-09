@@ -5293,18 +5293,21 @@ impl ProxyHttp for LoadBalancer {
                         // attack-mode checks, and activity recording.
                         let resolve_deadline =
                             std::time::Instant::now() + std::time::Duration::from_secs(5);
+                        // A context for a host without a live upstream (its
+                        // containers not running yet) is not routable: keep
+                        // polling rather than failing the first request.
                         let mut routable = self
                             .project_context_resolver
                             .resolve_context(&ctx.host)
                             .await
-                            .is_some();
+                            .is_some_and(|context| !context.upstream_unavailable);
                         while !routable && std::time::Instant::now() < resolve_deadline {
                             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                             routable = self
                                 .project_context_resolver
                                 .resolve_context(&ctx.host)
                                 .await
-                                .is_some();
+                                .is_some_and(|context| !context.upstream_unavailable);
                         }
 
                         if routable {
@@ -5395,9 +5398,14 @@ impl ProxyHttp for LoadBalancer {
             ctx.deployment = Some(project_ctx.deployment.clone());
             ctx.routing_status = "routed".to_string();
 
-            // Record activity for on-demand idle tracking
+            // Record activity for on-demand idle tracking. A request that
+            // will be answered 503 (no live upstream) is not activity: it must
+            // not keep an environment with dead containers from idling to
+            // sleep, after which the next request wakes it cleanly.
             if let Some(ref on_demand) = self.on_demand_manager {
-                on_demand.record_activity(project_ctx.environment.id);
+                if !project_ctx.upstream_unavailable {
+                    on_demand.record_activity(project_ctx.environment.id);
+                }
             }
 
             // Per-project/environment concurrent-connection cap (issue #646): a slow

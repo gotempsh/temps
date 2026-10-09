@@ -13,6 +13,12 @@ pub struct ProjectContext {
     pub project: Arc<projects::Model>,
     pub environment: Arc<environments::Model>,
     pub deployment: Arc<deployments::Model>,
+    /// The host belongs to this deployment but it has no live upstream right
+    /// now (stopped or crashed containers, or a paused deployment). The
+    /// request is still attributed and policed, but the upstream resolver
+    /// fails it with a 503 instead of proxying it anywhere.
+    #[serde(default)]
+    pub upstream_unavailable: bool,
 }
 
 /// Visitor information resolved from the stateless cookie codec.

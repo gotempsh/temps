@@ -1279,4 +1279,312 @@ mod route_table_tests {
 
         Ok(())
     }
+
+    // ── Hosts without a live backend (issue #1334) ────────────────────
+    //
+    // A deployment whose containers are all down used to vanish from the
+    // route table, so the proxy fell back to the console and answered the
+    // app's hostname with the console SPA and HTTP 200. These hosts must stay
+    // unroutable but be reported through `get_unavailable_route`.
+
+    /// Isolated database, or `None` when Docker is unavailable.
+    async fn database_or_skip() -> Option<TestDatabase> {
+        match TestDatabase::with_migrations().await {
+            Ok(database) => Some(database),
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Skipping unavailable-route test: Docker runtime unavailable: {error}");
+                None
+            }
+            Err(error) => panic!("Could not create isolated test database: {error}"),
+        }
+    }
+
+    /// One container row for `deployment_id` in `status`.
+    async fn insert_container(
+        test_db: &TestDBMockOperations,
+        deployment_id: i32,
+        status: &str,
+        host_port: Option<i32>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use temps_entities::deployment_containers;
+        deployment_containers::ActiveModel {
+            deployment_id: Set(deployment_id),
+            container_id: Set(format!("container-{status}-{deployment_id}")),
+            container_name: Set(format!("container-{status}-{deployment_id}")),
+            container_port: Set(3000),
+            host_port: Set(host_port),
+            image_name: Set(Some("test-image:latest".to_string())),
+            status: Set(Some(status.to_string())),
+            deployed_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await?;
+        Ok(())
+    }
+
+    async fn insert_environment_domain(
+        test_db: &TestDBMockOperations,
+        environment_id: i32,
+        domain: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        environment_domains::ActiveModel {
+            domain: Set(domain.to_string()),
+            environment_id: Set(environment_id),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await?;
+        Ok(())
+    }
+
+    /// Assert `host` is not routable and is reported unavailable for exactly
+    /// this project/environment/deployment.
+    fn assert_unavailable(
+        route_table: &CachedPeerTable,
+        host: &str,
+        ids: (i32, i32, i32),
+        reason: crate::route_table::UnavailableReason,
+    ) {
+        assert!(
+            route_table.get_route_by_host(host).is_none()
+                && route_table.get_route(host).is_none()
+                && route_table.resolve_route_for_sni(host).is_none(),
+            "{host} has no live backend and must not be routable"
+        );
+        let unavailable = route_table
+            .get_unavailable_route(host)
+            .unwrap_or_else(|| panic!("{host} must be reported as unavailable"));
+        assert_eq!(
+            (
+                unavailable.project.id,
+                unavailable.environment.id,
+                unavailable.deployment.id
+            ),
+            ids,
+            "{host} must be attributed to its own project/environment/deployment"
+        );
+        assert_eq!(unavailable.reason, reason, "{host}");
+    }
+
+    #[tokio::test]
+    async fn exited_only_container_reports_app_hosts_unavailable(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::route_table::UnavailableReason;
+        use temps_entities::environments;
+
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        let (project, environment, deployment) = test_db
+            .create_test_project_with_domain("exited-app.example.com")
+            .await?;
+        environments::ActiveModel {
+            id: Set(environment.id),
+            subdomain: Set("exited-app-production".to_string()),
+            ..Default::default()
+        }
+        .update(test_db.db.as_ref())
+        .await?;
+        // Docker reported the container as exited (`docker stop` or a crash).
+        insert_container(&test_db, deployment.id, "exited", Some(9700)).await?;
+        insert_environment_domain(&test_db, environment.id, "exited-app.preview.example.com")
+            .await?;
+
+        let route_table = CachedPeerTable::new(test_db.db.clone());
+        route_table.load_routes().await?;
+
+        let ids = (project.id, environment.id, deployment.id);
+        // Section 1 (environment domain), section 4 (the environment's own
+        // hostname and its internal name).
+        for host in [
+            "exited-app.preview.example.com".to_string(),
+            "exited-app-production".to_string(),
+            format!("production.{}.temps.local", project.slug),
+        ] {
+            assert_unavailable(&route_table, &host, ids, UnavailableReason::NoLiveBackend);
+        }
+        assert!(
+            route_table
+                .get_unavailable_route("unknown.example.com")
+                .is_none(),
+            "a host no project owns is not an application outage"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn host_mode_container_without_published_port_is_unavailable(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::route_table::UnavailableReason;
+
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        let (project, environment, deployment) = test_db
+            .create_test_project_with_domain("no-port.example.com")
+            .await?;
+        // Still "running" in the database, but the health monitor cleared
+        // the host port because Docker no longer publishes one.
+        insert_container(&test_db, deployment.id, "running", None).await?;
+        insert_environment_domain(&test_db, environment.id, "no-port.preview.example.com").await?;
+
+        // `CachedPeerTable::new` runs in Host execution mode, where a
+        // container is only reachable through its published port.
+        let route_table = CachedPeerTable::new(test_db.db.clone());
+        route_table.load_routes().await?;
+
+        assert_unavailable(
+            &route_table,
+            "no-port.preview.example.com",
+            (project.id, environment.id, deployment.id),
+            UnavailableReason::NoLiveBackend,
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn paused_deployment_hosts_are_unavailable() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::route_table::UnavailableReason;
+        use temps_entities::deployments;
+
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        let (project, environment, deployment) = test_db
+            .create_test_project_with_domain("paused-app.example.com")
+            .await?;
+        // Even a container row that still says "running" is not routed
+        // while the deployment is paused.
+        insert_container(&test_db, deployment.id, "running", Some(9701)).await?;
+        deployments::ActiveModel {
+            id: Set(deployment.id),
+            state: Set("paused".to_string()),
+            ..Default::default()
+        }
+        .update(test_db.db.as_ref())
+        .await?;
+        insert_environment_domain(&test_db, environment.id, "paused-app.preview.example.com")
+            .await?;
+
+        let route_table = CachedPeerTable::new(test_db.db.clone());
+        route_table.load_routes().await?;
+
+        assert_unavailable(
+            &route_table,
+            "paused-app.preview.example.com",
+            (project.id, environment.id, deployment.id),
+            UnavailableReason::Paused,
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sleeping_on_demand_environment_is_left_to_the_wake_path(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use temps_entities::environments;
+
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        let (_project, environment, deployment) = test_db
+            .create_test_project_with_domain("sleeping-app.example.com")
+            .await?;
+        environments::ActiveModel {
+            id: Set(environment.id),
+            sleeping: Set(true),
+            ..Default::default()
+        }
+        .update(test_db.db.as_ref())
+        .await?;
+        insert_container(&test_db, deployment.id, "exited", Some(9702)).await?;
+        insert_environment_domain(&test_db, environment.id, "sleeping-app.preview.example.com")
+            .await?;
+
+        let route_table = CachedPeerTable::new(test_db.db.clone());
+        let sleeping = route_table.load_routes().await?;
+
+        let host = "sleeping-app.preview.example.com";
+        assert!(route_table.get_route_by_host(host).is_none());
+        assert!(
+            route_table.get_unavailable_route(host).is_none(),
+            "a sleeping environment must keep waking on request, not answer 503"
+        );
+        assert!(
+            sleeping
+                .iter()
+                .any(|entry| entry.domain == host && entry.environment_id == environment.id),
+            "the sleeping environment must still be handed to the wake path: {sleeping:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_route_always_wins_over_an_unavailable_entry(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::route_table::UnavailableReason;
+
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        let (project, environment, deployment) = test_db
+            .create_test_project_with_domain("down-app.example.com")
+            .await?;
+        insert_container(&test_db, deployment.id, "exited", Some(9703)).await?;
+        for domain in [
+            "shared.example.com",
+            "app.wild.example.com",
+            "only-down.example.com",
+        ] {
+            insert_environment_domain(&test_db, environment.id, domain).await?;
+        }
+        // Operator routes that resolve two of those hosts to a live upstream:
+        // one exact, one through a wildcard.
+        for domain in ["shared.example.com", "*.wild.example.com"] {
+            custom_routes::ActiveModel {
+                domain: Set(domain.to_string()),
+                host: Set("localhost".to_string()),
+                port: Set(8080),
+                enabled: Set(true),
+                ..Default::default()
+            }
+            .insert(test_db.db.as_ref())
+            .await?;
+        }
+
+        let route_table = CachedPeerTable::new(test_db.db.clone());
+        route_table.load_routes().await?;
+
+        for host in ["shared.example.com", "app.wild.example.com"] {
+            assert!(
+                route_table.get_route_by_host(host).is_some(),
+                "{host} has a live route"
+            );
+            assert!(
+                route_table.get_unavailable_route(host).is_none(),
+                "{host} has a live route and must not be reported unavailable"
+            );
+        }
+        assert_unavailable(
+            &route_table,
+            "only-down.example.com",
+            (project.id, environment.id, deployment.id),
+            UnavailableReason::NoLiveBackend,
+        );
+
+        Ok(())
+    }
 }
