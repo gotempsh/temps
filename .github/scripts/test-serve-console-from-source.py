@@ -19,11 +19,13 @@ a GitHub runner. Elsewhere the tests skip when nginx is unavailable.
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import http.client
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import tempfile
@@ -36,6 +38,27 @@ from pathlib import Path
 SCRIPT = Path(__file__).resolve().parent / "serve-console-from-source.sh"
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC11B5B"
 UPLOAD_BYTES = 5 * 1024 * 1024
+
+
+def stop_nginx(pid_file: Path, timeout: float = 10.0) -> None:
+    """Stop the nginx master recorded in `pid_file`, if it is running."""
+    try:
+        pid = int(pid_file.read_text().strip())
+    except (FileNotFoundError, ValueError):
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.1)
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGKILL)
 
 
 def free_port() -> int:
@@ -127,7 +150,12 @@ class Upstream(BaseHTTPRequestHandler):
 class ConsoleProxyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        # Cleanups, not tearDownClass: unittest skips tearDownClass when
+        # setUpClass raises, but always runs registered class cleanups (in
+        # reverse order), so a failed or timed-out start never leaves nginx
+        # holding its port or the temporary directory behind.
         cls.tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.tmp.cleanup)
         root = Path(cls.tmp.name)
         cls.dist = root / "dist"
         (cls.dist / "static" / "js").mkdir(parents=True)
@@ -138,8 +166,13 @@ class ConsoleProxyTests(unittest.TestCase):
 
         cls.upstream_port = free_port()
         cls.upstream = ThreadingHTTPServer(("127.0.0.1", cls.upstream_port), Upstream)
+        cls.addClassCleanup(cls.upstream.server_close)
         threading.Thread(target=cls.upstream.serve_forever, daemon=True).start()
+        cls.addClassCleanup(cls.upstream.shutdown)
 
+        # Registered before the script runs: it may start nginx and then fail
+        # a later check, or be killed by the timeout before it can stop it.
+        cls.addClassCleanup(stop_nginx, cls.work / "nginx.pid")
         cls.port = free_port()
         result = subprocess.run(
             [str(SCRIPT), str(cls.dist), str(cls.port), str(cls.upstream_port), str(cls.work)],
@@ -148,19 +181,10 @@ class ConsoleProxyTests(unittest.TestCase):
             timeout=300,
         )
         if result.returncode != 0:
-            cls.upstream.shutdown()
             raise AssertionError(
                 f"serve-console-from-source.sh failed ({result.returncode}):\n"
                 f"{result.stdout}\n{result.stderr}"
             )
-
-    @classmethod
-    def tearDownClass(cls) -> None:
-        pid_file = cls.work / "nginx.pid"
-        if pid_file.exists():
-            subprocess.run(["kill", pid_file.read_text().strip()], check=False)
-        cls.upstream.shutdown()
-        cls.tmp.cleanup()
 
     def get(self, path: str, method: str = "GET", body: bytes | None = None):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
@@ -258,6 +282,45 @@ class ConsoleProxyTests(unittest.TestCase):
             self.assertIn(b"Sec-WebSocket-Accept: " + expected, handshake)
             sock.sendall(b"ping")
             self.assertEqual(sock.recv(1024), b"echo:ping")
+
+
+@unittest.skipUnless(
+    shutil.which("nginx") or (shutil.which("apt-get") and os.environ.get("CI")),
+    "nginx is not installed (the script installs it on CI runners)",
+)
+class FailedStartTests(unittest.TestCase):
+    def test_a_failed_check_after_start_stops_nginx(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        dist = Path(tmp.name) / "dist"
+        dist.mkdir()
+        (dist / "index.html").write_text("<!doctype html>\n")
+        work = Path(tmp.name) / "nginx"
+        self.addCleanup(stop_nginx, work / "nginx.pid")
+        port = free_port()
+        # Nothing listens upstream, so nginx starts and serves the bundle but
+        # the final /healthz check through it fails.
+        result = subprocess.run(
+            [str(SCRIPT), str(dist), str(port), str(free_port()), str(work)],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("did not reach the binary", result.stderr)
+        pid = int((work / "nginx.pid").read_text().strip()) if (work / "nginx.pid").exists() else None
+        deadline = time.monotonic() + 10
+        while pid is not None and time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            if pid is not None:
+                self.fail(f"nginx (pid {pid}) is still running after the script failed")
+        with socket.socket() as sock:
+            self.assertNotEqual(sock.connect_ex(("127.0.0.1", port)), 0, "console port still open")
 
 
 class ArgumentTests(unittest.TestCase):

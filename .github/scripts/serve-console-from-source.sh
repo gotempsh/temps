@@ -142,6 +142,19 @@ http {
 EOF
 
 "$NGINX" -t -q -p "$WORK" -e "$WORK/error.log" -c "$WORK/nginx.conf"
+
+# From here on nginx is running. Any failed check below must not leave it
+# holding the console port, so stop it on every exit until the checks pass;
+# INT/TERM become an exit so the trap runs for them too. (SIGKILL cannot be
+# trapped -- callers that can kill this script also stop nginx via its pid
+# file, $WORK/nginx.pid.)
+stop_nginx() {
+  "$NGINX" -q -p "$WORK" -e "$WORK/error.log" -c "$WORK/nginx.conf" -s stop 2>/dev/null \
+    || { [[ -f "$WORK/nginx.pid" ]] && kill "$(cat "$WORK/nginx.pid")" 2>/dev/null; } \
+    || true
+}
+trap stop_nginx EXIT
+trap 'exit 130' INT TERM
 "$NGINX" -p "$WORK" -e "$WORK/error.log" -c "$WORK/nginx.conf"
 
 console="http://127.0.0.1:${LISTEN_PORT}"
@@ -165,4 +178,6 @@ if ! curl -sf -o /dev/null "$console/healthz"; then
   exit 1
 fi
 
+# Every check passed: leave nginx serving for the rest of the job.
+trap - EXIT INT TERM
 echo "Serving the console from $DIST on port $LISTEN_PORT; API, MCP and health probes go to port $UPSTREAM_PORT"

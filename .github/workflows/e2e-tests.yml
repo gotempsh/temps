@@ -643,4 +643,8 @@ jobs:
           if [ -f /tmp/temps.pid ]; then
             kill "$(cat /tmp/temps.pid)" 2>/dev/null || true
           fi
+          # The console proxy, when console-from-source started one.
+          if [ -f /tmp/temps-console-proxy/nginx.pid ]; then
+            kill "$(cat /tmp/temps-console-proxy/nginx.pid)" 2>/dev/null || true
+          fi
           docker system prune -f 2>/dev/null || true
