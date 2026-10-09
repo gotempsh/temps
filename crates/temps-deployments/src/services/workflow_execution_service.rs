@@ -2724,18 +2724,30 @@ impl WorkflowExecutionService {
             return Err("node scheduling is not available on this server".to_string());
         };
 
-        // A dedicated builder of the required platform needs no placement.
-        if let Some(platform) = &candidate.platform {
-            let dedicated = scheduler
+        // A dedicated builder needs no placement: one of the required
+        // platform, or of any architecture for a static site. Placement below
+        // only considers workload nodes, so this is the only way a builder-only
+        // node can take the build.
+        let dedicated = match &candidate.platform {
+            Some(platform) => scheduler
                 .select_builder_node(platform)
                 .await
-                .map_err(|error| format!("could not list build nodes: {error}"))?;
-            if let Some(node) = dedicated {
-                return self
-                    .connect_build_node(deployment_id, node, platform.clone())
-                    .await
-                    .map_err(|error| error.to_string());
-            }
+                .map(|node| node.map(|node| (node, platform.clone()))),
+            None => scheduler.select_any_builder_node().await.map(|node| {
+                node.and_then(|node| {
+                    let platform = node.architecture.as_deref().map(|architecture| {
+                        temps_deployer::platform::canonicalize_platform(architecture)
+                    })?;
+                    Some((node, platform))
+                })
+            }),
+        }
+        .map_err(|error| format!("could not list build nodes: {error}"))?;
+        if let Some((node, platform)) = dedicated {
+            return self
+                .connect_build_node(deployment_id, node, platform)
+                .await
+                .map_err(|error| error.to_string());
         }
 
         let required_platforms: Vec<String> = candidate.platform.iter().cloned().collect();
@@ -2787,29 +2799,17 @@ impl WorkflowExecutionService {
 
         let platform = match candidate.platform {
             Some(platform) => platform,
-            None => {
-                // A static site builds for whatever the chosen worker runs,
-                // so a dedicated builder of that architecture can take it.
-                let platform = target_platform
-                    .filter(|value| temps_deployer::platform::is_buildable_platform(value))
-                    .ok_or_else(|| {
-                        format!(
-                            "worker '{target_name}' (id={target_id}) has not reported a \
-                             buildable architecture yet"
-                        )
-                    })?;
-                let dedicated = scheduler
-                    .select_builder_node(&platform)
-                    .await
-                    .map_err(|error| format!("could not list build nodes: {error}"))?;
-                if let Some(node) = dedicated {
-                    return self
-                        .connect_build_node(deployment_id, node, platform)
-                        .await
-                        .map_err(|error| error.to_string());
-                }
-                platform
-            }
+            // A static site builds for whatever the chosen worker runs; no
+            // dedicated builder exists, or it would have been picked above.
+            None => target_platform
+                .filter(|value| temps_deployer::platform::is_buildable_platform(value))
+                .map(|value| temps_deployer::platform::canonicalize_platform(&value))
+                .ok_or_else(|| {
+                    format!(
+                        "worker '{target_name}' (id={target_id}) has not reported a \
+                         buildable architecture yet"
+                    )
+                })?,
         };
         let node = scheduler
             .node_service()

@@ -557,6 +557,18 @@ impl NodeScheduler {
         Ok(pick_builder_node(active_nodes, platform))
     }
 
+    /// Pick a build-only node of any buildable architecture, for builds
+    /// whose output does not depend on the architecture (a static site,
+    /// whose image never runs). Same deterministic lowest-id rule as
+    /// [`Self::select_builder_node`].
+    pub async fn select_any_builder_node(&self) -> Result<Option<nodes::Model>, NodeError> {
+        let active_nodes = self
+            .node_service
+            .list_active(self.heartbeat_threshold_secs)
+            .await?;
+        Ok(pick_builder_node_for(active_nodes, None))
+    }
+
     /// Container platforms a build must cover for this deployment to be
     /// schedulable everywhere it could land.
     ///
@@ -1496,6 +1508,12 @@ fn schedule_anti_affinity_least_loaded(
 /// Choose a build-only node for `platform` from `nodes` (see
 /// [`NodeScheduler::select_builder_node`]).
 fn pick_builder_node(nodes: Vec<nodes::Model>, platform: &str) -> Option<nodes::Model> {
+    pick_builder_node_for(nodes, Some(platform))
+}
+
+/// The lowest-id active build-only node whose architecture is buildable and,
+/// when `platform` is given, matches it.
+fn pick_builder_node_for(nodes: Vec<nodes::Model>, platform: Option<&str>) -> Option<nodes::Model> {
     nodes
         .into_iter()
         .filter(|node| {
@@ -1503,7 +1521,9 @@ fn pick_builder_node(nodes: Vec<nodes::Model>, platform: &str) -> Option<nodes::
                 && node.id != CONTROL_PLANE_NODE_ID
                 && node.architecture.as_deref().is_some_and(|node_platform| {
                     temps_deployer::platform::is_buildable_platform(node_platform)
-                        && temps_deployer::platform::platforms_match(node_platform, platform)
+                        && platform.is_none_or(|platform| {
+                            temps_deployer::platform::platforms_match(node_platform, platform)
+                        })
                 })
         })
         .min_by_key(|node| node.id)
@@ -4241,6 +4261,22 @@ mod tests {
         let mut unknown = builder_node(1, "builder", "linux/amd64");
         unknown.architecture = None;
         assert!(pick_builder_node(vec![unknown], "linux/amd64").is_none());
+    }
+
+    /// A static site may use a dedicated builder of any architecture; one
+    /// that has not reported an architecture is still never chosen.
+    #[test]
+    fn any_architecture_builder_is_picked_for_platform_independent_builds() {
+        let arm = builder_node(4, "builder-arm", "linux/arm64");
+        let amd = builder_node(3, "builder-amd", "linux/amd64");
+        let worker = make_node(1, "worker");
+        let mut unknown = builder_node(2, "builder-unknown", "linux/amd64");
+        unknown.architecture = None;
+
+        let picked = pick_builder_node_for(vec![arm, amd, worker.clone(), unknown.clone()], None)
+            .expect("a builder of either architecture qualifies");
+        assert_eq!(picked.id, 3);
+        assert!(pick_builder_node_for(vec![worker, unknown], None).is_none());
     }
 
     fn build_offload_placement(exclude_control_plane: bool) -> ReplicaPlacementRequest<'static> {
