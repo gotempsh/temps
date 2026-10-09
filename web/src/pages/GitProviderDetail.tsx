@@ -38,6 +38,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { FeedbackAlert } from '@/components/ui/feedback-alert'
+import { ReadFailure } from '@/components/ui/read-failure'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useFeedback } from '@/hooks/useFeedback'
@@ -75,6 +76,7 @@ import { useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 import { isGitHubApp, isGitLabOAuth } from '@/lib/provider'
 import { gitInstallationPollingOptions } from '@/lib/git-installation-polling'
+import { isVerifiedNotFound } from '@/lib/read-failure'
 import {
   authMethodDisplayName,
   providerDisplayName,
@@ -93,15 +95,13 @@ export default function GitProviderDetail() {
 
   const providerId = parseInt(id || '0', 10)
 
-  const {
-    data: provider,
-    isLoading,
-    error,
-  } = useQuery({
+  const providerQuery = useQuery({
     ...getGitProviderOptions({ path: { provider_id: providerId } }),
     retry: false,
     enabled: !!id && !isNaN(providerId),
   })
+  const { data: provider, isLoading, error } = providerQuery
+  const providerMissing = isVerifiedNotFound(error)
 
   const {
     data: connections,
@@ -291,13 +291,30 @@ export default function GitProviderDetail() {
     )
   }
 
-  if (error || !provider) {
+  // Only a verified 404 (or an id that cannot name a provider) proves the
+  // provider is missing. A refused or failed read says nothing about it, so
+  // it gets the read-failure state instead of "not found".
+  if (error && !providerMissing && !provider) {
+    return (
+      <div className="space-y-4 p-4 sm:p-6">
+        <ReadFailure
+          resource="Git provider"
+          error={error}
+          onRetry={() => providerQuery.refetch()}
+          retrying={providerQuery.isFetching}
+        />
+        {backAction}
+      </div>
+    )
+  }
+
+  if (providerMissing || !provider) {
     return (
       <PageState
         variant="failed"
         icon={AlertTriangle}
         title="Git Provider Not Found"
-        description="The git provider you're looking for doesn't exist or you don't have access to it."
+        description="The git provider you're looking for doesn't exist or was deleted."
         action={backAction}
       />
     )
@@ -428,6 +445,16 @@ export default function GitProviderDetail() {
         <>
           {/* Feedback Alert */}
           <FeedbackAlert feedback={feedback} onDismiss={clearFeedback} />
+
+          {error && (
+            <ReadFailure
+              resource="Git provider"
+              error={error}
+              cached
+              onRetry={() => providerQuery.refetch()}
+              retrying={providerQuery.isFetching}
+            />
+          )}
 
           {/* GitHub App Instructions - Only show if no connections */}
           {isGitHubApp(provider) &&

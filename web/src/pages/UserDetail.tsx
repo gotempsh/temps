@@ -15,6 +15,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { EmptyState } from '@/components/ui/empty-state'
+import { ReadFailure } from '@/components/ui/read-failure'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Table,
@@ -63,9 +64,11 @@ export function UserDetail() {
     null
   )
 
-  const { data: users, isLoading: isLoadingUser } = useQuery(
+  // There is no single-user endpoint: the user is looked up in the list.
+  const usersQuery = useQuery(
     listUsersOptions({ query: { include_deleted: true } })
   )
+  const { data: users, isLoading: isLoadingUser } = usersQuery
 
   const target = useMemo(
     () => users?.find((u) => u.user.id === parsedId),
@@ -169,6 +172,32 @@ export function UserDetail() {
     )
   }
 
+  // A failed or refused list read says nothing about whether this user
+  // exists. Report the failure instead of "User not found", and do not render
+  // placeholder stats for a user we could not load.
+  if (usersQuery.isError && !target) {
+    return (
+      <div className="space-y-6">
+        <div className="flex items-center gap-2">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => navigate('/settings/users')}
+          >
+            <ArrowLeft className="mr-2 h-4 w-4" />
+            Back to users
+          </Button>
+        </div>
+        <ReadFailure
+          resource="User"
+          error={usersQuery.error}
+          onRetry={() => usersQuery.refetch()}
+          retrying={usersQuery.isFetching}
+        />
+      </div>
+    )
+  }
+
   const lastLoginLocation = stats?.lastLogin
     ? [stats.lastLogin.city, stats.lastLogin.country].filter(Boolean).join(', ')
     : ''
@@ -189,6 +218,16 @@ export function UserDetail() {
           Back to users
         </Button>
       </div>
+
+      {usersQuery.isError && (
+        <ReadFailure
+          resource="User"
+          error={usersQuery.error}
+          cached
+          onRetry={() => usersQuery.refetch()}
+          retrying={usersQuery.isFetching}
+        />
+      )}
 
       {/* Profile card */}
       <Card>

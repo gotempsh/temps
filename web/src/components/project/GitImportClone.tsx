@@ -14,6 +14,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { Card, CardContent } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
+import { ReadFailure } from '@/components/ui/read-failure'
 import {
   Select,
   SelectTrigger,
@@ -57,6 +58,10 @@ import {
   templateBelongsToSource,
   templateSource,
 } from '@/lib/template-source-selection'
+import {
+  gitConnectionsUnknown,
+  newProjectLandingSource,
+} from './newProjectLanding'
 
 const SOURCE_VALUES: ProjectSource[] = [
   'templates',
@@ -251,9 +256,21 @@ export function GitImportClone({
     [mode, updateSearchParams]
   )
 
-  const { data: connections } = useQuery({
+  const connectionsQuery = useQuery({
     ...listConnectionsOptions(),
   })
+  const connections = connectionsQuery.data
+  // A failed read is not "no connections": it must neither land on the
+  // template gallery as if nothing were connected nor spin forever. That
+  // holds over a cached empty list too -- the failed refresh is the answer.
+  const connectionsRead = {
+    connections,
+    isError: connectionsQuery.isError,
+  }
+  const connectionsVerifiedEmpty =
+    !gitConnectionsUnknown(connectionsRead) &&
+    !connectionsQuery.isError &&
+    (connections?.connections.length ?? 0) === 0
 
   // Providers list lets us pick the right icon per connection (a GitLab
   // connection should not render the GitHub mark).
@@ -291,8 +308,11 @@ export function GitImportClone({
   // connection). The Repositories pill keeps the connect path reachable.
   useEffect(() => {
     if (selectedSource !== null) return
-    if (!connections) return
-    const landing = connections.connections.length > 0 ? 'browse' : 'templates'
+    const landing = newProjectLandingSource({
+      connections,
+      isError: connectionsQuery.isError,
+    })
+    if (!landing) return
     if (mode === 'navigation') {
       setSearchParams(
         (prev) => {
@@ -307,7 +327,13 @@ export function GitImportClone({
     } else {
       queueMicrotask(() => setLocalSource(landing))
     }
-  }, [connections, selectedSource, mode, setSearchParams])
+  }, [
+    connections,
+    connectionsQuery.isError,
+    selectedSource,
+    mode,
+    setSearchParams,
+  ])
 
   useEffect(() => {
     if (!connections || connections.connections.length === 0) return
@@ -725,7 +751,24 @@ export function GitImportClone({
 
   const sourceContentEl = (
     <>
-      {!selectedSource && !connections && (
+      {/* Also on Templates when no connection is cached: the gallery is
+          where an empty list lands, so a stale empty read must still say it
+          could not be confirmed and offer Retry. */}
+      {connectionsQuery.isError &&
+        (selectedSource === null ||
+          selectedSource === 'browse' ||
+          (selectedSource === 'templates' &&
+            (connections?.connections.length ?? 0) === 0)) && (
+          <ReadFailure
+            resource="Git connections"
+            error={connectionsQuery.error}
+            cached={(connections?.connections.length ?? 0) > 0}
+            onRetry={() => void connectionsQuery.refetch()}
+            retrying={connectionsQuery.isFetching}
+          />
+        )}
+
+      {!selectedSource && !connections && !connectionsQuery.isError && (
         <div className="space-y-3">
           <Skeleton className="h-10 w-full" />
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
@@ -772,7 +815,7 @@ export function GitImportClone({
         </Card>
       )}
 
-      {selectedSource === 'browse' && connections && connectionCount === 0 && (
+      {selectedSource === 'browse' && connectionsVerifiedEmpty && (
         <Card>
           <CardContent className="flex flex-col items-center text-center py-12 px-6">
             <FolderGit2 className="size-8 text-muted-foreground mb-3" />

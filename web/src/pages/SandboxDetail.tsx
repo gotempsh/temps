@@ -85,6 +85,8 @@ import {
 import { useAuth } from '@/contexts/AuthContext-shared'
 import { SandboxPreviewPasswordCard } from '@/components/sandboxes/SandboxPreviewPasswordCard'
 import { SandboxNodeValue } from '@/components/sandboxes/SandboxNode'
+import { ReadFailure } from '@/components/ui/read-failure'
+import { isVerifiedNotFound } from '@/lib/read-failure'
 
 // Presentation for each timeline event type: icon, human label, and an
 // optional one-line detail derived from the event's structured payload.
@@ -435,17 +437,33 @@ export default function SandboxDetail() {
     )
   }
 
-  if (isError || !sandbox) {
+  // Only a verified 404 proves the sandbox is gone -- even when an earlier
+  // poll left a cached copy, the server has now said it no longer exists.
+  if (isError && isVerifiedNotFound(error)) {
     return (
       <PageState
         variant="failed"
         icon={Box}
         title="Sandbox not found"
-        description={
-          (error as Error)?.message ?? 'This sandbox may have been deleted.'
-        }
+        description="This sandbox may have been deleted."
         action={backAction}
       />
+    )
+  }
+
+  // Any other failed read (5xx, network, 401/403) says nothing about whether
+  // the sandbox exists, so it must not be reported as missing.
+  if (!sandbox) {
+    return (
+      <div className="w-full space-y-4 px-4 py-6 sm:px-6 lg:px-8">
+        <ReadFailure
+          resource="Sandbox"
+          error={error}
+          onRetry={() => refetch()}
+          retrying={isFetching}
+        />
+        {backAction}
+      </div>
     )
   }
 
@@ -739,6 +757,15 @@ export default function SandboxDetail() {
       aside={aside}
       main={
         <>
+      {isError && (
+        <ReadFailure
+          resource="Sandbox"
+          error={error}
+          cached
+          onRetry={() => refetch()}
+          retrying={isFetching}
+        />
+      )}
       {/* Live status strip — countdown with inline extend actions */}
       {!destroyed && (
         <Card className={expired ? 'border-destructive/40' : undefined}>

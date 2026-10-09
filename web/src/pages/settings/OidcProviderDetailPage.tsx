@@ -42,6 +42,7 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
+import { ReadFailure } from '@/components/ui/read-failure'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Tooltip,
@@ -178,7 +179,7 @@ export function OidcProviderDetailPage() {
     )
   }
 
-  if (providersQuery.isLoading) {
+  if (providersQuery.isPending) {
     return (
       <div className="space-y-4">
         <Skeleton className="h-8 w-64" />
@@ -188,15 +189,26 @@ export function OidcProviderDetailPage() {
   }
 
   if (!provider) {
+    // "Not found" is only provable from a list read that succeeded and lacks
+    // this id. A failed or refused list read says nothing about the provider.
     return (
       <div className="space-y-4">
-        <Alert variant="destructive">
-          <AlertCircle className="h-4 w-4" />
-          <AlertTitle>Provider not found</AlertTitle>
-          <AlertDescription>
-            The OIDC provider you requested does not exist or was deleted.
-          </AlertDescription>
-        </Alert>
+        {providersQuery.isError ? (
+          <ReadFailure
+            resource="SSO provider"
+            error={providersQuery.error}
+            onRetry={() => providersQuery.refetch()}
+            retrying={providersQuery.isFetching}
+          />
+        ) : (
+          <Alert variant="destructive">
+            <AlertCircle className="h-4 w-4" />
+            <AlertTitle>Provider not found</AlertTitle>
+            <AlertDescription>
+              The OIDC provider you requested does not exist or was deleted.
+            </AlertDescription>
+          </Alert>
+        )}
         <Button variant="outline" onClick={() => navigate('/settings/auth')}>
           <ArrowLeft className="mr-2 h-4 w-4" />
           Back to authentication
@@ -238,6 +250,19 @@ export function OidcProviderDetailPage() {
           </div>
         </div>
       </div>
+
+      {/* A failed refresh keeps the last-known settings on screen, but they
+          may have changed: say so and offer Retry rather than present them
+          as current. */}
+      {providersQuery.isError && (
+        <ReadFailure
+          resource="SSO provider"
+          error={providersQuery.error}
+          cached
+          onRetry={() => providersQuery.refetch()}
+          retrying={providersQuery.isFetching}
+        />
+      )}
 
       <ProviderEditor
         provider={provider}

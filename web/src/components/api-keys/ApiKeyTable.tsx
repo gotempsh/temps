@@ -28,10 +28,15 @@ import { useQuery } from '@tanstack/react-query'
 import { getApiKeyPermissionsOptions } from '@/api/client/@tanstack/react-query.gen'
 import type { ApiKeyResponse } from '@/api/client'
 import { DataTable, type DataTableColumn } from '@temps-sdk/ds'
+import { ReadFailure } from '@/components/ui/read-failure'
 
 interface ApiKeyTableProps {
   apiKeys: ApiKeyResponse[] | undefined
   isLoading: boolean
+  /** The list read's error. A failed read is never an empty list. */
+  error?: unknown
+  onRetry: () => void
+  retrying: boolean
   onView: (key: ApiKeyResponse) => void
   onEdit: (key: ApiKeyResponse) => void
   onDelete: (key: ApiKeyResponse) => void
@@ -128,6 +133,9 @@ function PermissionsDisplay({ apiKey }: { apiKey: ApiKeyResponse }) {
 export function ApiKeyTable({
   apiKeys,
   isLoading,
+  error,
+  onRetry,
+  retrying,
   onView,
   onEdit,
   onDelete,
@@ -135,7 +143,23 @@ export function ApiKeyTable({
   onDeactivate,
   onCreateClick,
 }: ApiKeyTableProps) {
-  if (!isLoading && (!apiKeys || apiKeys.length === 0)) {
+  const hasKeys = !!apiKeys && apiKeys.length > 0
+  const readFailed = error != null
+
+  // Check the read before the empty branch: a refused or failed read must not
+  // tell the user they have no keys and invite them to create the first one.
+  if (readFailed && !hasKeys) {
+    return (
+      <ReadFailure
+        resource="API keys"
+        error={error}
+        onRetry={onRetry}
+        retrying={retrying}
+      />
+    )
+  }
+
+  if (!isLoading && !hasKeys) {
     return (
       <div className="flex flex-col items-center justify-center py-12 space-y-4">
         <div className="rounded-full bg-muted p-4">
@@ -259,6 +283,17 @@ export function ApiKeyTable({
 
   return (
     <TooltipProvider>
+      {readFailed && (
+        <div className="mb-4">
+          <ReadFailure
+            resource="API keys"
+            error={error}
+            cached
+            onRetry={onRetry}
+            retrying={retrying}
+          />
+        </div>
+      )}
       <DataTable<ApiKeyResponse>
         columns={columns}
         rows={apiKeys ?? []}

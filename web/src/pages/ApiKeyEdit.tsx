@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { useNavigate, useParams } from 'react-router'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
@@ -18,6 +18,7 @@ import { Switch } from '@/components/ui/switch'
 import { Badge } from '@/components/ui/badge'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Separator } from '@/components/ui/separator'
+import { ReadFailure } from '@/components/ui/read-failure'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   ArrowLeft,
@@ -26,12 +27,17 @@ import {
   Clock,
   AlertCircle,
   Activity,
-  RotateCcw,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { format } from 'date-fns'
-import { getApiKey, updateApiKey, type UpdateApiKeyRequest } from '@/api/client'
+import { updateApiKey, type UpdateApiKeyRequest } from '@/api/client'
+import {
+  getApiKeyOptions,
+  getApiKeyQueryKey,
+} from '@/api/client/@tanstack/react-query.gen'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { isVerifiedNotFound } from '@/lib/read-failure'
+import { listApiKeysQueryKey } from '@/api/client/@tanstack/react-query.gen'
 
 export default function ApiKeyEdit() {
   usePageTitle('Edit API Key')
@@ -45,28 +51,15 @@ export default function ApiKeyEdit() {
     expires_at: '',
   })
 
-  const {
-    data: apiKey,
-    isLoading,
-    error: apiKeyError,
-    refetch: refetchApiKey,
-  } = useQuery({
-    queryKey: ['apiKey', id],
-    queryFn: async () => {
-      if (!id) throw new Error('No API key ID provided')
-      const response = await getApiKey({ path: { id: parseInt(id) } })
-      return response.data
-    },
-    enabled: !!id,
+  const apiKeyId = Number(id)
+  const validId = Number.isInteger(apiKeyId) && apiKeyId > 0
+  // Same query as the detail page. The generated options throw the server's
+  // Problem Details on a non-2xx response instead of resolving `undefined`.
+  const apiKeyQuery = useQuery({
+    ...getApiKeyOptions({ path: { id: apiKeyId } }),
+    enabled: validId,
   })
-
-  useEffect(() => {
-    if (apiKey && apiKeyError) {
-      toast.error('Failed to refresh API key', {
-        action: { label: 'Retry', onClick: () => void refetchApiKey() },
-      })
-    }
-  }, [apiKey, apiKeyError, refetchApiKey])
+  const { data: apiKey, isLoading, error: apiKeyError } = apiKeyQuery
 
   const [loadedApiKey, setLoadedApiKey] = useState(apiKey)
   if (apiKey !== loadedApiKey) {
@@ -89,8 +82,10 @@ export default function ApiKeyEdit() {
       errorTitle: 'Failed to update API key',
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['apiKeys'] })
-      queryClient.invalidateQueries({ queryKey: ['apiKey', id] })
+      queryClient.invalidateQueries({ queryKey: listApiKeysQueryKey() })
+      queryClient.invalidateQueries({
+        queryKey: getApiKeyQueryKey({ path: { id: apiKeyId } }),
+      })
       toast.success('API key updated successfully')
       navigate('/settings/keys')
     },
@@ -133,37 +128,19 @@ export default function ApiKeyEdit() {
     )
   }
 
-  const isNotFound =
-    (apiKeyError as any)?.status === 404 ||
-    (apiKeyError as any)?.title === 'API Key Not Found'
-
-  if (!apiKey && apiKeyError && !isNotFound) {
+  if (!apiKey && apiKeyError && !isVerifiedNotFound(apiKeyError)) {
     return (
-      <div className="w-full min-w-0 space-y-6">
-        <Card>
-          <CardContent className="py-12 text-center">
-            <AlertCircle className="h-12 w-12 text-destructive mx-auto mb-4" />
-            <h3 className="text-lg font-medium">Failed to load API key</h3>
-            <p className="text-muted-foreground mt-2">
-              {apiKeyError instanceof Error
-                ? apiKeyError.message
-                : 'An unexpected error occurred. Please try again.'}
-            </p>
-            <div className="flex justify-center gap-2 mt-4">
-              <Button variant="outline" onClick={() => void refetchApiKey()}>
-                <RotateCcw className="mr-2 h-4 w-4" />
-                Retry
-              </Button>
-              <Button
-                variant="ghost"
-                onClick={() => navigate('/settings/keys')}
-              >
-                <ArrowLeft className="mr-2 h-4 w-4" />
-                Back to API Keys
-              </Button>
-            </div>
-          </CardContent>
-        </Card>
+      <div className="w-full min-w-0 space-y-4">
+        <ReadFailure
+          resource="API key"
+          error={apiKeyError}
+          onRetry={() => void apiKeyQuery.refetch()}
+          retrying={apiKeyQuery.isFetching}
+        />
+        <Button variant="ghost" onClick={() => navigate('/settings/keys')}>
+          <ArrowLeft className="mr-2 h-4 w-4" />
+          Back to API Keys
+        </Button>
       </div>
     )
   }
@@ -212,6 +189,18 @@ export default function ApiKeyEdit() {
           </div>
         </div>
       </div>
+
+      {/* Editing stale settings would save over changes made since, so a
+          failed refresh is called out above the form. */}
+      {apiKeyError && (
+        <ReadFailure
+          resource="API key"
+          error={apiKeyError}
+          cached
+          onRetry={() => apiKeyQuery.refetch()}
+          retrying={apiKeyQuery.isFetching}
+        />
+      )}
 
       <form onSubmit={handleSubmit} className="space-y-6">
         {/* Key Information Card */}

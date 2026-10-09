@@ -27,6 +27,8 @@ import {
 } from '@/components/ui/card'
 import { Checkbox } from '@/components/ui/checkbox'
 import { EmptyState } from '@/components/ui/empty-state'
+import { ReadFailure } from '@/components/ui/read-failure'
+import { isVerifiedNotFound } from '@/lib/read-failure'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import {
@@ -95,6 +97,9 @@ export function NotificationRouteForm() {
     data: route,
     isLoading: routeLoading,
     isError: routeError,
+    error: routeReadError,
+    refetch: refetchRoute,
+    isFetching: routeFetching,
   } = useQuery({
     ...getNotificationRouteOptions({ path: { id: routeId } }),
     enabled: isEditing && Number.isInteger(routeId) && routeId > 0,
@@ -199,8 +204,10 @@ export function NotificationRouteForm() {
   const isLoading = providersLoading || (isEditing && routeLoading)
   const isSaving = createMutation.isPending || updateMutation.isPending
 
+  // "Not found" only for an id that can never exist or a verified 404. A
+  // failed or refused read (5xx, network, 401/403) is reported as such.
   if (
-    routeError ||
+    (routeError && isVerifiedNotFound(routeReadError)) ||
     (isEditing && (!Number.isInteger(routeId) || routeId <= 0))
   ) {
     return (
@@ -211,6 +218,23 @@ export function NotificationRouteForm() {
           description="The requested route may have been deleted or is no longer available."
           action={<Button onClick={returnToRoutes}>Back to Routes</Button>}
         />
+      </div>
+    )
+  }
+
+  if (routeError && !route) {
+    return (
+      <div className="w-full min-w-0 space-y-4">
+        <ReadFailure
+          resource="Notification route"
+          error={routeReadError}
+          onRetry={() => refetchRoute()}
+          retrying={routeFetching}
+        />
+        <Button variant="outline" onClick={returnToRoutes}>
+          <ArrowLeft className="mr-2 h-4 w-4" />
+          {returnTo ? 'Back' : 'Back to Routes'}
+        </Button>
       </div>
     )
   }
@@ -239,6 +263,15 @@ export function NotificationRouteForm() {
               <RouteTestButton routeId={route.id} routeName={route.name} />
             )}
           </div>
+          {routeError && route && (
+            <ReadFailure
+              resource="Notification route"
+              error={routeReadError}
+              cached
+              onRetry={() => refetchRoute()}
+              retrying={routeFetching}
+            />
+          )}
         </div>
 
         <form onSubmit={save}>
