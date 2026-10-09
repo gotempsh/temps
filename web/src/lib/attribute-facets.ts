@@ -34,6 +34,8 @@ export type AttributeKeyState =
   | { kind: 'unfaceted' }
   /** The facet list has not arrived, so the key cannot be classified yet. */
   | { kind: 'loading' }
+  /** The facet list request failed, so the key cannot be classified at all. */
+  | { kind: 'unavailable' }
 
 /** The attribute filter pair is sent as `key=value`, split on `,` and `=`. */
 export function validateAttributePair(
@@ -52,13 +54,14 @@ export function validateAttributePair(
 export function classifyAttributeKey(
   facets: readonly FacetInfo[] | undefined,
   rawKey: string,
-  value = ''
+  value = '',
+  listFailed = false
 ): AttributeKeyState {
   const key = rawKey.trim()
   if (!key) return { kind: 'empty' }
   const invalid = validateAttributePair(key, value)
   if (invalid) return { kind: 'invalid', reason: invalid }
-  if (!facets) return { kind: 'loading' }
+  if (!facets) return { kind: listFailed ? 'unavailable' : 'loading' }
   const facet = facets.find((f) => f.attribute_key === key)
   if (!facet) return { kind: 'unfaceted' }
   switch (facet.status) {
@@ -127,12 +130,88 @@ export function attributeFilterApplies(
       return true
     case 'unfaceted':
     case 'loading':
+    case 'unavailable':
       // While the facet list loads a key could still turn out to be one, so a
-      // caller that must never scan holds the filter back until it knows.
+      // caller that must never scan holds the filter back until it knows. The
+      // same goes when the list failed: the key may be a facet or may not.
       return !facetedOnly
     case 'empty':
     case 'invalid':
     case 'removing':
       return false
   }
+}
+
+/** Whether any facet is changing state, so the list should keep refreshing. */
+export function facetsInFlux(
+  facets: readonly FacetInfo[] | undefined
+): boolean {
+  return (facets ?? []).some(
+    (f) =>
+      f.status === 'pending' ||
+      f.status === 'running' ||
+      f.status === 'deleting'
+  )
+}
+
+/** The attribute filter as it is spelled in the URL. */
+export interface AttributeUrlFilter {
+  key: string
+  value: string
+}
+
+/**
+ * What to do about the attribute filter in the URL, given the inputs the user
+ * is typing into.
+ *
+ * - `adopt`: the URL changed from outside (a link, back/forward); the inputs
+ *   take its values rather than overwriting it with whatever they held.
+ * - `write`: the user finished typing and the URL does not say so yet.
+ * - `none`: nothing to do.
+ *
+ * A value only means something with a key, so the URL's canonical form drops
+ * the value when the key is empty. Comparing in that form is what keeps a
+ * cleared key from looking "different" forever.
+ */
+export type AttributeUrlSync =
+  | { action: 'none' }
+  | { action: 'adopt'; filter: AttributeUrlFilter }
+  | { action: 'write'; filter: AttributeUrlFilter }
+
+export function canonicalAttributeFilter(
+  key: string,
+  value: string
+): AttributeUrlFilter {
+  const trimmedKey = key.trim()
+  return { key: trimmedKey, value: trimmedKey ? value.trim() : '' }
+}
+
+export function planAttributeUrlSync({
+  url,
+  lastSeenUrl,
+  typed,
+  settled,
+}: {
+  /** The filter currently in the URL. */
+  url: AttributeUrlFilter
+  /** The URL filter at the previous run. */
+  lastSeenUrl: AttributeUrlFilter
+  /** What the inputs hold right now. */
+  typed: AttributeUrlFilter
+  /** The debounced inputs, i.e. what the user has stopped typing. */
+  settled: AttributeUrlFilter
+}): AttributeUrlSync {
+  const same = (a: AttributeUrlFilter, b: AttributeUrlFilter) =>
+    a.key === b.key && a.value === b.value
+  if (!same(url, lastSeenUrl)) {
+    // Our own write coming back needs no adoption.
+    return same(url, typed)
+      ? { action: 'none' }
+      : { action: 'adopt', filter: url }
+  }
+  // Still debouncing: the inputs are ahead of what would be written.
+  if (!same(typed, settled)) return { action: 'none' }
+  return same(settled, url)
+    ? { action: 'none' }
+    : { action: 'write', filter: settled }
 }

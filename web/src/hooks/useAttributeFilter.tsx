@@ -19,6 +19,7 @@ import {
   attributesQueryValue,
   classifyAttributeKey,
   facetCreationBlocker,
+  facetsInFlux,
 } from '@/lib/attribute-facets'
 
 /**
@@ -42,14 +43,26 @@ export function useAttributeFilter({
   onValueChange: (value: string) => void
 }) {
   const queryClient = useQueryClient()
-  const facetsQuery = useQuery({ ...listFacetsOptions(), staleTime: 30_000 })
+  const facetsQuery = useQuery({
+    ...listFacetsOptions(),
+    staleTime: 30_000,
+    // A facet that is indexing or being removed changes on its own; keep the
+    // notice truthful until it settles, then stop polling.
+    refetchInterval: (query) =>
+      facetsInFlux(query.state.data?.data) ? 3_000 : false,
+  })
   // Undefined until the list arrives, so a key is never called unfaceted early.
   const facets: readonly FacetInfo[] | undefined = useMemo(
     () => facetsQuery.data?.data,
     [facetsQuery.data?.data]
   )
   const key = attrKey.trim()
-  const state = classifyAttributeKey(facets, attrKey, attrValue)
+  const state = classifyAttributeKey(
+    facets,
+    attrKey,
+    attrValue,
+    facetsQuery.isError
+  )
   const applies = attributeFilterApplies(state, facetedOnly)
 
   const create = useMutation({
@@ -95,6 +108,7 @@ export function useAttributeFilter({
         creationBlocker={facetCreationBlocker(facets ?? [], attrKey)}
         creating={create.isPending}
         onCreate={() => create.mutate({ body: { attribute_key: key } })}
+        onRetry={() => void facetsQuery.refetch()}
       />
     ),
   }

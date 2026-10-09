@@ -2091,13 +2091,18 @@ async fn storage_reads_carry_the_read_bounds_and_writes_do_not() {
     }
 
     // Writes keep the plain client: a batch insert is not a bounded read.
-    let inserts = carried("INSERT INTO spans", "max_memory_usage", "!= '' OR 1 = 1").await;
+    let inserts = carried("INSERT INTO `spans`", "max_memory_usage", "IS NOT NULL").await;
     assert!(
         inserts >= 1,
         "the fixture write must be visible in query_log"
     );
     assert_eq!(
-        carried("INSERT INTO spans", "max_execution_time", "!= ''").await,
+        carried("INSERT INTO `spans`", "max_memory_usage", &bound).await,
+        0,
+        "inserts must not inherit the read memory cap"
+    );
+    assert_eq!(
+        carried("INSERT INTO `spans`", "max_execution_time", "!= ''").await,
         0,
         "inserts must not inherit the read time budget"
     );

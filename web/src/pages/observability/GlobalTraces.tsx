@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { traceDetailPath } from '@/lib/traces-time-window'
 import { Layers } from 'lucide-react'
 import { ProjectCardMedia } from '@/components/dashboard/ProjectCardMedia'
@@ -10,6 +10,11 @@ import { formatTraceDuration } from '@/lib/trace-presentation'
 import { useGlobalView } from '@/hooks/useGlobalView'
 import { useDebounce } from '@/hooks/useDebounce'
 import { useAttributeFilter } from '@/hooks/useAttributeFilter'
+import {
+  type AttributeUrlFilter,
+  canonicalAttributeFilter,
+  planAttributeUrlSync,
+} from '@/lib/attribute-facets'
 import { Link } from 'react-router'
 import { useQuery } from '@tanstack/react-query'
 import { queryGlobalTraceSummariesOptions } from '@/api/client/@tanstack/react-query.gen'
@@ -45,12 +50,10 @@ export default function GlobalTraces() {
     })
   // Attribute filter. Typing is local and debounced into the URL and the
   // request, so each keystroke neither refetches nor resets the page.
-  const [attrKey, setAttrKey] = useState(
-    () => view.params.get('attr_key') ?? ''
-  )
-  const [attrValue, setAttrValue] = useState(
-    () => view.params.get('attr_value') ?? ''
-  )
+  const urlKey = view.params.get('attr_key') ?? ''
+  const urlValue = view.params.get('attr_value') ?? ''
+  const [attrKey, setAttrKey] = useState(urlKey)
+  const [attrValue, setAttrValue] = useState(urlValue)
   const attribute = useAttributeFilter({
     attrKey,
     attrValue,
@@ -59,18 +62,41 @@ export default function GlobalTraces() {
     onValueChange: setAttrValue,
   })
   const attributes = useDebounce(attribute.query, 300)
-  const urlKey = view.params.get('attr_key') ?? ''
-  const urlValue = view.params.get('attr_value') ?? ''
-  const debouncedKey = useDebounce(attrKey.trim(), 300)
-  const debouncedValue = useDebounce(attrValue.trim(), 300)
+  const debouncedKey = useDebounce(attrKey, 300)
+  const debouncedValue = useDebounce(attrValue, 300)
+  const lastSeenUrl = useRef<AttributeUrlFilter>({
+    key: urlKey,
+    value: urlValue,
+  })
   const patchView = view.patch
   useEffect(() => {
-    if (debouncedKey === urlKey && debouncedValue === urlValue) return
-    patchView({
-      attr_key: debouncedKey || undefined,
-      attr_value: debouncedKey ? debouncedValue || undefined : undefined,
+    const url = { key: urlKey, value: urlValue }
+    const sync = planAttributeUrlSync({
+      url,
+      lastSeenUrl: lastSeenUrl.current,
+      typed: canonicalAttributeFilter(attrKey, attrValue),
+      settled: canonicalAttributeFilter(debouncedKey, debouncedValue),
     })
-  }, [debouncedKey, debouncedValue, urlKey, urlValue, patchView])
+    lastSeenUrl.current = url
+    if (sync.action === 'adopt') {
+      // The URL changed from outside (a link, back/forward): follow it.
+      setAttrKey(sync.filter.key)
+      setAttrValue(sync.filter.value)
+    } else if (sync.action === 'write') {
+      patchView({
+        attr_key: sync.filter.key || undefined,
+        attr_value: sync.filter.value || undefined,
+      })
+    }
+  }, [
+    attrKey,
+    attrValue,
+    debouncedKey,
+    debouncedValue,
+    urlKey,
+    urlValue,
+    patchView,
+  ])
   const query = useQuery({
     ...queryGlobalTraceSummariesOptions({
       query: {

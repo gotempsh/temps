@@ -73,6 +73,7 @@ export function AttributeFilterNotice({
   creationBlocker,
   creating,
   onCreate,
+  onRetry,
   className,
 }: {
   state: AttributeKeyState
@@ -82,6 +83,8 @@ export function AttributeFilterNotice({
   creationBlocker: string | null
   creating: boolean
   onCreate: () => void
+  /** Reloads the facet list after it failed to load. */
+  onRetry?: () => void
   className?: string
 }) {
   const key = attrKey.trim()
@@ -110,6 +113,17 @@ export function AttributeFilterNotice({
         )}
       />
       <p className="min-w-0 flex-1">{body.text}</p>
+      {state.kind === 'unavailable' && onRetry && (
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          className="h-7 text-xs"
+          onClick={onRetry}
+        >
+          Retry
+        </Button>
+      )}
       {offerCreate && (
         <div className="flex flex-col gap-1 sm:items-end">
           <Button
@@ -156,6 +170,14 @@ function noticeBody(
           }
     case 'loading':
       return null
+    case 'unavailable':
+      return {
+        tone: 'error',
+        Icon: AlertTriangle,
+        text: facetedOnly
+          ? `Couldn't load the facet list, so "${key}" cannot be checked and the filter is not applied. Retry to filter on it.`
+          : `Couldn't load the facet list, so "${key}" cannot be checked. The filter is still applied, but it may read the attributes of every span in the time range.`,
+      }
     case 'invalid':
       return { tone: 'error', Icon: AlertTriangle, text: state.reason }
     case 'ready':

@@ -7,8 +7,11 @@ import {
   FACET_CAPACITY,
   attributeFilterApplies,
   attributesQueryValue,
+  canonicalAttributeFilter,
   classifyAttributeKey,
   facetCreationBlocker,
+  facetsInFlux,
+  planAttributeUrlSync,
 } from './attribute-facets'
 
 function facet(key: string, status: FacetStatus = 'completed'): FacetInfo {
@@ -132,5 +135,122 @@ describe('attributeFilterApplies', () => {
   test('nothing is sent for an empty or invalid key', () => {
     expect(attributeFilterApplies(key(''), false)).toBe(false)
     expect(attributeFilterApplies(key('a,b'), false)).toBe(false)
+  })
+})
+
+describe('a failed facet list', () => {
+  test('is reported as unavailable, not loading forever', () => {
+    expect(classifyAttributeKey(undefined, 'tier', '', true).kind).toBe(
+      'unavailable'
+    )
+    expect(classifyAttributeKey(undefined, 'tier', '', false).kind).toBe(
+      'loading'
+    )
+    expect(classifyAttributeKey(undefined, '', '', true).kind).toBe('empty')
+  })
+
+  test('holds back a faceted-only caller and lets others scan', () => {
+    const state = classifyAttributeKey(undefined, 'tier', '', true)
+    expect(attributeFilterApplies(state, true)).toBe(false)
+    expect(attributeFilterApplies(state, false)).toBe(true)
+  })
+})
+
+describe('facetsInFlux', () => {
+  test('is true while any facet is indexing or being removed', () => {
+    expect(facetsInFlux([facet('a'), facet('b', 'pending')])).toBe(true)
+    expect(facetsInFlux([facet('a', 'running')])).toBe(true)
+    expect(facetsInFlux([facet('a', 'deleting')])).toBe(true)
+  })
+
+  test('is false once every facet has settled, or there are none', () => {
+    expect(facetsInFlux([facet('a'), facet('b', 'failed')])).toBe(false)
+    expect(facetsInFlux([])).toBe(false)
+    expect(facetsInFlux(undefined)).toBe(false)
+  })
+})
+
+describe('planAttributeUrlSync', () => {
+  const f = (key: string, value = '') => ({ key, value })
+
+  test('a cleared key is settled once the URL drops it, whatever value remains', () => {
+    // The input still holds a value but the key is gone: the canonical form
+    // has no value, so the URL already matches and nothing is rewritten.
+    const typed = canonicalAttributeFilter('', 'free')
+    expect(typed).toEqual(f(''))
+    expect(
+      planAttributeUrlSync({
+        url: f(''),
+        lastSeenUrl: f(''),
+        typed,
+        settled: typed,
+      })
+    ).toEqual({ action: 'none' })
+  })
+
+  test('writes what the user typed once they stop typing', () => {
+    expect(
+      planAttributeUrlSync({
+        url: f(''),
+        lastSeenUrl: f(''),
+        typed: f('tier', 'free'),
+        settled: f('tier', 'free'),
+      })
+    ).toEqual({ action: 'write', filter: f('tier', 'free') })
+  })
+
+  test('writes nothing while typing is still being debounced', () => {
+    expect(
+      planAttributeUrlSync({
+        url: f(''),
+        lastSeenUrl: f(''),
+        typed: f('tier', 'fr'),
+        settled: f('tier', 'f'),
+      })
+    ).toEqual({ action: 'none' })
+  })
+
+  test('adopts a URL that changed from outside instead of overwriting it', () => {
+    expect(
+      planAttributeUrlSync({
+        url: f('region', 'eu'),
+        lastSeenUrl: f('tier', 'free'),
+        typed: f('tier', 'free'),
+        settled: f('tier', 'free'),
+      })
+    ).toEqual({ action: 'adopt', filter: f('region', 'eu') })
+  })
+
+  test('does not adopt its own write coming back', () => {
+    expect(
+      planAttributeUrlSync({
+        url: f('tier', 'free'),
+        lastSeenUrl: f(''),
+        typed: f('tier', 'free'),
+        settled: f('tier', 'free'),
+      })
+    ).toEqual({ action: 'none' })
+  })
+
+  test('never writes stale inputs over a URL that just changed', () => {
+    // Inputs are settled on the old filter in the same render the URL changes.
+    const plan = planAttributeUrlSync({
+      url: f('region', 'eu'),
+      lastSeenUrl: f('tier', 'free'),
+      typed: f('tier', 'free'),
+      settled: f('tier', 'free'),
+    })
+    expect(plan.action).not.toBe('write')
+  })
+
+  test('is idle when URL, inputs and debounce all agree', () => {
+    expect(
+      planAttributeUrlSync({
+        url: f('tier', 'free'),
+        lastSeenUrl: f('tier', 'free'),
+        typed: f('tier', 'free'),
+        settled: f('tier', 'free'),
+      })
+    ).toEqual({ action: 'none' })
   })
 })

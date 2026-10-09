@@ -34,17 +34,25 @@ function notice(
     creationBlocker?: string | null
     creating?: boolean
     value?: string
+    listFailed?: boolean
+    onRetry?: () => void
   } = {}
 ) {
   return renderToStaticMarkup(
     <AttributeFilterNotice
-      state={classifyAttributeKey(facets, key, options.value)}
+      state={classifyAttributeKey(
+        facets,
+        key,
+        options.value,
+        options.listFailed
+      )}
       attrKey={key}
       facetedOnly={options.facetedOnly ?? false}
       hasFacets={(facets ?? []).length > 0}
       creationBlocker={options.creationBlocker ?? null}
       creating={options.creating ?? false}
       onCreate={() => {}}
+      onRetry={options.onRetry}
     />
   )
 }
@@ -116,6 +124,26 @@ describe('AttributeFilterNotice', () => {
   test('an unsendable key or value is explained', () => {
     const html = notice([facet('tier')], 'tier', { value: 'a,b' })
     expect(html).toContain('cannot contain &quot;,&quot;')
+  })
+})
+
+describe('AttributeFilterNotice when the facet list fails to load', () => {
+  test('says so and offers a retry instead of staying silent', () => {
+    const html = notice(undefined, 'tier', {
+      listFailed: true,
+      onRetry: () => {},
+    })
+    expect(html).toContain('Couldn&#x27;t load the facet list')
+    expect(html).toContain('Retry')
+  })
+
+  test('where scanning is not allowed it says the filter is not applied', () => {
+    const html = notice(undefined, 'tier', {
+      listFailed: true,
+      facetedOnly: true,
+      onRetry: () => {},
+    })
+    expect(html).toContain('filter is not applied')
   })
 })
 
