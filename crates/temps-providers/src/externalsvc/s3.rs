@@ -740,7 +740,7 @@ echo '[restore] complete'"#;
                 all: true,
                 filters: Some(HashMap::from([(
                     "name".to_string(),
-                    vec![container_name.clone()],
+                    vec![super::exact_container_name_filter(&container_name)],
                 )])),
                 ..Default::default()
             }))
@@ -1497,7 +1497,7 @@ impl ExternalService for S3Service {
                 all: true,
                 filters: Some(HashMap::from([(
                     "name".to_string(),
-                    vec![container_name.clone()],
+                    vec![super::exact_container_name_filter(&container_name)],
                 )])),
                 ..Default::default()
             }))
@@ -1579,7 +1579,7 @@ impl ExternalService for S3Service {
                 all: true,
                 filters: Some(HashMap::from([(
                     "name".to_string(),
-                    vec![container_name.clone()],
+                    vec![super::exact_container_name_filter(&container_name)],
                 )])),
                 ..Default::default()
             }))
@@ -1642,7 +1642,7 @@ impl ExternalService for S3Service {
                 all: true,
                 filters: Some(HashMap::from([(
                     "name".to_string(),
-                    vec![container_name.clone()],
+                    vec![super::exact_container_name_filter(&container_name)],
                 )])),
                 ..Default::default()
             }))
@@ -4296,6 +4296,7 @@ mod tests {
             backup_location: &outcome.location,
             source_service: &external_service,
             source_config: s3_config.clone(),
+            live_target_config: s3_config.clone(),
             pool: &mock_db,
             gate: &super::super::NoopRestoreGate,
         };

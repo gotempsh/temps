@@ -927,7 +927,7 @@ impl MariaDbService {
                 all: true,
                 filters: Some(HashMap::from([(
                     "name".to_string(),
-                    vec![container_name.clone()],
+                    vec![super::exact_container_name_filter(&container_name)],
                 )])),
                 ..Default::default()
             }))
@@ -3895,7 +3895,7 @@ impl ExternalService for MariaDbService {
                 all: true,
                 filters: Some(HashMap::from([(
                     "name".to_string(),
-                    vec![container_name.clone()],
+                    vec![super::exact_container_name_filter(&container_name)],
                 )])),
                 ..Default::default()
             }))
@@ -3950,7 +3950,7 @@ impl ExternalService for MariaDbService {
                 all: true,
                 filters: Some(HashMap::from([(
                     "name".to_string(),
-                    vec![container_name.clone()],
+                    vec![super::exact_container_name_filter(&container_name)],
                 )])),
                 ..Default::default()
             }))
@@ -3978,7 +3978,7 @@ impl ExternalService for MariaDbService {
                 all: true,
                 filters: Some(HashMap::from([(
                     "name".to_string(),
-                    vec![container_name.clone()],
+                    vec![super::exact_container_name_filter(&container_name)],
                 )])),
                 ..Default::default()
             }))

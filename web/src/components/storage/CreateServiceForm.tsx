@@ -40,6 +40,8 @@ import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import * as z from 'zod'
 
+import { problemDetail } from '@/lib/api-problem'
+
 import { advancedParamsHint } from '@/lib/service-link-copy'
 import {
   completeServiceCreation,
@@ -356,6 +358,23 @@ export function CreateServiceForm({
     ...createServiceMutation(),
     meta: {
       errorTitle: 'Failed to create service',
+    },
+    onError: (error) => {
+      if (
+        error &&
+        typeof error === 'object' &&
+        'error_code' in error &&
+        error.error_code === 'SERVICE_NAME_CONFLICT'
+      ) {
+        form.setError(
+          'name',
+          {
+            type: 'server',
+            message: problemDetail(error, 'Choose a unique service name.'),
+          },
+          { shouldFocus: true }
+        )
+      }
     },
     onSuccess: (data) => {
       completeServiceCreation({

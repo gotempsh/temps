@@ -8,6 +8,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use utoipa::ToSchema;
 
+/// Docker interprets name filters as regular-expression substring matches.
+/// Anchor and escape a single resource identity before listing containers.
+pub(crate) fn exact_container_name_filter(name: &str) -> String {
+    format!("^/{}$", regex::escape(name.trim_start_matches('/')))
+}
+
 /// Return the Docker summary whose name exactly matches `expected_name`.
 ///
 /// Docker's `name` list filter is substring-based: filtering for `redis-cache`
@@ -61,6 +67,15 @@ mod runtime_provisioning_tests {
         validate_runtime_target, HealthProbeResult, RuntimeProvisioningError, ServiceConfig,
         ServiceHealthProbeError, ServiceType,
     };
+
+    #[test]
+    fn exact_container_filter_does_not_match_a_sibling_or_regex_metacharacters() {
+        let filter =
+            regex::Regex::new(&super::exact_container_name_filter("/postgres-app.db")).unwrap();
+        assert!(filter.is_match("/postgres-app.db"));
+        assert!(!filter.is_match("/postgres-app.db-sibling"));
+        assert!(!filter.is_match("/postgres-appXdb"));
+    }
 
     #[test]
     fn docker_substring_name_match_is_not_treated_as_the_requested_container() {
@@ -1460,6 +1475,10 @@ pub struct RestoreContext<'a> {
     /// unchanged from the target's config and the caller is warned that
     /// the password is whatever the backup's original credentials were.
     pub source_config: ServiceConfig,
+    /// The target's live settings before origin credentials are merged.
+    /// Pre-restore SQL probes must authenticate with these settings; restored
+    /// data and new managed clones use `source_config` instead.
+    pub live_target_config: ServiceConfig,
     pub pool: &'a temps_database::DbConnection,
     /// Cancellation and write-boundary hooks for this restore. Engines poll
     /// [`RestoreGate::is_cancelled`] while they fetch the backup and call

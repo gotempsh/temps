@@ -79387,6 +79387,9 @@
           "400": {
             "description": "Invalid request"
           },
+          "409": {
+            "description": "Service name, container, or volumes are already owned by another service or an active restore"
+          },
           "500": {
             "description": "Internal server error"
           }
@@ -79538,6 +79541,9 @@
           },
           "403": {
             "description": "Insufficient permissions"
+          },
+          "409": {
+            "description": "Service name, container, or volumes are already owned by another service or an active restore"
           },
           "500": {
             "description": "Internal server error"
@@ -79837,6 +79843,9 @@
           "404": {
             "description": "Service not found"
           },
+          "409": {
+            "description": "An active restore uses this service, or duplicate service names prevent safe resource control"
+          },
           "500": {
             "description": "Internal server error"
           }
@@ -79925,7 +79934,7 @@
             "description": "Service not found"
           },
           "409": {
-            "description": "A major upgrade is in progress for this service"
+            "description": "A major upgrade is in progress, or duplicate service names prevent safe resource control"
           },
           "500": {
             "description": "Internal server error"
@@ -82102,7 +82111,7 @@
                 }
               }
             },
-            "description": "Conflict: a destructive cross-service restore requires explicit confirmation (`cross-service-restore-not-confirmed`), another restore is already active on this service (`restore-already-active`, with `active_restore_run_id`), data is being imported into it (`data-import-active`, with `active_data_import_run_id`), or the backup is being deleted"
+            "description": "Conflict: a destructive cross-service restore requires explicit confirmation (`cross-service-restore-not-confirmed`), another restore is already active on this service (`restore-already-active`, with `active_restore_run_id`), data is being imported into it (`data-import-active`, with `active_data_import_run_id`), the backup is being deleted, or a requested new-service name is already owned by a service or another active restore"
           }
         },
         "security": [
@@ -82465,7 +82474,7 @@
             "description": "Service not found"
           },
           "409": {
-            "description": "A Postgres major upgrade is in progress for this service"
+            "description": "A Postgres major upgrade is in progress, or duplicate service names prevent safe resource control"
           },
           "500": {
             "description": "Internal server error"
@@ -82545,6 +82554,9 @@
           "404": {
             "description": "Service not found"
           },
+          "409": {
+            "description": "Duplicate service names prevent safe resource control"
+          },
           "500": {
             "description": "Internal server error"
           }
@@ -82598,7 +82610,7 @@
             "description": "Service not found"
           },
           "409": {
-            "description": "A major upgrade is already in progress for this service"
+            "description": "A major upgrade is already in progress, or duplicate service names prevent safe resource control"
           },
           "500": {
             "description": "Internal server error"

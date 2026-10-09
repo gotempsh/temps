@@ -412,6 +412,73 @@ fn cluster_member_host_port(base: u16, ordinal: i32, is_monitor: bool) -> Option
     }
 }
 
+/// A short database reservation shared by every service-name writer,
+/// including restore admission and final clone registration.
+#[derive(Debug, thiserror::Error)]
+pub enum ServiceIdentityReservationError {
+    #[error("Database error while reserving service name: {0}")]
+    Database(#[from] sea_orm::DbErr),
+    #[error("Service name '{name}' is already used by service {existing_service_id}. Choose a unique name before creating or changing a service.")]
+    Registered {
+        name: String,
+        existing_service_id: i32,
+    },
+    #[error("Service name '{name}' is reserved by restore run {restore_run_id}. Wait for that restore to finish or choose a unique name.")]
+    Restoring { name: String, restore_run_id: i32 },
+}
+
+/// Reserve the name only until this transaction commits. A clone restore
+/// persists an active target-name reservation before it releases the lock;
+/// Docker and WAL-G work never hold this transaction open.
+pub async fn reserve_service_identity(
+    txn: &sea_orm::DatabaseTransaction,
+    name: &str,
+    exclude_service_id: Option<i32>,
+    exclude_restore_run_id: Option<i32>,
+) -> Result<(), ServiceIdentityReservationError> {
+    use sea_orm::ConnectionTrait;
+    txn.execute(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT pg_advisory_xact_lock(hashtextextended('external-service-name:' || $1, 0))",
+        [name.into()],
+    ))
+    .await?;
+    let mut query =
+        external_services::Entity::find().filter(external_services::Column::Name.eq(name));
+    if let Some(id) = exclude_service_id {
+        query = query.filter(external_services::Column::Id.ne(id));
+    }
+    if let Some(existing) = query.one(txn).await? {
+        return Err(ServiceIdentityReservationError::Registered {
+            name: name.to_string(),
+            existing_service_id: existing.id,
+        });
+    }
+    let mut query = temps_entities::restore_runs::Entity::find()
+        .filter(temps_entities::restore_runs::Column::TargetServiceName.eq(name))
+        .filter(temps_entities::restore_runs::Column::Status.is_in(["pending", "running"]));
+    if let Some(id) = exclude_restore_run_id {
+        query = query.filter(temps_entities::restore_runs::Column::Id.ne(id));
+    }
+    if let Some(run) = query.one(txn).await? {
+        return Err(ServiceIdentityReservationError::Restoring {
+            name: name.to_string(),
+            restore_run_id: run.id,
+        });
+    }
+    Ok(())
+}
+
+async fn reserve_service_name(
+    txn: &sea_orm::DatabaseTransaction,
+    name: &str,
+    exclude_service_id: Option<i32>,
+) -> Result<(), ExternalServiceError> {
+    reserve_service_identity(txn, name, exclude_service_id, None)
+        .await
+        .map_err(ExternalServiceError::from)
+}
+
 /// `pg_advisory_xact_lock` key serializing cluster port-block reservation
 /// ("TEMPSPRT"), so two concurrent creations cannot pick the same block.
 const CLUSTER_PORT_LOCK_KEY: i64 = 0x5445_4D50_5350_5254;
@@ -497,6 +564,37 @@ fn select_remote_container_name(
 pub enum ExternalServiceError {
     #[error("Service {id} not found")]
     ServiceNotFound { id: i32 },
+
+    #[error("Service name '{name}' is already used by service {existing_service_id}. Choose a unique name before creating or changing a service.")]
+    ServiceNameConflict {
+        name: String,
+        existing_service_id: i32,
+    },
+
+    #[error("Service name '{name}' is reserved by restore run {restore_run_id}. Wait for that restore to finish or choose a unique name.")]
+    ServiceNameRestoreConflict { name: String, restore_run_id: i32 },
+
+    #[error("Docker container '{container}' is being created by restore run {restore_run_id}. Wait for that restore to finish before importing an unowned container.")]
+    ServiceContainerRestoreConflict {
+        container: String,
+        restore_run_id: i32,
+    },
+
+    #[error("Service {service_id} cannot control resources for name '{name}': it is also used by service {existing_service_id}. Resolve the duplicate service records before retrying.")]
+    AmbiguousServiceName {
+        service_id: i32,
+        name: String,
+        existing_service_id: i32,
+    },
+
+    #[error("Cannot create service '{name}': Docker resource '{resource}' already exists. Choose a unique name, or use the explicit import flow to validate and adopt an existing container.")]
+    ServiceResourceConflict { name: String, resource: String },
+
+    #[error("Docker container '{container}' is already managed by service {existing_service_id}. Choose an unowned container to import; keep the existing service and its data")]
+    ServiceContainerConflict {
+        container: String,
+        existing_service_id: i32,
+    },
 
     #[error("Service with name '{name}' not found")]
     ServiceNotFoundByName { name: String },
@@ -723,6 +821,28 @@ fn validate_creator_claim(
         Err(ExternalServiceError::ServiceClaimDenied { service_id })
     } else {
         Ok(())
+    }
+}
+
+impl From<ServiceIdentityReservationError> for ExternalServiceError {
+    fn from(error: ServiceIdentityReservationError) -> Self {
+        match error {
+            ServiceIdentityReservationError::Database(error) => error.into(),
+            ServiceIdentityReservationError::Registered {
+                name,
+                existing_service_id,
+            } => Self::ServiceNameConflict {
+                name,
+                existing_service_id,
+            },
+            ServiceIdentityReservationError::Restoring {
+                name,
+                restore_run_id,
+            } => Self::ServiceNameRestoreConflict {
+                name,
+                restore_run_id,
+            },
+        }
     }
 }
 
@@ -2758,6 +2878,227 @@ impl ExternalServiceManager {
         })
     }
 
+    async fn ensure_new_local_service_resources_unused(
+        &self,
+        service: &external_services::Model,
+    ) -> Result<(), ExternalServiceError> {
+        if service.node_id.is_some() {
+            return Ok(());
+        }
+        let parameters = self.get_service_parameters(service.id).await?;
+        let service_type = ServiceType::from_str(&service.service_type).map_err(|_| {
+            ExternalServiceError::InvalidServiceType {
+                id: service.id,
+                service_type: service.service_type.clone(),
+            }
+        })?;
+        let instance = self.create_service_instance_for_parameters(
+            service.name.clone(),
+            service_type,
+            &parameters,
+        )?;
+        let names = instance.docker_resource_names().ok_or_else(|| {
+            ExternalServiceError::InternalError {
+                reason: format!("Cannot safely create service '{}': its engine does not report owned Docker resources", service.name),
+            }
+        })?;
+        let docker = self.require_docker()?;
+        for container in names.containers {
+            match docker
+                .inspect_container(
+                    &container,
+                    None::<bollard::query_parameters::InspectContainerOptions>,
+                )
+                .await
+            {
+                Ok(_) => {
+                    return Err(ExternalServiceError::ServiceResourceConflict {
+                        name: service.name.clone(),
+                        resource: container,
+                    })
+                }
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => {}
+                Err(error) => {
+                    return Err(ExternalServiceError::DockerError {
+                        id: service.id,
+                        reason: format!(
+                            "Failed to inspect new service '{}' container '{container}': {error}",
+                            service.name
+                        ),
+                    })
+                }
+            }
+        }
+        // A stale volume must not become a new service's data by name alone.
+        for volume in names.volumes {
+            match docker.inspect_volume(&volume).await {
+                Ok(_) => {
+                    return Err(ExternalServiceError::ServiceResourceConflict {
+                        name: service.name.clone(),
+                        resource: volume,
+                    })
+                }
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => {}
+                Err(error) => {
+                    return Err(ExternalServiceError::DockerError {
+                        id: service.id,
+                        reason: format!(
+                            "Failed to inspect new service '{}' volume '{volume}': {error}",
+                            service.name
+                        ),
+                    })
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn reserve_imported_container(
+        &self,
+        txn: &sea_orm::DatabaseTransaction,
+        container_id: &str,
+        container_name: &str,
+    ) -> Result<(), ExternalServiceError> {
+        use sea_orm::ConnectionTrait;
+        txn.execute(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT pg_advisory_xact_lock(hashtextextended('external-service-container:' || $1, 0))",
+            [container_id.into()],
+        ))
+        .await?;
+        let canonical_owner = Expr::cust_with_values(
+            "CASE service_type WHEN 'postgres' THEN 'postgres-' WHEN 'redis' THEN 'redis-' WHEN 'kv' THEN 'redis-' WHEN 'mariadb' THEN 'mariadb-' WHEN 'mongodb' THEN 'temps-mongodb-' WHEN 'rustfs' THEN 'rustfs-' WHEN 'blob' THEN 'rustfs-' WHEN 's3' THEN 'rustfs-' WHEN 'minio' THEN 'minio-' ELSE NULL END || name = $1",
+            [container_name],
+        );
+        let minio_owner = Expr::cust_with_values(
+            "service_type = 's3' AND 'minio-' || name = $1",
+            [container_name],
+        );
+        // Only the two built-in services have historical aliases. Arbitrary
+        // user names must not claim another service's prefixed workload.
+        let legacy_builtin_owner = Expr::cust_with_values(
+            "(service_type = 'blob' AND name = 'temps-blob' AND $1 = 'rustfs-blob-temps-blob') OR (service_type IN ('kv', 'redis') AND name = 'temps-kv' AND $1 = 'redis-kv-temps-kv')",
+            [container_name],
+        );
+        let registered_owners = external_services::Entity::find()
+            .filter(external_services::Column::NodeId.is_null())
+            .filter(
+                Condition::any()
+                    .add(external_services::Column::ContainerName.eq(container_name))
+                    .add(canonical_owner)
+                    .add(minio_owner)
+                    .add(legacy_builtin_owner),
+            );
+        if let Some(existing) = registered_owners.clone().one(txn).await? {
+            return Err(ExternalServiceError::ServiceContainerConflict {
+                container: container_name.to_string(),
+                existing_service_id: existing.id,
+            });
+        }
+        // A clone's active run owns its canonical container before its
+        // service row is registered. An alias import must not adopt it in
+        // that interval. Join its template in one bounded ownership query.
+        let restore = txn.query_one(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT r.id FROM restore_runs r JOIN external_services s ON s.id = r.source_service_id WHERE r.status IN ('pending', 'running') AND r.target_service_name IS NOT NULL AND ((CASE s.service_type WHEN 'postgres' THEN 'postgres-' WHEN 'redis' THEN 'redis-' WHEN 'kv' THEN 'redis-' WHEN 'mariadb' THEN 'mariadb-' WHEN 'mongodb' THEN 'temps-mongodb-' WHEN 'rustfs' THEN 'rustfs-' WHEN 'blob' THEN 'rustfs-' WHEN 's3' THEN 'rustfs-' WHEN 'minio' THEN 'minio-' ELSE NULL END || r.target_service_name) = $1 OR (s.service_type = 's3' AND 'minio-' || r.target_service_name = $1)) LIMIT 1",
+            [container_name.into()],
+        )).await?;
+        if let Some(restore) = restore {
+            return Err(ExternalServiceError::ServiceContainerRestoreConflict {
+                container: container_name.to_string(),
+                restore_run_id: restore.try_get("", "id")?,
+            });
+        }
+        // Registration commits its service row before the run becomes
+        // terminal. Recheck after the active-run snapshot to cover that
+        // handoff when a differently named import uses a different name lock.
+        if let Some(existing) = registered_owners.one(txn).await? {
+            return Err(ExternalServiceError::ServiceContainerConflict {
+                container: container_name.to_string(),
+                existing_service_id: existing.id,
+            });
+        }
+        // Imports made before the plaintext ownership column existed may
+        // retain their actual container name only in encrypted parameters.
+        // Stream this compatibility check; do not load all service configs.
+        {
+            use futures::TryStreamExt;
+            let mut legacy = external_services::Entity::find()
+                .filter(external_services::Column::NodeId.is_null())
+                .filter(external_services::Column::ContainerName.is_null())
+                .filter(external_services::Column::Config.is_not_null())
+                .stream(txn)
+                .await?;
+            while let Some(service) = legacy.try_next().await? {
+                let config = service.config.as_deref().unwrap_or_default();
+                let plaintext =
+                    self.encryption_service
+                        .decrypt_string(config)
+                        .map_err(|error| ExternalServiceError::DecryptionFailed {
+                            service_id: service.id,
+                            param_name: "config".to_string(),
+                            reason: format!("Cannot verify existing container ownership: {error}"),
+                        })?;
+                let parameters: serde_json::Value =
+                    serde_json::from_str(&plaintext).map_err(|error| {
+                        ExternalServiceError::InternalError {
+                            reason: format!(
+                                "Cannot verify container ownership for service {}: {error}",
+                                service.id
+                            ),
+                        }
+                    })?;
+                if parameters
+                    .get("container_name")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|name| {
+                        name.trim_start_matches('/') == container_name || name == container_id
+                    })
+                {
+                    return Err(ExternalServiceError::ServiceContainerConflict {
+                        container: container_name.to_string(),
+                        existing_service_id: service.id,
+                    });
+                }
+            }
+        }
+        if let Some(member) = service_members::Entity::find()
+            .filter(service_members::Column::NodeId.is_null())
+            .filter(service_members::Column::ContainerName.eq(container_name))
+            .one(txn)
+            .await?
+        {
+            return Err(ExternalServiceError::ServiceContainerConflict {
+                container: container_name.to_string(),
+                existing_service_id: member.service_id,
+            });
+        }
+        Ok(())
+    }
+
+    async fn ensure_unambiguous_service_name(
+        &self,
+        service: &external_services::Model,
+    ) -> Result<(), ExternalServiceError> {
+        if let Some(existing) = external_services::Entity::find()
+            .filter(external_services::Column::Name.eq(&service.name))
+            .filter(external_services::Column::Id.ne(service.id))
+            .one(self.db.as_ref())
+            .await?
+        {
+            return Err(ExternalServiceError::AmbiguousServiceName {
+                service_id: service.id,
+                name: service.name.clone(),
+                existing_service_id: existing.id,
+            });
+        }
+        Ok(())
+    }
+
     pub async fn create_service(
         &self,
         request: CreateExternalServiceRequest,
@@ -2906,6 +3247,7 @@ impl ExternalServiceManager {
             .db
             .transaction::<_, external_services::Model, ExternalServiceError>(|txn| {
                 Box::pin(async move {
+                    reserve_service_name(txn, &request.name, None).await?;
                     // Create service record with encrypted config
                     let new_service = external_services::ActiveModel {
                         name: Set(request.name.clone()),
@@ -3005,7 +3347,12 @@ impl ExternalServiceManager {
             self.get_service_info(service.id).await
         } else {
             // Standalone: initialize synchronously
-            let init_result = self.initialize_service(service.id).await;
+            let init_result = async {
+                self.ensure_new_local_service_resources_unused(&service)
+                    .await?;
+                self.initialize_service(service.id).await
+            }
+            .await;
 
             if let Err(e) = init_result {
                 error!(
@@ -3023,6 +3370,9 @@ impl ExternalServiceManager {
                     );
                 }
 
+                if matches!(e, ExternalServiceError::ServiceResourceConflict { .. }) {
+                    return Err(e);
+                }
                 return Err(ExternalServiceError::InitializationFailed {
                     id: service.id,
                     reason: e.to_string(),
@@ -3072,6 +3422,8 @@ impl ExternalServiceManager {
         ingest_key: String,
         ingest_url: String,
     ) -> Result<(), ExternalServiceError> {
+        let service = self.get_service(service_id).await?;
+        self.ensure_unambiguous_service_name(&service).await?;
         // Merge the key + URL into the existing encrypted params.
         let mut params = self.get_service_parameters(service_id).await?;
         params.insert(
@@ -3142,6 +3494,7 @@ impl ExternalServiceManager {
         service_id: i32,
     ) -> Result<(), ExternalServiceError> {
         let service = self.get_service(service_id).await?;
+        self.ensure_unambiguous_service_name(&service).await?;
         let service_type = ServiceType::from_str(&service.service_type).map_err(|_| {
             ExternalServiceError::InvalidServiceType {
                 id: service_id,
@@ -3334,6 +3687,7 @@ impl ExternalServiceManager {
         self.ensure_no_active_upgrade(service_id).await?;
 
         let service = self.get_service(service_id).await?;
+        self.ensure_unambiguous_service_name(&service).await?;
         let old_parameters = self.get_service_parameters(service_id).await?;
 
         // Get old configuration
@@ -3452,6 +3806,7 @@ impl ExternalServiceManager {
         request: UpdateExternalServiceRequest,
     ) -> Result<ExternalServiceInfo, ExternalServiceError> {
         let service = self.get_service(service_id).await?;
+        self.ensure_unambiguous_service_name(&service).await?;
 
         // Get the parameter strategy for this service type
         let strategy = parameter_strategies::get_strategy(&service.service_type).ok_or(
@@ -3512,6 +3867,14 @@ impl ExternalServiceManager {
                 reason: format!("Failed to encrypt config: {}", e),
             })?;
 
+        let name_transaction = if let Some(new_name) = request.name.as_deref() {
+            let txn = self.db.begin().await?;
+            reserve_service_name(&txn, new_name, Some(service_id)).await?;
+            Some(txn)
+        } else {
+            None
+        };
+
         // Update service config (and optionally name/slug) in database.
         // `name` was previously accepted by the request but silently dropped;
         // applying it here keeps the API contract honest.
@@ -3519,6 +3882,13 @@ impl ExternalServiceManager {
         service_update.config = Set(Some(encrypted_config));
         if let Some(new_name) = request.name {
             if new_name != service.name {
+                // Reserving a database name does not grant ownership of an
+                // existing Docker resource. Refuse a rename destination before
+                // stopping the original service or persisting its new identity.
+                let mut renamed_service = service.clone();
+                renamed_service.name = new_name.clone();
+                self.ensure_new_local_service_resources_unused(&renamed_service)
+                    .await?;
                 // The running container is identified by the service's
                 // current (pre-rename) name (see create_service_instance).
                 // initialize_service() below rebuilds its stop-then-recreate
@@ -3549,8 +3919,14 @@ impl ExternalServiceManager {
             service_update.slug = Set(Some(new_slug));
         }
         service_update.updated_at = Set(Utc::now());
-        self.persist_service_config(service_id, service_update)
-            .await?;
+        if let Some(txn) = name_transaction {
+            self.persist_service_config_in_transaction(service_id, service_update, &txn)
+                .await?;
+            txn.commit().await?;
+        } else {
+            self.persist_service_config(service_id, service_update)
+                .await?;
+        }
 
         // Reinitialize the service (this will stop, remove, and recreate the container with new image)
         self.initialize_service(service_id).await?;
@@ -3561,6 +3937,7 @@ impl ExternalServiceManager {
     pub async fn delete_service(&self, service_id: i32) -> Result<(), ExternalServiceError> {
         // Get service to check if it exists
         let service = self.get_service(service_id).await?;
+        self.ensure_unambiguous_service_name(&service).await?;
         let service_type_enum = ServiceType::from_str(&service.service_type).map_err(|_| {
             ExternalServiceError::InvalidServiceType {
                 id: service_id,
@@ -3593,13 +3970,35 @@ impl ExternalServiceManager {
         // get_service_parameters looks the service up by ID, which would fail
         // once the row is gone.
         let parameters = self.get_service_parameters(service_id).await?;
-        let service_name_snapshot = service.name.clone();
-        let service_type_snapshot = service.service_type.clone();
 
         // Delete from database first
         self.db
             .transaction::<_, (), ExternalServiceError>(|txn| {
                 Box::pin(async move {
+                    // Restore admission holds this source row while it
+                    // records its active run. Never cascade that reservation
+                    // away while the clone's engine can still create resources.
+                    let source = external_services::Entity::find_by_id(service_id)
+                        .lock_exclusive()
+                        .one(txn)
+                        .await?
+                        .ok_or(ExternalServiceError::ServiceNotFound { id: service_id })?;
+                    if let Some(run) = temps_entities::restore_runs::Entity::find()
+                        .filter(
+                            temps_entities::restore_runs::Column::SourceServiceId.eq(service_id),
+                        )
+                        .filter(
+                            temps_entities::restore_runs::Column::Status
+                                .is_in(["pending", "running"]),
+                        )
+                        .one(txn)
+                        .await?
+                    {
+                        return Err(ExternalServiceError::ServiceNameRestoreConflict {
+                            name: source.name,
+                            restore_run_id: run.id,
+                        });
+                    }
                     // Auto-generated per-service schedules are lifecycle-owned
                     // by Temps. Disable one in the same transaction when its
                     // final target is removed; user-created schedules are left
@@ -3632,20 +4031,25 @@ impl ExternalServiceManager {
                         .exec(txn)
                         .await?;
 
-                    // Backup audit rows intentionally outlive their source
-                    // service. Capture immutable provenance before deleting
-                    // the mutable service record; the migration removes the
-                    // former ON DELETE CASCADE foreign key.
+                    // Admission captured the repository's immutable identity.
+                    // Preserve it across renames; backfill only missing legacy
+                    // fields using the service row locked above.
                     external_service_backups::Entity::update_many()
                         .col_expr(
                             external_service_backups::Column::ServiceNameSnapshot,
-                            Expr::value(service_name_snapshot.clone()),
-                        )
-                        .col_expr(
-                            external_service_backups::Column::ServiceTypeSnapshot,
-                            Expr::value(service_type_snapshot.clone()),
+                            Expr::value(source.name.clone()),
                         )
                         .filter(external_service_backups::Column::ServiceId.eq(service_id))
+                        .filter(external_service_backups::Column::ServiceNameSnapshot.is_null())
+                        .exec(txn)
+                        .await?;
+                    external_service_backups::Entity::update_many()
+                        .col_expr(
+                            external_service_backups::Column::ServiceTypeSnapshot,
+                            Expr::value(source.service_type.clone()),
+                        )
+                        .filter(external_service_backups::Column::ServiceId.eq(service_id))
+                        .filter(external_service_backups::Column::ServiceTypeSnapshot.is_null())
                         .exec(txn)
                         .await?;
 
@@ -6445,12 +6849,28 @@ echo "[restore] Pre-seed complete"
     async fn persist_service_config(
         &self,
         service_id: i32,
-        mut active: external_services::ActiveModel,
+        active: external_services::ActiveModel,
     ) -> Result<external_services::Model, ExternalServiceError> {
         let txn = self.db.begin().await?;
+        let updated = self
+            .persist_service_config_in_transaction(service_id, active, &txn)
+            .await?;
+        txn.commit().await?;
+        Ok(updated)
+    }
+
+    async fn persist_service_config_in_transaction(
+        &self,
+        service_id: i32,
+        mut active: external_services::ActiveModel,
+        txn: &sea_orm::DatabaseTransaction,
+    ) -> Result<external_services::Model, ExternalServiceError> {
+        if let sea_orm::ActiveValue::Set(name) = &active.name {
+            reserve_service_name(txn, name, Some(service_id)).await?;
+        }
         let current = external_services::Entity::find_by_id(service_id)
             .lock_exclusive()
-            .one(&txn)
+            .one(txn)
             .await?
             .ok_or(ExternalServiceError::ServiceNotFound { id: service_id })?;
         let parse =
@@ -6516,9 +6936,7 @@ echo "[restore] Pre-seed complete"
                 ));
             }
         }
-        let updated = active.update(&txn).await?;
-        txn.commit().await?;
-        Ok(updated)
+        Ok(active.update(txn).await?)
     }
 
     async fn ensure_cluster_auth_secrets(
@@ -6975,6 +7393,7 @@ echo "[restore] Pre-seed complete"
         info!("Initializing service: {}", service_id);
         self.ensure_no_active_upgrade(service_id).await?;
         let service = self.get_service(service_id).await?;
+        self.ensure_unambiguous_service_name(&service).await?;
         let parameters = self.get_service_parameters(service_id).await?;
         let service_type_enum = ServiceType::from_str(&service.service_type).map_err(|_| {
             ExternalServiceError::InvalidServiceType {
@@ -10344,6 +10763,7 @@ echo "[restore] Pre-seed complete"
     ) -> Result<ExternalServiceInfo, ExternalServiceError> {
         self.ensure_no_active_upgrade(service_id).await?;
         let service = self.get_service(service_id).await?;
+        self.ensure_unambiguous_service_name(&service).await?;
         let service_type_enum = ServiceType::from_str(&service.service_type).map_err(|_| {
             ExternalServiceError::InvalidServiceType {
                 id: service_id,
@@ -10551,6 +10971,7 @@ echo "[restore] Pre-seed complete"
         service_id: i32,
     ) -> Result<ExternalServiceInfo, ExternalServiceError> {
         let service = self.get_service(service_id).await?;
+        self.ensure_unambiguous_service_name(&service).await?;
         let service_type_enum = ServiceType::from_str(&service.service_type).map_err(|_| {
             ExternalServiceError::InvalidServiceType {
                 id: service_id,
@@ -12439,6 +12860,8 @@ echo "[restore] Pre-seed complete"
         request: ImportExternalServiceRequest,
         created_by_user_id: Option<i32>,
     ) -> Result<ExternalServiceInfo> {
+        let name_transaction = self.db.begin().await?;
+        reserve_service_name(&name_transaction, &request.name, None).await?;
         // Get the service-specific implementation based on Docker inspection
         let docker = self
             .require_docker()
@@ -12456,6 +12879,26 @@ echo "[restore] Pre-seed complete"
                     e
                 )
             })?;
+
+        let container_name = container
+            .name
+            .as_deref()
+            .map(|name| name.trim_start_matches('/'))
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| ExternalServiceError::InternalError {
+                reason: "The import container has no canonical Docker name".to_string(),
+            })?;
+        let container_id =
+            container
+                .id
+                .as_deref()
+                .ok_or_else(|| ExternalServiceError::InternalError {
+                    reason: "The import container has no immutable Docker identity".to_string(),
+                })?;
+        // Name and ID aliases of the same Docker workload share this lock,
+        // even when concurrent callers choose different service names.
+        self.reserve_imported_container(&name_transaction, container_id, container_name)
+            .await?;
 
         let _image = container.config.and_then(|c| c.image).ok_or_else(|| {
             anyhow::anyhow!(
@@ -12646,9 +13089,11 @@ echo "[restore] Pre-seed complete"
             created_by_user_id: Set(created_by_user_id),
             ..Default::default()
         }
-        .insert(self.db.as_ref())
+        .insert(&name_transaction)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to save service to database: {}", e))?;
+
+        name_transaction.commit().await?;
 
         // Return the created service info
         Ok(ExternalServiceInfo {
@@ -15492,6 +15937,8 @@ mod tests {
     // ── End container stats helpers ──────────────────────────────────────────
 
     #[cfg(feature = "docker-tests")]
+    use crate::externalsvc::postgres::{postgres_container_name, postgres_volume_names};
+    #[cfg(feature = "docker-tests")]
     use bollard::Docker;
     #[cfg(feature = "docker-tests")]
     use serde_json::Value as JsonValue;
@@ -15557,6 +16004,482 @@ mod tests {
                 }
             }
         };
+    }
+
+    #[cfg(feature = "docker-tests")]
+    struct NameRaceResources {
+        docker: Arc<Docker>,
+        name: String,
+    }
+
+    #[cfg(feature = "docker-tests")]
+    impl Drop for NameRaceResources {
+        fn drop(&mut self) {
+            let docker = self.docker.clone();
+            let name = self.name.clone();
+            let cleanup = std::thread::spawn(move || {
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    eprintln!("Could not start cleanup for name-race fixture '{name}'");
+                    return;
+                };
+                runtime.block_on(async {
+                    let cleanup = async {
+                        let _ = docker
+                            .remove_container(
+                                &postgres_container_name(&name),
+                                Some(bollard::query_parameters::RemoveContainerOptions {
+                                    force: true,
+                                    v: true,
+                                    ..Default::default()
+                                }),
+                            )
+                            .await;
+                        for volume in postgres_volume_names(&name) {
+                            let _ = docker
+                                .remove_volume(
+                                    &volume,
+                                    None::<bollard::query_parameters::RemoveVolumeOptions>,
+                                )
+                                .await;
+                        }
+                    };
+                    if tokio::time::timeout(std::time::Duration::from_secs(20), cleanup)
+                        .await
+                        .is_err()
+                    {
+                        eprintln!("Cleanup timed out for name-race fixture '{name}'");
+                    }
+                });
+            });
+            let _ = cleanup.join();
+        }
+    }
+
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn concurrent_duplicate_service_names_preserve_original_database() {
+        let (manager, _test_db) = setup_test_manager_or_skip!();
+        let name = format!("name-race-{}", uuid::Uuid::new_v4());
+        let docker = manager.require_docker().unwrap();
+        assert!(matches!(
+            docker
+                .inspect_container(
+                    &postgres_container_name(&name),
+                    None::<bollard::query_parameters::InspectContainerOptions>
+                )
+                .await,
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404,
+                ..
+            })
+        ));
+        for volume in postgres_volume_names(&name) {
+            assert!(matches!(
+                docker.inspect_volume(&volume).await,
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404,
+                    ..
+                })
+            ));
+        }
+        // Register the unique, absent fixture resources before the first
+        // create so failed initialization and early assertions clean up too.
+        let _resources = NameRaceResources {
+            docker,
+            name: name.clone(),
+        };
+        let port = get_unused_port();
+        let request = || CreateExternalServiceRequest {
+            name: name.clone(),
+            service_type: ServiceType::Postgres,
+            version: None,
+            parameters: HashMap::from([
+                ("database".to_string(), serde_json::json!("app")),
+                ("username".to_string(), serde_json::json!("app")),
+                (
+                    "password".to_string(),
+                    serde_json::json!("TestPassword123!"),
+                ),
+                ("port".to_string(), serde_json::json!(port.to_string())),
+                (
+                    "docker_image".to_string(),
+                    serde_json::json!(std::env::var("TEMPS_TEST_POSTGRES_DOCKER_IMAGE")
+                        .unwrap_or_else(|_| "gotempsh/postgres-walg:18-bookworm".to_string())),
+                ),
+            ]),
+            node_id: None,
+            topology: "standalone".to_string(),
+            members: vec![],
+        };
+        let (left, right) = tokio::join!(
+            manager.create_service(request()),
+            manager.create_service(request())
+        );
+        let (original, rejected) = match (left, right) {
+            (Ok(service), Err(error)) | (Err(error), Ok(service)) => (service, error),
+            other => panic!("exactly one create must succeed: {other:?}"),
+        };
+        let result = async {
+            assert!(
+                matches!(rejected, ExternalServiceError::ServiceNameConflict { existing_service_id, .. } if existing_service_id == original.id)
+            );
+            assert_eq!(
+                external_services::Entity::find()
+                    .filter(external_services::Column::Name.eq(&name))
+                    .count(manager.db.as_ref())
+                    .await
+                    .unwrap(),
+                1
+            );
+            let connection = format!("postgres://app:TestPassword123!@127.0.0.1:{port}/app");
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&connection)
+                .await
+                .unwrap();
+            sqlx::raw_sql("CREATE TABLE name_guard_marker (id integer PRIMARY KEY, marker text); INSERT INTO name_guard_marker VALUES (1, 'preserved')")
+                .execute(&pool).await.unwrap();
+            let retry = manager.create_service(request()).await.unwrap_err();
+            assert!(matches!(
+                retry,
+                ExternalServiceError::ServiceNameConflict { .. }
+            ));
+            let marker: String =
+                sqlx::query_scalar("SELECT marker FROM name_guard_marker WHERE id = 1")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(marker, "preserved");
+            let container_name = postgres_container_name(&name);
+            let before = manager
+                .require_docker()
+                .unwrap()
+                .inspect_container(
+                    &container_name,
+                    None::<bollard::query_parameters::InspectContainerOptions>,
+                )
+                .await
+                .unwrap();
+            // Historical built-in aliases remain lifecycle targets. Query
+            // real PostgreSQL ownership without touching any host-wide alias.
+            for (builtin, service_type, alias) in [
+                ("temps-blob", "blob", "rustfs-blob-temps-blob"),
+                ("temps-kv", "redis", "redis-kv-temps-kv"),
+            ] {
+                let mut owner: external_services::ActiveModel =
+                    manager.get_service(original.id).await.unwrap().into();
+                owner.id = sea_orm::ActiveValue::NotSet;
+                owner.name = Set(builtin.to_string());
+                owner.service_type = Set(service_type.to_string());
+                owner.config = Set(None);
+                owner.status = Set("stopped".to_string());
+                let owner = owner.insert(manager.db.as_ref()).await.unwrap();
+                let txn = manager.db.begin().await.unwrap();
+                let conflict = manager
+                    .reserve_imported_container(
+                        &txn,
+                        &format!("owned-alias-id-{}", uuid::Uuid::new_v4()),
+                        alias,
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(conflict, ExternalServiceError::ServiceContainerConflict { existing_service_id, .. } if existing_service_id == owner.id)
+                );
+                txn.rollback().await.unwrap();
+                external_services::Entity::delete_by_id(owner.id)
+                    .exec(manager.db.as_ref())
+                    .await
+                    .unwrap();
+            }
+            let txn = manager.db.begin().await.unwrap();
+            manager
+                .reserve_imported_container(
+                    &txn,
+                    "owned-unused-alias-id",
+                    &format!("rustfs-blob-{name}"),
+                )
+                .await
+                .unwrap();
+            txn.rollback().await.unwrap();
+            // The internal rename path must reserve its destination before
+            // stopping the original container, just as create/import do.
+            let existing_name = format!("rename-existing-{}", uuid::Uuid::new_v4());
+            let mut existing: external_services::ActiveModel =
+                manager.get_service(original.id).await.unwrap().into();
+            existing.id = sea_orm::ActiveValue::NotSet;
+            existing.name = Set(existing_name.clone());
+            existing.status = Set("stopped".to_string());
+            let existing = existing.insert(manager.db.as_ref()).await.unwrap();
+            let rename = |name: String| UpdateExternalServiceRequest {
+                name: Some(name),
+                parameters: HashMap::new(),
+                docker_image: None,
+            };
+            let conflict = manager
+                .update_service(original.id, rename(existing_name))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(conflict, ExternalServiceError::ServiceNameConflict { existing_service_id, .. } if existing_service_id == existing.id)
+            );
+            external_services::Entity::delete_by_id(existing.id)
+                .exec(manager.db.as_ref())
+                .await
+                .unwrap();
+            let occupied_name = format!("rename-occupied-{}", uuid::Uuid::new_v4());
+            let occupied_container = postgres_container_name(&occupied_name);
+            let docker = manager.require_docker().unwrap();
+            assert!(matches!(
+                docker
+                    .inspect_container(
+                        &occupied_container,
+                        None::<bollard::query_parameters::InspectContainerOptions>
+                    )
+                    .await,
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404,
+                    ..
+                })
+            ));
+            for volume in postgres_volume_names(&occupied_name) {
+                assert!(matches!(
+                    docker.inspect_volume(&volume).await,
+                    Err(bollard::errors::Error::DockerResponseServerError {
+                        status_code: 404,
+                        ..
+                    })
+                ));
+            }
+            let _occupied_resources = NameRaceResources {
+                docker: docker.clone(),
+                name: occupied_name.clone(),
+            };
+            let occupied = docker
+                .create_container(
+                    Some(bollard::query_parameters::CreateContainerOptions {
+                        name: Some(occupied_container.clone()),
+                        ..Default::default()
+                    }),
+                    bollard::models::ContainerCreateBody {
+                        image: Some(
+                            std::env::var("TEMPS_TEST_POSTGRES_DOCKER_IMAGE").unwrap_or_else(
+                                |_| "gotempsh/postgres-walg:18-bookworm".to_string(),
+                            ),
+                        ),
+                        entrypoint: Some(vec!["sh".to_string()]),
+                        cmd: Some(vec!["-c".to_string(), "sleep 300".to_string()]),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let conflict = manager
+                .update_service(original.id, rename(occupied_name))
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                conflict,
+                ExternalServiceError::ServiceResourceConflict { .. }
+            ));
+            let after = docker
+                .inspect_container(
+                    &container_name,
+                    None::<bollard::query_parameters::InspectContainerOptions>,
+                )
+                .await
+                .unwrap();
+            assert_eq!(before.id, after.id);
+            assert_eq!(before.state.unwrap().status, after.state.unwrap().status);
+            assert_eq!(manager.get_service(original.id).await.unwrap().name, name);
+            assert_eq!(
+                docker
+                    .inspect_container(
+                        &occupied_container,
+                        None::<bollard::query_parameters::InspectContainerOptions>
+                    )
+                    .await
+                    .unwrap()
+                    .id,
+                Some(occupied.id)
+            );
+            let marker: String =
+                sqlx::query_scalar("SELECT marker FROM name_guard_marker WHERE id = 1")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(marker, "preserved");
+            pool.close().await;
+        };
+        let assertion = std::panic::AssertUnwindSafe(result);
+        use futures::FutureExt;
+        let assertion = assertion.catch_unwind().await;
+        manager.delete_service(original.id).await.unwrap();
+        if let Err(error) = assertion {
+            std::panic::resume_unwind(error);
+        }
+    }
+
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn deleting_renamed_service_preserves_admitted_backup_provenance() {
+        use temps_entities::{backups, s3_sources, users};
+        let (manager, test_db) = setup_test_manager_or_skip!();
+        let now = Utc::now();
+        let original_name = format!("backup-original-{}", uuid::Uuid::new_v4());
+        let renamed_name = format!("backup-renamed-{}", uuid::Uuid::new_v4());
+        // Only database fixtures are needed. Verify the uniquely named cleanup
+        // targets are absent before exercising the real service deletion path.
+        let docker = manager.require_docker().unwrap();
+        for name in [&original_name, &renamed_name] {
+            assert!(matches!(
+                docker
+                    .inspect_container(
+                        &postgres_container_name(name),
+                        None::<bollard::query_parameters::InspectContainerOptions>
+                    )
+                    .await,
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404,
+                    ..
+                })
+            ));
+            for volume in postgres_volume_names(name) {
+                assert!(matches!(
+                    docker.inspect_volume(&volume).await,
+                    Err(bollard::errors::Error::DockerResponseServerError {
+                        status_code: 404,
+                        ..
+                    })
+                ));
+            }
+        }
+        let user = users::ActiveModel {
+            name: Set("Backup Owner".to_string()),
+            email: Set(format!("backup-owner-{}@test.local", uuid::Uuid::new_v4())),
+            email_verified: Set(true),
+            mfa_enabled: Set(false),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await
+        .unwrap();
+        let service = external_services::ActiveModel {
+            name: Set(original_name.clone()),
+            service_type: Set("postgres".to_string()),
+            status: Set("stopped".to_string()),
+            config: Set(Some(
+                manager.encryption_service.encrypt_string("{}").unwrap(),
+            )),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await
+        .unwrap();
+        let source = s3_sources::ActiveModel {
+            name: Set(format!("backup-source-{}", uuid::Uuid::new_v4())),
+            bucket_name: Set("test-bucket".to_string()),
+            region: Set("us-east-1".to_string()),
+            bucket_path: Set("owned".to_string()),
+            access_key_id: Set("test-access".to_string()),
+            secret_key: Set("test-secret".to_string()),
+            is_default: Set(false),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await
+        .unwrap();
+        let location =
+            format!("s3://test-bucket/owned/external_services/postgres/{original_name}/walg");
+        let backup = backups::ActiveModel {
+            name: Set("admitted backup".to_string()),
+            backup_id: Set(uuid::Uuid::new_v4().to_string()),
+            backup_type: Set("full".to_string()),
+            state: Set("completed".to_string()),
+            started_at: Set(now),
+            finished_at: Set(Some(now)),
+            size_bytes: Set(Some(1024)),
+            s3_source_id: Set(source.id),
+            s3_location: Set(location.clone()),
+            metadata: Set("{}".to_string()),
+            compression_type: Set("gzip".to_string()),
+            created_by: Set(user.id),
+            tags: Set("[]".to_string()),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await
+        .unwrap();
+        let mut child_ids = Vec::new();
+        for (name, kind) in [
+            (Some(original_name.clone()), Some("postgres".to_string())),
+            (Some(original_name.clone()), None),
+            (None, None),
+        ] {
+            let child = external_service_backups::ActiveModel {
+                service_id: Set(service.id),
+                backup_id: Set(backup.id),
+                backup_type: Set("full".to_string()),
+                state: Set("completed".to_string()),
+                started_at: Set(now),
+                finished_at: Set(Some(now)),
+                size_bytes: Set(Some(1024)),
+                s3_location: Set(location.clone()),
+                metadata: Set(serde_json::json!({})),
+                compression_type: Set("gzip".to_string()),
+                created_by: Set(user.id),
+                service_name_snapshot: Set(name),
+                service_type_snapshot: Set(kind),
+                ..Default::default()
+            }
+            .insert(test_db.db.as_ref())
+            .await
+            .unwrap();
+            child_ids.push(child.id);
+        }
+        let mut renamed: external_services::ActiveModel = service.clone().into();
+        renamed.name = Set(renamed_name.clone());
+        renamed.update(test_db.db.as_ref()).await.unwrap();
+        manager.delete_service(service.id).await.unwrap();
+        assert!(external_services::Entity::find_by_id(service.id)
+            .one(test_db.db.as_ref())
+            .await
+            .unwrap()
+            .is_none());
+        let retained = external_service_backups::Entity::find()
+            .filter(external_service_backups::Column::Id.is_in(child_ids))
+            .order_by_asc(external_service_backups::Column::Id)
+            .all(test_db.db.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(retained.len(), 3);
+        assert_eq!(
+            retained[0].service_name_snapshot.as_deref(),
+            Some(original_name.as_str())
+        );
+        assert_eq!(
+            retained[1].service_name_snapshot.as_deref(),
+            Some(original_name.as_str())
+        );
+        assert_eq!(
+            retained[2].service_name_snapshot.as_deref(),
+            Some(renamed_name.as_str())
+        );
+        assert!(retained
+            .iter()
+            .all(
+                |child| child.service_type_snapshot.as_deref() == Some("postgres")
+                    && child.s3_location == location
+            ));
     }
 
     /// The core safety guard: only PENDING/RUNNING/ROLLING_BACK upgrade rows
@@ -15795,19 +16718,145 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_create_s3_service() {
+        struct S3FixtureResources {
+            name: String,
+        }
+
+        impl Drop for S3FixtureResources {
+            fn drop(&mut self) {
+                let name = self.name.clone();
+                let cleanup = std::thread::spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("Failed to start S3 fixture cleanup runtime");
+                    runtime.block_on(async {
+                        let cleanup = async {
+                            // A fresh client keeps cleanup independent of the test runtime.
+                            let docker = Docker::connect_with_local_defaults()
+                                .map_err(|error| error.to_string())?;
+                            let container_name = format!("rustfs-{name}");
+                            match docker
+                                .inspect_container(
+                                    &container_name,
+                                    None::<bollard::query_parameters::InspectContainerOptions>,
+                                )
+                                .await
+                            {
+                                Ok(container) => {
+                                    let labels = container.config.and_then(|config| config.labels);
+                                    if labels
+                                        .as_ref()
+                                        .and_then(|labels| labels.get("temps.service_name"))
+                                        != Some(&name)
+                                    {
+                                        return Err(format!(
+                                            "Refusing to clean S3 fixture container '{container_name}': ownership label changed"
+                                        ));
+                                    }
+                                    let id = container.id.ok_or_else(|| {
+                                        format!("S3 fixture container '{container_name}' has no ID")
+                                    })?;
+                                    docker
+                                        .remove_container(
+                                            &id,
+                                            Some(bollard::query_parameters::RemoveContainerOptions {
+                                                force: true,
+                                                ..Default::default()
+                                            }),
+                                        )
+                                        .await
+                                        .map_err(|error| error.to_string())?;
+                                }
+                                Err(bollard::errors::Error::DockerResponseServerError {
+                                    status_code: 404,
+                                    ..
+                                }) => {}
+                                Err(error) => return Err(error.to_string()),
+                            }
+                            for volume in [format!("rustfs_{name}_data"), format!("rustfs_{name}_logs")] {
+                                match docker
+                                    .remove_volume(
+                                        &volume,
+                                        None::<bollard::query_parameters::RemoveVolumeOptions>,
+                                    )
+                                    .await
+                                {
+                                    Ok(())
+                                    | Err(bollard::errors::Error::DockerResponseServerError {
+                                        status_code: 404,
+                                        ..
+                                    }) => {}
+                                    Err(error) => return Err(format!("Volume '{volume}': {error}")),
+                                }
+                            }
+                            Ok::<(), String>(())
+                        };
+                        match tokio::time::timeout(std::time::Duration::from_secs(20), cleanup).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => eprintln!("S3 fixture '{name}' cleanup failed: {error}"),
+                            Err(_) => eprintln!("S3 fixture '{name}' cleanup exceeded 20 seconds"),
+                        }
+                    });
+                });
+                if cleanup.join().is_err() {
+                    eprintln!("S3 fixture '{}' cleanup thread panicked", self.name);
+                }
+            }
+        }
+
         let (manager, _test_db) = setup_test_manager_or_skip!();
-
-        let random_unused_port = get_unused_port();
-        let mut params = HashMap::new();
-        params.insert(
-            "port".to_string(),
-            JsonValue::String(random_unused_port.to_string()),
+        let name = format!("test-s3-{}", uuid::Uuid::new_v4());
+        let docker = manager.require_docker().unwrap();
+        let container_name = format!("rustfs-{name}");
+        assert!(
+            matches!(
+                docker
+                    .inspect_container(
+                        &container_name,
+                        None::<bollard::query_parameters::InspectContainerOptions>
+                    )
+                    .await,
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404,
+                    ..
+                })
+            ),
+            "S3 fixture container '{container_name}' must not exist before creation"
         );
-        // Note: bucket_name is not a parameter - buckets are created dynamically during provisioning
-        // access_key and secret_key have defaults, so they're optional
-
+        for volume in [format!("rustfs_{name}_data"), format!("rustfs_{name}_logs")] {
+            assert!(
+                matches!(
+                    docker.inspect_volume(&volume).await,
+                    Err(bollard::errors::Error::DockerResponseServerError {
+                        status_code: 404,
+                        ..
+                    })
+                ),
+                "S3 fixture volume '{volume}' must not exist before creation"
+            );
+        }
+        // These UUID-derived resources were absent above; clean them even if
+        // creation or a readiness assertion fails before delete_service runs.
+        let _cleanup = S3FixtureResources { name: name.clone() };
+        let api_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let console_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut params = HashMap::from([
+            (
+                "port".to_string(),
+                JsonValue::String(api_listener.local_addr().unwrap().port().to_string()),
+            ),
+            (
+                "console_port".to_string(),
+                JsonValue::String(console_listener.local_addr().unwrap().port().to_string()),
+            ),
+        ]);
+        // A test-only override lets shared-host runs use a run-owned image.
+        if let Ok(image) = std::env::var("TEMPS_TEST_RUSTFS_DOCKER_IMAGE") {
+            params.insert("docker_image".to_string(), JsonValue::String(image));
+        }
         let request = CreateExternalServiceRequest {
-            name: "test-s3".to_string(),
+            name: name.clone(),
             service_type: ServiceType::S3,
             version: None,
             parameters: params,
@@ -15815,16 +16864,54 @@ mod tests {
             topology: "standalone".to_string(),
             members: Vec::new(),
         };
-
-        let result = manager.create_service(request).await;
-
-        let service = result.expect("Failed to create S3 service");
-        assert_eq!(service.name, "test-s3");
+        drop(api_listener);
+        drop(console_listener);
+        let mut service = manager
+            .create_service(request)
+            .await
+            .expect("Failed to create S3 service");
+        assert_eq!(service.name, name);
         assert_eq!(service.service_type, ServiceType::S3);
-        assert_eq!(service.status, "running");
+        eprintln!(
+            "S3 fixture '{name}' created with status '{}'",
+            service.status
+        );
 
-        // Cleanup
-        let _ = manager.delete_service(service.id).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(190);
+        while service.status != "running" {
+            // Readiness is additive: this test also compiles on versions that
+            // mark the service running synchronously and omit the field.
+            let snapshot = serde_json::to_value(&service).unwrap();
+            let diagnostic = format!(
+                "status={}, error={:?}, readiness={:?}",
+                service.status,
+                service.error_message,
+                snapshot.get("readiness")
+            );
+            assert_ne!(
+                service.status, "failed",
+                "S3 fixture '{name}' failed: {diagnostic}"
+            );
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "S3 fixture '{name}' did not become ready within 190 seconds: {diagnostic}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            service = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                manager.get_service_info(service.id),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("S3 fixture '{name}' status read timed out: {diagnostic}"))
+            .unwrap_or_else(|error| {
+                panic!("S3 fixture '{name}' status read failed: {error}; {diagnostic}")
+            });
+        }
+        eprintln!("S3 fixture '{name}' reached running");
+        manager
+            .delete_service(service.id)
+            .await
+            .expect("Failed to delete owned S3 fixture");
     }
 
     #[cfg(feature = "docker-tests")]
@@ -16710,6 +17797,242 @@ mod tests {
                 "persisted health_status {persisted:?} should report {expected}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn service_name_reservation_locks_before_check_and_rejects_collision() {
+        let existing = encrypted_service_model(17, serde_json::json!({}));
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .append_query_results([vec![existing]])
+            .into_connection();
+        let txn = db.begin().await.unwrap();
+        let error = reserve_service_name(&txn, "postgres-test", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ExternalServiceError::ServiceNameConflict {
+                existing_service_id: 17,
+                ..
+            }
+        ));
+        txn.rollback().await.unwrap();
+        let log = db.into_transaction_log();
+        let statements = log[0].statements();
+        let lock = statements
+            .iter()
+            .position(|statement| statement.sql.contains("pg_advisory_xact_lock"))
+            .unwrap();
+        let check = statements
+            .iter()
+            .position(|statement| {
+                statement.sql.contains("SELECT") && statement.sql.contains("external_services")
+            })
+            .unwrap();
+        assert!(lock < check);
+        assert!(statements
+            .iter()
+            .all(|statement| !statement.sql.contains("INSERT")));
+    }
+
+    #[tokio::test]
+    async fn imported_container_reservation_rejects_existing_owner_before_validation() {
+        let existing = encrypted_service_model(17, serde_json::json!({}));
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .append_query_results([vec![existing]])
+                .into_connection(),
+        );
+        let manager = mock_service_manager_with_db(db.clone());
+        let txn = db.begin().await.unwrap();
+        let error = manager
+            .reserve_imported_container(&txn, "immutable-container-id", "postgres-test")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ExternalServiceError::ServiceContainerConflict {
+                existing_service_id: 17,
+                ..
+            }
+        ));
+        txn.rollback().await.unwrap();
+        drop(manager);
+        let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("test database still has owners"));
+        let log = db.into_transaction_log();
+        let statements = log[0].statements();
+        let lock = statements
+            .iter()
+            .position(|s| s.sql.contains("pg_advisory_xact_lock"))
+            .unwrap();
+        let owner = statements
+            .iter()
+            .position(|s| s.sql.contains("SELECT") && s.sql.contains("external_services"))
+            .unwrap();
+        assert!(lock < owner);
+        assert!(statements.iter().all(|s| !s.sql.contains("INSERT")));
+    }
+
+    fn active_name_restore(id: i32, name: &str) -> temps_entities::restore_runs::Model {
+        temps_entities::restore_runs::Model {
+            id,
+            source_backup_id: 1,
+            source_service_id: 17,
+            target_service_id: None,
+            target_service_name: Some(name.to_string()),
+            mode: "new_service".to_string(),
+            status: "running".to_string(),
+            phase: "provision".to_string(),
+            recovery_target: None,
+            parameter_overrides: serde_json::json!({}),
+            resume_token: None,
+            log_id: "owned-log".to_string(),
+            error_message: None,
+            attempt: 1,
+            started_at: Some(Utc::now()),
+            finished_at: None,
+            created_by: 1,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            cancel_requested_at: None,
+            cancel_requested_by: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn service_name_reservation_refuses_a_durable_clone_reservation() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .append_query_results([Vec::<external_services::Model>::new()])
+            .append_query_results([vec![active_name_restore(41, "copy")]])
+            .into_connection();
+        let txn = db.begin().await.unwrap();
+        let error = reserve_service_name(&txn, "copy", None).await.unwrap_err();
+        assert!(matches!(
+            error,
+            ExternalServiceError::ServiceNameRestoreConflict {
+                restore_run_id: 41,
+                ..
+            }
+        ));
+        txn.rollback().await.unwrap();
+        let log = db.into_transaction_log();
+        assert!(log[0]
+            .statements()
+            .iter()
+            .all(|s| !s.sql.contains("INSERT")));
+    }
+
+    #[tokio::test]
+    async fn imported_container_reservation_refuses_an_unregistered_clone() {
+        let owner =
+            std::collections::BTreeMap::from([("id".to_string(), sea_orm::Value::Int(Some(41)))]);
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .append_query_results([Vec::<external_services::Model>::new()])
+                .append_query_results([vec![owner]])
+                .into_connection(),
+        );
+        let manager = mock_service_manager_with_db(db.clone());
+        let txn = db.begin().await.unwrap();
+        let error = manager
+            .reserve_imported_container(&txn, "owned-clone-id", "postgres-copy")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ExternalServiceError::ServiceContainerRestoreConflict {
+                restore_run_id: 41,
+                ..
+            }
+        ));
+        txn.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn imported_container_reservation_rechecks_registration_after_clone_handoff() {
+        let owner = encrypted_service_model(23, serde_json::json!({}));
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .append_query_results([Vec::<external_services::Model>::new()])
+                .append_query_results([
+                    Vec::<std::collections::BTreeMap<String, sea_orm::Value>>::new(),
+                ])
+                .append_query_results([vec![owner]])
+                .into_connection(),
+        );
+        let manager = mock_service_manager_with_db(db.clone());
+        let txn = db.begin().await.unwrap();
+        let error = manager
+            .reserve_imported_container(&txn, "owned-clone-id", "postgres-copy")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ExternalServiceError::ServiceContainerConflict {
+                existing_service_id: 23,
+                ..
+            }
+        ));
+        txn.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_duplicate_service_cannot_stop_shared_container() {
+        let existing = encrypted_service_model(17, serde_json::json!({}));
+        let duplicate = encrypted_service_model(23, serde_json::json!({}));
+        let manager = mock_service_manager(vec![vec![duplicate], vec![existing]]);
+        let error = manager.stop_service(23).await.unwrap_err();
+        assert!(matches!(
+            error,
+            ExternalServiceError::AmbiguousServiceName {
+                service_id: 23,
+                existing_service_id: 17,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_duplicate_service_cannot_apply_metrics_to_shared_container() {
+        let existing = encrypted_service_model(17, serde_json::json!({}));
+        let duplicate = encrypted_service_model(23, serde_json::json!({}));
+        let manager = mock_service_manager(vec![vec![duplicate], vec![existing]]);
+        let error = manager
+            .store_and_apply_ingest_key(
+                23,
+                "unused-key".to_string(),
+                "http://localhost/unused".to_string(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ExternalServiceError::AmbiguousServiceName {
+                service_id: 23,
+                existing_service_id: 17,
+                ..
+            }
+        ));
     }
 
     fn encrypted_service_model(id: i32, parameters: serde_json::Value) -> external_services::Model {
