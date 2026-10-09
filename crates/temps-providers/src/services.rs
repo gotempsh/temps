@@ -1584,43 +1584,52 @@ struct ClusterLifecycleReport {
 
 /// The members a cluster Stop/Start acts on, in the order it acts on them.
 ///
-/// Stop: standbys, then the primary, then the monitor. The monitor stays up
-/// while the data nodes go down, and once no standby is running it has no
-/// candidate to promote, so stopping the primary cannot trigger a failover.
-/// Start is the reverse: the monitor first so every keeper can reach it, then
-/// the primary, then the standbys.
+/// Stop, when the monitor named the live `primary`: standbys, then the
+/// primary, then the monitor. The monitor stays up while the data nodes go
+/// down, and once no standby is running it has no candidate to promote, so
+/// stopping the primary cannot trigger a failover.
 ///
-/// `primary` is the live primary's container name when the monitor reported
-/// one; otherwise the stored `primary` role is used. A member whose
-/// provisioning failed is still stopped (it may have a running container the
-/// monitor could promote) but never started.
+/// Stop, when the live primary is unknown (the monitor could not be
+/// queried): the monitor first, then the data members. Stored roles cannot
+/// stand in for the live primary (the role reconciler records every data
+/// member as `replica`), and promotion needs the monitor, so with it down no
+/// order of the data members can cause a failover. If the monitor cannot be
+/// stopped, Stop halts before touching any data member.
+///
+/// Start: the monitor first so every keeper can reach it, then the data
+/// members (a stored `primary` first).
+///
+/// A member whose provisioning failed is still stopped (it may have a
+/// running container the monitor could promote) but never started.
 fn cluster_lifecycle_order<'a>(
     members: &'a [service_members::Model],
     primary: Option<&str>,
     action: ClusterLifecycleAction,
 ) -> Vec<&'a service_members::Model> {
+    // Lower tiers go first.
     let tier = |member: &service_members::Model| -> u8 {
-        if is_role_monitor(&member.role) {
-            2
-        } else if primary.map_or_else(
-            || is_role_primary(&member.role),
-            |name| name == member.container_name,
-        ) {
-            1
-        } else {
-            0
+        let monitor = is_role_monitor(&member.role);
+        match (action, primary) {
+            (ClusterLifecycleAction::Stop, Some(_)) if monitor => 2,
+            (ClusterLifecycleAction::Stop, Some(primary)) => {
+                u8::from(primary == member.container_name)
+            }
+            (ClusterLifecycleAction::Stop, None) => u8::from(!monitor),
+            (ClusterLifecycleAction::Start, _) if monitor => 0,
+            (ClusterLifecycleAction::Start, _) => {
+                if is_role_primary(&member.role) {
+                    1
+                } else {
+                    2
+                }
+            }
         }
     };
     let mut ordered: Vec<_> = members
         .iter()
         .filter(|member| action == ClusterLifecycleAction::Stop || member.status != "failed")
         .collect();
-    match action {
-        ClusterLifecycleAction::Stop => ordered.sort_by_key(|m| (tier(m), m.ordinal)),
-        ClusterLifecycleAction::Start => {
-            ordered.sort_by_key(|m| (std::cmp::Reverse(tier(m)), m.ordinal))
-        }
-    }
+    ordered.sort_by_key(|m| (tier(m), m.ordinal));
     ordered
 }
 
@@ -1727,12 +1736,17 @@ fn recorded_member_status(
 /// takes the lifecycle lock before starting one), so such a member is not
 /// "still being provisioned": refusing a Stop because of it would leave the
 /// cluster's leftover containers impossible to stop.
-fn settle_members_of_failed_cluster(members: &mut [service_members::Model]) {
+///
+/// Returns the ids of the members it changed, whose rows must say so too.
+fn settle_members_of_failed_cluster(members: &mut [service_members::Model]) -> Vec<i32> {
+    let mut abandoned = Vec::new();
     for member in members {
         if !cluster_member_is_settled(&member.status) {
             member.status = "failed".to_string();
+            abandoned.push(member.id);
         }
     }
+    abandoned
 }
 
 /// Member states Stop/Start can act on. Anything else (`pending`,
@@ -11475,7 +11489,30 @@ echo "[restore] Pre-seed complete"
             .all(self.db.as_ref())
             .await?;
         if service.status == "failed" {
-            settle_members_of_failed_cluster(&mut members);
+            let abandoned = settle_members_of_failed_cluster(&mut members);
+            if !abandoned.is_empty() {
+                // Saved before any container changes, so the API stops
+                // reporting these members as still being provisioned.
+                service_members::Entity::update_many()
+                    .col_expr(
+                        service_members::Column::Status,
+                        sea_orm::sea_query::Expr::value("failed"),
+                    )
+                    .col_expr(
+                        service_members::Column::ProvisioningStep,
+                        sea_orm::sea_query::Expr::value(Some(
+                            member_provisioning_step::FAILED.to_string(),
+                        )),
+                    )
+                    .col_expr(
+                        service_members::Column::UpdatedAt,
+                        sea_orm::sea_query::Expr::value(Utc::now()),
+                    )
+                    .filter(service_members::Column::Id.is_in(abandoned))
+                    .filter(service_members::Column::Status.is_in(["pending", "creating"]))
+                    .exec(self.db.as_ref())
+                    .await?;
+            }
         }
         if let Some(busy) = members
             .iter()
@@ -18742,9 +18779,9 @@ mod tests {
             .collect()
     }
 
-    /// Regression for #1353: a cluster is stopped standbys first, primary
-    /// next and monitor last (so no standby is left for the monitor to
-    /// promote), and started in the reverse order.
+    /// Regression for #1353: with the live primary known, a cluster is
+    /// stopped standbys first, primary next and monitor last (so no standby
+    /// is left for the monitor to promote); it is started monitor first.
     #[test]
     fn cluster_lifecycle_order_stops_standbys_first_and_starts_the_monitor_first() {
         let members = vec![
@@ -18756,7 +18793,7 @@ mod tests {
         assert_eq!(
             lifecycle_names(cluster_lifecycle_order(
                 &members,
-                None,
+                Some("postgres-ha-1"),
                 ClusterLifecycleAction::Stop
             )),
             [
@@ -18789,6 +18826,33 @@ mod tests {
                 "postgres-ha-3",
                 "postgres-ha-2",
                 "postgres-ha-monitor"
+            ]
+        );
+    }
+
+    /// Greptile on #1366: when the monitor cannot name the live primary,
+    /// stored roles cannot stand in for it (data members are all stored as
+    /// `replica`), so Stop takes the monitor down first: without it no
+    /// standby can be promoted, whatever order the data members follow.
+    #[test]
+    fn cluster_stop_without_a_known_primary_stops_the_monitor_first() {
+        let members = vec![
+            cluster_member(1, "replica", "running"),
+            cluster_member(0, "monitor", "running"),
+            cluster_member(2, "replica", "running"),
+            cluster_member(3, "primary", "running"),
+        ];
+        assert_eq!(
+            lifecycle_names(cluster_lifecycle_order(
+                &members,
+                None,
+                ClusterLifecycleAction::Stop
+            )),
+            [
+                "postgres-ha-monitor",
+                "postgres-ha-1",
+                "postgres-ha-2",
+                "postgres-ha-3"
             ]
         );
     }
@@ -18997,7 +19061,8 @@ mod tests {
             cluster_member(2, "replica", "creating"),
             cluster_member(3, "replica", "stopped"),
         ];
-        settle_members_of_failed_cluster(&mut members);
+        let abandoned = settle_members_of_failed_cluster(&mut members);
+        assert_eq!(abandoned, [members[1].id, members[2].id]);
         let statuses: Vec<&str> = members.iter().map(|m| m.status.as_str()).collect();
         assert_eq!(statuses, ["running", "failed", "failed", "stopped"]);
         assert!(members.iter().all(|m| cluster_member_is_settled(&m.status)));
