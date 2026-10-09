@@ -442,8 +442,11 @@ WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'app_db')\gexec"#;
 /// explicit `password_encryption = md5`.
 ///
 /// Must run after [`NODE_ENFORCE_SNIPPET`]: both rewrite `pg_hba.conf`.
-/// Expects `PGDATA` and `NODE_PORT`. Starts a background job that always
-/// exits 0 (a member whose Postgres never answers keeps its current rules).
+/// Expects `PGDATA` and `NODE_PORT`. Starts a background job that exits 0
+/// once the rules are decided (keeping `md5` is a decision), and 1 when
+/// PostgreSQL never answered, so nothing was decided: the member keeps its
+/// current rules, and an upgrade waiting on the job must not record the
+/// cluster as converged. The entrypoint does not wait on it.
 const NODE_APP_AUTH_SNIPPET: &str = r#"(
   HBA="$PGDATA/pg_hba.conf"
   APP_RULE='^([[:space:]]*host(ssl)?[[:space:]]+all[[:space:]]+all[[:space:]]+(0\.0\.0\.0/0|::/0)[[:space:]]+)(md5|scram-sha-256)([[:space:]]|$)'
@@ -471,7 +474,7 @@ const NODE_APP_AUTH_SNIPPET: &str = r#"(
     exit 0
   done
   echo "temps: application pg_hba rules left unchanged: PostgreSQL on port $NODE_PORT did not accept local connections" >&2
-  exit 0
+  exit 1
 ) &"#;
 
 /// Removes pg_autoctl's pidfile left behind by an unclean stop.
@@ -650,9 +653,10 @@ fi"#
         script.push(body.to_string());
         if step == AuthUpgradeStep::NodeEnforce {
             // Runs after the infrastructure rewrite (never concurrently with
-            // it) and is waited for so the step returns converged. The job
-            // always exits 0: keeping `md5` is a logged decision, not a
-            // failure of the infrastructure upgrade.
+            // it) and is waited for so the step returns converged. Keeping
+            // `md5` is a logged decision and exits 0; a member whose
+            // PostgreSQL never answered exits 1 so the step fails and the
+            // cluster is not marked converged (it is retried next start).
             script.push(NODE_APP_AUTH_SNIPPET.to_string());
             script.push("wait $!".to_string());
         }
@@ -1856,6 +1860,19 @@ exit 0
     /// bash is unavailable.
     #[cfg(unix)]
     fn run_app_auth_snippet(hba: &str, md5_roles: &str) -> Option<(String, String, bool)> {
+        let (hba, stderr, reloaded, succeeded) = run_app_auth_snippet_status(hba, md5_roles)?;
+        assert!(succeeded, "snippet failed: {stderr}");
+        Some((hba, stderr, reloaded))
+    }
+
+    /// Like [`run_app_auth_snippet`], also returning whether the job exited
+    /// 0. `sleep` is stubbed so a PostgreSQL that never answers exhausts the
+    /// retry loop immediately.
+    #[cfg(unix)]
+    fn run_app_auth_snippet_status(
+        hba: &str,
+        md5_roles: &str,
+    ) -> Option<(String, String, bool, bool)> {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("bin");
@@ -1874,6 +1891,9 @@ exit 0
         )
         .unwrap();
         std::fs::set_permissions(gosu, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let sleep = bin.join("sleep");
+        std::fs::write(&sleep, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(sleep, std::fs::Permissions::from_mode(0o755)).unwrap();
         let pgdata = dir.path().join("pgdata");
         std::fs::create_dir(&pgdata).unwrap();
         std::fs::write(pgdata.join("pg_hba.conf"), hba).unwrap();
@@ -1889,7 +1909,6 @@ exit 0
             .env("COMMAND_LOG", &log)
             .output()
             .ok()?;
-        assert!(output.status.success(), "snippet failed: {output:?}");
         let leftovers: Vec<_> = std::fs::read_dir(&pgdata)
             .unwrap()
             .filter_map(|e| e.ok())
@@ -1901,7 +1920,30 @@ exit 0
             std::fs::read_to_string(pgdata.join("pg_hba.conf")).unwrap(),
             String::from_utf8_lossy(&output.stderr).into_owned(),
             std::fs::read_to_string(&log).unwrap().contains("reload"),
+            output.status.success(),
         ))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_auth_fails_when_postgres_never_answers_so_the_upgrade_is_retried() {
+        // `psql` prints nothing on every attempt, as when the server is down.
+        let Some((hba, stderr, reloaded, succeeded)) =
+            run_app_auth_snippet_status(LEGACY_NODE_HBA, "")
+        else {
+            eprintln!("bash unavailable; skipping");
+            return;
+        };
+        assert!(
+            !succeeded,
+            "an undecided member must fail the step, or the cluster is marked converged: {stderr}"
+        );
+        assert_eq!(hba, LEGACY_NODE_HBA, "rules must be left unchanged");
+        assert!(!reloaded);
+        assert!(
+            stderr.contains("did not accept local connections") && stderr.contains("5432"),
+            "{stderr}"
+        );
     }
 
     const LEGACY_NODE_HBA: &str = "\
