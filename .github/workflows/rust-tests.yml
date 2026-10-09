@@ -31,25 +31,35 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Documentation-only pull requests skip the build and test jobs.
+  # Pull requests skip the jobs that cannot see what they changed.
   #
-  # `code` is "false" only when every changed file is documentation (see
-  # .github/scripts/classify-ci-changes.py for what counts, including the docs
-  # pages CI itself reads). Pushes to `main` always run everything, since
-  # they seed the caches and nightly-release decisions read their results.
+  # .github/scripts/classify-ci-changes.py sorts the changed files into areas:
+  #   code  "false" when every changed file is documentation (including the
+  #         docs pages CI itself reads, which count as code)
+  #   rust  "false" when nothing outside docs, web/, apps/temps-cli/ and
+  #         skills/ changed: no Rust input, so Cargo Check, Clippy and every
+  #         Rust test group are skipped, and build-binary reuses the binary
+  #         main built instead of compiling one
+  #   web   "true" when web/ changed, or rust is "true"
+  #   cli   "true" when apps/temps-cli/ changed, or rust is "true"
+  # Pushes to `main` always run everything, since they seed the caches, the
+  # binaries pull requests reuse, and the nightly-release decision.
   #
-  # Gated jobs test `code != 'false'` under `!cancelled()`, so if this job
-  # fails the output is empty and everything runs: a broken classifier costs
+  # Gated jobs test `!= 'false'` under `!cancelled()`, so if this job fails
+  # every output is empty and everything runs: a broken classifier costs
   # runner time, never coverage. Jobs skipped through `if:` report success, so
-  # required checks still pass on a docs-only PR. Matrix jobs are the
-  # exception -- a skipped matrix is never expanded, so `Unit Tests (unit-a)`
-  # would never report -- which is why unit-tests skips its steps instead.
+  # required checks still pass. Matrix jobs are the exception -- a skipped
+  # matrix is never expanded, so `Unit Tests (unit-a)` would never report --
+  # which is why unit-tests skips its steps instead.
   # ---------------------------------------------------------------------------
   changes:
     name: Detect code changes
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.classify.outputs.code }}
+      rust: ${{ steps.classify.outputs.rust }}
+      web: ${{ steps.classify.outputs.web }}
+      cli: ${{ steps.classify.outputs.cli }}
     steps:
       - name: Checkout code
         if: github.event_name == 'pull_request'
@@ -65,7 +75,7 @@ jobs:
         run: |
           if [[ "$GITHUB_EVENT_NAME" != "pull_request" ]]; then
             echo "Not a pull request ($GITHUB_EVENT_NAME); running every job."
-            echo "code=true" >> "$GITHUB_OUTPUT"
+            printf '%s\n' code=true rust=true web=true cli=true >> "$GITHUB_OUTPUT"
             exit 0
           fi
           python3 .github/scripts/classify-ci-changes.py --base HEAD^1 --head HEAD
@@ -132,8 +142,14 @@ jobs:
       - name: Test upgrade-test release selection
         run: python3 .github/scripts/test_release_select.py
 
-      - name: Test docs-only CI classification
+      - name: Test CI change classification
         run: python3 .github/scripts/test-classify-ci-changes.py
+
+      - name: Test main binary reuse lookup
+        run: python3 .github/scripts/test-find-reusable-binary.py
+
+      - name: Test the console proxy E2E uses with a reused binary
+        run: python3 .github/scripts/test-serve-console-from-source.py
 
       - name: Verify source attribution headers
         run: python3 scripts/source_attribution.py check
@@ -141,7 +157,7 @@ jobs:
   otel-protobuf-compat:
     name: OTEL protobuf compatibility (Ubuntu 22.04)
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     # The release workflow uses Ubuntu 22.04, whose protobuf compiler requires
     # an explicit proto3-optional flag for the OpenTelemetry metrics schema.
     # Keep this check on the same runner so newer `protoc` versions cannot mask
@@ -178,33 +194,101 @@ jobs:
   # musl-static is the right target for both: it is exactly the binary that
   # ships in the Docker image, and a static binary runs fine directly on the
   # runner. E2E therefore now tests the artifact users actually get.
+  #
+  # A pull request that changes no Rust input (`rust == 'false'`) does not
+  # compile at all. It downloads the binary a `main` push already built from
+  # the same Rust source (.github/scripts/find-reusable-binary.py) and
+  # re-uploads it under the usual name, so every consumer is unchanged. That
+  # binary embeds main's console, not this pull request's, so the E2E job is
+  # told (`reused-from`) to serve the console from this checkout in front of
+  # it. On a pull request the compile takes 45-65 minutes; the download takes
+  # seconds. No match, or any error on the way, builds as before.
   # ---------------------------------------------------------------------------
   build-binary:
     name: Build temps Binary (musl)
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    # Only when a consumer below will run: a docs- or skills-only change has
+    # none, and would otherwise compile (or download) a binary nobody reads.
+    if: >-
+      ${{ !cancelled() && (needs.changes.outputs.rust != 'false'
+      || needs.changes.outputs.web != 'false' || needs.changes.outputs.cli != 'false') }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Looks up main's rust-tests runs and downloads their binary artifact.
+      actions: read
+    outputs:
+      # The main commit whose binary was reused, or empty when it was built.
+      reused-from: ${{ steps.binary-source.outputs.reused-from }}
     # Warm this is ~5 minutes. The ceiling is sized for a fully cold cache,
     # which took 81 minutes the last time the cargo cache was evicted — a
     # tighter bound would turn a slow run into a failed one.
     timeout-minutes: 100
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+        with:
+          # The reuse lookup walks main's first-parent history back from the
+          # merge commit's base, and diffs each candidate against the merge
+          # commit, so it needs that much history.
+          fetch-depth: ${{ needs.changes.outputs.rust == 'false' && 20 || 1 }}
+
+      - name: Find a reusable main binary
+        id: reuse
+        if: github.event_name == 'pull_request' && needs.changes.outputs.rust == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >-
+          python3 .github/scripts/find-reusable-binary.py
+          --base HEAD^1 --head HEAD --artifact temps-binary-musl-fast
+
+      - name: Download reusable main binary
+        id: reuse-download
+        if: steps.reuse.outputs.run-id != ''
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ steps.reuse.outputs.artifact-name }}
+          path: ci-prebuilt
+          run-id: ${{ steps.reuse.outputs.run-id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Every step from here to the upload compiles, and is skipped when this
+      # reports a reused binary.
+      - name: Record binary source
+        id: binary-source
+        env:
+          DOWNLOAD_OUTCOME: ${{ steps.reuse-download.outcome }}
+          REUSE_SHA: ${{ steps.reuse.outputs.sha }}
+          REUSE_RUN: ${{ steps.reuse.outputs.run-id }}
+        run: |
+          if [[ "$DOWNLOAD_OUTCOME" == success ]] \
+            && chmod +x ci-prebuilt/temps && ci-prebuilt/temps --version; then
+            echo "::notice title=temps binary reused::No Rust input changed, so this run uses the binary main built for $REUSE_SHA (run $REUSE_RUN) instead of compiling one. E2E serves this pull request's console in front of it."
+            echo "reused-from=$REUSE_SHA" >> "$GITHUB_OUTPUT"
+          else
+            if [[ -n "$REUSE_RUN" ]]; then
+              echo "::warning::Could not use main's binary from run $REUSE_RUN (download: $DOWNLOAD_OUTCOME); building it instead."
+            fi
+            rm -rf ci-prebuilt
+            echo "reused-from=" >> "$GITHUB_OUTPUT"
+          fi
+
       # The runner starts with ~27GiB free. The restored cache archive, its
       # extracted target dir, the build and the archive written on save all
       # need room at once: with the 21GB entry, restores aborted partway and a
       # save died with "No space left on device", which left its key reserved
       # so later runs could not save either. Same cleanup as the test jobs.
       - name: Free up disk space
+        if: steps.binary-source.outputs.reused-from == ''
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force
           sudo apt-get clean
           df -h /
 
-      - name: Checkout code
-        uses: actions/checkout@v7.0.1
-
       - name: Set up Docker Buildx
+        if: steps.binary-source.outputs.reused-from == ''
         uses: docker/setup-buildx-action@v4
 
       # The toolchain stage (apk deps, bun, wasm-pack/wasm-bindgen-cli compiled
@@ -214,6 +298,7 @@ jobs:
       # would, but with a cargo target dir that persists across runs — the
       # one thing an in-Docker build can never have.
       - name: Build toolchain image (GHA layer cache)
+        if: steps.binary-source.outputs.reused-from == ''
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -254,6 +339,7 @@ jobs:
       # Cargo.lock now rebuilds the delta on top of main's copy on every
       # push, instead of everyone cold-building because the pool thrashed.
       - name: Restore cargo target dir (musl, fast profile)
+        if: steps.binary-source.outputs.reused-from == ''
         id: musl-cache
         uses: actions/cache/restore@v6
         with:
@@ -266,6 +352,7 @@ jobs:
       # Build the CAPTCHA from source before embedding it in the application.
       # Byte differences from the committed package do not block the build.
       - name: Rebuild CAPTCHA WASM in toolchain container
+        if: steps.binary-source.outputs.reused-from == ''
         run: |
           docker run --rm --platform linux/amd64 \
             --volume "$PWD":/build --workdir /build/crates/temps-captcha-wasm \
@@ -281,6 +368,7 @@ jobs:
       # messages list every unit of the build, fresh or not, which is what
       # the prune step below keys on.
       - name: Build temps binary in toolchain container
+        if: steps.binary-source.outputs.reused-from == ''
         run: |
           mkdir -p ci-build-cache/target ci-build-cache/cargo-registry ci-prebuilt
           docker run --rm \
@@ -309,6 +397,7 @@ jobs:
       # this build did not use before saving. Runs that don't save only
       # report what would go, so the numbers stay visible on every PR.
       - name: Prune stale build output from cargo cache
+        if: steps.binary-source.outputs.reused-from == ''
         env:
           PRUNE_MODE: ${{ github.ref == 'refs/heads/main' && steps.musl-cache.outputs.cache-hit != 'true' && '--apply' || '' }}
         run: |
@@ -325,7 +414,7 @@ jobs:
       # was wrongly removed before the save, so the cache stays complete, and
       # the warning says the prune script needs updating.
       - name: Verify pruned cache is still fresh
-        if: github.ref == 'refs/heads/main' && steps.musl-cache.outputs.cache-hit != 'true'
+        if: steps.binary-source.outputs.reused-from == '' && github.ref == 'refs/heads/main' && steps.musl-cache.outputs.cache-hit != 'true'
         run: |
           docker run --rm \
             --volume "$PWD":/build --workdir /build \
@@ -348,7 +437,7 @@ jobs:
           fi
 
       - name: Save cargo target dir (musl, fast profile)
-        if: github.ref == 'refs/heads/main' && steps.musl-cache.outputs.cache-hit != 'true'
+        if: steps.binary-source.outputs.reused-from == '' && github.ref == 'refs/heads/main' && steps.musl-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: ci-build-cache
@@ -359,26 +448,46 @@ jobs:
         with:
           name: temps-binary-musl-fast
           path: ci-prebuilt/temps
-          retention-days: 1
+          # Pull requests that change no Rust input reuse main's copy, so keep
+          # it long enough to outlive a quiet weekend on main: a base whose
+          # binary has expired means a 45-65 minute compile instead. Pull
+          # request copies are only read within their own run.
+          retention-days: ${{ github.ref == 'refs/heads/main' && 7 || 1 }}
           # Already a stripped binary; re-compressing costs more than it saves.
           compression-level: 0
 
   # Lives in its own file for readability; called from here so it can reuse
   # the binary `build-binary` already compiled. Artifacts are per-run, and a
   # called workflow is part of the same run, so the download just works.
+  #
+  # The consumers below each run only for the areas they can see. Their
+  # `!cancelled()` plus the explicit build-binary check keeps them running
+  # when `changes` itself failed (every output empty), which the implicit
+  # success() would not.
+  #   e2e           console + API: Rust or web/ changes
+  #   scenario-e2e  drives the CLI against the API: Rust or apps/temps-cli/
+  #   upgrade-test, compose-security  the binary and the install path: Rust
   e2e:
     name: E2E
-    needs: build-binary
+    needs: [changes, build-binary]
+    if: >-
+      ${{ !cancelled() && needs.build-binary.result == 'success'
+      && (needs.changes.outputs.rust != 'false' || needs.changes.outputs.web != 'false') }}
     uses: ./.github/workflows/e2e-tests.yml
     with:
       binary-artifact: temps-binary-musl-fast
+      # A reused binary embeds main's console; test this checkout's instead.
+      console-from-source: ${{ needs.build-binary.outputs.reused-from != '' }}
 
   # The existing E2E workflow above covers Playwright and three example
   # deployments. This separate matrix runs the real apps/temps-e2e scenario
   # CLI in isolated shards, including the dedicated multinode/mTLS topology.
   scenario-e2e:
     name: Scenario E2E
-    needs: build-binary
+    needs: [changes, build-binary]
+    if: >-
+      ${{ !cancelled() && needs.build-binary.result == 'success'
+      && (needs.changes.outputs.rust != 'false' || needs.changes.outputs.cli != 'false') }}
     uses: ./.github/workflows/apps-e2e-tests.yml
     with:
       binary-artifact: temps-binary-musl-fast
@@ -388,7 +497,8 @@ jobs:
   # and a backup-based rollback. Also runs nightly from its own file.
   upgrade-test:
     name: Upgrade
-    needs: build-binary
+    needs: [changes, build-binary]
+    if: ${{ !cancelled() && needs.build-binary.result == 'success' && needs.changes.outputs.rust != 'false' }}
     uses: ./.github/workflows/upgrade-tests.yml
     with:
       binary-artifact: temps-binary-musl-fast
@@ -396,7 +506,8 @@ jobs:
   compose-security:
     name: Compose Security
     runs-on: ubuntu-latest
-    needs: build-binary
+    needs: [changes, build-binary]
+    if: ${{ !cancelled() && needs.build-binary.result == 'success' && needs.changes.outputs.rust != 'false' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
@@ -444,7 +555,7 @@ jobs:
   check:
     name: Cargo Check
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -529,7 +640,9 @@ jobs:
   web-typecheck:
     name: Web TypeScript Check
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    # Skipped only for docs-, CLI- and skills-only changes. Anything web/
+    # imports from outside itself is in the Rust area, which sets `web` too.
+    if: ${{ !cancelled() && needs.changes.outputs.web != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -605,7 +718,7 @@ jobs:
   clippy:
     name: Clippy
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -683,7 +796,7 @@ jobs:
   build-test-binaries:
     name: Build Test Binaries
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -808,15 +921,15 @@ jobs:
   #
   # These three checks are required by branch protection, and a matrix job
   # skipped through `if:` is never expanded, so `Unit Tests (unit-a)` would
-  # never report and a docs-only PR could not merge. On a docs-only PR
-  # (`code == 'false'`) the job therefore still runs once per group, but every
+  # never report and a PR without Rust changes could not merge. On such a PR
+  # (`rust == 'false'`) the job therefore still runs once per group, but every
   # step is skipped. Otherwise it runs exactly as before: only after
   # build-test-binaries succeeds.
   unit-tests:
     name: "Unit Tests (${{ matrix.group }})"
     runs-on: ubuntu-latest
     needs: [changes, build-test-binaries]
-    if: ${{ !cancelled() && (needs.build-test-binaries.result == 'success' || needs.changes.outputs.code == 'false') }}
+    if: ${{ !cancelled() && (needs.build-test-binaries.result == 'success' || needs.changes.outputs.rust == 'false') }}
     strategy:
       fail-fast: false
       matrix:
@@ -886,12 +999,12 @@ jobs:
               and kind(=test)
 
     steps:
-      - name: Skip on a documentation-only change
-        if: needs.changes.outputs.code == 'false'
-        run: echo "Every changed file is documentation; nothing for ${{ matrix.group }} to test."
+      - name: Skip when no Rust input changed
+        if: needs.changes.outputs.rust == 'false'
+        run: echo "No Rust input changed; nothing for ${{ matrix.group }} to test."
 
       - name: Free up disk space
-        if: needs.changes.outputs.code != 'false'
+        if: needs.changes.outputs.rust != 'false'
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force
@@ -916,7 +1029,7 @@ jobs:
       # separate processes hitting one shared instance (see
       # run_migrations_with_retry's deadlock-retry logic in test_utils.rs).
       - name: Start TimescaleDB (background workers disabled)
-        if: needs.changes.outputs.code != 'false'
+        if: needs.changes.outputs.rust != 'false'
         run: |
           docker run -d --name timescaledb \
             -e POSTGRES_DB=test_db \
@@ -928,31 +1041,31 @@ jobs:
             postgres -c timescaledb.max_background_workers=0
 
       - name: Checkout code
-        if: needs.changes.outputs.code != 'false'
+        if: needs.changes.outputs.rust != 'false'
         uses: actions/checkout@v7.0.1
 
       - name: Install Rust toolchain
-        if: needs.changes.outputs.code != 'false'
+        if: needs.changes.outputs.rust != 'false'
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install cargo-nextest
-        if: needs.changes.outputs.code != 'false'
+        if: needs.changes.outputs.rust != 'false'
         uses: taiki-e/install-action@nextest
 
       - name: Download test binaries
-        if: needs.changes.outputs.code != 'false'
+        if: needs.changes.outputs.rust != 'false'
         uses: actions/download-artifact@v8
         with:
           name: test-binaries-default
 
       - name: Verify TimescaleDB is ready
-        if: needs.changes.outputs.code != 'false'
+        if: needs.changes.outputs.rust != 'false'
         run: |
           timeout 60 bash -c 'until docker exec timescaledb pg_isready -U test_user -d test_db; do sleep 1; done'
           echo "TimescaleDB is ready"
 
       - name: Run unit tests
-        if: needs.changes.outputs.code != 'false'
+        if: needs.changes.outputs.rust != 'false'
         env:
           RUST_BACKTRACE: 1
           TEMPS_TEST_DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db

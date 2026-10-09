@@ -19,6 +19,16 @@ on:
         required: false
         default: temps-binary-musl-fast
         type: string
+      # rust-tests.yml sets this when build-binary reused the binary main
+      # built, because nothing but the console changed. That binary embeds
+      # main's console, so the browser suite would test none of the pull
+      # request's changes. With this set the console is built from this
+      # checkout and served in front of the binary instead.
+      console-from-source:
+        description: "Serve the console built from this checkout instead of the one the binary embeds"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -62,6 +72,9 @@ jobs:
       # 0/false/off/no/disabled — see temps-telemetry/src/service.rs.)
       TEMPS_TELEMETRY: "0"
       TEMPS_BIN: ./ci-prebuilt/temps
+      # Where `temps serve` listens for the console. The browser always uses
+      # 8081; with console-from-source, nginx takes 8081 and the binary 8082.
+      TEMPS_CONSOLE_PORT: ${{ inputs.console-from-source && '8082' || '8081' }}
       # Main and PR builds exercise the beta binary channel. Point sandbox
       # pulls at the matching published image set; the default stable tag is
       # only published by a stable release and otherwise forces a multi-minute
@@ -79,9 +92,10 @@ jobs:
         uses: actions/checkout@v7.0.1
 
       # No Rust toolchain, no wasm-pack, no rsbuild production build — the
-      # binary arrives prebuilt with the web UI already embedded. Bun stays,
-      # but only to install web/node_modules for the Playwright console tests
-      # below; it no longer builds the UI.
+      # binary arrives prebuilt with the web UI already embedded. Bun stays to
+      # install web/node_modules for the Playwright console tests below, and
+      # builds the UI only with console-from-source, when the binary's
+      # embedded console is not this checkout's.
       - name: Download temps binary
         uses: actions/download-artifact@v8
         with:
@@ -120,6 +134,12 @@ jobs:
         with:
           path: web/node_modules
           key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
+
+      # The same production build crates/temps-cli/build.rs embeds, just not
+      # embedded: served by nginx in front of the reused binary (see below).
+      - name: Build the console from this checkout
+        if: inputs.console-from-source
+        run: cd web && bun run build
 
       - name: Generate self-signed localho.st certificate
         run: |
@@ -283,7 +303,7 @@ jobs:
             --data-dir "$TEMPS_DATA_DIR" \
             --address 0.0.0.0:5002 \
             --tls-address 0.0.0.0:3443 \
-            --console-address 0.0.0.0:8081 \
+            --console-address "0.0.0.0:$TEMPS_CONSOLE_PORT" \
             --disable-https-redirect \
             --screenshot-provider noop \
             > /tmp/temps.log 2>&1 &
@@ -300,13 +320,19 @@ jobs:
       - name: Wait for platform health
         run: |
           echo "Waiting for Temps to become healthy..."
-          timeout 120 bash -c 'until curl -sf http://localhost:8081/ > /dev/null 2>&1; do sleep 2; done'
+          timeout 120 bash -c "until curl -sf http://localhost:${TEMPS_CONSOLE_PORT}/ > /dev/null 2>&1; do sleep 2; done"
           echo "Platform is healthy"
           # NOTE: this only proves the shell is served. A console whose JS dies
           # on boot still answers 200 here -- that is exactly how #504 shipped.
           # The console UI tests below are what actually verify it works.
-          curl -s -o /dev/null -w "Console HTTP %{http_code}" http://localhost:8081/
+          curl -s -o /dev/null -w "Console HTTP %{http_code}" "http://localhost:$TEMPS_CONSOLE_PORT/"
           echo ""
+
+      # Fails unless 8081 serves this checkout's index.html (on / and on a
+      # client-side route) and reaches the binary's /healthz through the proxy.
+      - name: Serve this checkout's console in front of the binary
+        if: inputs.console-from-source
+        run: .github/scripts/serve-console-from-source.sh web/dist 8081 "$TEMPS_CONSOLE_PORT"
 
       # Drives the real console in a real browser against the instance started
       # above. Runs before the API-level deploys so a broken UI is reported as a
@@ -580,6 +606,12 @@ jobs:
             tail -100 /tmp/temps.log
           else
             echo "No temps log file found"
+          fi
+
+          if [ -f /tmp/temps-console-proxy/error.log ]; then
+            echo ""
+            echo "=== Console proxy (nginx) errors ==="
+            tail -50 /tmp/temps-console-proxy/error.log
           fi
 
           echo ""

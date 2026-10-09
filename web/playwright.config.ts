@@ -24,7 +24,11 @@ import { defineConfig, devices } from '@playwright/test'
  *
  * Note that the console under test is the bundle the Rust binary *embeds*
  * (crates/temps-cli/dist), not a dev-server build. That distinction matters:
- * #504 only manifested in the built bundle.
+ * #504 only manifested in the built bundle. The one exception is a pull
+ * request that changes no Rust input: CI reuses main's binary, whose embedded
+ * console is main's, and serves this checkout's production build (`bun run
+ * build`, still not a dev server) in front of it on the same port -- see
+ * .github/scripts/serve-console-from-source.sh.
  */
 
 const baseURL = process.env.E2E_BASE_URL ?? 'http://localhost:8081'
