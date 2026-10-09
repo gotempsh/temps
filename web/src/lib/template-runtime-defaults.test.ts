@@ -75,28 +75,30 @@ const template = {
 }
 
 describe('template runtime defaults', () => {
-  test('starter images accept tags while service images require immutable digests', () => {
+  test('template images require an immutable digest, like the server', () => {
     const values = templateRuntimeDefaults({
       image: 'ghcr.io/gotempsh/observability-starter:latest',
     })
     expect(
-      createTemplateRuntimeDefaultsSchema('starter').safeParse(values).success
-    ).toBe(true)
-    expect(
-      createTemplateRuntimeDefaultsSchema('service').safeParse(values).success
+      createTemplateRuntimeDefaultsSchema().safeParse(values).success
     ).toBe(false)
     values.image = `ghcr.io/gotempsh/observability-starter@sha256:${'a'.repeat(64)}`
     expect(
-      createTemplateRuntimeDefaultsSchema('service').safeParse(values).success
+      createTemplateRuntimeDefaultsSchema().safeParse(values).success
+    ).toBe(true)
+    values.image = `ghcr.io/gotempsh/observability-starter:1.0@sha256:${'a'.repeat(64)}`
+    expect(
+      createTemplateRuntimeDefaultsSchema().safeParse(values).success
     ).toBe(true)
     for (const image of [
       '',
       'registry.test/image with spaces',
       'registry.test/image\n:latest',
+      `registry.test/image@sha256:${'a'.repeat(63)}`,
     ]) {
       values.image = image
       expect(
-        createTemplateRuntimeDefaultsSchema('starter').safeParse(values).success
+        createTemplateRuntimeDefaultsSchema().safeParse(values).success
       ).toBe(false)
     }
   })

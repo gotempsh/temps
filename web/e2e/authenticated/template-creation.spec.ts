@@ -3,7 +3,7 @@
 
 import { expect, test } from '@playwright/test'
 
-test('observability starter submits its tagged image and exposes collapsed validation errors', async ({
+test('observability starter submits its pinned image and exposes collapsed validation errors', async ({
   page,
 }) => {
   const errors: string[] = []
@@ -60,7 +60,9 @@ test('observability starter submits its tagged image and exposes collapsed valid
   await expect.poll(() => submissions.length).toBe(1)
   expect(submissions[0]).toMatchObject({
     template_slug: 'observability-starter',
-    image: 'ghcr.io/gotempsh/observability-starter:latest',
+    image: expect.stringMatching(
+      /^ghcr\.io\/gotempsh\/observability-starter@sha256:[0-9a-f]{64}$/
+    ),
     storage_service_ids: [101],
   })
   await expect(

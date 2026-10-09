@@ -3209,15 +3209,6 @@ fn has_template_runtime_overrides(
         || request.health_check_path.is_some()
 }
 
-fn is_pinned_sha256_image_reference(image: &str) -> bool {
-    image.rsplit_once('@').is_some_and(|(name, digest)| {
-        !name.trim().is_empty()
-            && digest.strip_prefix("sha256:").is_some_and(|hash| {
-                hash.len() == 64 && hash.chars().all(|character| character.is_ascii_hexdigit())
-            })
-    })
-}
-
 fn resolve_image_template_runtime(
     template: &temps_core::templates::ProjectTemplate,
     request: &super::templates::CreateProjectFromTemplateRequest,
@@ -3249,7 +3240,7 @@ fn resolve_image_template_runtime(
                 .to_string(),
         });
     }
-    if !is_pinned_sha256_image_reference(image_ref) {
+    if !temps_core::templates::is_pinned_image_reference(image_ref) {
         return Err(TemplateRuntimeOverrideError::InvalidImage {
             reason: "use an immutable image reference ending in @sha256:<64 hex characters>"
                 .to_string(),
