@@ -775,7 +775,7 @@ export function EnvironmentConfigurationCard({
               <div className="flex-1 min-w-0">
                 <Label className="text-sm font-medium">Build location</Label>
                 <p className="text-xs text-muted-foreground">
-                  Where this environment's images are built. Building on a
+                  Where this environment&apos;s images are built. Building on a
                   worker node keeps the CPU and memory of a build away from the
                   proxy and running apps on the control plane.
                 </p>

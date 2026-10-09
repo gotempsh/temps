@@ -58,11 +58,14 @@ pub(crate) async fn copy_node_built_image(
             return Ok(NodeImageCopy::AlreadyPresent);
         }
     }
-    let stream = owner.export_image_stream(image_tag).await.map_err(|error| {
-        WorkflowError::JobExecutionFailed(format!(
-            "Failed to export image '{image_tag}' from build node '{owner_name}': {error}"
-        ))
-    })?;
+    let stream = owner
+        .export_image_stream(image_tag)
+        .await
+        .map_err(|error| {
+            WorkflowError::JobExecutionFailed(format!(
+                "Failed to export image '{image_tag}' from build node '{owner_name}': {error}"
+            ))
+        })?;
     destination
         .import_image_stream(stream, image_tag)
         .await
@@ -72,11 +75,14 @@ pub(crate) async fn copy_node_built_image(
                  control plane: {error}"
             ))
         })?;
-    let imported = destination.inspect_image(image_tag).await.map_err(|error| {
-        WorkflowError::JobExecutionFailed(format!(
+    let imported = destination
+        .inspect_image(image_tag)
+        .await
+        .map_err(|error| {
+            WorkflowError::JobExecutionFailed(format!(
             "Cannot verify image '{image_tag}' imported from build node '{owner_name}': {error}"
         ))
-    })?;
+        })?;
     if !same_image_id(&imported.id, &built.id) {
         return Err(WorkflowError::JobValidationFailed(format!(
             "Image '{image_tag}' imported into the control plane is {} but build node \
@@ -248,9 +254,10 @@ mod tests {
         let worker = FakeImageStore::holding("app:latest", "sha256:built");
         let control_plane = FakeImageStore::default();
 
-        let outcome = copy_node_built_image(&worker, "builder-1", &control_plane, "app:latest", None)
-            .await
-            .expect("copy succeeds");
+        let outcome =
+            copy_node_built_image(&worker, "builder-1", &control_plane, "app:latest", None)
+                .await
+                .expect("copy succeeds");
 
         assert_eq!(outcome, NodeImageCopy::Transferred);
         assert_eq!(
@@ -265,9 +272,10 @@ mod tests {
         let worker = FakeImageStore::holding("app:latest", "sha256:built");
         let control_plane = FakeImageStore::holding("app:latest", "sha256:built");
 
-        let outcome = copy_node_built_image(&worker, "builder-1", &control_plane, "app:latest", None)
-            .await
-            .expect("copy succeeds");
+        let outcome =
+            copy_node_built_image(&worker, "builder-1", &control_plane, "app:latest", None)
+                .await
+                .expect("copy succeeds");
 
         assert_eq!(outcome, NodeImageCopy::AlreadyPresent);
         assert!(control_plane.imports.lock().unwrap().is_empty());
@@ -280,9 +288,10 @@ mod tests {
         let worker = FakeImageStore::holding("app:latest", "sha256:built");
         let control_plane = FakeImageStore::holding("app:latest", "sha256:stale");
 
-        let outcome = copy_node_built_image(&worker, "builder-1", &control_plane, "app:latest", None)
-            .await
-            .expect("copy succeeds");
+        let outcome =
+            copy_node_built_image(&worker, "builder-1", &control_plane, "app:latest", None)
+                .await
+                .expect("copy succeeds");
 
         assert_eq!(outcome, NodeImageCopy::Transferred);
         assert_eq!(

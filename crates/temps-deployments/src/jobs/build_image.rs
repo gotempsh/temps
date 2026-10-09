@@ -2436,14 +2436,12 @@ mod tests {
         let context = WorkflowContext::new("wf".to_string(), 1, 1, 1, writer.clone());
 
         assert!(job.execute(context).await.is_err());
-        assert!(
-            writer
-                .lines
-                .lock()
-                .unwrap()
-                .iter()
-                .all(|line| !line.contains("Build location")),
-        );
+        assert!(writer
+            .lines
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|line| !line.contains("Build location")),);
     }
 
     /// A build moved to a worker streams its image back to the control
@@ -2508,9 +2506,11 @@ mod tests {
         assert!(control_plane.images.lock().unwrap().is_empty());
         let lines = writer.lines.lock().unwrap().clone();
         assert!(
-            lines.iter().any(|line| line.contains("Could not copy the image")
-                && line.contains("builder-1")
-                && line.contains("Source maps")),
+            lines
+                .iter()
+                .any(|line| line.contains("Could not copy the image")
+                    && line.contains("builder-1")
+                    && line.contains("Source maps")),
             "{lines:?}"
         );
     }

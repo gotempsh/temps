@@ -264,9 +264,11 @@ fn offload_build_candidate(
     // `.npmrc` is generated from these on the control plane only; a worker
     // build would fail outright, and the values must not leave this host.
     if needs_npm_credentials {
-        return Err("this build uses NPM_TOKEN or NPM_RC for private packages, and worker \
+        return Err(
+            "this build uses NPM_TOKEN or NPM_RC for private packages, and worker \
              builds cannot receive registry credentials yet"
-            .to_string());
+                .to_string(),
+        );
     }
     // DeployStaticJob reads the output files from the build node, and the
     // image itself runs nowhere.
@@ -3874,7 +3876,13 @@ mod tests {
         // A single requested platform is still one image, built for that
         // platform rather than the control plane's.
         assert_eq!(
-            offload_build_candidate(false, false, &["linux/arm64".into()], Some("linux/amd64"), true),
+            offload_build_candidate(
+                false,
+                false,
+                &["linux/arm64".into()],
+                Some("linux/amd64"),
+                true
+            ),
             Ok(OffloadBuildCandidate {
                 platform: Some("linux/arm64".to_string())
             })
@@ -3901,7 +3909,9 @@ mod tests {
             );
         }
         assert_eq!(
-            offload_build_candidate(true, false,
+            offload_build_candidate(
+                true,
+                false,
                 &["linux/amd64".into(), "linux/arm64".into()],
                 Some("linux/amd64"),
                 true
@@ -3914,14 +3924,19 @@ mod tests {
     fn offload_build_candidate_explains_every_reason_to_stay_local() {
         use super::offload_build_candidate;
 
-        let multi_arch = offload_build_candidate(false, false,
+        let multi_arch = offload_build_candidate(
+            false,
+            false,
             &["linux/amd64".into(), "linux/arm64".into()],
             Some("linux/amd64"),
             true,
         )
         .unwrap_err();
         assert!(multi_arch.contains("2 images"), "{multi_arch}");
-        assert!(multi_arch.contains("linux/amd64, linux/arm64"), "{multi_arch}");
+        assert!(
+            multi_arch.contains("linux/amd64, linux/arm64"),
+            "{multi_arch}"
+        );
 
         for static_output_only in [false, true] {
             let no_scheduler =

@@ -1069,10 +1069,7 @@ mod tests {
             BuildLocation::Node
         );
         assert_eq!(
-            DeploymentConfig::resolve_build_location(
-                Some(&env_control_plane),
-                Some(&project_node)
-            ),
+            DeploymentConfig::resolve_build_location(Some(&env_control_plane), Some(&project_node)),
             BuildLocation::ControlPlane
         );
         assert_eq!(

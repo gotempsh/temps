@@ -325,7 +325,9 @@ export function DeployDefaultsCard({
                 render={({ field }) => (
                   <FormItem className="flex flex-col gap-3 rounded-lg border p-4 sm:flex-row sm:items-center sm:justify-between">
                     <div className="space-y-0.5">
-                      <FormLabel className="text-base">Build location</FormLabel>
+                      <FormLabel className="text-base">
+                        Build location
+                      </FormLabel>
                       <FormDescription>
                         Build images on a worker node to keep build CPU and
                         memory away from the proxy and running apps on the

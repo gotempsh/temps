@@ -3,10 +3,7 @@
 
 import { describe, expect, test } from 'bun:test'
 
-import {
-  buildLocationToPayload,
-  buildLocationToSelect,
-} from './build-location'
+import { buildLocationToPayload, buildLocationToSelect } from './build-location'
 
 describe('buildLocationToSelect', () => {
   test('an unset environment follows the project', () => {
