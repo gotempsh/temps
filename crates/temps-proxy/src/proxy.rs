@@ -564,6 +564,40 @@ fn https_redirect_response(redirect_url: &str, request_id: &str) -> Result<Respo
     Ok(response)
 }
 
+/// Build the `Location` for a custom domain's "Redirect to" setting.
+///
+/// The stored target is an absolute URL (the domain service normalizes a bare
+/// host to `https://host`). When it names only an origin — no path beyond `/`,
+/// no query, no fragment — the request's path and query are carried over, so
+/// `www.example.com/pricing?x=1` lands on `example.com/pricing?x=1` instead of
+/// the target's homepage. A target that spells out its own path or query is a
+/// deliberate "send everything here" redirect and is returned verbatim, which
+/// is what every redirect did before path preservation existed.
+///
+/// `path` is the raw request path from the URI (still percent-encoded), so no
+/// re-encoding happens here.
+fn domain_redirect_location(target: &str, path: &str, query: Option<&str>) -> String {
+    let Some(scheme_end) = target.find("://") else {
+        // Not an absolute URL (legacy row written before normalization):
+        // keep the old behaviour rather than guess how to join it.
+        return target.to_string();
+    };
+    let after_scheme = &target[scheme_end + 3..];
+    let rest = after_scheme
+        .find(['/', '?', '#'])
+        .map_or("", |idx| &after_scheme[idx..]);
+    if !rest.is_empty() && rest != "/" {
+        return target.to_string();
+    }
+
+    let origin = &target[..scheme_end + 3 + after_scheme.len() - rest.len()];
+    let path = if path.is_empty() { "/" } else { path };
+    match query.filter(|q| !q.is_empty()) {
+        Some(query) => format!("{origin}{path}?{query}"),
+        None => format!("{origin}{path}"),
+    }
+}
+
 fn strip_proxy_owned_response_headers(response: &mut ResponseHeader) {
     // Applications must not be able to impersonate the pre-upstream redirect
     // used by managed monitors to decide whether a local TLS follow-up is safe.
@@ -634,6 +668,117 @@ fn should_apply_production_https_default(
         && !path.starts_with(INTERNAL_CLUSTER_PREFIX)
         && force_https.is_none()
         && has_environment
+}
+
+#[cfg(test)]
+mod domain_redirect_location_tests {
+    use super::domain_redirect_location;
+
+    #[test]
+    fn origin_target_keeps_request_path() {
+        assert_eq!(
+            domain_redirect_location("https://example.com", "/pricing", None),
+            "https://example.com/pricing"
+        );
+    }
+
+    #[test]
+    fn origin_target_keeps_request_query() {
+        assert_eq!(
+            domain_redirect_location("https://example.com", "/pricing", Some("x=1&y=two")),
+            "https://example.com/pricing?x=1&y=two"
+        );
+    }
+
+    #[test]
+    fn empty_query_is_dropped() {
+        assert_eq!(
+            domain_redirect_location("https://example.com", "/pricing", Some("")),
+            "https://example.com/pricing"
+        );
+    }
+
+    #[test]
+    fn root_request_lands_on_target_root() {
+        assert_eq!(
+            domain_redirect_location("https://example.com", "/", None),
+            "https://example.com/"
+        );
+        assert_eq!(
+            domain_redirect_location("https://example.com", "", None),
+            "https://example.com/"
+        );
+    }
+
+    #[test]
+    fn trailing_slashes_are_preserved_without_doubling() {
+        assert_eq!(
+            domain_redirect_location("https://example.com/", "/docs/", None),
+            "https://example.com/docs/"
+        );
+        assert_eq!(
+            domain_redirect_location("https://example.com/", "/", Some("a=1")),
+            "https://example.com/?a=1"
+        );
+    }
+
+    #[test]
+    fn target_port_and_scheme_are_kept() {
+        assert_eq!(
+            domain_redirect_location("http://example.com:8080", "/a/b", Some("c=d")),
+            "http://example.com:8080/a/b?c=d"
+        );
+    }
+
+    #[test]
+    fn target_with_its_own_path_is_used_verbatim() {
+        assert_eq!(
+            domain_redirect_location("https://example.com/welcome", "/pricing", Some("x=1")),
+            "https://example.com/welcome"
+        );
+        assert_eq!(
+            domain_redirect_location("https://example.com/blog/", "/post", None),
+            "https://example.com/blog/"
+        );
+    }
+
+    #[test]
+    fn target_with_its_own_query_or_fragment_is_used_verbatim() {
+        assert_eq!(
+            domain_redirect_location("https://example.com?ref=old", "/pricing", None),
+            "https://example.com?ref=old"
+        );
+        assert_eq!(
+            domain_redirect_location("https://example.com/#top", "/pricing", None),
+            "https://example.com/#top"
+        );
+    }
+
+    #[test]
+    fn encoded_request_path_is_not_reencoded() {
+        assert_eq!(
+            domain_redirect_location("https://example.com", "/caf%C3%A9/a%20b", Some("q=%2F")),
+            "https://example.com/caf%C3%A9/a%20b?q=%2F"
+        );
+    }
+
+    #[test]
+    fn protocol_relative_looking_path_stays_on_target_host() {
+        // `//evil.example` as a request path must not become a host: the
+        // target origin always precedes it.
+        assert_eq!(
+            domain_redirect_location("https://example.com", "//evil.example/x", None),
+            "https://example.com//evil.example/x"
+        );
+    }
+
+    #[test]
+    fn non_absolute_legacy_target_is_returned_unchanged() {
+        assert_eq!(
+            domain_redirect_location("example.com", "/pricing", None),
+            "example.com"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -6162,11 +6307,13 @@ impl ProxyHttp for LoadBalancer {
         }
 
         // Check if this host should redirect
-        if let Some((redirect_url, status_code)) = self
+        if let Some((redirect_target, status_code)) = self
             .project_context_resolver
             .get_redirect_info(&ctx.host)
             .await
         {
+            let redirect_url =
+                domain_redirect_location(&redirect_target, &ctx.path, ctx.query_string.as_deref());
             debug!(
                 request_id = %ctx.request_id,
                 host = %ctx.host,
@@ -6317,13 +6464,15 @@ impl ProxyHttp for LoadBalancer {
         }
 
         // Check for redirects or static file serving
-        if let Some(redirect_info) = self
+        if let Some((redirect_target, status_code)) = self
             .project_context_resolver
             .get_redirect_info(&ctx.host)
             .await
         {
-            let mut resp = ResponseHeader::build(redirect_info.1, None)?;
-            resp.insert_header(header::LOCATION, &redirect_info.0)?;
+            let location =
+                domain_redirect_location(&redirect_target, &ctx.path, ctx.query_string.as_deref());
+            let mut resp = ResponseHeader::build(status_code, None)?;
+            resp.insert_header(header::LOCATION, &location)?;
             session.write_response_header(Box::new(resp), true).await?;
             return Ok(true);
         }

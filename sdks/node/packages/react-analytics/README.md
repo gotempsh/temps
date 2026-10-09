@@ -244,7 +244,7 @@ useSpeedAnalytics({
 | **CLS** | Cumulative Layout Shift | Visual stability |
 | **INP** | Interaction to Next Paint | Overall responsiveness |
 
-Initial metrics (TTFB, FCP, LCP, FID) are batched into a single request. Late metrics (CLS, INP) are sent individually as they stabilize.
+Load metrics (TTFB, FCP, LCP) are sent in a single request as soon as all three are known, or when the page is hidden, whichever comes first -- they never wait for an interaction, so visitors who only read the page are measured too. FID is included when it already arrived and sent on its own otherwise. Late metrics (CLS, INP) are sent individually as they stabilize. Every metric is attributed to the path the page loaded on, even when it is reported after a client-side navigation.
 
 ### `useEngagementTracking(options?)`
 
