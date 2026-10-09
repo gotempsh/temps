@@ -19,6 +19,7 @@ import { DropEnvironmentVariables } from '@/components/drop/DropEnvironmentVaria
 import { DetectedPresetCard } from '@/components/drop/DetectedPresetCard'
 import { DetectedPresetGrid } from '@/components/drop/DetectedPresetGrid'
 import { DropNoProjectFound } from '@/components/drop/DropNoProjectFound'
+import { DropInvalidArchive } from '@/components/drop/DropInvalidArchive'
 import { PageContainer } from '@/components/layout/PageContainer'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
@@ -39,7 +40,12 @@ import {
   isDropArchive,
   type DropFile,
 } from '@/lib/drop-archive'
-import { dropErrorMessage, inferredProjectName } from '@/lib/drop-files'
+import {
+  dropArchiveErrorDetails,
+  dropArchiveErrorReason,
+  dropErrorMessage,
+  inferredProjectName,
+} from '@/lib/drop-files'
 import { consumeDropFilesHandoff } from '@/lib/drop-handoff'
 import { sourceArchiveUploadsSupported } from '@/lib/platform-capabilities'
 import {
@@ -117,6 +123,12 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
   const [rootPage, setRootPage] = useState('')
   const [stage, setStage] = useState<DropStage>('idle')
   const [error, setError] = useState<string | null>(null)
+  const [archiveErrorDetails, setArchiveErrorDetails] = useState<string | null>(
+    null
+  )
+  const [archiveErrorReason, setArchiveErrorReason] = useState<
+    string | undefined
+  >()
   // Files Temps looks for, once inspection found nothing it can build.
   const [detectionGap, setDetectionGap] = useState<string[] | null>(null)
   const [project, setProject] = useState<ProjectResponse | null>(null)
@@ -158,6 +170,8 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
   const isBusy = !['idle', 'done'].includes(stage)
   const selectedCandidate =
     inspection?.candidates[Number(selectedCandidateIndex)]
+  const needsNewSelection =
+    detectionGap !== null || archiveErrorDetails !== null
 
   const inspectArchive = async (archive: File, signal?: AbortSignal) => {
     const response = await inspectDropArchive({
@@ -177,6 +191,8 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
     const controller = new AbortController()
     detectionAbortRef.current = controller
     try {
+      setArchiveErrorDetails(null)
+      setArchiveErrorReason(undefined)
       setStage('packing')
       const result = await prepareAndInspectDrop(
         nextFiles,
@@ -194,6 +210,8 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
       if (detectionRunRef.current !== runId) return
 
       setPreparedArchive(result.archive)
+      setArchiveErrorDetails(null)
+      setArchiveErrorReason(undefined)
       setInspection(result.inspection)
       setSelectedCandidateIndex('0')
       if (!nameWasEdited) {
@@ -203,6 +221,8 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
     } catch (caught) {
       if (detectionRunRef.current !== runId) return
       setError(dropErrorMessage(caught))
+      setArchiveErrorDetails(dropArchiveErrorDetails(caught))
+      setArchiveErrorReason(dropArchiveErrorReason(caught))
       setDetectionGap(dropDetectionGap(caught))
       setPreparedArchive(null)
       setInspection(null)
@@ -220,6 +240,8 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
     detectionAbortRef.current = null
     setFiles(nextFiles)
     setError(null)
+    setArchiveErrorDetails(null)
+    setArchiveErrorReason(undefined)
     setDetectionGap(null)
     setProject(null)
     setEnvironment(null)
@@ -263,6 +285,8 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
     setRootPage('')
     setStage('idle')
     setError(null)
+    setArchiveErrorDetails(null)
+    setArchiveErrorReason(undefined)
     setProject(null)
     setDetectionGap(null)
     setEnvironment(null)
@@ -281,6 +305,8 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
     const normalizedProjectName = ensureDropProjectName(projectName)
     setProjectName(normalizedProjectName)
     setError(null)
+    setArchiveErrorDetails(null)
+    setArchiveErrorReason(undefined)
     try {
       const archive = preparedArchive
       const detected = inspection
@@ -636,7 +662,12 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
                   </div>
                 </div>
 
-                {detectionGap ? (
+                {archiveErrorDetails !== null ? (
+                  <DropInvalidArchive
+                    details={archiveErrorDetails}
+                    reason={archiveErrorReason}
+                  />
+                ) : detectionGap ? (
                   <DropNoProjectFound supportedFiles={detectionGap} />
                 ) : (
                   error && (
@@ -654,22 +685,24 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
                 size="lg"
                 className="h-12 w-full"
                 disabled={files.length === 0 || isBusy}
-                onClick={detectionGap ? reset : deploy}
+                onClick={needsNewSelection ? reset : deploy}
               >
                 {isBusy ? (
                   <Loader2 className="mr-2 size-4 animate-spin" />
-                ) : detectionGap ? (
+                ) : needsNewSelection ? (
                   <FolderOpen className="mr-2 size-4" />
                 ) : (
                   <UploadCloud className="mr-2 size-4" />
                 )}
-                {detectionGap
-                  ? 'Choose different files'
-                  : stageLabel(
-                      stage,
-                      selectedCandidate?.label,
-                      files.length > 0
-                    )}
+                {archiveErrorDetails !== null
+                  ? 'Choose another archive'
+                  : detectionGap
+                    ? 'Choose different files'
+                    : stageLabel(
+                        stage,
+                        selectedCandidate?.label,
+                        files.length > 0
+                      )}
               </Button>
               <p className="mt-3 text-center text-xs text-muted-foreground">
                 Failed setup is rolled back automatically.

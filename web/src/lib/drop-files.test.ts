@@ -2,7 +2,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
-import { filesFromDrop } from './drop-files'
+import {
+  dropArchiveErrorDetails,
+  dropArchiveErrorReason,
+  filesFromDrop,
+} from './drop-files'
 
 type FakeEntry = {
   isFile: boolean
@@ -145,3 +149,50 @@ describe('filesFromDrop', () => {
     expect(filesRead).toBe(1)
   })
 })
+
+describe('archive rejection feedback', () => {
+  test('recognizes the structural Problem Details title and keeps diagnostics', () => {
+    expect(
+      dropArchiveErrorDetails({
+        title: 'Invalid ZIP Archive',
+        detail: 'ZIP end-of-central-directory record not found',
+      })
+    ).toBe('ZIP end-of-central-directory record not found')
+    expect(dropArchiveErrorDetails({ title: 'Invalid ZIP Archive' })).toBe(
+      'Archive validation rejected this file.'
+    )
+  })
+
+  test('keeps unsafe-path rejections actionable without discarding the reason', () => {
+    expect(
+      dropArchiveErrorDetails({
+        title: 'Invalid ZIP Archive',
+        detail: 'Archive entry would escape the project directory',
+      })
+    ).toBe('Archive entry would escape the project directory')
+  })
+
+  test('leaves temporary service and network failures retryable', () => {
+    for (const error of [
+      new TypeError('Failed to fetch'),
+      { title: 'ZIP Validation Failed', detail: 'Temporary worker failure' },
+      { title: 'Service Unavailable', detail: 'Try again shortly' },
+      null,
+    ]) {
+      expect(dropArchiveErrorDetails(error)).toBeNull()
+    }
+  })
+})
+
+for (const [title, instruction] of [
+  ['Invalid ZIP Entry', 'original project files'],
+  ['Unsafe ZIP Entry', 'inside that folder'],
+  ['Sensitive ZIP Entry', 'Remove environment files'],
+  ['Unsupported ZIP Entry', 'Replace links with the actual project files'],
+]) {
+  test(`${title} requires replacement and explains how to correct its entries`, () => {
+    const error = { title, detail: 'The server rejected a project entry' }
+    expect(dropArchiveErrorDetails(error)).toBe(error.detail)
+    expect(dropArchiveErrorReason(error)).toContain(instruction)
+  })
+}
