@@ -100,6 +100,11 @@ pub struct NodeRemoveCommand {
     /// Skip confirmation prompt
     #[arg(long)]
     pub yes: bool,
+    /// Remove the node even if containers Temps placed on it could not be
+    /// confirmed removed (only when the host is gone for good). They are
+    /// recorded as orphaned and listed in the output.
+    #[arg(long)]
+    pub force: bool,
 }
 
 // ── API response types ──
@@ -568,7 +573,10 @@ async fn execute_remove(cmd: NodeRemoveCommand) -> anyhow::Result<()> {
     }
 
     let client = make_client();
-    let url = api_url(&cmd.api_url, &format!("/nodes/{}", cmd.node_id));
+    let mut url = api_url(&cmd.api_url, &format!("/nodes/{}", cmd.node_id));
+    if cmd.force {
+        url.push_str("?force=true");
+    }
 
     let response = client
         .delete(&url)

@@ -667,6 +667,16 @@ Current limits of worker builds:
   (`NPM_TOKEN`/`.npmrc`) and environment values passed as build arguments are
   not sent to workers. A build that needs them fails with a message naming
   what was withheld.
+- **No build-time variables.** Project variables are set when the container
+  runs, not while a worker builds it. A generated Dockerfile is rendered
+  without them, so an ordinary Vite or Next.js app builds on a worker. If the
+  app sets a variable its framework inlines into the bundle (`VITE_*`,
+  `NEXT_PUBLIC_*`, `PUBLIC_*`, `REACT_APP_*`, `GATSBY_*`, `NUXT_PUBLIC_*`,
+  `EXPO_PUBLIC_*`), the build stays on the control plane when it can, and
+  otherwise fails before building with the variable names and the
+  alternatives. Autopack builds on the worker and warns instead. Your own
+  Dockerfile may declare an `ARG` that no project variable sets (for example
+  `ARG NODE_VERSION=22`); an `ARG` that one would set is refused by name.
 
 Build caches stay separate per project on a shared worker: like the control
 plane, a worker scopes `RUN --mount=type=cache` mounts by project, environment
@@ -761,6 +771,8 @@ Multi-node is functional but still evolving. Known limitations:
 - **No bin-packing** — placement is least-loaded plus anti-affinity, not full bin-packing across resource dimensions.
 - **Worker sandboxes are a subset** — sandboxes on worker nodes have no terminal, agent runtime (Fleet), snapshots, preview URLs, disk resize, workspace volumes or Firecracker/microsandbox backends yet. See [Sandboxes on worker nodes](#sandboxes).
 - **Sandboxes don't move** — a sandbox stays on the node it was created on. Draining a node does not move its sandboxes; [evict them](#sandboxes) before removing the node.
+- **Drain rebuilds what it moves** — a deployment whose only replicas are on the draining node is rebuilt elsewhere from its source: the Git ref it was built from, the same image for image deployments, or the retained ZIP for uploaded-source deployments. If any such deployment has nothing to rebuild from (for example its uploaded archive is gone), the drain is refused with a `409` that names it (the first 50 individually, the rest counted), and the node is left unchanged; redeploy or delete that workload first.
+- **Removing a node cleans up what Temps left on it** — before a drained node is removed, Temps removes the containers it placed there that no deployment needs but that may still exist, such as a failed deployment's container, or one a drain's redeploy replaced while the node was unreachable. With the agent running, Temps asks the node about each of those containers individually: one that is still there is removed after its labels confirm the owning project, and only Docker reporting it not found counts as already gone, so nothing it placed there is forgotten. Containers that earlier releases recorded as removed on a worker without confirming it are checked the same way after upgrading. Containers of a current or still-running deployment block removal until the drain has moved them, and so do those of the deployment a rollout in progress would fall back to if its new deployment fails its checks; retry once the rollout finishes. If the node's agent cannot confirm that a container is gone, removal is refused with a `409` listing each container (the first 50 are described individually and the rest are counted). Start `temps agent` on the node, or remove them on that host with `docker rm -f`, then retry. If the host is gone for good, remove it with `?force=true` (**Remove Anyway** in the console's remove dialog, or `temps node remove <id> --yes --force`): the containers are recorded as orphaned on that node, listed in the response, and later project deletion skips them instead of failing. Because removal deletes containers on the host, it asks an administrator with MFA enrolled to verify again in the console, as draining does; API keys and CLI tokens are not prompted.
 - **Sandboxes need a `full`-profile control plane** — a control plane started with `--profile control-plane` serves no sandbox API, so it cannot place sandboxes on workers either.
 
 ---

@@ -346,16 +346,42 @@ fn prepare_build_context(
     }
     // The planner includes every resolved environment value in build_args,
     // including credentials, even when a Dockerfile does not use them. Do not
-    // transfer any of those values to a worker. A Dockerfile declaring ARG
-    // needs an explicit credential-handling design before remote builds can
-    // preserve the local builder's semantics safely.
+    // transfer any of those values to a worker. An ARG that would receive one
+    // of them needs an explicit credential-handling design before remote
+    // builds can preserve the local builder's semantics safely; an ARG that
+    // receives none (its default, or empty) builds identically without them.
     if !request.build_args.is_empty() || !request.build_args_buildkit.is_empty() {
         let contents =
             std::fs::read_to_string(root.join(&dockerfile)).map_err(BuilderError::IoError)?;
-        if dockerfile_declares_build_arg(&contents) {
-            return Err(BuilderError::InvalidContext(
-                "Worker builds cannot use Dockerfile ARG instructions until build-argument credential handling is reviewed".into(),
-            ));
+        let Some(declared) = dockerfile_build_arg_names(&contents) else {
+            return Err(BuilderError::InvalidContext(format!(
+                "Worker builds cannot use the ARG instructions in '{}': a declaration spans \
+                 several lines or names a variable reference, so it cannot be confirmed that \
+                 no build-argument value would be lost. Declare one ARG per line, or build on \
+                 the control plane",
+                dockerfile.display()
+            )));
+        };
+        let lost: std::collections::BTreeSet<&str> = request
+            .build_args
+            .keys()
+            .chain(request.build_args_buildkit.keys())
+            .map(String::as_str)
+            .filter(|supplied| {
+                declared
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(supplied))
+            })
+            .collect();
+        if !lost.is_empty() {
+            // Names only: the values are exactly what must not leave here.
+            return Err(BuilderError::InvalidContext(format!(
+                "Worker builds cannot pass build-argument values yet, but '{}' declares ARG {} \
+                 for a project variable that the build would silently lose. Build on the \
+                 control plane, or remove the ARG",
+                dockerfile.display(),
+                lost.into_iter().collect::<Vec<_>>().join(", ")
+            )));
         }
     }
     // The cache namespace is the one argument a worker receives: it is
@@ -404,12 +430,53 @@ fn prepare_build_context(
     Ok((archive_file, spec))
 }
 
-/// Conservative scan: false positives only refuse a build, while a missed
-/// ARG could change its result after we intentionally discard all arguments.
-fn dockerfile_declares_build_arg(contents: &str) -> bool {
-    contents
-        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
-        .any(|word| word.eq_ignore_ascii_case("ARG"))
+/// The names a Dockerfile declares with `ARG` (or `ONBUILD ARG`), or `None`
+/// when a declaration cannot be read with certainty.
+///
+/// Conservative: false positives only refuse a build, while a missed ARG
+/// could change its result after we intentionally discard all arguments.
+/// Every physical line is treated as a possible instruction, so a
+/// continuation or heredoc line that happens to start with `ARG` only adds
+/// names. A declaration continued onto another line (either escape
+/// character) or naming a `$` reference is not read at all: `None`.
+fn dockerfile_build_arg_names(contents: &str) -> Option<std::collections::BTreeSet<String>> {
+    let mut names = std::collections::BTreeSet::new();
+    for line in contents.trim_start_matches('\u{feff}').lines() {
+        let mut words = line.split_whitespace();
+        let Some(instruction) = words.next() else {
+            continue;
+        };
+        if instruction.starts_with('#') {
+            continue;
+        }
+        let declares = instruction.eq_ignore_ascii_case("ARG")
+            || (instruction.eq_ignore_ascii_case("ONBUILD")
+                && words
+                    .next()
+                    .is_some_and(|word| word.eq_ignore_ascii_case("ARG")));
+        if !declares {
+            continue;
+        }
+        let line = line.trim_end();
+        if line.ends_with('\\') || line.ends_with('`') {
+            return None;
+        }
+        let mut declared_any = false;
+        for word in words {
+            // `NAME=default`; a quoted default containing spaces only adds
+            // spurious names, never hides one.
+            let name = word.split('=').next().unwrap_or_default();
+            if name.is_empty() || name.contains('$') {
+                return None;
+            }
+            names.insert(name.to_string());
+            declared_any = true;
+        }
+        if !declared_any {
+            return None;
+        }
+    }
+    Some(names)
 }
 
 async fn dispatch_build_event(
@@ -1622,14 +1689,84 @@ mod tests {
             .insert("TOKEN".into(), "must-not-transfer".into());
         match prepare_build_context(&request) {
             Err(BuilderError::InvalidContext(message)) => {
-                assert!(message.contains("ARG instructions"));
+                assert!(message.contains("Worker builds cannot"), "{message}");
+                assert!(message.contains("ARG TOKEN"), "{message}");
                 assert!(!message.contains("must-not-transfer"));
             }
             other => panic!("expected InvalidContext, got {:?}", other.map(|_| ())),
         }
-        assert!(dockerfile_declares_build_arg(
-            "FROM base\nONBUILD ARG TOKEN\n"
+        assert!(dockerfile_build_arg_names("FROM base\nONBUILD ARG TOKEN\n")
+            .expect("parsed")
+            .contains("TOKEN"));
+    }
+
+    /// An ARG that no supplied value targets builds identically without the
+    /// discarded arguments, so the worker accepts it -- including the
+    /// generated form and a pinned default -- and still transfers no value.
+    #[test]
+    fn worker_build_accepts_dockerfile_args_that_receive_no_value() {
+        let source = tempfile::tempdir().expect("source");
+        std::fs::write(
+            source.path().join("Dockerfile"),
+            "# syntax=docker/dockerfile:1\nARG NODE_VERSION=22\nFROM node:${NODE_VERSION}\n\
+             arg BUILD_LABEL\nRUN echo build \\\n  ARG unrelated\n",
+        )
+        .expect("Dockerfile");
+        let mut request = context_request(source.path(), None);
+        request
+            .build_args
+            .insert("TEMPS_API_TOKEN".into(), "must-not-transfer".into());
+        request
+            .build_args
+            .insert("BUILDKIT_CACHE_MOUNT_NS".into(), "namespace".into());
+        let (archive, spec) = prepare_build_context(&request).expect("accepted");
+        let spec_json = serde_json::to_string(&spec).expect("serialize spec");
+        assert!(!spec_json.contains("must-not-transfer"));
+        let mut tar = tar::Archive::new(archive.reopen().expect("reopen archive"));
+        for entry in tar.entries().expect("entries") {
+            let mut entry = entry.expect("entry");
+            let mut body = String::new();
+            use std::io::Read;
+            entry.read_to_string(&mut body).expect("entry body");
+            assert!(!body.contains("must-not-transfer"));
+        }
+
+        // Case differences and buildkit arguments still count as a lost value.
+        std::fs::write(
+            source.path().join("Dockerfile"),
+            "FROM scratch\nARG temps_api_token\n",
+        )
+        .expect("Dockerfile");
+        assert!(matches!(
+            prepare_build_context(&request),
+            Err(BuilderError::InvalidContext(_))
         ));
+        let mut buildkit = context_request(source.path(), None);
+        buildkit
+            .build_args_buildkit
+            .insert("TEMPS_API_TOKEN".into(), "must-not-transfer".into());
+        assert!(matches!(
+            prepare_build_context(&buildkit),
+            Err(BuilderError::InvalidContext(_))
+        ));
+    }
+
+    #[test]
+    fn dockerfile_build_arg_names_reads_only_what_it_can_confirm() {
+        let names = |contents: &str| {
+            dockerfile_build_arg_names(contents).map(|names| names.into_iter().collect::<Vec<_>>())
+        };
+        assert_eq!(names("FROM scratch\n"), Some(vec![]));
+        assert_eq!(
+            names("\u{feff}ARG A=1 B\n  arg\tC=\"x y\"\n# ARG COMMENTED\nRUN echo ARG\n"),
+            Some(vec!["A".into(), "B".into(), "C".into(), "y\"".into()])
+        );
+        // A continued declaration could hide a name on the next line.
+        assert_eq!(names("ARG A \\\n  B\n"), None);
+        assert_eq!(names("# escape=`\nARG A `\n  B\n"), None);
+        // A referenced name cannot be resolved here.
+        assert_eq!(names("ARG ${NAME}\n"), None);
+        assert_eq!(names("ARG\n"), None);
     }
 
     #[cfg(unix)]

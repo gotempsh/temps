@@ -19,6 +19,7 @@ use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tracing::{debug, info, warn};
 
+use crate::jobs::builder_node::{image_builder_for_build, BuilderNodeResolver};
 use crate::jobs::ImageOutput;
 
 /// Output from CaptureSourceMapsJob
@@ -107,6 +108,9 @@ pub struct CaptureSourceMapsJob {
     /// so they match what browsers report in stack traces.
     path_rewrites: Vec<(String, String)>,
     image_builder: Arc<dyn ImageBuilder>,
+    /// Reaches the worker that built the image, when the build ran on one
+    /// (control-plane profile or a project that builds on worker nodes).
+    builder_node_resolver: Option<Arc<dyn BuilderNodeResolver>>,
     source_map_service: Arc<SourceMapService>,
     log_id: Option<String>,
     log_service: Option<Arc<LogService>>,
@@ -148,10 +152,17 @@ impl CaptureSourceMapsJob {
             search_paths,
             path_rewrites,
             image_builder,
+            builder_node_resolver: None,
             source_map_service,
             log_id: None,
             log_service: None,
         }
+    }
+
+    /// Read worker-built images from the node that built them.
+    pub fn with_builder_node_resolver(mut self, resolver: Arc<dyn BuilderNodeResolver>) -> Self {
+        self.builder_node_resolver = Some(resolver);
+        self
     }
 
     pub fn with_log_id(mut self, log_id: String) -> Self {
@@ -253,8 +264,39 @@ impl WorkflowTask for CaptureSourceMapsJob {
         self.log(format!("Extracting source maps from image: {}", image_tag))
             .await?;
 
+        // A worker-built image is only readable on the node that built it;
+        // the local daemon does not have it (and may not exist at all).
+        let image_builder = match image_builder_for_build(
+            &context,
+            &self.build_job_id,
+            &self.image_builder,
+            self.builder_node_resolver.as_ref(),
+        )
+        .await
+        {
+            Ok((image_builder, _)) => image_builder,
+            Err(error) => {
+                // Best effort like the rest of this job: the deployment still
+                // serves, only symbolication for this release is lost. Return
+                // before the stale-map cleanup so older releases keep theirs.
+                warn!(
+                    deployment_id = self.deployment_id,
+                    "Cannot reach the node that built image {}: {}", image_tag, error
+                );
+                self.log(format!(
+                    "⚠️ Skipping source map capture: cannot reach the node that built image {image_tag}: {error}"
+                ))
+                .await?;
+                let mut updated_context = context.clone();
+                updated_context.set_output(&self.job_id, "source_maps_captured", 0u32)?;
+                updated_context.set_output(&self.job_id, "total_size_bytes", 0u64)?;
+                updated_context.set_output(&self.job_id, "release", &self.release)?;
+                return Ok(JobResult::success(updated_context));
+            }
+        };
+
         // Detect the image's WORKDIR to resolve relative search paths
-        let workdir = match self.image_builder.inspect_image(image_tag).await {
+        let workdir = match image_builder.inspect_image(image_tag).await {
             Ok(info) => {
                 let wd = info.working_dir.unwrap_or_else(|| "/app".to_string());
                 self.log(format!("Detected image WORKDIR: {}", wd)).await?;
@@ -316,8 +358,7 @@ impl WorkflowTask for CaptureSourceMapsJob {
             ))
             .await?;
 
-            let extraction_result = self
-                .image_builder
+            let extraction_result = image_builder
                 .extract_from_image(image_tag, &absolute_search_path, temp_dir.path())
                 .await;
             match extraction_result {
@@ -671,5 +712,183 @@ mod tests {
             resolve_absolute_path("/app/", ".next/server"),
             "/app/.next/server"
         );
+    }
+    /// Records which images it was asked to inspect. `local` doubles must
+    /// never be used for a worker-built image: any call panics.
+    struct RecordingBuilder {
+        usable: bool,
+        inspected: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingBuilder {
+        fn new(usable: bool) -> Arc<Self> {
+            Arc::new(Self {
+                usable,
+                inspected: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ImageBuilder for RecordingBuilder {
+        async fn build_image(
+            &self,
+            _request: temps_deployer::BuildRequest,
+        ) -> Result<temps_deployer::BuildResult, temps_deployer::BuilderError> {
+            unimplemented!("not used by source map capture")
+        }
+        async fn build_image_with_callback(
+            &self,
+            _request: temps_deployer::BuildRequestWithCallback,
+        ) -> Result<temps_deployer::BuildResult, temps_deployer::BuilderError> {
+            unimplemented!("not used by source map capture")
+        }
+        async fn import_image(
+            &self,
+            _image_path: std::path::PathBuf,
+            _tag: &str,
+        ) -> Result<String, temps_deployer::BuilderError> {
+            unimplemented!("not used by source map capture")
+        }
+        async fn save_image(
+            &self,
+            _image_name: &str,
+            _output_path: &Path,
+        ) -> Result<(), temps_deployer::BuilderError> {
+            unimplemented!("not used by source map capture")
+        }
+        async fn extract_from_image(
+            &self,
+            _image_name: &str,
+            _source_path: &str,
+            _destination_path: &Path,
+        ) -> Result<(), temps_deployer::BuilderError> {
+            assert!(
+                self.usable,
+                "the local builder does not have a worker-built image"
+            );
+            Ok(())
+        }
+        async fn list_images(&self) -> Result<Vec<String>, temps_deployer::BuilderError> {
+            unimplemented!("not used by source map capture")
+        }
+        async fn remove_image(
+            &self,
+            _image_name: &str,
+        ) -> Result<(), temps_deployer::BuilderError> {
+            unimplemented!("not used by source map capture")
+        }
+        async fn inspect_image(
+            &self,
+            image_name: &str,
+        ) -> Result<temps_deployer::ImageInfo, temps_deployer::BuilderError> {
+            assert!(
+                self.usable,
+                "the local builder does not have a worker-built image"
+            );
+            self.inspected
+                .lock()
+                .expect("inspection log")
+                .push(image_name.to_string());
+            Err(temps_deployer::BuilderError::Other(
+                "no image config in this test".to_string(),
+            ))
+        }
+        fn get_native_platform(&self) -> String {
+            "linux/amd64".to_string()
+        }
+    }
+
+    fn worker_build_context(node_id: i32) -> WorkflowContext {
+        let mut context = crate::test_utils::create_test_context("test".to_string(), 1, 1, 1);
+        for (key, value) in [
+            ("image_tag", "temps-app:abc"),
+            ("image_id", "sha256:abc"),
+            ("build_context", "/tmp/build"),
+            ("dockerfile_path", "/tmp/build/Dockerfile"),
+        ] {
+            context
+                .set_output("build", key, value)
+                .expect("set build output");
+        }
+        context
+            .set_output("build", "size_bytes", 1u64)
+            .expect("set size");
+        context
+            .set_output(
+                "build",
+                "image_tags_by_platform",
+                std::collections::HashMap::from([(
+                    "linux/amd64".to_string(),
+                    "temps-app:abc".to_string(),
+                )]),
+            )
+            .expect("set tags");
+        context
+            .set_output("build", "builder_node_id", Some(node_id))
+            .expect("set builder node");
+        context
+    }
+
+    fn capture_job(
+        local: Arc<dyn ImageBuilder>,
+        search_paths: Vec<String>,
+    ) -> CaptureSourceMapsJob {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection();
+        CaptureSourceMapsJob::new(
+            "capture".to_string(),
+            1,
+            1,
+            "abc".to_string(),
+            "build".to_string(),
+            search_paths,
+            vec![],
+            local,
+            Arc::new(SourceMapService::new(Arc::new(db))),
+        )
+    }
+
+    #[tokio::test]
+    async fn worker_built_image_is_read_on_the_build_node() {
+        let local = RecordingBuilder::new(false);
+        let node = RecordingBuilder::new(true);
+        let resolver = Arc::new(crate::jobs::builder_node::tests::StaticResolver::new(
+            7,
+            node.clone(),
+        ));
+        let job = capture_job(local, vec![".next/static".to_string()])
+            .with_builder_node_resolver(resolver.clone());
+
+        job.execute(worker_build_context(7))
+            .await
+            .expect("capture is best effort");
+
+        assert_eq!(*resolver.lookups.lock().expect("lookups"), vec![7]);
+        assert_eq!(
+            *node.inspected.lock().expect("inspections"),
+            vec!["temps-app:abc".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn unreachable_build_node_skips_capture_without_reading_locally() {
+        // No resolver: the job cannot reach node 7 and must not fall back to
+        // the local builder, which panics on use.
+        let job = capture_job(
+            RecordingBuilder::new(false),
+            vec![".next/static".to_string()],
+        );
+
+        let result = job
+            .execute(worker_build_context(7))
+            .await
+            .expect("capture is best effort");
+
+        let captured: u32 = result
+            .context
+            .get_output("capture", "source_maps_captured")
+            .expect("output readable")
+            .expect("output set");
+        assert_eq!(captured, 0);
     }
 }

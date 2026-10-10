@@ -42,7 +42,9 @@ When creating a project in Temps, set the **Root Directory** field to the subdir
 
 By default, Temps clones the entire repository and uses your specified directory as the build context. Framework detection, dependency installation, and builds all run relative to this directory.
 
-If the app does not need files outside that subdirectory (no workspace lockfile, no shared packages, no repository-root files), enable **Pull only the root directory** on Git settings. Deploy then sparse-checkouts that path only. Leave it off when the build still needs the rest of the tree — Turborepo, pnpm workspaces, root lockfiles, and Dockerfiles that `COPY` sibling packages all do.
+If the app does not need files outside that subdirectory (no workspace lockfile, no shared packages, no repository-root files), enable **Pull only the root directory** on Git settings. Deploy then sparse-checkouts that path only. Leave it off when the build still needs the rest of the tree — Turborepo, pnpm workspaces, root lockfiles, Go and Cargo workspaces, and Dockerfiles that `COPY` sibling packages all do.
+
+If the deployed branch or commit does not contain the root directory, the deployment stops at **Download Repository** and says which part of the path is missing and which directories exist there (for example a case mismatch, or a directory that is a Git submodule, which is not fetched).
 
 ---
 
@@ -61,6 +63,21 @@ Detection is priority-ordered: Lerna > Turborepo > Nx. When a monorepo tool is d
 <Note>
   pnpm workspaces (`pnpm-workspace.yaml`) are supported through pnpm's package manager detection. Temps detects `pnpm-lock.yaml` and uses `pnpm install --frozen-lockfile` automatically. You do not need Turborepo or Nx on top of pnpm workspaces — though many projects use both.
 </Note>
+
+### Go and Cargo workspaces {{ anchor: true, id: 'go-cargo' }}
+
+A nested Go module or Rust crate built with a generated Dockerfile (the Go, Rust or Autopack preset) keeps its checked-in sibling dependencies. Temps builds from the repository root, runs the build in the selected directory, and still applies the repository's `.dockerignore` and its own exclusions (`.git`, `.env*`) when it does. This happens when the app:
+
+- has a Go `replace` pointing at a relative directory outside it, or is listed in a `go.work`;
+- has a Cargo `path` dependency outside it, or is a member of an enclosing Cargo `[workspace]`.
+
+```text {{ title: 'Example layout, Root Directory apps/api' }}
+go.work                 # use ./apps/api, ./packages/shared
+apps/api/go.mod         # replace example.test/shared => ../../packages/shared
+packages/shared/go.mod
+```
+
+A dependency path that leaves the repository (absolute, too many `..`, or through a symbolic link) is refused before building. A crate inside a Cargo workspace that neither lists nor excludes it is refused with the `members` change to make. Other apps keep building from their own directory only.
 
 ---
 

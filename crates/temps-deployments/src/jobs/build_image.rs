@@ -79,6 +79,17 @@ fn preset_build_root(
             }
         }
     }
+    // A nested Go module or Cargo crate whose `replace`/`path` dependencies or
+    // workspace live beside it builds from the repository root; the preset
+    // runs its commands in the application's directory.
+    if let Some(language) = temps_presets::CompiledLanguage::for_preset(preset, app) {
+        if temps_presets::compiled_workspace_app(source_root, app, language)
+            .map_err(|error| WorkflowError::JobValidationFailed(error.to_string()))?
+            .is_some()
+        {
+            return Ok(source_root.to_path_buf());
+        }
+    }
     if matches!(
         preset,
         "python" | "nixpacks-python" | "nixpacks" | "autopack"
@@ -130,6 +141,37 @@ fn write_workspace_ignore(root: &Path, dockerfile: &Path) -> Result<(), Workflow
     ignore.push_str(temps_deployer::build_protocol::WORKSPACE_ROOT_IGNORE_MARKER);
     ignore.push_str("\n**/node_modules\n**/.git\n**/.env\n**/.env.*\n");
     write_no_follow(path, ignore.as_bytes(), create_new)
+}
+
+/// Variable name prefixes that frontend frameworks inline into the
+/// application at build time (Vite, Next.js, SvelteKit/Astro, Create React
+/// App, Gatsby, Nuxt, Expo). A build that does not receive such a value
+/// ships an app with it empty, with nothing at runtime able to restore it.
+const BUILD_INLINED_VARIABLE_PREFIXES: &[&str] = &[
+    "VITE_",
+    "NEXT_PUBLIC_",
+    "PUBLIC_",
+    "REACT_APP_",
+    "GATSBY_",
+    "NUXT_PUBLIC_",
+    "EXPO_PUBLIC_",
+];
+
+/// The variables among `names` that a framework inlines at build time,
+/// sorted and de-duplicated. Names only: values never leave the planner.
+pub(crate) fn build_inlined_variables<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut inlined: Vec<String> = names
+        .into_iter()
+        .filter(|name| {
+            BUILD_INLINED_VARIABLE_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix) && name.len() > prefix.len())
+        })
+        .map(str::to_owned)
+        .collect();
+    inlined.sort();
+    inlined.dedup();
+    inlined
 }
 
 fn validate_relative_build_path(path: &Path, label: &str) -> Result<(), WorkflowError> {
@@ -761,13 +803,27 @@ impl BuildImageJob {
         Ok(())
     }
 
-    /// The worker node that will run this build, when the preset must be
-    /// rendered without build variables because of it.
-    fn build_vars_omitted_on(
-        remote_builder_node_id: Option<i32>,
+    /// How a generated Dockerfile treats project variables on a worker build.
+    ///
+    /// A worker never receives build-argument values and refuses a Dockerfile
+    /// that declares an `ARG` (`temps_deployer::remote`), so every generated
+    /// `ARG` is left out there. That is only safe for variables the build
+    /// does not inline: `Err` names the ones a framework bakes into the
+    /// bundle, which would silently be empty. Autopack has always built on
+    /// workers without any of them and only warns, so it never refuses.
+    fn worker_build_vars(
         preset: &dyn temps_presets::Preset,
-    ) -> Option<i32> {
-        remote_builder_node_id.filter(|_| preset.uses_autopack())
+        build_vars: &[String],
+    ) -> Result<(), Vec<String>> {
+        if preset.uses_autopack() {
+            return Ok(());
+        }
+        let inlined = build_inlined_variables(build_vars.iter().map(String::as_str));
+        if inlined.is_empty() {
+            Ok(())
+        } else {
+            Err(inlined)
+        }
     }
 
     /// Detect log level from message content
@@ -939,22 +995,48 @@ impl BuildImageJob {
             .collect();
 
         // A worker build never receives build-argument values and refuses a
-        // Dockerfile that declares an `ARG` (`temps_deployer::remote`). Autopack
-        // built on workers without them before it could declare them, so keep
-        // that working and say what the build is missing.
-        if let Some(node_id) =
-            Self::build_vars_omitted_on(self.remote_builder_node_id, preset.as_ref())
-        {
-            if !build_vars.is_empty() {
+        // Dockerfile that declares an `ARG` (`temps_deployer::remote`). Every
+        // build carries platform variables (HOST, telemetry, the BuildKit
+        // cache namespace), so declaring them would refuse every generated
+        // build; leave them out and say what the build does not receive.
+        if let Some(node_id) = self.remote_builder_node_id {
+            if let Err(inlined) = Self::worker_build_vars(preset.as_ref(), &build_vars) {
+                // Same shape as a preset's own plan failure, so it is
+                // classified as configuration rather than an invalid Dockerfile.
+                let message = format!(
+                    "Build plan failed for preset '{}': this build runs on worker node {}, \
+                     which does not receive project variables yet, but {} {} inlined into the \
+                     application at build time and would be empty. On a server that builds \
+                     locally, set this environment's build location to the control plane; \
+                     otherwise build the app in CI and deploy the resulting image or static \
+                     bundle.",
+                    preset_slug,
+                    node_id,
+                    inlined.join(", "),
+                    if inlined.len() == 1 { "is" } else { "are" }
+                );
+                self.log_with_level(context, LogLevel::Error, format!("ERROR: {message}"))
+                    .await?;
+                return Err(WorkflowError::JobExecutionFailed(message));
+            }
+            let project_variables = build_vars
+                .iter()
+                .filter(|name| !name.starts_with("BUILDKIT_"))
+                .count();
+            if project_variables > 0 {
+                let consequence = if preset.uses_autopack() {
+                    "so a value the framework inlines at build time (VITE_*, NEXT_PUBLIC_*, \
+                     PUBLIC_*) will be empty."
+                } else {
+                    "none of them is a variable this framework inlines at build time."
+                };
                 self.log(
                     context,
                     format!(
                         "Build warning: this build runs on worker node {}, which does not receive \
                          project variables yet. {} variable(s) are set when the container runs, \
-                         but not while it builds, so a value the framework inlines at build time \
-                         (VITE_*, NEXT_PUBLIC_*, PUBLIC_*) will be empty.",
-                        node_id,
-                        build_vars.len()
+                         but not while it builds; {}",
+                        node_id, project_variables, consequence
                     ),
                 )
                 .await?;
@@ -1194,9 +1276,19 @@ impl BuildImageJob {
             .repo_dir
             .canonicalize()
             .map_err(WorkflowError::IoError)?;
-        let canonical_context = build_context
-            .canonicalize()
-            .map_err(WorkflowError::IoError)?;
+        let canonical_context = build_context.canonicalize().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                // Name the path instead of a bare "No such file or directory".
+                WorkflowError::JobValidationFailed(format!(
+                    "Invalid configuration: build context '{}' is not in the checked-out source \
+                     at '{}'. Check the project's root directory and build context settings",
+                    self.build_config.build_context.as_deref().unwrap_or("."),
+                    repo_output.repo_dir.display()
+                ))
+            } else {
+                WorkflowError::IoError(error)
+            }
+        })?;
         if !canonical_context.starts_with(&canonical_root) {
             return Err(WorkflowError::JobValidationFailed(format!(
                 "Build context '{}' escapes source root '{}'",
@@ -2092,6 +2184,75 @@ mod tests {
         assert!(preset_build_root("nextjs", root, &app).is_err());
     }
 
+    /// Nested Go/Cargo apps with sibling dependencies build from the
+    /// repository root, only for presets that generate their Dockerfile.
+    #[test]
+    fn compiled_sibling_dependencies_use_repository_context_for_generated_presets() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        let go_app = root.join("go/apps/api");
+        let cargo_app = root.join("rust/apps/api");
+        for (path, contents) in [
+            ("go/apps/api/go.mod", "module a\nreplace b => ../../packages/shared\n"),
+            ("go/packages/shared/go.mod", "module b\n"),
+            (
+                "rust/apps/api/Cargo.toml",
+                "[package]\nname = \"a\"\nversion = \"0.1.0\"\n[dependencies]\nb = { path = \"../../packages/shared\" }\n",
+            ),
+            (
+                "rust/packages/shared/Cargo.toml",
+                "[package]\nname = \"b\"\nversion = \"0.1.0\"\n",
+            ),
+        ] {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+        for (app, presets) in [
+            (&go_app, ["go", "nixpacks-go", "nixpacks", "autopack"]),
+            (
+                &cargo_app,
+                ["rust", "nixpacks-rust", "nixpacks", "autopack"],
+            ),
+        ] {
+            for preset in presets {
+                assert_eq!(
+                    preset_build_root(preset, &root, app).unwrap(),
+                    root,
+                    "{preset}"
+                );
+            }
+            assert_eq!(preset_build_root("dockerfile", &root, app).unwrap(), *app);
+        }
+
+        // A dependency leaving the repository is refused before any build.
+        std::fs::write(
+            go_app.join("go.mod"),
+            "module a\nreplace b => ../../../../outside\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            preset_build_root("go", &root, &go_app),
+            Err(WorkflowError::JobValidationFailed(_))
+        ));
+
+        // The same broken go.mod beside a JavaScript application is never
+        // read when the build is JavaScript: the application builds alone.
+        std::fs::write(
+            go_app.join("package.json"),
+            r#"{"name":"web","scripts":{"start":"node server.js"}}"#,
+        )
+        .unwrap();
+        for preset in ["nixpacks", "autopack", "nixpacks-node"] {
+            assert_eq!(
+                preset_build_root(preset, &root, &go_app).unwrap(),
+                go_app,
+                "{preset}"
+            );
+        }
+        assert!(preset_build_root("go", &root, &go_app).is_err());
+    }
+
     #[test]
     fn python_sibling_context_is_limited_to_generated_python_builds() {
         let repo = tempfile::tempdir().unwrap();
@@ -2887,32 +3048,157 @@ mod tests {
     }
 
     #[test]
-    fn autopack_presets_drop_build_vars_only_on_worker_builds() {
+    fn worker_builds_refuse_only_build_inlined_variables() {
         let autopack = temps_presets::get_preset_by_slug("autopack").unwrap();
         let python = temps_presets::get_preset_by_slug("python").unwrap();
         let nextjs = temps_presets::get_preset_by_slug("nextjs").unwrap();
+        let vite = temps_presets::get_preset_by_slug("vite").unwrap();
+        // What every build carries even with no project variables at all.
+        let platform: Vec<String> = ["HOST", "SENTRY_DSN", "BUILDKIT_CACHE_MOUNT_NS"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let with_public = |name: &str| {
+            let mut vars = platform.clone();
+            vars.push(name.to_string());
+            vars
+        };
 
-        // A worker never receives the values and refuses a Dockerfile that
-        // declares an ARG, so Autopack renders without them there.
+        // Platform and runtime-only variables never block a worker build.
+        for preset in [&autopack, &python, &nextjs, &vite] {
+            assert_eq!(
+                BuildImageJob::worker_build_vars(preset.as_ref(), &platform),
+                Ok(())
+            );
+        }
+        // Autopack has always built on workers without any of them.
         assert_eq!(
-            BuildImageJob::build_vars_omitted_on(Some(7), autopack.as_ref()),
-            Some(7)
+            BuildImageJob::worker_build_vars(autopack.as_ref(), &with_public("VITE_API_URL")),
+            Ok(())
+        );
+        // Other presets refuse rather than build an app whose inlined
+        // variables are silently empty, and name exactly those variables.
+        assert_eq!(
+            BuildImageJob::worker_build_vars(vite.as_ref(), &with_public("VITE_API_URL")),
+            Err(vec!["VITE_API_URL".to_string()])
         );
         assert_eq!(
-            BuildImageJob::build_vars_omitted_on(Some(7), python.as_ref()),
-            Some(7)
+            BuildImageJob::worker_build_vars(nextjs.as_ref(), &with_public("NEXT_PUBLIC_SITE")),
+            Err(vec!["NEXT_PUBLIC_SITE".to_string()])
         );
-        // Local builds receive every value.
+    }
+
+    #[test]
+    fn build_inlined_variables_matches_framework_prefixes_only() {
         assert_eq!(
-            BuildImageJob::build_vars_omitted_on(None, autopack.as_ref()),
-            None
+            build_inlined_variables([
+                "VITE_B",
+                "VITE_A",
+                "VITE_A",
+                "VITE_",
+                "HOST",
+                "PUBLICATION",
+                "PUBLIC_X",
+                "REACT_APP_Y",
+                "DATABASE_URL",
+            ]),
+            vec!["PUBLIC_X", "REACT_APP_Y", "VITE_A", "VITE_B"]
         );
-        // Other presets keep refusing on workers rather than building an
-        // app whose inlined variables are silently empty.
-        assert_eq!(
-            BuildImageJob::build_vars_omitted_on(Some(7), nextjs.as_ref()),
-            None
+        assert!(build_inlined_variables([]).is_empty());
+    }
+
+    /// The generated Vite Dockerfile for a worker build declares no `ARG`,
+    /// so the worker's context validation accepts it, while a local build
+    /// keeps declaring every variable.
+    #[tokio::test]
+    async fn generated_vite_dockerfile_on_worker_declares_no_build_args() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"qa-vite","scripts":{"build":"vite build"}}"#,
+        )
+        .unwrap();
+        let repo = RepositoryOutput {
+            repo_dir: dir.path().to_path_buf(),
+            checkout_ref: "main".to_string(),
+            repo_owner: "owner".to_string(),
+            repo_name: "repo".to_string(),
+        };
+        let mut context = crate::test_utils::create_test_context("wf".to_string(), 1, 1, 1);
+        context
+            .set_output(
+                "download_repo",
+                "repo_dir",
+                repo.repo_dir.display().to_string(),
+            )
+            .unwrap();
+        context
+            .set_output("download_repo", "checkout_ref", "main")
+            .unwrap();
+        context
+            .set_output("download_repo", "repo_owner", "owner")
+            .unwrap();
+        context
+            .set_output("download_repo", "repo_name", "repo")
+            .unwrap();
+        let platform_args = vec![
+            ("HOST".to_string(), "0.0.0.0".to_string()),
+            ("SENTRY_DSN".to_string(), "synthetic-dsn".to_string()),
+            ("BUILDKIT_CACHE_MOUNT_NS".to_string(), "ns".to_string()),
+        ];
+        for (worker, expect_args) in [(Some(7), false), (None, true)] {
+            let mut builder = BuildImageJobBuilder::new()
+                .job_id("build".into())
+                .download_job_id("download_repo".into())
+                .image_tag("app:latest".into())
+                .preset(StoredPreset::Vite)
+                .build_args(platform_args.clone());
+            if let Some(node_id) = worker {
+                builder = builder.remote_builder_node_id(node_id);
+            }
+            let job = builder
+                .build(Arc::new(RecordingImageBuilder::default()))
+                .unwrap();
+            let dockerfile = dir.path().join("Dockerfile");
+            let _ = std::fs::remove_file(&dockerfile);
+            job.ensure_dockerfile(&context, &repo.repo_dir, &dockerfile, &repo.repo_dir)
+                .await
+                .unwrap();
+            let rendered = std::fs::read_to_string(&dockerfile).unwrap();
+            assert_eq!(rendered.contains("ARG HOST"), expect_args, "{rendered}");
+            assert_eq!(
+                rendered.contains("ARG SENTRY_DSN"),
+                expect_args,
+                "{rendered}"
+            );
+            assert!(!rendered.contains("synthetic-dsn"), "{rendered}");
+        }
+
+        // A public build-time variable is refused before anything is built.
+        let job = BuildImageJobBuilder::new()
+            .job_id("build".into())
+            .download_job_id("download_repo".into())
+            .image_tag("app:latest".into())
+            .preset(StoredPreset::Vite)
+            .remote_builder_node_id(7)
+            .build_args(vec![("VITE_API_URL".to_string(), "synthetic".to_string())])
+            .build(Arc::new(RecordingImageBuilder::default()))
+            .unwrap();
+        let dockerfile = dir.path().join("Dockerfile");
+        let _ = std::fs::remove_file(&dockerfile);
+        let error = job
+            .ensure_dockerfile(&context, &repo.repo_dir, &dockerfile, &repo.repo_dir)
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(matches!(error, WorkflowError::JobExecutionFailed(_)));
+        assert!(message.contains("VITE_API_URL"), "{message}");
+        assert!(
+            message.contains("Build plan failed for preset 'vite'"),
+            "{message}"
         );
+        assert!(!message.contains("synthetic"), "{message}");
+        assert!(!dockerfile.exists());
     }
 
     #[tokio::test]
@@ -2968,6 +3254,32 @@ mod tests {
 
         let error = job.build_image(&repo, &context).await.unwrap_err();
         assert!(matches!(error, WorkflowError::JobValidationFailed(_)));
+    }
+
+    /// A configured nested directory missing from the checkout names the
+    /// path and the setting to fix, not a bare "No such file or directory".
+    #[tokio::test]
+    async fn missing_build_context_names_the_configured_directory() {
+        let builder = Arc::new(RecordingImageBuilder::default());
+        let job = BuildImageJobBuilder::new()
+            .job_id("build".to_string())
+            .download_job_id("download_repo".to_string())
+            .image_tag("myapp:latest".to_string())
+            .build_context("examples/starters/go/gin".to_string())
+            .build(builder.clone())
+            .unwrap();
+        let (_dir, repo) = repo_with_dockerfile();
+        let context = crate::test_utils::create_test_context("wf".to_string(), 1, 1, 1);
+
+        let error = job.build_image(&repo, &context).await.unwrap_err();
+        let message = error.to_string();
+        assert!(
+            matches!(error, WorkflowError::JobValidationFailed(_)),
+            "{message}"
+        );
+        assert!(message.contains("examples/starters/go/gin"), "{message}");
+        assert!(message.contains("Invalid configuration"), "{message}");
+        assert!(builder.builds().is_empty());
     }
 
     #[cfg(unix)]

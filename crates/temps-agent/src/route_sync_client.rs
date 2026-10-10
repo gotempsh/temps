@@ -160,6 +160,11 @@ pub struct RouteSyncClient {
     /// side, so the client timeout must be a comfortable margin
     /// above that.
     pub http: reqwest::Client,
+    /// Generation the control plane last accepted an ACK for from this
+    /// process, or [`NOTHING_ACKED`]. A fresh process has ACKed nothing: the
+    /// generation it loaded from disk may have been applied by a previous
+    /// run that died before its ACK got through, so it is sent again.
+    last_acked: std::sync::atomic::AtomicU64,
 }
 
 impl RouteSyncClient {
@@ -199,6 +204,7 @@ impl RouteSyncClient {
             control_plane_ca,
         )
         .build()?;
+        let last_acked = std::sync::atomic::AtomicU64::new(NOTHING_ACKED);
         Ok(Self {
             control_plane_url,
             node_id,
@@ -206,6 +212,7 @@ impl RouteSyncClient {
             store,
             shutdown,
             http,
+            last_acked,
         })
     }
 
@@ -244,10 +251,23 @@ impl RouteSyncClient {
     }
 
     async fn tick_once(&self) -> Result<(), TickError> {
+        // Resend an ACK that failed (or that a previous run never got
+        // through) before polling. While the generation is unchanged nothing
+        // else would resend it, and the deployment completion gate waits on
+        // exactly this ACK. If it fails again, routes must still arrive: skip
+        // the long-poll and fetch the current snapshot at once (`since=0`
+        // always answers immediately), then fail the round so the loop backs
+        // off and resends the ACK. A refused node is cleared by that same
+        // snapshot request.
+        let pending_ack = self.ack_if_pending().await.err();
+        if let Some(error) = &pending_ack {
+            warn!(error = %error, "route ACK not accepted; fetching routes without waiting");
+        }
         let since = self.store.current_generation();
+        let poll_since = if pending_ack.is_some() { 0 } else { since };
         let url = format!(
             "{}/api/internal/nodes/{}/routes/snapshot?since={}",
-            self.control_plane_url, self.node_id, since
+            self.control_plane_url, self.node_id, poll_since
         );
 
         let resp = self
@@ -315,12 +335,32 @@ impl RouteSyncClient {
                 .map(snapshot_route_into_entry)
                 .collect();
             let applied = self.store.apply_snapshot(body.generation, routes);
-            self.ack(applied).await.ok();
+            // A failed ACK fails the round: the loop backs off briefly and
+            // the next round resends it before polling again.
+            self.ack(applied).await?;
         } else {
             debug!(generation = body.generation, "route snapshot unchanged");
         }
+        // The outstanding ACK still fails the round unless an ACK for what
+        // is applied now got through above.
+        if let Some(error) = pending_ack {
+            if self.last_acked.load(std::sync::atomic::Ordering::Acquire)
+                != self.store.current_generation()
+            {
+                return Err(error.into());
+            }
+        }
 
         Ok(())
+    }
+
+    async fn ack_if_pending(&self) -> Result<(), String> {
+        let applied = self.store.current_generation();
+        // Generation 0 is an empty store: nothing has been applied yet.
+        if applied == 0 || applied == self.last_acked.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+        self.ack(applied).await
     }
 
     async fn ack(&self, applied_generation: u64) -> Result<(), String> {
@@ -339,9 +379,14 @@ impl RouteSyncClient {
         if !resp.status().is_success() {
             return Err(format!("CP returned {} for {url}", resp.status()));
         }
+        self.last_acked
+            .store(applied_generation, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 }
+
+/// `last_acked` before this process has had any ACK accepted.
+const NOTHING_ACKED: u64 = u64::MAX;
 
 fn snapshot_route_into_entry(route: SnapshotRoute) -> RouteEntry {
     RouteEntry {
@@ -389,13 +434,26 @@ mod tests {
         let address = listener
             .local_addr()
             .expect("read route-sync fixture address");
-        let app = axum::Router::new().route(
-            "/api/internal/nodes/{node_id}/routes/snapshot",
-            axum::routing::get(move || {
-                let body = body.clone();
-                async move { (status, axum::Json(body)) }
-            }),
-        );
+        let app = axum::Router::new()
+            .route(
+                "/api/internal/nodes/{node_id}/routes/snapshot",
+                axum::routing::get(move || {
+                    let body = body.clone();
+                    async move { (status, axum::Json(body)) }
+                }),
+            )
+            // The ACK answers like the snapshot: a revoked node is refused
+            // on both.
+            .route(
+                "/api/internal/nodes/{node_id}/routes/ack",
+                axum::routing::post(move || async move {
+                    if status.is_success() {
+                        StatusCode::OK
+                    } else {
+                        status
+                    }
+                }),
+            );
         let shutdown = Arc::new(Notify::new());
         let task_shutdown = Arc::clone(&shutdown);
         tokio::spawn(async move {
@@ -580,6 +638,239 @@ mod tests {
         let health = crate::public_ingress::health().expect("public ingress health initialized");
         assert_eq!(health.route_count, 1);
         assert_eq!(health.certificate_count, 0);
+    }
+
+    /// A failed ACK is resent before the next long-poll instead of waiting
+    /// for another route change, and an accepted ACK is not repeated.
+    #[tokio::test]
+    async fn test_failed_ack_is_resent_before_the_next_poll() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let acks = Arc::new(AtomicUsize::new(0));
+        let acked_generations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind route-sync control-plane fixture");
+        let address = listener.local_addr().expect("read fixture address");
+        let app = {
+            let acks = Arc::clone(&acks);
+            let acked_generations = Arc::clone(&acked_generations);
+            axum::Router::new()
+                .route(
+                    "/api/internal/nodes/{node_id}/routes/snapshot",
+                    axum::routing::get(|| async {
+                        axum::Json(serde_json::json!({
+                            "generation": 8,
+                            "routes": [{
+                                "host": "app.temps.local",
+                                "backends": [{"address": "10.0.0.2:8080"}]
+                            }]
+                        }))
+                    }),
+                )
+                .route(
+                    "/api/internal/nodes/{node_id}/routes/ack",
+                    axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                        let acks = Arc::clone(&acks);
+                        let acked_generations = Arc::clone(&acked_generations);
+                        async move {
+                            acked_generations
+                                .lock()
+                                .expect("ack fixture lock")
+                                .push(body["applied_generation"].as_u64());
+                            if acks.fetch_add(1, Ordering::SeqCst) == 0 {
+                                StatusCode::SERVICE_UNAVAILABLE
+                            } else {
+                                StatusCode::OK
+                            }
+                        }
+                    }),
+                )
+        };
+        let server_shutdown = Arc::new(Notify::new());
+        let task_shutdown = Arc::clone(&server_shutdown);
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move { task_shutdown.notified().await })
+                .await
+                .expect("serve route-sync fixture");
+        });
+        let snapshot_dir = TempDir::new().expect("create route snapshot directory");
+        let store = Arc::new(RouteStore::new(snapshot_dir.path().join("routes.json")));
+        let client = RouteSyncClient::new(
+            format!("http://{address}"),
+            7,
+            "test-token".to_string(),
+            Arc::clone(&store),
+            Arc::new(Notify::new()),
+        )
+        .expect("create route sync client");
+
+        // Generation 8 is applied, but its ACK is refused: the round fails.
+        assert!(client.tick_once().await.is_err());
+        assert_eq!(store.current_generation(), 8);
+        // The next round resends it first, then polls an unchanged generation.
+        client.tick_once().await.expect("resend ACK and poll");
+        // Nothing is pending any more.
+        client.tick_once().await.expect("poll unchanged generation");
+        assert_eq!(acks.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *acked_generations.lock().expect("ack fixture lock"),
+            vec![Some(8), Some(8)]
+        );
+        server_shutdown.notify_waiters();
+    }
+
+    /// An ACK that keeps failing never stops route updates: the agent
+    /// fetches the snapshot without long-polling, applies new routes, and
+    /// keeps failing the round so the ACK is retried after backoff.
+    #[tokio::test]
+    async fn test_failing_acks_do_not_block_route_updates() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let generation = Arc::new(AtomicU64::new(8));
+        let polled_since = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind route-sync control-plane fixture");
+        let address = listener.local_addr().expect("read fixture address");
+        let app = {
+            let generation = Arc::clone(&generation);
+            let polled_since = Arc::clone(&polled_since);
+            axum::Router::new()
+                .route(
+                    "/api/internal/nodes/{node_id}/routes/snapshot",
+                    axum::routing::get(
+                        move |axum::extract::Query(query): axum::extract::Query<
+                            std::collections::HashMap<String, String>,
+                        >| {
+                            let generation = Arc::clone(&generation);
+                            let polled_since = Arc::clone(&polled_since);
+                            async move {
+                                polled_since
+                                    .lock()
+                                    .expect("snapshot fixture lock")
+                                    .push(query.get("since").cloned());
+                                let current = generation.fetch_add(1, Ordering::SeqCst);
+                                axum::Json(serde_json::json!({
+                                    "generation": current,
+                                    "routes": [{
+                                        "host": format!("gen-{current}.temps.local"),
+                                        "backends": [{"address": "10.0.0.2:8080"}]
+                                    }]
+                                }))
+                            }
+                        },
+                    ),
+                )
+                .route(
+                    "/api/internal/nodes/{node_id}/routes/ack",
+                    axum::routing::post(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+                )
+        };
+        let server_shutdown = Arc::new(Notify::new());
+        let task_shutdown = Arc::clone(&server_shutdown);
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move { task_shutdown.notified().await })
+                .await
+                .expect("serve route-sync fixture");
+        });
+        let snapshot_dir = TempDir::new().expect("create route snapshot directory");
+        let store = Arc::new(RouteStore::new(snapshot_dir.path().join("routes.json")));
+        let client = RouteSyncClient::new(
+            format!("http://{address}"),
+            7,
+            "test-token".to_string(),
+            Arc::clone(&store),
+            Arc::new(Notify::new()),
+        )
+        .expect("create route sync client");
+
+        assert!(client.tick_once().await.is_err());
+        assert_eq!(store.current_generation(), 8);
+        // The ACK for 8 fails again, yet generation 9 is fetched and applied.
+        assert!(client.tick_once().await.is_err());
+        assert_eq!(store.current_generation(), 9);
+        assert_eq!(
+            *polled_since.lock().expect("snapshot fixture lock"),
+            vec![Some("0".to_string()), Some("0".to_string())],
+            "with an ACK outstanding the agent does not long-poll"
+        );
+        server_shutdown.notify_waiters();
+    }
+
+    /// A restarted agent ACKs the generation it loaded from disk before it
+    /// parks on the long-poll: the run that applied it may have died before
+    /// its ACK got through, and the generation not changing again would
+    /// otherwise leave the node behind for good.
+    #[tokio::test]
+    async fn test_restart_acks_the_generation_loaded_from_disk() {
+        let acked_generations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind route-sync control-plane fixture");
+        let address = listener.local_addr().expect("read fixture address");
+        let app = {
+            let acked_generations = Arc::clone(&acked_generations);
+            axum::Router::new()
+                .route(
+                    "/api/internal/nodes/{node_id}/routes/snapshot",
+                    axum::routing::get(|| async {
+                        axum::Json(serde_json::json!({
+                            "generation": 8,
+                            "routes": [{
+                                "host": "app.temps.local",
+                                "backends": [{"address": "10.0.0.2:8080"}]
+                            }]
+                        }))
+                    }),
+                )
+                .route(
+                    "/api/internal/nodes/{node_id}/routes/ack",
+                    axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                        let acked_generations = Arc::clone(&acked_generations);
+                        async move {
+                            acked_generations
+                                .lock()
+                                .expect("ack fixture lock")
+                                .push(body["applied_generation"].as_u64());
+                            StatusCode::OK
+                        }
+                    }),
+                )
+        };
+        let server_shutdown = Arc::new(Notify::new());
+        let task_shutdown = Arc::clone(&server_shutdown);
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move { task_shutdown.notified().await })
+                .await
+                .expect("serve route-sync fixture");
+        });
+        let snapshot_dir = TempDir::new().expect("create route snapshot directory");
+        let snapshot_path = snapshot_dir.path().join("routes.json");
+        // The previous run applied and persisted generation 8.
+        RouteStore::new(snapshot_path.clone()).apply_snapshot(8, vec![route("app.temps.local")]);
+        let store = Arc::new(RouteStore::new(snapshot_path));
+        store.load_from_disk();
+        assert_eq!(store.current_generation(), 8);
+        let client = RouteSyncClient::new(
+            format!("http://{address}"),
+            7,
+            "test-token".to_string(),
+            Arc::clone(&store),
+            Arc::new(Notify::new()),
+        )
+        .expect("create route sync client");
+
+        client.tick_once().await.expect("ACK and poll");
+        client.tick_once().await.expect("poll unchanged generation");
+
+        assert_eq!(
+            *acked_generations.lock().expect("ack fixture lock"),
+            vec![Some(8)],
+            "the loaded generation is ACKed once, before the first poll"
+        );
+        server_shutdown.notify_waiters();
     }
 
     /// A node the control plane refuses (e.g. while draining) retries on a

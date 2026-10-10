@@ -267,9 +267,12 @@ pub async fn get_routes_snapshot(
     let armed = notifier.notified();
     tokio::pin!(armed);
 
-    // Fast path: generation already moved past `since` — return now.
+    // Fast path: generation already moved past `since` — return now. A
+    // `since` ahead of this server (its generation was reset, e.g. a restore)
+    // also returns now: waiting for the counter to exceed it would leave the
+    // agent on stale routes, unwoken by every reload, for the full poll.
     let mut current = app_state.peer_table.current_generation();
-    if current > q.since {
+    if current != q.since {
         return Ok(Json(
             build_snapshot(&app_state, &node, current)
                 .await
@@ -291,7 +294,7 @@ pub async fn get_routes_snapshot(
         // by this point we're already inside the wait, so a race here
         // only costs another loop iteration, bounded by the outer timeout.
         loop {
-            if app_state.peer_table.current_generation() > q.since {
+            if app_state.peer_table.current_generation() != q.since {
                 break;
             }
             let notified = notifier.notified();
@@ -328,6 +331,24 @@ pub async fn post_routes_ack(
     // existing column type in node_dns_state. Workers ack u64s but
     // route_generation in practice fits comfortably in i64 (we'd
     // need 9.2e18 reloads to overflow).
+    //
+    // A generation this server has not issued (an agent still on a snapshot
+    // from before a reset) proves nothing about the current routes; storing
+    // it would satisfy the completion gate for routes the node never
+    // received. Its next poll returns at once with the current snapshot.
+    if body.applied_generation > server_generation {
+        warn!(
+            node_id,
+            applied_generation = body.applied_generation,
+            server_generation,
+            "ignoring route ACK for a generation this server has not issued"
+        );
+        return Ok(Json(RouteAckResponse {
+            node_id,
+            applied_generation: body.applied_generation,
+            server_generation,
+        }));
+    }
     let applied_i64: i64 = body.applied_generation.try_into().unwrap_or(i64::MAX);
     let now = chrono::Utc::now();
     let upsert = node_route_state::ActiveModel {

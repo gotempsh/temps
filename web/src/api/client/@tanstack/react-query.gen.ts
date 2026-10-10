@@ -9024,9 +9024,12 @@ export const registerNodeMutation = (options?: Partial<Options<RegisterNodeData>
 };
 
 /**
- * Remove a node from the cluster entirely. The node should be drained first
- * to ensure containers have been rescheduled. If the node still has active
- * containers, it will be drained automatically before removal.
+ * Remove a node from the cluster entirely. The node must be drained first so
+ * its current containers have been rescheduled. Containers no deployment needs
+ * that may still exist on the node (a failed deployment's, ones retired while
+ * it was offline, or ones a redeploy replaced while it was unreachable) are
+ * removed first; if any cannot be, the removal is refused unless `force=true`,
+ * which records them as orphaned.
  */
 export const adminRemoveNodeMutation = (options?: Partial<Options<AdminRemoveNodeData>>): UseMutationOptions<AdminRemoveNodeResponse, DefaultError, Options<AdminRemoveNodeData>> => {
     const mutationOptions: UseMutationOptions<AdminRemoveNodeResponse, DefaultError, Options<AdminRemoveNodeData>> = {

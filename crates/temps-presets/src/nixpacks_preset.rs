@@ -259,7 +259,7 @@ impl NixpacksPreset {
     }
 
     /// The autopack provider that claims this project, if any.
-    fn detect_provider_id(path: &Path) -> Option<String> {
+    pub(crate) fn detect_provider_id(path: &Path) -> Option<String> {
         let app = match App::new(path) {
             Ok(app) => app,
             Err(error) => {

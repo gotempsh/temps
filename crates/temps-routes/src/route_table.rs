@@ -740,10 +740,14 @@ pub struct CachedPeerTable {
     /// Bumped at the end of every successful `load_routes()`. Workers
     /// long-poll `GET /internal/.../routes/snapshot?since=N` and the
     /// handler waits until this counter exceeds `N` (or a timeout)
-    /// before returning the current snapshot. Restart-safe: a CP
-    /// restart resets the counter; agents detect this (current < their
-    /// applied) and re-fetch a fresh snapshot.
+    /// before returning the current snapshot. The first successful load
+    /// continues from the persisted `route_generation.current`, so the
+    /// numbering agents ACK and the completion gate compares stays
+    /// monotonic across restarts.
     generation: std::sync::atomic::AtomicU64,
+
+    /// Whether `generation` has been raised to the persisted value yet.
+    generation_seeded: std::sync::atomic::AtomicBool,
 
     /// Notify hookup so long-poll handlers can sleep until the next
     /// generation bump rather than spinning. Awoken on every
@@ -784,6 +788,7 @@ impl CachedPeerTable {
             on_reload_callback: parking_lot::Mutex::new(None),
             on_cert_eligible_callback: parking_lot::Mutex::new(None),
             generation: std::sync::atomic::AtomicU64::new(0),
+            generation_seeded: std::sync::atomic::AtomicBool::new(false),
             generation_changed: Arc::new(tokio::sync::Notify::new()),
             // Off until the bootstrap says otherwise: label discovery is
             // opt-in, so the safe default is "adopt nothing".
@@ -817,6 +822,45 @@ impl CachedPeerTable {
             ),
         }
         *self.traefik_discovery_network.write() = network;
+    }
+
+    /// Raise the in-memory generation to the persisted
+    /// `route_generation.current` once per process. A read failure leaves it
+    /// unseeded so the next successful load tries again.
+    async fn seed_generation_from_database(&self) {
+        use std::sync::atomic::Ordering;
+        if self.generation_seeded.load(Ordering::Acquire) {
+            return;
+        }
+        let statement = sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT current FROM route_generation WHERE id = 1".to_string(),
+        );
+        match sea_orm::ConnectionTrait::query_one(self.db.as_ref(), statement).await {
+            Ok(row) => {
+                let persisted = row
+                    .and_then(|row| row.try_get::<i64>("", "current").ok())
+                    .and_then(|current| u64::try_from(current).ok())
+                    .unwrap_or(0);
+                self.generation.fetch_max(persisted, Ordering::AcqRel);
+                self.generation_seeded.store(true, Ordering::Release);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "failed to read route_generation; the route generation restarts from the \
+                     in-memory value until a later reload can read it"
+                );
+            }
+        }
+    }
+
+    /// Behave as if the persisted generation had already been read, so a test
+    /// can stand in for a process whose startup read failed.
+    #[cfg(test)]
+    pub(crate) fn skip_generation_seed_for_test(&self) {
+        self.generation_seeded
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Current in-memory route table generation. Bumped on every
@@ -2570,6 +2614,13 @@ impl CachedPeerTable {
         // sees the new value. Do this BEFORE the DNS reconcile so readiness
         // waiters are released as soon as the in-memory maps are live —
         // they must never be gated on DNS work.
+        //
+        // The first load continues the persisted numbering. Restarting at 1
+        // would leave every agent long-polling with a `since` above it -- not
+        // woken by new generations until its 25s poll expires -- and leave
+        // their old, higher ACKs satisfying the completion gate for routes
+        // they never received.
+        self.seed_generation_from_database().await;
         let new_gen = self
             .generation
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
@@ -2616,10 +2667,16 @@ impl CachedPeerTable {
         // Best-effort — a transient DB error here doesn't block the
         // route table itself, and the next successful reload will
         // overwrite the stale value.
+        //
+        // Never lower it: when the startup read of the persisted value
+        // failed, this process numbers from 1 until a later reload can seed
+        // it, and writing that over the durable value would make every
+        // node's earlier ACK look ahead of the routes it actually has.
         let new_gen_i64: i64 = new_gen.try_into().unwrap_or(i64::MAX);
         let stmt = sea_orm::Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "UPDATE route_generation SET current = $1, updated_at = now() WHERE id = 1",
+            "UPDATE route_generation SET current = GREATEST(current, $1), updated_at = now() \
+             WHERE id = 1",
             [new_gen_i64.into()],
         );
         if let Err(e) = sea_orm::ConnectionTrait::execute(self.db.as_ref(), stmt).await {

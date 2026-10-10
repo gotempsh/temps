@@ -215,15 +215,43 @@ pub(crate) fn render(
         }
     }
     let mut analysis = analyze(&app, &env, &registry).map_err(|e| e.to_string())?;
-    let python_app = if analysis.provider == "python" {
+    // A nested application whose build needs the repository root as context
+    // (#1342: Python with a root requirements file; Go modules and Cargo
+    // crates with sibling dependencies, see `compiled_workspace_app`).
+    // Analysis stays on the selected application; install and build copy the
+    // repository and run in the application's directory, so relative pip,
+    // `replace` and `path` dependencies resolve.
+    let nested_prefix = if analysis.provider == "python" {
         python_app_directory(config.root_local_path, config.local_path)?
+            .map(|relative| (format!("cd /app/{relative} && "), relative, false))
+    } else if let Some(language) =
+        crate::CompiledLanguage::from_autopack_provider(&analysis.provider)
+    {
+        // Rendered into the failing Dockerfile and the build log.
+        crate::compiled_workspace_app(config.root_local_path, config.local_path, language)
+            .map_err(|error| error.to_string())?
+            .map(|compiled| {
+                let mut prefix = format!("cd /app/{} && ", compiled.relative);
+                match compiled.language {
+                    crate::CompiledLanguage::Go if compiled.ignore_go_work => {
+                        prefix.push_str("export GOWORK=off && ");
+                    }
+                    crate::CompiledLanguage::Go => {}
+                    // A workspace member's output lands in the workspace's
+                    // target directory. Use the cached /app/target either
+                    // way, and keep the crate-relative `target/` path the
+                    // plan copies the binary from.
+                    crate::CompiledLanguage::Cargo => prefix.push_str(
+                        "export CARGO_TARGET_DIR=/app/target && if [ ! -L target ]; then rm -rf target \
+                         && ln -s /app/target target; fi && ",
+                    ),
+                }
+                (prefix, compiled.relative, true)
+            })
     } else {
         None
     };
-    if let Some(relative) = python_app {
-        // Analysis stays inside the selected application capability. Only the
-        // explicitly supplied repository root is copied into the build; install
-        // and build commands retain the app's cwd, so relative pip paths work.
+    if let Some((prefix, relative, compiled_binary)) = nested_prefix {
         for step in &mut analysis.plan.steps {
             if matches!(step.name.as_str(), "install" | "build") {
                 for input in &mut step.inputs {
@@ -233,13 +261,19 @@ pub(crate) fn render(
                 }
                 for command in &mut step.commands {
                     if let autopack_core::plan::Command::Exec(exec) = command {
-                        exec.cmd = format!("cd /app/{relative} && {}", exec.cmd);
+                        exec.cmd = format!("{prefix}{}", exec.cmd);
                     }
                 }
             }
         }
+        // A Go or Cargo build's absolute start command is the built binary
+        // and runs as planned. Anything else, including an absolute Python
+        // launcher such as `/usr/bin/env gunicorn app:app`, names modules and
+        // files relative to the application, so it starts in that directory.
         if let Some(start) = &mut analysis.plan.deploy.start_command {
-            *start = format!("cd /app/{relative} && {start}");
+            if !(compiled_binary && start.starts_with('/')) {
+                *start = format!("cd /app/{relative} && {start}");
+            }
         }
     }
 
@@ -897,6 +931,59 @@ mod tests {
         );
     }
     #[test]
+    fn nested_go_module_with_a_sibling_replace_builds_in_its_directory() {
+        let repo = fixture(&[
+            ("go.work", "go 1.22\n\nuse (\n\t./apps/api\n\t./packages/shared\n)\n"),
+            (
+                "apps/api/go.mod",
+                "module example.test/qa/api\n\ngo 1.22\n\nrequire example.test/qa/shared v0.0.0\n\nreplace example.test/qa/shared => ../../packages/shared\n",
+            ),
+            (
+                "apps/api/main.go",
+                "package main\n\nimport \"net/http\"\n\nfunc main() { http.ListenAndServe(\":8080\", nil) }\n",
+            ),
+            ("packages/shared/go.mod", "module example.test/qa/shared\n\ngo 1.22\n"),
+            ("packages/shared/shared.go", "package shared\n"),
+        ]);
+        let app = repo.path().join("apps/api");
+        let mut config = DockerfileConfig::new(repo.path(), &app, "fixture");
+        config.use_buildkit = true;
+        let nested = render(&config, Some("go")).unwrap().content;
+        assert!(nested.contains("cd /app/apps/api && "), "{nested}");
+        assert!(!nested.contains("GOWORK=off"), "{nested}");
+
+        // Built alone (the default), nothing changes.
+        let alone = render(&buildkit_config(&app), Some("go")).unwrap().content;
+        assert!(!alone.contains("cd /app/apps/api"), "{alone}");
+    }
+
+    #[test]
+    fn nested_cargo_crate_with_a_sibling_path_dependency_builds_in_its_directory() {
+        let repo = fixture(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"apps/api\", \"packages/shared\"]\nresolver = \"2\"\n",
+            ),
+            (
+                "apps/api/Cargo.toml",
+                "[package]\nname = \"qa-api\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"qa-api\"\npath = \"src/main.rs\"\n\n[dependencies]\nqa-shared = { path = \"../../packages/shared\" }\n",
+            ),
+            ("apps/api/src/main.rs", "fn main() {}\n"),
+            (
+                "packages/shared/Cargo.toml",
+                "[package]\nname = \"qa-shared\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("packages/shared/src/lib.rs", ""),
+        ]);
+        let app = repo.path().join("apps/api");
+        let mut config = DockerfileConfig::new(repo.path(), &app, "fixture");
+        config.use_buildkit = true;
+        let nested = render(&config, Some("rust")).unwrap().content;
+        assert!(nested.contains("cd /app/apps/api && "), "{nested}");
+        assert!(nested.contains("CARGO_TARGET_DIR=/app/target"), "{nested}");
+    }
+
+    #[test]
     fn nested_pnpm_server_uses_root_version_lock_and_selected_entrypoint() {
         let repo = fixture(&[
             (
@@ -964,6 +1051,34 @@ mod tests {
         );
         assert!(
             rendered.contains("cd /app/apps/api && gunicorn app:app"),
+            "{rendered}"
+        );
+    }
+
+    /// An absolute launcher does not make the module it serves absolute: a
+    /// nested Python app's `Procfile` start still runs in the app directory.
+    #[test]
+    fn nested_python_absolute_start_command_keeps_the_app_directory() {
+        let repo = fixture(&[
+            (
+                "apps/api/requirements.txt",
+                "../../packages/shared\nflask==3.1.2\ngunicorn==23.0.0",
+            ),
+            (
+                "apps/api/app.py",
+                "from flask import Flask\napp = Flask(__name__)",
+            ),
+            ("apps/api/Procfile", "web: /usr/bin/env gunicorn app:app"),
+            (
+                "packages/shared/pyproject.toml",
+                "[project]\nname='fixture-shared'\nversion='1.0.0'",
+            ),
+        ]);
+        let app = repo.path().join("apps/api");
+        let config = DockerfileConfig::new(repo.path(), &app, "fixture").with_buildkit(true);
+        let rendered = render(&config, Some("python")).unwrap().content;
+        assert!(
+            rendered.contains("cd /app/apps/api && /usr/bin/env gunicorn app:app"),
             "{rendered}"
         );
     }

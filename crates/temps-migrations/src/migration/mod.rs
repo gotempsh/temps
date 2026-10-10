@@ -316,6 +316,7 @@ mod m20261006_000001_restore_runs_interrupted_status;
 mod m20261007_000001_cron_executions_cron_index;
 mod m20261007_000002_restore_runs_cancellation;
 mod m20261008_000001_create_service_data_imports;
+mod m20261009_000001_unconfirm_legacy_worker_container_removals;
 
 pub struct Migrator;
 
@@ -703,6 +704,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261007_000001_cron_executions_cron_index::Migration),
             Box::new(m20261007_000002_restore_runs_cancellation::Migration),
             Box::new(m20261008_000001_create_service_data_imports::Migration),
+            Box::new(m20261009_000001_unconfirm_legacy_worker_container_removals::Migration),
         ]
     }
 }

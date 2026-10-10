@@ -8,7 +8,10 @@
 //! (not the regular user auth) — the node presents the registration token
 //! which is verified against the hashed token stored in the nodes table.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use axum::{
     extract::{ConnectInfo, Path, Query, State},
@@ -25,17 +28,19 @@ use temps_config::ConfigService;
 use tracing::{error, info, warn};
 use utoipa::{OpenApi, ToSchema};
 
-use crate::handlers::audit::{NodeArchitectureChangedAudit, NodePublicIngressChangedAudit};
+use crate::handlers::audit::{
+    NodeArchitectureChangedAudit, NodeDrainAudit, NodePublicIngressChangedAudit, NodeRemovalAudit,
+};
 use crate::handlers::types::AppState;
 use crate::services::node_service::{
-    node_address_host, HeartbeatRequest, NodeError, NodeService, RegisterNodeRequest,
-    RegistrationContext,
+    node_address_host, remove_owned_container, HeartbeatRequest, NodeError, NodeService,
+    RegisterNodeRequest, RegistrationContext, MAX_DESCRIBED_UNREMOVED,
 };
-use crate::services::CONTROL_PLANE_NODE_ID;
 use crate::services::{DockerDiskUsage, DockerDiskUsageCategory, DockerDiskUsageError};
+use crate::services::{CONTROL_PLANE_NODE_ID, MAX_REDEPLOY_PLAN_BATCH};
 use temps_core::problemdetails::{self, Problem};
-use temps_core::AuditContext;
 use temps_core::{AppSettings, PublicHostnameStrategy, SensitiveAction};
+use temps_core::{AuditContext, AuditOperation, RequestMetadata};
 use temps_deployer::ContainerDeployer;
 
 /// App state for node registration handlers
@@ -348,6 +353,22 @@ pub struct DrainNodeResponse {
 pub struct RemoveNodeResponse {
     pub id: i32,
     pub message: String,
+    /// Containers Temps could not confirm were removed from the node before
+    /// it was removed (only with `force=true`). They are recorded as
+    /// orphaned; remove them on that host by hand if it still exists.
+    #[serde(default)]
+    pub orphaned_containers: Vec<String>,
+}
+
+/// Query parameters for removing a node.
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct RemoveNodeQuery {
+    /// Remove the node even if containers Temps placed on it could not be
+    /// confirmed removed (e.g. the host is gone for good). Those containers
+    /// are recorded as orphaned instead of being re-homed.
+    #[serde(default)]
+    pub force: bool,
 }
 
 /// Progress of a node drain operation.
@@ -2783,6 +2804,124 @@ async fn create_remote_deployer(
     Some(Arc::new(deployer))
 }
 
+/// 409 for a node removal refused because containers Temps placed on it may
+/// still exist there, and removing the node would lose track of them.
+fn node_holds_containers_problem(
+    node_id: i32,
+    node_name: &str,
+    unremoved_count: usize,
+    unremoved: &[String],
+) -> Problem {
+    problemdetails::new(StatusCode::CONFLICT)
+        .with_title("Node Still Holds Containers")
+        .with_detail(format!(
+            "Node '{node_name}' was not removed: Temps could not confirm that {} container(s) it \
+             placed there are gone ({}). Start `temps agent` on the node so Temps can remove them, \
+             or remove them on that host with `docker rm -f`, then retry. If the host is gone for \
+             good, retry with DELETE /internal/nodes/{node_id}?force=true: the containers are then \
+             recorded as orphaned on '{node_name}' and are not touched again.",
+            unremoved_count,
+            unremoved.join("; ")
+        ))
+        .with_value("node_id", node_id)
+        .with_value("node_name", node_name.to_string())
+        .with_value("unremoved_count", unremoved_count)
+        .with_value("unremoved_containers", unremoved.to_vec())
+}
+
+/// 409 for a drain refused before it changed anything, because at least one
+/// workload that only runs on this node has nothing to be rebuilt from.
+fn drain_refused_problem(node_name: &str, unmovable: &BoundedReport) -> Problem {
+    let lines = unmovable.report();
+    problemdetails::new(StatusCode::CONFLICT)
+        .with_title("Node Cannot Be Drained")
+        .with_detail(format!(
+            "Node '{node_name}' was not drained and is unchanged: {} workload(s) running only on \
+             it cannot be redeployed to another node: {}. Move or delete these workloads, then \
+             drain again.",
+            unmovable.count(),
+            lines.join("; ")
+        ))
+        .with_value("node_name", node_name.to_string())
+        .with_value("unmovable_count", unmovable.count())
+        .with_value("unmovable_workloads", lines)
+}
+
+/// Failure descriptions with a fixed memory bound: every failure is counted,
+/// the first [`MAX_DESCRIBED_UNREMOVED`] are described, and the report ends
+/// with a line counting the rest.
+#[derive(Debug, Default)]
+struct BoundedReport {
+    count: usize,
+    lines: Vec<String>,
+}
+
+impl BoundedReport {
+    fn push(&mut self, line: String) {
+        self.count += 1;
+        if self.lines.len() < MAX_DESCRIBED_UNREMOVED {
+            self.lines.push(line);
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.count
+    }
+
+    fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    fn report(&self) -> Vec<String> {
+        let mut lines = self.lines.clone();
+        let undescribed = self.count.saturating_sub(lines.len());
+        if undescribed > 0 {
+            lines.push(format!("and {undescribed} more not listed here"));
+        }
+        lines
+    }
+}
+
+/// Write an audit record for a node operation. A failure is logged and never
+/// fails the operation, which has already happened.
+async fn record_audit(app_state: &AppState, audit: &dyn AuditOperation, node_id: i32) {
+    if let Err(error) = app_state.audit_service.create_audit_log(audit).await {
+        error!(node_id, %error, "node operation succeeded but its audit record failed");
+    }
+}
+
+/// 500 for a drain whose redeploys could not all be queued after the
+/// pre-check passed. States exactly what already happened, so the operator
+/// does not have to guess whether to retry.
+fn drain_incomplete_problem(
+    node_id: i32,
+    node_name: &str,
+    failed_redeploys: &BoundedReport,
+    retired_count: usize,
+    redeployed_count: usize,
+    reactivated: bool,
+) -> Problem {
+    let node_state = if reactivated {
+        "The node was set back to active; retry the drain once the cause is fixed.".to_string()
+    } else {
+        format!(
+            "The node remains draining; undrain it (DELETE /internal/nodes/{node_id}/drain) and \
+             retry once the cause is fixed."
+        )
+    };
+    problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+        .with_title("Node Drain Incomplete")
+        .with_detail(format!(
+            "Drain of node '{node_name}' did not complete: {} redeploy(s) could not be queued, so \
+             those workloads are still on the node ({}). {redeployed_count} environment(s) were \
+             redeployed and {retired_count} container(s) retired before the failure. {node_state}",
+            failed_redeploys.count(),
+            failed_redeploys.report().join("; ")
+        ))
+        .with_value("node_name", node_name.to_string())
+        .with_value("failed_redeploys", failed_redeploys.report())
+}
+
 /// Drain a node: mark it as "draining" so no new replicas are scheduled on it,
 /// and trigger redeployment of all affected environments so their containers
 /// are rescheduled to healthy nodes.
@@ -2797,13 +2936,15 @@ async fn create_remote_deployer(
         (status = 200, description = "Node drain initiated", body = DrainNodeResponse),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Node not found"),
-        (status = 500, description = "Internal server error")
+        (status = 409, description = "Node already draining, or a workload only on this node cannot be redeployed elsewhere; the node is unchanged"),
+        (status = 500, description = "Internal server error, or a redeploy could not be queued (the response says what already happened)")
     ),
     security(("bearer_auth" = []))
 )]
 async fn admin_drain_node(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AppState>>,
+    axum::Extension(metadata): axum::Extension<RequestMetadata>,
     Path(node_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
@@ -2833,6 +2974,32 @@ async fn admin_drain_node(
         .await
         .map_err(Problem::from)?;
 
+    // Every workload that has to move must be rebuildable somewhere else.
+    // Check them all before changing anything: a drain that cannot move a
+    // workload would otherwise stay "draining" forever with the container
+    // still on the node, after reporting success. Planned a batch at a time,
+    // keeping only what failed, so memory does not grow with the workloads.
+    let mut unmovable = BoundedReport::default();
+    for batch in affected.chunks(MAX_REDEPLOY_PLAN_BATCH) {
+        let plans = app_state
+            .deployment_service
+            .plan_drain_redeploys(batch)
+            .await
+            .map_err(Problem::from)?;
+        for (deployment_id, plan) in plans {
+            if let Err(e) = plan {
+                warn!(
+                    node_id,
+                    deployment_id, "Drain refused: workload cannot be redeployed elsewhere: {}", e
+                );
+                unmovable.push(e.to_string());
+            }
+        }
+    }
+    if !unmovable.is_empty() {
+        return Err(drain_refused_problem(&node.name, &unmovable));
+    }
+
     // Mark the node as draining — scheduler will exclude it from new assignments
     app_state
         .node_service
@@ -2843,113 +3010,217 @@ async fn admin_drain_node(
     let mut retired_count = 0usize;
     let mut redeployed_count = 0usize;
     let mut redeployed_environments = HashSet::new();
+    let mut failed_redeploys = BoundedReport::default();
 
-    for dep in &affected {
-        if dep.is_current && dep.needs_redeploy() {
-            if !redeployed_environments.insert((dep.project_id, dep.environment_id)) {
-                info!(
-                    node_id,
-                    project_id = dep.project_id,
-                    environment_id = dep.environment_id,
-                    deployment_id = dep.deployment_id,
-                    "Drain: redeploy already queued for environment in this drain pass"
-                );
-                continue;
+    for batch in affected.chunks(MAX_REDEPLOY_PLAN_BATCH) {
+        // Planned again for this batch: the redeploys use these plans, and
+        // holding every plan from the check above would grow with the node.
+        // The node is already draining, so a failure here must not return
+        // early: this batch's moves are reported as failed below, which sets
+        // an active node back to active and says what already happened.
+        let mut planning_error = None;
+        let mut sources = match app_state
+            .deployment_service
+            .plan_drain_redeploys(batch)
+            .await
+        {
+            Ok(sources) => sources,
+            Err(e) => {
+                error!(node_id, "Drain: could not plan a batch of redeploys: {}", e);
+                planning_error = Some(e.to_string());
+                HashMap::new()
             }
-
-            // All replicas are on this node — must redeploy to maintain availability
-            match app_state
-                .deployment_service
-                .redeploy_environment(dep.project_id, dep.environment_id, dep.deployment_id)
-                .await
-            {
-                Ok(_) => {
-                    redeployed_count += 1;
+        };
+        for dep in batch {
+            if dep.is_current && dep.needs_redeploy() {
+                if !redeployed_environments.insert((dep.project_id, dep.environment_id)) {
                     info!(
                         node_id,
                         project_id = dep.project_id,
                         environment_id = dep.environment_id,
                         deployment_id = dep.deployment_id,
-                        "Drain: triggered full redeploy (no healthy replicas on other nodes)"
+                        "Drain: redeploy already queued for environment in this drain pass"
                     );
+                    continue;
                 }
-                Err(e) => {
-                    redeployed_environments.remove(&(dep.project_id, dep.environment_id));
-                    error!(
-                        node_id,
-                        project_id = dep.project_id,
-                        environment_id = dep.environment_id,
-                        deployment_id = dep.deployment_id,
-                        "Drain: failed to trigger redeploy: {}",
-                        e
-                    );
-                }
-            }
-        } else {
-            // Historical deployments are never redeployed. Current deployments
-            // reach this branch only when another node still has a healthy
-            // replica. In both cases, stop and retire this node's containers.
-            // First, stop containers on the agent (best-effort)
-            let containers = app_state
-                .node_service
-                .list_containers_for_node_deployment(node_id, dep.deployment_id)
-                .await
-                .unwrap_or_default();
 
-            if let Some(remote_deployer) = create_remote_deployer(
-                &node,
-                &app_state.config_service,
-                &app_state.encryption_service,
-            )
-            .await
-            {
-                for container in &containers {
-                    if let Err(e) = remote_deployer
-                        .stop_container(&container.container_id)
-                        .await
-                    {
-                        warn!(
+                // All replicas are on this node — must redeploy to maintain availability
+                let source = match sources.remove(&dep.deployment_id) {
+                    Some(Ok(source)) => source,
+                    // Changed since the check above (e.g. its archive was
+                    // deleted in between).
+                    Some(Err(e)) => {
+                        redeployed_environments.remove(&(dep.project_id, dep.environment_id));
+                        failed_redeploys.push(e.to_string());
+                        continue;
+                    }
+                    None => {
+                        redeployed_environments.remove(&(dep.project_id, dep.environment_id));
+                        failed_redeploys.push(match &planning_error {
+                            Some(reason) => format!(
+                                "deployment {} of project {} could not be planned: {reason}",
+                                dep.deployment_id, dep.project_id
+                            ),
+                            None => format!(
+                                "deployment {} of project {} was not planned",
+                                dep.deployment_id, dep.project_id
+                            ),
+                        });
+                        continue;
+                    }
+                };
+                match app_state
+                    .deployment_service
+                    .redeploy_environment_from(
+                        dep.project_id,
+                        dep.environment_id,
+                        dep.deployment_id,
+                        source,
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        redeployed_count += 1;
+                        info!(
                             node_id,
-                            container_id = %container.container_id,
-                            "Drain: failed to stop container on agent (will still retire): {}", e
+                            project_id = dep.project_id,
+                            environment_id = dep.environment_id,
+                            deployment_id = dep.deployment_id,
+                            "Drain: triggered full redeploy (no healthy replicas on other nodes)"
                         );
                     }
+                    Err(e) => {
+                        redeployed_environments.remove(&(dep.project_id, dep.environment_id));
+                        error!(
+                            node_id,
+                            project_id = dep.project_id,
+                            environment_id = dep.environment_id,
+                            deployment_id = dep.deployment_id,
+                            "Drain: failed to trigger redeploy: {}",
+                            e
+                        );
+                        failed_redeploys.push(e.to_string());
+                    }
                 }
-            }
+            } else {
+                // Historical deployments (including failed ones whose container
+                // still exists) are never redeployed. Current deployments reach
+                // this branch only when another node still has a healthy replica.
+                // In both cases, remove and retire this node's containers. Only a
+                // removal the agent confirmed is recorded as `removed`; anything
+                // else stays `retired` so cleanup still knows it may exist on
+                // this node.
+                let containers = app_state
+                    .node_service
+                    .list_containers_for_node_deployment(node_id, dep.deployment_id)
+                    .await
+                    .unwrap_or_default();
 
-            // Then soft-delete in DB so the proxy stops routing to them
-            match app_state
-                .node_service
-                .retire_containers_on_node(node_id, dep.deployment_id)
+                let mut confirmed_removed = HashSet::new();
+                if let Some(remote_deployer) = create_remote_deployer(
+                    &node,
+                    &app_state.config_service,
+                    &app_state.encryption_service,
+                )
                 .await
-            {
-                Ok(count) => {
-                    retired_count += count;
-                    info!(
-                        node_id,
-                        deployment_id = dep.deployment_id,
-                        project_id = dep.project_id,
-                        environment_id = dep.environment_id,
-                        is_current = dep.is_current,
-                        retired = count,
-                        remaining = dep
-                            .total_active_containers
-                            .saturating_sub(dep.containers_on_node),
-                        "Drain: retired containers without starting another deployment"
-                    );
+                {
+                    for container in &containers {
+                        match remove_owned_container(
+                            remote_deployer.as_ref(),
+                            &container.container_id,
+                            dep.project_id,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                confirmed_removed.insert(container.container_id.clone());
+                            }
+                            Err(error) => warn!(
+                                node_id,
+                                container_id = %container.container_id,
+                                "Drain: could not remove container on agent (retiring it; cleanup will retry): {}",
+                                error
+                            ),
+                        }
+                    }
                 }
-                Err(e) => {
-                    error!(
-                        node_id,
-                        deployment_id = dep.deployment_id,
-                        "Drain: failed to retire containers: {}",
-                        e
-                    );
+
+                // Then soft-delete in DB so the proxy stops routing to them
+                match app_state
+                    .node_service
+                    .retire_containers_on_node(node_id, dep.deployment_id, &confirmed_removed)
+                    .await
+                {
+                    Ok(count) => {
+                        retired_count += count;
+                        info!(
+                            node_id,
+                            deployment_id = dep.deployment_id,
+                            project_id = dep.project_id,
+                            environment_id = dep.environment_id,
+                            is_current = dep.is_current,
+                            retired = count,
+                            remaining = dep
+                                .total_active_containers
+                                .saturating_sub(dep.containers_on_node),
+                            "Drain: retired containers without starting another deployment"
+                        );
+                    }
+                    Err(e) => {
+                        error!(
+                            node_id,
+                            deployment_id = dep.deployment_id,
+                            "Drain: failed to retire containers: {}",
+                            e
+                        );
+                    }
                 }
             }
         }
     }
 
+    let audit_drain = |outcome: &str| NodeDrainAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        node_id,
+        node_name: node.name.clone(),
+        outcome: outcome.to_string(),
+        redeployed_environments: redeployed_count,
+        retired_containers: retired_count,
+        failed_redeploys: failed_redeploys.count(),
+    };
+    if !failed_redeploys.is_empty() {
+        record_audit(&app_state, &audit_drain("incomplete"), node_id).await;
+        // The pre-check passed, so this is a transient failure (queue,
+        // database). Put an active node back so the drain can simply be
+        // retried; leaving it "draining" would strand the workloads that never
+        // moved. Any other prior status (e.g. offline) is not restored to
+        // "active" here — the operator undrains it explicitly.
+        let reactivated = node.status == "active"
+            && match app_state.node_service.mark_active(node_id).await {
+                Ok(()) => true,
+                Err(e) => {
+                    error!(
+                        node_id,
+                        "Drain: failed to reactivate node after a failed redeploy: {}", e
+                    );
+                    false
+                }
+            };
+        return Err(drain_incomplete_problem(
+            node_id,
+            &node.name,
+            &failed_redeploys,
+            retired_count,
+            redeployed_count,
+            reactivated,
+        ));
+    }
+
+    record_audit(&app_state, &audit_drain("draining"), node_id).await;
     info!(
         node_id,
         node_name = %node.name,
@@ -3020,21 +3291,25 @@ async fn admin_undrain_node(
     }))
 }
 
-/// Remove a node from the cluster entirely. The node should be drained first
-/// to ensure containers have been rescheduled. If the node still has active
-/// containers, it will be drained automatically before removal.
+/// Remove a node from the cluster entirely. The node must be drained first so
+/// its current containers have been rescheduled. Containers no deployment needs
+/// that may still exist on the node (a failed deployment's, ones retired while
+/// it was offline, or ones a redeploy replaced while it was unreachable) are
+/// removed first; if any cannot be, the removal is refused unless `force=true`,
+/// which records them as orphaned.
 #[utoipa::path(
     tag = "Nodes",
     delete,
     path = "/internal/nodes/{node_id}",
     params(
-        ("node_id" = i32, Path, description = "Node ID")
+        ("node_id" = i32, Path, description = "Node ID"),
+        RemoveNodeQuery
     ),
     responses(
         (status = 200, description = "Node removed", body = RemoveNodeResponse),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Node not found"),
-        (status = 409, description = "Node still has active containers or live sandboxes"),
+        (status = 409, description = "Node still has active containers, live sandboxes, or containers Temps could not confirm were removed (retry with force=true only if the host is gone)"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -3042,44 +3317,141 @@ async fn admin_undrain_node(
 async fn admin_remove_node(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AppState>>,
+    axum::Extension(metadata): axum::Extension<RequestMetadata>,
     Path(node_id): Path<i32>,
+    Query(query): Query<RemoveNodeQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
+    require_sensitive_action(
+        app_state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        SensitiveAction::RemoveNode { node_id },
+    )
+    .await?;
     let node = app_state
         .node_service
         .get_by_id(node_id)
         .await
         .map_err(Problem::from)?;
 
-    // Check if node still has active containers
-    let containers = app_state
+    // Containers no deployment needs may still exist on the node: a failed
+    // deployment's container, one retired while the node was offline, or one
+    // superseded by a redeploy whose teardown could not reach the node.
+    // Remove the ones Temps owns while the node is still reachable; after the
+    // node row is gone nothing could address them. Containers a deployment
+    // still uses refuse the removal: moving them is the drain's job.
+    let remote_deployer = create_remote_deployer(
+        &node,
+        &app_state.config_service,
+        &app_state.encryption_service,
+    )
+    .await;
+    let audit_removal =
+        |outcome: &str, confirmed_gone: usize, unconfirmed: usize| NodeRemovalAudit {
+            context: AuditContext {
+                user_id: auth.user_id(),
+                ip_address: Some(metadata.ip_address.clone()),
+                user_agent: metadata.user_agent.clone(),
+            },
+            node_id,
+            node_name: node.name.clone(),
+            force: query.force,
+            outcome: outcome.to_string(),
+            containers_confirmed_gone: confirmed_gone,
+            containers_unconfirmed: unconfirmed,
+        };
+    let leftovers = match app_state
         .node_service
-        .list_containers_for_node(node_id)
+        .remove_leftover_containers(&node, remote_deployer.as_deref())
         .await
-        .map_err(Problem::from)?;
-
-    if !containers.is_empty() {
-        return Err(problemdetails::new(StatusCode::CONFLICT)
-            .with_title("Node Has Active Containers")
-            .with_detail(format!(
-                "Node '{}' still has {} active container(s). Drain the node first with POST /internal/nodes/{}/drain",
-                node.name, containers.len(), node_id
-            )));
+    {
+        Ok(leftovers) => leftovers,
+        Err(error) => {
+            // A cleanup that stopped partway may already have removed
+            // containers from the host; a refusal before it started records
+            // zero of each.
+            let (outcome, confirmed_gone, unconfirmed) = match &error {
+                NodeError::LeftoverCleanupInterrupted {
+                    confirmed_gone,
+                    unremoved_count,
+                    ..
+                } => ("cleanup_interrupted", *confirmed_gone, *unremoved_count),
+                NodeError::StillServing { .. } => ("refused_still_serving", 0, 0),
+                _ => ("cleanup_failed", 0, 0),
+            };
+            record_audit(
+                &app_state,
+                &audit_removal(outcome, confirmed_gone, unconfirmed),
+                node_id,
+            )
+            .await;
+            return Err(Problem::from(error));
+        }
+    };
+    let unremoved_count = leftovers.unremoved_count;
+    let confirmed_gone = leftovers.confirmed_gone;
+    let unremoved = leftovers.unremoved_report();
+    if unremoved_count > 0 && !query.force {
+        // Containers may already have been removed from the host above.
+        record_audit(
+            &app_state,
+            &audit_removal(
+                "refused_unconfirmed_containers",
+                confirmed_gone,
+                unremoved_count,
+            ),
+            node_id,
+        )
+        .await;
+        return Err(node_holds_containers_problem(
+            node_id,
+            &node.name,
+            unremoved_count,
+            &unremoved,
+        ));
     }
 
     let node_name = node.name.clone();
 
-    app_state
-        .node_service
-        .remove(node_id)
-        .await
-        .map_err(Problem::from)?;
+    if let Err(error) = app_state.node_service.remove(node_id).await {
+        record_audit(
+            &app_state,
+            &audit_removal("failed", confirmed_gone, unremoved_count),
+            node_id,
+        )
+        .await;
+        return Err(Problem::from(error));
+    }
+    record_audit(
+        &app_state,
+        &audit_removal("removed", confirmed_gone, unremoved_count),
+        node_id,
+    )
+    .await;
 
-    info!(node_id, node_name = %node_name, "Node removed from cluster");
+    info!(
+        node_id,
+        node_name = %node_name,
+        orphaned_containers = unremoved_count,
+        "Node removed from cluster"
+    );
 
+    let message = if unremoved_count == 0 {
+        format!("Node '{}' removed from cluster", node_name)
+    } else {
+        format!(
+            "Node '{}' removed from cluster. {} container(s) could not be removed and were \
+             recorded as orphaned on it; if the host still exists, remove them there with \
+             `docker rm -f`: {}",
+            node_name,
+            unremoved_count,
+            unremoved.join("; ")
+        )
+    };
     Ok(Json(RemoveNodeResponse {
         id: node_id,
-        message: format!("Node '{}' removed from cluster", node_name),
+        message,
+        orphaned_containers: unremoved,
     }))
 }
 
@@ -3477,6 +3849,29 @@ impl From<NodeError> for Problem {
                 .with_value("node_id", node_id)
                 .with_value("node_name", node_name.clone())
                 .with_value("live_sandboxes", count),
+            NodeError::LeftoverCleanupInterrupted {
+                node_id,
+                ref node_name,
+                confirmed_gone,
+                unremoved_count,
+                ..
+            } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Node Container Cleanup Interrupted")
+                .with_detail(error.to_string())
+                .with_value("node_id", node_id)
+                .with_value("node_name", node_name.clone())
+                .with_value("containers_confirmed_gone", confirmed_gone)
+                .with_value("containers_unconfirmed", unremoved_count),
+            NodeError::StillServing {
+                node_id,
+                ref node_name,
+                count,
+            } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Node Has Active Containers")
+                .with_detail(error.to_string())
+                .with_value("node_id", node_id)
+                .with_value("node_name", node_name.clone())
+                .with_value("serving_containers", count),
             NodeError::IdentityConflict { ref name } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Node Identity Conflict")
                 .with_detail(format!(
@@ -3608,6 +4003,245 @@ mod tests {
     use sea_orm::{DatabaseBackend, MockDatabase};
     use temps_entities::{deployment_containers, nodes};
     use tower::ServiceExt;
+
+    // ── Removing containers a node removal would lose track of ──────────
+
+    mod container_removal {
+        use super::super::node_holds_containers_problem;
+        use crate::services::node_service::{
+            describe_unremoved_container, remove_owned_container, ContainerRemovalError,
+        };
+        use axum::http::StatusCode;
+        use mockall::mock;
+        use std::collections::HashMap;
+
+        mock! {
+            Deployer {}
+            #[async_trait::async_trait]
+            impl temps_deployer::ContainerDeployer for Deployer {
+                async fn deploy_container(&self, request: temps_deployer::DeployRequest) -> Result<temps_deployer::DeployResult, temps_deployer::DeployerError>;
+                async fn start_container(&self, container_id: &str) -> Result<(), temps_deployer::DeployerError>;
+                async fn stop_container(&self, container_id: &str) -> Result<(), temps_deployer::DeployerError>;
+                async fn pause_container(&self, container_id: &str) -> Result<(), temps_deployer::DeployerError>;
+                async fn resume_container(&self, container_id: &str) -> Result<(), temps_deployer::DeployerError>;
+                async fn remove_container(&self, container_id: &str) -> Result<(), temps_deployer::DeployerError>;
+                async fn get_container_info(&self, container_id: &str) -> Result<temps_deployer::ContainerInfo, temps_deployer::DeployerError>;
+                async fn get_container_stats(&self, container_id: &str) -> Result<temps_deployer::ContainerStats, temps_deployer::DeployerError>;
+                async fn list_containers(&self) -> Result<Vec<temps_deployer::ContainerInfo>, temps_deployer::DeployerError>;
+                async fn get_container_logs(&self, container_id: &str) -> Result<String, temps_deployer::DeployerError>;
+                async fn stream_container_logs(&self, container_id: &str) -> Result<Box<dyn futures::Stream<Item = String> + Unpin + Send>, temps_deployer::DeployerError>;
+                async fn image_exists(&self, image_name: &str) -> Result<bool, temps_deployer::DeployerError>;
+            }
+        }
+
+        fn labelled(project_id: &str) -> temps_deployer::ContainerInfo {
+            temps_deployer::ContainerInfo {
+                labels: HashMap::from([
+                    ("sh.temps.managed".to_string(), "true".to_string()),
+                    ("sh.temps.project_id".to_string(), project_id.to_string()),
+                ]),
+                ..Default::default()
+            }
+        }
+
+        #[tokio::test]
+        async fn an_owned_container_is_removed() {
+            let mut deployer = MockDeployer::new();
+            deployer
+                .expect_get_container_info()
+                .returning(|_| Ok(labelled("7")));
+            deployer
+                .expect_remove_container()
+                .withf(|id| id == "failed-app")
+                .times(1)
+                .returning(|_| Ok(()));
+
+            assert!(remove_owned_container(&deployer, "failed-app", 7)
+                .await
+                .is_ok());
+        }
+
+        #[tokio::test]
+        async fn a_container_already_gone_counts_as_removed() {
+            let mut deployer = MockDeployer::new();
+            deployer.expect_get_container_info().returning(|id| {
+                Err(temps_deployer::DeployerError::ContainerNotFound(
+                    id.to_string(),
+                ))
+            });
+            deployer.expect_remove_container().never();
+
+            assert!(remove_owned_container(&deployer, "gone", 7).await.is_ok());
+        }
+
+        #[tokio::test]
+        async fn a_container_of_another_project_is_left_in_place() {
+            let mut deployer = MockDeployer::new();
+            deployer
+                .expect_get_container_info()
+                .returning(|_| Ok(labelled("8")));
+            deployer.expect_remove_container().never();
+
+            let error = remove_owned_container(&deployer, "reused-id", 7)
+                .await
+                .expect_err("ownership mismatch must refuse");
+            assert!(
+                matches!(
+                    &error,
+                    ContainerRemovalError::NotOwned { container_id, project_id: 7 }
+                        if container_id == "reused-id"
+                ),
+                "{error:?}"
+            );
+            assert!(error.to_string().contains("project 7"), "{error}");
+        }
+
+        #[tokio::test]
+        async fn an_unreachable_agent_is_reported_not_assumed() {
+            let mut deployer = MockDeployer::new();
+            deployer.expect_get_container_info().returning(|_| {
+                Err(temps_deployer::DeployerError::NetworkError(
+                    "connection refused".to_string(),
+                ))
+            });
+            deployer.expect_remove_container().never();
+
+            let error = remove_owned_container(&deployer, "stranded", 7)
+                .await
+                .expect_err("an unreachable agent confirms nothing");
+            assert!(
+                matches!(&error, ContainerRemovalError::Inspect { container_id, .. } if container_id == "stranded"),
+                "{error:?}"
+            );
+            assert!(error.to_string().contains("connection refused"), "{error}");
+        }
+
+        #[test]
+        fn refusing_removal_names_each_container_and_both_remedies() {
+            let container = temps_entities::deployment_containers::Model {
+                id: 1,
+                deployment_id: 42,
+                container_id: "abc123".to_string(),
+                container_name: "app-42".to_string(),
+                container_port: 3000,
+                host_port: None,
+                image_name: None,
+                status: Some("retired".to_string()),
+                service_name: None,
+                created_at: chrono::Utc::now(),
+                deployed_at: chrono::Utc::now(),
+                ready_at: None,
+                deleted_at: Some(chrono::Utc::now()),
+                node_id: Some(5),
+                exit_code: None,
+                exit_reason: None,
+                oom_killed: None,
+                error_message: None,
+                finished_at: None,
+                started_at: None,
+                cpu_limit_cores: None,
+                port_bindings: None,
+            };
+            let line =
+                describe_unremoved_container(&container, 9, "the node's agent cannot be reached");
+            assert!(line.contains("'app-42' (abc123)"), "{line}");
+            assert!(line.contains("deployment 42 in project 9"), "{line}");
+            assert!(line.contains("status retired"), "{line}");
+
+            let problem =
+                node_holds_containers_problem(5, "worker-b", 1, std::slice::from_ref(&line));
+            assert_eq!(problem.status_code, StatusCode::CONFLICT);
+            let body = serde_json::to_string(&problem.body).unwrap();
+            assert!(body.contains("was not removed"), "{body}");
+            assert!(body.contains("temps agent"), "{body}");
+            assert!(body.contains("force=true"), "{body}");
+            assert_eq!(
+                problem.body.get("unremoved_containers"),
+                Some(&serde_json::json!([line]))
+            );
+        }
+    }
+
+    // ── Drain refusals for workloads that cannot move ───────────────────
+
+    #[test]
+    fn a_drain_with_an_unmovable_workload_is_refused_with_its_details() {
+        let reason = "Invalid deployment state: Deployment 12 of project 3, environment 4 was \
+                      built from uploaded source 'source-bundles/a.zip', which is no longer \
+                      retained on this server. Upload the source again so it is built on an \
+                      eligible node";
+        let mut unmovable = BoundedReport::default();
+        unmovable.push(reason.to_string());
+        let problem = drain_refused_problem("worker-a", &unmovable);
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        let body = serde_json::to_string(&problem.body).unwrap();
+        assert!(body.contains("was not drained and is unchanged"), "{body}");
+        assert!(
+            body.contains("Deployment 12 of project 3, environment 4"),
+            "{body}"
+        );
+        // The reason and the advice are separate sentences.
+        assert!(body.contains("eligible node. Move or delete"), "{body}");
+        assert!(body.contains("drain again"), "{body}");
+        assert_eq!(
+            problem.body.get("unmovable_workloads"),
+            Some(&serde_json::json!([reason]))
+        );
+    }
+
+    /// However many workloads cannot move, the refusal counts them all but
+    /// describes a bounded number.
+    #[test]
+    fn a_drain_refusal_stays_bounded() {
+        let mut unmovable = BoundedReport::default();
+        for id in 0..MAX_DESCRIBED_UNREMOVED + 25 {
+            unmovable.push(format!("Deployment {id} cannot be rebuilt"));
+        }
+        let problem = drain_refused_problem("worker-a", &unmovable);
+        assert_eq!(
+            problem.body.get("unmovable_count"),
+            Some(&serde_json::json!(MAX_DESCRIBED_UNREMOVED + 25))
+        );
+        let listed = problem
+            .body
+            .get("unmovable_workloads")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(listed.len(), MAX_DESCRIBED_UNREMOVED + 1);
+        assert_eq!(
+            listed.last(),
+            Some(&serde_json::json!("and 25 more not listed here"))
+        );
+        let body = serde_json::to_string(&problem.body).unwrap();
+        assert!(
+            body.contains(&format!("{} workload(s)", MAX_DESCRIBED_UNREMOVED + 25)),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn an_incomplete_drain_says_what_happened_and_how_to_retry() {
+        let mut failed = BoundedReport::default();
+        failed.push("Queue error: queue closed".to_string());
+        let reactivated = drain_incomplete_problem(7, "worker-a", &failed, 2, 1, true);
+        assert_eq!(reactivated.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let body = serde_json::to_string(&reactivated.body).unwrap();
+        assert!(body.contains("1 redeploy(s) could not be queued"), "{body}");
+        assert!(
+            body.contains("1 environment(s) were redeployed and 2 container(s) retired"),
+            "{body}"
+        );
+        assert!(body.contains("set back to active"), "{body}");
+        assert!(!body.contains("Node drain initiated"), "{body}");
+
+        let still_draining = drain_incomplete_problem(7, "worker-a", &failed, 0, 0, false);
+        let body = serde_json::to_string(&still_draining.body).unwrap();
+        assert!(body.contains("remains draining"), "{body}");
+        // The undrain path names this node, not a placeholder.
+        assert!(body.contains("DELETE /internal/nodes/7/drain"), "{body}");
+        assert!(!body.contains("{node_id}"), "{body}");
+    }
 
     // ── Drain status and node removal with sandboxes (ADR-048) ──────────
 

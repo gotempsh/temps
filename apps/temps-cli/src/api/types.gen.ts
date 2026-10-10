@@ -19900,6 +19900,12 @@ export type RemoteDeploymentResponse = {
 export type RemoveNodeResponse = {
     id: number;
     message: string;
+    /**
+     * Containers Temps could not confirm were removed from the node before
+     * it was removed (only with `force=true`). They are recorded as
+     * orphaned; remove them on that host by hand if it still exists.
+     */
+    orphaned_containers?: Array<string>;
 };
 
 export type RenameConversationRequest = {
@@ -44288,7 +44294,14 @@ export type AdminRemoveNodeData = {
          */
         node_id: number;
     };
-    query?: never;
+    query?: {
+        /**
+         * Remove the node even if containers Temps placed on it could not be
+         * confirmed removed (e.g. the host is gone for good). Those containers
+         * are recorded as orphaned instead of being re-homed.
+         */
+        force?: boolean;
+    };
     url: '/internal/nodes/{node_id}';
 };
 
@@ -44302,7 +44315,7 @@ export type AdminRemoveNodeErrors = {
      */
     404: unknown;
     /**
-     * Node still has active containers or live sandboxes
+     * Node still has active containers, live sandboxes, or containers Temps could not confirm were removed (retry with force=true only if the host is gone)
      */
     409: unknown;
     /**
@@ -44568,7 +44581,11 @@ export type AdminDrainNodeErrors = {
      */
     404: unknown;
     /**
-     * Internal server error
+     * Node already draining, or a workload only on this node cannot be redeployed elsewhere; the node is unchanged
+     */
+    409: unknown;
+    /**
+     * Internal server error, or a redeploy could not be queued (the response says what already happened)
      */
     500: unknown;
 };

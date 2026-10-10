@@ -668,7 +668,14 @@ async fn failover_node(
         for dep in &affected {
             if !dep.is_current {
                 match node_service
-                    .retire_containers_on_node(node_id, dep.deployment_id)
+                    .retire_containers_on_node(
+                        node_id,
+                        dep.deployment_id,
+                        // The node is offline: nothing confirmed the
+                        // containers are gone, so cleanup must still
+                        // remove them if it comes back.
+                        &std::collections::HashSet::new(),
+                    )
                     .await
                 {
                     Ok(count) => {
@@ -742,7 +749,14 @@ async fn failover_node(
             } else {
                 // Other nodes have healthy replicas — just retire stale containers
                 match node_service
-                    .retire_containers_on_node(node_id, dep.deployment_id)
+                    .retire_containers_on_node(
+                        node_id,
+                        dep.deployment_id,
+                        // The node is offline: nothing confirmed the
+                        // containers are gone, so cleanup must still
+                        // remove them if it comes back.
+                        &std::collections::HashSet::new(),
+                    )
                     .await
                 {
                     Ok(count) => {
