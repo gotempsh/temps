@@ -84,7 +84,7 @@ fn preset_build_root(
     // runs its commands in the application's directory.
     if let Some(language) = temps_presets::CompiledLanguage::for_preset(preset, app) {
         if temps_presets::compiled_workspace_app(source_root, app, language)
-            .map_err(WorkflowError::JobValidationFailed)?
+            .map_err(|error| WorkflowError::JobValidationFailed(error.to_string()))?
             .is_some()
         {
             return Ok(source_root.to_path_buf());

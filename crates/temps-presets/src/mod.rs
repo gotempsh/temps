@@ -41,7 +41,9 @@ pub mod providers;
 pub use autopack_preset::{python_app_directory, AutopackPreset};
 use build_system::BuildSystem;
 pub use build_system::MonorepoTool;
-pub use compiled_workspace::{compiled_workspace_app, CompiledLanguage, CompiledWorkspaceApp};
+pub use compiled_workspace::{
+    compiled_workspace_app, CompiledLanguage, CompiledWorkspaceApp, CompiledWorkspaceError,
+};
 use docker::DockerfilePreset;
 use docker_custom::DockerCustomPreset;
 use docusaurus::Docusaurus;

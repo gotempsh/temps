@@ -227,7 +227,9 @@ pub(crate) fn render(
     } else if let Some(language) =
         crate::CompiledLanguage::from_autopack_provider(&analysis.provider)
     {
-        crate::compiled_workspace_app(config.root_local_path, config.local_path, language)?
+        // Rendered into the failing Dockerfile and the build log.
+        crate::compiled_workspace_app(config.root_local_path, config.local_path, language)
+            .map_err(|error| error.to_string())?
             .map(|compiled| {
                 let mut prefix = format!("cd /app/{} && ", compiled.relative);
                 match compiled.language {

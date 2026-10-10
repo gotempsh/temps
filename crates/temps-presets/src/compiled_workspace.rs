@@ -50,6 +50,61 @@ impl CompiledLanguage {
     }
 }
 
+/// Why a nested Go module or Cargo crate cannot be planned for a repository
+/// build. Every variant names the directory, manifest or declaration at fault.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CompiledWorkspaceError {
+    #[error("Application directory '{directory}' escapes the source repository")]
+    ApplicationEscapes { directory: String },
+
+    #[error("Application directory '{directory}' must be UTF-8")]
+    ApplicationNotUtf8 { directory: String },
+
+    #[error(
+        "Unsupported application directory '{directory}' for a repository build: use letters, \
+         digits, '/', '_', '.' and '-', or a Dockerfile with an explicit build context"
+    )]
+    UnsupportedApplicationDirectory { directory: String },
+
+    #[error("Cannot read '{manifest}': {reason}")]
+    ManifestUnreadable { manifest: String, reason: String },
+
+    #[error("'{manifest}' must be a regular non-symlink file")]
+    ManifestNotRegularFile { manifest: String },
+
+    #[error("'{manifest}' exceeds the {limit} byte planning limit")]
+    ManifestTooLarge { manifest: String, limit: u64 },
+
+    #[error("Cannot parse '{manifest}': {reason}")]
+    ManifestUnparsable { manifest: String, reason: String },
+
+    #[error(
+        "Local dependency '{declaration}' of '{owner}' leaves the source repository. Include \
+         it inside the repository, or use a Dockerfile with an explicit build context"
+    )]
+    DependencyEscapes { declaration: String, owner: String },
+
+    #[error(
+        "Local dependency '{declaration}' of '{owner}' has no {manifest} inside the source \
+         repository (it is missing, or leaves the repository through a symlink). Upload or \
+         connect the complete repository, or use a Dockerfile with an explicit build context"
+    )]
+    DependencyMissing {
+        declaration: String,
+        owner: String,
+        manifest: String,
+    },
+
+    #[error(
+        "'{crate_manifest}' names Cargo workspace '{workspace_manifest}', which has no \
+         [workspace] table in the source repository"
+    )]
+    MissingWorkspaceTable {
+        crate_manifest: String,
+        workspace_manifest: String,
+    },
+}
+
 /// A selected application that must be built from the repository root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledWorkspaceApp {
@@ -72,19 +127,22 @@ pub fn compiled_workspace_app(
     root: &Path,
     selected: &Path,
     language: CompiledLanguage,
-) -> Result<Option<CompiledWorkspaceApp>, String> {
+) -> Result<Option<CompiledWorkspaceApp>, CompiledWorkspaceError> {
     if root == selected {
         return Ok(None);
     }
+    let escapes_repository = || CompiledWorkspaceError::ApplicationEscapes {
+        directory: selected.display().to_string(),
+    };
     let relative = selected
         .strip_prefix(root)
-        .map_err(|_| "Application directory escapes the source repository".to_string())?;
+        .map_err(|_| escapes_repository())?;
     if relative.as_os_str().is_empty()
         || relative
             .components()
             .any(|component| !matches!(component, Component::Normal(_)))
     {
-        return Err("Application directory escapes the source repository".to_string());
+        return Err(escapes_repository());
     }
     let ignore_go_work = match language {
         CompiledLanguage::Go if is_regular_file(&selected.join("go.mod")) => {
@@ -103,15 +161,16 @@ pub fn compiled_workspace_app(
     };
     let text = relative
         .to_str()
-        .ok_or_else(|| "Application directory must be UTF-8".to_string())?;
+        .ok_or_else(|| CompiledWorkspaceError::ApplicationNotUtf8 {
+            directory: relative.display().to_string(),
+        })?;
     if !text
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || "/_.-".contains(c))
     {
-        return Err(format!(
-            "Unsupported application directory '{text}' for a repository build: use letters, \
-             digits, '/', '_', '.' and '-', or a Dockerfile with an explicit build context"
-        ));
+        return Err(CompiledWorkspaceError::UnsupportedApplicationDirectory {
+            directory: text.to_string(),
+        });
     }
     Ok(Some(CompiledWorkspaceApp {
         relative: text.to_string(),
@@ -125,30 +184,34 @@ fn is_regular_file(path: &Path) -> bool {
 }
 
 /// A manifest inside the repository, or `None` when absent.
-fn read_manifest(root: &Path, relative: &Path) -> Result<Option<String>, String> {
+fn read_manifest(root: &Path, relative: &Path) -> Result<Option<String>, CompiledWorkspaceError> {
     use std::io::Read;
+    let manifest = || relative.display().to_string();
+    let unreadable = |error: std::io::Error| CompiledWorkspaceError::ManifestUnreadable {
+        manifest: manifest(),
+        reason: error.to_string(),
+    };
     let path = root.join(relative);
     let metadata = match std::fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("Cannot read '{}': {error}", relative.display())),
+        Err(error) => return Err(unreadable(error)),
     };
     if !metadata.is_file() {
-        return Err(format!(
-            "'{}' must be a regular non-symlink file",
-            relative.display()
-        ));
+        return Err(CompiledWorkspaceError::ManifestNotRegularFile {
+            manifest: manifest(),
+        });
     }
     if metadata.len() > MAX_MANIFEST_BYTES {
-        return Err(format!(
-            "'{}' exceeds the {MAX_MANIFEST_BYTES} byte planning limit",
-            relative.display()
-        ));
+        return Err(CompiledWorkspaceError::ManifestTooLarge {
+            manifest: manifest(),
+            limit: MAX_MANIFEST_BYTES,
+        });
     }
     let mut contents = String::new();
     std::fs::File::open(&path)
         .and_then(|file| file.take(MAX_MANIFEST_BYTES).read_to_string(&mut contents))
-        .map_err(|error| format!("Cannot read '{}': {error}", relative.display()))?;
+        .map_err(unreadable)?;
     Ok(Some(contents))
 }
 
@@ -182,29 +245,26 @@ fn require_dependency(
     manifest: &str,
     declaration: &str,
     owner: &Path,
-) -> Result<(), String> {
+) -> Result<(), CompiledWorkspaceError> {
     let inside = match (root.canonicalize(), root.join(resolved).canonicalize()) {
         (Ok(root), Ok(target)) => target.starts_with(root),
         _ => false,
     };
     if !inside || !is_regular_file(&root.join(resolved).join(manifest)) {
-        return Err(format!(
-            "Local dependency '{declaration}' of '{}' has no {manifest} inside the source \
-             repository (it is missing, or leaves the repository through a symlink). Upload \
-             or connect the complete repository, or use a Dockerfile with an explicit build \
-             context",
-            owner.display()
-        ));
+        return Err(CompiledWorkspaceError::DependencyMissing {
+            declaration: declaration.to_string(),
+            owner: owner.display().to_string(),
+            manifest: manifest.to_string(),
+        });
     }
     Ok(())
 }
 
-fn escapes(declaration: &str, owner: &Path) -> String {
-    format!(
-        "Local dependency '{declaration}' of '{}' leaves the source repository. Include it \
-         inside the repository, or use a Dockerfile with an explicit build context",
-        owner.display()
-    )
+fn escapes(declaration: &str, owner: &Path) -> CompiledWorkspaceError {
+    CompiledWorkspaceError::DependencyEscapes {
+        declaration: declaration.to_string(),
+        owner: owner.display().to_string(),
+    }
 }
 
 /// The directory arguments of a `go.mod`/`go.work` directive, in both its
@@ -285,7 +345,7 @@ fn go_local_replacement(
     base: &Path,
     target: &str,
     manifest: &Path,
-) -> Result<Option<PathBuf>, String> {
+) -> Result<Option<PathBuf>, CompiledWorkspaceError> {
     if Path::new(target).is_absolute() {
         return Err(escapes(target, manifest));
     }
@@ -309,7 +369,7 @@ struct GoWork {
     replaces: Vec<(String, String)>,
 }
 
-fn nearest_go_work(root: &Path, relative: &Path) -> Result<Option<GoWork>, String> {
+fn nearest_go_work(root: &Path, relative: &Path) -> Result<Option<GoWork>, CompiledWorkspaceError> {
     let mut directory = Some(relative.to_path_buf());
     while let Some(current) = directory {
         let path = current.join("go.work");
@@ -354,7 +414,10 @@ fn is_go_local_path(path: &str) -> bool {
 /// at it that lists it alongside other modules or carries `replace`
 /// directives -- building the module alone would drop that `go.work`, and
 /// its replacements with it.
-fn go_needs_repository(root: &Path, relative: &Path) -> Result<Option<bool>, String> {
+fn go_needs_repository(
+    root: &Path,
+    relative: &Path,
+) -> Result<Option<bool>, CompiledWorkspaceError> {
     let go_mod = relative.join("go.mod");
     let contents = read_manifest(root, &go_mod)?.unwrap_or_default();
     let mut needs = false;
@@ -431,11 +494,15 @@ fn cargo_path_dependencies(manifest: &toml::Table) -> Vec<String> {
     found
 }
 
-fn parse_cargo(root: &Path, relative: &Path) -> Result<Option<toml::Table>, String> {
+fn parse_cargo(root: &Path, relative: &Path) -> Result<Option<toml::Table>, CompiledWorkspaceError> {
     read_manifest(root, relative)?
         .map(|contents| {
-            toml::from_str::<toml::Table>(&contents)
-                .map_err(|error| format!("Cannot parse '{}': {error}", relative.display()))
+            toml::from_str::<toml::Table>(&contents).map_err(|error| {
+                CompiledWorkspaceError::ManifestUnparsable {
+                    manifest: relative.display().to_string(),
+                    reason: error.to_string(),
+                }
+            })
         })
         .transpose()
 }
@@ -495,7 +562,7 @@ fn member_matches(pattern: &str, member: &Path) -> bool {
 
 /// Whether the crate at `relative` needs the repository: a path dependency
 /// outside the crate, or membership of an enclosing Cargo workspace.
-fn cargo_needs_repository(root: &Path, relative: &Path) -> Result<bool, String> {
+fn cargo_needs_repository(root: &Path, relative: &Path) -> Result<bool, CompiledWorkspaceError> {
     let cargo_toml = relative.join("Cargo.toml");
     let manifest = parse_cargo(root, &cargo_toml)?.unwrap_or_default();
     let mut path_dependency_outside = false;
@@ -539,13 +606,9 @@ fn cargo_needs_repository(root: &Path, relative: &Path) -> Result<bool, String> 
     let workspace_manifest = workspace_root.join("Cargo.toml");
     let workspace = parse_cargo(root, &workspace_manifest)?
         .and_then(|manifest| manifest.get("workspace").and_then(toml::Value::as_table).cloned())
-        .ok_or_else(|| {
-            format!(
-                "'{}' names Cargo workspace '{}', which has no [workspace] table in the \
-                 source repository",
-                cargo_toml.display(),
-                workspace_manifest.display()
-            )
+        .ok_or_else(|| CompiledWorkspaceError::MissingWorkspaceTable {
+            crate_manifest: cargo_toml.display().to_string(),
+            workspace_manifest: workspace_manifest.display().to_string(),
         })?;
     let member = relative
         .strip_prefix(&workspace_root)
@@ -618,7 +681,7 @@ mod tests {
     }
 
     /// `apps/api`, built as the language whose manifest it has.
-    fn app(root: &tempfile::TempDir) -> Result<Option<CompiledWorkspaceApp>, String> {
+    fn app(root: &tempfile::TempDir) -> Result<Option<CompiledWorkspaceApp>, CompiledWorkspaceError> {
         let selected = root.path().join("apps/api");
         let language = if selected.join("go.mod").is_file() {
             CompiledLanguage::Go
@@ -924,7 +987,10 @@ mod tests {
             ),
             SHARED_GO,
         ]);
-        assert!(app(&root).unwrap_err().contains("has no go.mod"));
+        assert!(matches!(
+            app(&root),
+            Err(CompiledWorkspaceError::DependencyMissing { ref manifest, .. }) if manifest == "go.mod"
+        ));
     }
 
     #[test]
@@ -933,14 +999,23 @@ mod tests {
             "apps/api/go.mod",
             "module a\nreplace b => ../../../outside\n",
         )]);
-        assert!(app(&root).unwrap_err().contains("leaves the source repository"));
+        assert!(matches!(
+            app(&root),
+            Err(CompiledWorkspaceError::DependencyEscapes { .. })
+        ));
         let root = repository(&[("apps/api/go.mod", "module a\nreplace b => /srv/b\n")]);
-        assert!(app(&root).unwrap_err().contains("leaves the source repository"));
+        assert!(matches!(
+            app(&root),
+            Err(CompiledWorkspaceError::DependencyEscapes { .. })
+        ));
         let root = repository(&[(
             "apps/api/Cargo.toml",
             "[package]\nname = \"a\"\nversion = \"0.1.0\"\n[dependencies]\nb = { path = \"../../packages/missing\" }\n",
         )]);
-        assert!(app(&root).unwrap_err().contains("has no Cargo.toml"));
+        assert!(matches!(
+            app(&root),
+            Err(CompiledWorkspaceError::DependencyMissing { ref manifest, .. }) if manifest == "Cargo.toml"
+        ));
     }
 
     #[cfg(unix)]
@@ -956,7 +1031,10 @@ mod tests {
             root.path().join("packages"),
         )
         .unwrap();
-        assert!(app(&root).unwrap_err().contains("has no go.mod"));
+        assert!(matches!(
+            app(&root),
+            Err(CompiledWorkspaceError::DependencyMissing { ref manifest, .. }) if manifest == "go.mod"
+        ));
     }
 
     #[test]
@@ -976,7 +1054,16 @@ mod tests {
             CompiledLanguage::Go,
         )
         .unwrap_err();
-        assert!(error.contains("Unsupported application directory"), "{error}");
+        assert_eq!(
+            error,
+            CompiledWorkspaceError::UnsupportedApplicationDirectory {
+                directory: "apps/my api".to_string()
+            }
+        );
+        assert!(
+            error.to_string().contains("Unsupported application directory"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -1449,15 +1449,14 @@ WHERE project.id = $2
             0
         };
 
-        let active_node_names: Vec<(i32, String)> = nodes::Entity::find()
+        let active_nodes: Vec<i32> = nodes::Entity::find()
+            .select_only()
+            .column(nodes::Column::Id)
             .filter(nodes::Column::Status.eq("active"))
+            .into_tuple::<i32>()
             .all(db)
             .await
-            .map_err(|e| format!("listing active nodes: {e}"))?
-            .into_iter()
-            .map(|n| (n.id, n.name))
-            .collect();
-        let active_nodes: Vec<i32> = active_node_names.iter().map(|(id, _)| *id).collect();
+            .map_err(|e| format!("listing active nodes: {e}"))?;
 
         if active_nodes.is_empty() {
             return Ok(());
@@ -1511,12 +1510,28 @@ WHERE project.id = $2
                             .filter(|s| s.applied_generation < route_gen)
                             .count();
                     reason.push_str(&format!(" — {lagging} node(s) behind on route_gen"));
-                    let details = describe_lagging_route_nodes(
-                        &active_node_names,
+                    // Name a bounded number of them; the rest are counted.
+                    let (named, unnamed) =
+                        lagging_route_node_ids(&active_nodes, &route_states, route_gen);
+                    let names: Vec<(i32, String)> = nodes::Entity::find()
+                        .select_only()
+                        .column(nodes::Column::Id)
+                        .column(nodes::Column::Name)
+                        .filter(nodes::Column::Id.is_in(named))
+                        .order_by_asc(nodes::Column::Id)
+                        .into_tuple()
+                        .all(db)
+                        .await
+                        .map_err(|e| format!("naming lagging nodes: {e}"))?;
+                    let mut details = describe_lagging_route_nodes(
+                        &names,
                         &route_states,
                         route_gen,
                         chrono::Utc::now(),
                     );
+                    if unnamed > 0 {
+                        details.push(format!("and {unnamed} more"));
+                    }
                     if !details.is_empty() {
                         reason.push_str(&format!(
                             " ({}). Check that `temps agent` is running on each lagging node and \
@@ -2768,6 +2783,35 @@ impl Default for MarkDeploymentCompleteJobBuilder {
     }
 }
 
+/// Most lagging nodes a route-propagation timeout names; the rest are counted.
+const MAX_NAMED_LAGGING_NODES: usize = 10;
+
+/// The first [`MAX_NAMED_LAGGING_NODES`] active nodes that have not ACKed
+/// `target` route generation, and how many more there are.
+fn lagging_route_node_ids(
+    active_nodes: &[i32],
+    states: &[temps_entities::node_route_state::Model],
+    target: i64,
+) -> (Vec<i32>, usize) {
+    let mut named = Vec::new();
+    let mut unnamed = 0;
+    for id in active_nodes {
+        let lagging = states
+            .iter()
+            .find(|state| state.node_id == *id)
+            .is_none_or(|state| state.applied_generation < target);
+        if !lagging {
+            continue;
+        }
+        if named.len() < MAX_NAMED_LAGGING_NODES {
+            named.push(*id);
+        } else {
+            unnamed += 1;
+        }
+    }
+    (named, unnamed)
+}
+
 /// One line per active node that has not ACKed `target` route generation:
 /// its name and id, the generation it last ACKed and how long ago, so an
 /// operator knows which agent to look at.
@@ -2834,6 +2878,30 @@ mod lagging_node_tests {
                 "node 'worker-c' (id 3) has never ACKed a route generation".to_string(),
             ]
         );
+    }
+
+    /// However many nodes lag, only a bounded number are named.
+    #[test]
+    fn lagging_route_nodes_are_bounded() {
+        let state =
+            |node_id: i32, applied_generation: i64| temps_entities::node_route_state::Model {
+                node_id,
+                applied_generation,
+                last_sync_at: None,
+                health: "healthy".to_string(),
+            };
+        let active: Vec<i32> = (1..=40).collect();
+        // Node 1 is current; every other node lags or never ACKed.
+        let states = vec![state(1, 10), state(2, 9)];
+
+        let (named, unnamed) = lagging_route_node_ids(&active, &states, 10);
+
+        assert_eq!(
+            named,
+            (2..2 + MAX_NAMED_LAGGING_NODES as i32).collect::<Vec<_>>()
+        );
+        assert_eq!(unnamed, 39 - MAX_NAMED_LAGGING_NODES);
+        assert_eq!(lagging_route_node_ids(&[1], &states, 10), (Vec::new(), 0));
     }
 }
 

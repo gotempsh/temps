@@ -28,19 +28,19 @@ use temps_config::ConfigService;
 use tracing::{error, info, warn};
 use utoipa::{OpenApi, ToSchema};
 
-use crate::handlers::audit::{NodeArchitectureChangedAudit, NodePublicIngressChangedAudit};
+use crate::handlers::audit::{
+    NodeArchitectureChangedAudit, NodeDrainAudit, NodePublicIngressChangedAudit, NodeRemovalAudit,
+};
 use crate::handlers::types::AppState;
 use crate::services::node_service::{
-    node_address_host, remove_owned_container, AffectedDeployment, HeartbeatRequest, NodeError,
-    NodeService, RegisterNodeRequest, RegistrationContext, MAX_DESCRIBED_UNREMOVED,
-};
-use crate::services::{
-    DeploymentError, RedeploySource, CONTROL_PLANE_NODE_ID, MAX_REDEPLOY_PLAN_BATCH,
+    node_address_host, remove_owned_container, HeartbeatRequest, NodeError, NodeService,
+    RegisterNodeRequest, RegistrationContext, MAX_DESCRIBED_UNREMOVED,
 };
 use crate::services::{DockerDiskUsage, DockerDiskUsageCategory, DockerDiskUsageError};
+use crate::services::{CONTROL_PLANE_NODE_ID, MAX_REDEPLOY_PLAN_BATCH};
 use temps_core::problemdetails::{self, Problem};
-use temps_core::AuditContext;
 use temps_core::{AppSettings, PublicHostnameStrategy, SensitiveAction};
+use temps_core::{AuditContext, AuditOperation, RequestMetadata};
 use temps_deployer::ContainerDeployer;
 
 /// App state for node registration handlers
@@ -2882,28 +2882,12 @@ impl BoundedReport {
     }
 }
 
-/// What each workload in `batch` that has to move would be rebuilt from,
-/// keyed by deployment. At most [`MAX_REDEPLOY_PLAN_BATCH`] entries.
-async fn plan_drain_batch(
-    app_state: &AppState,
-    batch: &[AffectedDeployment],
-) -> Result<HashMap<i32, Result<RedeploySource, DeploymentError>>, Problem> {
-    let to_move: Vec<&AffectedDeployment> =
-        batch.iter().filter(|dep| dep.needs_redeploy()).collect();
-    let targets: Vec<(i32, i32, i32)> = to_move
-        .iter()
-        .map(|dep| (dep.project_id, dep.environment_id, dep.deployment_id))
-        .collect();
-    let plans = app_state
-        .deployment_service
-        .plan_redeploys(&targets)
-        .await
-        .map_err(Problem::from)?;
-    Ok(to_move
-        .iter()
-        .map(|dep| dep.deployment_id)
-        .zip(plans)
-        .collect())
+/// Write an audit record for a node operation. A failure is logged and never
+/// fails the operation, which has already happened.
+async fn record_audit(app_state: &AppState, audit: &dyn AuditOperation, node_id: i32) {
+    if let Err(error) = app_state.audit_service.create_audit_log(audit).await {
+        error!(node_id, %error, "node operation succeeded but its audit record failed");
+    }
 }
 
 /// 500 for a drain whose redeploys could not all be queued after the
@@ -2960,6 +2944,7 @@ fn drain_incomplete_problem(
 async fn admin_drain_node(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AppState>>,
+    axum::Extension(metadata): axum::Extension<RequestMetadata>,
     Path(node_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
@@ -2996,7 +2981,11 @@ async fn admin_drain_node(
     // keeping only what failed, so memory does not grow with the workloads.
     let mut unmovable = BoundedReport::default();
     for batch in affected.chunks(MAX_REDEPLOY_PLAN_BATCH) {
-        let plans = plan_drain_batch(&app_state, batch).await?;
+        let plans = app_state
+            .deployment_service
+            .plan_drain_redeploys(batch)
+            .await
+            .map_err(Problem::from)?;
         for (deployment_id, plan) in plans {
             if let Err(e) = plan {
                 warn!(
@@ -3026,7 +3015,22 @@ async fn admin_drain_node(
     for batch in affected.chunks(MAX_REDEPLOY_PLAN_BATCH) {
         // Planned again for this batch: the redeploys use these plans, and
         // holding every plan from the check above would grow with the node.
-        let mut sources = plan_drain_batch(&app_state, batch).await?;
+        // The node is already draining, so a failure here must not return
+        // early: this batch's moves are reported as failed below, which sets
+        // an active node back to active and says what already happened.
+        let mut planning_error = None;
+        let mut sources = match app_state
+            .deployment_service
+            .plan_drain_redeploys(batch)
+            .await
+        {
+            Ok(sources) => sources,
+            Err(e) => {
+                error!(node_id, "Drain: could not plan a batch of redeploys: {}", e);
+                planning_error = Some(e.to_string());
+                HashMap::new()
+            }
+        };
         for dep in batch {
             if dep.is_current && dep.needs_redeploy() {
                 if !redeployed_environments.insert((dep.project_id, dep.environment_id)) {
@@ -3052,10 +3056,16 @@ async fn admin_drain_node(
                     }
                     None => {
                         redeployed_environments.remove(&(dep.project_id, dep.environment_id));
-                        failed_redeploys.push(format!(
-                            "deployment {} of project {} was not planned",
-                            dep.deployment_id, dep.project_id
-                        ));
+                        failed_redeploys.push(match &planning_error {
+                            Some(reason) => format!(
+                                "deployment {} of project {} could not be planned: {reason}",
+                                dep.deployment_id, dep.project_id
+                            ),
+                            None => format!(
+                                "deployment {} of project {} was not planned",
+                                dep.deployment_id, dep.project_id
+                            ),
+                        });
                         continue;
                     }
                 };
@@ -3169,7 +3179,21 @@ async fn admin_drain_node(
         }
     }
 
+    let audit_drain = |outcome: &str| NodeDrainAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        node_id,
+        node_name: node.name.clone(),
+        outcome: outcome.to_string(),
+        redeployed_environments: redeployed_count,
+        retired_containers: retired_count,
+        failed_redeploys: failed_redeploys.count(),
+    };
     if !failed_redeploys.is_empty() {
+        record_audit(&app_state, &audit_drain("incomplete"), node_id).await;
         // The pre-check passed, so this is a transient failure (queue,
         // database). Put an active node back so the drain can simply be
         // retried; leaving it "draining" would strand the workloads that never
@@ -3196,6 +3220,7 @@ async fn admin_drain_node(
         ));
     }
 
+    record_audit(&app_state, &audit_drain("draining"), node_id).await;
     info!(
         node_id,
         node_name = %node.name,
@@ -3292,6 +3317,7 @@ async fn admin_undrain_node(
 async fn admin_remove_node(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AppState>>,
+    axum::Extension(metadata): axum::Extension<RequestMetadata>,
     Path(node_id): Path<i32>,
     Query(query): Query<RemoveNodeQuery>,
 ) -> Result<impl IntoResponse, Problem> {
@@ -3327,7 +3353,27 @@ async fn admin_remove_node(
         .map_err(Problem::from)?;
     let unremoved_count = leftovers.unremoved_count;
     let unremoved = leftovers.unremoved_report();
+    let audit_removal = |outcome: &str| NodeRemovalAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        node_id,
+        node_name: node.name.clone(),
+        force: query.force,
+        outcome: outcome.to_string(),
+        containers_confirmed_gone: leftovers.confirmed_gone,
+        containers_unconfirmed: unremoved_count,
+    };
     if unremoved_count > 0 && !query.force {
+        // Containers may already have been removed from the host above.
+        record_audit(
+            &app_state,
+            &audit_removal("refused_unconfirmed_containers"),
+            node_id,
+        )
+        .await;
         return Err(node_holds_containers_problem(
             node_id,
             &node.name,
@@ -3338,11 +3384,11 @@ async fn admin_remove_node(
 
     let node_name = node.name.clone();
 
-    app_state
-        .node_service
-        .remove(node_id)
-        .await
-        .map_err(Problem::from)?;
+    if let Err(error) = app_state.node_service.remove(node_id).await {
+        record_audit(&app_state, &audit_removal("failed"), node_id).await;
+        return Err(Problem::from(error));
+    }
+    record_audit(&app_state, &audit_removal("removed"), node_id).await;
 
     info!(
         node_id,

@@ -245,23 +245,30 @@ struct OffloadBuildCandidate {
     platform: Option<String>,
 }
 
+/// Project variables a framework inlines into a generated build, which keep
+/// that build on the control plane. Names only, never values.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "{names} {verb} inlined into the application at build time, and worker builds cannot \
+     receive project variables yet",
+    names = .variables.join(", "),
+    verb = if .variables.len() == 1 { "is" } else { "are" }
+)]
+struct InlinedVariablesKeepBuildLocal {
+    variables: Vec<String>,
+}
+
 /// A worker build receives no variable values, so a generated build that a
-/// framework inlines variables into would ship them empty. `Err` is the
-/// build-log reason it stays on the control plane; names only, never values.
-fn inlined_variables_allow_offload(inlined_build_variables: &[String]) -> Result<(), String> {
+/// framework inlines variables into would ship them empty.
+fn inlined_variables_allow_offload(
+    inlined_build_variables: &[String],
+) -> Result<(), InlinedVariablesKeepBuildLocal> {
     if inlined_build_variables.is_empty() {
         return Ok(());
     }
-    Err(format!(
-        "{} {} inlined into the application at build time, and worker builds cannot \
-         receive project variables yet",
-        inlined_build_variables.join(", "),
-        if inlined_build_variables.len() == 1 {
-            "is"
-        } else {
-            "are"
-        }
-    ))
+    Err(InlinedVariablesKeepBuildLocal {
+        variables: inlined_build_variables.to_vec(),
+    })
 }
 
 /// Whether a build that the control plane would run can move to a worker
@@ -2781,7 +2788,10 @@ impl WorkflowExecutionService {
         needs_npm_credentials: bool,
         inlined_build_variables: &[String],
     ) -> Result<SelectedNodeBuilder, String> {
-        inlined_variables_allow_offload(inlined_build_variables)?;
+        // The reason becomes the build-log line explaining why the build
+        // stays on the control plane.
+        inlined_variables_allow_offload(inlined_build_variables)
+            .map_err(|reason| reason.to_string())?;
         let static_output_only = deployment_jobs::Entity::find()
             .filter(deployment_jobs::Column::DeploymentId.eq(deployment_id))
             .filter(deployment_jobs::Column::JobType.eq("DeployStaticJob"))
@@ -4054,14 +4064,16 @@ mod tests {
 
         assert_eq!(inlined_variables_allow_offload(&[]), Ok(()));
         let one = inlined_variables_allow_offload(&["VITE_API_URL".to_string()]).unwrap_err();
-        assert!(one.contains("VITE_API_URL is inlined"), "{one}");
+        assert_eq!(one.variables, vec!["VITE_API_URL".to_string()]);
+        assert!(one.to_string().contains("VITE_API_URL is inlined"), "{one}");
         let two = inlined_variables_allow_offload(&[
             "NEXT_PUBLIC_A".to_string(),
             "NEXT_PUBLIC_B".to_string(),
         ])
         .unwrap_err();
         assert!(
-            two.contains("NEXT_PUBLIC_A, NEXT_PUBLIC_B are inlined"),
+            two.to_string()
+                .contains("NEXT_PUBLIC_A, NEXT_PUBLIC_B are inlined"),
             "{two}"
         );
     }

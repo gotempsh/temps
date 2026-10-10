@@ -2378,6 +2378,30 @@ impl DeploymentService {
         Ok(plans)
     }
 
+    /// What each workload in `batch` that a node drain has to move would be
+    /// rebuilt from, keyed by deployment id. Only workloads whose every
+    /// replica is on the drained node are rebuilt; the rest are retired in
+    /// place and get no plan. `batch` holds at most
+    /// [`MAX_REDEPLOY_PLAN_BATCH`] workloads.
+    pub async fn plan_drain_redeploys(
+        &self,
+        batch: &[crate::services::node_service::AffectedDeployment],
+    ) -> Result<HashMap<i32, Result<RedeploySource, DeploymentError>>, DeploymentError> {
+        check_redeploy_plan_batch(batch.len())?;
+        let to_move: Vec<&crate::services::node_service::AffectedDeployment> =
+            batch.iter().filter(|dep| dep.needs_redeploy()).collect();
+        let targets: Vec<(i32, i32, i32)> = to_move
+            .iter()
+            .map(|dep| (dep.project_id, dep.environment_id, dep.deployment_id))
+            .collect();
+        let plans = self.plan_redeploys(&targets).await?;
+        Ok(to_move
+            .iter()
+            .map(|dep| dep.deployment_id)
+            .zip(plans)
+            .collect())
+    }
+
     /// Whether a deployment's own metadata names what to rebuild it from (an
     /// image, or an uploaded source bundle); otherwise it rebuilds from Git.
     fn rebuilds_from_metadata(deploy: &deployments::Model) -> bool {
