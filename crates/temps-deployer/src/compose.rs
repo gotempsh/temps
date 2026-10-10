@@ -4250,25 +4250,59 @@ impl ComposeExecutor {
             let is_raw_image_id = normalized.starts_with("sha256:")
                 || (normalized.len() == 64
                     && normalized.bytes().all(|byte| byte.is_ascii_hexdigit()));
-            if Self::contains_interpolation(image)
-                || (self.enforced(PolicyCheck::ImageReferences)
-                    && (normalized == "temps.internal"
-                        || normalized.starts_with("temps.internal/")
-                        || is_raw_image_id))
-            {
+            let is_temps_internal =
+                normalized == "temps.internal" || normalized.starts_with("temps.internal/");
+            // Each cause gets its own reason naming the offending value and
+            // the fix that applies to it: a shared message cannot tell the
+            // reader which of the three rules fired, nor which one they can
+            // actually change.
+            let rejection = if Self::contains_interpolation(image) {
+                Some(if has_build {
+                    format!(
+                        "image '{image}' uses a variable, and this service also has build:. \
+                         Remove image: from the service; Temps names the image it builds itself"
+                    )
+                } else {
+                    format!(
+                        "image '{image}' uses a variable, which is checked before variables are \
+                         resolved because it could otherwise select another deployment's local \
+                         image. Write the literal registry reference (for example \
+                         ghcr.io/org/app:1.2.3), or have an instance administrator disable \
+                         'Block variables in guarded fields' so Temps resolves variables first \
+                         and checks the result"
+                    )
+                })
+            } else if self.enforced(PolicyCheck::ImageReferences) && is_temps_internal {
+                Some(format!(
+                    "image '{image}' refers to a Temps-internal image, which may belong to \
+                     another deployment. Use build: to build this service from source, or a \
+                     registry reference"
+                ))
+            } else if self.enforced(PolicyCheck::ImageReferences) && is_raw_image_id {
+                Some(format!(
+                    "image '{image}' is a raw image ID, which can select another deployment's \
+                     local image. Use a registry reference such as ghcr.io/org/app:1.2.3 or \
+                     ghcr.io/org/app@sha256:<digest>"
+                ))
+            } else {
+                None
+            };
+            if let Some(reason) = rejection {
                 return Err(ComposeError::SecurityPolicyViolation {
                     service: service_name.to_string(),
                     field: "image".to_string(),
-                    reason: "interpolated, raw-ID, and Temps-internal image references are not allowed because they can select another deployment's local image"
-                        .to_string(),
+                    reason,
                 });
             }
             if self.enforced(PolicyCheck::BuildImage) && has_build {
                 return Err(ComposeError::SecurityPolicyViolation {
                     service: service_name.to_string(),
                     field: "image".to_string(),
-                    reason: "a Compose build may not set image; Temps assigns a deployment-scoped image name to prevent daemon-global tag collisions"
-                        .to_string(),
+                    reason: format!(
+                        "image '{image}' is set on a service that also has build:. Remove \
+                         image:; Temps assigns a deployment-scoped name to the image it builds \
+                         so it cannot collide with another deployment's tag"
+                    ),
                 });
             }
         }
@@ -7188,6 +7222,7 @@ impl ComposeExecutor {
             return String::new();
         }
         let inline_keys = self.service_inline_environment_keys(compose_content);
+        let build_arg_keys = Self::service_build_arg_keys(compose_content);
 
         let mut services_map = Mapping::new();
         for service in &services {
@@ -7215,6 +7250,36 @@ impl ComposeExecutor {
                         Value::String("environment".to_string()),
                         Value::Mapping(overrides),
                     );
+                }
+            }
+
+            // Project variables reach a `build:` service's Dockerfile `ARG`s,
+            // the same way they do for a Dockerfile deployment. Only keys the
+            // service's own `build.args` leaves undeclared are added: an
+            // explicit value in the Compose file wins, and it can still opt
+            // into the project value with `KEY: ${KEY}`. Image-only services
+            // are skipped, since adding `build:` would turn them into builds.
+            if let Some(declared) = build_arg_keys.get(service) {
+                let mut keys: Vec<&String> = project_env_vars
+                    .keys()
+                    .filter(|key| !declared.contains(*key))
+                    .collect();
+                keys.sort();
+                if !keys.is_empty() {
+                    let mut args = Mapping::new();
+                    for key in keys {
+                        if let Some(value) = project_env_vars.get(key) {
+                            // `$$` keeps the value literal: Compose interpolates
+                            // every `-f` file, generated overrides included.
+                            args.insert(
+                                Value::String(key.clone()),
+                                Value::String(value.replace('$', "$$")),
+                            );
+                        }
+                    }
+                    let mut build = Mapping::new();
+                    build.insert(Value::String("args".to_string()), Value::Mapping(args));
+                    service_map.insert(Value::String("build".to_string()), Value::Mapping(build));
                 }
             }
 
@@ -7283,6 +7348,53 @@ impl ComposeExecutor {
             if !keys.is_empty() {
                 result.insert(service_name.to_string(), keys);
             }
+        }
+
+        result
+    }
+
+    /// For each service with a `build:` directive, the build-arg keys its own
+    /// `build.args` declares (empty when it declares none, including the
+    /// `build: ./dir` short form). Services without `build:` are absent.
+    /// Handles both `args:` shapes: the sequence form (`- KEY=value` / bare
+    /// `- KEY`) and the mapping form (`KEY: value`). Unparseable YAML yields
+    /// an empty map, so no build args are injected rather than failing here.
+    fn service_build_arg_keys(compose_content: &str) -> HashMap<String, HashSet<String>> {
+        let mut result = HashMap::new();
+        let Ok(mut root) = serde_yaml::from_str::<YamlValue>(compose_content) else {
+            return result;
+        };
+        if root.apply_merge().is_err() {
+            return result;
+        }
+        let Some(services) = root.get("services").and_then(YamlValue::as_mapping) else {
+            return result;
+        };
+
+        for (name, service_value) in services {
+            let Some(service_name) = name.as_str() else {
+                continue;
+            };
+            let Some(build) = service_value.as_mapping().and_then(|m| m.get("build")) else {
+                continue;
+            };
+
+            let mut keys = HashSet::new();
+            match build.get("args") {
+                Some(YamlValue::Sequence(seq)) => {
+                    for entry in seq.iter().filter_map(YamlValue::as_str) {
+                        let key = entry.split('=').next().unwrap_or(entry).trim();
+                        if !key.is_empty() {
+                            keys.insert(key.to_string());
+                        }
+                    }
+                }
+                Some(YamlValue::Mapping(map)) => {
+                    keys.extend(map.keys().filter_map(YamlValue::as_str).map(str::to_string));
+                }
+                _ => {}
+            }
+            result.insert(service_name.to_string(), keys);
         }
 
         result
@@ -8539,6 +8651,74 @@ services:
         assert!(override_yaml.contains(".env.temps"));
         // Each service should have env_file
         assert_eq!(override_yaml.matches("env_file:").count(), 3);
+    }
+
+    #[test]
+    fn test_generate_env_override_passes_project_vars_as_build_args() {
+        let docker = Docker::connect_with_defaults();
+        if docker.is_err() {
+            return;
+        }
+        let executor = ComposeExecutor::new(Arc::new(docker.unwrap()), PathBuf::from("/tmp/test"));
+
+        let compose = r#"
+services:
+  web:
+    build: .
+  api:
+    build:
+      context: ./api
+      args:
+        - NODE_ENV=production
+  worker:
+    build:
+      context: ./worker
+      args:
+        API_URL: https://compose.example
+  db:
+    image: postgres:17-alpine
+"#;
+        let project_vars = HashMap::from([
+            ("API_URL".to_string(), "https://project.example".to_string()),
+            ("NODE_ENV".to_string(), "development".to_string()),
+            ("PRICE".to_string(), "costs $5 or ${X}".to_string()),
+        ]);
+
+        let override_yaml = executor.generate_env_override(compose, ".env.temps", &project_vars);
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&override_yaml).unwrap();
+        let args = |service: &str| {
+            parsed
+                .get("services")
+                .and_then(|s| s.get(service))
+                .and_then(|s| s.get("build"))
+                .and_then(|b| b.get("args"))
+                .cloned()
+        };
+
+        // Short-form build: every project variable becomes a build arg, with
+        // `$` escaped so Compose does not interpolate the literal value.
+        let web = args("web").expect("web builds, so it gets build args");
+        assert_eq!(
+            web.get("API_URL").and_then(|v| v.as_str()),
+            Some("https://project.example")
+        );
+        assert_eq!(
+            web.get("PRICE").and_then(|v| v.as_str()),
+            Some("costs $$5 or $${X}")
+        );
+
+        // An arg the Compose file declares (list or map form) keeps its value.
+        let api = args("api").expect("api builds, so it gets build args");
+        assert!(api.get("NODE_ENV").is_none());
+        assert!(api.get("API_URL").is_some());
+        let worker = args("worker").expect("worker builds, so it gets build args");
+        assert!(worker.get("API_URL").is_none());
+        assert!(worker.get("NODE_ENV").is_some());
+
+        // An image-only service must not gain a `build:` section.
+        let db = parsed.get("services").and_then(|s| s.get("db")).unwrap();
+        assert!(db.get("build").is_none());
+        assert!(db.get("env_file").is_some());
     }
 
     #[test]
@@ -11751,6 +11931,46 @@ volumes:
                 "services:\n  app:\n    image: registry.example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
             )
             .is_ok());
+    }
+
+    #[test]
+    fn test_image_rejection_names_the_value_and_the_fix_for_each_cause() {
+        let Some(executor) = test_executor() else {
+            return;
+        };
+        for (compose, expected) in [
+            (
+                "services:\n  app:\n    image: ${IMAGE}\n    build: .\n",
+                ["'${IMAGE}'", "Remove image:"],
+            ),
+            (
+                "services:\n  app:\n    image: ghcr.io/org/app:${TAG:-latest}\n",
+                ["'ghcr.io/org/app:${TAG:-latest}'", "Block variables in guarded fields"],
+            ),
+            (
+                "services:\n  app:\n    image: temps.internal/victim:latest\n",
+                ["'temps.internal/victim:latest'", "Temps-internal image"],
+            ),
+            (
+                "services:\n  app:\n    image: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+                ["'sha256:aaaa", "raw image ID"],
+            ),
+            (
+                "services:\n  app:\n    image: alpine\n    build: .\n",
+                ["'alpine'", "Remove image:"],
+            ),
+        ] {
+            let message = executor
+                .validate_compose_security_policy("compose file", compose)
+                .unwrap_err()
+                .to_string();
+            for fragment in expected {
+                assert!(
+                    message.contains(fragment),
+                    "rejection of {compose:?} should mention {fragment:?}: {message}"
+                );
+            }
+        }
     }
 
     #[test]
