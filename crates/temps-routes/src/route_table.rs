@@ -852,26 +852,21 @@ async fn claim_and_commit(
     Ok(claimed)
 }
 
-/// Raise `counter` to a generation claimed from the database and return the
-/// generation this reload publishes.
+/// Raise `counter` to a committed claim and return the generation now
+/// published.
 ///
-/// Always strictly above the value the counter held, so every reload wakes
-/// the long-poll waiters even if `claimed` were somehow not ahead of it, and
-/// never below `claimed`, so the in-memory sequence matches the durable one
-/// whenever the claim is ahead (the normal case).
+/// Only ever stores `claimed` itself, never a value derived from it, so every
+/// published generation is one the database committed. A claim is always
+/// above the in-memory value it was made from; it can only be at or below the
+/// counter when a concurrent claim (the background retry racing a reload)
+/// committed and was adopted first, and that later number already covers the
+/// routes this claim was for, so the counter is left as it is.
 pub(crate) fn adopt_claimed_generation(
     counter: &std::sync::atomic::AtomicU64,
     claimed: u64,
 ) -> u64 {
-    use std::sync::atomic::Ordering;
-    let mut current = counter.load(Ordering::Acquire);
-    loop {
-        let next = claimed.max(current.saturating_add(1));
-        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => return next,
-            Err(actual) => current = actual,
-        }
-    }
+    let previous = counter.fetch_max(claimed, std::sync::atomic::Ordering::AcqRel);
+    previous.max(claimed)
 }
 
 pub struct CachedPeerTable {
@@ -1046,7 +1041,7 @@ impl CachedPeerTable {
     }
 
     /// Number the reload that just finished, returning the generation it
-    /// published, or `None` when its number is still being claimed.
+    /// published, or why it could not be claimed yet.
     ///
     /// Authoritative: one atomic statement claims the next value of the
     /// durable counter (see [`claim_route_generation_within`]). A single-row
@@ -1071,14 +1066,14 @@ impl CachedPeerTable {
     ///
     /// Runs once per reload (control plane, serialized by
     /// `route_reload_lock`), never per request.
-    async fn advance_generation(&self) -> Option<u64> {
+    async fn advance_generation(&self) -> Result<u64, RouteGenerationError> {
         use std::sync::atomic::Ordering;
         if !self.generation_authoritative.load(Ordering::Acquire) {
-            return Some(self.generation.fetch_add(1, Ordering::AcqRel) + 1);
+            return Ok(self.generation.fetch_add(1, Ordering::AcqRel) + 1);
         }
         let previous = self.generation.load(Ordering::Acquire);
         match claim_route_generation(self.db.as_ref(), previous).await {
-            Ok(claimed) => Some(adopt_claimed_generation(&self.generation, claimed)),
+            Ok(claimed) => Ok(adopt_claimed_generation(&self.generation, claimed)),
             Err(error) => {
                 warn!(
                     previous_generation = previous,
@@ -1086,7 +1081,7 @@ impl CachedPeerTable {
                      will be published to workers once a retried claim commits"
                 );
                 self.schedule_claim_retry();
-                None
+                Err(error)
             }
         }
     }
@@ -2899,9 +2894,9 @@ impl CachedPeerTable {
         // snapshot endpoint has issued.
         self.loaded
             .store(true, std::sync::atomic::Ordering::Release);
-        let new_gen = self.advance_generation().await;
+        let published = self.advance_generation().await;
         debug!(
-            generation = ?new_gen,
+            generation = ?published.as_ref().ok(),
             role = ?self.route_generation_role(),
             "Route table reloaded"
         );
@@ -2944,7 +2939,21 @@ impl CachedPeerTable {
             }
         }
 
-        Ok(sleeping_environments)
+        // A reload whose generation was not claimed must not count as a
+        // completed reload: callers publish `RouteTableUpdated` on success,
+        // and the deployment completion gate would then compare workers'
+        // old ACKs against the unchanged durable target and pass while they
+        // still serve the previous routes. Failing here keeps the gate
+        // waiting; it re-requests a reload, whose claim (or the background
+        // retry) publishes the generation.
+        match published {
+            Ok(_) => Ok(sleeping_environments),
+            Err(error) => Err(sea_orm::DbErr::Custom(format!(
+                "Route table reloaded and live in this process ({} routes), but not yet \
+                 published to worker nodes: {error}",
+                self.len()
+            ))),
+        }
     }
 
     /// Get route information for a host (O(1) lookup)
@@ -4521,50 +4530,58 @@ mod route_generation_tests {
     }
 
     #[test]
-    fn adopted_generations_strictly_increase_and_never_fall_below_a_claim() {
+    fn adoption_publishes_only_committed_claims_and_never_goes_backwards() {
         let counter = AtomicU64::new(0);
         // The normal case: the claim is ahead, and is used as-is.
         assert_eq!(adopt_claimed_generation(&counter, 41), 41);
         assert_eq!(adopt_claimed_generation(&counter, 42), 42);
-        // A claim at or below the current value still advances by one, so
-        // the reload wakes its waiters and never repeats a generation.
-        assert_eq!(adopt_claimed_generation(&counter, 42), 43);
-        assert_eq!(adopt_claimed_generation(&counter, 7), 44);
+        // A claim overtaken by a later one (the retry racing a reload) leaves
+        // the later, also committed, number in place and invents none.
+        assert_eq!(adopt_claimed_generation(&counter, 7), 42);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Acquire), 42);
         // A claim far ahead (a restored database) is adopted.
         assert_eq!(adopt_claimed_generation(&counter, 1_000), 1_000);
-        // Saturates instead of wrapping to 0 ("never loaded").
-        let full = AtomicU64::new(u64::MAX);
-        assert_eq!(adopt_claimed_generation(&full, 3), u64::MAX);
     }
 
     #[test]
-    fn concurrent_adoption_never_hands_out_a_generation_twice() {
+    fn concurrent_adoption_only_ever_publishes_a_claimed_value() {
         let counter = Arc::new(AtomicU64::new(0));
         let handles: Vec<_> = (0..8u64)
             .map(|thread| {
                 let counter = counter.clone();
                 std::thread::spawn(move || {
                     (0..500u64)
-                        .map(|i| adopt_claimed_generation(&counter, (i * 8 + thread) / 3))
-                        .collect::<Vec<u64>>()
+                        .map(|i| {
+                            let claimed = i * 8 + thread + 1;
+                            (claimed, adopt_claimed_generation(&counter, claimed))
+                        })
+                        .collect::<Vec<(u64, u64)>>()
                 })
             })
             .collect();
-        let mut seen = HashSet::new();
+        let claimed: HashSet<u64> = (1..=8 * 500).collect();
         for handle in handles {
-            let values = handle.join().expect("adopting thread");
-            assert!(
-                values.windows(2).all(|pair| pair[0] < pair[1]),
-                "one caller's generations must strictly increase"
-            );
-            for value in values {
+            let results = handle.join().expect("adopting thread");
+            for (mine, published) in &results {
                 assert!(
-                    seen.insert(value),
-                    "generation {value} was handed out twice"
+                    published >= mine,
+                    "published {published} below claim {mine}"
+                );
+                assert!(
+                    claimed.contains(published),
+                    "published {published}, which nobody claimed"
                 );
             }
+            assert!(
+                results.windows(2).all(|pair| pair[0].1 <= pair[1].1),
+                "one caller never sees the generation go backwards"
+            );
         }
-        assert_eq!(seen.len(), 8 * 500);
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Acquire),
+            8 * 500,
+            "the counter ends at the highest claim"
+        );
     }
 
     #[test]
@@ -4738,11 +4755,18 @@ mod route_generation_tests {
                 .contains("route_generation singleton row (id = 1)"),
             "{missing}"
         );
-        table.load_routes().await.expect("load without the row");
-        table
-            .load_routes()
-            .await
-            .expect("second load without the row");
+        for _ in 0..2 {
+            let unpublished = table
+                .load_routes()
+                .await
+                .expect_err("a reload without a claimed generation is not complete");
+            assert!(
+                unpublished
+                    .to_string()
+                    .contains("not yet published to worker nodes"),
+                "{unpublished}"
+            );
+        }
         assert!(table.has_loaded());
         assert_eq!(table.current_generation(), 1, "nothing published");
         assert_eq!(persisted(&db).await, None, "nothing re-creates the row");
@@ -4805,7 +4829,10 @@ mod route_generation_tests {
         );
 
         let started = std::time::Instant::now();
-        table.load_routes().await.expect("load during the stall");
+        table
+            .load_routes()
+            .await
+            .expect_err("a reload whose claim stalled is not complete");
         assert!(
             started.elapsed() < ROUTE_GENERATION_CLAIM_TIMEOUT + std::time::Duration::from_secs(3),
             "the reload must not wait on the database beyond the claim bound, took {:?}",
@@ -4860,7 +4887,7 @@ mod route_generation_tests {
         table
             .load_routes()
             .await
-            .expect("load with failing commits");
+            .expect_err("a reload whose claim did not commit is not complete");
         assert!(table.has_loaded(), "routes are live in this process");
         assert_eq!(table.current_generation(), 0, "nothing published");
 
