@@ -41,6 +41,13 @@ fn redact_url(raw: &str) -> String {
     parsed.to_string()
 }
 
+/// Largest response accepted from a screenshot service. The image arrives
+/// base64-encoded inside JSON, so this allows an image of about 48 MiB.
+const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
+/// How much of an error response is kept for the error message.
+const MAX_ERROR_BODY_BYTES: usize = 4 * 1024;
+
 /// Remote screenshot provider that calls an external API
 pub struct RemoteScreenshotProvider {
     /// Base URL of the screenshot service
@@ -49,6 +56,51 @@ pub struct RemoteScreenshotProvider {
     api_key: Option<String>,
     /// HTTP client
     client: Client,
+    /// Responses larger than this are refused without being buffered whole.
+    max_response_bytes: usize,
+}
+
+/// A response body read with a size cap.
+enum CappedBody {
+    Complete(Vec<u8>),
+    TooLarge,
+}
+
+/// Read `response`'s body, giving up as soon as it exceeds `limit` bytes so a
+/// misbehaving service cannot make Temps buffer an unbounded response.
+async fn read_body_capped(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<CappedBody, reqwest::Error> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Ok(CappedBody::TooLarge);
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() + chunk.len() > limit {
+            return Ok(CappedBody::TooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(CappedBody::Complete(body))
+}
+
+/// The first `limit` bytes of `response`'s body as text, for error messages.
+async fn read_body_prefix(mut response: reqwest::Response, limit: usize) -> String {
+    let mut body = Vec::new();
+    while body.len() < limit {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let take = chunk.len().min(limit - body.len());
+                body.extend_from_slice(&chunk[..take]);
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&body).into_owned()
 }
 
 #[derive(Serialize)]
@@ -87,7 +139,14 @@ impl RemoteScreenshotProvider {
             service_url,
             api_key,
             client,
+            max_response_bytes: MAX_RESPONSE_BYTES,
         })
+    }
+
+    #[cfg(test)]
+    fn with_max_response_bytes(mut self, max_response_bytes: usize) -> Self {
+        self.max_response_bytes = max_response_bytes;
+        self
     }
 }
 
@@ -127,7 +186,7 @@ impl ScreenshotProvider for RemoteScreenshotProvider {
 
         if !response.status().is_success() {
             let status = response.status();
-            let error_text = response.text().await.unwrap_or_default();
+            let error_text = read_body_prefix(response, MAX_ERROR_BODY_BYTES).await;
             error!(
                 "Screenshot service returned error {}: {}",
                 status, error_text
@@ -138,10 +197,26 @@ impl ScreenshotProvider for RemoteScreenshotProvider {
             )));
         }
 
-        let screenshot_response: ScreenshotResponse = response.json().await.map_err(|e| {
-            error!("Failed to parse screenshot service response: {}", e);
-            ScreenshotError::HttpRequest(format!("Failed to parse response: {}", e))
-        })?;
+        let body = match read_body_capped(response, self.max_response_bytes)
+            .await
+            .map_err(|e| {
+                error!("Failed to read screenshot service response: {}", e);
+                ScreenshotError::HttpRequest(format!("Failed to read response: {}", e))
+            })? {
+            CappedBody::Complete(body) => body,
+            CappedBody::TooLarge => {
+                return Err(ScreenshotError::ProviderError(format!(
+                    "the screenshot service at {} sent a response larger than {} bytes",
+                    redact_url(&self.service_url),
+                    self.max_response_bytes
+                )))
+            }
+        };
+        let screenshot_response: ScreenshotResponse =
+            serde_json::from_slice(&body).map_err(|e| {
+                error!("Failed to parse screenshot service response: {}", e);
+                ScreenshotError::HttpRequest(format!("Failed to parse response: {}", e))
+            })?;
 
         if !screenshot_response.success {
             let error_msg = screenshot_response
@@ -251,6 +326,74 @@ mod tests {
             !redacted.contains("pass:word"),
             "unparsable input must not be echoed back, got: {}",
             redacted
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_responses_are_refused() {
+        let mut server = mockito::Server::new_async().await;
+        let image = "A".repeat(4096);
+        server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_body(format!(r#"{{"success":true,"image":"{image}"}}"#))
+            .create_async()
+            .await;
+        let provider = RemoteScreenshotProvider::new(server.url(), None)
+            .unwrap()
+            .with_max_response_bytes(1024);
+
+        let err = provider
+            .capture_screenshot("http://app.local")
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("larger than 1024 bytes"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn responses_within_the_limit_return_the_image() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_body(r#"{"success":true,"image":"iVBORw0KGgo="}"#)
+            .create_async()
+            .await;
+        let provider = RemoteScreenshotProvider::new(server.url(), None)
+            .unwrap()
+            .with_max_response_bytes(1024);
+
+        let bytes = provider
+            .capture_screenshot("http://app.local")
+            .await
+            .unwrap();
+
+        assert_eq!(bytes, b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[tokio::test]
+    async fn error_bodies_are_truncated() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/")
+            .with_status(502)
+            .with_body("x".repeat(MAX_ERROR_BODY_BYTES * 4))
+            .create_async()
+            .await;
+        let provider = RemoteScreenshotProvider::new(server.url(), None).unwrap();
+
+        let err = provider
+            .capture_screenshot("http://app.local")
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("502"), "{err}");
+        assert!(
+            err.len() < MAX_ERROR_BODY_BYTES + 200,
+            "error message kept {} bytes",
+            err.len()
         );
     }
 

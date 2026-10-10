@@ -8,8 +8,9 @@
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tokio::fs;
+use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
 use temps_config::ConfigService;
@@ -289,20 +290,7 @@ impl ScreenshotService {
         // readable image: a provider can answer with an empty body, an HTML
         // error page, or a truncated file. Decoding is CPU work, so it runs off
         // the async runtime.
-        let image_data = tokio::task::spawn_blocking(move || {
-            validate_image_bytes(&image_data).map(|_| image_data)
-        })
-        .await
-        .map_err(|e| {
-            ScreenshotError::CaptureFailed(format!(
-                "Validating the screenshot of {} failed to run: {}",
-                url, e
-            ))
-        })?
-        .map_err(|reason| ScreenshotError::InvalidImage {
-            url: url.to_string(),
-            reason,
-        })?;
+        let image_data = validate_image_bounded(DECODE_PERMITS.clone(), url, image_data).await?;
 
         if let Some(store) = &self.durable_store {
             store
@@ -403,6 +391,44 @@ impl ScreenshotService {
 /// capture reaches it at about 34,000px tall; anything larger is refused rather
 /// than risking the memory of a small host.
 const MAX_DECODED_IMAGE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// One screenshot is decoded at a time across the whole instance, so however
+/// many captures finish together, validation needs at most
+/// `MAX_DECODED_IMAGE_BYTES` of pixel memory.
+static DECODE_PERMITS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(1)));
+
+/// Run [`validate_image_bytes`] on a blocking thread once a decode permit is
+/// free, returning the bytes when they are a readable image.
+///
+/// The permit is moved into the blocking task, so it is held until the decode
+/// actually ends even if the caller stops waiting (a capture timeout).
+async fn validate_image_bounded(
+    permits: Arc<Semaphore>,
+    url: &str,
+    image_data: Vec<u8>,
+) -> ScreenshotResult<Vec<u8>> {
+    let permit = permits.acquire_owned().await.map_err(|e| {
+        ScreenshotError::CaptureFailed(format!(
+            "Could not schedule validation of the screenshot of {}: {}",
+            url, e
+        ))
+    })?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        validate_image_bytes(&image_data).map(|_| image_data)
+    })
+    .await
+    .map_err(|e| {
+        ScreenshotError::CaptureFailed(format!(
+            "Validating the screenshot of {} failed to run: {}",
+            url, e
+        ))
+    })?
+    .map_err(|reason| ScreenshotError::InvalidImage {
+        url: url.to_string(),
+        reason,
+    })
+}
 
 /// Check that `bytes` is a readable PNG, JPEG or WebP image rather than an
 /// empty body, an error page or a truncated file, returning its format.
@@ -522,6 +548,44 @@ mod image_validation_tests {
 
             assert!(reason.contains("do not decode"), "{format:?}: {reason}");
         }
+    }
+
+    #[tokio::test]
+    async fn decodes_wait_for_a_shared_permit() {
+        let permits = Arc::new(Semaphore::new(1));
+        let held = permits.clone().acquire_owned().await.unwrap();
+        let png = encoded(image::ImageFormat::Png);
+
+        // Another decode holds the only permit, so this one must wait.
+        let waited = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            validate_image_bounded(permits.clone(), "http://app.local", png.clone()),
+        )
+        .await;
+        assert!(waited.is_err(), "a decode started without a free permit");
+
+        drop(held);
+        let validated = validate_image_bounded(permits.clone(), "http://app.local", png.clone())
+            .await
+            .expect("decodes once the permit is free");
+        assert_eq!(validated, png);
+        assert_eq!(permits.available_permits(), 1, "the permit is returned");
+    }
+
+    #[tokio::test]
+    async fn bounded_validation_reports_unreadable_images() {
+        let err = validate_image_bounded(
+            Arc::new(Semaphore::new(1)),
+            "http://app.local",
+            b"<html>oops</html>".to_vec(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, ScreenshotError::InvalidImage { ref url, .. } if url == "http://app.local"),
+            "{err}"
+        );
     }
 
     #[test]
