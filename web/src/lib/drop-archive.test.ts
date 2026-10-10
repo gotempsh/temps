@@ -3,9 +3,11 @@
 
 import { describe, expect, test } from 'bun:test'
 import {
+  classifyDropPath,
   formatDetectedProjectLabel,
   htmlRootCandidates,
   normalizeDropFiles,
+  partitionDropFiles,
   prepareDrop,
   type DropFile,
 } from './drop-archive'
@@ -56,6 +58,59 @@ describe('drop archive preparation', () => {
     ])
 
     expect(files.map(({ path }) => path)).toEqual(['index.html'])
+  })
+
+  test('keeps environment templates, as a ZIP of the same folder does', () => {
+    const files = normalizeDropFiles([
+      dropped('app/Cargo.toml'),
+      dropped('app/.env.example', 'PORT=8080'),
+      dropped('app/.env.sample'),
+      dropped('app/.env.template'),
+      dropped('app/.env.dist'),
+      dropped('app/.env', 'TOKEN=secret'),
+    ])
+
+    expect(files.map(({ path }) => path)).toEqual([
+      'Cargo.toml',
+      '.env.example',
+      '.env.sample',
+      '.env.template',
+      '.env.dist',
+    ])
+  })
+
+  test('reports what it left out, one line per directory', () => {
+    const { leftOut } = partitionDropFiles([
+      dropped('app/index.js'),
+      dropped('app/.env', 'TOKEN=secret'),
+      dropped('app/node_modules/a/index.js'),
+      dropped('app/node_modules/b/index.js'),
+      dropped('app/.git/HEAD'),
+      dropped('app/certs/server.key', 'secret'),
+    ])
+
+    expect(leftOut).toEqual([
+      { path: '.env', reason: 'environment_file', files: 1 },
+      { path: '.git/', reason: 'version_control', files: 1 },
+      { path: 'certs/server.key', reason: 'private_key', files: 1 },
+      { path: 'node_modules/', reason: 'dependencies', files: 2 },
+    ])
+  })
+
+  test('classifies paths with the same rule as the server', () => {
+    expect(classifyDropPath('apps/api/.env.production.example')).toEqual({
+      kind: 'keep',
+    })
+    expect(classifyDropPath('node_modules/x/test/cert.pem')).toEqual({
+      kind: 'skip',
+      reason: 'dependencies',
+      reportedPath: 'node_modules/',
+    })
+    expect(classifyDropPath('config/.env.local')).toEqual({
+      kind: 'skip',
+      reason: 'environment_file',
+      reportedPath: 'config/.env.local',
+    })
   })
 
   test('finds root page choices when index.html is absent', () => {

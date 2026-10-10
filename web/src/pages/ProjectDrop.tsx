@@ -13,6 +13,7 @@ import {
   type ProjectResponse,
 } from '@/api/client'
 import { DetectedPresetCard } from '@/components/drop/DetectedPresetCard'
+import { DropLeftOutNotice } from '@/components/drop/DropLeftOutNotice'
 import { DetectedPresetGrid } from '@/components/drop/DetectedPresetGrid'
 import { DropNoProjectFound } from '@/components/drop/DropNoProjectFound'
 import { DropZone } from '@/components/drop/DropZone'
@@ -32,6 +33,7 @@ import {
   htmlRootCandidates,
   isDropArchive,
   type DropFile,
+  type DropLeftOutPath,
 } from '@/lib/drop-archive'
 import { dropErrorMessage } from '@/lib/drop-files'
 import { sourceArchiveUploadsSupported } from '@/lib/platform-capabilities'
@@ -104,6 +106,11 @@ export function ProjectDrop({ project }: { project: ProjectResponse }) {
   const [inspection, setInspection] = useState<DropInspectionResponse | null>(
     null
   )
+  // What the upload left out; shown alongside `inspection` only.
+  const [leftOut, setLeftOut] = useState<{
+    paths: DropLeftOutPath[]
+    fileCount: number
+  }>({ paths: [], fileCount: 0 })
   const [candidateIndex, setCandidateIndex] = useState('0')
   const [environments, setEnvironments] = useState<EnvironmentResponse[]>([])
   const [environmentId, setEnvironmentId] = useState('')
@@ -183,6 +190,7 @@ export function ProjectDrop({ project }: { project: ProjectResponse }) {
       if (detectionRunRef.current !== runId) return
       setPreparedArchive(result.archive)
       setInspection(result.inspection)
+      setLeftOut({ paths: result.leftOut, fileCount: result.leftOutFileCount })
       const current = (project.directory || '.').replace(/^\.\/+/, '') || '.'
       const match = result.inspection.candidates.findIndex(
         (candidate) => (candidate.directory || '.') === current
@@ -429,6 +437,13 @@ export function ProjectDrop({ project }: { project: ProjectResponse }) {
                       phase={stage === 'packing' ? 'packing' : 'detecting'}
                     />
                   )}
+
+                {inspection && (
+                  <DropLeftOutNotice
+                    leftOut={leftOut.paths}
+                    fileCount={leftOut.fileCount}
+                  />
+                )}
 
                 <div className="rounded-xl border bg-muted/35 p-4 text-sm">
                   <div className="flex items-center justify-between gap-3">

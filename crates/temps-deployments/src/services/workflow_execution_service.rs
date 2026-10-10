@@ -2572,11 +2572,14 @@ impl WorkflowExecutionService {
                     ));
                 }
                 let absolute_path = self.config_service.data_dir().join(archive_path);
-                Ok(Arc::new(PrepareSourceBundleJob::new(
-                    db_job.job_id.clone(),
-                    absolute_path,
-                    project.slug.clone(),
-                )))
+                Ok(Arc::new(
+                    PrepareSourceBundleJob::new(
+                        db_job.job_id.clone(),
+                        absolute_path,
+                        project.slug.clone(),
+                    )
+                    .with_log_service(self.log_service.clone(), db_job.log_id.clone()),
+                ))
             }
 
             // Unsupported job types - log warning but don't fail the entire workflow

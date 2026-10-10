@@ -187,7 +187,7 @@ describe('archive rejection feedback', () => {
 for (const [title, instruction] of [
   ['Invalid ZIP Entry', 'original project files'],
   ['Unsafe ZIP Entry', 'inside that folder'],
-  ['Sensitive ZIP Entry', 'Remove environment files'],
+  ['Sensitive ZIP Entry', 'Remove private keys and credentials'],
   ['Unsupported ZIP Entry', 'Replace links with the actual project files'],
 ]) {
   test(`${title} requires replacement and explains how to correct its entries`, () => {
@@ -196,3 +196,13 @@ for (const [title, instruction] of [
     expect(dropArchiveErrorReason(error)).toContain(instruction)
   })
 }
+
+test('a refused private key is named, so the user knows which file to remove', () => {
+  const reason = dropArchiveErrorReason({
+    title: 'Sensitive ZIP Entry',
+    detail: "Archive entry 'certs/server.key' looks like a private key",
+    entry: 'certs/server.key',
+  })
+  expect(reason).toContain('Remove certs/server.key from the archive')
+  expect(reason).not.toContain('environment files')
+})

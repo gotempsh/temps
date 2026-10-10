@@ -536,6 +536,8 @@ async fn authorize_storage_service_scopes(
             super::types::ProjectEnvVarInput,
             DropInspectionResponse,
             DropPresetCandidate,
+            temps_core::drop_entries::DropSkippedPath,
+            temps_core::drop_entries::DropSkipReason,
             ChangeProjectSourceRequest,
             SetAlternateSourcesRequest,
             ProjectResponse,
@@ -641,6 +643,15 @@ pub struct DropPresetCandidate {
 pub struct DropInspectionResponse {
     pub suggested_name: String,
     pub candidates: Vec<DropPresetCandidate>,
+    /// What the deployment will leave out of this archive: version control,
+    /// installed dependencies, environment files that may hold secrets, OS
+    /// metadata. Directories are listed once. At most 50 paths; see
+    /// `skipped_file_count` for the total.
+    #[serde(default)]
+    pub skipped_entries: Vec<temps_core::drop_entries::DropSkippedPath>,
+    /// Archive entries left out in total, including any not listed.
+    #[serde(default)]
+    pub skipped_file_count: u64,
 }
 
 #[derive(utoipa::ToSchema)]
@@ -729,10 +740,13 @@ pub async fn inspect_drop_archive(
     // `spawn_blocking` as the ZIP walk so it stays off the async runtime AND
     // stays covered by `inspection_permit`, which is released when this closure
     // returns.
-    let candidates = tokio::task::spawn_blocking(move || {
+    let (candidates, skipped) = tokio::task::spawn_blocking(move || {
         let _inspection_permit = inspection_permit;
-        let manifests = inspect_zip_manifests(&archive_path)?;
-        Ok::<_, Problem>(drop_inspection_candidates(&manifests))
+        let inspection = inspect_zip_archive(&archive_path)?;
+        Ok::<_, Problem>((
+            drop_inspection_candidates(&inspection.manifests),
+            inspection.skipped,
+        ))
     })
     .await
     .map_err(|error| {
@@ -755,6 +769,8 @@ pub async fn inspect_drop_archive(
     Ok(Json(DropInspectionResponse {
         suggested_name,
         candidates,
+        skipped_entries: skipped.paths(),
+        skipped_file_count: skipped.total_files(),
     }))
 }
 
@@ -845,7 +861,38 @@ fn compose_path_for_candidate(
         .map(|file_name| (*file_name).to_string())
 }
 
+/// Rejection for an archive entry that is private material. Names the entry,
+/// in `detail` and as `entry`, so the console can say which file to remove.
+fn sensitive_zip_entry_problem(
+    entry: &str,
+    reason: temps_core::drop_entries::DropRefusalReason,
+) -> Problem {
+    problemdetails::new(StatusCode::BAD_REQUEST)
+        .with_title("Sensitive ZIP Entry")
+        .with_detail(format!(
+            "Archive entry '{entry}' {reason}. Remove it from the archive and upload again: \
+             Drop never accepts private keys or credentials. Environment files (.env, \
+             .env.local), node_modules/ and .git/ do not need removing; they are left out \
+             automatically, and templates such as .env.example are kept"
+        ))
+        .with_value("entry", entry)
+}
+
+/// Manifests of a Drop archive, for detection; see [`inspect_zip_archive`].
+#[cfg(test)]
 fn inspect_zip_manifests(path: &std::path::Path) -> Result<BTreeMap<String, String>, Problem> {
+    inspect_zip_archive(path).map(|inspection| inspection.manifests)
+}
+
+/// What [`inspect_zip_archive`] read from a Drop archive.
+struct DropZipInspection {
+    /// Every kept entry's path; the contents of the manifests detection reads.
+    manifests: BTreeMap<String, String>,
+    /// Entries left out under the Drop rules, for the console's notice.
+    skipped: temps_core::drop_entries::DropSkipReport,
+}
+
+fn inspect_zip_archive(path: &std::path::Path) -> Result<DropZipInspection, Problem> {
     const MAX_FILES: usize = 20_000;
     const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
     /// Aggregate budget across every manifest we buffer. `MAX_FILES` x
@@ -881,6 +928,7 @@ fn inspect_zip_manifests(path: &std::path::Path) -> Result<BTreeMap<String, Stri
     }
 
     let mut manifests = BTreeMap::new();
+    let mut skipped = temps_core::drop_entries::DropSkipReport::default();
     let mut total_manifest_bytes: u64 = 0;
     let mut manifest_count: usize = 0;
     let mut total_path_bytes: usize = 0;
@@ -901,25 +949,18 @@ fn inspect_zip_manifests(path: &std::path::Path) -> Result<BTreeMap<String, Stri
                     entry.name()
                 ))
         })?;
-        if path.components().any(|component| {
-            let std::path::Component::Normal(value) = component else {
-                return false;
-            };
-            let name = value.to_string_lossy();
-            name == ".git"
-                || name == "node_modules"
-                || name == ".env"
-                || name.starts_with(".env.")
-                || name.ends_with(".pem")
-                || name.ends_with(".key")
-                || name == "credentials.json"
-        }) {
-            return Err(problemdetails::new(StatusCode::BAD_REQUEST)
-                .with_title("Sensitive ZIP Entry")
-                .with_detail(format!(
-                    "Archive entry '{}' must be excluded from Drop uploads",
-                    entry.name()
-                )));
+        match temps_core::drop_entries::classify_drop_entry(&path) {
+            temps_core::drop_entries::DropEntryDisposition::Keep => {}
+            temps_core::drop_entries::DropEntryDisposition::Skip {
+                reason,
+                reported_path,
+            } => {
+                skipped.record(reason, reported_path);
+                continue;
+            }
+            temps_core::drop_entries::DropEntryDisposition::Refuse { reason } => {
+                return Err(sensitive_zip_entry_problem(entry.name(), reason));
+            }
         }
         if entry
             .unix_mode()
@@ -990,7 +1031,7 @@ fn inspect_zip_manifests(path: &std::path::Path) -> Result<BTreeMap<String, Stri
         }
         manifests.insert(normalized, contents);
     }
-    Ok(manifests)
+    Ok(DropZipInspection { manifests, skipped })
 }
 
 /// Tell project creators whether Cloudflare is ready and what their new-project default is.
@@ -4158,7 +4199,7 @@ mod tests {
         authorize_storage_service_scopes, canonicalize_template_environment_variables,
         canonicalize_template_upgrade_environment_variables, compose_path_for_candidate,
         drop_inspection_candidates, drop_preset_candidate_from, image_deployment_dispatch_feedback,
-        image_template_preset_config, inspect_zip_manifests,
+        image_template_preset_config, inspect_zip_archive, inspect_zip_manifests,
         missing_required_template_configuration, no_deployable_project_problem,
         parse_owner_repo_from_git_url, production_environment_variable_names,
         project_created_from_template_telemetry_event, require_git_settings_permissions,
@@ -4711,8 +4752,13 @@ mod tests {
             assert_eq!(response.label, label);
             assert!(!response.is_static);
         }
-        // Adding language manifests must not bypass the archive secret policy.
+        // Adding language manifests must not bypass the archive secret policy:
+        // an environment file is never read or kept, and a key still refuses
+        // the upload.
         let zip = drop_test_zip(&[("composer.json", "{}"), (".env", "APP_KEY=fixture-only")]);
+        let manifests = inspect_zip_manifests(zip.path()).unwrap();
+        assert!(!manifests.contains_key(".env"));
+        let zip = drop_test_zip(&[("composer.json", "{}"), ("storage/oauth-private.key", "x")]);
         assert!(inspect_zip_manifests(zip.path()).is_err());
     }
 
@@ -4766,11 +4812,99 @@ mod tests {
                 !candidates[0].is_static,
                 "{slug} must not be served as files"
             );
-            // Recognising more files must not loosen the archive policy.
-            let mut with_secret = files.clone();
-            with_secret.push((".env", "fixture-only"));
-            assert!(inspect_zip_manifests(drop_test_zip(&with_secret).path()).is_err());
+            // Recognising more files must not loosen the archive policy:
+            // private keys still refuse the upload, and an environment file
+            // is still never read or kept.
+            let mut with_key = files.clone();
+            with_key.push(("certs/server.key", "fixture-only"));
+            assert!(inspect_zip_manifests(drop_test_zip(&with_key).path()).is_err());
+            let mut with_env = files.clone();
+            with_env.push((".env", "fixture-only"));
+            let manifests = inspect_zip_manifests(drop_test_zip(&with_env).path()).unwrap();
+            assert!(!manifests.contains_key(".env"));
         }
+    }
+
+    /// A Rust web app with a Dockerfile and a committed `.env.example` used to
+    /// be refused as a whole ("Sensitive ZIP Entry ... '.env.example'").
+    #[test]
+    fn drop_keeps_environment_templates() {
+        let zip = drop_test_zip(&[
+            (".env.example", "DATABASE_URL=postgres://localhost/app"),
+            (
+                "Cargo.toml",
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"",
+            ),
+            ("Cargo.lock", "version = 3"),
+            ("Dockerfile", "FROM rust:1\n"),
+            ("src/main.rs", "fn main() {}"),
+        ]);
+        let inspection = inspect_zip_archive(zip.path()).unwrap();
+        assert!(inspection.manifests.contains_key(".env.example"));
+        assert!(inspection.skipped.is_empty());
+        let candidates = drop_inspection_candidates(&inspection.manifests);
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.directory == "."),
+            "{candidates:?}"
+        );
+    }
+
+    /// Secrets and generated directories are left out and reported, the way
+    /// a dropped folder already treats them, instead of refusing the ZIP.
+    #[test]
+    fn drop_leaves_out_env_files_and_generated_directories_and_reports_them() {
+        let zip = drop_test_zip(&[
+            ("package.json", "{\"name\":\"web\"}"),
+            ("index.js", "console.log(1)"),
+            (".env", "fixture-only"),
+            ("config/.env.production", "fixture-only"),
+            ("node_modules/left-pad/index.js", "module.exports = 1"),
+            ("node_modules/left-pad/package.json", "{}"),
+            (".git/config", "[core]"),
+            ("node_modules/some-lib/test/fixture.pem", "fixture-only"),
+        ]);
+        let inspection = inspect_zip_archive(zip.path()).unwrap();
+        for left_out in [".env", "config/.env.production", ".git/config"] {
+            assert!(!inspection.manifests.contains_key(left_out), "{left_out}");
+        }
+        assert!(inspection
+            .manifests
+            .keys()
+            .all(|path| !path.starts_with("node_modules/")));
+        assert_eq!(inspection.skipped.total_files(), 6);
+        let listed: Vec<(String, u64)> = inspection
+            .skipped
+            .paths()
+            .into_iter()
+            .map(|skipped| (skipped.path, skipped.files))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                (".env".to_string(), 1),
+                (".git/".to_string(), 1),
+                ("config/.env.production".to_string(), 1),
+                ("node_modules/".to_string(), 3),
+            ]
+        );
+        assert_eq!(
+            drop_inspection_candidates(&inspection.manifests)[0].directory,
+            "."
+        );
+    }
+
+    #[test]
+    fn drop_refuses_private_material_and_names_the_entry() {
+        let zip = drop_test_zip(&[("package.json", "{}"), ("certs/server.key", "fixture-only")]);
+        let problem = inspect_zip_archive(zip.path()).err().unwrap();
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+        assert_eq!(problem.body["title"], "Sensitive ZIP Entry");
+        assert_eq!(problem.body["entry"], "certs/server.key");
+        let detail = problem.body["detail"].as_str().unwrap();
+        assert!(detail.contains("'certs/server.key'"), "{detail}");
+        assert!(detail.contains("private key"), "{detail}");
     }
 
     #[test]
@@ -4858,6 +4992,7 @@ mod tests {
         let zip = drop_test_zip(&[
             ("composer.json", "{}"),
             ("vendor/private/.env", "fixture-only"),
+            ("vendor/private/tls.key", "fixture-only"),
         ]);
         assert!(inspect_zip_manifests(zip.path()).is_err());
         // The size cap remains enforced for an actual application manifest.

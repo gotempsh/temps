@@ -194,7 +194,7 @@ export function dropArchiveErrorDetails(error: unknown): string | null {
 /** Explain the permanent intake rejection without exposing parser jargon. */
 export function dropArchiveErrorReason(error: unknown): string | undefined {
   if (!error || typeof error !== 'object') return undefined
-  const problem = error as { title?: unknown }
+  const problem = error as { title?: unknown; entry?: unknown }
   switch (problem.title) {
     case 'Invalid ZIP Archive':
       return 'The selected file is not a valid or supported ZIP archive.'
@@ -203,7 +203,11 @@ export function dropArchiveErrorReason(error: unknown): string | undefined {
     case 'Unsafe ZIP Entry':
       return 'The ZIP includes a file outside the project folder. Keep every archive entry inside that folder.'
     case 'Sensitive ZIP Entry':
-      return 'Remove environment files, private keys, and credentials from the project archive before uploading it.'
+      // The server names the entry; environment files, node_modules/ and
+      // .git/ are left out automatically and never cause this.
+      return typeof problem.entry === 'string' && problem.entry
+        ? `Remove ${problem.entry} from the archive and upload it again: it looks like a private key or credentials file, which Drop never accepts.`
+        : 'Remove private keys and credentials files from the project archive before uploading it.'
     case 'Unsupported ZIP Entry':
       return 'Symbolic links are not supported. Replace links with the actual project files before creating the new ZIP.'
     default:

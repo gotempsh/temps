@@ -10,16 +10,42 @@ export interface PreparedDrop {
   file: File
   fileCount: number
   rootPage: string | null
+  /** What a dropped folder left out of the upload (empty for a ZIP, whose
+   * left-out entries the server reports). */
+  leftOut: DropLeftOutPath[]
 }
 
+/**
+ * Why a file is not uploaded. Mirrors the server's `DropSkipReason`, plus
+ * `private_key`: a folder's keys and credentials are never packed, while a
+ * ZIP that contains one is refused by the server, naming the entry.
+ */
+export type DropLeftOutReason =
+  | 'version_control'
+  | 'dependencies'
+  | 'environment_file'
+  | 'os_metadata'
+  | 'private_key'
+
+/** One line of the "left out of the upload" notice. */
+export interface DropLeftOutPath {
+  /** The file, or the directory (ending in `/`) whose files were left out. */
+  path: string
+  reason: DropLeftOutReason
+  files: number
+}
+
+type DropPathDisposition =
+  | { kind: 'keep' }
+  | { kind: 'skip'; reason: DropLeftOutReason; reportedPath: string }
+
+/** Distinct left-out paths listed, matching the server's bound. */
+const MAX_LEFT_OUT_PATHS = 50
+
+/** Last dot-separated suffixes that make a `.env.*` file a template. */
+const ENV_TEMPLATE_SUFFIXES = new Set(['example', 'sample', 'template', 'dist'])
+
 const ARCHIVE_PATTERN = /\.zip$/i
-const IGNORED_PATH_PARTS = new Set([
-  '.DS_Store',
-  'Thumbs.db',
-  '__MACOSX',
-  '.git',
-  'node_modules',
-])
 const textEncoder = new TextEncoder()
 const MAX_BROWSER_PACKAGE_BYTES = 100 * 1024 * 1024
 
@@ -47,39 +73,107 @@ function cleanPath(path: string): string {
   return parts.join('/')
 }
 
-function shouldIgnore(path: string): boolean {
-  return path
-    .split('/')
-    .some(
+function isEnvironmentFile(name: string): boolean {
+  if (name === '.env') return true
+  if (!name.startsWith('.env.')) return false
+  const suffix = name.split('.').pop() ?? ''
+  return !ENV_TEMPLATE_SUFFIXES.has(suffix)
+}
+
+/**
+ * The server's Drop rule (`temps_core::drop_entries`), so a folder and a ZIP
+ * of the same project upload the same files: templates such as
+ * `.env.example` are kept; version control, dependencies, environment files,
+ * OS metadata and private keys are left out. Directory rules win, so a test
+ * certificate inside `node_modules/` is reported as dependencies.
+ */
+export function classifyDropPath(path: string): DropPathDisposition {
+  const parts = path.split('/').filter(Boolean)
+  const last = parts.length - 1
+  const through = (index: number) =>
+    parts.slice(0, index + 1).join('/') + (index < last ? '/' : '')
+  const directoryReasons: Record<string, DropLeftOutReason> = {
+    '.git': 'version_control',
+    node_modules: 'dependencies',
+    __MACOSX: 'os_metadata',
+  }
+  for (const [index, part] of parts.entries()) {
+    const reason = directoryReasons[part]
+    if (reason) return { kind: 'skip', reason, reportedPath: through(index) }
+  }
+  for (const [index, part] of parts.entries()) {
+    if (isEnvironmentFile(part)) {
+      return {
+        kind: 'skip',
+        reason: 'environment_file',
+        reportedPath: through(index),
+      }
+    }
+  }
+  if (parts[last] === '.DS_Store' || parts[last] === 'Thumbs.db') {
+    return { kind: 'skip', reason: 'os_metadata', reportedPath: path }
+  }
+  if (
+    parts.some(
       (part) =>
-        IGNORED_PATH_PARTS.has(part) ||
-        part === '.env' ||
-        part.startsWith('.env.') ||
         part.endsWith('.pem') ||
         part.endsWith('.key') ||
         part === 'credentials.json'
     )
+  ) {
+    return { kind: 'skip', reason: 'private_key', reportedPath: path }
+  }
+  return { kind: 'keep' }
 }
 
-export function normalizeDropFiles(files: DropFile[]): DropFile[] {
+/** Kept files, with a shared top folder removed, and what was left out. */
+export function partitionDropFiles(files: DropFile[]): {
+  kept: DropFile[]
+  leftOut: DropLeftOutPath[]
+} {
   const cleaned = files
     .map(({ file, path }) => ({ file, path: cleanPath(path || file.name) }))
-    .filter(({ path }) => path && !shouldIgnore(path))
+    .filter(({ path }) => path)
 
-  if (cleaned.length === 0) return []
-
+  // The selected folder's own name is not part of the project.
   const splitPaths = cleaned.map(({ path }) => path.split('/'))
-  const firstPart = splitPaths[0][0]
-  const hasSharedFolder = splitPaths.every(
-    (parts) => parts.length > 1 && parts[0] === firstPart
-  )
-
-  return hasSharedFolder
+  const firstPart = splitPaths[0]?.[0]
+  const hasSharedFolder =
+    splitPaths.length > 0 &&
+    splitPaths.every((parts) => parts.length > 1 && parts[0] === firstPart)
+  const relative = hasSharedFolder
     ? cleaned.map(({ file, path }) => ({
         file,
         path: path.slice(firstPart.length + 1),
       }))
     : cleaned
+
+  const kept: DropFile[] = []
+  const leftOut = new Map<string, DropLeftOutPath>()
+  for (const entry of relative) {
+    const disposition = classifyDropPath(entry.path)
+    if (disposition.kind === 'keep') {
+      kept.push(entry)
+      continue
+    }
+    const listed = leftOut.get(disposition.reportedPath)
+    if (listed) listed.files += 1
+    else if (leftOut.size < MAX_LEFT_OUT_PATHS) {
+      leftOut.set(disposition.reportedPath, {
+        path: disposition.reportedPath,
+        reason: disposition.reason,
+        files: 1,
+      })
+    }
+  }
+  return {
+    kept,
+    leftOut: [...leftOut.values()].sort((a, b) => a.path.localeCompare(b.path)),
+  }
+}
+
+export function normalizeDropFiles(files: DropFile[]): DropFile[] {
+  return partitionDropFiles(files).kept
 }
 
 export function htmlRootCandidates(files: DropFile[]): string[] {
@@ -231,10 +325,10 @@ export async function prepareDrop(
     if (rawFiles[0].file.size > 500 * 1024 * 1024) {
       throw new Error('Drop exceeds the 500 MB upload limit')
     }
-    return { file: rawFiles[0].file, fileCount: 1, rootPage: null }
+    return { file: rawFiles[0].file, fileCount: 1, rootPage: null, leftOut: [] }
   }
 
-  const files = normalizeDropFiles(rawFiles)
+  const { kept: files, leftOut } = partitionDropFiles(rawFiles)
   if (files.length === 0) throw new Error('The selected folder is empty')
 
   const totalBytes = files.reduce((sum, { file }) => sum + file.size, 0)
@@ -264,5 +358,6 @@ export async function prepareDrop(
     file: new File([archive], 'temps-drop.zip', { type: 'application/zip' }),
     fileCount: files.length,
     rootPage,
+    leftOut,
   }
 }
