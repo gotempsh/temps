@@ -69,8 +69,11 @@ pub struct OperationResultResponse {
     /// `completed` or `failed`. Poll
     /// `GET …/operations/{operation_type}` for the outcome.
     pub status: OperationStatus,
-    /// `true` only when `status` is `completed`.
-    pub success: bool,
+    /// The outcome, final only once `status` is terminal: `null` while the
+    /// operation is `pending`, `true` when it `completed`, `false` when it
+    /// `failed`. Read `status` first; a `null` here is not a failure.
+    #[schema(required = false)]
+    pub success: Option<bool>,
     pub message: String,
     /// The project and deployment the record belongs to, plus the stored
     /// image once a `take_screenshot` has completed.
@@ -84,7 +87,13 @@ impl From<OperationResult> for OperationResultResponse {
         Self {
             operation: result.operation.to_string(),
             status: result.status,
-            success: result.success,
+            // Derived from the status alone, so a record can never pair a
+            // pending or failed status with a success flag.
+            success: match result.status {
+                OperationStatus::Pending => None,
+                OperationStatus::Completed => Some(true),
+                OperationStatus::Failed => Some(false),
+            },
             message: result.message,
             data: result.data,
             executed_at: result.executed_at,
@@ -259,7 +268,7 @@ pub async fn get_external_image(
     path = "/projects/{project_id}/deployments/{deployment_id}/operations",
     request_body = ExecuteOperationRequest,
     responses(
-        (status = 202, description = "Operation accepted. `take_screenshot` returns `status: pending`; poll the operation status for `completed` (with `screenshot_location`) or `failed` (with the reason)", body = OperationResultResponse),
+        (status = 202, description = "Operation accepted. `take_screenshot` returns `status: pending` with `success: null`; poll the operation status for `completed` (with `screenshot_location`) or `failed` (with the reason)", body = OperationResultResponse),
         (status = 400, description = "Invalid operation or deployment ID", body = ProblemDetails),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
@@ -474,7 +483,7 @@ pub async fn get_deployment_operations(
     tag = "Deployments",
     path = "/projects/{project_id}/deployments/{deployment_id}/operations/{operation_type}",
     responses(
-        (status = 200, description = "Operation status", body = OperationResultResponse),
+        (status = 200, description = "Operation status. `success` is `null` until `status` is `completed` or `failed`", body = OperationResultResponse),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Operation not found"),
@@ -586,5 +595,78 @@ mod tests {
             );
             assert_eq!(manager.get_operations(3, &key).len(), 1);
         }
+    }
+
+    fn operation_with(status: OperationStatus, success: bool) -> OperationResult {
+        OperationResult {
+            operation: DeploymentOperation::TakeScreenshot,
+            status,
+            success,
+            message: "Capturing a screenshot of deployment 25".to_string(),
+            data: DeploymentOperationDetails::new(23, "25"),
+            executed_at: Utc::now(),
+        }
+    }
+
+    /// A client reading `success` must not see a running capture as a
+    /// failure: until `status` is terminal there is no outcome to report.
+    #[test]
+    fn a_pending_operation_reports_no_outcome_yet() {
+        let response =
+            OperationResultResponse::from(operation_with(OperationStatus::Pending, false));
+        assert_eq!(response.success, None);
+
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["status"], "pending");
+        assert!(
+            json["success"].is_null(),
+            "pending must serialize success as null, got {json}"
+        );
+    }
+
+    #[test]
+    fn a_terminal_operation_reports_its_outcome_from_its_status() {
+        let completed =
+            OperationResultResponse::from(operation_with(OperationStatus::Completed, true));
+        assert_eq!(completed.success, Some(true));
+        let failed = OperationResultResponse::from(operation_with(OperationStatus::Failed, false));
+        assert_eq!(failed.success, Some(false));
+
+        // The status decides, so a record whose flag disagrees with it can
+        // never report a pending or failed operation as a success.
+        let disagreeing =
+            OperationResultResponse::from(operation_with(OperationStatus::Pending, true));
+        assert_eq!(disagreeing.success, None);
+        let disagreeing =
+            OperationResultResponse::from(operation_with(OperationStatus::Failed, true));
+        assert_eq!(disagreeing.success, Some(false));
+    }
+
+    #[test]
+    fn the_schema_documents_success_as_final_only_once_status_is_terminal() {
+        use utoipa::openapi::schema::{Schema, SchemaType, Type};
+        use utoipa::openapi::RefOr;
+
+        let openapi = ExternalImagesApiDoc::openapi();
+        let schemas = &openapi.components.as_ref().unwrap().schemas;
+        let RefOr::T(Schema::Object(response)) = &schemas["OperationResultResponse"] else {
+            panic!("OperationResultResponse must be an object schema");
+        };
+        assert!(
+            !response.required.iter().any(|field| field == "success"),
+            "success must not be required: it is null while the operation is pending"
+        );
+        let RefOr::T(Schema::Object(success)) = &response.properties["success"] else {
+            panic!("success must be an inline schema");
+        };
+        assert_eq!(
+            success.schema_type,
+            SchemaType::from_iter([Type::Boolean, Type::Null])
+        );
+        let description = success.description.as_deref().unwrap_or_default();
+        assert!(
+            description.contains("pending") && description.contains("null"),
+            "success must say it is null while pending: {description:?}"
+        );
     }
 }
