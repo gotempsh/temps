@@ -15958,6 +15958,43 @@
         },
         "type": "object"
       },
+      "DeploymentOperationDetails": {
+        "description": "What an operation record refers to, and what it produced.",
+        "properties": {
+          "deployment_id": {
+            "type": "string"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "screenshot": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DeploymentScreenshotCapture",
+                "description": "The stored image. Set only on a `completed` `take_screenshot`."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "project_id",
+          "deployment_id"
+        ],
+        "type": "object"
+      },
+      "DeploymentOperationStatus": {
+        "description": "Where an operation is in its lifecycle.\n\nAn operation that does its work in the background (a screenshot capture)\nis recorded as `Pending` when it starts and replaced by a `Completed` or\n`Failed` record when it ends, so a caller can poll for the outcome instead\nof being told it succeeded before anything ran.\n\nPublished as `DeploymentOperationStatus`: `temps-projects` already owns the\n`OperationStatus` schema name, and two schemas with one name silently\nreplace each other in the merged OpenAPI document.",
+        "enum": [
+          "pending",
+          "completed",
+          "failed"
+        ],
+        "type": "string"
+      },
       "DeploymentResponse": {
         "properties": {
           "branch": {
@@ -16094,6 +16131,30 @@
           "url",
           "created_at",
           "is_current"
+        ],
+        "type": "object"
+      },
+      "DeploymentScreenshotCapture": {
+        "description": "A screenshot captured by a `take_screenshot` operation.",
+        "properties": {
+          "captured_at": {
+            "example": "2026-10-10T01:25:34.793514Z",
+            "format": "date-time",
+            "type": "string"
+          },
+          "screenshot_location": {
+            "description": "Image path relative to the static files directory, as recorded on the\ndeployment's `screenshot_location`.",
+            "type": "string"
+          },
+          "url": {
+            "description": "Deployment URL that was captured.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url",
+          "screenshot_location",
+          "captured_at"
         ],
         "type": "object"
       },
@@ -26177,6 +26238,31 @@
       "GroupedPageMetric": {
         "properties": {
           "cls": {
+            "description": "Mean Cumulative Layout Shift (score).",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "cls_p50": {
+            "description": "50th percentile Cumulative Layout Shift (score). Null when no sample in\nthe group reported it.",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "cls_p75": {
+            "description": "75th percentile Cumulative Layout Shift (score) — the Core Web Vitals assessment percentile. Null when no sample in\nthe group reported it.",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "cls_p90": {
+            "description": "90th percentile Cumulative Layout Shift (score). Null when no sample in\nthe group reported it.",
             "format": "float",
             "type": [
               "number",
@@ -26191,10 +26277,36 @@
             ]
           },
           "events": {
+            "description": "Beacons in the group. Each beacon may carry only some metrics, so a\nmetric's own sample count can be lower.",
             "format": "int64",
             "type": "integer"
           },
           "fcp": {
+            "description": "Mean First Contentful Paint (ms).",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "fcp_p50": {
+            "description": "50th percentile First Contentful Paint (ms). Null when no sample in\nthe group reported it.",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "fcp_p75": {
+            "description": "75th percentile First Contentful Paint (ms) — the Core Web Vitals assessment percentile. Null when no sample in\nthe group reported it.",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "fcp_p90": {
+            "description": "90th percentile First Contentful Paint (ms). Null when no sample in\nthe group reported it.",
             "format": "float",
             "type": [
               "number",
@@ -26205,6 +26317,31 @@
             "type": "string"
           },
           "inp": {
+            "description": "Mean Interaction to Next Paint (ms).",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "inp_p50": {
+            "description": "50th percentile Interaction to Next Paint (ms). Null when no sample in\nthe group reported it.",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "inp_p75": {
+            "description": "75th percentile Interaction to Next Paint (ms) — the Core Web Vitals assessment percentile. Null when no sample in\nthe group reported it.",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "inp_p90": {
+            "description": "90th percentile Interaction to Next Paint (ms). Null when no sample in\nthe group reported it.",
             "format": "float",
             "type": [
               "number",
@@ -26212,6 +26349,31 @@
             ]
           },
           "lcp": {
+            "description": "Mean Largest Contentful Paint (ms). A mean is pulled far off by a\nhandful of extreme beacons; prefer `lcp_p75` for ranking groups.",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "lcp_p50": {
+            "description": "50th percentile Largest Contentful Paint (ms). Null when no sample in\nthe group reported it.",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "lcp_p75": {
+            "description": "75th percentile Largest Contentful Paint (ms) — the Core Web Vitals assessment percentile. Null when no sample in\nthe group reported it.",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "lcp_p90": {
+            "description": "90th percentile Largest Contentful Paint (ms). Null when no sample in\nthe group reported it.",
             "format": "float",
             "type": [
               "number",
@@ -26219,6 +26381,31 @@
             ]
           },
           "ttfb": {
+            "description": "Mean Time to First Byte (ms).",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "ttfb_p50": {
+            "description": "50th percentile Time to First Byte (ms). Null when no sample in\nthe group reported it.",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "ttfb_p75": {
+            "description": "75th percentile Time to First Byte (ms) — the Core Web Vitals assessment percentile. Null when no sample in\nthe group reported it.",
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "ttfb_p90": {
+            "description": "90th percentile Time to First Byte (ms). Null when no sample in\nthe group reported it.",
             "format": "float",
             "type": [
               "number",
@@ -34965,7 +35152,10 @@
       },
       "OperationResultResponse": {
         "properties": {
-          "data": {},
+          "data": {
+            "$ref": "#/components/schemas/DeploymentOperationDetails",
+            "description": "The project and deployment the record belongs to, plus the stored\nimage once a `take_screenshot` has completed."
+          },
           "executed_at": {
             "example": "2025-10-12T12:15:47.609192Z",
             "format": "date-time",
@@ -34977,14 +35167,21 @@
           "operation": {
             "type": "string"
           },
+          "status": {
+            "$ref": "#/components/schemas/DeploymentOperationStatus",
+            "description": "`pending` while background work (a screenshot capture) runs, then\n`completed` or `failed`. Poll\n`GET …/operations/{operation_type}` for the outcome."
+          },
           "success": {
+            "description": "`true` only when `status` is `completed`.",
             "type": "boolean"
           }
         },
         "required": [
           "operation",
+          "status",
           "success",
           "message",
+          "data",
           "executed_at"
         ],
         "type": "object"
@@ -50745,7 +50942,7 @@
             ]
           },
           "filter_path": {
-            "description": "Page pathname (matches `performance_metrics.pathname`)",
+            "description": "Page pathname (matches `performance_metrics.pathname` exactly).\n`path` is accepted as an alias: callers that guessed the obvious name\nwere otherwise silently served unfiltered results, since unknown\nquery parameters are ignored.",
             "type": [
               "string",
               "null"
@@ -98311,7 +98508,7 @@
             }
           },
           {
-            "description": "Filter to one page pathname (optional)",
+            "description": "Filter to one page pathname, exact match (optional). `path` is accepted as an alias.",
             "in": "query",
             "name": "filter_path",
             "required": false,
@@ -98500,7 +98697,7 @@
             }
           },
           {
-            "description": "Filter to one page pathname (optional)",
+            "description": "Filter to one page pathname, exact match (optional). `path` is accepted as an alias.",
             "in": "query",
             "name": "filter_path",
             "required": false,
@@ -98698,7 +98895,7 @@
             }
           },
           {
-            "description": "Filter to one page pathname (optional)",
+            "description": "Filter to one page pathname, exact match (optional). `path` is accepted as an alias.",
             "in": "query",
             "name": "filter_path",
             "required": false,
@@ -105871,10 +106068,17 @@
                 }
               }
             },
-            "description": "Operation executed"
+            "description": "Operation accepted. `take_screenshot` returns `status: pending`; poll the operation status for `completed` (with `screenshot_location`) or `failed` (with the reason)"
           },
           "400": {
-            "description": "Invalid operation"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid operation or deployment ID"
           },
           "401": {
             "description": "Unauthorized"
@@ -105883,10 +106087,44 @@
             "description": "Insufficient permissions"
           },
           "404": {
-            "description": "Deployment not found"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Deployment not found in this project"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Screenshots are disabled (see `setup_path`), or a capture of this deployment is already running"
           },
           "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
             "description": "Internal server error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The screenshot provider is unavailable; `detail` gives the reason and `setup_path` where to change it"
           }
         },
         "security": [

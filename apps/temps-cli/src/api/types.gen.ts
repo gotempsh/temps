@@ -7631,6 +7631,29 @@ export type DeploymentMetadata = {
     uploadedImageId?: string | null;
 };
 
+/**
+ * What an operation record refers to, and what it produced.
+ */
+export type DeploymentOperationDetails = {
+    deployment_id: string;
+    project_id: number;
+    screenshot?: DeploymentScreenshotCapture | null;
+};
+
+/**
+ * Where an operation is in its lifecycle.
+ *
+ * An operation that does its work in the background (a screenshot capture)
+ * is recorded as `Pending` when it starts and replaced by a `Completed` or
+ * `Failed` record when it ends, so a caller can poll for the outcome instead
+ * of being told it succeeded before anything ran.
+ *
+ * Published as `DeploymentOperationStatus`: `temps-projects` already owns the
+ * `OperationStatus` schema name, and two schemas with one name silently
+ * replace each other in the merged OpenAPI document.
+ */
+export type DeploymentOperationStatus = 'pending' | 'completed' | 'failed';
+
 export type DeploymentResponse = {
     branch?: string | null;
     cancelled_reason?: string | null;
@@ -7652,6 +7675,22 @@ export type DeploymentResponse = {
     started_at?: number | null;
     status: string;
     tag?: string | null;
+    url: string;
+};
+
+/**
+ * A screenshot captured by a `take_screenshot` operation.
+ */
+export type DeploymentScreenshotCapture = {
+    captured_at: string;
+    /**
+     * Image path relative to the static files directory, as recorded on the
+     * deployment's `screenshot_location`.
+     */
+    screenshot_location: string;
+    /**
+     * Deployment URL that was captured.
+     */
     url: string;
 };
 
@@ -12139,19 +12178,114 @@ export type GroupKey = {
 };
 
 export type GroupedPageMetric = {
+    /**
+     * Mean Cumulative Layout Shift (score).
+     */
     cls?: number | null;
+    /**
+     * 50th percentile Cumulative Layout Shift (score). Null when no sample in
+     * the group reported it.
+     */
+    cls_p50?: number | null;
+    /**
+     * 75th percentile Cumulative Layout Shift (score) — the Core Web Vitals assessment percentile. Null when no sample in
+     * the group reported it.
+     */
+    cls_p75?: number | null;
+    /**
+     * 90th percentile Cumulative Layout Shift (score). Null when no sample in
+     * the group reported it.
+     */
+    cls_p90?: number | null;
     /**
      * ISO 3166-1 alpha-2 code of the group's country. Populated for the
      * geographic dimensions (country/region/city) so clients can match map
      * geometries without name-based lookups; null otherwise.
      */
     country_code?: string | null;
+    /**
+     * Beacons in the group. Each beacon may carry only some metrics, so a
+     * metric's own sample count can be lower.
+     */
     events: number;
+    /**
+     * Mean First Contentful Paint (ms).
+     */
     fcp?: number | null;
+    /**
+     * 50th percentile First Contentful Paint (ms). Null when no sample in
+     * the group reported it.
+     */
+    fcp_p50?: number | null;
+    /**
+     * 75th percentile First Contentful Paint (ms) — the Core Web Vitals assessment percentile. Null when no sample in
+     * the group reported it.
+     */
+    fcp_p75?: number | null;
+    /**
+     * 90th percentile First Contentful Paint (ms). Null when no sample in
+     * the group reported it.
+     */
+    fcp_p90?: number | null;
     group_key: string;
+    /**
+     * Mean Interaction to Next Paint (ms).
+     */
     inp?: number | null;
+    /**
+     * 50th percentile Interaction to Next Paint (ms). Null when no sample in
+     * the group reported it.
+     */
+    inp_p50?: number | null;
+    /**
+     * 75th percentile Interaction to Next Paint (ms) — the Core Web Vitals assessment percentile. Null when no sample in
+     * the group reported it.
+     */
+    inp_p75?: number | null;
+    /**
+     * 90th percentile Interaction to Next Paint (ms). Null when no sample in
+     * the group reported it.
+     */
+    inp_p90?: number | null;
+    /**
+     * Mean Largest Contentful Paint (ms). A mean is pulled far off by a
+     * handful of extreme beacons; prefer `lcp_p75` for ranking groups.
+     */
     lcp?: number | null;
+    /**
+     * 50th percentile Largest Contentful Paint (ms). Null when no sample in
+     * the group reported it.
+     */
+    lcp_p50?: number | null;
+    /**
+     * 75th percentile Largest Contentful Paint (ms) — the Core Web Vitals assessment percentile. Null when no sample in
+     * the group reported it.
+     */
+    lcp_p75?: number | null;
+    /**
+     * 90th percentile Largest Contentful Paint (ms). Null when no sample in
+     * the group reported it.
+     */
+    lcp_p90?: number | null;
+    /**
+     * Mean Time to First Byte (ms).
+     */
     ttfb?: number | null;
+    /**
+     * 50th percentile Time to First Byte (ms). Null when no sample in
+     * the group reported it.
+     */
+    ttfb_p50?: number | null;
+    /**
+     * 75th percentile Time to First Byte (ms) — the Core Web Vitals assessment percentile. Null when no sample in
+     * the group reported it.
+     */
+    ttfb_p75?: number | null;
+    /**
+     * 90th percentile Time to First Byte (ms). Null when no sample in
+     * the group reported it.
+     */
+    ttfb_p90?: number | null;
 };
 
 export type GroupedPageMetricsQuery = SpeedSegmentFilters & {
@@ -16065,10 +16199,23 @@ export type OperationEntry = {
 export type OperationKind = 'deployment' | 'rollback' | 'promotion' | 'restore' | 'backup' | 'autofix';
 
 export type OperationResultResponse = {
-    data?: unknown;
+    /**
+     * The project and deployment the record belongs to, plus the stored
+     * image once a `take_screenshot` has completed.
+     */
+    data: DeploymentOperationDetails;
     executed_at: string;
     message: string;
     operation: string;
+    /**
+     * `pending` while background work (a screenshot capture) runs, then
+     * `completed` or `failed`. Poll
+     * `GET …/operations/{operation_type}` for the outcome.
+     */
+    status: DeploymentOperationStatus;
+    /**
+     * `true` only when `status` is `completed`.
+     */
     success: boolean;
 };
 
@@ -23477,7 +23624,10 @@ export type SpeedSegmentFilters = {
      */
     filter_operating_system?: string | null;
     /**
-     * Page pathname (matches `performance_metrics.pathname`)
+     * Page pathname (matches `performance_metrics.pathname` exactly).
+     * `path` is accepted as an alias: callers that guessed the obvious name
+     * were otherwise silently served unfiltered results, since unknown
+     * query parameters are ignored.
      */
     filter_path?: string | null;
     /**
@@ -50417,7 +50567,7 @@ export type GetPerformanceMetricsData = {
          */
         include_bots?: boolean;
         /**
-         * Filter to one page pathname (optional)
+         * Filter to one page pathname, exact match (optional). `path` is accepted as an alias.
          */
         filter_path?: string;
         /**
@@ -50507,7 +50657,7 @@ export type GetMetricsOverTimeData = {
          */
         include_bots?: boolean;
         /**
-         * Filter to one page pathname (optional)
+         * Filter to one page pathname, exact match (optional). `path` is accepted as an alias.
          */
         filter_path?: string;
         /**
@@ -50601,7 +50751,7 @@ export type GetGroupedPageMetricsData = {
          */
         include_bots?: boolean;
         /**
-         * Filter to one page pathname (optional)
+         * Filter to one page pathname, exact match (optional). `path` is accepted as an alias.
          */
         filter_path?: string;
         /**
@@ -55289,9 +55439,9 @@ export type ExecuteDeploymentOperationData = {
 
 export type ExecuteDeploymentOperationErrors = {
     /**
-     * Invalid operation
+     * Invalid operation or deployment ID
      */
-    400: unknown;
+    400: ProblemDetails;
     /**
      * Unauthorized
      */
@@ -55301,18 +55451,28 @@ export type ExecuteDeploymentOperationErrors = {
      */
     403: unknown;
     /**
-     * Deployment not found
+     * Deployment not found in this project
      */
-    404: unknown;
+    404: ProblemDetails;
+    /**
+     * Screenshots are disabled (see `setup_path`), or a capture of this deployment is already running
+     */
+    409: ProblemDetails;
     /**
      * Internal server error
      */
-    500: unknown;
+    500: ProblemDetails;
+    /**
+     * The screenshot provider is unavailable; `detail` gives the reason and `setup_path` where to change it
+     */
+    503: ProblemDetails;
 };
+
+export type ExecuteDeploymentOperationError = ExecuteDeploymentOperationErrors[keyof ExecuteDeploymentOperationErrors];
 
 export type ExecuteDeploymentOperationResponses = {
     /**
-     * Operation executed
+     * Operation accepted. `take_screenshot` returns `status: pending`; poll the operation status for `completed` (with `screenshot_location`) or `failed` (with the reason)
      */
     202: OperationResultResponse;
 };
