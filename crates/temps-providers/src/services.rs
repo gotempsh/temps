@@ -1948,6 +1948,27 @@ fn compute_uptime_percent(entries: &[HealthCheckEntry], window_hours: i64) -> Op
     }
 }
 
+/// Roll `txn` back now and hand back `error`, for a locked check that
+/// fails. Dropping a sea-orm transaction only queues its ROLLBACK; sqlx
+/// sends it later, from a task, when the connection returns to the pool.
+/// Until then the connection stays idle in the transaction and keeps every
+/// lock it took: the `FOR UPDATE` row lock, and the table locks a `DROP` or
+/// `ALTER` waits on. On a current-thread runtime that is blocked, as by a
+/// test database's synchronous cleanup, it is never sent at all.
+async fn rollback_before_error(
+    txn: sea_orm::DatabaseTransaction,
+    error: ExternalServiceError,
+) -> ExternalServiceError {
+    if let Err(rollback_error) = txn.rollback().await {
+        warn!(
+            error = %error,
+            rollback_error = %rollback_error,
+            "Could not roll back a transaction after a failed locked check"
+        );
+    }
+    error
+}
+
 /// Detect a Postgres unique-constraint violation by inspecting the
 /// error chain. Sea-ORM wraps `SqlxError`, which wraps the libpq
 /// `SQLSTATE`. The reliable signal is `SQLSTATE 23505` ("unique
@@ -8908,27 +8929,20 @@ echo "[restore] Pre-seed complete"
         }
     }
 
-    /// Retry a failed cluster service initialization.
-    ///
-    /// Cleans up any leftover containers and service_members from the previous
-    /// attempt, then re-runs `initialize_cluster`.
-    ///
-    /// If `member_requests` is empty, the original member configuration is
-    /// reconstructed from the preserved `service_members` records (which are
-    /// now kept with "failed" status instead of being deleted on rollback).
-    pub async fn retry_cluster(
+    /// The checks and the switch to `creating` that [`Self::retry_cluster`]
+    /// makes under the cluster's row lock, in `lock`. Returns the leftover
+    /// member rows and the member list to rebuild. The caller commits on
+    /// success and rolls back on error.
+    async fn claim_cluster_retry(
         &self,
+        lock: &sea_orm::DatabaseTransaction,
         service_id: i32,
         member_requests: &[ClusterMemberRequest],
-    ) -> Result<ExternalServiceInfo, ExternalServiceError> {
-        // Checked and switched to `creating` under the row lock, in one short
-        // transaction committed before any container is removed: from then
-        // on Stop, Start and Add Replica refuse the cluster, so none of them
-        // acts on the members this retry tears down. See `claim_cluster`.
-        let lock = self.db.begin().await?;
+    ) -> Result<(Vec<service_members::Model>, Vec<ClusterMemberRequest>), ExternalServiceError>
+    {
         let service = external_services::Entity::find_by_id(service_id)
             .lock_exclusive()
-            .one(&lock)
+            .one(lock)
             .await?
             .ok_or(ExternalServiceError::ServiceNotFound { id: service_id })?;
 
@@ -8958,7 +8972,7 @@ echo "[restore] Pre-seed complete"
         let leftover_members = service_members::Entity::find()
             .filter(service_members::Column::ServiceId.eq(service_id))
             .order_by_asc(service_members::Column::Ordinal)
-            .all(&lock)
+            .all(lock)
             .await?;
 
         // Reconstruct member specs from preserved records if none were provided
@@ -8996,7 +9010,35 @@ echo "[restore] Pre-seed complete"
         service_update.status = Set("creating".to_string());
         service_update.error_message = Set(None);
         service_update.updated_at = Set(Utc::now());
-        service_update.update(&lock).await?;
+        service_update.update(lock).await?;
+        Ok((leftover_members, effective_members))
+    }
+
+    /// Retry a failed cluster service initialization.
+    ///
+    /// Cleans up any leftover containers and service_members from the previous
+    /// attempt, then re-runs `initialize_cluster`.
+    ///
+    /// If `member_requests` is empty, the original member configuration is
+    /// reconstructed from the preserved `service_members` records (which are
+    /// now kept with "failed" status instead of being deleted on rollback).
+    pub async fn retry_cluster(
+        &self,
+        service_id: i32,
+        member_requests: &[ClusterMemberRequest],
+    ) -> Result<ExternalServiceInfo, ExternalServiceError> {
+        // Checked and switched to `creating` under the row lock, in one short
+        // transaction committed before any container is removed: from then
+        // on Stop, Start and Add Replica refuse the cluster, so none of them
+        // acts on the members this retry tears down. See `claim_cluster`.
+        let lock = self.db.begin().await?;
+        let claimed = self
+            .claim_cluster_retry(&lock, service_id, member_requests)
+            .await;
+        let (leftover_members, effective_members) = match claimed {
+            Ok(claimed) => claimed,
+            Err(error) => return Err(rollback_before_error(lock, error).await),
+        };
         lock.commit().await?;
 
         for member in &leftover_members {
@@ -9177,20 +9219,27 @@ echo "[restore] Pre-seed complete"
                 // or has already moved the cluster to `stopping` and this add
                 // is refused. Never a member the Stop did not see.
                 let lock = self.db.begin().await?;
-                let status = external_services::Entity::find_by_id(service_id)
-                    .lock_exclusive()
-                    .one(&lock)
-                    .await?
-                    .ok_or(ExternalServiceError::ServiceNotFound { id: service_id })?
-                    .status;
-                if status != "running" {
-                    return Err(ExternalServiceError::ParameterValidationFailed {
-                        service_id,
-                        reason: format!(
-                            "Cluster must be in 'running' status to add a member, current: '{}'",
-                            status
-                        ),
-                    });
+                let checked = async {
+                    let status = external_services::Entity::find_by_id(service_id)
+                        .lock_exclusive()
+                        .one(&lock)
+                        .await?
+                        .ok_or(ExternalServiceError::ServiceNotFound { id: service_id })?
+                        .status;
+                    if status != "running" {
+                        return Err(ExternalServiceError::ParameterValidationFailed {
+                            service_id,
+                            reason: format!(
+                                "Cluster must be in 'running' status to add a member, current: '{}'",
+                                status
+                            ),
+                        });
+                    }
+                    Ok(())
+                }
+                .await;
+                if let Err(error) = checked {
+                    return Err(rollback_before_error(lock, error).await);
                 }
                 match member_record.insert(&lock).await {
                     Ok(model) => {
@@ -9199,8 +9248,15 @@ echo "[restore] Pre-seed complete"
                         chosen_model = Some(model);
                         break;
                     }
-                    // Dropping `lock` rolls the failed insert back.
+                    // The failed insert is rolled back before the next attempt.
                     Err(e) if is_unique_violation(&e) => {
+                        if let Err(rollback_error) = lock.rollback().await {
+                            warn!(
+                                service_id,
+                                rollback_error = %rollback_error,
+                                "Could not roll back a colliding cluster member insert"
+                            );
+                        }
                         // Another `add_cluster_member` won this ordinal.
                         // Loop and recompute against the now-larger
                         // member set.
@@ -9213,7 +9269,7 @@ echo "[restore] Pre-seed complete"
                         last_err = Some(e);
                         continue;
                     }
-                    Err(e) => return Err(e.into()),
+                    Err(e) => return Err(rollback_before_error(lock, e.into()).await),
                 }
             }
             match (chosen_plan, chosen_model) {
@@ -11388,26 +11444,34 @@ echo "[restore] Pre-seed complete"
         action: ClusterLifecycleAction,
     ) -> Result<external_services::Model, ExternalServiceError> {
         let txn = self.db.begin().await?;
-        let service = external_services::Entity::find_by_id(service_id)
-            .lock_exclusive()
-            .one(&txn)
-            .await?
-            .ok_or(ExternalServiceError::ServiceNotFound { id: service_id })?;
-        cluster_claim_decision(
-            service_id,
-            &service.status,
-            service.updated_at,
-            Utc::now(),
-            action,
-        )?;
-        external_services::ActiveModel {
-            id: Set(service_id),
-            status: Set(action.claim_status().to_string()),
-            updated_at: Set(Utc::now()),
-            ..Default::default()
+        let claimed = async {
+            let service = external_services::Entity::find_by_id(service_id)
+                .lock_exclusive()
+                .one(&txn)
+                .await?
+                .ok_or(ExternalServiceError::ServiceNotFound { id: service_id })?;
+            cluster_claim_decision(
+                service_id,
+                &service.status,
+                service.updated_at,
+                Utc::now(),
+                action,
+            )?;
+            external_services::ActiveModel {
+                id: Set(service_id),
+                status: Set(action.claim_status().to_string()),
+                updated_at: Set(Utc::now()),
+                ..Default::default()
+            }
+            .update(&txn)
+            .await?;
+            Ok(service)
         }
-        .update(&txn)
-        .await?;
+        .await;
+        let service = match claimed {
+            Ok(service) => service,
+            Err(error) => return Err(rollback_before_error(txn, error).await),
+        };
         txn.commit().await?;
         Ok(service)
     }
