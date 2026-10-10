@@ -22,8 +22,9 @@ use tracing::{debug, error, info};
 use utoipa::OpenApi;
 
 use crate::services::{
-    DeploymentOperation, ExternalImage, OperationResult, OperationStatus, PushImageRequest,
-    PushedExternalImageResponse, ScreenshotOperationError, SCREENSHOT_SETTINGS_PATH,
+    DeploymentOperation, DeploymentOperationDetails, DeploymentScreenshotCapture, ExternalImage,
+    OperationResult, OperationStatus, PushImageRequest, PushedExternalImageResponse,
+    ScreenshotOperationError, SCREENSHOT_SETTINGS_PATH,
 };
 
 #[derive(OpenApi)]
@@ -42,7 +43,9 @@ use crate::services::{
         ExecuteOperationRequest,
         OperationResultResponse,
         OperationResultsResponse,
-        OperationStatus
+        OperationStatus,
+        DeploymentOperationDetails,
+        DeploymentScreenshotCapture
     )),
     info(
         title = "External Images API",
@@ -69,7 +72,9 @@ pub struct OperationResultResponse {
     /// `true` only when `status` is `completed`.
     pub success: bool,
     pub message: String,
-    pub data: Option<serde_json::Value>,
+    /// The project and deployment the record belongs to, plus the stored
+    /// image once a `take_screenshot` has completed.
+    pub data: DeploymentOperationDetails,
     #[schema(value_type = String, format = DateTime, example = "2025-10-12T12:15:47.609192Z")]
     pub executed_at: UtcDateTime,
 }
@@ -309,7 +314,7 @@ pub async fn execute_deployment_operation(
             .await?
     } else {
         let result = legacy_operation_record(operation, project_id, &deployment_id);
-        record_legacy_operation(&state, &deployment_id, &result)?;
+        record_legacy_operation(&state, project_id, &deployment_id, &result)?;
         result
     };
 
@@ -350,27 +355,24 @@ fn legacy_operation_record(
         status: OperationStatus::Completed,
         success: true,
         message: "Operation executed successfully".to_string(),
-        data: Some(serde_json::json!({
-            "deployment_id": deployment_id,
-            "project_id": project_id,
-            "timestamp": Utc::now()
-        })),
+        data: DeploymentOperationDetails::new(project_id, deployment_id),
         executed_at: Utc::now(),
     }
 }
 
 fn record_legacy_operation(
     state: &AppState,
+    project_id: i32,
     deployment_id: &str,
     result: &OperationResult,
 ) -> Result<(), Problem> {
     state
         .external_deployment_manager
-        .record_operation(deployment_id, result.clone())
+        .record_operation(project_id, deployment_id, result.clone())
         .map_err(|err| {
             error!(
-                "Failed to record operation {} for deployment {}: {}",
-                result.operation, deployment_id, err
+                "Failed to record operation {} for deployment {} in project {}: {}",
+                result.operation, deployment_id, project_id, err
             );
             problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Operation Failed")
@@ -440,7 +442,7 @@ pub async fn get_deployment_operations(
 
     let operations = state
         .external_deployment_manager
-        .get_operations(&deployment_id);
+        .get_operations(project_id, &deployment_id);
 
     let responses: Vec<OperationResultResponse> = operations
         .into_iter()
@@ -493,10 +495,11 @@ pub async fn get_deployment_operation_status(
         }
     };
 
-    match state
-        .external_deployment_manager
-        .get_latest_operation(&deployment_id, &operation)
-    {
+    match state.external_deployment_manager.get_latest_operation(
+        project_id,
+        &deployment_id,
+        &operation,
+    ) {
         Some(result) => Ok(Json(OperationResultResponse::from(result))),
         None => Err(problemdetails::new(StatusCode::NOT_FOUND)
             .with_title("Operation Not Found")

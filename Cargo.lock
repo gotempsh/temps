@@ -14903,11 +14903,14 @@ name = "temps-screenshots"
 version = "0.1.0-beta.56"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-trait",
  "axum",
  "base64 0.23.1",
  "bytes",
+ "chrono",
  "headless_chrome",
+ "image",
  "mockito",
  "reqwest 0.12.28",
  "sea-orm 1.1.20",
@@ -14917,6 +14920,7 @@ dependencies = [
  "temps-config",
  "temps-core",
  "temps-database",
+ "temps-entities",
  "temps-file-store",
  "thiserror 2.0.21",
  "tokio",

@@ -42,12 +42,48 @@ impl std::fmt::Display for DeploymentOperation {
 /// is recorded as `Pending` when it starts and replaced by a `Completed` or
 /// `Failed` record when it ends, so a caller can poll for the outcome instead
 /// of being told it succeeded before anything ran.
+///
+/// Published as `DeploymentOperationStatus`: `temps-projects` already owns the
+/// `OperationStatus` schema name, and two schemas with one name silently
+/// replace each other in the merged OpenAPI document.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+#[schema(as = DeploymentOperationStatus)]
 #[serde(rename_all = "snake_case")]
 pub enum OperationStatus {
     Pending,
     Completed,
     Failed,
+}
+
+/// What an operation record refers to, and what it produced.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+pub struct DeploymentOperationDetails {
+    pub project_id: i32,
+    pub deployment_id: String,
+    /// The stored image. Set only on a `completed` `take_screenshot`.
+    pub screenshot: Option<DeploymentScreenshotCapture>,
+}
+
+impl DeploymentOperationDetails {
+    pub fn new(project_id: i32, deployment_id: impl Into<String>) -> Self {
+        Self {
+            project_id,
+            deployment_id: deployment_id.into(),
+            screenshot: None,
+        }
+    }
+}
+
+/// A screenshot captured by a `take_screenshot` operation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+pub struct DeploymentScreenshotCapture {
+    /// Deployment URL that was captured.
+    pub url: String,
+    /// Image path relative to the static files directory, as recorded on the
+    /// deployment's `screenshot_location`.
+    pub screenshot_location: String,
+    #[schema(value_type = String, format = DateTime, example = "2026-10-10T01:25:34.793514Z")]
+    pub captured_at: UtcDateTime,
 }
 
 /// Result of an executed operation
@@ -58,7 +94,7 @@ pub struct OperationResult {
     /// `true` only for a `Completed` operation.
     pub success: bool,
     pub message: String,
-    pub data: Option<serde_json::Value>,
+    pub data: DeploymentOperationDetails,
     pub executed_at: UtcDateTime,
 }
 
@@ -107,12 +143,17 @@ impl From<ExternalImage> for PushedExternalImageResponse {
 /// Operation records kept per deployment; older ones are dropped first.
 const MAX_OPERATIONS_PER_DEPLOYMENT: usize = 50;
 
+/// Operation history is keyed by project *and* deployment, so a caller
+/// authorized for one project can never read or append to another project's
+/// records by supplying a foreign deployment ID.
+type OperationKey = (i32, String);
+
 /// In-memory store for external images and operation results
 /// This keeps external images and operations in memory without database changes
 #[derive(Clone)]
 pub struct ExternalDeploymentManager {
     images: Arc<RwLock<HashMap<String, ExternalImage>>>,
-    operations: Arc<RwLock<HashMap<String, Vec<OperationResult>>>>,
+    operations: Arc<RwLock<HashMap<OperationKey, Vec<OperationResult>>>>,
 }
 
 impl ExternalDeploymentManager {
@@ -175,24 +216,29 @@ impl ExternalDeploymentManager {
             .unwrap_or_default()
     }
 
-    /// Record an operation result for a deployment
+    /// Record an operation result for a deployment of `project_id`
     pub fn record_operation(
         &self,
+        project_id: i32,
         deployment_id: &str,
         result: OperationResult,
     ) -> Result<(), String> {
         debug!(
-            "Recording operation {} for deployment {}",
-            result.operation, deployment_id
+            "Recording operation {} for deployment {} in project {}",
+            result.operation, deployment_id, project_id
         );
 
-        let mut operations = self
-            .operations
-            .write()
-            .map_err(|e| format!("Failed to acquire write lock: {}", e))?;
+        let mut operations = self.operations.write().map_err(|e| {
+            format!(
+                "Failed to acquire write lock to record {} for deployment {} in project {}: {}",
+                result.operation, deployment_id, project_id, e
+            )
+        })?;
         let deployment_ops = operations
-            .entry(deployment_id.to_string())
+            .entry((project_id, deployment_id.to_string()))
             .or_insert_with(Vec::new);
+        // Keep per-deployment history bounded: repeated operations must not
+        // grow this in-memory map without limit.
         if deployment_ops.len() >= MAX_OPERATIONS_PER_DEPLOYMENT {
             let excess = deployment_ops.len() + 1 - MAX_OPERATIONS_PER_DEPLOYMENT;
             deployment_ops.drain(0..excess);
@@ -202,74 +248,41 @@ impl ExternalDeploymentManager {
         Ok(())
     }
 
-    /// Record `pending` for `deployment_id` unless the latest record of the
-    /// same operation is still pending, in which case that record is returned
-    /// and nothing is recorded. Check and insert happen under one write lock,
-    /// so two concurrent requests cannot both start the same background work.
-    pub fn begin_operation(
-        &self,
-        deployment_id: &str,
-        pending: OperationResult,
-    ) -> Result<Result<(), OperationResult>, String> {
-        let mut operations = self.operations.write().map_err(|e| {
-            format!(
-                "Failed to acquire write lock to start {} for deployment {}: {}",
-                pending.operation, deployment_id, e
-            )
-        })?;
-        let deployment_ops = operations
-            .entry(deployment_id.to_string())
-            .or_insert_with(Vec::new);
-        if let Some(running) = deployment_ops
-            .iter()
-            .rev()
-            .find(|op| op.operation == pending.operation)
-            .filter(|op| op.status == OperationStatus::Pending)
-        {
-            return Ok(Err(running.clone()));
-        }
-        // Keep per-deployment history bounded: repeated captures must not grow
-        // this in-memory map without limit.
-        if deployment_ops.len() >= MAX_OPERATIONS_PER_DEPLOYMENT {
-            let excess = deployment_ops.len() + 1 - MAX_OPERATIONS_PER_DEPLOYMENT;
-            deployment_ops.drain(0..excess);
-        }
-        deployment_ops.push(pending);
-        Ok(Ok(()))
-    }
-
-    /// Get all operations for a deployment
-    pub fn get_operations(&self, deployment_id: &str) -> Vec<OperationResult> {
+    /// Get all operations for a deployment of `project_id`
+    pub fn get_operations(&self, project_id: i32, deployment_id: &str) -> Vec<OperationResult> {
         self.operations
             .read()
             .ok()
-            .and_then(|ops| ops.get(deployment_id).cloned())
+            .and_then(|ops| ops.get(&(project_id, deployment_id.to_string())).cloned())
             .unwrap_or_default()
     }
 
     /// Get the latest result for a specific operation type
     pub fn get_latest_operation(
         &self,
+        project_id: i32,
         deployment_id: &str,
         operation: &DeploymentOperation,
     ) -> Option<OperationResult> {
         self.operations.read().ok().and_then(|ops| {
-            ops.get(deployment_id).and_then(|ops| {
-                ops.iter()
-                    .rev()
-                    .find(|op| &op.operation == operation)
-                    .cloned()
-            })
+            ops.get(&(project_id, deployment_id.to_string()))
+                .and_then(|ops| {
+                    ops.iter()
+                        .rev()
+                        .find(|op| &op.operation == operation)
+                        .cloned()
+                })
         })
     }
 
     /// Check if an operation has been completed for a deployment
     pub fn has_completed_operation(
         &self,
+        project_id: i32,
         deployment_id: &str,
         operation: &DeploymentOperation,
     ) -> bool {
-        self.get_latest_operation(deployment_id, operation)
+        self.get_latest_operation(project_id, deployment_id, operation)
             .map(|op| op.success)
             .unwrap_or(false)
     }
@@ -285,6 +298,14 @@ impl Default for ExternalDeploymentManager {
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    #[test]
+    fn operation_status_schema_does_not_collide_with_project_operations() {
+        assert_eq!(
+            <OperationStatus as utoipa::ToSchema>::name(),
+            "DeploymentOperationStatus"
+        );
+    }
 
     #[test]
     fn test_push_and_retrieve_image() {
@@ -333,25 +354,30 @@ mod tests {
         assert!(result.is_err());
     }
 
+    fn record(operation: DeploymentOperation, status: OperationStatus) -> OperationResult {
+        OperationResult {
+            operation,
+            status,
+            success: status == OperationStatus::Completed,
+            message: format!("{:?}", status),
+            data: DeploymentOperationDetails::new(3, "7"),
+            executed_at: Utc::now(),
+        }
+    }
+
     #[test]
     fn test_record_and_retrieve_operations() {
         let manager = ExternalDeploymentManager::new();
-        let deployment_id = "deploy_123";
-
-        let result = OperationResult {
-            operation: DeploymentOperation::Deploy,
-            status: OperationStatus::Completed,
-            success: true,
-            message: "Deployment successful".to_string(),
-            data: Some(serde_json::json!({"containers": ["app-0", "app-1"]})),
-            executed_at: Utc::now(),
-        };
 
         manager
-            .record_operation(deployment_id, result.clone())
+            .record_operation(
+                3,
+                "deploy_123",
+                record(DeploymentOperation::Deploy, OperationStatus::Completed),
+            )
             .unwrap();
 
-        let operations = manager.get_operations(deployment_id);
+        let operations = manager.get_operations(3, "deploy_123");
         assert_eq!(operations.len(), 1);
         assert_eq!(operations[0].operation, DeploymentOperation::Deploy);
         assert!(operations[0].success);
@@ -360,80 +386,61 @@ mod tests {
     #[test]
     fn test_check_completed_operation() {
         let manager = ExternalDeploymentManager::new();
-        let deployment_id = "deploy_123";
-
-        let failed_result = OperationResult {
-            operation: DeploymentOperation::Deploy,
-            status: OperationStatus::Failed,
-            success: false,
-            message: "Failed to deploy".to_string(),
-            data: None,
-            executed_at: Utc::now(),
-        };
 
         manager
-            .record_operation(deployment_id, failed_result)
+            .record_operation(
+                3,
+                "deploy_123",
+                record(DeploymentOperation::Deploy, OperationStatus::Failed),
+            )
             .unwrap();
-
-        assert!(!manager.has_completed_operation(deployment_id, &DeploymentOperation::Deploy));
-
-        let success_result = OperationResult {
-            operation: DeploymentOperation::Deploy,
-            status: OperationStatus::Completed,
-            success: true,
-            message: "Deployment successful".to_string(),
-            data: None,
-            executed_at: Utc::now(),
-        };
+        assert!(!manager.has_completed_operation(3, "deploy_123", &DeploymentOperation::Deploy));
 
         manager
-            .record_operation(deployment_id, success_result)
+            .record_operation(
+                3,
+                "deploy_123",
+                record(DeploymentOperation::Deploy, OperationStatus::Completed),
+            )
             .unwrap();
-
-        assert!(manager.has_completed_operation(deployment_id, &DeploymentOperation::Deploy));
-    }
-
-    fn screenshot_record(status: OperationStatus) -> OperationResult {
-        OperationResult {
-            operation: DeploymentOperation::TakeScreenshot,
-            status,
-            success: status == OperationStatus::Completed,
-            message: format!("{:?}", status),
-            data: None,
-            executed_at: Utc::now(),
-        }
+        assert!(manager.has_completed_operation(3, "deploy_123", &DeploymentOperation::Deploy));
     }
 
     #[test]
-    fn test_begin_operation_refuses_while_same_operation_is_pending() {
+    fn test_operations_of_another_project_are_invisible() {
         let manager = ExternalDeploymentManager::new();
-
-        assert!(manager
-            .begin_operation("7", screenshot_record(OperationStatus::Pending))
-            .unwrap()
-            .is_ok());
-
-        let running = manager
-            .begin_operation("7", screenshot_record(OperationStatus::Pending))
-            .unwrap()
-            .expect_err("a second capture must not start while one is pending");
-        assert_eq!(running.status, OperationStatus::Pending);
-        assert_eq!(manager.get_operations("7").len(), 1);
-
-        // Once it finishes, a new capture may start.
         manager
-            .record_operation("7", screenshot_record(OperationStatus::Failed))
+            .record_operation(
+                3,
+                "7",
+                record(
+                    DeploymentOperation::TakeScreenshot,
+                    OperationStatus::Completed,
+                ),
+            )
             .unwrap();
+
+        // Same deployment ID, different project: nothing to read.
+        assert!(manager.get_operations(99, "7").is_empty());
         assert!(manager
-            .begin_operation("7", screenshot_record(OperationStatus::Pending))
-            .unwrap()
-            .is_ok());
+            .get_latest_operation(99, "7", &DeploymentOperation::TakeScreenshot)
+            .is_none());
+        assert!(!manager.has_completed_operation(99, "7", &DeploymentOperation::TakeScreenshot));
+
+        // ...and writing there leaves the owner's history untouched.
+        manager
+            .record_operation(
+                99,
+                "7",
+                record(DeploymentOperation::TakeScreenshot, OperationStatus::Failed),
+            )
+            .unwrap();
         assert_eq!(
             manager
-                .get_latest_operation("7", &DeploymentOperation::TakeScreenshot)
+                .get_latest_operation(3, "7", &DeploymentOperation::TakeScreenshot)
                 .unwrap()
                 .status,
-            OperationStatus::Pending
+            OperationStatus::Completed
         );
     }
 
@@ -442,12 +449,28 @@ mod tests {
         let manager = ExternalDeploymentManager::new();
         for _ in 0..(MAX_OPERATIONS_PER_DEPLOYMENT + 10) {
             manager
-                .record_operation("7", screenshot_record(OperationStatus::Failed))
+                .record_operation(
+                    3,
+                    "7",
+                    record(DeploymentOperation::TakeScreenshot, OperationStatus::Failed),
+                )
                 .unwrap();
         }
         assert_eq!(
-            manager.get_operations("7").len(),
+            manager.get_operations(3, "7").len(),
             MAX_OPERATIONS_PER_DEPLOYMENT
+        );
+    }
+
+    #[test]
+    fn test_operation_details_schema_names_are_distinct() {
+        assert_eq!(
+            <DeploymentOperationDetails as utoipa::ToSchema>::name(),
+            "DeploymentOperationDetails"
+        );
+        assert_eq!(
+            <DeploymentScreenshotCapture as utoipa::ToSchema>::name(),
+            "DeploymentScreenshotCapture"
         );
     }
 }

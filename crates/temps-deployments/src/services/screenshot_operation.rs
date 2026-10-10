@@ -10,12 +10,15 @@
 //! Nothing is reported as successful until an image has been captured,
 //! validated and recorded on the deployment.
 
-use std::sync::Arc;
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use chrono::Utc;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use temps_config::ConfigService;
+use temps_core::UtcDateTime;
 use temps_database::DbConnection;
 use temps_entities::{deployments, prelude::Deployments};
 use temps_screenshots::ScreenshotServiceTrait;
@@ -23,7 +26,8 @@ use thiserror::Error;
 use tracing::{error, info, warn};
 
 use super::external_deployment::{
-    DeploymentOperation, ExternalDeploymentManager, OperationResult, OperationStatus,
+    DeploymentOperation, DeploymentOperationDetails, DeploymentScreenshotCapture,
+    ExternalDeploymentManager, OperationResult, OperationStatus,
 };
 use crate::jobs::{capture_deployment_screenshot, DeploymentScreenshotError};
 
@@ -73,11 +77,41 @@ pub enum ScreenshotOperationError {
     },
 }
 
+/// Captures running right now, by deployment ID, with when each started.
+///
+/// Kept apart from the operation history on purpose: history is trimmed and
+/// gains newer records while a capture runs, so its latest entry cannot prove
+/// whether a capture is still in progress.
+type InFlightCaptures = Arc<Mutex<HashMap<i32, UtcDateTime>>>;
+
+fn lock_in_flight(in_flight: &InFlightCaptures) -> MutexGuard<'_, HashMap<i32, UtcDateTime>> {
+    // Every critical section is a single insert or remove, so a panic while
+    // holding the lock cannot leave the map half-updated; keep using it.
+    in_flight
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A deployment's claim on its single capture slot. Dropping it frees the
+/// slot, and it is moved into the background task, so the slot is held until
+/// that task ends -- however it ends.
+struct CaptureSlot {
+    in_flight: InFlightCaptures,
+    deployment_id: i32,
+}
+
+impl Drop for CaptureSlot {
+    fn drop(&mut self) {
+        lock_in_flight(&self.in_flight).remove(&self.deployment_id);
+    }
+}
+
 pub struct ScreenshotOperationService {
     db: Arc<DbConnection>,
     screenshot_service: Arc<dyn ScreenshotServiceTrait>,
     config_service: Arc<ConfigService>,
     operations: Arc<ExternalDeploymentManager>,
+    in_flight: InFlightCaptures,
 }
 
 impl ScreenshotOperationService {
@@ -92,6 +126,7 @@ impl ScreenshotOperationService {
             screenshot_service,
             config_service,
             operations,
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -120,11 +155,15 @@ impl ScreenshotOperationService {
                 deployment_id,
             })?;
 
-        let key = deployment_id.to_string();
+        // Claim the slot before probing the provider: the local browser probe
+        // launches Chrome and takes seconds, and a concurrent request must be
+        // told a capture is running rather than probe and record a failure
+        // over it. Every early return below frees the slot.
+        let slot = self.claim(deployment_id)?;
 
         if !self.screenshot_service.is_enabled().await {
             let err = ScreenshotOperationError::Disabled { deployment_id };
-            self.record_failure(&key, &err.to_string());
+            self.record_failure(project_id, deployment_id, &err.to_string());
             return Err(err);
         }
 
@@ -134,7 +173,7 @@ impl ScreenshotOperationService {
                 provider: self.screenshot_service.provider_name(),
                 reason: reason.to_string(),
             };
-            self.record_failure(&key, &err.to_string());
+            self.record_failure(project_id, deployment_id, &err.to_string());
             return Err(err);
         }
 
@@ -145,27 +184,14 @@ impl ScreenshotOperationService {
                 deployment_id,
                 self.screenshot_service.provider_name()
             ),
-            Some(serde_json::json!({
-                "deployment_id": deployment_id,
-                "project_id": project_id,
-            })),
+            DeploymentOperationDetails::new(project_id, deployment_id.to_string()),
         );
-
-        match self
-            .operations
-            .begin_operation(&key, pending.clone())
+        self.operations
+            .record_operation(project_id, &deployment_id.to_string(), pending.clone())
             .map_err(|reason| ScreenshotOperationError::Record {
                 deployment_id,
                 reason,
-            })? {
-            Ok(()) => {}
-            Err(running) => {
-                return Err(ScreenshotOperationError::AlreadyRunning {
-                    deployment_id,
-                    started_at: running.executed_at.to_rfc3339(),
-                })
-            }
-        }
+            })?;
 
         let db = self.db.clone();
         let screenshot_service = self.screenshot_service.clone();
@@ -189,6 +215,8 @@ impl ScreenshotOperationService {
                 })
             });
 
+            let mut details =
+                DeploymentOperationDetails::new(project_id, deployment_id.to_string());
             let record = match result {
                 Ok(captured) => {
                     info!(
@@ -197,54 +225,73 @@ impl ScreenshotOperationService {
                         screenshot_location = %captured.screenshot_location,
                         "On-demand screenshot captured"
                     );
-                    operation_record(
-                        OperationStatus::Completed,
-                        format!(
-                            "Screenshot of deployment {} captured and saved to {}",
-                            deployment_id, captured.screenshot_location
-                        ),
-                        Some(serde_json::json!({
-                            "deployment_id": deployment_id,
-                            "project_id": project_id,
-                            "url": captured.url,
-                            "screenshot_location": captured.screenshot_location,
-                            "captured_at": captured.captured_at,
-                        })),
-                    )
+                    let message = format!(
+                        "Screenshot of deployment {} captured and saved to {}",
+                        deployment_id, captured.screenshot_location
+                    );
+                    details.screenshot = Some(DeploymentScreenshotCapture {
+                        url: captured.url,
+                        screenshot_location: captured.screenshot_location,
+                        captured_at: captured.captured_at,
+                    });
+                    operation_record(OperationStatus::Completed, message, details)
                 }
                 Err(e) => {
                     warn!(
                         deployment_id,
                         project_id, "On-demand screenshot failed: {}", e
                     );
-                    operation_record(
-                        OperationStatus::Failed,
-                        e.to_string(),
-                        Some(serde_json::json!({
-                            "deployment_id": deployment_id,
-                            "project_id": project_id,
-                        })),
-                    )
+                    operation_record(OperationStatus::Failed, e.to_string(), details)
                 }
             };
 
-            if let Err(e) = operations.record_operation(&deployment_id.to_string(), record) {
+            if let Err(e) =
+                operations.record_operation(project_id, &deployment_id.to_string(), record)
+            {
                 error!(
                     deployment_id,
-                    "Failed to record the outcome of a screenshot capture: {}", e
+                    project_id, "Failed to record the outcome of a screenshot capture: {}", e
                 );
             }
+            // Free the slot only after the outcome is readable, so a new
+            // request never starts before this one's result is recorded.
+            drop(slot);
         });
 
         Ok(pending)
     }
 
-    fn record_failure(&self, deployment_key: &str, message: &str) {
-        let record = operation_record(OperationStatus::Failed, message.to_string(), None);
-        if let Err(e) = self.operations.record_operation(deployment_key, record) {
+    /// Take `deployment_id`'s capture slot, or report the capture holding it.
+    fn claim(&self, deployment_id: i32) -> Result<CaptureSlot, ScreenshotOperationError> {
+        let mut in_flight = lock_in_flight(&self.in_flight);
+        match in_flight.entry(deployment_id) {
+            Entry::Occupied(running) => Err(ScreenshotOperationError::AlreadyRunning {
+                deployment_id,
+                started_at: running.get().to_rfc3339(),
+            }),
+            Entry::Vacant(slot) => {
+                slot.insert(Utc::now());
+                Ok(CaptureSlot {
+                    in_flight: self.in_flight.clone(),
+                    deployment_id,
+                })
+            }
+        }
+    }
+
+    fn record_failure(&self, project_id: i32, deployment_id: i32, message: &str) {
+        let record = operation_record(
+            OperationStatus::Failed,
+            message.to_string(),
+            DeploymentOperationDetails::new(project_id, deployment_id.to_string()),
+        );
+        if let Err(e) =
+            self.operations
+                .record_operation(project_id, &deployment_id.to_string(), record)
+        {
             error!(
-                deployment_id = deployment_key,
-                "Failed to record a rejected screenshot operation: {}", e
+                deployment_id,
+                project_id, "Failed to record a rejected screenshot operation: {}", e
             );
         }
     }
@@ -253,7 +300,7 @@ impl ScreenshotOperationService {
 fn operation_record(
     status: OperationStatus,
     message: String,
-    data: Option<serde_json::Value>,
+    data: DeploymentOperationDetails,
 ) -> OperationResult {
     OperationResult {
         operation: DeploymentOperation::TakeScreenshot,
@@ -405,6 +452,29 @@ mod tests {
         ScreenshotOperationService::new(db.clone(), screenshots, config_service(db), operations)
     }
 
+    /// Poll until the background capture of deployment 7 in project 3 ends.
+    async fn outcome(operations: &ExternalDeploymentManager) -> OperationResult {
+        for _ in 0..250 {
+            let current = operations
+                .get_latest_operation(3, "7", &DeploymentOperation::TakeScreenshot)
+                .expect("the pending record is readable while the capture runs");
+            if current.status != OperationStatus::Pending {
+                return current;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the background capture of deployment 7 never finished");
+    }
+
+    /// Ownership lookup, then the URL resolution the capture performs
+    /// (deployment row, then the settings row -- empty means defaults).
+    fn capture_reaches_the_provider() -> MockDatabase {
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![deployment(7, 3)]])
+            .append_query_results(vec![vec![deployment(7, 3)]])
+            .append_query_results(vec![Vec::<temps_entities::settings::Model>::new()])
+    }
+
     #[tokio::test]
     async fn disabled_screenshots_fail_with_setup_path_and_never_capture() {
         let screenshots = Arc::new(FakeScreenshots::new(false, Ok(()), Ok(())));
@@ -425,10 +495,11 @@ mod tests {
         assert_eq!(screenshots.captures.load(Ordering::SeqCst), 0);
 
         let latest = operations
-            .get_latest_operation("7", &DeploymentOperation::TakeScreenshot)
+            .get_latest_operation(3, "7", &DeploymentOperation::TakeScreenshot)
             .expect("the rejection is readable from the status endpoint");
         assert_eq!(latest.status, OperationStatus::Failed);
         assert!(!latest.success);
+        assert_eq!(latest.data, DeploymentOperationDetails::new(3, "7"));
     }
 
     #[tokio::test]
@@ -452,7 +523,7 @@ mod tests {
         assert!(message.contains("timed out after 10 seconds"), "{message}");
         assert_eq!(screenshots.captures.load(Ordering::SeqCst), 0);
         let latest = operations
-            .get_latest_operation("7", &DeploymentOperation::TakeScreenshot)
+            .get_latest_operation(3, "7", &DeploymentOperation::TakeScreenshot)
             .unwrap();
         assert_eq!(latest.status, OperationStatus::Failed);
     }
@@ -476,7 +547,8 @@ mod tests {
                 deployment_id: 7
             }
         ));
-        assert!(operations.get_operations("7").is_empty());
+        assert!(operations.get_operations(99, "7").is_empty());
+        assert!(operations.get_operations(3, "7").is_empty());
     }
 
     #[tokio::test]
@@ -487,34 +559,28 @@ mod tests {
             Err("the provider returned no data".to_string()),
         ));
         let operations = Arc::new(ExternalDeploymentManager::new());
-        // 1: ownership lookup. The background capture then resolves the URL
-        // through ConfigService (settings + deployment queries); the mock
-        // answers with empty results, which is itself a failure, so either
-        // way the operation must end `failed`, never `completed`.
-        let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results(vec![vec![deployment(7, 3)]]);
 
-        let pending = service(db, screenshots, operations.clone())
-            .start(3, 7)
-            .await
-            .expect("an available provider starts the capture");
+        let pending = service(
+            capture_reaches_the_provider(),
+            screenshots.clone(),
+            operations.clone(),
+        )
+        .start(3, 7)
+        .await
+        .expect("an available provider starts the capture");
         assert_eq!(pending.status, OperationStatus::Pending);
         assert!(!pending.success);
 
-        let mut latest = None;
-        for _ in 0..100 {
-            let current = operations
-                .get_latest_operation("7", &DeploymentOperation::TakeScreenshot)
-                .unwrap();
-            if current.status != OperationStatus::Pending {
-                latest = Some(current);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let latest = latest.expect("the background capture must finish");
+        let latest = outcome(&operations).await;
         assert_eq!(latest.status, OperationStatus::Failed);
         assert!(!latest.success);
+        assert_eq!(screenshots.captures.load(Ordering::SeqCst), 1);
+        assert!(
+            latest.message.contains("the provider returned no data"),
+            "{}",
+            latest.message
+        );
+        assert_eq!(latest.data.screenshot, None);
     }
 
     #[tokio::test]
@@ -523,12 +589,8 @@ mod tests {
         let operations = Arc::new(ExternalDeploymentManager::new());
         let mut captured = deployment(7, 3);
         captured.screenshot_location = Some("screenshots/deployment-7.png".to_string());
-        // Ownership lookup, URL resolution (deployment + settings row), the
-        // reload before the update, and the UPDATE ... RETURNING row.
-        let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results(vec![vec![deployment(7, 3)]])
-            .append_query_results(vec![vec![deployment(7, 3)]])
-            .append_query_results(vec![Vec::<temps_entities::settings::Model>::new()])
+        // Then the reload before the update, and the UPDATE ... RETURNING row.
+        let db = capture_reaches_the_provider()
             .append_query_results(vec![vec![deployment(7, 3)]])
             .append_query_results(vec![vec![captured]]);
 
@@ -538,49 +600,39 @@ mod tests {
             .expect("an available provider starts the capture");
         assert_eq!(pending.status, OperationStatus::Pending);
 
-        let mut latest = None;
-        for _ in 0..100 {
-            let current = operations
-                .get_latest_operation("7", &DeploymentOperation::TakeScreenshot)
-                .unwrap();
-            if current.status != OperationStatus::Pending {
-                latest = Some(current);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let latest = latest.expect("the background capture must finish");
+        let latest = outcome(&operations).await;
         assert_eq!(latest.status, OperationStatus::Completed, "{latest:?}");
         assert!(latest.success);
-        let data = latest.data.expect("a completed capture carries its result");
-        let location = data["screenshot_location"]
-            .as_str()
+        let screenshot = latest
+            .data
+            .screenshot
             .expect("a completed capture reports where it was stored");
         assert!(
-            location.starts_with("screenshots/deployment-7-") && location.ends_with(".png"),
-            "{location}"
+            screenshot
+                .screenshot_location
+                .starts_with("screenshots/deployment-7-")
+                && screenshot.screenshot_location.ends_with(".png"),
+            "{}",
+            screenshot.screenshot_location
         );
         assert_eq!(screenshots.captures.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
-    async fn second_request_while_capturing_is_rejected() {
+    async fn second_request_is_rejected_before_probing_the_provider() {
+        // A probe would fail, so reaching it would surface ProviderUnavailable.
+        let screenshots = Arc::new(FakeScreenshots::new(
+            true,
+            Err("probe must not run while a capture is in flight".to_string()),
+            Ok(()),
+        ));
         let operations = Arc::new(ExternalDeploymentManager::new());
-        operations
-            .begin_operation(
-                "7",
-                operation_record(OperationStatus::Pending, "running".to_string(), None),
-            )
-            .unwrap()
-            .unwrap();
-        let screenshots = Arc::new(FakeScreenshots::new(true, Ok(()), Ok(())));
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![deployment(7, 3)]]);
+        let service = service(db, screenshots.clone(), operations.clone());
+        let _running = service.claim(7).expect("first capture takes the slot");
 
-        let err = service(db, screenshots.clone(), operations)
-            .start(3, 7)
-            .await
-            .unwrap_err();
+        let err = service.start(3, 7).await.unwrap_err();
 
         assert!(matches!(
             err,
@@ -590,5 +642,99 @@ mod tests {
             }
         ));
         assert_eq!(screenshots.captures.load(Ordering::SeqCst), 0);
+        // The rejected request leaves no record that could hide the running one.
+        assert!(operations.get_operations(3, "7").is_empty());
+    }
+
+    #[tokio::test]
+    async fn running_capture_stays_guarded_whatever_the_history_says() {
+        let screenshots = Arc::new(FakeScreenshots::new(true, Ok(()), Ok(())));
+        let operations = Arc::new(ExternalDeploymentManager::new());
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![deployment(7, 3)]]);
+        let service = service(db, screenshots.clone(), operations.clone());
+        let _running = service.claim(7).expect("first capture takes the slot");
+
+        // A failed record on top, then enough other operations to trim every
+        // screenshot record out of the bounded history.
+        service.record_failure(3, 7, "a rejected request");
+        for _ in 0..60 {
+            operations
+                .record_operation(
+                    3,
+                    "7",
+                    OperationResult {
+                        operation: DeploymentOperation::MarkComplete,
+                        status: OperationStatus::Completed,
+                        success: true,
+                        message: "recorded".to_string(),
+                        data: DeploymentOperationDetails::new(3, "7"),
+                        executed_at: Utc::now(),
+                    },
+                )
+                .unwrap();
+        }
+        assert!(operations
+            .get_latest_operation(3, "7", &DeploymentOperation::TakeScreenshot)
+            .is_none());
+
+        let err = service.start(3, 7).await.unwrap_err();
+
+        assert!(matches!(
+            err,
+            ScreenshotOperationError::AlreadyRunning {
+                deployment_id: 7,
+                ..
+            }
+        ));
+        assert_eq!(screenshots.captures.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn rejected_requests_free_the_slot() {
+        let screenshots = Arc::new(FakeScreenshots::new(
+            true,
+            Err("no browser".to_string()),
+            Ok(()),
+        ));
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![deployment(7, 3)]])
+            .append_query_results(vec![vec![deployment(7, 3)]]);
+        let service = service(db, screenshots, Arc::new(ExternalDeploymentManager::new()));
+
+        for _ in 0..2 {
+            let err = service.start(3, 7).await.unwrap_err();
+            assert!(
+                matches!(err, ScreenshotOperationError::ProviderUnavailable { .. }),
+                "{err}"
+            );
+        }
+        assert!(service.claim(7).is_ok());
+    }
+
+    #[tokio::test]
+    async fn finished_capture_frees_the_slot_after_recording_its_outcome() {
+        let screenshots = Arc::new(FakeScreenshots::new(
+            true,
+            Ok(()),
+            Err("the provider returned no data".to_string()),
+        ));
+        let operations = Arc::new(ExternalDeploymentManager::new());
+        let service = service(
+            capture_reaches_the_provider(),
+            screenshots,
+            operations.clone(),
+        );
+
+        service.start(3, 7).await.expect("capture starts");
+        assert_eq!(outcome(&operations).await.status, OperationStatus::Failed);
+
+        for _ in 0..250 {
+            if service.claim(7).is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the slot was never freed after the capture ended");
     }
 }
