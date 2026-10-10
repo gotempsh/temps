@@ -582,16 +582,11 @@ fn sanitize_compose_diagnostic(diagnostic: &str, redact_values: &[String]) -> St
 /// Remove the start of a stderr capture whose front was trimmed away.
 ///
 /// The trim can cut through a sensitive value, leaving its suffix at the very
-/// start, where no redaction rule recognises it. If a whole line follows, the
-/// capture starts there. Otherwise the capture is one line longer than the
-/// limit, whose ending is the error and must survive, so only the fragment is
-/// removed: the longest proper suffix of any sensitive value that the capture
-/// starts with, found on the raw bytes so the amount removed never depends on
-/// how much later masking shrinks the text. The rest of the token the cut went
-/// through is dropped too, which removes a split credential-shaped token (for
-/// example a URL whose userinfo lost its start); a line with no whitespace
-/// keeps everything after the fragment. Complete values that remain are
-/// masked by the diagnostic sanitizer as usual.
+/// start, where no rule recognises it. If a whole line follows, the capture
+/// starts there. Otherwise the capture is one line longer than the limit,
+/// whose ending is the error and must survive: it is masked with that leading
+/// fragment included (see [`mask_cut_text`]), then loses only the token the
+/// cut went through.
 fn drop_leading_fragment(captured: &mut Vec<u8>, redact_values: &[String]) {
     if let Some(newline) = captured.iter().position(|byte| *byte == b'\n') {
         if captured[newline + 1..]
@@ -602,22 +597,73 @@ fn drop_leading_fragment(captured: &mut Vec<u8>, redact_values: &[String]) {
             return;
         }
     }
+    let text = String::from_utf8_lossy(captured);
+    let masked = mask_cut_text(&text, redact_values, CutEdge::Start);
+    *captured = format!("… {masked}").into_bytes();
+}
+
+/// Which end of a text a cut went through.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CutEdge {
+    Start,
+    End,
+}
+
+/// Mask `text`, which was cut at `edge`, then drop the token the cut went
+/// through.
+///
+/// Everything is located on the original text before anything is removed:
+/// every complete occurrence of a sensitive value, plus the fragment the cut
+/// left of a split value (the longest proper suffix of a value that the text
+/// starts with, or the longest proper prefix it ends with). Their union is
+/// masked in one pass, so neither masking nor cutting can break a value into
+/// unrecognised pieces, including a value containing spaces. Only then does
+/// the cut edge move to the nearest whitespace, which removes a split
+/// credential-shaped token (a URL whose userinfo lost its `@`); masked values
+/// contain no whitespace, so this cannot split one. A text with no whitespace
+/// keeps everything.
+fn mask_cut_text(text: &str, redact_values: &[String], edge: CutEdge) -> String {
+    let bytes = text.as_bytes();
     let fragment = redact_values
         .iter()
-        .map(|value| value_suffix_prefix_overlap(value.as_bytes(), captured))
+        .map(|value| match edge {
+            CutEdge::Start => value_suffix_prefix_overlap(value.as_bytes(), bytes),
+            CutEdge::End => {
+                let reversed_value: Vec<u8> = value.bytes().rev().collect();
+                let reversed_text: Vec<u8> = bytes.iter().rev().copied().collect();
+                value_suffix_prefix_overlap(&reversed_value, &reversed_text)
+            }
+        })
         .max()
         .unwrap_or(0);
-    let start = captured[fragment..]
-        .iter()
-        .position(u8::is_ascii_whitespace)
-        .map_or(fragment, |offset| fragment + offset);
-    let kept = captured[start..]
-        .iter()
-        .position(|byte| !byte.is_ascii_whitespace())
-        .map_or(captured.len(), |offset| start + offset);
-    let mut marked = "… ".as_bytes().to_vec();
-    marked.extend_from_slice(&captured[kept..]);
-    *captured = marked;
+    // Widen to char boundaries: masking a little more is always safe.
+    let fragment_range = match edge {
+        CutEdge::Start => {
+            let mut end = fragment;
+            while !text.is_char_boundary(end) {
+                end += 1;
+            }
+            0..end
+        }
+        CutEdge::End => {
+            let mut start = text.len() - fragment;
+            while !text.is_char_boundary(start) {
+                start -= 1;
+            }
+            start..text.len()
+        }
+    };
+    let masked = redact_text_ranges(text, redact_values, Some(fragment_range));
+    match edge {
+        CutEdge::Start => match masked.find(char::is_whitespace) {
+            Some(space) => masked[space..].trim_start().to_string(),
+            None => masked,
+        },
+        CutEdge::End => match masked.rfind(char::is_whitespace) {
+            Some(space) => masked[..space].trim_end().to_string(),
+            None => masked,
+        },
+    }
 }
 
 /// Length of the longest proper suffix of `value` that `text` starts with.
@@ -658,46 +704,68 @@ fn value_suffix_prefix_overlap(value: &[u8], text: &[u8]) -> usize {
 /// Mask every known sensitive value and credential-shaped token in `text`,
 /// without bounding its length.
 fn redact_compose_text(text: &str, redact_values: &[String]) -> String {
-    let mut redacted = text.to_string();
-    for value in redact_values {
-        if !value.is_empty() {
-            redacted = redacted.replace(value, "<redacted>");
+    redact_text_ranges(text, redact_values, None)
+}
+
+/// Mask the union of every complete occurrence of a sensitive value in
+/// `text` and the `extra` byte range, then credential-shaped tokens.
+///
+/// Occurrences are all found on the original text and masked together.
+/// Replacing one value at a time would let a shorter value nested in a longer
+/// one (a password inside a connection string) mask its part first, leaving
+/// the rest of the longer value unrecognised.
+fn redact_text_ranges(
+    text: &str,
+    redact_values: &[String],
+    extra: Option<std::ops::Range<usize>>,
+) -> String {
+    let mut ranges: Vec<std::ops::Range<usize>> = redact_values
+        .iter()
+        .filter(|value| !value.is_empty())
+        .flat_map(|value| {
+            text.match_indices(value.as_str())
+                .map(|(start, found)| start..start + found.len())
+        })
+        .collect();
+    if let Some(extra) = extra.filter(|range| !range.is_empty()) {
+        ranges.push(extra);
+    }
+    ranges.sort_by_key(|range| range.start);
+
+    let mut masked = String::with_capacity(text.len());
+    let mut position = 0;
+    for range in ranges {
+        if range.end <= position {
+            continue;
         }
+        let start = range.start.max(position);
+        if start > position {
+            masked.push_str(&text[position..start]);
+            masked.push_str("<redacted>");
+        } else if !masked.ends_with("<redacted>") {
+            masked.push_str("<redacted>");
+        }
+        position = range.end;
     }
+    masked.push_str(&text[position..]);
+
     for regex in CREDENTIAL_PATTERNS.iter() {
-        redacted = regex.replace_all(&redacted, "${1}<redacted>").into_owned();
+        masked = regex.replace_all(&masked, "${1}<redacted>").into_owned();
     }
-    redacted
+    masked
 }
 
 /// Redacted head of an output line cut at [`MAX_STREAMED_LINE_BYTES`].
 ///
 /// The cut may fall inside a sensitive value whose remainder never arrives,
-/// leaving its prefix at the end of the head, where no redaction rule
-/// recognises it. Only that fragment is removed: the longest proper prefix of
-/// any sensitive value that the head ends with, found on the raw bytes. The
-/// head then backs up to the previous whitespace, which removes a split
-/// credential-shaped token (for example a URL whose userinfo was cut before
-/// its `@`), and is redacted as usual.
+/// leaving its prefix at the end of the head; [`mask_cut_text`] masks it with
+/// the rest of the line and then drops the token the cut went through.
 fn truncated_line_head(head: &[u8], redact_values: &[String]) -> String {
-    let reversed_head: Vec<u8> = head.iter().rev().copied().collect();
-    let fragment = redact_values
-        .iter()
-        .map(|value| {
-            let reversed_value: Vec<u8> = value.bytes().rev().collect();
-            value_suffix_prefix_overlap(&reversed_value, &reversed_head)
-        })
-        .max()
-        .unwrap_or(0);
-    let end = head.len() - fragment;
-    let end = head[..end]
-        .iter()
-        .rposition(u8::is_ascii_whitespace)
-        .unwrap_or(end);
-    let kept = sanitize_compose_diagnostic(&String::from_utf8_lossy(&head[..end]), redact_values);
+    let text = String::from_utf8_lossy(head);
+    let masked = mask_cut_text(&text, redact_values, CutEdge::End);
     format!(
         "{} … [line truncated after {} bytes]",
-        kept.trim_end(),
+        masked.trim_end(),
         MAX_STREAMED_LINE_BYTES
     )
 }
@@ -13763,6 +13831,38 @@ services:
         let line = truncated_line_head(head, &[]);
         assert!(!line.contains("hunter2"), "{line}");
         assert!(line.starts_with("pulling from"), "{line}");
+    }
+
+    #[test]
+    fn values_containing_spaces_are_never_split_at_either_cut_edge() {
+        let redact = vec!["swordfish secret".to_string()];
+
+        // A complete value right before a streamed line's cut.
+        let line = truncated_line_head(b"build says swordfish secret", &redact);
+        assert_eq!(line, "build says … [line truncated after 16384 bytes]");
+
+        // A complete value right after a trimmed capture's cut.
+        let mut captured = b"swordfish secret and then the error".to_vec();
+        drop_leading_fragment(&mut captured, &redact);
+        assert_eq!(captured, "… and then the error".as_bytes());
+
+        // A split value with a space on either side of the cut.
+        let line = truncated_line_head(b"build says swordfish sec", &redact);
+        assert_eq!(line, "build says … [line truncated after 16384 bytes]");
+        let mut captured = b"fish secret and then the error".to_vec();
+        drop_leading_fragment(&mut captured, &redact);
+        assert_eq!(captured, "… and then the error".as_bytes());
+    }
+
+    #[test]
+    fn nested_sensitive_values_are_masked_whole() {
+        // Replacing the shorter value first would split the longer one into
+        // unrecognised pieces.
+        let redact = vec!["inner".to_string(), "outer-inner-tail".to_string()];
+        assert_eq!(
+            redact_compose_text("x outer-inner-tail y inner z", &redact),
+            "x <redacted> y <redacted> z"
+        );
     }
 
     #[test]
