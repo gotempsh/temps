@@ -597,8 +597,7 @@ fn drop_leading_fragment(captured: &mut Vec<u8>, redact_values: &[String]) {
             return;
         }
     }
-    let text = String::from_utf8_lossy(captured);
-    let masked = mask_cut_text(&text, redact_values, CutEdge::Start);
+    let masked = mask_cut_text(captured, redact_values, CutEdge::Start);
     *captured = format!("… {masked}").into_bytes();
 }
 
@@ -609,51 +608,39 @@ enum CutEdge {
     End,
 }
 
-/// Mask `text`, which was cut at `edge`, then drop the token the cut went
+/// Mask `raw`, which was cut at `edge`, then drop the token the cut went
 /// through.
 ///
-/// Everything is located on the original text before anything is removed:
-/// every complete occurrence of a sensitive value, plus the fragment the cut
-/// left of a split value (the longest proper suffix of a value that the text
-/// starts with, or the longest proper prefix it ends with). Their union is
-/// masked in one pass, so neither masking nor cutting can break a value into
-/// unrecognised pieces, including a value containing spaces. Only then does
-/// the cut edge move to the nearest whitespace, which removes a split
-/// credential-shaped token (a URL whose userinfo lost its `@`); masked values
-/// contain no whitespace, so this cannot split one. A text with no whitespace
-/// keeps everything.
-fn mask_cut_text(text: &str, redact_values: &[String], edge: CutEdge) -> String {
-    let bytes = text.as_bytes();
+/// Everything is located on the original bytes before anything is decoded or
+/// removed: every complete occurrence of a sensitive value, plus the fragment
+/// the cut left of a split value (the longest proper suffix of a value that
+/// the bytes start with, or the longest proper prefix they end with). A cut
+/// inside a multibyte character would turn into U+FFFD on decoding and stop
+/// matching, so matching never happens on decoded text. The union of those
+/// ranges is masked in one pass, so neither masking nor cutting can break a
+/// value into unrecognised pieces, including a value containing spaces. Only
+/// then does the cut edge move to the nearest whitespace, which removes a
+/// split credential-shaped token (a URL whose userinfo lost its `@`); masked
+/// values contain no whitespace, so this cannot split one. Text with no
+/// whitespace keeps everything.
+fn mask_cut_text(raw: &[u8], redact_values: &[String], edge: CutEdge) -> String {
     let fragment = redact_values
         .iter()
         .map(|value| match edge {
-            CutEdge::Start => value_suffix_prefix_overlap(value.as_bytes(), bytes),
+            CutEdge::Start => value_suffix_prefix_overlap(value.as_bytes(), raw),
             CutEdge::End => {
                 let reversed_value: Vec<u8> = value.bytes().rev().collect();
-                let reversed_text: Vec<u8> = bytes.iter().rev().copied().collect();
-                value_suffix_prefix_overlap(&reversed_value, &reversed_text)
+                let reversed_raw: Vec<u8> = raw.iter().rev().copied().collect();
+                value_suffix_prefix_overlap(&reversed_value, &reversed_raw)
             }
         })
         .max()
         .unwrap_or(0);
-    // Widen to char boundaries: masking a little more is always safe.
     let fragment_range = match edge {
-        CutEdge::Start => {
-            let mut end = fragment;
-            while !text.is_char_boundary(end) {
-                end += 1;
-            }
-            0..end
-        }
-        CutEdge::End => {
-            let mut start = text.len() - fragment;
-            while !text.is_char_boundary(start) {
-                start -= 1;
-            }
-            start..text.len()
-        }
+        CutEdge::Start => 0..fragment,
+        CutEdge::End => raw.len() - fragment..raw.len(),
     };
-    let masked = redact_text_ranges(text, redact_values, Some(fragment_range));
+    let masked = redact_byte_ranges(raw, redact_values, Some(fragment_range));
     match edge {
         CutEdge::Start => match masked.find(char::is_whitespace) {
             Some(space) => masked[space..].trim_start().to_string(),
@@ -678,17 +665,7 @@ fn value_suffix_prefix_overlap(value: &[u8], text: &[u8]) -> usize {
     if pattern.is_empty() {
         return 0;
     }
-    let mut prefix_function = vec![0_usize; pattern.len()];
-    let mut matched = 0;
-    for index in 1..pattern.len() {
-        while matched > 0 && pattern[index] != pattern[matched] {
-            matched = prefix_function[matched - 1];
-        }
-        if pattern[index] == pattern[matched] {
-            matched += 1;
-        }
-        prefix_function[index] = matched;
-    }
+    let prefix_function = kmp_prefix_function(pattern);
     let mut matched = 0;
     for &byte in value {
         while matched > 0 && (matched == pattern.len() || byte != pattern[matched]) {
@@ -701,54 +678,98 @@ fn value_suffix_prefix_overlap(value: &[u8], text: &[u8]) -> usize {
     matched
 }
 
+/// KMP prefix function: for each position, the length of the longest proper
+/// prefix of `pattern[..=position]` that is also its suffix.
+fn kmp_prefix_function(pattern: &[u8]) -> Vec<usize> {
+    let mut prefix_function = vec![0_usize; pattern.len()];
+    let mut matched = 0;
+    for index in 1..pattern.len() {
+        while matched > 0 && pattern[index] != pattern[matched] {
+            matched = prefix_function[matched - 1];
+        }
+        if pattern[index] == pattern[matched] {
+            matched += 1;
+        }
+        prefix_function[index] = matched;
+    }
+    prefix_function
+}
+
+/// Byte ranges of every non-overlapping occurrence of `needle` in
+/// `haystack`, in linear time.
+fn find_occurrences(haystack: &[u8], needle: &[u8]) -> Vec<std::ops::Range<usize>> {
+    let mut found = Vec::new();
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return found;
+    }
+    let prefix_function = kmp_prefix_function(needle);
+    let mut matched = 0;
+    for (index, &byte) in haystack.iter().enumerate() {
+        while matched > 0 && byte != needle[matched] {
+            matched = prefix_function[matched - 1];
+        }
+        if byte == needle[matched] {
+            matched += 1;
+        }
+        if matched == needle.len() {
+            found.push(index + 1 - needle.len()..index + 1);
+            // Non-overlapping: the next match starts after this one.
+            matched = 0;
+        }
+    }
+    found
+}
+
 /// Mask every known sensitive value and credential-shaped token in `text`,
 /// without bounding its length.
 fn redact_compose_text(text: &str, redact_values: &[String]) -> String {
-    redact_text_ranges(text, redact_values, None)
+    redact_byte_ranges(text.as_bytes(), redact_values, None)
 }
 
-/// Mask the union of every complete occurrence of a sensitive value in
-/// `text` and the `extra` byte range, then credential-shaped tokens.
+/// Mask the union of every complete occurrence of a sensitive value in `raw`
+/// and the `extra` byte range, decode the result, then mask credential-shaped
+/// tokens.
 ///
-/// Occurrences are all found on the original text and masked together.
+/// Occurrences are all found on the original bytes and masked together.
 /// Replacing one value at a time would let a shorter value nested in a longer
 /// one (a password inside a connection string) mask its part first, leaving
-/// the rest of the longer value unrecognised.
-fn redact_text_ranges(
-    text: &str,
+/// the rest of the longer value unrecognised. Decoding happens last, so a
+/// value is matched even next to bytes that are not valid UTF-8.
+fn redact_byte_ranges(
+    raw: &[u8],
     redact_values: &[String],
     extra: Option<std::ops::Range<usize>>,
 ) -> String {
     let mut ranges: Vec<std::ops::Range<usize>> = redact_values
         .iter()
-        .filter(|value| !value.is_empty())
-        .flat_map(|value| {
-            text.match_indices(value.as_str())
-                .map(|(start, found)| start..start + found.len())
-        })
+        .flat_map(|value| find_occurrences(raw, value.as_bytes()))
         .collect();
     if let Some(extra) = extra.filter(|range| !range.is_empty()) {
         ranges.push(extra);
     }
     ranges.sort_by_key(|range| range.start);
 
-    let mut masked = String::with_capacity(text.len());
+    let mut masked = Vec::with_capacity(raw.len());
     let mut position = 0;
+    let mut previous_was_mask = false;
     for range in ranges {
         if range.end <= position {
             continue;
         }
         let start = range.start.max(position);
         if start > position {
-            masked.push_str(&text[position..start]);
-            masked.push_str("<redacted>");
-        } else if !masked.ends_with("<redacted>") {
-            masked.push_str("<redacted>");
+            masked.extend_from_slice(&raw[position..start]);
+            previous_was_mask = false;
+        }
+        if !previous_was_mask {
+            masked.extend_from_slice(b"<redacted>");
+            previous_was_mask = true;
         }
         position = range.end;
     }
-    masked.push_str(&text[position..]);
+    masked.extend_from_slice(&raw[position..]);
 
+    let mut masked = String::from_utf8_lossy(&masked).into_owned();
     for regex in CREDENTIAL_PATTERNS.iter() {
         masked = regex.replace_all(&masked, "${1}<redacted>").into_owned();
     }
@@ -761,8 +782,7 @@ fn redact_text_ranges(
 /// leaving its prefix at the end of the head; [`mask_cut_text`] masks it with
 /// the rest of the line and then drops the token the cut went through.
 fn truncated_line_head(head: &[u8], redact_values: &[String]) -> String {
-    let text = String::from_utf8_lossy(head);
-    let masked = mask_cut_text(&text, redact_values, CutEdge::End);
+    let masked = mask_cut_text(head, redact_values, CutEdge::End);
     format!(
         "{} … [line truncated after {} bytes]",
         masked.trim_end(),
@@ -6402,11 +6422,10 @@ impl ComposeExecutor {
         redact_values: &[String],
         line: &[u8],
     ) {
-        if line.iter().all(u8::is_ascii_whitespace) {
+        let Some(last) = line.iter().rposition(|byte| !byte.is_ascii_whitespace()) else {
             return;
-        }
-        let text =
-            sanitize_compose_diagnostic(String::from_utf8_lossy(line).trim_end(), redact_values);
+        };
+        let text = redact_byte_ranges(&line[..=last], redact_values, None);
         // The forwarder outlives both readers; a closed channel only means
         // the command is being abandoned (timeout), so the line is moot.
         let _ = lines.send(text).await;
@@ -6825,7 +6844,7 @@ impl ComposeExecutor {
             });
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = redact_byte_ranges(&output.stdout, redact_values, None);
         debug!(project = %project_name, stdout = %stdout, "docker compose up completed");
 
         Ok(())
@@ -13852,6 +13871,33 @@ services:
         let mut captured = b"fish secret and then the error".to_vec();
         drop_leading_fragment(&mut captured, &redact);
         assert_eq!(captured, "… and then the error".as_bytes());
+    }
+
+    #[test]
+    fn a_cut_inside_a_multibyte_character_still_masks_the_split_value() {
+        let value = "swordfish sécret";
+        let redact = vec![value.to_string()];
+        let e_acute = value.find('é').unwrap();
+        // Cut between the two bytes of `é`.
+        let split = e_acute + 1;
+
+        let mut head = b"build says ".to_vec();
+        head.extend_from_slice(&value.as_bytes()[..split]);
+        let line = truncated_line_head(&head, &redact);
+        assert_eq!(line, "build says … [line truncated after 16384 bytes]");
+
+        let mut captured = value.as_bytes()[split..].to_vec();
+        captured.extend_from_slice(b" and then the error");
+        drop_leading_fragment(&mut captured, &redact);
+        assert_eq!(captured, "… and then the error".as_bytes());
+    }
+
+    #[test]
+    fn find_occurrences_returns_non_overlapping_byte_ranges() {
+        assert_eq!(find_occurrences(b"abcabcab", b"abc"), vec![0..3, 3..6]);
+        assert_eq!(find_occurrences(b"aaaa", b"aa"), vec![0..2, 2..4]);
+        assert!(find_occurrences(b"abc", b"").is_empty());
+        assert!(find_occurrences(b"ab", b"abc").is_empty());
     }
 
     #[test]
