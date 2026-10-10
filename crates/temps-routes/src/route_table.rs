@@ -776,9 +776,15 @@ pub(crate) async fn claim_route_generation(
 /// Atomically claim the generation after `previous`, giving up after
 /// `timeout`.
 ///
-/// `GREATEST(current, previous) + 1` in a single `UPDATE ... RETURNING`: the
-/// row lock serializes concurrent claims, so each caller gets a distinct
-/// value, and the result is above both the stored and the in-memory value.
+/// `GREATEST(current, previous, <highest stored node ACK>) + 1` in a single
+/// `UPDATE ... RETURNING`: the row lock serializes concurrent claims, so each
+/// caller gets a distinct value, and the result is above the stored value,
+/// the in-memory value, and every generation a node has acknowledged. The
+/// last term is what stops a restarted process from reissuing a number an
+/// earlier process published without persisting it (a lost commit, or a
+/// locally numbered reload): a worker that already holds that number would
+/// treat the reissued snapshot as one it has, and keep stale routes. It is
+/// one aggregate over one row per node.
 ///
 /// Two phases share one deadline (`timeout` plus a short grace for a
 /// connection that stalls outside a statement):
@@ -857,7 +863,8 @@ async fn claim_uncommitted(
     let row = txn
         .query_one(sea_orm::Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "UPDATE route_generation SET current = GREATEST(current, $1) + 1, \
+            "UPDATE route_generation SET current = GREATEST(current, $1, \
+             (SELECT COALESCE(MAX(applied_generation), 0) FROM node_route_state)) + 1, \
              updated_at = now() WHERE id = 1 RETURNING current",
             [previous_i64.into()],
         ))
@@ -4809,6 +4816,45 @@ mod route_generation_tests {
             .await
             .expect("load once commits succeed");
         assert_eq!(table.current_generation(), 102);
+        assert_eq!(persisted(&db).await, Some(102));
+    }
+
+    /// A number published without being persisted (here: a lost commit,
+    /// then a restart) is never issued again once a node has acknowledged
+    /// it, so a worker holding it cannot mistake a new snapshot for its own.
+    #[tokio::test]
+    async fn a_restarted_process_never_reissues_a_generation_a_node_acknowledged() {
+        let Some(database) = database_or_skip().await else {
+            return;
+        };
+        let db = database.db.clone();
+        execute(
+            &db,
+            "UPDATE route_generation SET current = 100 WHERE id = 1",
+        )
+        .await;
+        execute(
+            &db,
+            "INSERT INTO nodes (name, token_hash, address, private_address, role, status, \
+             labels, capacity) VALUES ('worker-1', 'synthetic-hash', '127.0.0.1', '10.0.0.2', \
+             'worker', 'active', '{}', '{}')",
+        )
+        .await;
+        // The previous process published 101, its commit was lost, and the
+        // worker acknowledged 101 before the process restarted.
+        execute(
+            &db,
+            "INSERT INTO node_route_state (node_id, applied_generation, health) \
+             SELECT id, 101, 'healthy' FROM nodes WHERE name = 'worker-1'",
+        )
+        .await;
+
+        let restarted = CachedPeerTable::new(db.clone());
+        restarted
+            .load_routes()
+            .await
+            .expect("first load after restart");
+        assert_eq!(restarted.current_generation(), 102);
         assert_eq!(persisted(&db).await, Some(102));
     }
 }
