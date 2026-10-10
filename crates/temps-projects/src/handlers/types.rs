@@ -1278,6 +1278,12 @@ impl From<ProjectError> for Problem {
                 .with_title("Invalid Git URL")
                 .with_detail(error.to_string()),
 
+            ProjectError::DirectoryNotInRepository { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Root Directory Not In Repository")
+                    .with_detail(error.to_string())
+            }
+
             // 403, not 409: the slug is not taken, the caller is not allowed
             // to take it. An admin sending the same request succeeds.
             ProjectError::DockerSocketSlugReserved { .. } => {
@@ -1519,6 +1525,37 @@ mod tests {
         assert!(problem.body["detail"]
             .as_str()
             .is_some_and(|detail| detail.contains("Connect this project")));
+    }
+
+    /// Issue #1350: a root directory missing from the repository is the
+    /// caller's input to fix, so it is a 400 naming repository, branch and path.
+    #[test]
+    fn root_directory_not_in_repository_is_a_contextual_400() {
+        let problem: Problem = ProjectError::DirectoryNotInRepository {
+            repository: "example/monorepo".to_string(),
+            branch: "main".to_string(),
+            directory: "apps/apii".to_string(),
+            explanation: "'apps' has no 'apii'; it contains: api, web".to_string(),
+        }
+        .into();
+
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            problem.body.get("title"),
+            Some(&serde_json::json!("Root Directory Not In Repository"))
+        );
+        let detail = problem.body["detail"].as_str().unwrap_or_default();
+        for expected in [
+            "'apps/apii'",
+            "example/monorepo",
+            "branch 'main'",
+            "'apps' has no 'apii'; it contains: api, web",
+        ] {
+            assert!(
+                detail.contains(expected),
+                "{expected} missing from: {detail}"
+            );
+        }
     }
 
     #[test]

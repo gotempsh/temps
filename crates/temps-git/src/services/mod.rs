@@ -20,5 +20,6 @@ pub mod pr_comment_listener;
 pub mod pr_commenter;
 pub mod public_repo;
 pub mod repository;
+pub mod repository_directory;
 
 pub mod host_import;

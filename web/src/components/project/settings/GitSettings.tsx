@@ -95,7 +95,11 @@ import {
   splitPresetSelection,
 } from '@/lib/preset-selection'
 import { repositoryFilePath } from '@/lib/repository-file-path'
-import { isRepositoryRootDirectory } from '@/lib/project-directory'
+import { problemDetail } from '@/lib/api-problem'
+import {
+  isRepositoryRootDirectory,
+  rootDirectoryHelp,
+} from '@/lib/project-directory'
 import {
   projectSettingsSections,
   type ProjectSettingsView,
@@ -455,6 +459,10 @@ function GitSettingsInline({
 
   // Directory editor
   const [directoryDraft, setDirectoryDraft] = useState('')
+  // The server refuses a root directory the repository does not have on the
+  // configured branch, naming what is there instead; keep that next to the
+  // field rather than only in a toast that disappears.
+  const [directoryError, setDirectoryError] = useState<string | null>(null)
   useEffect(() => {
     // The draft intentionally resets after a successful server refetch.
     // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -1039,16 +1047,31 @@ function GitSettingsInline({
                     editing={editing === 'directory'}
                     onStartEdit={() => {
                       setDirectoryDraft(project.directory || './')
+                      setDirectoryError(null)
                       setEditing('directory')
                     }}
-                    onCancel={close}
+                    onCancel={() => {
+                      setDirectoryError(null)
+                      close()
+                    }}
                     onSave={async () => {
                       const next = directoryDraft || './'
                       if (next === project.directory) {
                         close()
                         return
                       }
-                      await saveGitField({ directory: next })
+                      try {
+                        await saveGitField({ directory: next })
+                      } catch (error) {
+                        setDirectoryError(
+                          problemDetail(
+                            error,
+                            'The root directory could not be saved.'
+                          )
+                        )
+                        return
+                      }
+                      setDirectoryError(null)
                       toast.success('Root directory updated')
                       close()
                     }}
@@ -1062,13 +1085,36 @@ function GitSettingsInline({
                       </div>
                     }
                     editor={
-                      <Input
-                        value={directoryDraft}
-                        onChange={(e) => setDirectoryDraft(e.target.value)}
-                        placeholder="./"
-                        className="flex-1 font-mono text-sm"
-                        autoFocus
-                      />
+                      <div className="flex-1 min-w-0 space-y-1">
+                        <Input
+                          value={directoryDraft}
+                          onChange={(e) => {
+                            setDirectoryDraft(e.target.value)
+                            setDirectoryError(null)
+                          }}
+                          placeholder="./"
+                          className="font-mono text-sm"
+                          aria-invalid={directoryError ? true : undefined}
+                          aria-describedby="root-directory-help"
+                          autoFocus
+                        />
+                        <p
+                          id="root-directory-help"
+                          role={directoryError ? 'alert' : undefined}
+                          className={cn(
+                            'text-xs',
+                            directoryError
+                              ? 'text-destructive'
+                              : 'text-muted-foreground'
+                          )}
+                        >
+                          {rootDirectoryHelp(
+                            directoryError,
+                            isLocalSource,
+                            project.main_branch
+                          )}
+                        </p>
+                      </div>
                     }
                   />
                   <li

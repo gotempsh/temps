@@ -3337,6 +3337,93 @@ impl GitProviderManager {
         Ok(preset_data)
     }
 
+    /// Check that `directory` exists in `owner/repo` at `branch`, through the
+    /// connection's provider API.
+    ///
+    /// Never fails: anything that prevents a definite answer (the connection
+    /// or provider cannot be loaded, the provider has no listing API, the API
+    /// is unreachable or slow) is
+    /// [`RepositoryDirectoryCheck::Unverified`](super::repository_directory::RepositoryDirectoryCheck::Unverified),
+    /// so a flaky provider never blocks saving a project. The whole walk is
+    /// bounded by `REPOSITORY_DIRECTORY_CHECK_TIMEOUT` and issues one listing
+    /// per path component.
+    pub async fn check_repository_directory(
+        &self,
+        connection_id: i32,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+        directory: &str,
+    ) -> super::repository_directory::RepositoryDirectoryCheck {
+        use super::repository_directory::{
+            check_repository_directory, DirectoryListingEntry, RepositoryDirectoryCheck,
+            REPOSITORY_DIRECTORY_CHECK_TIMEOUT,
+        };
+
+        let walk = async {
+            let provider_service = match self.get_connection(connection_id).await {
+                Ok(connection) => match self.get_provider_service(connection.provider_id).await {
+                    Ok(service) => service,
+                    Err(error) => {
+                        return RepositoryDirectoryCheck::Unverified {
+                            reason: format!(
+                                "the Git provider of connection {connection_id} could not be \
+                                 loaded: {error}"
+                            ),
+                        }
+                    }
+                },
+                Err(error) => {
+                    return RepositoryDirectoryCheck::Unverified {
+                        reason: format!(
+                            "Git connection {connection_id} could not be loaded: {error}"
+                        ),
+                    }
+                }
+            };
+            if matches!(provider_service.provider_type(), GitProviderType::Generic) {
+                return RepositoryDirectoryCheck::Unverified {
+                    reason: "generic Git providers have no API to list repository directories"
+                        .to_string(),
+                };
+            }
+            check_repository_directory(directory, |path| {
+                let provider_service = provider_service.clone();
+                async move {
+                    self.execute_with_refresh(connection_id, |access_token| {
+                        let provider_service = provider_service.clone();
+                        let path = path.clone();
+                        async move {
+                            provider_service
+                                .list_directory(&access_token, owner, repo, &path, Some(branch))
+                                .await
+                        }
+                    })
+                    .await
+                    .map(|entries| {
+                        entries
+                            .into_iter()
+                            .map(|entry| DirectoryListingEntry {
+                                name: entry.name,
+                                is_dir: entry.is_dir,
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                }
+            })
+            .await
+        };
+        match tokio::time::timeout(REPOSITORY_DIRECTORY_CHECK_TIMEOUT, walk).await {
+            Ok(check) => check,
+            Err(_) => RepositoryDirectoryCheck::Unverified {
+                reason: format!(
+                    "listing {owner}/{repo} at '{branch}' did not finish within {}s",
+                    REPOSITORY_DIRECTORY_CHECK_TIMEOUT.as_secs()
+                ),
+            },
+        }
+    }
+
     /// Calculate repository preset in real-time without storing it
     pub async fn calculate_repository_preset_live(
         &self,

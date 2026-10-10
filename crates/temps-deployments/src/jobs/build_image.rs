@@ -3201,6 +3201,218 @@ mod tests {
         assert!(!dockerfile.exists());
     }
 
+    /// What a stand-in worker received on `POST /agent/images/build`.
+    #[derive(Default)]
+    struct CapturedWorkerBuild {
+        authorization: Option<String>,
+        spec_json: String,
+        spec: Option<temps_deployer::build_protocol::BuildSpec>,
+        files: std::collections::BTreeMap<String, String>,
+    }
+
+    /// Stands in for a worker agent's build endpoint. Before answering it
+    /// applies the checks the real agent (`temps_agent::build_handler`)
+    /// applies before handing the context to Docker: the spec must come first
+    /// and pass `BuildSpec::validate`, the context must be a readable tar, and
+    /// the spec's Dockerfile must be in it. Answers with the same NDJSON
+    /// terminal event the agent streams.
+    async fn fake_worker_build(
+        axum::extract::State(captured): axum::extract::State<
+            Arc<std::sync::Mutex<CapturedWorkerBuild>>,
+        >,
+        headers: axum::http::HeaderMap,
+        mut multipart: axum::extract::Multipart,
+    ) -> (axum::http::StatusCode, String) {
+        use axum::http::StatusCode;
+        let refuse = |message: String| (StatusCode::BAD_REQUEST, message);
+        let authorization = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let Ok(Some(spec_field)) = multipart.next_field().await else {
+            return refuse("expected spec field first".into());
+        };
+        if spec_field.name() != Some("spec") {
+            return refuse("expected spec field first".into());
+        }
+        let Ok(spec_json) = spec_field.text().await else {
+            return refuse("unreadable spec".into());
+        };
+        let spec: temps_deployer::build_protocol::BuildSpec = match serde_json::from_str(&spec_json)
+        {
+            Ok(spec) => spec,
+            Err(error) => return refuse(format!("spec is not valid JSON: {error}")),
+        };
+        if let Err(message) = spec.validate() {
+            return refuse(message);
+        }
+        let Ok(Some(context_field)) = multipart.next_field().await else {
+            return refuse("expected context field after spec".into());
+        };
+        let Ok(archive) = context_field.bytes().await else {
+            return refuse("unreadable context".into());
+        };
+        let mut files = std::collections::BTreeMap::new();
+        let mut tar = tar::Archive::new(std::io::Cursor::new(archive.to_vec()));
+        let Ok(entries) = tar.entries() else {
+            return refuse("context is not a tar archive".into());
+        };
+        for entry in entries {
+            let Ok(mut entry) = entry else {
+                return refuse("corrupt context entry".into());
+            };
+            let Ok(path) = entry.path().map(|path| path.to_string_lossy().into_owned()) else {
+                return refuse("unreadable context path".into());
+            };
+            let mut body = Vec::new();
+            if entry.read_to_end(&mut body).is_err() {
+                return refuse(format!("unreadable context file {path}"));
+            }
+            files.insert(path, String::from_utf8_lossy(&body).into_owned());
+        }
+        if !files.contains_key(&spec.dockerfile) {
+            return refuse(format!(
+                "Dockerfile '{}' is absent from the uploaded context",
+                spec.dockerfile
+            ));
+        }
+        let result = temps_deployer::build_protocol::BuildEvent::Result(BuildResult {
+            image_id: "sha256:worker-built".to_string(),
+            image_name: spec.image_name.clone(),
+            size_bytes: 1,
+            build_duration_ms: 1,
+        });
+        let event = match serde_json::to_string(&result) {
+            Ok(event) => event,
+            Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+        };
+        let mut captured = captured.lock().unwrap();
+        captured.authorization = authorization;
+        captured.spec_json = spec_json;
+        captured.spec = Some(spec);
+        captured.files = files;
+        (StatusCode::OK, format!("{event}\n"))
+    }
+
+    /// Issue #1344, end to end on the control-plane side: an ordinary Vite
+    /// source with no Dockerfile, built on a worker with the platform
+    /// variables every build carries plus a runtime-only secret, goes through
+    /// the real `RemoteNodeDeployer` upload to a worker endpoint and builds.
+    /// The worker receives a generated Dockerfile with no `ARG`, the cache
+    /// namespace as the only build input, and no variable value anywhere.
+    #[tokio::test]
+    async fn generated_vite_build_on_a_worker_is_accepted_and_transfers_no_values() {
+        let captured = Arc::new(std::sync::Mutex::new(CapturedWorkerBuild::default()));
+        let app = axum::Router::new()
+            .route(
+                "/agent/images/build",
+                axum::routing::post(fake_worker_build),
+            )
+            .with_state(captured.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let worker = Arc::new(
+            temps_deployer::remote::RemoteNodeDeployer::new(
+                format!("http://{address}"),
+                "worker-token".to_string(),
+                "worker-1".to_string(),
+            )
+            .unwrap(),
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"web","private":true,"scripts":{"build":"vite build"},"devDependencies":{"vite":"^5.0.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("index.html"),
+            "<!doctype html><title>web</title>",
+        )
+        .unwrap();
+        let repo = RepositoryOutput {
+            repo_dir: dir.path().to_path_buf(),
+            checkout_ref: "main".to_string(),
+            repo_owner: "owner".to_string(),
+            repo_name: "web".to_string(),
+        };
+        let mut context = crate::test_utils::create_test_context("wf".to_string(), 1, 1, 1);
+        for (key, value) in [
+            ("repo_dir", repo.repo_dir.display().to_string()),
+            ("checkout_ref", "main".to_string()),
+            ("repo_owner", "owner".to_string()),
+            ("repo_name", "web".to_string()),
+        ] {
+            context.set_output("download_repo", key, value).unwrap();
+        }
+        const SECRET: &str = "postgres://synthetic-user:synthetic-secret@db.internal/app";
+        let job = BuildImageJobBuilder::new()
+            .job_id("build".into())
+            .download_job_id("download_repo".into())
+            .image_tag("web:worker".into())
+            .preset(StoredPreset::Vite)
+            .remote_builder_node_id(7)
+            .build_args(vec![
+                ("HOST".to_string(), "0.0.0.0".to_string()),
+                ("SENTRY_DSN".to_string(), "synthetic-dsn-value".to_string()),
+                ("DATABASE_URL".to_string(), SECRET.to_string()),
+                (
+                    temps_deployer::build_protocol::CACHE_MOUNT_NAMESPACE_ARG.to_string(),
+                    "ns-web-main".to_string(),
+                ),
+            ])
+            .build(worker)
+            .unwrap();
+
+        let output = job
+            .build_image(&repo, &context)
+            .await
+            .expect("a generated Vite build is accepted by the worker");
+        server.abort();
+
+        assert_eq!(output.image_tag, "web:worker");
+        let captured = captured.lock().unwrap();
+        assert_eq!(
+            captured.authorization.as_deref(),
+            Some("Bearer worker-token")
+        );
+        let spec = captured.spec.as_ref().expect("the worker received a spec");
+        assert_eq!(spec.image_name, "web:worker");
+        assert_eq!(spec.cache_namespace.as_deref(), Some("ns-web-main"));
+        let dockerfile = captured
+            .files
+            .get(&spec.dockerfile)
+            .expect("the generated Dockerfile was uploaded");
+        assert!(dockerfile.contains("FROM "), "{dockerfile}");
+        let declared_args: Vec<&str> = dockerfile
+            .lines()
+            .filter(|line| {
+                line.split_whitespace()
+                    .next()
+                    .is_some_and(|word| word.eq_ignore_ascii_case("ARG"))
+            })
+            .collect();
+        assert!(
+            declared_args.is_empty(),
+            "a worker build must declare no ARG: {declared_args:?}\n{dockerfile}"
+        );
+        assert!(captured.files.contains_key("package.json"));
+        assert!(captured.files.contains_key("index.html"));
+        for value in [SECRET, "synthetic-secret", "synthetic-dsn-value"] {
+            assert!(
+                !captured.spec_json.contains(value),
+                "the spec carries '{value}'"
+            );
+            for (path, contents) in &captured.files {
+                assert!(!contents.contains(value), "{path} carries '{value}'");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn worker_build_refuses_npm_credentials_before_writing_context() {
         for key in ["NPM_TOKEN", "NPM_RC"] {

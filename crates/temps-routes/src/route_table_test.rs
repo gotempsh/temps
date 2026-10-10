@@ -33,54 +33,8 @@ mod route_table_tests {
         Ok(())
     }
 
-    /// A restarted control plane continues the persisted route generation
-    /// instead of starting again at 1 below every agent's last ACK.
-    #[tokio::test]
-    async fn test_route_generation_continues_across_restarts(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        use sea_orm::{ConnectionTrait, Statement};
-        let test_db_mock = TestDatabase::with_migrations().await?;
-        let db = test_db_mock.db.clone();
-        let current = |db: Arc<sea_orm::DatabaseConnection>| async move {
-            let row = db
-                .query_one(Statement::from_string(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "SELECT current FROM route_generation WHERE id = 1".to_string(),
-                ))
-                .await?
-                .ok_or("route_generation row missing")?;
-            Ok::<i64, Box<dyn std::error::Error>>(row.try_get::<i64>("", "current")?)
-        };
-
-        let first = CachedPeerTable::new(db.clone());
-        first.load_routes().await?;
-        first.load_routes().await?;
-        assert_eq!(first.current_generation(), 2);
-        assert_eq!(current(db.clone()).await?, 2);
-
-        // A previous process got further than this one ever will on its own.
-        db.execute(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            "UPDATE route_generation SET current = 41 WHERE id = 1".to_string(),
-        ))
-        .await?;
-        let restarted = CachedPeerTable::new(db.clone());
-        restarted.load_routes().await?;
-        assert_eq!(restarted.current_generation(), 42);
-        assert_eq!(current(db.clone()).await?, 42);
-        restarted.load_routes().await?;
-        assert_eq!(restarted.current_generation(), 43);
-
-        // A process that could not read the persisted value numbers from 1,
-        // but must not write that over the durable generation.
-        let unseeded = CachedPeerTable::new(db.clone());
-        unseeded.skip_generation_seed_for_test();
-        unseeded.load_routes().await?;
-        assert_eq!(unseeded.current_generation(), 1);
-        assert_eq!(current(db.clone()).await?, 43);
-
-        Ok(())
-    }
+    // Route generation numbering across restarts, split-mode processes and
+    // concurrent claims is covered by `route_table::route_generation_tests`.
 
     #[tokio::test]
     async fn test_route_table_loads_custom_routes() -> Result<(), Box<dyn std::error::Error>> {

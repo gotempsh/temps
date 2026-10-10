@@ -14504,6 +14504,7 @@ dependencies = [
  "hex",
  "http 1.5.0",
  "log",
+ "mockito",
  "rand 0.10.3",
  "sea-orm 1.1.20",
  "serde",

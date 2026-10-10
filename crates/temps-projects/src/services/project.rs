@@ -657,6 +657,61 @@ fn normalize_project_directory(directory: &str) -> Result<String, ProjectError> 
     Ok(normalized.trim_start_matches("./").to_string())
 }
 
+/// The source location a write would leave a Git project with, as far as the
+/// configuration-time root directory check (issue #1350) needs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceDirectoryTarget<'a> {
+    connection_id: Option<i32>,
+    is_public_repo: bool,
+    git_url: Option<&'a str>,
+    repo_owner: &'a str,
+    repo_name: &'a str,
+    branch: &'a str,
+    /// Already normalized with [`normalize_project_directory`].
+    directory: &'a str,
+}
+
+impl SourceDirectoryTarget<'_> {
+    /// Whether this write changes anything the check depends on compared with
+    /// the stored project. Unchanged sources are not re-checked, so an
+    /// unrelated edit (a preset change re-sending the same directory) is never
+    /// refused because the repository changed underneath the project.
+    fn differs_from(&self, project: &projects::Model) -> bool {
+        // The public flag and URL decide whether (and against which
+        // provider) a connectionless project can be checked at all.
+        self.connection_id != project.git_provider_connection_id
+            || self.is_public_repo != project.is_public_repo
+            || self.git_url != project.git_url.as_deref()
+            || self.repo_owner != project.repo_owner
+            || self.repo_name != project.repo_name
+            || self.branch != project.main_branch
+            || self.directory != normalized_stored_directory(&project.directory)
+    }
+}
+
+/// A stored directory in the normalized form, for change detection. Rows
+/// written before normalization (`"/"`, `"./"`) compare equal to `"."`.
+fn normalized_stored_directory(directory: &str) -> String {
+    normalize_project_directory(directory).unwrap_or_else(|_| directory.to_string())
+}
+
+/// The public provider that can list `git_url`'s repository without
+/// credentials, when there is one.
+///
+/// Only GitHub: its contents API answers unauthenticated requests for public
+/// repositories. Deliberately unauthenticated, so the check can never reveal
+/// anything about a private repository a shared credential could see.
+fn public_directory_provider(git_url: Option<&str>) -> Option<&'static str> {
+    let url = url::Url::parse(git_url?.trim()).ok()?;
+    if !matches!(url.scheme(), "https" | "http") {
+        return None;
+    }
+    match url.host_str()?.to_ascii_lowercase().as_str() {
+        "github.com" | "www.github.com" => Some("github"),
+        _ => None,
+    }
+}
+
 /// Root checkout (`.`) cannot use sparse clone — there is no subdirectory.
 fn pull_only_root_directory_value(
     normalized_directory: &str,
@@ -1066,6 +1121,119 @@ impl ProjectService {
         self
     }
 
+    /// Refuse a root directory the repository provably does not have at the
+    /// configured branch (issue #1350).
+    ///
+    /// Policy: refuse only on proof of absence (see
+    /// `temps_git::services::repository_directory`). A provider that cannot
+    /// be reached, rate limits, has no listing API, or a project without a
+    /// connection or a listable public URL, saves unverified with a warning:
+    /// GitHub being flaky must never stop someone saving a project, and the
+    /// deploy-time check in `download_repo` still explains a missing
+    /// directory against the actual checkout. Bounded by the provider check's
+    /// own timeout, and at most one listing per path component.
+    async fn verify_root_directory_in_repository(
+        &self,
+        project_id: Option<i32>,
+        target: SourceDirectoryTarget<'_>,
+    ) -> Result<(), ProjectError> {
+        use temps_git::RepositoryDirectoryCheck;
+
+        let owner = target.repo_owner.trim();
+        let name = target.repo_name.trim();
+        let branch = target.branch.trim();
+        if target.directory == "."
+            || owner.is_empty()
+            || name.is_empty()
+            || owner == "unknown"
+            || name == "unknown"
+            || branch.is_empty()
+        {
+            return Ok(());
+        }
+        let repository = format!("{owner}/{name}");
+        let check = if let Some(connection_id) = target.connection_id.filter(|id| *id > 0) {
+            self.git_provider_manager
+                .check_repository_directory(connection_id, owner, name, branch, target.directory)
+                .await
+        } else if target.is_public_repo {
+            match public_directory_provider(target.git_url) {
+                Some(provider_name) => match PublicRepoProviderFactory::create(provider_name) {
+                    Ok(provider) => {
+                        temps_git::services::public_repo::check_public_repository_directory(
+                            provider.as_ref(),
+                            owner,
+                            name,
+                            branch,
+                            target.directory,
+                        )
+                        .await
+                    }
+                    Err(error) => RepositoryDirectoryCheck::Unverified {
+                        reason: format!("the {provider_name} public API is unavailable: {error}"),
+                    },
+                },
+                None => RepositoryDirectoryCheck::Unverified {
+                    reason: "only public GitHub repositories can be listed without a Git \
+                             connection"
+                        .to_string(),
+                },
+            }
+        } else {
+            RepositoryDirectoryCheck::Unverified {
+                reason: "the project has no Git connection to list the repository with".to_string(),
+            }
+        };
+        match check {
+            RepositoryDirectoryCheck::Present => {
+                info!(
+                    project_id = ?project_id,
+                    %repository,
+                    branch,
+                    directory = target.directory,
+                    "Root directory '{}' exists in {} on branch '{}'",
+                    target.directory,
+                    repository,
+                    branch
+                );
+                Ok(())
+            }
+            RepositoryDirectoryCheck::Missing(missing) => {
+                warn!(
+                    project_id = ?project_id,
+                    %repository,
+                    branch,
+                    directory = target.directory,
+                    "Refusing root directory '{}': {}",
+                    target.directory,
+                    missing.explanation()
+                );
+                Err(ProjectError::DirectoryNotInRepository {
+                    repository,
+                    branch: branch.to_string(),
+                    directory: target.directory.to_string(),
+                    explanation: missing.explanation(),
+                })
+            }
+            RepositoryDirectoryCheck::Unverified { reason } => {
+                warn!(
+                    project_id = ?project_id,
+                    %repository,
+                    branch,
+                    directory = target.directory,
+                    %reason,
+                    "Saving root directory '{}' for {} on branch '{}' without verifying it \
+                     exists ({}); the first deployment checks it in the checkout",
+                    target.directory,
+                    repository,
+                    branch,
+                    reason
+                );
+                Ok(())
+            }
+        }
+    }
+
     pub async fn create_project(
         &self,
         request: CreateProjectRequest,
@@ -1328,6 +1496,24 @@ impl ProjectService {
                 url: redact_url_password(git_url),
                 reason: e.to_string(),
             })?;
+        }
+
+        // Explain a root directory the repository does not have now, rather
+        // than as a bare ENOENT from the first build (issue #1350).
+        if request.source_type == temps_entities::source_type::SourceType::Git {
+            self.verify_root_directory_in_repository(
+                None,
+                SourceDirectoryTarget {
+                    connection_id: request.git_provider_connection_id,
+                    is_public_repo: request.is_public_repo.unwrap_or(false),
+                    git_url: request.git_url.as_deref(),
+                    repo_owner: request.repo_owner.as_deref().unwrap_or_default(),
+                    repo_name: request.repo_name.as_deref().unwrap_or_default(),
+                    branch: &request.main_branch,
+                    directory: &normalized_directory,
+                },
+            )
+            .await?;
         }
 
         let project = projects::ActiveModel {
@@ -2252,6 +2438,22 @@ impl ProjectService {
 
         let normalized_directory = normalize_project_directory(&request.directory)?;
 
+        if project.source_type == temps_entities::source_type::SourceType::Git {
+            let target = SourceDirectoryTarget {
+                connection_id: project.git_provider_connection_id,
+                is_public_repo: project.is_public_repo,
+                git_url: project.git_url.as_deref(),
+                repo_owner: request.repo_owner.as_deref().unwrap_or("unknown"),
+                repo_name: request.repo_name.as_deref().unwrap_or("unknown"),
+                branch: &request.main_branch,
+                directory: &normalized_directory,
+            };
+            if target.differs_from(&project) {
+                self.verify_root_directory_in_repository(Some(project_id), target)
+                    .await?;
+            }
+        }
+
         let resolved = resolve_preset_selection(
             request.preset.as_str(),
             request.preset_config.as_ref(),
@@ -2805,6 +3007,39 @@ impl ProjectService {
         if let Some(name_value) = new_name.as_deref() {
             if name_value.to_lowercase() != project.name.to_lowercase() {
                 self.ensure_project_name_available(name_value, Some(project_id))
+                    .await?;
+            }
+        }
+        // Same for a root directory the repository does not have (issue
+        // #1350): checked against the source this request would leave the
+        // project with, before any write, and outside every transaction so a
+        // provider round-trip never holds a row lock.
+        if project.source_type == temps_entities::source_type::SourceType::Git
+            && (git_provider_connection_id.is_some()
+                || main_branch.is_some()
+                || repo_owner.is_some()
+                || repo_name.is_some()
+                || directory.is_some())
+        {
+            let normalized_directory = match directory.as_deref() {
+                Some(requested) => normalize_project_directory(requested)?,
+                None => normalized_stored_directory(&project.directory),
+            };
+            let target = SourceDirectoryTarget {
+                connection_id: match git_provider_connection_id {
+                    Some(id) if id > 0 => Some(id),
+                    Some(_) => None,
+                    None => project.git_provider_connection_id,
+                },
+                is_public_repo: project.is_public_repo,
+                git_url: project.git_url.as_deref(),
+                repo_owner: repo_owner.as_deref().unwrap_or(&project.repo_owner),
+                repo_name: repo_name.as_deref().unwrap_or(&project.repo_name),
+                branch: main_branch.as_deref().unwrap_or(&project.main_branch),
+                directory: &normalized_directory,
+            };
+            if target.differs_from(&project) {
+                self.verify_root_directory_in_repository(Some(project_id), target)
                     .await?;
             }
         }
@@ -3490,6 +3725,32 @@ impl ProjectService {
                         )));
                     }
                 }
+            }
+        }
+
+        // The branch exists; now the root directory on it (issue #1350).
+        // This endpoint always makes the project a Git source, so the check
+        // applies whatever the project was before.
+        {
+            let normalized_directory = normalize_project_directory(&directory)?;
+            let target = SourceDirectoryTarget {
+                connection_id: match git_provider_connection_id {
+                    Some(id) if id > 0 => Some(id),
+                    Some(_) => None,
+                    None => old_connection_id,
+                },
+                is_public_repo: is_public_repo.unwrap_or(project.is_public_repo),
+                git_url: git_url.as_deref().or(project.git_url.as_deref()),
+                repo_owner: &repo_owner,
+                repo_name: &repo_name,
+                branch: &main_branch,
+                directory: &normalized_directory,
+            };
+            if target.differs_from(&project)
+                || project.source_type != temps_entities::source_type::SourceType::Git
+            {
+                self.verify_root_directory_in_repository(Some(project_id), target)
+                    .await?;
             }
         }
 
@@ -12252,6 +12513,248 @@ mod tests {
                 Err(ProjectError::GitProviderConnectionNotFound { .. })
             ),
             "connection created by a different user was rejected; connections must be installation-scoped, not user-scoped"
+        );
+    }
+
+    // ── Root directory checked against the repository (issue #1350) ─────
+
+    #[test]
+    fn only_public_github_https_urls_are_listed_without_a_connection() {
+        for (url, expected) in [
+            ("https://github.com/example/monorepo", Some("github")),
+            ("https://github.com/example/monorepo.git", Some("github")),
+            ("https://WWW.GitHub.com/example/monorepo", Some("github")),
+            ("https://gitlab.com/example/monorepo", None),
+            ("https://github.com.example.net/example/monorepo", None),
+            ("git@github.com:example/monorepo.git", None),
+            ("ssh://git@github.com/example/monorepo", None),
+            ("not a url", None),
+        ] {
+            assert_eq!(public_directory_provider(Some(url)), expected, "{url}");
+        }
+        assert_eq!(public_directory_provider(None), None);
+    }
+
+    #[test]
+    fn a_source_is_rechecked_only_when_its_location_changes() {
+        let project = temps_entities::projects::Model {
+            git_provider_connection_id: Some(3),
+            repo_owner: "example".to_string(),
+            repo_name: "monorepo".to_string(),
+            main_branch: "main".to_string(),
+            // Stored before normalization existed.
+            directory: "./apps/api".to_string(),
+            ..project_for_hosting_lock_test("directory-check")
+        };
+        let same = SourceDirectoryTarget {
+            connection_id: Some(3),
+            is_public_repo: false,
+            git_url: None,
+            repo_owner: "example",
+            repo_name: "monorepo",
+            branch: "main",
+            directory: "apps/api",
+        };
+        assert!(!same.differs_from(&project));
+        for changed in [
+            SourceDirectoryTarget {
+                directory: "apps/web",
+                ..same
+            },
+            SourceDirectoryTarget {
+                branch: "release",
+                ..same
+            },
+            SourceDirectoryTarget {
+                repo_owner: "other",
+                ..same
+            },
+            SourceDirectoryTarget {
+                repo_name: "other",
+                ..same
+            },
+            SourceDirectoryTarget {
+                connection_id: Some(4),
+                ..same
+            },
+            // A connectionless project moved to a public URL (or between
+            // providers) is checked against the new repository.
+            SourceDirectoryTarget {
+                is_public_repo: true,
+                ..same
+            },
+            SourceDirectoryTarget {
+                git_url: Some("https://github.com/example/monorepo"),
+                ..same
+            },
+        ] {
+            assert!(changed.differs_from(&project), "{changed:?}");
+        }
+    }
+
+    /// A save that points the root directory at a path the repository does
+    /// not have is refused with the repository, branch and what is there
+    /// instead; a path that exists saves; an unreachable provider saves too.
+    #[tokio::test]
+    async fn root_directory_changes_are_checked_against_the_repository() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        use temps_entities::{git_provider_connections, git_providers};
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+
+        let mut server = mockito::Server::new_async().await;
+        let listing = |entries: &[(&str, &str)]| {
+            serde_json::Value::Array(
+                entries
+                    .iter()
+                    .map(|(name, kind)| serde_json::json!({ "name": name, "path": name, "type": kind }))
+                    .collect(),
+            )
+            .to_string()
+        };
+        let main_ref = || mockito::Matcher::UrlEncoded("ref".into(), "main".into());
+        server
+            .mock("GET", "/repos/example/monorepo/contents/")
+            .match_query(main_ref())
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(listing(&[("apps", "dir"), ("README.md", "file")]))
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/repos/example/monorepo/contents/apps")
+            .match_query(main_ref())
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(listing(&[("api", "dir"), ("web", "dir")]))
+            .create_async()
+            .await;
+
+        let encryption = temps_core::EncryptionService::new(
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
+        let provider = git_providers::ActiveModel {
+            name: Set("Directory Check Provider".to_string()),
+            provider_type: Set("github".to_string()),
+            base_url: Set(None),
+            api_url: Set(Some(server.url())),
+            auth_method: Set("pat".to_string()),
+            auth_config: Set(serde_json::json!({
+                "PersonalAccessToken": { "token": "synthetic-token" }
+            })),
+            webhook_secret: Set(None),
+            is_active: Set(true),
+            is_default: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let connection = git_provider_connections::ActiveModel {
+            provider_id: Set(provider.id),
+            user_id: Set(None),
+            account_name: Set("example".to_string()),
+            account_type: Set("User".to_string()),
+            access_token: Set(Some(encryption.encrypt_string("synthetic-token").unwrap())),
+            refresh_token: Set(None),
+            token_expires_at: Set(None),
+            refresh_token_expires_at: Set(None),
+            installation_id: Set(None),
+            metadata: Set(None),
+            is_active: Set(true),
+            is_expired: Set(false),
+            syncing: Set(false),
+            last_synced_at: Set(None),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Directory Check Project".to_string()),
+            slug: Set("directory-check-project".to_string()),
+            repo_name: Set("monorepo".to_string()),
+            repo_owner: Set("example".to_string()),
+            directory: Set(".".to_string()),
+            git_provider_connection_id: Set(Some(connection.id)),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let stored_directory = |db: Arc<temps_database::DbConnection>, id: i32| async move {
+            temps_entities::projects::Entity::find_by_id(id)
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .unwrap()
+                .directory
+        };
+
+        let Err(error) = project_service
+            .update_project_settings(
+                project.id,
+                UpdateProjectSettingsParams {
+                    directory: Some("apps/apii".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+        else {
+            panic!("a directory the repository does not have must be refused");
+        };
+        assert!(
+            matches!(error, ProjectError::DirectoryNotInRepository { .. }),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        for expected in [
+            "'apps/apii'",
+            "example/monorepo",
+            "branch 'main'",
+            "'apps' has no 'apii'; it contains: api, web",
+        ] {
+            assert!(
+                message.contains(expected),
+                "{expected} missing from: {message}"
+            );
+        }
+        assert_eq!(stored_directory(db.clone(), project.id).await, ".");
+
+        project_service
+            .update_project_settings(
+                project.id,
+                UpdateProjectSettingsParams {
+                    directory: Some("apps/api".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("a directory the repository has is saved");
+        assert_eq!(stored_directory(db.clone(), project.id).await, "apps/api");
+
+        // The provider going away must not block saving.
+        drop(server);
+        project_service
+            .update_project_settings(
+                project.id,
+                UpdateProjectSettingsParams {
+                    directory: Some("apps/worker".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("an unreachable provider saves unverified");
+        assert_eq!(
+            stored_directory(db.clone(), project.id).await,
+            "apps/worker"
         );
     }
 

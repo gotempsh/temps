@@ -434,6 +434,12 @@ impl ProxyCommand {
             db.clone(),
             runtime_context.clone(),
         ));
+        // Split topology (ADR-017): `temps serve` answers the workers'
+        // route-sync polls and is the only writer of `route_generation`, the
+        // generation the deployment completion gate waits for every worker to
+        // ACK. This process reloads the same routes but its reload count is
+        // unrelated to the one workers see, so it must never write that row.
+        route_table.set_route_generation_role(temps_routes::RouteGenerationRole::Local);
 
         // Split topology (ADR-017): this process never runs the Traefik label
         // discovery watcher — `temps serve` owns the single writer per Docker

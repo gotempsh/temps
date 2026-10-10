@@ -130,6 +130,53 @@ pub trait PublicRepoProvider: Send + Sync {
         path: &str,
         reference: &str,
     ) -> Result<FileContent, PublicRepoError>;
+
+    /// List one directory level at `path` (`""` is the root) at `reference`.
+    ///
+    /// Used to check a configured root directory before it is saved. Providers
+    /// without an implementation answer `ProviderNotSupported`, which callers
+    /// treat as "cannot verify", never as "missing".
+    async fn list_directory(
+        &self,
+        _owner: &str,
+        _repo: &str,
+        _path: &str,
+        _reference: &str,
+    ) -> Result<Vec<crate::services::repository_directory::DirectoryListingEntry>, PublicRepoError>
+    {
+        Err(PublicRepoError::ProviderNotSupported(format!(
+            "{} public repositories cannot list directories",
+            self.provider_name()
+        )))
+    }
+}
+
+/// Check that `directory` exists in a public repository at `reference`,
+/// bounded by `REPOSITORY_DIRECTORY_CHECK_TIMEOUT`. Never fails; see
+/// [`crate::services::repository_directory`] for when it refuses.
+pub async fn check_public_repository_directory(
+    provider: &dyn PublicRepoProvider,
+    owner: &str,
+    repo: &str,
+    reference: &str,
+    directory: &str,
+) -> crate::services::repository_directory::RepositoryDirectoryCheck {
+    use crate::services::repository_directory::{
+        check_repository_directory, RepositoryDirectoryCheck, REPOSITORY_DIRECTORY_CHECK_TIMEOUT,
+    };
+    let walk = check_repository_directory(directory, |path| async move {
+        provider.list_directory(owner, repo, &path, reference).await
+    });
+    match tokio::time::timeout(REPOSITORY_DIRECTORY_CHECK_TIMEOUT, walk).await {
+        Ok(check) => check,
+        Err(_) => RepositoryDirectoryCheck::Unverified {
+            reason: format!(
+                "listing public repository {owner}/{repo} at '{reference}' did not finish \
+                 within {}s",
+                REPOSITORY_DIRECTORY_CHECK_TIMEOUT.as_secs()
+            ),
+        },
+    }
 }
 
 /// GitHub public repository provider
@@ -525,6 +572,64 @@ impl PublicRepoProvider for GitHubPublicProvider {
             content: file.content,
             encoding: file.encoding,
         })
+    }
+
+    async fn list_directory(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        reference: &str,
+    ) -> Result<Vec<crate::services::repository_directory::DirectoryListingEntry>, PublicRepoError>
+    {
+        let encoded_path = path
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .map(|segment| urlencoding::encode(segment).into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        let url = format!(
+            "{}/repos/{}/{}/contents/{}?ref={}",
+            self.api_url,
+            owner,
+            repo,
+            encoded_path,
+            urlencoding::encode(reference)
+        );
+        let display_path = if path.is_empty() { "/" } else { path };
+        let response = Self::validate_response(
+            self.send_with_retry(|| self.client.get(&url)).await?,
+            self.token.is_some(),
+            &format!(
+                "list directory '{}' in {}/{} at {}",
+                display_path, owner, repo, reference
+            ),
+        )
+        .await?;
+
+        // A directory is a JSON array; anything else (a file's object) is not
+        // a directory listing.
+        #[derive(Deserialize)]
+        struct GitHubContentItem {
+            name: String,
+            #[serde(rename = "type")]
+            item_type: String,
+        }
+        let items: Vec<GitHubContentItem> = response.json().await.map_err(|e| {
+            PublicRepoError::ApiError(format!(
+                "Failed to parse the listing of '{}' in {}/{} at {}: {}",
+                display_path, owner, repo, reference, e
+            ))
+        })?;
+        Ok(items
+            .into_iter()
+            .map(
+                |item| crate::services::repository_directory::DirectoryListingEntry {
+                    is_dir: item.item_type == "dir",
+                    name: item.name,
+                },
+            )
+            .collect())
     }
 }
 
@@ -1378,6 +1483,89 @@ mod tests {
                 if name == "example/private-repository"
         ));
         repository.assert_async().await;
+    }
+
+    /// Issue #1350: a public GitHub repository's root directory is checked
+    /// one listing per component, refused only when a listed parent lacks it,
+    /// and never refused because the API is unavailable.
+    #[tokio::test]
+    async fn github_public_directory_check_lists_each_component() {
+        use crate::services::repository_directory::RepositoryDirectoryCheck;
+        let mut server = mockito::Server::new_async().await;
+        let listing = |entries: &[(&str, &str)]| {
+            serde_json::Value::Array(
+                entries
+                    .iter()
+                    .map(|(name, kind)| serde_json::json!({ "name": name, "type": kind }))
+                    .collect(),
+            )
+            .to_string()
+        };
+        let root = server
+            .mock("GET", "/repos/example/monorepo/contents/")
+            .match_query(mockito::Matcher::UrlEncoded("ref".into(), "main".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(listing(&[
+                ("apps", "dir"),
+                ("docs", "dir"),
+                ("README.md", "file"),
+            ]))
+            .expect(2)
+            .create_async()
+            .await;
+        let apps = server
+            .mock("GET", "/repos/example/monorepo/contents/apps")
+            .match_query(mockito::Matcher::UrlEncoded("ref".into(), "main".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(listing(&[
+                ("api", "dir"),
+                ("web", "dir"),
+                ("shared", "symlink"),
+            ]))
+            .expect(2)
+            .create_async()
+            .await;
+        let provider =
+            GitHubPublicProvider::with_token_and_api_url("unused".to_string(), server.url());
+
+        assert_eq!(
+            check_public_repository_directory(&provider, "example", "monorepo", "main", "apps/api")
+                .await,
+            RepositoryDirectoryCheck::Present
+        );
+        let RepositoryDirectoryCheck::Missing(missing) = check_public_repository_directory(
+            &provider,
+            "example",
+            "monorepo",
+            "main",
+            "apps/apii",
+        )
+        .await
+        else {
+            panic!("expected the missing component to be reported");
+        };
+        assert_eq!(
+            missing.explanation(),
+            "'apps' has no 'apii'; it contains: api, web"
+        );
+        root.assert_async().await;
+        apps.assert_async().await;
+
+        // An unknown branch or a rate limit is not proof of absence.
+        let limited = server
+            .mock("GET", "/repos/example/monorepo/contents/")
+            .match_query(mockito::Matcher::UrlEncoded("ref".into(), "gone".into()))
+            .with_status(429)
+            .create_async()
+            .await;
+        assert!(matches!(
+            check_public_repository_directory(&provider, "example", "monorepo", "gone", "apps")
+                .await,
+            RepositoryDirectoryCheck::Unverified { .. }
+        ));
+        limited.assert_async().await;
     }
 
     #[tokio::test]

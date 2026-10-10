@@ -20,8 +20,11 @@
 //! deltas-and-tombstones protocol would save bytes but cost a more
 //! complex apply path on the agent. We optimise for *correctness under
 //! restart and reconnect*: the agent can hydrate from a single snapshot
-//! and never has to reconcile partial state. CP restart resets the
-//! generation counter; agents detect (`current < applied`) and re-fetch.
+//! and never has to reconcile partial state. The generation is claimed
+//! from the durable `route_generation` row by this process alone (see
+//! `RouteGenerationRole`), so it continues across CP restarts; a `since`
+//! that differs from the current generation (e.g. after a database
+//! restore) returns at once and the agent re-fetches.
 //!
 //! ## Auth
 //!
