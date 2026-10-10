@@ -8089,21 +8089,21 @@ RETURNING id
         let differs = |supplied: &Option<String>, stored: &str| {
             supplied.as_deref().is_some_and(|value| value != stored)
         };
-        // Stored credentials are only decrypted when one was supplied.
-        let credential_changed = |supplied: &Option<String>, field: &str, stored: &str| {
-            supplied
-                .as_deref()
-                .map(|value| decrypt(field, stored).map(|stored| value != stored))
-                .transpose()
-                .map(|changed| changed.unwrap_or(false))
+        // A stored credential is only decrypted when a replacement was
+        // supplied, to compare them. One that cannot be decrypted any more
+        // (a changed server key, damaged data) is being replaced, which is
+        // exactly how an operator repairs it, so it counts as a change.
+        let credential_changed = |supplied: &Option<String>, stored: &str| {
+            supplied.as_deref().is_some_and(|value| {
+                match self.encryption_service.decrypt_string(stored) {
+                    Ok(stored) => value != stored,
+                    Err(_) => true,
+                }
+            })
         };
         let connection_changed = differs(&request.bucket_name, &current.bucket_name)
-            || credential_changed(
-                &request.access_key_id,
-                "access key ID",
-                &current.access_key_id,
-            )?
-            || credential_changed(&request.secret_key, "secret key", &current.secret_key)?
+            || credential_changed(&request.access_key_id, &current.access_key_id)
+            || credential_changed(&request.secret_key, &current.secret_key)
             || differs(&request.region, &current.region)
             || request
                 .endpoint
@@ -13354,6 +13354,48 @@ mod tests {
             db.into_transaction_log().len(),
             1,
             "only the source lookup may run; nothing is written"
+        );
+    }
+
+    /// Stored credentials that can no longer be decrypted (a changed server
+    /// key, damaged data) are repaired by replacing them: supplying both
+    /// replacements must not fail on reading the old ones. Here the new
+    /// endpoint is unreachable, so reaching the connectivity check (and
+    /// failing there, with nothing saved) proves the update got past them.
+    #[tokio::test]
+    async fn test_update_s3_source_replaces_credentials_that_cannot_be_decrypted() {
+        let encryption = EncryptionService::new("test_encryption_key_1234567890ab").unwrap();
+        let mut source = operator_s3_source(&encryption);
+        source.access_key_id = "not-decryptable".to_string();
+        source.secret_key = "not-decryptable-either".to_string();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![source]])
+                .into_connection(),
+        );
+        let Ok(service) = build_service_for_mock(db.clone()) else {
+            return;
+        };
+
+        let error = service
+            .update_s3_source(
+                31,
+                crate::handlers::backup_handler::UpdateS3SourceRequest {
+                    name: None,
+                    bucket_name: None,
+                    bucket_path: None,
+                    access_key_id: Some("new-access-key".to_string()),
+                    secret_key: Some("new-secret-key".to_string()),
+                    region: None,
+                    endpoint: Some("http://temps-s3-probe.invalid:9000".to_string()),
+                    force_path_style: None,
+                },
+            )
+            .await
+            .expect_err("the new endpoint is unreachable");
+        assert!(
+            matches!(error, BackupError::S3Unreachable { .. }),
+            "replacing undecryptable credentials must reach the connectivity check: {error:?}"
         );
     }
 
