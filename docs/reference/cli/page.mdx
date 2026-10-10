@@ -1111,7 +1111,7 @@ Create a backup schedule
 | -------------------------- | ------------------------------------------ | ------- | -------- |
 | `-n, --name <name>`        | Schedule name                              | -       | Yes      |
 | `-t, --type <type>`        | Backup type (full, incremental)            | -       | Yes      |
-| `-s, --schedule <cron>`    | Schedule expression (cron format)          | -       | Yes      |
+| `-s, --schedule <cron>`    | Schedule expression: six-field cron with seconds first, e.g. `0 0 2 * * *` | -       | No       |
 | `-r, --retention <days>`   | Retention period in days                   | -       | Yes      |
 | `-d, --description <desc>` | Description                                | -       | Yes      |
 | `--s3-source-id <id>`      | S3 Source ID                               | -       | Yes      |
@@ -4625,8 +4625,8 @@ bunx @temps-sdk/cli projects create --name my-app
 # Deploy to production
 bunx @temps-sdk/cli deploy --project my-app --environment production
 
-# View deployment logs
-bunx @temps-sdk/cli logs --project my-app --follow
+# View deployment build logs
+bunx @temps-sdk/cli deployments logs --project my-app --follow
 
 # Stream runtime container logs
 bunx @temps-sdk/cli runtime-logs --project my-app
@@ -4641,8 +4641,8 @@ bunx @temps-sdk/cli containers list --project-id 1 --environment-id 1
 # List environments
 bunx @temps-sdk/cli environments list --project my-app
 
-# Set environment variables
-bunx @temps-sdk/cli environments vars set --project my-app --key DATABASE_URL --value "postgres://..."
+# Set an environment variable (prompts for the value, so it stays out of shell history)
+bunx @temps-sdk/cli environments vars set --project my-app DATABASE_URL --environments production
 
 # View environment variables
 bunx @temps-sdk/cli environments vars list --project my-app
@@ -4651,14 +4651,17 @@ bunx @temps-sdk/cli environments vars list --project my-app
 ### Managing Domains
 
 ```bash
-# Add a custom domain
-bunx @temps-sdk/cli domains add --project my-app --domain app.example.com
+# Request a certificate for a domain
+bunx @temps-sdk/cli domains add --domain app.example.com
+
+# Route the domain to a project environment
+bunx @temps-sdk/cli custom-domains create --project-id 1 --environment-id 1 --domain app.example.com
 
 # List domains
-bunx @temps-sdk/cli domains list --project my-app
+bunx @temps-sdk/cli domains list
 
 # Remove a domain
-bunx @temps-sdk/cli domains remove --project my-app --domain app.example.com
+bunx @temps-sdk/cli domains remove --domain app.example.com
 ```
 
 ## Environment Variables

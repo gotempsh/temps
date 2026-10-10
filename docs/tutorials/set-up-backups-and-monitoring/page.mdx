@@ -147,29 +147,25 @@ Check that files were written to your S3 bucket. The backup is stored at:
 
 There is also an index file at `{bucket_path}/backups/index.json` that lists all backups.
 
-### Verify from the CLI
+### Verify from the command line
 
-If you have the Temps CLI installed, you can list backups directly from S3:
-
-```bash
-bunx @temps-sdk/cli backup list \
-  --access-key-id YOUR_ACCESS_KEY \
-  --secret-access-key YOUR_SECRET_KEY \
-  --bucket-name your-backup-bucket \
-  --bucket-path backups \
-  --region us-east-1
-```
-
-For non-AWS providers, add `--endpoint` and `--force-path-style`:
+The `temps backup` commands belong to the **Temps server binary** installed on your host, not to `bunx @temps-sdk/cli`. They read the bucket directly, so they work even when Temps is down. Pass credentials through environment variables so they stay out of your shell history and the process list:
 
 ```bash
-bunx @temps-sdk/cli backup list \
-  --access-key-id YOUR_ACCESS_KEY \
-  --secret-access-key YOUR_SECRET_KEY \
-  --bucket-name your-backup-bucket \
-  --endpoint https://your-minio-server:9000 \
-  --force-path-style
+export S3_BUCKET_NAME='your-backup-bucket'
+export S3_BUCKET_PATH='backups'
+export S3_REGION='us-east-1'
+export S3_FORCE_PATH_STYLE='false'   # AWS S3; use 'true' for MinIO, RustFS and most other providers
+# export S3_ENDPOINT='https://your-minio-server:9000'   # non-AWS providers only
+
+printf 'S3 access key: '; IFS= read -r S3_ACCESS_KEY_ID; export S3_ACCESS_KEY_ID
+printf 'S3 secret key: '; stty -echo; IFS= read -r S3_SECRET_ACCESS_KEY; stty echo; printf '\n'
+export S3_SECRET_ACCESS_KEY
+
+temps backup list
 ```
+
+While Temps is running, `bunx @temps-sdk/cli backups sources backups --id <source-id>` lists the backups Temps recorded for that source, from your workstation.
 
 ---
 
@@ -446,67 +442,85 @@ The point of backups is restoring from them. Test this now while everything is w
 
 ### Restore via the CLI
 
-The CLI is the primary way to restore backups. It handles downloading from S3, decompressing, and restoring both the Temps database and all managed services.
+A full restore uses the **Temps server binary** on the host (`temps backup …`), not `bunx @temps-sdk/cli`. It downloads the recovery set from S3, restores the Temps database and the managed services, and installs the instance's encryption secrets. The complete procedure, including what to check before and after, is in [Restore a Temps instance from S3](/docs/restore-instance-from-s3); the short version is:
 
-**Step 1: List available backups**
+**Step 1: Set the S3 and database variables**
 
-```bash
-bunx @temps-sdk/cli backup list \
-  --access-key-id YOUR_ACCESS_KEY \
-  --secret-access-key YOUR_SECRET_KEY \
-  --bucket-name your-backup-bucket \
-  --region us-east-1
-```
-
-Note the `backup-id` (UUID) of the backup you want to restore.
-
-**Step 2: Restore the full backup**
+Export the `S3_*` variables shown earlier under **Verify from the command line**, then point the restore at the Temps database and data directory:
 
 ```bash
-bunx @temps-sdk/cli backup restore \
-  --access-key-id YOUR_ACCESS_KEY \
-  --secret-access-key YOUR_SECRET_KEY \
-  --bucket-name your-backup-bucket \
-  --region us-east-1 \
-  --database-url "postgres://user:password@localhost:16432/temps" \
-  --backup-id YOUR_BACKUP_UUID
+export TEMPS_DATABASE_URL='postgresql://temps:REDACTED@127.0.0.1:5432/temps'
+export TEMPS_DATA_DIR='/var/lib/temps'
 ```
 
-This command:
-
-1. Downloads the backup from S3
-2. Decompresses the database dump
-3. Restores the Temps PostgreSQL database using `pg_restore`
-4. Restores all managed service backups (PostgreSQL databases, MariaDB databases, Redis instances, etc.)
-
-**Step 3: Restart Temps**
-
-After a restore, restart the Temps service to pick up the restored data:
+**Step 2: Pick a backup and validate it**
 
 ```bash
-sudo systemctl restart temps
+temps backup list
+export BACKUP_ID='00000000-0000-4000-8000-000000000000'   # from the Backup ID column
+
+# Read-only check of the recovery set and the target
+temps backup restore --backup-id "$BACKUP_ID" --dry-run
 ```
+
+Do not continue if the dry run fails. Fix the reported problem or pick another backup, then rerun it.
+
+**Step 3: Stop Temps**
+
+The restore replaces the Temps database and the instance's secret files, so nothing may write to them while it runs. Stop every Temps process, but leave PostgreSQL and Docker running:
+
+```bash
+sudo systemctl stop temps
+sudo systemctl stop temps-proxy 2>/dev/null || true
+
+# Must print `inactive` or `failed` before you continue
+sudo systemctl is-active temps
+```
+
+Do not run the restore while `temps serve` is still active.
+
+**Step 4: Restore**
+
+```bash
+temps backup restore --backup-id "$BACKUP_ID"
+```
+
+**Step 5: Start Temps**
+
+Start Temps on the restored data and check its startup log:
+
+```bash
+sudo systemctl start temps
+sudo journalctl -u temps -n 200 --no-pager
+```
+
+If you run the separate proxy service, start it once your applications are back:
+
+```bash
+sudo systemctl start temps-proxy
+```
+
+See [Start and verify Temps](/docs/restore-instance-from-s3#start-and-verify-temps) for the checks to run before sending traffic back.
 
 ### Restore a single managed service
 
-If you only need to restore one specific service (e.g. a PostgreSQL database that was corrupted), use `restore-service`:
+If you only need to restore one specific service (e.g. a PostgreSQL database that was corrupted) and Temps is running, restore it through the API from your workstation; see [Backups](/docs/backups):
 
 ```bash
-bunx @temps-sdk/cli backup restore-service \
-  --access-key-id YOUR_ACCESS_KEY \
-  --secret-access-key YOUR_SECRET_KEY \
-  --bucket-name your-backup-bucket \
-  --region us-east-1 \
-  --backup-id YOUR_BACKUP_UUID \
-  --service-name my-postgres-db \
-  --encryption-key YOUR_TEMPS_ENCRYPTION_KEY
+bunx @temps-sdk/cli services restore --id <service-id> --backup-id <backup-id>
 ```
 
-The `--encryption-key` is needed because managed service connection credentials are encrypted at rest. You can find it in your Temps configuration.
+If Temps itself is down, the server binary can restore a single service straight from S3. With the `S3_*` and `TEMPS_DATABASE_URL` variables from above exported:
 
-<Note>
-For non-AWS S3 providers, add `--endpoint` and `--force-path-style` to all CLI commands, just as you did when listing backups.
-</Note>
+```bash
+# The service's name as shown in the Temps console, e.g. postgres-heex
+printf 'Temps encryption key: '; stty -echo; IFS= read -r TEMPS_ENCRYPTION_KEY; stty echo; printf '\n'
+export TEMPS_ENCRYPTION_KEY
+
+temps backup restore-service --backup-id "$BACKUP_ID" --service-name postgres-heex
+```
+
+The encryption key is needed because managed service connection credentials are encrypted at rest. It is the `encryption_key` file in your Temps data directory.
 
 ---
 

@@ -489,14 +489,18 @@ Each execution includes:
 
 ### View Logs
 
-Check your application logs to see cron job execution:
+Check the execution history and your application logs to see cron job execution:
 
 ```bash
-# View deployment logs
-temps logs --project my-app --environment production
+# Cron jobs of an environment, then the run history of one of them
+temps environments crons list --project my-app --environment production
+temps environments crons executions --project my-app --environment production --id 7
 
-# Filter for cron-related logs
-temps logs --project my-app | grep "cron"
+# Your application's own output while it handles the cron request
+temps runtime-logs --project my-app --environment production --tail 200
+
+# Search collected logs for cron-related lines in the last day
+temps logs search --project my-app --env production --text cron --since 24h
 ```
 
 ---

@@ -45,8 +45,8 @@ Show deployment status
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID (required) | - | No |
-| `-d, --deployment-id <id>` | Deployment ID (required) | - | No |
+| `-p, --project <project>` | Project slug or ID (defaults to the linked project) | - | No |
+| `-d, --deployment-id <id>` | Deployment ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
 ### `deployments rollback`
@@ -57,7 +57,7 @@ Rollback to previous deployment
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID (required) | - | No |
+| `-p, --project <project>` | Project slug or ID (defaults to the linked project) | - | No |
 | `-e, --environment <env>` | Target environment | `production` | No |
 | `--to <deployment>` | Rollback to specific deployment ID | - | No |
 

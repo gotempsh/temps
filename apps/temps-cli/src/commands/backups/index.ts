@@ -188,7 +188,7 @@ export function registerBackupsCommands(program: Command): void {
     .description('Create a backup schedule')
     .option('-n, --name <name>', 'Schedule name')
     .option('-t, --type <type>', 'Backup type (full, incremental)')
-    .option('-s, --schedule <cron>', 'Schedule expression (cron format)')
+    .option('-s, --schedule <cron>', 'Schedule expression: six-field cron with seconds first, e.g. "0 0 2 * * *"')
     .option('-r, --retention <days>', 'Retention period in days')
     .option('-d, --description <desc>', 'Description')
     .option('--s3-source-id <id>', 'S3 Source ID')
@@ -357,7 +357,7 @@ async function listSchedules(options: { json?: boolean }): Promise<void> {
 
   if (schedules.length === 0) {
     info('No backup schedules configured')
-    info('Run: temps backups schedules create --name daily-backup --type full --schedule "0 2 * * *" --retention 30 --s3-source-id 1 -y')
+    info('Run: temps backups schedules create --name daily-backup --type full --schedule "0 0 2 * * *" --retention 30 --s3-source-id 1 -y')
     newline()
     return
   }
@@ -422,8 +422,8 @@ async function createSchedule(options: CreateScheduleOptions): Promise<void> {
     })
 
     scheduleExpression = options.schedule || await promptText({
-      message: 'Schedule expression (cron format, e.g., 0 2 * * * for daily at 2 AM)',
-      default: '0 2 * * *',
+      message: 'Schedule expression (cron with seconds first, e.g., 0 0 2 * * * for daily at 2 AM)',
+      default: '0 0 2 * * *',
       required: true,
     })
 

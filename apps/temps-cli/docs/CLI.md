@@ -2,7 +2,7 @@
 
 > Auto-generated documentation for the Temps CLI.
 >
-> Generated on: 2026-10-09
+> Generated on: 2026-10-10
 
 ## Installation
 
@@ -405,8 +405,8 @@ Show deployment status
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID (required) | - | No |
-| `-d, --deployment-id <id>` | Deployment ID (required) | - | No |
+| `-p, --project <project>` | Project slug or ID (defaults to the linked project) | - | No |
+| `-d, --deployment-id <id>` | Deployment ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
 ### `deployments rollback`
@@ -417,7 +417,7 @@ Rollback to previous deployment
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID (required) | - | No |
+| `-p, --project <project>` | Project slug or ID (defaults to the linked project) | - | No |
 | `-e, --environment <env>` | Target environment | `production` | No |
 | `--to <deployment>` | Rollback to specific deployment ID | - | No |
 
@@ -1279,7 +1279,7 @@ Create a backup schedule
 |------|-------------|---------|----------|
 | `-n, --name <name>` | Schedule name | - | No |
 | `-t, --type <type>` | Backup type (full, incremental) | - | No |
-| `-s, --schedule <cron>` | Schedule expression (cron format) | - | No |
+| `-s, --schedule <cron>` | Schedule expression: six-field cron with seconds first, e.g. "0 0 2 * * *" | - | No |
 | `-r, --retention <days>` | Retention period in days | - | No |
 | `-d, --description <desc>` | Description | - | No |
 | `--s3-source-id <id>` | S3 Source ID | - | No |

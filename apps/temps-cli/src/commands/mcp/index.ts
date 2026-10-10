@@ -88,7 +88,7 @@ async function ensureMcpAuth(opts: { yes?: boolean; urlOverride?: string } = {})
       default: true,
     })
     if (!wantsLogin) {
-      console.error(`Not authenticated to ${opts.urlOverride}. Please run: temps login --url ${opts.urlOverride}`)
+      console.error(`Not authenticated to ${opts.urlOverride}. Please run: temps login ${opts.urlOverride}`)
       process.exit(1)
     }
 

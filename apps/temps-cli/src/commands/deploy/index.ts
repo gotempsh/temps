@@ -131,15 +131,15 @@ export function registerDeployCommands(program: Command): void {
   deployments
     .command('status')
     .description('Show deployment status')
-    .option('-p, --project <project>', 'Project slug or ID (required)')
-    .option('-d, --deployment-id <id>', 'Deployment ID (required)')
+    .option('-p, --project <project>', 'Project slug or ID (defaults to the linked project)')
+    .requiredOption('-d, --deployment-id <id>', 'Deployment ID')
     .option('--json', 'Output in JSON format')
     .action(status)
 
   deployments
     .command('rollback')
     .description('Rollback to previous deployment')
-    .option('-p, --project <project>', 'Project slug or ID (required)')
+    .option('-p, --project <project>', 'Project slug or ID (defaults to the linked project)')
     .option('-e, --environment <env>', 'Target environment', 'production')
     .option('--to <deployment>', 'Rollback to specific deployment ID')
     .action(rollback)

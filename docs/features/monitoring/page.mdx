@@ -57,28 +57,50 @@ The monitoring dashboard shows:
 
 ### Via API
 
-Access metrics programmatically using the API:
+Resource metrics are reported per container. First list the containers of an environment to get a `container_id`, then read its metrics:
 
 ```bash
-# Get real-time metrics for an environment
+# List the containers of an environment
 curl -H "Authorization: Bearer YOUR_TOKEN" \
-  "https://your-temps-instance.com/api/projects/{project_id}/environments/{environment_id}/metrics"
+  "https://your-temps-instance.com/api/projects/{project_id}/environments/{environment_id}/containers"
+
+# Current CPU, memory and network usage of one container
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  "https://your-temps-instance.com/api/projects/{project_id}/environments/{environment_id}/containers/{container_id}/metrics"
 ```
 
 The API returns:
 
 ```json
 {
-  "requests_total": 1523,
-  "requests_rate": 12.5,
-  "response_time_avg_ms": 45,
+  "container_id": "3f2a9c1b7e4d",
+  "container_name": "my-app-production-web",
   "cpu_percent": 23.5,
+  "cpu_limit_cores": 1.0,
   "memory_bytes": 268435456,
-  "memory_percent": 52.0,
-  "network_rx_bytes_per_sec": 1024,
-  "network_tx_bytes_per_sec": 2048
+  "memory_limit_bytes": 536870912,
+  "memory_percent": 50.0,
+  "network_rx_bytes": 1048576,
+  "network_tx_bytes": 2097152,
+  "timestamp": "2026-01-15T12:15:47.609192Z"
 }
 ```
+
+`cpu_percent` follows the Docker convention: `200` means two cores fully used. `memory_percent` and `memory_limit_bytes` are `null` when the container has no memory limit. Network counters are totals since the container started, not rates.
+
+For history and live updates of the same container:
+
+```bash
+# Averaged history; range is 1h, 6h, 24h or 7d (default 1h)
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  "https://your-temps-instance.com/api/projects/{project_id}/environments/{environment_id}/containers/{container_id}/metrics/history?metric=container.cpu_percent&range=24h"
+
+# Server-Sent Events stream, one update per interval in milliseconds
+curl -N -H "Authorization: Bearer YOUR_TOKEN" \
+  "https://your-temps-instance.com/api/projects/{project_id}/environments/{environment_id}/containers/{container_id}/metrics/stream?interval=2000"
+```
+
+Useful history metrics are `container.cpu_percent`, `container.memory_used_bytes`, `container.memory_percent`, `container.network_rx_bytes_delta` and `container.network_tx_bytes_delta`. A `503` response from `metrics/history` means the metrics store is not available on this instance; the current-metrics endpoint still works. Request counts and response times come from the proxy and are shown in the dashboard.
 
 ---
 

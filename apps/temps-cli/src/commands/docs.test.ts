@@ -83,13 +83,13 @@ describe('generateDocs', () => {
       'bunx @temps-sdk/cli@0.1.36 --target-context production projects create --name my-app',
     )
     expect(commandReference).toContain(
-      'bunx @temps-sdk/cli@0.1.36 --target-context production environments vars set --project my-app --key DATABASE_URL',
+      'bunx @temps-sdk/cli@0.1.36 --target-context production environments vars set --project my-app DATABASE_URL --environments production',
     )
     expect(commandReference).toContain(
-      'bunx @temps-sdk/cli@0.1.36 --target-context production domains add --project my-app --domain app.example.com',
+      'bunx @temps-sdk/cli@0.1.36 --target-context production domains add --domain app.example.com',
     )
     expect(commandReference).toContain(
-      'bunx @temps-sdk/cli@0.1.36 --target-context production domains remove --project my-app --domain app.example.com',
+      'bunx @temps-sdk/cli@0.1.36 --target-context production domains remove --domain app.example.com',
     )
     expect(commandReference).toContain('| `-n, --limit <number>` | Limit results | `10` | No |')
   })
