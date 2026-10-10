@@ -16,6 +16,7 @@ import {
   listApiKeysOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { useSettings } from './useSettings'
+import { useIsInstanceAdmin } from './useIsInstanceAdmin'
 import { SIMULATE_EMPTY_INSTALL } from '@/lib/devSimulate'
 import { getAiHarnessStatus } from '@/lib/ai-onboarding'
 import { hasCompletedDeployment } from '@/lib/first-deploy'
@@ -55,6 +56,11 @@ export interface ActivationSignals {
 const TOTAL = 11
 
 export function useActivationSignals(): ActivationSignals {
+  // Platform settings, DNS providers and the user list are readable by
+  // instance administrators only. Every other role would be refused on every
+  // page that shows the checklist, so those reads are skipped for them (a
+  // disabled query is not loading, so `isLoaded` is unaffected).
+  const isAdmin = useIsInstanceAdmin()
   const { data: settings, isLoading: settingsLoading } = useSettings()
 
   const { data: connections, isLoading: connectionsLoading } = useQuery({
@@ -97,11 +103,13 @@ export function useActivationSignals(): ActivationSignals {
   const { data: dnsProvidersData, isLoading: dnsProvidersLoading } = useQuery({
     ...listDnsProvidersOptions({}),
     retry: false,
+    enabled: isAdmin,
   })
 
   const { data: usersData, isLoading: usersLoading } = useQuery({
     ...listUsersOptions({ query: { include_deleted: false } }),
     retry: false,
+    enabled: isAdmin,
   })
 
   const { data: aiProviderStatus, isLoading: aiProviderStatusLoading } =

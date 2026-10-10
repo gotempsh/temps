@@ -8,6 +8,7 @@ import {
   updatePlatformSettings as updateSettingsApi,
   type PlatformSettings,
 } from '@/api/platformSettings'
+import { useIsInstanceAdmin } from './useIsInstanceAdmin'
 
 // Re-export types for backward compatibility
 export type { PlatformSettings } from '@/api/platformSettings'
@@ -17,13 +18,20 @@ export type {
   ScreenshotSettings as Screenshots,
 } from '@/api/client/types.gen'
 
+/**
+ * Platform settings (`GET /settings`). The endpoint needs `settings:read`,
+ * which only instance administrators hold, so the read is never sent for
+ * any other role: it would be refused every time, from every page that
+ * mounts this hook. For those roles the query stays idle with no data.
+ */
 export function useSettings(options: { enabled?: boolean } = {}) {
+  const isAdmin = useIsInstanceAdmin()
   return useQuery({
     queryKey: ['platform-settings'],
     queryFn: getPlatformSettings,
     staleTime: 5 * 60 * 1000, // 5 minutes
     retry: 1,
-    enabled: options.enabled ?? true,
+    enabled: isAdmin && (options.enabled ?? true),
   })
 }
 

@@ -22,6 +22,7 @@ import {
   type AnalyticsDateFilter,
   type QuickFilter,
 } from '@/hooks/useAnalyticsDateRange'
+import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
@@ -216,9 +217,13 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
   // to a display name + avatar for the assignee control. No per-project
   // members endpoint exists yet, so this mirrors the same source
   // TeamDetail's AddMemberDialog uses for its user picker.
-  const { data: usersData } = useQuery(
-    listUsersOptions({ query: { include_deleted: false } })
-  )
+  // Listing users needs `users:write` (instance administrators only); other
+  // roles fall back to showing the raw assignee string.
+  const isInstanceAdmin = useIsInstanceAdmin()
+  const { data: usersData } = useQuery({
+    ...listUsersOptions({ query: { include_deleted: false } }),
+    enabled: isInstanceAdmin,
+  })
   const userByIdentity = useMemo(() => {
     const map = new Map<string, NonNullable<typeof usersData>[number]>()
     for (const u of usersData ?? []) {

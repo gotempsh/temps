@@ -61,6 +61,7 @@ import {
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { useNavigate, useParams } from 'react-router'
+import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
 
 export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
   const { projectSlug, errorGroupId } = useParams<{
@@ -125,9 +126,13 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
   // No per-project members endpoint exists yet — same instance-wide user
   // source TeamDetail's AddMemberDialog uses to resolve `assigned_to` (an
   // email/username string) to a display name + avatar.
-  const { data: usersData } = useQuery(
-    listUsersOptions({ query: { include_deleted: false } })
-  )
+  // Listing users needs `users:write` (instance administrators only); other
+  // roles fall back to showing the raw assignee string.
+  const isInstanceAdmin = useIsInstanceAdmin()
+  const { data: usersData } = useQuery({
+    ...listUsersOptions({ query: { include_deleted: false } }),
+    enabled: isInstanceAdmin,
+  })
   const userByIdentity = useMemo(() => {
     const map = new Map<string, NonNullable<typeof usersData>[number]>()
     for (const u of usersData ?? []) {

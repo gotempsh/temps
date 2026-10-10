@@ -5,6 +5,7 @@ import {
   listBackupAlertsOptions,
   type BackupAlertResponse,
 } from '@/lib/backup-alerts'
+import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
 import { useQuery } from '@tanstack/react-query'
 import { formatDistanceToNowStrict } from 'date-fns'
 import { Bell, CalendarClock, ChevronRight, Loader2 } from 'lucide-react'
@@ -27,13 +28,24 @@ import { Separator } from '../ui/separator'
  *
  * The watcher auto-resolves alerts, so the badge clears itself when the
  * underlying condition lifts. The list polls every 60s via `listBackupAlertsOptions`.
+ *
+ * Backup alerts are instance-wide, and the server serves them to instance
+ * administrators only. For every other role the button is not rendered and
+ * the alerts are never requested: the poll would be refused every minute,
+ * and a non-admin could not act on a global backup alert anyway.
  */
 export function BackupAlertsButton() {
-  const { data, isLoading } = useQuery(listBackupAlertsOptions())
+  const isAdmin = useIsInstanceAdmin()
+  const { data, isLoading } = useQuery({
+    ...listBackupAlertsOptions(),
+    enabled: isAdmin,
+  })
   const alerts = data?.alerts ?? []
   const count = alerts.length
   const hasAlerts = count > 0
   const [open, setOpen] = useState(false)
+
+  if (!isAdmin) return null
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
