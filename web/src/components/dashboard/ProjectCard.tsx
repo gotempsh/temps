@@ -66,7 +66,7 @@ const HEALTH_TONE_STYLES: Record<
     dot: 'bg-emerald-500',
     text: 'text-emerald-600 dark:text-emerald-400',
   },
-  degraded: { dot: 'bg-amber-500', text: 'text-amber-600 dark:text-amber-400' },
+  degraded: { dot: 'bg-amber-500', text: 'text-amber-700 dark:text-amber-400' },
   down: { dot: 'bg-red-500', text: 'text-red-700 dark:text-red-400' },
   idle: { dot: 'bg-zinc-300', text: 'text-muted-foreground' },
   unavailable: { dot: 'bg-zinc-400', text: 'text-muted-foreground' },

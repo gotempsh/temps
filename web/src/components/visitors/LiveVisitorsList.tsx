@@ -139,7 +139,7 @@ export function LiveVisitorsList({ project }: LiveVisitorsListProps) {
                           <UserIcon
                             className={`h-5 w-5 ${
                               visitor.is_crawler
-                                ? 'text-amber-600 dark:text-amber-400'
+                                ? 'text-amber-700 dark:text-amber-400'
                                 : 'text-blue-600 dark:text-blue-400'
                             }`}
                           />

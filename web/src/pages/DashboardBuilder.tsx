@@ -260,7 +260,12 @@ export default function DashboardBuilder({ project }: DashboardBuilderProps) {
   return (
     <div className="w-full space-y-6">
       <div className="flex items-center gap-4">
-        <Button variant="ghost" size="icon" onClick={() => goBack()}>
+        <Button
+          aria-label="Back"
+          variant="ghost"
+          size="icon"
+          onClick={() => goBack()}
+        >
           <ArrowLeft className="size-4" />
         </Button>
         <div>

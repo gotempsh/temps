@@ -75,6 +75,7 @@ export function FunnelCard({
           </div>
           <div className="flex gap-1">
             <Button
+              aria-label="Edit funnel"
               variant="ghost"
               size="sm"
               onClick={(e) => {
@@ -85,6 +86,7 @@ export function FunnelCard({
               <Pencil className="h-4 w-4" />
             </Button>
             <Button
+              aria-label="Delete funnel"
               variant="ghost"
               size="sm"
               onClick={(e) => {

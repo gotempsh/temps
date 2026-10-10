@@ -204,6 +204,7 @@ export default function LogsList({ project }: LogsListProps) {
           </p>
         </div>
         <Button
+          aria-label="Refresh"
           variant="ghost"
           size="icon"
           onClick={() => refetch()}
@@ -232,6 +233,7 @@ export default function LogsList({ project }: LogsListProps) {
             View trace
           </Button>
           <Button
+            aria-label="Clear trace filter"
             variant="ghost"
             size="icon"
             className="h-7 w-7"
@@ -394,6 +396,7 @@ export default function LogsList({ project }: LogsListProps) {
             </span>
             <div className="flex gap-1">
               <Button
+                aria-label="Previous page"
                 variant="outline"
                 size="sm"
                 onClick={() => setPage((p) => Math.max(1, p - 1))}
@@ -402,6 +405,7 @@ export default function LogsList({ project }: LogsListProps) {
                 <ChevronLeft className="h-4 w-4" />
               </Button>
               <Button
+                aria-label="Next page"
                 variant="outline"
                 size="sm"
                 onClick={() => setPage((p) => p + 1)}

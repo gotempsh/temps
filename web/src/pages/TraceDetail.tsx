@@ -856,6 +856,7 @@ export default function TraceDetail({ project }: TraceDetailProps) {
           </p>
         </div>
         <Button
+          aria-label="Refresh"
           variant="ghost"
           size="icon"
           className="shrink-0"

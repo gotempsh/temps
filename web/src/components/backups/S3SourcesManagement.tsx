@@ -505,7 +505,7 @@ export function S3SourcesManagement() {
                           {isDefault && (
                             <Badge
                               variant="outline"
-                              className="gap-1 border-amber-400/40 text-amber-600 dark:text-amber-300"
+                              className="gap-1 border-amber-400/40 text-amber-700 dark:text-amber-300"
                             >
                               <Star className="size-3 fill-current" />
                               Default
@@ -532,7 +532,12 @@ export function S3SourcesManagement() {
                   <div>
                     <DropdownMenu>
                       <DropdownMenuTrigger asChild>
-                        <Button variant="ghost" size="icon" className="h-8 w-8">
+                        <Button
+                          aria-label="Open menu"
+                          variant="ghost"
+                          size="icon"
+                          className="h-8 w-8"
+                        >
                           <EllipsisVertical className="h-4 w-4" />
                         </Button>
                       </DropdownMenuTrigger>

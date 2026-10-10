@@ -292,7 +292,7 @@ export function UserDetail() {
                   ) : (
                     <Badge
                       variant="secondary"
-                      className="gap-1 bg-amber-500/10 text-amber-600 dark:text-amber-400"
+                      className="gap-1 bg-amber-500/10 text-amber-700 dark:text-amber-400"
                     >
                       <MailWarning className="h-3 w-3" />
                       Unverified
@@ -301,7 +301,7 @@ export function UserDetail() {
                   {target.user.must_change_password && (
                     <Badge
                       variant="secondary"
-                      className="gap-1 bg-amber-500/10 text-amber-600 dark:text-amber-400"
+                      className="gap-1 bg-amber-500/10 text-amber-700 dark:text-amber-400"
                     >
                       <KeyRound className="h-3 w-3" />
                       Must change password
@@ -575,7 +575,7 @@ function StatCard({ icon, label, value, hint, loading, tone }: StatCardProps) {
           <div
             className={
               tone === 'warning'
-                ? 'mt-1 text-lg font-semibold text-amber-600 dark:text-amber-400'
+                ? 'mt-1 text-lg font-semibold text-amber-700 dark:text-amber-400'
                 : 'mt-1 text-lg font-semibold'
             }
           >

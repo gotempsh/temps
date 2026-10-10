@@ -526,6 +526,7 @@ function SlowQueriesContent({
             </div>
             <div className="flex items-center gap-1">
               <Button
+                aria-label="Previous page"
                 variant="outline"
                 size="icon"
                 className="size-8"
@@ -538,6 +539,7 @@ function SlowQueriesContent({
                 {page} / {totalPages}
               </span>
               <Button
+                aria-label="Next page"
                 variant="outline"
                 size="icon"
                 className="size-8"
@@ -745,7 +747,7 @@ function StatCell({
         {badge === 'warn' && (
           <Badge
             variant="outline"
-            className="text-[10px] text-amber-600 border-amber-200 bg-amber-50"
+            className="text-[10px] text-amber-700 border-amber-200 bg-amber-50"
           >
             low
           </Badge>

@@ -1486,6 +1486,7 @@ export function ProxyLogsDataTable({
                 </div>
                 <div className="flex items-center gap-2">
                   <Button
+                    aria-label="First page"
                     variant="outline"
                     size="sm"
                     onClick={() => setPage(1)}
@@ -1494,6 +1495,7 @@ export function ProxyLogsDataTable({
                     <ChevronsLeft className="h-4 w-4" />
                   </Button>
                   <Button
+                    aria-label="Previous page"
                     variant="outline"
                     size="sm"
                     onClick={() => setPage(page - 1)}
@@ -1507,6 +1509,7 @@ export function ProxyLogsDataTable({
                     </span>
                   </div>
                   <Button
+                    aria-label="Next page"
                     variant="outline"
                     size="sm"
                     onClick={() => setPage(page + 1)}
@@ -1515,6 +1518,7 @@ export function ProxyLogsDataTable({
                     <ChevronRight className="h-4 w-4" />
                   </Button>
                   <Button
+                    aria-label="Last page"
                     variant="outline"
                     size="sm"
                     onClick={() => setPage(data.total_pages)}

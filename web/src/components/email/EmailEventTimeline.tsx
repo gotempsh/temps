@@ -17,12 +17,7 @@ import {
 import { Skeleton } from '@/components/ui/skeleton'
 import { fmtDateTime, fmtRelativeTime, useUrlState } from '@temps-sdk/ds'
 import { useQuery } from '@tanstack/react-query'
-import {
-  ChevronLeft,
-  ChevronRight,
-  Globe,
-  Monitor,
-} from 'lucide-react'
+import { ChevronLeft, ChevronRight, Globe, Monitor } from 'lucide-react'
 import { useMemo } from 'react'
 import { EventBadge, EventIcon } from './shared'
 import { parseUserAgent, problemMessage } from './sharedUtils'
@@ -46,7 +41,9 @@ async function fetchEmailEvents(
     query: eventType ? { event_type: eventType } : undefined,
   })
   if (response.error || !response.data) {
-    throw new Error(problemMessage(response.error, 'Failed to fetch email events'))
+    throw new Error(
+      problemMessage(response.error, 'Failed to fetch email events')
+    )
   }
   return response.data
 }
@@ -207,7 +204,6 @@ export function EmailEventTimeline({ emailId }: { emailId: string }) {
                       </span>
                     )}
                   </div>
-
                 </div>
               </div>
             ))}
@@ -222,6 +218,7 @@ export function EmailEventTimeline({ emailId }: { emailId: string }) {
             </p>
             <div className="flex items-center gap-2">
               <Button
+                aria-label="Previous page"
                 variant="outline"
                 size="sm"
                 className="h-7 text-xs"
@@ -234,6 +231,7 @@ export function EmailEventTimeline({ emailId }: { emailId: string }) {
                 {page} / {totalPages}
               </span>
               <Button
+                aria-label="Next page"
                 variant="outline"
                 size="sm"
                 className="h-7 text-xs"

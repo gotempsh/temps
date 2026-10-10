@@ -216,6 +216,7 @@ export function WebhooksSettings({ project }: WebhooksSettingsProps) {
                   <DropdownMenu>
                     <DropdownMenuTrigger asChild>
                       <Button
+                        aria-label="Open menu"
                         variant="ghost"
                         size="icon"
                         className="h-8 w-8"

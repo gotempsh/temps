@@ -416,7 +416,7 @@ function StatBlock({
 }) {
   const valueClass =
     tone === 'warn'
-      ? 'text-2xl font-semibold tracking-tight tabular-nums text-amber-600 dark:text-amber-400'
+      ? 'text-2xl font-semibold tracking-tight tabular-nums text-amber-700 dark:text-amber-400'
       : 'text-2xl font-semibold tracking-tight tabular-nums'
   return (
     <Card>

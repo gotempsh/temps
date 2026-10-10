@@ -277,7 +277,7 @@ export function ProjectOverview({
                         className={cn(
                           'text-sm font-medium tabular-nums',
                           (apiTraffic?.overall_error_rate ?? 0) > 0.05
-                            ? 'text-amber-600 dark:text-amber-400'
+                            ? 'text-amber-700 dark:text-amber-400'
                             : 'text-muted-foreground'
                         )}
                       >
@@ -772,7 +772,7 @@ function RouteMetric({
       <p
         className={cn(
           'truncate text-sm font-medium tabular-nums',
-          warning && 'text-amber-600 dark:text-amber-400'
+          warning && 'text-amber-700 dark:text-amber-400'
         )}
       >
         {value}

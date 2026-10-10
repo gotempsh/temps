@@ -607,7 +607,7 @@ function buildFixMessage(
 const ACTION_STATUS: Record<string, { label: string; cls: string }> = {
   proposed: {
     label: 'Awaiting your confirmation',
-    cls: 'text-amber-600 dark:text-amber-400',
+    cls: 'text-amber-700 dark:text-amber-400',
   },
   executing: { label: 'Running…', cls: 'text-muted-foreground' },
   executed: { label: 'Executed', cls: 'text-green-600 dark:text-green-400' },
@@ -783,7 +783,7 @@ function PendingActionCard({
         />
       ) : (
         <div className="flex min-w-0 items-start gap-2 px-2.5 py-2">
-          <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+          <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-amber-700 dark:text-amber-400" />
           <div className="min-w-0 flex-1 space-y-0.5">
             <div className="flex items-center gap-1.5">
               <span className="rounded bg-muted px-1 py-0.5 font-mono text-[10px] font-semibold uppercase">
@@ -1070,7 +1070,7 @@ function PlanActionCard({
   return (
     <div className="min-w-0 overflow-hidden rounded-lg border border-amber-500/30 bg-amber-500/5 text-xs">
       <div className="flex items-center gap-2 border-b border-amber-500/20 px-2.5 py-2">
-        <ShieldCheck className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+        <ShieldCheck className="h-4 w-4 shrink-0 text-amber-700 dark:text-amber-400" />
         <span className="font-medium">Multi-step plan</span>
         <span className="text-muted-foreground">
           {doneCount}/{plan.steps.length} done

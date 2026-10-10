@@ -137,3 +137,34 @@ test('cached users stay visible when a refresh fails', () => {
   expect(html).not.toContain('No users found')
   client.clear()
 })
+
+test('a user row is a link, not a button that contains the row menu', () => {
+  const client = createClient()
+  const users: RouteUserWithRoles[] = [
+    {
+      user: {
+        id: 7,
+        name: 'Operator Two',
+        username: 'operator2',
+        email: 'operator2@example.test',
+        email_verified: true,
+        image: '',
+        mfa_enabled: false,
+        must_change_password: false,
+        created_at: Date.parse('2026-01-01T00:00:00Z'),
+        updated_at: Date.parse('2026-01-01T00:00:00Z'),
+      },
+      roles: [],
+    },
+  ]
+  client.setQueryData(listKey, users)
+  const html = render(client)
+  // The name opens the user; the row is no longer an ARIA button wrapping
+  // the "Open menu" button (axe nested-interactive).
+  expect(html).toMatch(
+    /<a [^>]*href="\/settings\/users\/7"[^>]*>Operator Two<\/a>/
+  )
+  expect(html).not.toContain('role="button"')
+  expect(html).toContain('Open menu')
+  client.clear()
+})

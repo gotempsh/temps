@@ -1375,7 +1375,7 @@ function GitSettingsInline({
                         </div>
                         <div className="flex items-center gap-1.5">
                           {composeOverrideDirty && (
-                            <div className="text-sm text-amber-600 dark:text-amber-400">
+                            <div className="text-sm text-amber-700 dark:text-amber-400">
                               Unsaved
                             </div>
                           )}
@@ -1655,7 +1655,7 @@ function GitSettingsInline({
                   {hasWebhook ? (
                     <Check className="size-4 text-green-600 dark:text-green-400" />
                   ) : (
-                    <RefreshCw className="size-4 text-amber-600 dark:text-amber-400" />
+                    <RefreshCw className="size-4 text-amber-700 dark:text-amber-400" />
                   )}
                 </div>
                 <div className="flex-1 min-w-0">
@@ -2434,7 +2434,7 @@ function ExcludedServicesInline({
                   {service.looksLikeDatabase && (
                     <Tooltip>
                       <TooltipTrigger asChild>
-                        <span className="flex items-center gap-1 text-xs text-amber-600 dark:text-amber-500">
+                        <span className="flex items-center gap-1 text-xs text-amber-700 dark:text-amber-500">
                           <Database className="h-3 w-3" />
                           <Info className="h-3 w-3" />
                         </span>

@@ -472,7 +472,7 @@ function StatCard({
         <Skeleton className="mt-2 h-7 w-20" />
       ) : (
         <p
-          className={`mt-1 text-2xl font-semibold tabular-nums ${warn && value > 0 ? 'text-amber-600 dark:text-amber-400' : ''}`}
+          className={`mt-1 text-2xl font-semibold tabular-nums ${warn && value > 0 ? 'text-amber-700 dark:text-amber-400' : ''}`}
         >
           {value.toLocaleString()}
         </p>

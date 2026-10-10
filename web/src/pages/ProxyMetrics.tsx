@@ -1020,7 +1020,7 @@ const TRAFFIC_COLUMNS: {
 
 const STATUS_STYLES: Record<string, { dot: string; text: string }> = {
   healthy: { dot: 'bg-emerald-500', text: 'text-emerald-600' },
-  degraded: { dot: 'bg-amber-500', text: 'text-amber-600' },
+  degraded: { dot: 'bg-amber-500', text: 'text-amber-700 dark:text-amber-600' },
   down: { dot: 'bg-red-500', text: 'text-red-600' },
   unknown: { dot: 'bg-muted-foreground/40', text: 'text-muted-foreground' },
 }

@@ -252,7 +252,7 @@ export function TriggerBackupDialog({
                                   {selectedIsDefault ? (
                                     <span
                                       title="Default source"
-                                      className="inline-flex shrink-0 items-center gap-0.5 text-xs text-amber-600 dark:text-amber-400"
+                                      className="inline-flex shrink-0 items-center gap-0.5 text-xs text-amber-700 dark:text-amber-400"
                                     >
                                       <Star className="h-3 w-3 fill-current" />
                                       Default
@@ -286,7 +286,7 @@ export function TriggerBackupDialog({
                                     {isDefault ? (
                                       <span
                                         title="Default source"
-                                        className="inline-flex items-center gap-0.5 text-xs text-amber-600 dark:text-amber-400"
+                                        className="inline-flex items-center gap-0.5 text-xs text-amber-700 dark:text-amber-400"
                                       >
                                         <Star className="h-3 w-3 fill-current" />
                                         Default

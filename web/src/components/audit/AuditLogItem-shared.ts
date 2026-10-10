@@ -168,7 +168,7 @@ export const CATEGORY_META: Record<
   backup: {
     label: 'Backup',
     icon: HardDrive,
-    tone: 'bg-amber-500/10 text-amber-600 dark:text-amber-400',
+    tone: 'bg-amber-500/10 text-amber-700 dark:text-amber-400',
   },
   pipeline: {
     label: 'Pipeline',

@@ -102,6 +102,7 @@ export function CreateWebhookPage({ project }: CreateWebhookPageProps) {
     <div className="space-y-6">
       <div className="flex items-center gap-4">
         <Button
+          aria-label="Back"
           variant="ghost"
           size="icon"
           onClick={() =>

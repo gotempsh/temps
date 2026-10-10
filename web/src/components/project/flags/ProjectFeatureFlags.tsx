@@ -482,7 +482,7 @@ function SourceBadge({
     return (
       <Badge
         variant="outline"
-        className="text-amber-600 dark:text-amber-400"
+        className="text-amber-700 dark:text-amber-400"
         title="Disabled in this environment — the default value is served"
       >
         Disabled

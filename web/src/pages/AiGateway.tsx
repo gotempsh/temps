@@ -1770,6 +1770,9 @@ function SpanTreeRow({
         {/* Expand/collapse toggle */}
         {hasChildren ? (
           <button
+            type="button"
+            aria-label={open ? 'Collapse child spans' : 'Expand child spans'}
+            aria-expanded={open}
             className="h-4 w-4 shrink-0 text-muted-foreground hover:text-foreground"
             onClick={(e) => {
               e.stopPropagation()

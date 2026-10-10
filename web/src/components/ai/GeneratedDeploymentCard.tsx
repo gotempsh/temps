@@ -41,7 +41,7 @@ function statusPresentation(status: string) {
     }
   }
   if (status === 'paused') {
-    return { label: 'Paused', className: 'text-amber-600 dark:text-amber-400' }
+    return { label: 'Paused', className: 'text-amber-700 dark:text-amber-400' }
   }
   return {
     label: status === 'running' ? 'Deploying' : 'Queued',

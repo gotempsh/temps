@@ -560,6 +560,7 @@ export function VisitorGlobePage({ project }: VisitorGlobePageProps) {
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
           <Button
+            aria-label="Back"
             variant="ghost"
             size="icon"
             onClick={() => navigate(`/projects/${project.slug}/analytics`)}

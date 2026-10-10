@@ -41,6 +41,7 @@ export function AddGitProvider() {
       <div className="space-y-6 p-4 sm:p-6 lg:p-8">
         <div className="flex items-center gap-4">
           <Button
+            aria-label="Back"
             variant="ghost"
             size="icon"
             onClick={() => navigate('/git-providers')}

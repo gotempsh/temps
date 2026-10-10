@@ -264,6 +264,7 @@ export default function TraceOperations({ project }: TraceOperationsProps) {
         </div>
         <div className="flex items-center gap-3">
           <Button
+            aria-label="Refresh"
             variant="ghost"
             size="icon"
             onClick={() => {
@@ -523,6 +524,7 @@ export default function TraceOperations({ project }: TraceOperationsProps) {
           </span>
           <div className="flex items-center gap-2">
             <Button
+              aria-label="Previous page"
               variant="outline"
               size="sm"
               disabled={page <= 1}
@@ -531,6 +533,7 @@ export default function TraceOperations({ project }: TraceOperationsProps) {
               <ChevronLeft className="h-4 w-4" />
             </Button>
             <Button
+              aria-label="Next page"
               variant="outline"
               size="sm"
               disabled={page >= totalPages}

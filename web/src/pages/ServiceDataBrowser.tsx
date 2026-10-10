@@ -1716,6 +1716,7 @@ export function ServiceDataBrowser() {
         <div className="p-6 pb-0">
           <div className="flex items-center gap-3 mb-4">
             <Button
+              aria-label="Back"
               variant="ghost"
               size="icon"
               onClick={() => navigate(`/storage/${id}`)}
@@ -1785,6 +1786,7 @@ export function ServiceDataBrowser() {
         <div className="p-6 pb-0">
           <div className="flex items-center gap-3 mb-4">
             <Button
+              aria-label="Back"
               variant="ghost"
               size="icon"
               onClick={() => navigate(`/storage/${id}`)}
@@ -1854,6 +1856,7 @@ export function ServiceDataBrowser() {
       <div className="p-4 md:p-6 pb-0">
         <div className="flex items-center gap-3 mb-4">
           <Button
+            aria-label="Back"
             variant="ghost"
             size="icon"
             onClick={() => navigate(`/storage/${id}`)}
@@ -4339,7 +4342,7 @@ function EntityDataView({
                     {queryResult.truncated && (
                       <Badge
                         variant="outline"
-                        className="text-xs gap-1 border-amber-500/50 text-amber-600 dark:text-amber-400"
+                        className="text-xs gap-1 border-amber-500/50 text-amber-700 dark:text-amber-400"
                         title="This page was shortened to stay within the response size limit. There are more rows at this offset — deselect large columns to fit more per page."
                       >
                         <AlertTriangle className="size-3" />

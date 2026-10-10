@@ -169,6 +169,7 @@ export function ErrorEventDetail({ project }: { project: ProjectResponse }) {
       <div className="mb-6">
         <div className="flex items-start gap-3 mb-2">
           <Button
+            aria-label="Back"
             variant="ghost"
             size="sm"
             onClick={() =>

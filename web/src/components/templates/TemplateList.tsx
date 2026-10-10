@@ -114,7 +114,7 @@ export function TemplateList({
   if (isTemplatesError) {
     return (
       <div className="flex flex-col items-center justify-center gap-3 rounded-lg border border-amber-500/30 bg-amber-500/5 px-6 py-12 text-center">
-        <AlertCircle className="size-6 text-amber-600 dark:text-amber-400" />
+        <AlertCircle className="size-6 text-amber-700 dark:text-amber-400" />
         <div>
           <p className="font-medium">Could not load the template catalog</p>
           <p className="mt-1 text-sm text-muted-foreground">

@@ -190,13 +190,13 @@ const STATUS_LABEL: Record<MetricStatus, string> = {
 const STATUS_CHIP: Record<MetricStatus, string> = {
   good: 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/20',
   'needs-improvement':
-    'bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/20',
+    'bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-500/20',
   poor: 'bg-red-500/10 text-red-600 dark:text-red-400 border-red-500/20',
 }
 
 const STATUS_TEXT: Record<MetricStatus, string> = {
   good: 'text-emerald-600 dark:text-emerald-400',
-  'needs-improvement': 'text-amber-600 dark:text-amber-400',
+  'needs-improvement': 'text-amber-700 dark:text-amber-400',
   poor: 'text-red-600 dark:text-red-400',
 }
 
@@ -865,6 +865,7 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
           </Select>
 
           <Button
+            aria-label="Refresh"
             variant="outline"
             size="sm"
             className="h-8"

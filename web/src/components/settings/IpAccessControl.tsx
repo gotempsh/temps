@@ -273,6 +273,7 @@ export function IpAccessControl() {
                       </div>
                       <div className="flex gap-2">
                         <Button
+                          aria-label="Edit rule"
                           type="button"
                           variant="ghost"
                           size="icon"
@@ -281,6 +282,7 @@ export function IpAccessControl() {
                           <Edit className="h-4 w-4" />
                         </Button>
                         <Button
+                          aria-label="Delete rule"
                           type="button"
                           variant="ghost"
                           size="icon"
@@ -331,6 +333,7 @@ export function IpAccessControl() {
                       </div>
                       <div className="flex gap-2">
                         <Button
+                          aria-label="Edit rule"
                           type="button"
                           variant="ghost"
                           size="icon"
@@ -339,6 +342,7 @@ export function IpAccessControl() {
                           <Edit className="h-4 w-4" />
                         </Button>
                         <Button
+                          aria-label="Delete rule"
                           type="button"
                           variant="ghost"
                           size="icon"

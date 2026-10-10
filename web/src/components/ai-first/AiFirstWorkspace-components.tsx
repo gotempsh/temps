@@ -2741,7 +2741,7 @@ export function WorkspaceFilesPanel({
                         : change.status === 'untracked' ||
                             change.status === 'added'
                           ? 'text-success'
-                          : 'text-amber-600 dark:text-amber-300'
+                          : 'text-amber-700 dark:text-amber-300'
                     )}
                   >
                     {change.status?.slice(0, 1) ?? 'M'}
@@ -2805,7 +2805,7 @@ export function WorkspaceFilesPanel({
             file paths and credential-like diff values are hidden.
           </p>
           {changes?.changes_truncated && (
-            <p className="text-[10px] text-amber-600 dark:text-amber-300">
+            <p className="text-[10px] text-amber-700 dark:text-amber-300">
               Working changes are capped at the first 200 safe paths.
             </p>
           )}
@@ -4312,7 +4312,7 @@ function CreateThreadDialog({
             Platform actions remain explicitly approval-gated.
           </p>
           {harnesses.length === 0 && (
-            <p className="rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-sm text-amber-600">
+            <p className="rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-sm text-amber-700 dark:text-amber-600">
               No development harness is ready. Authenticate Claude Code, Codex,
               or OpenCode in Agent Sandbox settings.
             </p>

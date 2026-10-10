@@ -153,7 +153,7 @@ function severityBadge(severity: string) {
       return <Badge variant="destructive">Critical</Badge>
     case 'warning':
       return (
-        <Badge className="border-transparent bg-amber-500/15 text-amber-600 hover:bg-amber-500/25 dark:text-amber-400">
+        <Badge className="border-transparent bg-amber-500/15 text-amber-700 hover:bg-amber-500/25 dark:text-amber-400">
           Warning
         </Badge>
       )
@@ -572,7 +572,7 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
     {
       label: 'Warning',
       value: summary?.warning ?? 0,
-      tone: 'text-amber-600 dark:text-amber-400',
+      tone: 'text-amber-700 dark:text-amber-400',
     },
   ]
 

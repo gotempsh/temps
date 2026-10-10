@@ -382,6 +382,7 @@ function ReleaseCard({
             </Badge>
           )}
           <Button
+            aria-label="Delete source map"
             type="button"
             variant="ghost"
             size="icon"
@@ -449,6 +450,7 @@ function SourceMapFileRow({ map, onDelete }: SourceMapFileRowProps) {
           <TimeAgo date={map.created_at} />
         </span>
         <Button
+          aria-label="Delete source map"
           type="button"
           variant="ghost"
           size="icon"

@@ -232,6 +232,7 @@ function ClusterMemberConfig({
             </div>
 
             <Button
+              aria-label="Remove member"
               type="button"
               variant="ghost"
               size="icon"
