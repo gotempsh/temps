@@ -3148,7 +3148,12 @@ async fn admin_drain_node(
                 // Then soft-delete in DB so the proxy stops routing to them
                 match app_state
                     .node_service
-                    .retire_containers_on_node(node_id, dep.deployment_id, &confirmed_removed)
+                    .retire_containers_on_node(
+                        node_id,
+                        dep.deployment_id,
+                        &confirmed_removed,
+                        crate::services::node_service::RetireReason::Drain,
+                    )
                     .await
                 {
                     Ok(count) => {

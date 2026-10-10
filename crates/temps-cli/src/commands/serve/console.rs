@@ -86,6 +86,7 @@ use temps_deployments::handlers::nodes::NodeAppState;
 use temps_deployments::jobs::node_health_check::{
     check_control_plane_resources, check_drain_completion, check_node_health, check_node_resources,
     failover_due_nodes, notify_nodes_offline, refresh_control_plane_metrics,
+    restore_recovered_replicas, HeartbeatWatch,
 };
 use temps_deployments::services::node_service::NodeService;
 use utoipa_swagger_ui::SwaggerUi;
@@ -4290,8 +4291,12 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         let health_config_service = service_context.get_service::<temps_config::ConfigService>();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            // Node silence only counts from when this process started watching
+            // heartbeats: while it was down it recorded none.
+            let mut heartbeat_watch = HeartbeatWatch::start(chrono::Utc::now());
             loop {
                 interval.tick().await;
+                let watching_since = heartbeat_watch.tick(chrono::Utc::now());
                 // Sample the control plane's own host metrics so the synthetic
                 // control-plane node shows live CPU/mem/disk (it has no agent
                 // heartbeat). Always runs, independent of alert config.
@@ -4312,7 +4317,9 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                     },
                     None => temps_core::MultiNodeSettings::default().node_failover_after_secs,
                 };
-                let offline_ids = check_node_health(&health_node_service, health_db.as_ref()).await;
+                let offline_ids =
+                    check_node_health(&health_node_service, health_db.as_ref(), watching_since)
+                        .await;
                 if !offline_ids.is_empty() {
                     tracing::info!(
                         "Node health check: marked {} node(s) as offline",
@@ -4339,6 +4346,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                 {
                     let failed_over = failover_due_nodes(
                         after_secs,
+                        watching_since,
                         &health_node_service,
                         deployment_service,
                         health_alarm_service.as_ref(),
@@ -4348,6 +4356,19 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                         tracing::info!(
                             "Node health check: failed over workloads from {} node(s)",
                             failed_over.len()
+                        );
+                    }
+                }
+
+                // Restore the replicas a failover took out of routing on nodes
+                // that are sending heartbeats again.
+                if let Some(ref deployment_service) = deployment_service_for_failover {
+                    let restored =
+                        restore_recovered_replicas(&health_node_service, deployment_service).await;
+                    if restored > 0 {
+                        tracing::info!(
+                            "Node health check: queued {} recovery redeploy(s) for recovered node(s)",
+                            restored
                         );
                     }
                 }

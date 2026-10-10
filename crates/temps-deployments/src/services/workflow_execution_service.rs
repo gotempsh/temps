@@ -3774,6 +3774,19 @@ impl WorkflowExecutionService {
             }
         }
 
+        // Containers a drain or failover took out of routing on a worker
+        // without confirming they were removed (`retired`, `failed_over`)
+        // are no longer live rows, so neither query above sees them. Once
+        // their deployment is superseded nothing else removes them, and one
+        // on a node that came back keeps running unrouted (#1384). Each is
+        // removed only after Docker's labels confirm it belongs to this
+        // project, like node removal does, and recorded as removed; one that
+        // cannot be confirmed yet (node offline) is left for the next
+        // successful deployment. Bounded per deployment.
+        total_containers_cleaned += self
+            .remove_retired_worker_containers(project_id, environment_id, current_deployment)
+            .await;
+
         if total_containers_cleaned > 0 {
             info!(
                 "Cleaned up {} containers from previous deployments",
@@ -3782,6 +3795,101 @@ impl WorkflowExecutionService {
         }
 
         Ok(first_stopped_container_id)
+    }
+
+    /// See the end of [`Self::teardown_previous_deployment`]. Returns how many
+    /// containers were confirmed gone. Failures are logged, never returned:
+    /// the new deployment is already live.
+    async fn remove_retired_worker_containers(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        current_deployment: &deployments::Model,
+    ) -> usize {
+        use crate::services::node_service::{
+            remove_retired_container, CONTAINER_STATUS_FAILED_OVER, CONTAINER_STATUS_RETIRED,
+        };
+        use temps_entities::deployment_containers;
+
+        const MAX_RETIRED_WORKER_CLEANUPS: u64 = 20;
+        let retired = match deployment_containers::Entity::find()
+            .find_also_related(deployments::Entity)
+            .filter(deployment_containers::Column::DeletedAt.is_not_null())
+            .filter(deployment_containers::Column::NodeId.is_not_null())
+            .filter(
+                deployment_containers::Column::Status
+                    .is_in([CONTAINER_STATUS_RETIRED, CONTAINER_STATUS_FAILED_OVER]),
+            )
+            .filter(deployments::Column::ProjectId.eq(project_id))
+            .filter(deployments::Column::EnvironmentId.eq(environment_id))
+            .filter(
+                Condition::any()
+                    .add(deployments::Column::CreatedAt.lt(current_deployment.created_at))
+                    .add(
+                        Condition::all()
+                            .add(deployments::Column::CreatedAt.eq(current_deployment.created_at))
+                            .add(deployments::Column::Id.lt(current_deployment.id)),
+                    ),
+            )
+            .order_by_asc(deployment_containers::Column::Id)
+            .limit(MAX_RETIRED_WORKER_CLEANUPS)
+            .all(self.db.as_ref())
+            .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                warn!(
+                    project_id,
+                    environment_id,
+                    "Could not look up retired worker containers of superseded deployments: {error}"
+                );
+                return 0;
+            }
+        };
+
+        let mut removed = 0;
+        for (container, _) in retired {
+            let deployer = match self.teardown_deployer_for_node(container.node_id).await {
+                Ok(deployer) => deployer,
+                Err(error) => {
+                    warn!(
+                        project_id,
+                        deployment_id = container.deployment_id,
+                        node_id = ?container.node_id,
+                        container_id = %container.container_id,
+                        "Retired worker container left for a later cleanup: {error}"
+                    );
+                    continue;
+                }
+            };
+            match remove_retired_container(
+                self.db.as_ref(),
+                deployer.as_ref(),
+                &container,
+                project_id,
+            )
+            .await
+            {
+                Ok(()) => {
+                    removed += 1;
+                    info!(
+                        project_id,
+                        deployment_id = container.deployment_id,
+                        node_id = ?container.node_id,
+                        container_id = %container.container_id,
+                        "Removed retired worker container of a superseded deployment"
+                    );
+                }
+                Err(error) => warn!(
+                    project_id,
+                    deployment_id = container.deployment_id,
+                    node_id = ?container.node_id,
+                    container_id = %container.container_id,
+                    "Retired worker container left for a later cleanup: {error}"
+                ),
+            }
+        }
+        removed
     }
 }
 

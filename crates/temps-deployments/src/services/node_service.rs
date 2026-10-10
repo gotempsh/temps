@@ -27,6 +27,37 @@ pub const CONTAINER_STATUS_RETIRED: &str = "retired";
 /// gone. Temps no longer manages that host, so cleanup skips it;
 /// `error_message` records which node it was on.
 pub const CONTAINER_STATUS_ORPHANED: &str = "orphaned";
+/// `deployment_containers.status` for a replica a failover took out of
+/// routing while the environment kept serving from replicas on other nodes.
+/// Like [`CONTAINER_STATUS_RETIRED`] it may still exist on its node; in
+/// addition, the replica count it left short is restored once that node
+/// sends heartbeats again, after which the row becomes `retired`.
+pub const CONTAINER_STATUS_FAILED_OVER: &str = "failed_over";
+
+/// Why [`NodeService::retire_containers_on_node`] takes containers out of
+/// routing. It decides how an unconfirmed container is recorded and what
+/// the log says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetireReason {
+    /// The operator is draining the node.
+    Drain,
+    /// The node stayed offline past the failover grace period and the
+    /// deployment is not the one its environment serves.
+    FailoverHistorical,
+    /// The node stayed offline past the failover grace period, and replicas
+    /// of the environment's serving deployment remain on other nodes.
+    FailoverReplica,
+}
+
+impl RetireReason {
+    /// Status recorded for a container whose removal was not confirmed.
+    fn unconfirmed_status(self) -> &'static str {
+        match self {
+            Self::Drain | Self::FailoverHistorical => CONTAINER_STATUS_RETIRED,
+            Self::FailoverReplica => CONTAINER_STATUS_FAILED_OVER,
+        }
+    }
+}
 
 /// Deployment states after which a deployment never runs again, so its
 /// containers can no longer become the ones its environment serves.
@@ -159,6 +190,51 @@ pub async fn remove_owned_container(
             timeout_secs: CONTAINER_REMOVAL_TIMEOUT_SECS,
         }),
     }
+}
+
+/// Why [`remove_retired_container`] left a container in place.
+#[derive(Debug, thiserror::Error)]
+pub enum RetiredContainerRemovalError {
+    #[error(transparent)]
+    Container(#[from] ContainerRemovalError),
+
+    #[error("container {container_id} is gone but recording it as removed failed: {source}")]
+    Record {
+        container_id: String,
+        source: sea_orm::DbErr,
+    },
+}
+
+/// Remove a container a drain or failover took out of routing without
+/// confirming it was removed (`retired`, `failed_over`), once Docker's
+/// labels confirm it belongs to `project_id`, and record it as removed.
+/// The row is only updated while it still has the status it was read with,
+/// so a concurrent cleanup's outcome is never overwritten.
+pub async fn remove_retired_container(
+    db: &DatabaseConnection,
+    deployer: &dyn temps_deployer::ContainerDeployer,
+    container: &deployment_containers::Model,
+    project_id: i32,
+) -> Result<(), RetiredContainerRemovalError> {
+    remove_owned_container(deployer, &container.container_id, project_id).await?;
+    let read_status = match &container.status {
+        Some(status) => deployment_containers::Column::Status.eq(status.clone()),
+        None => deployment_containers::Column::Status.is_null(),
+    };
+    deployment_containers::Entity::update_many()
+        .col_expr(
+            deployment_containers::Column::Status,
+            Expr::value(CONTAINER_STATUS_REMOVED),
+        )
+        .filter(deployment_containers::Column::Id.eq(container.id))
+        .filter(read_status)
+        .exec(db)
+        .await
+        .map_err(|source| RetiredContainerRemovalError::Record {
+            container_id: container.container_id.clone(),
+            source,
+        })?;
+    Ok(())
 }
 
 /// One line per container a node removal could not confirm is gone.
@@ -1597,11 +1673,20 @@ impl NodeService {
 
     /// Offline nodes whose last heartbeat is older than `failover_after_secs`
     /// and whose workloads have not been failed over yet for this outage.
+    ///
+    /// Silence is only counted from `watching_since`, when the control plane
+    /// started (or resumed) watching heartbeats: while it was down it could
+    /// not record any, so a node is never due before the grace period has
+    /// passed since then, however old its last recorded heartbeat is.
     pub async fn list_due_for_failover(
         &self,
         failover_after_secs: i64,
+        watching_since: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<nodes::Model>, NodeError> {
         let cutoff = chrono::Utc::now() - chrono::Duration::seconds(failover_after_secs);
+        if watching_since >= cutoff {
+            return Ok(Vec::new());
+        }
 
         let nodes = nodes::Entity::find()
             .filter(nodes::Column::Status.eq("offline"))
@@ -2292,6 +2377,7 @@ impl NodeService {
         node_id: i32,
         deployment_id: i32,
         confirmed_removed: &HashSet<String>,
+        reason: RetireReason,
     ) -> Result<usize, NodeError> {
         let containers = deployment_containers::Entity::find()
             .filter(deployment_containers::Column::NodeId.eq(node_id))
@@ -2305,7 +2391,7 @@ impl NodeService {
             let status = if confirmed_removed.contains(&container.container_id) {
                 CONTAINER_STATUS_REMOVED
             } else {
-                CONTAINER_STATUS_RETIRED
+                reason.unconfirmed_status()
             };
             let mut active: deployment_containers::ActiveModel = container.into();
             active.deleted_at = Set(Some(chrono::Utc::now()));
@@ -2314,15 +2400,116 @@ impl NodeService {
         }
 
         if count > 0 {
-            tracing::info!(
-                node_id,
-                deployment_id,
-                count,
-                "Retired containers on draining node"
-            );
+            match reason {
+                RetireReason::Drain => tracing::info!(
+                    node_id,
+                    deployment_id,
+                    count,
+                    "Retired containers on draining node"
+                ),
+                RetireReason::FailoverHistorical => tracing::info!(
+                    node_id,
+                    deployment_id,
+                    count,
+                    "Failover: retired historical deployment containers on offline node"
+                ),
+                RetireReason::FailoverReplica => tracing::info!(
+                    node_id,
+                    deployment_id,
+                    count,
+                    "Failover: took replicas on offline node out of routing; they are \
+                     restored when the node sends heartbeats again"
+                ),
+            }
         }
 
         Ok(count)
+    }
+
+    /// Replicas a failover took out of routing whose node is active again,
+    /// with their deployment's project and environment and whether that
+    /// deployment is still the one the environment serves. At most `limit`
+    /// rows, oldest first, so a pass is bounded however many accumulated.
+    pub async fn failed_over_replicas_on_recovered_nodes(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<FailedOverReplica>, NodeError> {
+        let rows = deployment_containers::Entity::find()
+            .join(
+                JoinType::InnerJoin,
+                deployment_containers::Relation::Deployment.def(),
+            )
+            .join(
+                JoinType::InnerJoin,
+                deployments::Relation::Environment.def(),
+            )
+            .join(
+                JoinType::InnerJoin,
+                deployment_containers::Relation::Node.def(),
+            )
+            .filter(deployment_containers::Column::Status.eq(CONTAINER_STATUS_FAILED_OVER))
+            .filter(nodes::Column::Status.eq("active"))
+            .order_by_asc(deployment_containers::Column::Id)
+            .limit(limit)
+            .select_only()
+            .column_as(deployment_containers::Column::Id, "container_row_id")
+            .column_as(deployment_containers::Column::NodeId, "node_id")
+            .column_as(deployment_containers::Column::DeploymentId, "deployment_id")
+            .column_as(deployments::Column::ProjectId, "project_id")
+            .column_as(deployments::Column::EnvironmentId, "environment_id")
+            .column_as(
+                environments::Column::CurrentDeploymentId,
+                "current_deployment_id",
+            )
+            .into_model::<FailedOverReplica>()
+            .all(self.db.as_ref())
+            .await?;
+        Ok(rows)
+    }
+
+    /// Record that the failed-over replicas `container_row_ids` were handled
+    /// (their replica count restored, or no longer needed): they become
+    /// ordinary `retired` rows that cleanup still removes from their node.
+    /// Only rows still `failed_over` change, so a concurrent cleanup that
+    /// already confirmed one removed is never overwritten.
+    pub async fn settle_failed_over_replicas(
+        &self,
+        container_row_ids: &[i32],
+    ) -> Result<u64, NodeError> {
+        if container_row_ids.is_empty() {
+            return Ok(0);
+        }
+        let result = deployment_containers::Entity::update_many()
+            .col_expr(
+                deployment_containers::Column::Status,
+                Expr::value(CONTAINER_STATUS_RETIRED),
+            )
+            .filter(deployment_containers::Column::Id.is_in(container_row_ids.to_vec()))
+            .filter(deployment_containers::Column::Status.eq(CONTAINER_STATUS_FAILED_OVER))
+            .exec(self.db.as_ref())
+            .await?;
+        Ok(result.rows_affected)
+    }
+}
+
+/// A replica a failover took out of routing, on a node that is active again.
+/// See [`NodeService::failed_over_replicas_on_recovered_nodes`].
+#[derive(Debug, Clone, PartialEq, Eq, sea_orm::FromQueryResult)]
+pub struct FailedOverReplica {
+    pub container_row_id: i32,
+    pub node_id: i32,
+    pub deployment_id: i32,
+    pub project_id: i32,
+    pub environment_id: i32,
+    /// The deployment the environment serves now.
+    pub current_deployment_id: Option<i32>,
+}
+
+impl FailedOverReplica {
+    /// Whether the replica belongs to the deployment its environment still
+    /// serves, so its missing replica count must be restored.
+    pub fn is_current(&self) -> bool {
+        self.current_deployment_id == Some(self.deployment_id)
     }
 }
 
@@ -4137,6 +4324,89 @@ mod tests {
             temps_deployer::DeployerError::ContainerNotFound(format!("container {id} not found"))
         }
 
+        /// #1384: a replica a failover retired on a node that came back is
+        /// removed once its deployment is superseded, after its labels
+        /// confirm the project, and recorded as removed.
+        #[tokio::test]
+        async fn a_retired_container_is_removed_after_its_labels_confirm_the_project() {
+            let mut retired = sample_container(7, 20, 5);
+            retired.container_id = "c-failed-over".to_string();
+            retired.deleted_at = Some(chrono::Utc::now());
+            retired.status = Some(CONTAINER_STATUS_FAILED_OVER.to_string());
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_exec_results(vec![updated()])
+                    .into_connection(),
+            );
+            let mut deployer = MockDeployer::new();
+            deployer
+                .expect_get_container_info()
+                .returning(|id| Ok(on_node(id, "100")));
+            deployer
+                .expect_remove_container()
+                .withf(|id| id == "c-failed-over")
+                .times(1)
+                .returning(|_| Ok(()));
+
+            remove_retired_container(db.as_ref(), &deployer, &retired, 100)
+                .await
+                .expect("removed");
+
+            let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("db still has owners"));
+            let log = format!("{:?}", db.into_transaction_log());
+            assert!(log.contains(CONTAINER_STATUS_REMOVED), "{log}");
+            // Only while the row still has the status it was read with.
+            assert!(log.contains(CONTAINER_STATUS_FAILED_OVER), "{log}");
+        }
+
+        #[tokio::test]
+        async fn a_retired_container_of_another_project_is_left_in_place() {
+            let mut retired = sample_container(7, 20, 5);
+            retired.container_id = "c-reused".to_string();
+            retired.deleted_at = Some(chrono::Utc::now());
+            retired.status = Some(CONTAINER_STATUS_RETIRED.to_string());
+            let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+            let mut deployer = MockDeployer::new();
+            deployer
+                .expect_get_container_info()
+                .returning(|id| Ok(on_node(id, "999")));
+            deployer.expect_remove_container().never();
+
+            let error = remove_retired_container(db.as_ref(), &deployer, &retired, 100)
+                .await
+                .expect_err("labels name another project");
+            assert!(matches!(
+                error,
+                RetiredContainerRemovalError::Container(ContainerRemovalError::NotOwned { .. })
+            ));
+            let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("db still has owners"));
+            assert!(db.into_transaction_log().is_empty(), "the row is untouched");
+        }
+
+        #[tokio::test]
+        async fn a_retired_container_already_gone_is_recorded_as_removed() {
+            let mut retired = sample_container(7, 20, 5);
+            retired.container_id = "c-gone".to_string();
+            retired.deleted_at = Some(chrono::Utc::now());
+            retired.status = Some(CONTAINER_STATUS_RETIRED.to_string());
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_exec_results(vec![updated()])
+                    .into_connection(),
+            );
+            let mut deployer = MockDeployer::new();
+            deployer
+                .expect_get_container_info()
+                .returning(|id| Err(not_found(id)));
+            deployer.expect_remove_container().never();
+
+            remove_retired_container(db.as_ref(), &deployer, &retired, 100)
+                .await
+                .expect("gone counts as removed");
+            let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("db still has owners"));
+            assert_eq!(db.into_transaction_log().len(), 1);
+        }
+
         #[tokio::test]
         async fn removal_is_refused_while_a_deployment_uses_the_node() {
             let db = MockDatabase::new(DatabaseBackend::Postgres)
@@ -4590,7 +4860,7 @@ mod tests {
         let service = NodeService::new(Arc::new(db));
 
         let count = service
-            .retire_containers_on_node(5, 10, &HashSet::new())
+            .retire_containers_on_node(5, 10, &HashSet::new(), RetireReason::Drain)
             .await
             .unwrap();
         assert_eq!(count, 2);
@@ -4854,6 +5124,80 @@ mod tests {
         ));
     }
 
+    /// #1384: a failover that leaves replicas elsewhere records the ones it
+    /// takes out of routing as `failed_over`, so they are restored when the
+    /// node recovers; a drain keeps recording `retired`.
+    #[tokio::test]
+    async fn test_retire_reason_decides_the_status_of_unconfirmed_containers() {
+        for (reason, expected) in [
+            (RetireReason::Drain, CONTAINER_STATUS_RETIRED),
+            (RetireReason::FailoverHistorical, CONTAINER_STATUS_RETIRED),
+            (RetireReason::FailoverReplica, CONTAINER_STATUS_FAILED_OVER),
+        ] {
+            let container = sample_container(1, 10, 5);
+            let mut updated = container.clone();
+            updated.status = Some(expected.to_string());
+            updated.deleted_at = Some(chrono::Utc::now());
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results(vec![vec![container]])
+                    .append_query_results(vec![vec![updated]])
+                    .into_connection(),
+            );
+            let service = NodeService::new(db.clone());
+            let count = service
+                .retire_containers_on_node(5, 10, &HashSet::new(), reason)
+                .await
+                .unwrap();
+            assert_eq!(count, 1);
+            drop(service);
+            let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("db still has owners"));
+            let log = format!("{:?}", db.into_transaction_log());
+            assert!(log.contains(expected), "{reason:?}: {log}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_failed_over_replicas_are_found_only_on_active_nodes_and_settled_once() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![Vec::<
+                    std::collections::BTreeMap<String, sea_orm::Value>,
+                >::new()])
+                .append_exec_results(vec![sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 2,
+                }])
+                .into_connection(),
+        );
+        let service = NodeService::new(db.clone());
+        assert!(service
+            .failed_over_replicas_on_recovered_nodes(100)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(service.settle_failed_over_replicas(&[]).await.unwrap(), 0);
+        assert_eq!(
+            service.settle_failed_over_replicas(&[3, 4]).await.unwrap(),
+            2
+        );
+        drop(service);
+
+        let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("db still has owners"));
+        let log = db.into_transaction_log();
+        assert_eq!(log.len(), 2, "an empty settle issues no statement");
+        let select = &log[0].statements()[0];
+        assert!(select.sql.contains("LIMIT"), "{}", select.sql);
+        let select_values = format!("{:?}", select.values);
+        assert!(select_values.contains("failed_over"), "{select_values}");
+        assert!(select_values.contains("active"), "{select_values}");
+        let update = &log[1].statements()[0];
+        let update_values = format!("{:?}", update.values);
+        // Only rows still `failed_over` become `retired`.
+        assert!(update_values.contains("retired"), "{update_values}");
+        assert!(update_values.contains("failed_over"), "{update_values}");
+    }
+
     #[tokio::test]
     async fn test_retire_containers_on_node_empty() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
@@ -4862,7 +5206,7 @@ mod tests {
         let service = NodeService::new(Arc::new(db));
 
         let count = service
-            .retire_containers_on_node(5, 10, &HashSet::new())
+            .retire_containers_on_node(5, 10, &HashSet::new(), RetireReason::Drain)
             .await
             .unwrap();
         assert_eq!(count, 0);
