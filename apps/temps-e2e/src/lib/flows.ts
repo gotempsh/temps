@@ -574,7 +574,7 @@ export function looksLikeConsoleFallback(body: string): boolean {
 /**
  * Poll the target until it serves the deployed app rather than the Temps console
  * SPA fallback, then return. The proxy serves the console shell (HTTP 200,
- * `<title>Temps</title>`) for unknown/failed hosts AND for the brief window
+ * `<title>Temps</title>`) for unknown hosts AND for the brief window
  * before a freshly-started container's route propagates — so a bare status check
  * cannot distinguish "app is serving" from "deploy failed / not routed yet".
  * This is the guard that makes a broken deploy actually fail (after giving the
@@ -636,17 +636,13 @@ export async function fetchBody(
 }
 
 /**
- * The mirror of `assertNotConsoleFallback`: poll a target until it DOES serve
- * the Temps console SPA fallback (or times out still serving something else).
- *
- * Used to prove a deployment pause actually took live traffic offline: after
- * pausing, `route_table::load_routes` finds no routable container for the
- * environment (see the fix note there) and skips the route entirely, so the
- * proxy falls through to its unknown-host console fallback. A real app
- * response (or a hung/refused connection) here means pause did NOT actually
- * stop traffic.
+ * Poll a known application host until it returns HTTP 503 without the Temps
+ * console HTML. Paused and stopped applications retain their known route and
+ * report unavailability instead of serving the console as a successful page.
+ * A live app response, console fallback, or transport error cannot prove this
+ * behavior and is retried until the deadline.
  */
-export async function waitForConsoleFallback(opts: {
+export async function waitForAppUnavailable(opts: {
   url: string
   headers?: Record<string, string>
   timeoutMs?: number
@@ -662,15 +658,15 @@ export async function waitForConsoleFallback(opts: {
       const r = await fetchBody(opts.url, opts.headers, 10_000)
       status = r.status
       body = r.body
-      if (looksLikeConsoleFallback(body)) return
+      if (status === 503 && !looksLikeConsoleFallback(body)) return
     } catch {
       // transient — retry
     }
     await sleep(intervalMs)
   }
   throw new Error(
-    `expected the paused deployment to serve the Temps console fallback, but got HTTP ${status} ` +
-      `with a non-fallback body after ${Math.round(timeoutMs / 1000)}s ` +
+    `expected the paused/stopped app to return HTTP 503 without the Temps console HTML, ` +
+      `but got HTTP ${status} after ${Math.round(timeoutMs / 1000)}s ` +
       `(body starts: ${JSON.stringify(body.slice(0, 80))})`,
   )
 }

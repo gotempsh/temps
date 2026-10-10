@@ -5,13 +5,14 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { SettingsSection } from '@/components/ui/settings-section'
 import { Switch } from '@/components/ui/switch'
+import { Textarea } from '@/components/ui/textarea'
 import { Label } from '@/components/ui/label'
 import { AdminGateCard } from '@/components/settings/AdminGateCard'
 import { SecuritySettings } from '@/components/settings/SecuritySettings'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useSettings, useUpdateSettings } from '@/hooks/useSettings'
-import { AlertCircle, LockKeyhole, Loader2, Save } from 'lucide-react'
+import { AlertCircle, LockKeyhole, Loader2, Network, Save } from 'lucide-react'
 import { useEffect } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
@@ -24,6 +25,15 @@ interface SecurityFormData {
   security_headers: SecurityHeadersType
   rate_limiting: RateLimitType
   trust_loopback_forwarded_ip: boolean
+  /** One network per line; split into `trusted_private_networks` on save. */
+  trusted_private_networks_text: string
+}
+
+function parseNetworkLines(text: string): string[] {
+  return text
+    .split(/[\n,]/)
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0)
 }
 
 export function SecurityPage() {
@@ -59,6 +69,7 @@ export function SecurityPage() {
         blacklist_ips: [],
       },
       trust_loopback_forwarded_ip: false,
+      trusted_private_networks_text: '',
     },
   })
 
@@ -100,17 +111,34 @@ export function SecurityPage() {
           blacklist_ips: [],
         },
         trust_loopback_forwarded_ip: settings.trust_loopback_forwarded_ip,
+        trusted_private_networks_text: (
+          settings.trusted_private_networks ?? []
+        ).join('\n'),
       })
     }
   }, [settings, reset])
 
   const onSubmit = async (data: SecurityFormData) => {
+    const { trusted_private_networks_text, ...rest } = data
     try {
-      await updateSettings.mutateAsync(data)
-      reset(data)
+      const saved = await updateSettings.mutateAsync({
+        ...rest,
+        trusted_private_networks: parseNetworkLines(
+          trusted_private_networks_text
+        ),
+      })
+      // The server normalizes entries (bare IPs gain /32, host bits are
+      // cleared); the settings refetch re-runs the reset effect above with
+      // the stored form, so the textarea ends up showing what is enforced.
+      reset({
+        ...data,
+        trusted_private_networks_text: (
+          saved.trusted_private_networks ?? []
+        ).join('\n'),
+      })
       toast.success('Security settings saved')
     } catch {
-      toast.error('Failed to save settings')
+      // useUpdateSettings already surfaces the server's validation detail.
     }
   }
 
@@ -170,6 +198,48 @@ export function SecurityPage() {
               analytics and IP-based controls. Changes reach proxy processes
               within a few seconds.
             </p>
+          </div>
+        </SettingsSection>
+        <SettingsSection
+          title="Trusted private networks"
+          description="Let webhooks, notifications, uptime checks, AI providers, self-hosted git, OIDC and importers reach services on your private network"
+          icon={Network}
+        >
+          <div className="space-y-3">
+            <Label htmlFor="trusted-private-networks">
+              Networks (one CIDR or IP address per line)
+            </Label>
+            <Textarea
+              id="trusted-private-networks"
+              rows={4}
+              className="font-mono text-sm"
+              placeholder={'10.0.0.0/8\n192.168.1.20\n100.64.0.0/10'}
+              {...register('trusted_private_networks_text')}
+            />
+            <p className="text-sm text-muted-foreground">
+              By default Temps refuses to send requests to private, loopback and
+              CGNAT addresses so a project member cannot use a webhook URL to
+              probe your internal network. List the networks that host services
+              you want to reach, such as an internal webhook receiver, a model
+              server or a Git server. Only private ranges are accepted
+              (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8,
+              100.64.0.0/10, fc00::/7, ::1). Cloud metadata endpoints stay
+              blocked.
+            </p>
+            <Alert>
+              <AlertCircle className="h-4 w-4" />
+              <AlertTitle>
+                Everyone who can configure a URL gains access
+              </AlertTitle>
+              <AlertDescription>
+                Any project member who can create a webhook, uptime check or AI
+                provider can make Temps send requests into these networks. Keep
+                them narrow, and avoid trusting the network your Temps database
+                or Docker API listens on. Loopback (127.0.0.0/8) reaches the
+                Temps host itself. Changes are audit-logged and reach every
+                Temps process within a few seconds.
+              </AlertDescription>
+            </Alert>
           </div>
         </SettingsSection>
         <SecuritySettings

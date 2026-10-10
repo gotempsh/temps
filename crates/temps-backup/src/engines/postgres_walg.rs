@@ -183,9 +183,9 @@ impl BackupEngine for PostgresWalgEngine {
         // backup doesn't retroactively archive that already-completed
         // segment (no `.ready` marker was ever written for it), so a
         // restore's `wal-g wal-fetch` finds nothing and Postgres fails to
-        // start with "could not locate required checkpoint record". Non-fatal
-        // by design: a failure here still lets the base backup proceed, it
-        // just won't be immediately restorable.
+        // start with "could not locate required checkpoint record". Refuse
+        // backup-push if archiving cannot be enabled and verified rather than
+        // reporting an unrestorable base backup as completed.
         //
         // No-op after the first backup on a given service: `enable_continuous_archiving`
         // checks whether archiving is already active before doing the
@@ -200,18 +200,15 @@ impl BackupEngine for PostgresWalgEngine {
             version: None,
             parameters: serde_json::from_str(&config_json).unwrap_or(Value::Null),
         };
-        if let Err(e) = postgres_service
+        postgres_service
             .enable_continuous_archiving(service_config, &s3_credentials, &walg_prefix)
             .await
-        {
-            error!(
-                backup_id,
-                container = %container_name,
-                "Failed to enable continuous WAL archiving before backup-push; the base backup \
-                 will proceed but will not be immediately restorable: {}",
-                e
-            );
-        }
+            .map_err(|error| BackupError::Failed {
+                reason: format!(
+                    "Cannot create a recoverable WAL-G backup for service {} ('{}'): continuous archiving could not be enabled and verified: {}",
+                    service.id, service.name, error
+                ),
+            })?;
 
         // WAL-G memory tuning — see v1 notes. Defaults can OOM small containers
         // because each in-flight tar buffer is held fully in RAM. These values

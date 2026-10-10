@@ -35,6 +35,7 @@ The defaults are chosen so that Temps is safe to try on a laptop: it listens onl
 | ☐ | The proxy listens on ports 80 and 443 and the console has a certificate | [HTTPS](#tls) |
 | ☐ | Only 80 and 443 (plus the WireGuard port, if you use worker nodes) are open to the internet | [Network](#network) |
 | ☐ | The admin surface is restricted with the admin listener or the admin access gate | [Admin surface](#admin-surface) |
+| ☐ | Trusted private networks are empty, or list only the networks outbound features need | [Outbound private networks](#outbound-private-networks) |
 | ☐ | `encryption_key` and `auth_secret` are backed up somewhere other than the server | [Encryption key](#encryption-key) |
 | ☐ | A backup schedule with the control plane included runs, and you have restored from it once | [Backups](#backups) |
 | ☐ | Every admin has MFA, and admin password logins require it | [Accounts](#accounts) |
@@ -92,6 +93,19 @@ Without further configuration, anyone who can reach the server can load the logi
 - **Admin listener.** `TEMPS_CONSOLE_ADMIN_ADDRESS` moves login, the dashboard and the management API to a separate bind address, such as loopback behind an SSH tunnel or a VPN interface, while SDK ingest endpoints stay public.
 
 See [Admin Listener](/docs/admin-listener) for the routes on each side and tested recipes. Authentication endpoints (login, MFA verification, password reset, SSO callbacks) are also rate-limited to 10 requests per minute per IP.
+
+---
+
+## Trust private networks for outbound requests {{ anchor: true, id: 'outbound-private-networks' }}
+
+Many features send requests to URLs that users configure, including webhooks, notification channels, uptime checks, AI gateway providers, self-hosted Git, OIDC providers, sandbox seed URLs and importers. Temps refuses any of them that point at a private, loopback, CGNAT or link-local address, so a project member cannot use a webhook URL to read your internal services or your cloud provider's metadata endpoint.
+
+On a self-hosted install you may want some of those features to reach your own network, for example a Gitea server, an Ollama box or an internal webhook receiver. List those networks under **Settings → Security → Trusted private networks**, one CIDR or IP address per line:
+
+- Only private ranges are accepted: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.0/8`, `100.64.0.0/10`, `fc00::/7` and `::1`. Public ranges are already reachable, and link-local ranges are never trustable.
+- Cloud metadata endpoints (`169.254.169.254`, `100.100.100.200`, `fd00:ec2::254`) stay blocked even inside a trusted range.
+- Every user who can configure one of the features above can reach the trusted networks, so keep the list as narrow as possible. Some of these features return what they fetch: importers copy a database's contents into a project, sandbox seeding downloads a URL, and AI providers return the upstream response. Do not trust the network where the Temps database, the Docker API or other management services listen. Trusting `127.0.0.0/8` makes the Temps host itself reachable.
+- Changes are recorded in the audit log as `TRUSTED_PRIVATE_NETWORKS_UPDATED` with the previous and new lists, and reach every Temps process within a few seconds.
 
 ---
 

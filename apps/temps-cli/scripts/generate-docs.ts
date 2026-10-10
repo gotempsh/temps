@@ -76,18 +76,17 @@ function parseArgs(): DocsFormat {
   return result
 }
 
-function extractCommandInfo(cmd: Command, parentName = ''): CommandInfo {
+export function extractCommandInfo(cmd: Command, parentName = ''): CommandInfo {
   const name = parentName ? `${parentName} ${cmd.name()}` : cmd.name()
   const aliases = cmd.aliases()
 
-  const options: OptionInfo[] = cmd.options.map((opt: any) => ({
+  const options: OptionInfo[] = cmd.options.map((opt) => ({
     flags: opt.flags,
     description: opt.description || '',
     defaultValue:
       opt.defaultValue !== undefined ? String(opt.defaultValue) : undefined,
-    // `<value>` only means the value is required *when the option is
-    // supplied*; `.makeOptionMandatory()` is what makes the option itself
-    // required. Same rule as `temps docs` (src/commands/docs.ts).
+    // A required argument applies only when its option is supplied. Commander
+    // records whether the flag itself must be present separately.
     required: opt.mandatory === true,
   }))
 
@@ -408,4 +407,6 @@ async function main() {
   }
 }
 
-main().catch(console.error)
+if (import.meta.main) {
+  main().catch(console.error)
+}

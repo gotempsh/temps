@@ -50,6 +50,18 @@ use temps_core::{
     PublicHostnameStrategy,
 };
 
+/// Whether a settings write explicitly changes outbound private-network trust.
+pub enum TrustedPrivateNetworksIntent {
+    Unchanged,
+    Replace(Vec<String>),
+}
+
+/// Values from the locked row and the committed update, for accurate auditing.
+pub struct SettingsUpdateResult {
+    pub previous_trusted_private_networks: Vec<String>,
+    pub trusted_private_networks: Vec<String>,
+}
+
 /// Rebase credential-owned fields onto the row locked by the settings writer.
 /// A bulk settings payload (including one built from an older GET) is never
 /// allowed to create, restore, or verify a provider credential.
@@ -827,6 +839,33 @@ pub struct ConfigService {
     listener_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
+/// Publish the settings that sync call sites read from process-wide caches
+/// (TLS verification and the outbound SSRF trust list), so they never await
+/// a DB lookup. Always called under the settings-cache generation guard.
+fn publish_process_wide_settings(settings: &AppSettings) {
+    temps_core::tls::set_insecure_tls(settings.insecure_tls);
+    temps_core::url_validation::set_trusted_private_networks(trusted_networks_from_settings(
+        settings,
+    ));
+}
+
+/// Entries are validated on save; one that fails here was written around the
+/// API (a hand-edited row). Skip it rather than trusting it, and say so.
+fn trusted_networks_from_settings(
+    settings: &AppSettings,
+) -> Vec<temps_core::url_validation::IpNet> {
+    let mut networks = Vec::with_capacity(settings.trusted_private_networks.len());
+    for entry in &settings.trusted_private_networks {
+        match temps_core::url_validation::parse_trusted_private_network(entry) {
+            Ok(network) => networks.push(network),
+            Err(error) => {
+                warn!(%error, "Ignoring invalid trusted private network from AppSettings")
+            }
+        }
+    }
+    networks
+}
+
 impl ConfigService {
     pub fn new(config: Arc<ServerConfig>, db: Arc<DbConnection>) -> Self {
         Self {
@@ -1236,7 +1275,7 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         // guard as the settings snapshot. A DB read started before an
         // invalidation must not be able to restore stale TLS behavior after
         // the newer settings have become authoritative.
-        temps_core::tls::set_insecure_tls(settings.insecure_tls);
+        publish_process_wide_settings(&settings);
         cache.snapshot = Some((settings, std::time::Instant::now()));
         true
     }
@@ -1251,7 +1290,7 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             return false;
         }
         cache.generation = cache.generation.wrapping_add(1);
-        temps_core::tls::set_insecure_tls(settings.insecure_tls);
+        publish_process_wide_settings(&settings);
         cache.snapshot = Some((settings, std::time::Instant::now()));
         true
     }
@@ -1280,9 +1319,27 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     /// locked row, never from the request.
     pub async fn update_settings_with_geo_intent(
         &self,
-        mut settings: AppSettings,
+        settings: AppSettings,
         geo_license_key_intent: GeoLicenseKeyIntent,
     ) -> Result<(), ConfigServiceError> {
+        self.update_settings_with_intents(
+            settings,
+            geo_license_key_intent,
+            TrustedPrivateNetworksIntent::Unchanged,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Apply explicit admin changes while preserving private-network trust
+    /// from the locked row for unrelated writes. A cached settings snapshot
+    /// must never restore trust that an administrator has since revoked.
+    pub async fn update_settings_with_intents(
+        &self,
+        mut settings: AppSettings,
+        geo_license_key_intent: GeoLicenseKeyIntent,
+        trusted_private_networks_intent: TrustedPrivateNetworksIntent,
+    ) -> Result<SettingsUpdateResult, ConfigServiceError> {
         let now = Utc::now();
         let cache_generation = self.settings_cache.read().await.generation;
 
@@ -1336,6 +1393,16 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
                 }
             })?,
             None => AppSettings::default(),
+        };
+        settings.trusted_private_networks = match trusted_private_networks_intent {
+            TrustedPrivateNetworksIntent::Unchanged => {
+                locked_settings.trusted_private_networks.clone()
+            }
+            TrustedPrivateNetworksIntent::Replace(networks) => networks,
+        };
+        let result = SettingsUpdateResult {
+            previous_trusted_private_networks: locked_settings.trusted_private_networks.clone(),
+            trusted_private_networks: settings.trusted_private_networks.clone(),
         };
         // Consent belongs to the SystemAdmin-only plugin endpoint. A generic
         // settings save must not undo a consent update committed before this lock.
@@ -1519,7 +1586,7 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             self.invalidate_settings_cache().await;
         }
 
-        Ok(())
+        Ok(result)
     }
 
     /// Drop the cached `AppSettings` snapshot so the next `get_settings` call
@@ -1533,15 +1600,17 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             cache.generation = cache.generation.wrapping_add(1);
             cache.snapshot = None;
             // Fail closed until the authoritative row has been reloaded. This
-            // is important when the invalidated value had insecure TLS enabled.
+            // is important when the invalidated value had insecure TLS enabled
+            // or trusted private networks the operator has since removed.
             temps_core::tls::set_insecure_tls(false);
+            temps_core::url_validation::set_trusted_private_networks(Vec::new());
         }
 
         // Reload immediately so cross-process settings changes (including an
         // intentional insecure-TLS opt-in) become effective when the NOTIFY is
         // processed, rather than waiting for an unrelated future caller.
         if let Err(error) = self.get_settings().await {
-            warn!(%error, "Failed to reload AppSettings after cache invalidation; strict TLS remains enabled");
+            warn!(%error, "Failed to reload AppSettings after cache invalidation; strict TLS and the default SSRF policy remain in effect");
         }
         debug!("Invalidated AppSettings cache (settings_change NOTIFY)");
     }
@@ -4797,6 +4866,182 @@ mod tests {
             "v2",
             "invalidate_settings_cache must force a fresh DB read, not serve the cached v1"
         );
+    }
+
+    #[test]
+    fn published_trusted_networks_skip_invalid_entries() {
+        let settings = AppSettings {
+            trusted_private_networks: vec!["10.0.0.0/8".to_string(), "8.8.8.0/24".to_string()],
+            ..AppSettings::default()
+        };
+        let published: Vec<String> = trusted_networks_from_settings(&settings)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+
+        assert_eq!(
+            published,
+            vec!["10.0.0.0/8"],
+            "a hand-edited public range must never be trusted"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_field_update_preserves_locked_private_network_trust() {
+        // Startup has cached the old allowlist. An admin commits a removal
+        // or replacement before startup saves its unrelated console version.
+        for current_networks in [vec![], vec!["192.168.4.0/24".to_string()]] {
+            let mut locked = settings_row("example.test");
+            locked.data["trusted_private_networks"] = serde_json::json!(current_networks);
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Sqlite)
+                    .append_query_results([
+                        vec![locked.clone()],
+                        vec![locked.clone()],
+                        vec![locked.clone()],
+                        vec![locked],
+                    ])
+                    .append_exec_results([sea_orm::MockExecResult {
+                        last_insert_id: 1,
+                        rows_affected: 1,
+                    }])
+                    .into_connection(),
+            );
+            let svc = ConfigService::new(test_config(), db.clone());
+            svc.settings_cache.write().await.snapshot = Some((
+                AppSettings {
+                    trusted_private_networks: vec!["10.0.0.0/8".to_string()],
+                    ..AppSettings::default()
+                },
+                std::time::Instant::now(),
+            ));
+
+            svc.update_setting_field(|settings| {
+                settings.console_version = Some("new-console".to_string());
+            })
+            .await
+            .expect("startup field save");
+            let saved = svc.get_settings().await.expect("rebased cache");
+            assert_eq!(saved.console_version.as_deref(), Some("new-console"));
+            assert_eq!(saved.trusted_private_networks, current_networks);
+
+            drop(svc);
+            let log = Arc::try_unwrap(db)
+                .expect("released database")
+                .into_transaction_log();
+            let sql = log
+                .iter()
+                .flat_map(|txn| txn.statements())
+                .map(ToString::to_string)
+                .find(|sql| sql.starts_with("UPDATE "))
+                .expect("persisted settings update");
+            assert!(
+                !sql.contains("10.0.0.0/8"),
+                "revoked network restored: {sql}"
+            );
+            assert!(sql.contains("new-console"), "unrelated update lost: {sql}");
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_private_network_update_reports_the_locked_audit_values() {
+        for submitted in [vec![], vec!["192.168.4.0/24".to_string()]] {
+            let mut locked = settings_row("example.test");
+            locked.data["trusted_private_networks"] = serde_json::json!(["10.1.0.0/16"]);
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Sqlite)
+                    .append_query_results([
+                        vec![locked.clone()],
+                        vec![locked.clone()],
+                        vec![locked.clone()],
+                        vec![locked],
+                    ])
+                    .append_exec_results([sea_orm::MockExecResult {
+                        last_insert_id: 1,
+                        rows_affected: 1,
+                    }])
+                    .into_connection(),
+            );
+            let svc = ConfigService::new(test_config(), db);
+            let stale = AppSettings {
+                trusted_private_networks: vec!["10.0.0.0/8".to_string()],
+                ..AppSettings::default()
+            };
+            let saved = svc
+                .update_settings_with_intents(
+                    stale,
+                    GeoLicenseKeyIntent::Unchanged,
+                    TrustedPrivateNetworksIntent::Replace(submitted.clone()),
+                )
+                .await
+                .expect("explicit trust update");
+            assert_eq!(saved.previous_trusted_private_networks, vec!["10.1.0.0/16"]);
+            assert_eq!(saved.trusted_private_networks, submitted);
+            assert_eq!(
+                svc.get_settings()
+                    .await
+                    .expect("committed cache")
+                    .trusted_private_networks,
+                submitted
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_stale_settings_save_cannot_restore_revoked_private_networks() {
+        let mut database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Skipping private-network race test: Docker unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("private-network race test database failed: {error}"),
+        };
+        let svc = ConfigService::new(test_config(), database.db.clone());
+        svc.update_settings_with_intents(
+            AppSettings::default(),
+            GeoLicenseKeyIntent::Unchanged,
+            TrustedPrivateNetworksIntent::Replace(vec!["10.0.0.0/8".to_string()]),
+        )
+        .await
+        .expect("initial trust");
+        let mut startup_snapshot = svc.get_settings().await.expect("startup snapshot");
+
+        svc.update_settings_with_intents(
+            startup_snapshot.clone(),
+            GeoLicenseKeyIntent::Unchanged,
+            TrustedPrivateNetworksIntent::Replace(vec![]),
+        )
+        .await
+        .expect("admin revokes trust");
+        startup_snapshot.console_version = Some("new-console".to_string());
+        svc.update_settings(startup_snapshot)
+            .await
+            .expect("stale startup save");
+
+        let row = settings::Entity::find_by_id(1)
+            .one(database.db.as_ref())
+            .await
+            .expect("database readback")
+            .expect("settings row");
+        let persisted = AppSettings::from_json(row.data);
+        assert!(
+            persisted.trusted_private_networks.is_empty(),
+            "revoked trust must remain absent in PostgreSQL"
+        );
+        assert_eq!(persisted.console_version.as_deref(), Some("new-console"));
+        assert!(svc
+            .get_settings()
+            .await
+            .expect("committed cache")
+            .trusted_private_networks
+            .is_empty());
+        drop(svc);
+        database.cleanup().await;
     }
 
     #[tokio::test]

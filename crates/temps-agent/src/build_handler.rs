@@ -433,7 +433,9 @@ async fn receive_build(
         image_name: spec.image_name,
         context_path: context_dir,
         dockerfile_path: Some(dockerfile),
-        build_args: Default::default(),
+        // Only the control plane's cache namespace (validated above); project
+        // variables never reach a worker build.
+        build_args: worker_build_args(spec.cache_namespace),
         build_args_buildkit: Default::default(),
         platform: spec.platform,
         log_path: scratch.path().join("build.log"),
@@ -774,8 +776,34 @@ fn tar_response(body: Body) -> Response {
         .into_response()
 }
 
+/// The build arguments a worker build runs with: only the control plane's
+/// cache namespace (already validated with the spec), so builds of different
+/// projects on this node never share BuildKit cache mounts.
+fn worker_build_args(cache_namespace: Option<String>) -> std::collections::HashMap<String, String> {
+    cache_namespace
+        .map(|namespace| {
+            std::collections::HashMap::from([(
+                temps_deployer::build_protocol::CACHE_MOUNT_NAMESPACE_ARG.to_string(),
+                namespace,
+            )])
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn worker_build_args_hold_only_the_cache_namespace() {
+        assert!(super::worker_build_args(None).is_empty());
+        let args = super::worker_build_args(Some("abc123".to_string()));
+        assert_eq!(args.len(), 1);
+        assert_eq!(
+            args.get(temps_deployer::build_protocol::CACHE_MOUNT_NAMESPACE_ARG)
+                .map(String::as_str),
+            Some("abc123")
+        );
+    }
+
     use super::*;
 
     #[tokio::test]

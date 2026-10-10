@@ -46,6 +46,7 @@ import { usePageTitle } from '@/hooks/usePageTitle'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { listBackupChildrenOptions } from '@/lib/backup-children'
 import { deleteBackup } from '@/lib/backup-cleanup'
+import { problemDetail } from '@/lib/api-problem'
 import { cancelBackup } from '@/lib/schedule-runs'
 import { cn } from '@/lib/utils'
 import { restoreBackupHref } from '@/pages/service-restore/restore-selection'
@@ -323,7 +324,12 @@ export function BackupDetail() {
         setShowDeleteDialog(false)
         return
       }
-      const message = err instanceof Error ? err.message : 'Unknown error'
+      const message = problemDetail(
+        err,
+        err instanceof Error
+          ? err.message
+          : 'Backup deletion failed. Retry or check the backup dependencies.'
+      )
       toast.error('Failed to delete backup', { description: message })
     },
   })

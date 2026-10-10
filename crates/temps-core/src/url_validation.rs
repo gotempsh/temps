@@ -7,6 +7,10 @@
 //! vulnerabilities by blocking private IP ranges, cloud metadata services, and malicious schemes.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::{Arc, RwLock};
+
+pub use ipnet::IpNet;
+use once_cell::sync::Lazy;
 use thiserror::Error;
 use url::Url;
 
@@ -18,10 +22,10 @@ pub enum UrlValidationError {
     #[error("URL scheme must be HTTP or HTTPS")]
     InvalidScheme,
 
-    #[error("Private IP addresses are not allowed")]
+    #[error("Private IP addresses are not allowed{}", TRUSTED_NETWORKS_HINT)]
     PrivateIp,
 
-    #[error("Loopback addresses are not allowed")]
+    #[error("Loopback addresses are not allowed{}", TRUSTED_NETWORKS_HINT)]
     LoopbackIp,
 
     #[error("Link-local addresses are not allowed")]
@@ -48,11 +52,197 @@ pub enum UrlValidationError {
     #[error("DNS resolution failed: {0}")]
     DnsResolutionFailed(String),
 
-    #[error("Domain resolves to a blocked IP address")]
+    #[error("Domain resolves to a blocked IP address{}", TRUSTED_NETWORKS_HINT)]
     DomainResolvesToBlockedIp,
 
     #[error("URL must resolve to a loopback or private address (this is a local-only tool)")]
     NotLocalOrPrivate,
+
+    #[error("Invalid trusted private network '{entry}': {reason}")]
+    InvalidTrustedNetwork { entry: String, reason: String },
+}
+
+/// Appended to the errors a trusted private network can lift, so whoever hits
+/// one learns the block is an instance policy rather than a bug.
+const TRUSTED_NETWORKS_HINT: &str = " (an administrator can allow specific private networks \
+     under Settings > Security > Trusted private networks)";
+
+/// Address ranges an operator may mark as trusted outbound destinations.
+///
+/// Only ranges that are private *by allocation* qualify: RFC 1918, loopback,
+/// RFC 6598 shared address space (CGNAT, used by Tailscale and similar
+/// overlays) and IPv6 unique-local/loopback. Anything else is either already
+/// reachable (public space) or must never be reachable (link-local, where
+/// cloud metadata lives; multicast; broadcast), so accepting it would only
+/// let a typo such as `0.0.0.0/0` silently disable the SSRF guard.
+const TRUSTABLE_RANGES: &[&str] = &[
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "127.0.0.0/8",
+    "100.64.0.0/10",
+    "fc00::/7",
+    "::1/128",
+];
+
+/// Private networks the instance operator has explicitly trusted as outbound
+/// destinations (`AppSettings.trusted_private_networks`).
+///
+/// Self-hosted installs routinely need to reach services on their own LAN or
+/// overlay network: an internal webhook receiver, an Ollama box, a Gitea
+/// server, an uptime target. The default stays closed; an address inside one
+/// of these networks is accepted by every outbound validator in this module.
+/// Cloud metadata endpoints are rejected even when inside a trusted network.
+///
+/// Loaded from the database at startup and re-published by the config
+/// service whenever settings change (same lifecycle as `tls::set_insecure_tls`),
+/// so sync validators never await a DB lookup.
+static TRUSTED_PRIVATE_NETWORKS: Lazy<RwLock<Arc<[IpNet]>>> =
+    Lazy::new(|| RwLock::new(Arc::from(Vec::new())));
+
+/// Parse one operator-supplied trusted network entry.
+///
+/// Accepts CIDR notation (`10.0.0.0/8`, `fd12:3456::/48`) or a bare address,
+/// which is treated as a single host. The entry must lie entirely inside one
+/// of the private ranges in [`TRUSTABLE_RANGES`].
+pub fn parse_trusted_private_network(entry: &str) -> Result<IpNet, UrlValidationError> {
+    let trimmed = entry.trim();
+    let invalid = |reason: &str| UrlValidationError::InvalidTrustedNetwork {
+        entry: trimmed.to_string(),
+        reason: reason.to_string(),
+    };
+
+    let net = match trimmed.parse::<IpNet>() {
+        Ok(net) => net,
+        Err(_) => trimmed
+            .parse::<IpAddr>()
+            .map(IpNet::from)
+            .map_err(|_| invalid("expected a CIDR such as 10.0.0.0/8 or a single IP address"))?,
+    }
+    .trunc();
+
+    let eligible = TRUSTABLE_RANGES
+        .iter()
+        .filter_map(|range| range.parse::<IpNet>().ok())
+        .any(|range| range.contains(&net));
+    if !eligible {
+        return Err(invalid(
+            "only private ranges can be trusted (10.0.0.0/8, 172.16.0.0/12, \
+             192.168.0.0/16, 127.0.0.0/8, 100.64.0.0/10, fc00::/7, ::1)",
+        ));
+    }
+
+    Ok(net)
+}
+
+/// Parse a full list of trusted network entries, failing on the first invalid
+/// one so a settings save never half-applies.
+pub fn parse_trusted_private_networks(
+    entries: &[String],
+) -> Result<Vec<IpNet>, UrlValidationError> {
+    entries
+        .iter()
+        .filter(|entry| !entry.trim().is_empty())
+        .map(|entry| parse_trusted_private_network(entry))
+        .collect()
+}
+
+/// Publish the operator's trusted private networks to this process.
+///
+/// Called with the persisted value at startup, after every settings save,
+/// and with an empty list when the settings cache is invalidated (fail closed
+/// until the authoritative row is reloaded).
+pub fn set_trusted_private_networks(networks: Vec<IpNet>) {
+    let mut guard = TRUSTED_PRIVATE_NETWORKS
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = Arc::from(networks);
+}
+
+/// Snapshot of the trusted private networks currently in effect.
+pub fn trusted_private_networks() -> Arc<[IpNet]> {
+    TRUSTED_PRIVATE_NETWORKS
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// Validate an IP address as an outbound destination, honouring the
+/// operator's trusted private networks.
+///
+/// Use this — not the bare [`validate_ipv4`]/[`validate_ipv6`] classifiers —
+/// anywhere Temps is about to connect to a user-configured destination
+/// (including DNS-pinning connectors). The bare classifiers stay strict
+/// because they also answer "is this a public address?" for geo lookups and
+/// node setup, where an operator trust list has no business changing the
+/// answer.
+pub fn validate_outbound_ip(ip: IpAddr) -> Result<(), UrlValidationError> {
+    validate_outbound_ip_with(ip, &trusted_private_networks())
+}
+
+/// Whether `ip` is inside one of the operator's trusted private networks (and
+/// is not a cloud metadata endpoint).
+///
+/// For call sites with their own stricter or looser blocklist (e.g. OIDC
+/// discovery) that should still honour the operator's trust list.
+pub fn is_trusted_private_destination(ip: IpAddr) -> bool {
+    is_trusted_with(ip, &trusted_private_networks())
+}
+
+fn is_trusted_with(ip: IpAddr, trusted: &[IpNet]) -> bool {
+    // Match `::ffff:10.0.0.5` against a trusted `10.0.0.0/8` exactly like
+    // `10.0.0.5`. Only the IPv4-*mapped* form is unwrapped: `to_ipv4()` would
+    // also turn `::1` into `0.0.0.1`, so a trusted `::1` could never match.
+    // Deprecated IPv4-compatible forms (`::10.0.0.5`) are simply not trusted
+    // and fall through to the strict classifiers.
+    let mapped_v4 = match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4),
+        IpAddr::V4(_) => None,
+    };
+    let candidates = [Some(ip), mapped_v4];
+    let candidates = candidates.iter().flatten();
+
+    let is_metadata = candidates.clone().any(|candidate| match candidate {
+        IpAddr::V4(v4) => is_cloud_metadata_ipv4(v4),
+        IpAddr::V6(v6) => is_cloud_metadata_ipv6(v6),
+    });
+    !is_metadata
+        && candidates
+            .clone()
+            .any(|candidate| trusted.iter().any(|net| net.contains(candidate)))
+}
+
+fn validate_outbound_ip_with(ip: IpAddr, trusted: &[IpNet]) -> Result<(), UrlValidationError> {
+    // `is_trusted_with` never trusts a metadata endpoint (Alibaba's
+    // 100.100.100.200 sits inside 100.64.0.0/10, AWS's fd00:ec2::254 inside
+    // fc00::/7), so those fall through to the strict classifiers below, which
+    // reject them. IPv4-mapped IPv6 is handled the same way on both paths.
+    if is_trusted_with(ip, trusted) {
+        return Ok(());
+    }
+
+    match ip {
+        IpAddr::V4(v4) => validate_ipv4(&v4),
+        IpAddr::V6(v6) => validate_ipv6(&v6),
+    }
+}
+
+/// `localhost` names are rejected syntactically unless loopback itself has
+/// been trusted; the resolved address is still checked by the async path.
+fn validate_localhost_name_with(
+    lower_host: &str,
+    trusted: &[IpNet],
+) -> Result<(), UrlValidationError> {
+    if lower_host == "localhost" || lower_host.ends_with(".localhost") {
+        let loopback_trusted = trusted.iter().any(|net| {
+            net.contains(&IpAddr::V4(Ipv4Addr::LOCALHOST))
+                || net.contains(&IpAddr::V6(Ipv6Addr::LOCALHOST))
+        });
+        if !loopback_trusted {
+            return Err(UrlValidationError::LoopbackIp);
+        }
+    }
+    Ok(())
 }
 
 /// Validates a URL for external webhook/HTTP requests
@@ -84,6 +274,10 @@ pub enum UrlValidationError {
 /// assert!(validate_external_url("http://169.254.169.254/latest/meta-data").is_err());
 /// ```
 pub fn validate_external_url(url: &str) -> Result<Url, UrlValidationError> {
+    validate_external_url_with(url, &trusted_private_networks())
+}
+
+fn validate_external_url_with(url: &str, trusted: &[IpNet]) -> Result<Url, UrlValidationError> {
     // Parse URL
     let parsed =
         Url::parse(url).map_err(|e| UrlValidationError::InvalidFormat(format!("{}", e)))?;
@@ -96,15 +290,12 @@ pub fn validate_external_url(url: &str) -> Result<Url, UrlValidationError> {
     // Validate host
     if let Some(host) = parsed.host() {
         match host {
-            url::Host::Ipv4(ip) => validate_ipv4(&ip)?,
-            url::Host::Ipv6(ip) => validate_ipv6(&ip)?,
+            url::Host::Ipv4(ip) => validate_outbound_ip_with(IpAddr::V4(ip), trusted)?,
+            url::Host::Ipv6(ip) => validate_outbound_ip_with(IpAddr::V6(ip), trusted)?,
             url::Host::Domain(domain) => {
                 // Block well-known loopback and internal hostnames synchronously.
                 // For full DNS resolution validation, use an async validator at the service layer.
-                let lower = domain.to_lowercase();
-                if lower == "localhost" || lower.ends_with(".localhost") {
-                    return Err(UrlValidationError::LoopbackIp);
-                }
+                validate_localhost_name_with(&domain.to_lowercase(), trusted)?;
             }
         }
     } else {
@@ -436,7 +627,9 @@ fn is_unique_local_ipv6(ip: &Ipv6Addr) -> bool {
 /// plaintext transport in 2026.
 ///
 /// After scheme validation, the host is run through `validate_external_url`
-/// so private/loopback/link-local/cloud-metadata IPs are still rejected.
+/// so private/loopback/link-local/cloud-metadata IPs are still rejected,
+/// unless the operator has trusted the private network (self-hosted Gitea or
+/// GitLab on a LAN). HTTPS stays mandatory either way.
 pub fn validate_git_url(url: &str) -> Result<Url, UrlValidationError> {
     // Reject SCP-style `git@host:path` before parsing — no scheme present,
     // `Url::parse` would treat it as a relative path.
@@ -530,9 +723,9 @@ pub fn validate_external_database_url(url: &str) -> Result<Url, UrlValidationErr
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host);
 
+    let trusted = trusted_private_networks();
     match bare.parse::<IpAddr>() {
-        Ok(IpAddr::V4(ip)) => validate_ipv4(&ip)?,
-        Ok(IpAddr::V6(ip)) => validate_ipv6(&ip)?,
+        Ok(ip) => validate_outbound_ip_with(ip, &trusted)?,
         Err(_) => {
             let lower = bare.to_lowercase();
             if lower.is_empty() {
@@ -540,9 +733,7 @@ pub fn validate_external_database_url(url: &str) -> Result<Url, UrlValidationErr
                     "database URL must have a valid host".to_string(),
                 ));
             }
-            if lower == "localhost" || lower.ends_with(".localhost") {
-                return Err(UrlValidationError::LoopbackIp);
-            }
+            validate_localhost_name_with(&lower, &trusted)?;
         }
     }
 
@@ -635,7 +826,7 @@ pub async fn validate_external_database_url_async(url: &str) -> Result<Url, UrlV
 
 /// Resolve `domain:port` and return the socket addresses, **rejecting the whole
 /// domain if any resolved IP is non-public** (loopback, RFC1918, link-local,
-/// etc.).
+/// etc.) and outside the operator's trusted private networks.
 ///
 /// Unlike [`validate_domain_async`], this returns the validated addresses so a
 /// caller can pin its HTTP client to them. Pinning closes the DNS-rebinding
@@ -659,12 +850,9 @@ pub async fn resolve_and_validate_domain(
         ));
     }
 
+    let trusted = trusted_private_networks();
     for addr in &addrs {
-        let validation_result = match addr.ip() {
-            IpAddr::V4(ip) => validate_ipv4(&ip),
-            IpAddr::V6(ip) => validate_ipv6(&ip),
-        };
-        if validation_result.is_err() {
+        if validate_outbound_ip_with(addr.ip(), &trusted).is_err() {
             // If any resolved IP is blocked, reject the entire domain.
             return Err(UrlValidationError::DomainResolvesToBlockedIp);
         }
@@ -1097,5 +1285,154 @@ mod tests {
                 "{hostile} must be rejected"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod trusted_private_network_tests {
+    use super::*;
+
+    fn nets(entries: &[&str]) -> Vec<IpNet> {
+        let owned: Vec<String> = entries.iter().map(|entry| entry.to_string()).collect();
+        parse_trusted_private_networks(&owned).expect("test networks must parse")
+    }
+
+    #[test]
+    fn parses_cidrs_and_bare_addresses() {
+        let parsed = nets(&["10.0.0.0/8", " 192.168.1.20 ", "fd12:3456::/48", "::1", ""]);
+        assert_eq!(
+            parsed,
+            vec![
+                "10.0.0.0/8".parse::<IpNet>().unwrap(),
+                "192.168.1.20/32".parse::<IpNet>().unwrap(),
+                "fd12:3456::/48".parse::<IpNet>().unwrap(),
+                "::1/128".parse::<IpNet>().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn normalizes_host_bits() {
+        assert_eq!(
+            parse_trusted_private_network("10.1.2.3/16").unwrap(),
+            "10.1.0.0/16".parse::<IpNet>().unwrap()
+        );
+    }
+
+    #[test]
+    fn rejects_entries_outside_private_ranges() {
+        for entry in [
+            "0.0.0.0/0",
+            "::/0",
+            "8.8.8.0/24",
+            "169.254.0.0/16",
+            "169.254.169.254",
+            "224.0.0.0/4",
+            "fe80::/10",
+            "10.0.0.0/7",
+            "not-a-network",
+            "10.0.0.0/33",
+        ] {
+            let error = parse_trusted_private_network(entry)
+                .expect_err(&format!("{entry} must not be trustable"));
+            assert!(
+                matches!(error, UrlValidationError::InvalidTrustedNetwork { .. }),
+                "{entry}: unexpected error {error:?}"
+            );
+            assert!(error.to_string().contains(entry.trim()), "{error}");
+        }
+    }
+
+    #[test]
+    fn default_policy_still_blocks_private_destinations() {
+        for url in [
+            "http://10.0.0.5:5678/webhook",
+            "http://192.168.1.10/",
+            "http://127.0.0.1:9000/",
+            "http://localhost:9000/",
+            "http://100.101.102.103/",
+            "http://[fd12:3456::1]/",
+        ] {
+            assert!(
+                validate_external_url_with(url, &[]).is_err(),
+                "{url} must be blocked without trusted networks"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_network_allows_its_own_addresses_only() {
+        let trusted = nets(&["10.0.0.0/8", "fd12:3456::/48"]);
+        for url in [
+            "http://10.0.0.5:5678/webhook",
+            "https://10.255.0.1/",
+            "http://[fd12:3456::1]/hook",
+            "http://[::ffff:10.0.0.5]/hook",
+        ] {
+            assert!(
+                validate_external_url_with(url, &trusted).is_ok(),
+                "{url} is inside a trusted network"
+            );
+        }
+        for url in [
+            "http://192.168.1.10/",
+            "http://127.0.0.1/",
+            "http://localhost/",
+            "http://[fd99::1]/",
+            "http://169.254.169.254/latest/meta-data",
+        ] {
+            assert!(
+                validate_external_url_with(url, &trusted).is_err(),
+                "{url} is outside every trusted network"
+            );
+        }
+        // Public destinations are unaffected.
+        assert!(validate_external_url_with("https://example.com/hook", &trusted).is_ok());
+    }
+
+    #[test]
+    fn trusted_ipv6_loopback_matches_literal() {
+        let trusted = nets(&["::1"]);
+        assert!(validate_external_url_with("http://[::1]:9000/", &trusted).is_ok());
+        assert!(validate_external_url_with("http://[::1]:9000/", &[]).is_err());
+        // An IPv4-compatible spelling is not unwrapped into a trusted range.
+        assert!(validate_external_url_with("http://[::a00:5]/", &nets(&["10.0.0.0/8"])).is_err());
+    }
+
+    #[test]
+    fn trusted_loopback_also_allows_localhost_names() {
+        let trusted = nets(&["127.0.0.0/8"]);
+        assert!(validate_external_url_with("http://localhost:9000/", &trusted).is_ok());
+        assert!(validate_external_url_with("http://127.0.0.1:9000/", &trusted).is_ok());
+        assert!(
+            validate_external_url_with("http://localhost:9000/", &nets(&["10.0.0.0/8"])).is_err()
+        );
+    }
+
+    #[test]
+    fn metadata_endpoints_stay_blocked_inside_trusted_ranges() {
+        let trusted = nets(&["100.64.0.0/10", "fc00::/7"]);
+        for ip in [
+            "100.100.100.200".parse::<IpAddr>().unwrap(),
+            "fd00:ec2::254".parse::<IpAddr>().unwrap(),
+            "::ffff:169.254.169.254".parse::<IpAddr>().unwrap(),
+        ] {
+            assert!(
+                matches!(
+                    validate_outbound_ip_with(ip, &trusted),
+                    Err(UrlValidationError::CloudMetadata)
+                ),
+                "{ip} must stay blocked"
+            );
+        }
+        assert!(validate_outbound_ip_with("100.101.102.103".parse().unwrap(), &trusted).is_ok());
+    }
+
+    #[test]
+    fn blocked_errors_point_at_the_setting() {
+        let error = validate_external_url_with("http://10.0.0.5/", &[]).unwrap_err();
+        let message = error.to_string();
+        assert!(message.starts_with("Private IP addresses are not allowed"));
+        assert!(message.contains("Trusted private networks"), "{message}");
     }
 }

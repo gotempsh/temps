@@ -1848,6 +1848,16 @@ export type AppSettings = {
      * This is the sole control surface — there is no CLI/env override.
      */
     trust_loopback_forwarded_ip?: boolean | null;
+    /**
+     * Private networks (CIDRs or single addresses) that user-configured
+     * outbound requests may reach: webhooks, notification channels, uptime
+     * checks, AI gateway providers, self-hosted git, importers. Empty by
+     * default, which keeps the SSRF guard blocking every private, loopback
+     * and CGNAT destination. Only private ranges are accepted, and cloud
+     * metadata endpoints stay blocked regardless. Published process-wide via
+     * `url_validation::set_trusted_private_networks`.
+     */
+    trusted_private_networks?: Array<string>;
 };
 
 /**
@@ -2016,6 +2026,11 @@ export type AppSettingsResponse = {
      * proxy process, including a standalone `temps proxy`.
      */
     trust_loopback_forwarded_ip: boolean;
+    /**
+     * Private networks (normalized CIDRs) that user-configured outbound
+     * requests may reach despite the SSRF guard. Empty means none.
+     */
+    trusted_private_networks: Array<string>;
 };
 
 export type ApplicationGitConnectionsResponse = {
@@ -38880,6 +38895,10 @@ export type CreateServiceErrors = {
      */
     400: unknown;
     /**
+     * Service name, container, or volumes are already owned by another service or an active restore
+     */
+    409: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -39001,6 +39020,10 @@ export type ImportExternalServiceErrors = {
      * Insufficient permissions
      */
     403: unknown;
+    /**
+     * Service name, container, or volumes are already owned by another service or an active restore
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -39225,6 +39248,10 @@ export type DeleteServiceErrors = {
      */
     404: unknown;
     /**
+     * An active restore uses this service, or duplicate service names prevent safe resource control
+     */
+    409: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -39293,7 +39320,7 @@ export type UpdateServiceErrors = {
      */
     404: unknown;
     /**
-     * A major upgrade is in progress for this service
+     * A major upgrade is in progress, or duplicate service names prevent safe resource control
      */
     409: unknown;
     /**
@@ -40721,7 +40748,7 @@ export type StartRestoreErrors = {
      */
     404: ProblemDetails;
     /**
-     * Conflict: a destructive cross-service restore requires explicit confirmation (`cross-service-restore-not-confirmed`), another restore is already active on this service (`restore-already-active`, with `active_restore_run_id`), data is being imported into it (`data-import-active`, with `active_data_import_run_id`), or the backup is being deleted
+     * Conflict: a destructive cross-service restore requires explicit confirmation (`cross-service-restore-not-confirmed`), another restore is already active on this service (`restore-already-active`, with `active_restore_run_id`), data is being imported into it (`data-import-active`, with `active_data_import_run_id`), the backup is being deleted, or a requested new-service name is already owned by a service or another active restore
      */
     409: ProblemDetails;
 };
@@ -40938,7 +40965,7 @@ export type StartServiceErrors = {
      */
     404: unknown;
     /**
-     * A Postgres major upgrade is in progress for this service
+     * A Postgres major upgrade is in progress, or duplicate service names prevent safe resource control
      */
     409: unknown;
     /**
@@ -41006,6 +41033,10 @@ export type StopServiceErrors = {
      */
     404: unknown;
     /**
+     * Duplicate service names prevent safe resource control
+     */
+    409: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -41042,7 +41073,7 @@ export type UpgradeServiceErrors = {
      */
     404: unknown;
     /**
-     * A major upgrade is already in progress for this service
+     * A major upgrade is already in progress, or duplicate service names prevent safe resource control
      */
     409: unknown;
     /**

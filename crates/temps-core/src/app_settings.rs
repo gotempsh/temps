@@ -156,6 +156,16 @@ pub struct AppSettings {
     #[serde(default)]
     pub insecure_tls: bool,
 
+    /// Private networks (CIDRs or single addresses) that user-configured
+    /// outbound requests may reach: webhooks, notification channels, uptime
+    /// checks, AI gateway providers, self-hosted git, importers. Empty by
+    /// default, which keeps the SSRF guard blocking every private, loopback
+    /// and CGNAT destination. Only private ranges are accepted, and cloud
+    /// metadata endpoints stay blocked regardless. Published process-wide via
+    /// `url_validation::set_trusted_private_networks`.
+    #[serde(default)]
+    pub trusted_private_networks: Vec<String>,
+
     /// Build-time resource limits applied on the control plane to prevent
     /// `docker build` from saturating host CPU/RAM. Worker nodes are
     /// intentionally NOT subject to these limits (each worker is dedicated
@@ -2014,6 +2024,7 @@ impl Default for AppSettings {
             on_demand_tls: OnDemandTlsSettings::default(),
             ai_config: AiConfigSettings::default(),
             insecure_tls: false,
+            trusted_private_networks: Vec::new(),
             ai_chat_limits: AiChatLimitsSettings::default(),
             ai_workspace_file_limits: AiWorkspaceFileLimitsSettings::default(),
             request_timeouts: RequestTimeoutSettings::default(),
