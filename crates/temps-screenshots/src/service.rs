@@ -28,6 +28,9 @@ pub struct ScreenshotService {
     config_service: Arc<ConfigService>,
     provider: ArcSwap<ProviderSlot>,
     durable_store: Option<Arc<dyn FileStore>>,
+    /// Limits how many captures hold image data at once; shared by every
+    /// service in the process (see [`CAPTURE_PERMITS`]).
+    capture_permits: Arc<Semaphore>,
 }
 
 /// The active provider and the settings it was built from.
@@ -206,6 +209,7 @@ impl ScreenshotService {
             config_service,
             provider: ArcSwap::from_pointee(slot),
             durable_store,
+            capture_permits: CAPTURE_PERMITS.clone(),
         })
     }
 
@@ -257,6 +261,7 @@ impl ScreenshotService {
             config_service,
             provider: ArcSwap::from_pointee(ProviderSlot::pinned(provider)),
             durable_store: None,
+            capture_permits: CAPTURE_PERMITS.clone(),
         }
     }
 
@@ -273,12 +278,17 @@ impl ScreenshotService {
             config_service,
             provider: ArcSwap::from_pointee(ProviderSlot::pinned(provider)),
             durable_store: Some(durable_store),
+            capture_permits: CAPTURE_PERMITS.clone(),
         }
     }
 
     /// Capture a screenshot and save it to the static files directory
     pub async fn capture_and_save(&self, url: &str, filename: &str) -> ScreenshotResult<PathBuf> {
         debug!("Capturing screenshot of {} and saving as {}", url, filename);
+
+        // Held until the image is stored: the fetched bytes, their decode and
+        // the write all count against it.
+        let _capture_permit = self.acquire_capture_permit(url).await?;
 
         // Capture screenshot
         let image_data = self
@@ -352,7 +362,32 @@ impl ScreenshotService {
     /// Capture a screenshot and return the image bytes (without saving)
     pub async fn capture(&self, url: &str) -> ScreenshotResult<Vec<u8>> {
         debug!("Capturing screenshot of {}", url);
+        let _capture_permit = self.acquire_capture_permit(url).await?;
         self.current_provider().await?.capture_screenshot(url).await
+    }
+
+    /// Wait for a capture permit before fetching anything, so queued captures
+    /// hold no image data while they wait.
+    async fn acquire_capture_permit(
+        &self,
+        url: &str,
+    ) -> ScreenshotResult<tokio::sync::OwnedSemaphorePermit> {
+        self.capture_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| {
+                ScreenshotError::CaptureFailed(format!(
+                    "Could not schedule the screenshot of {}: {}",
+                    url, e
+                ))
+            })
+    }
+
+    #[cfg(test)]
+    fn with_capture_permits(mut self, capture_permits: Arc<Semaphore>) -> Self {
+        self.capture_permits = capture_permits;
+        self
     }
 
     /// Check if screenshots are enabled in configuration
@@ -391,6 +426,13 @@ impl ScreenshotService {
 /// capture reaches it at about 34,000px tall; anything larger is refused rather
 /// than risking the memory of a small host.
 const MAX_DECODED_IMAGE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Captures that may fetch, validate and store an image at the same time
+/// across the whole instance. Each holds at most a 64 MiB provider response
+/// and its decoded bytes, and decoding is limited separately below, so
+/// screenshot memory stays around 2 × 112 MiB + 256 MiB however many captures
+/// are requested; the rest wait without holding any image data.
+static CAPTURE_PERMITS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(2)));
 
 /// One screenshot is decoded at a time across the whole instance, so however
 /// many captures finish together, validation needs at most
@@ -655,6 +697,7 @@ mod provider_selection_tests {
                 ScreenshotService::slot_from_settings(initial).expect("initial provider"),
             ),
             durable_store: None,
+            capture_permits: Arc::new(Semaphore::new(1)),
         }
     }
 
@@ -715,6 +758,58 @@ mod provider_selection_tests {
         let after = service.current_provider().await.expect("provider");
 
         assert!(Arc::ptr_eq(&before, &after));
+    }
+
+    /// Returns a fixed image and counts how often it was asked for one.
+    struct CountingProvider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ScreenshotProvider for CountingProvider {
+        async fn capture_screenshot(&self, _url: &str) -> ScreenshotResult<Vec<u8>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![1, 2, 3])
+        }
+
+        fn provider_name(&self) -> &'static str {
+            "counting"
+        }
+
+        async fn check_availability(&self) -> ScreenshotResult<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_captures_fetch_nothing_until_a_permit_is_free() {
+        let provider = Arc::new(CountingProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let permits = Arc::new(Semaphore::new(1));
+        let service = ScreenshotService::with_provider(
+            config_service(MockDatabase::new(DatabaseBackend::Postgres)),
+            provider.clone(),
+        )
+        .with_capture_permits(permits.clone());
+        let running = permits.clone().acquire_owned().await.unwrap();
+
+        let waited = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            service.capture("http://app.local"),
+        )
+        .await;
+        assert!(waited.is_err(), "a capture started without a free permit");
+        assert_eq!(
+            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a queued capture must not fetch image data"
+        );
+
+        drop(running);
+        service.capture("http://app.local").await.unwrap();
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(permits.available_permits(), 1, "the permit is returned");
     }
 
     #[tokio::test]

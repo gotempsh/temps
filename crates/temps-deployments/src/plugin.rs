@@ -367,6 +367,11 @@ impl TempsPlugin for DeploymentsPlugin {
                 );
             }
 
+            // One capture slot per deployment, shared by the pipeline's
+            // TakeScreenshotJob and on-demand `take_screenshot` operations.
+            let capture_guard = Arc::new(crate::jobs::DeploymentCaptureGuard::default());
+            context.register_service(capture_guard.clone());
+
             // Create WorkflowExecutionService
             let workflow_execution_service = Arc::new(WorkflowExecutionService::new(
                 db.clone(),
@@ -383,6 +388,7 @@ impl TempsPlugin for DeploymentsPlugin {
                     .unwrap_or_else(|| Arc::new(crate::jobs::NoOpAgentSyncService)),
                 config_service.clone(),
                 screenshot_service,
+                capture_guard.clone(),
                 docker_handle,
             ));
 
@@ -723,6 +729,7 @@ impl TempsPlugin for DeploymentsPlugin {
             context.require_service::<temps_screenshots::ScreenshotService>(),
             config_service.clone(),
             external_deployment_manager.clone(),
+            context.require_service::<crate::jobs::DeploymentCaptureGuard>(),
         ));
         let external_service_manager =
             context.require_service::<temps_providers::ExternalServiceManager>();

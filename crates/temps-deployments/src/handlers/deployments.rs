@@ -4821,6 +4821,7 @@ mod tests {
                 .expect("Failed to create screenshot service"),
         );
 
+        let capture_guard = Arc::new(crate::jobs::DeploymentCaptureGuard::default());
         let workflow_executor = Arc::new(crate::services::WorkflowExecutionService::new(
             db.clone(),
             queue_service.clone(),
@@ -4851,6 +4852,7 @@ mod tests {
                 db.clone(),
             )),
             screenshot_service.clone(),
+            capture_guard.clone(),
             Arc::new(temps_core::DockerHandle::available(Arc::new(
                 bollard::Docker::connect_with_local_defaults().expect("docker"),
             ))),
@@ -4905,6 +4907,7 @@ mod tests {
                 screenshot_service,
                 config_service.clone(),
                 external_deployment_manager,
+                capture_guard,
             )),
             remote_deployment_service,
             db: db.clone(),

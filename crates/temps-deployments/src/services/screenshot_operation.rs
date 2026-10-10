@@ -10,15 +10,11 @@
 //! Nothing is reported as successful until an image has been captured,
 //! validated and recorded on the deployment.
 
-use std::collections::hash_map::Entry;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::sync::Arc;
 
 use chrono::Utc;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use temps_config::ConfigService;
-use temps_core::UtcDateTime;
 use temps_database::DbConnection;
 use temps_entities::{deployments, prelude::Deployments};
 use temps_screenshots::ScreenshotServiceTrait;
@@ -29,15 +25,13 @@ use super::external_deployment::{
     DeploymentOperation, DeploymentOperationDetails, DeploymentScreenshotCapture,
     ExternalDeploymentManager, OperationResult, OperationStatus,
 };
-use crate::jobs::{capture_deployment_screenshot, DeploymentScreenshotError};
+use crate::jobs::{
+    capture_deployment_screenshot, DeploymentCaptureGuard, DeploymentCaptureSlot,
+    DeploymentScreenshotError, SCREENSHOT_CAPTURE_TIMEOUT,
+};
 
 /// Console page where screenshots are enabled and their provider chosen.
 pub const SCREENSHOT_SETTINGS_PATH: &str = "/settings#screenshots";
-
-/// Hard ceiling for one on-demand capture. Providers bound page loads
-/// themselves; this guarantees a `pending` record always ends, so a hung
-/// provider cannot block later captures of the same deployment forever.
-const CAPTURE_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Debug, Error)]
 pub enum ScreenshotOperationError {
@@ -77,41 +71,14 @@ pub enum ScreenshotOperationError {
     },
 }
 
-/// Captures running right now, by deployment ID, with when each started.
-///
-/// Kept apart from the operation history on purpose: history is trimmed and
-/// gains newer records while a capture runs, so its latest entry cannot prove
-/// whether a capture is still in progress.
-type InFlightCaptures = Arc<Mutex<HashMap<i32, UtcDateTime>>>;
-
-fn lock_in_flight(in_flight: &InFlightCaptures) -> MutexGuard<'_, HashMap<i32, UtcDateTime>> {
-    // Every critical section is a single insert or remove, so a panic while
-    // holding the lock cannot leave the map half-updated; keep using it.
-    in_flight
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// A deployment's claim on its single capture slot. Dropping it frees the
-/// slot, and it is moved into the background task, so the slot is held until
-/// that task ends -- however it ends.
-struct CaptureSlot {
-    in_flight: InFlightCaptures,
-    deployment_id: i32,
-}
-
-impl Drop for CaptureSlot {
-    fn drop(&mut self) {
-        lock_in_flight(&self.in_flight).remove(&self.deployment_id);
-    }
-}
-
 pub struct ScreenshotOperationService {
     db: Arc<DbConnection>,
     screenshot_service: Arc<dyn ScreenshotServiceTrait>,
     config_service: Arc<ConfigService>,
     operations: Arc<ExternalDeploymentManager>,
-    in_flight: InFlightCaptures,
+    /// Shared with the deployment pipeline's `TakeScreenshotJob`, so an
+    /// on-demand capture never overlaps the automatic one.
+    capture_guard: Arc<DeploymentCaptureGuard>,
 }
 
 impl ScreenshotOperationService {
@@ -120,13 +87,14 @@ impl ScreenshotOperationService {
         screenshot_service: Arc<dyn ScreenshotServiceTrait>,
         config_service: Arc<ConfigService>,
         operations: Arc<ExternalDeploymentManager>,
+        capture_guard: Arc<DeploymentCaptureGuard>,
     ) -> Self {
         Self {
             db,
             screenshot_service,
             config_service,
             operations,
-            in_flight: Arc::new(Mutex::new(HashMap::new())),
+            capture_guard,
         }
     }
 
@@ -199,7 +167,7 @@ impl ScreenshotOperationService {
         let operations = self.operations.clone();
         tokio::spawn(async move {
             let result = tokio::time::timeout(
-                CAPTURE_TIMEOUT,
+                SCREENSHOT_CAPTURE_TIMEOUT,
                 capture_deployment_screenshot(
                     deployment_id,
                     screenshot_service.as_ref(),
@@ -211,7 +179,7 @@ impl ScreenshotOperationService {
             .unwrap_or_else(|_| {
                 Err(DeploymentScreenshotError::TimedOut {
                     deployment_id,
-                    timeout_secs: CAPTURE_TIMEOUT.as_secs(),
+                    timeout_secs: SCREENSHOT_CAPTURE_TIMEOUT.as_secs(),
                 })
             });
 
@@ -262,21 +230,13 @@ impl ScreenshotOperationService {
     }
 
     /// Take `deployment_id`'s capture slot, or report the capture holding it.
-    fn claim(&self, deployment_id: i32) -> Result<CaptureSlot, ScreenshotOperationError> {
-        let mut in_flight = lock_in_flight(&self.in_flight);
-        match in_flight.entry(deployment_id) {
-            Entry::Occupied(running) => Err(ScreenshotOperationError::AlreadyRunning {
+    fn claim(&self, deployment_id: i32) -> Result<DeploymentCaptureSlot, ScreenshotOperationError> {
+        self.capture_guard
+            .try_claim(deployment_id)
+            .map_err(|started_at| ScreenshotOperationError::AlreadyRunning {
                 deployment_id,
-                started_at: running.get().to_rfc3339(),
-            }),
-            Entry::Vacant(slot) => {
-                slot.insert(Utc::now());
-                Ok(CaptureSlot {
-                    in_flight: self.in_flight.clone(),
-                    deployment_id,
-                })
-            }
-        }
+                started_at: started_at.to_rfc3339(),
+            })
     }
 
     fn record_failure(&self, project_id: i32, deployment_id: i32, message: &str) {
@@ -449,7 +409,13 @@ mod tests {
         operations: Arc<ExternalDeploymentManager>,
     ) -> ScreenshotOperationService {
         let db = Arc::new(db.into_connection());
-        ScreenshotOperationService::new(db.clone(), screenshots, config_service(db), operations)
+        ScreenshotOperationService::new(
+            db.clone(),
+            screenshots,
+            config_service(db),
+            operations,
+            Arc::new(DeploymentCaptureGuard::default()),
+        )
     }
 
     /// Poll until the background capture of deployment 7 in project 3 ends.

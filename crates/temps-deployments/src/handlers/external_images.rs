@@ -280,6 +280,7 @@ pub async fn execute_deployment_operation(
     permission_guard!(auth, DeploymentsWrite);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
+    let deployment_id = operation_deployment_key(&deployment_id);
 
     debug!(
         "Executing operation {} for deployment {} in project {}",
@@ -341,6 +342,17 @@ pub async fn execute_deployment_operation(
         StatusCode::ACCEPTED,
         Json(OperationResultResponse::from(result)),
     ))
+}
+
+/// Operation-history key for a deployment ID taken from the path. Numeric IDs
+/// are put in canonical form (`007` and `+7` become `7`), matching how
+/// `take_screenshot` parses them, so a record written by one request is found
+/// by every later one however the ID was spelled. Other IDs are kept as-is.
+fn operation_deployment_key(deployment_id: &str) -> String {
+    deployment_id
+        .parse::<i32>()
+        .map(|id| id.to_string())
+        .unwrap_or_else(|_| deployment_id.to_string())
 }
 
 /// `deploy` and `mark_complete` only record that they were requested; they
@@ -434,6 +446,7 @@ pub async fn get_deployment_operations(
     permission_guard!(auth, DeploymentsRead);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
+    let deployment_id = operation_deployment_key(&deployment_id);
 
     debug!(
         "Getting operations for deployment {} in project {}",
@@ -477,6 +490,7 @@ pub async fn get_deployment_operation_status(
     permission_guard!(auth, DeploymentsRead);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
+    let deployment_id = operation_deployment_key(&deployment_id);
 
     debug!(
         "Getting {} operation status for deployment {} in project {}",
@@ -535,4 +549,42 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             "/projects/{project_id}/deployments/{deployment_id}/operations/{operation_type}",
             get(get_deployment_operation_status),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::ExternalDeploymentManager;
+
+    #[test]
+    fn numeric_deployment_ids_have_one_canonical_key() {
+        assert_eq!(operation_deployment_key("7"), "7");
+        assert_eq!(operation_deployment_key("007"), "7");
+        assert_eq!(operation_deployment_key("+7"), "7");
+        assert_eq!(operation_deployment_key("ext-image-1"), "ext-image-1");
+    }
+
+    #[test]
+    fn an_operation_started_with_a_padded_id_can_be_polled_with_it() {
+        let manager = ExternalDeploymentManager::new();
+        let written_as = operation_deployment_key("007");
+        manager
+            .record_operation(
+                3,
+                &written_as,
+                legacy_operation_record(DeploymentOperation::MarkComplete, 3, &written_as),
+            )
+            .unwrap();
+
+        for spelling in ["007", "7"] {
+            let key = operation_deployment_key(spelling);
+            assert!(
+                manager
+                    .get_latest_operation(3, &key, &DeploymentOperation::MarkComplete)
+                    .is_some(),
+                "polling with {spelling:?} must find the record"
+            );
+            assert_eq!(manager.get_operations(3, &key).len(), 1);
+        }
+    }
 }
