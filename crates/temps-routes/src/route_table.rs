@@ -753,16 +753,23 @@ pub enum RouteGenerationError {
     Timeout { previous: u64, timeout_ms: u128 },
 }
 
-/// How long a reload may wait to claim its generation before numbering it
-/// locally. Every reload waits for the claim before waking route waiters
-/// (readiness checks, worker long-polls), so a stalled database must not hold
-/// them asleep for longer than this.
+/// How long a reload may wait to claim its generation. Every reload waits
+/// for the claim before waking route waiters (readiness checks, worker
+/// long-polls), so a stalled database must not hold them asleep for longer
+/// than this; a claim that gives up is retried in the background.
 pub(crate) const ROUTE_GENERATION_CLAIM_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(2);
 
 /// Extra time the client allows past the server-side statement timeout, for
 /// a connection that stalls outside a statement (acquire, `BEGIN`, `COMMIT`).
 const ROUTE_GENERATION_CLAIM_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// First delay before retrying a failed claim, doubled per attempt.
+const ROUTE_GENERATION_RETRY_INITIAL_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(250);
+
+/// Longest delay between claim retries while the database stays unavailable.
+const ROUTE_GENERATION_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Atomically claim the generation after `previous` from the durable counter,
 /// bounded by [`ROUTE_GENERATION_CLAIM_TIMEOUT`].
@@ -774,78 +781,46 @@ pub(crate) async fn claim_route_generation(
 }
 
 /// Atomically claim the generation after `previous`, giving up after
-/// `timeout`.
+/// `timeout` (plus a short grace for a connection that stalls outside a
+/// statement).
 ///
 /// `GREATEST(current, previous, <highest stored node ACK>) + 1` in a single
 /// `UPDATE ... RETURNING`: the row lock serializes concurrent claims, so each
 /// caller gets a distinct value, and the result is above the stored value,
-/// the in-memory value, and every generation a node has acknowledged. The
-/// last term is what stops a restarted process from reissuing a number an
-/// earlier process published without persisting it (a lost commit, or a
-/// locally numbered reload): a worker that already holds that number would
-/// treat the reissued snapshot as one it has, and keep stale routes. It is
-/// one aggregate over one row per node.
+/// the in-memory value, and every generation a node has acknowledged (one
+/// aggregate over one row per node).
 ///
-/// Two phases share one deadline (`timeout` plus a short grace for a
-/// connection that stalls outside a statement):
-///
-/// 1. `BEGIN`, `SET LOCAL statement_timeout`, the `UPDATE`. Giving up here is
-///    always safe: Postgres cancels the statement, and a transaction dropped
-///    before `COMMIT` is sent rolls back, so nothing is claimed.
-/// 2. `COMMIT`. Once the `UPDATE` has returned a value, the claim is used
-///    whatever the commit outcome. If the commit succeeded (even with a
-///    late or lost reply) the row now holds that value and the reload must
-///    publish it, or workers could never reach the gate's target. If it did
-///    not, publishing it anyway is still safe: the row stays below what
-///    workers are given, and the next claim starts above both.
+/// `Ok` only once the claim has committed. The statement runs under
+/// `SET LOCAL statement_timeout`; any failure or timeout, including a
+/// `COMMIT` whose outcome is unknown, is an error, and the caller publishes
+/// nothing. A commit that did land despite a lost reply is harmless: the
+/// retried claim starts above it, so the value is skipped, never reissued.
 pub(crate) async fn claim_route_generation_within(
     db: &DatabaseConnection,
     previous: u64,
     timeout: std::time::Duration,
 ) -> Result<u64, RouteGenerationError> {
     let timeout_ms = timeout.as_millis();
-    let deadline = tokio::time::Instant::now() + timeout + ROUTE_GENERATION_CLAIM_GRACE;
-    let (txn, claimed) = match tokio::time::timeout_at(
-        deadline,
-        claim_uncommitted(db, previous, timeout_ms),
+    match tokio::time::timeout(
+        timeout + ROUTE_GENERATION_CLAIM_GRACE,
+        claim_and_commit(db, previous, timeout_ms),
     )
     .await
     {
-        Ok(result) => result?,
-        Err(_) => {
-            return Err(RouteGenerationError::Timeout {
-                previous,
-                timeout_ms,
-            })
-        }
-    };
-    match tokio::time::timeout_at(deadline, txn.commit()).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => warn!(
-            previous_generation = previous,
-            claimed_generation = claimed,
-            %error,
-            "Committing route generation {claimed} failed; publishing it anyway so the \
-             durable generation can never be ahead of what workers are given"
-        ),
-        Err(_) => warn!(
-            previous_generation = previous,
-            claimed_generation = claimed,
+        Ok(result) => result,
+        Err(_) => Err(RouteGenerationError::Timeout {
+            previous,
             timeout_ms,
-            "Committing route generation {claimed} did not answer within {timeout_ms} ms; \
-             publishing it anyway, since the commit may have succeeded"
-        ),
+        }),
     }
-    Ok(claimed)
 }
 
-/// Phase 1 of [`claim_route_generation_within`]: the claimed value and the
-/// still-open transaction that holds it.
-async fn claim_uncommitted(
+/// The body of [`claim_route_generation_within`], without its bound.
+async fn claim_and_commit(
     db: &DatabaseConnection,
     previous: u64,
     timeout_ms: u128,
-) -> Result<(sea_orm::DatabaseTransaction, u64), RouteGenerationError> {
+) -> Result<u64, RouteGenerationError> {
     use sea_orm::{ConnectionTrait, TransactionTrait};
     let claim_error = |source| RouteGenerationError::Claim { previous, source };
     // Leave room for the `+ 1` below; 9.2e18 reloads is unreachable anyway.
@@ -873,7 +848,8 @@ async fn claim_uncommitted(
         .ok_or(RouteGenerationError::MissingRow { previous })?;
     let value = row.try_get::<i64>("", "current").map_err(claim_error)?;
     let claimed = u64::try_from(value).map_err(|_| RouteGenerationError::Negative { value })?;
-    Ok((txn, claimed))
+    txn.commit().await.map_err(claim_error)?;
+    Ok(claimed)
 }
 
 /// Raise `counter` to a generation claimed from the database and return the
@@ -937,7 +913,16 @@ pub struct CachedPeerTable {
     /// claimed from the durable `route_generation` row (see
     /// [`Self::advance_generation`]), so the numbering agents ACK and the
     /// completion gate compares is one sequence, monotonic across restarts.
-    generation: std::sync::atomic::AtomicU64,
+    /// Shared with the claim-retry task (see [`Self::schedule_claim_retry`]).
+    generation: Arc<std::sync::atomic::AtomicU64>,
+
+    /// Whether at least one `load_routes()` has published a route snapshot.
+    /// Separate from `generation`, which an authoritative process only
+    /// advances once a generation is durably claimed.
+    loaded: std::sync::atomic::AtomicBool,
+
+    /// A claim-retry task is running (at most one per table).
+    claim_retry_pending: Arc<std::sync::atomic::AtomicBool>,
 
     /// Whether this process owns the durable `route_generation` row
     /// ([`RouteGenerationRole::Authoritative`], the default) or only numbers
@@ -983,7 +968,9 @@ impl CachedPeerTable {
             on_sleeping_callback: parking_lot::Mutex::new(None),
             on_reload_callback: parking_lot::Mutex::new(None),
             on_cert_eligible_callback: parking_lot::Mutex::new(None),
-            generation: std::sync::atomic::AtomicU64::new(0),
+            generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            loaded: std::sync::atomic::AtomicBool::new(false),
+            claim_retry_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             generation_authoritative: std::sync::atomic::AtomicBool::new(true),
             generation_changed: Arc::new(tokio::sync::Notify::new()),
             // Off until the bootstrap says otherwise: label discovery is
@@ -1058,44 +1045,96 @@ impl CachedPeerTable {
         }
     }
 
-    /// Number the reload that just finished and return its generation.
+    /// Number the reload that just finished, returning the generation it
+    /// published, or `None` when its number is still being claimed.
     ///
     /// Authoritative: one atomic statement claims the next value of the
-    /// durable counter, `GREATEST(current, <in-memory>) + 1`. A single-row
+    /// durable counter (see [`claim_route_generation_within`]). A single-row
     /// update cannot interleave with another writer's, so two claims never
-    /// return the same value, and taking the greater of the two counters means
-    /// neither the durable nor the in-memory sequence goes backwards: a
-    /// restored database below this process's numbering, or a process that
-    /// restarted below the database's, both continue from the higher one.
+    /// return the same value, and taking the greatest of the stored value,
+    /// the in-memory value and every stored node ACK means no sequence goes
+    /// backwards: a restored database below this process's numbering, or a
+    /// process that restarted below the database's, both continue from the
+    /// higher one.
     ///
-    /// When the claim fails (the database is briefly unreachable, or stalls
-    /// past `ROUTE_GENERATION_CLAIM_TIMEOUT`) the reload still has to wake
-    /// waiters, so the in-memory counter advances on its own
-    /// and the row is left alone; the next successful claim starts above it.
-    /// An agent that ACKs such a generation has the newest routes, and the
-    /// completion gate's target (the row) is at or below its ACK.
+    /// A generation is published only once its claim has committed, so a
+    /// number workers were given always exists in the row and can never be
+    /// issued again, even across a restart. When the claim fails (the
+    /// database is unreachable, stalls past `ROUTE_GENERATION_CLAIM_TIMEOUT`,
+    /// or the commit cannot be confirmed) the reload's routes are already
+    /// live in this process, and a single background task retries the claim
+    /// with backoff and publishes the generation for whatever routes are
+    /// current when it succeeds. Workers keep their previous routes until
+    /// then.
     ///
     /// Local: the in-memory counter only; the row is never touched.
     ///
     /// Runs once per reload (control plane, serialized by
     /// `route_reload_lock`), never per request.
-    async fn advance_generation(&self) -> u64 {
+    async fn advance_generation(&self) -> Option<u64> {
         use std::sync::atomic::Ordering;
         if !self.generation_authoritative.load(Ordering::Acquire) {
-            return self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+            return Some(self.generation.fetch_add(1, Ordering::AcqRel) + 1);
         }
         let previous = self.generation.load(Ordering::Acquire);
         match claim_route_generation(self.db.as_ref(), previous).await {
-            Ok(claimed) => adopt_claimed_generation(&self.generation, claimed),
+            Ok(claimed) => Some(adopt_claimed_generation(&self.generation, claimed)),
             Err(error) => {
                 warn!(
                     previous_generation = previous,
-                    "{error}; numbering this reload locally until a later reload can claim \
-                     from the database"
+                    "{error}; the new routes are live in this process, and their generation \
+                     will be published to workers once a retried claim commits"
                 );
-                self.generation.fetch_add(1, Ordering::AcqRel) + 1
+                self.schedule_claim_retry();
+                None
             }
         }
+    }
+
+    /// Retry a failed generation claim in the background until one commits,
+    /// then publish it and wake waiters. At most one task per table; a
+    /// reload whose own claim succeeds in the meantime is harmless (the
+    /// retry then claims and publishes one more, higher, generation).
+    fn schedule_claim_retry(&self) {
+        use std::sync::atomic::Ordering;
+        if self.claim_retry_pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let db = self.db.clone();
+        let generation = self.generation.clone();
+        let notify = self.generation_changed.clone();
+        let pending = self.claim_retry_pending.clone();
+        tokio::spawn(async move {
+            let mut delay = ROUTE_GENERATION_RETRY_INITIAL_DELAY;
+            let mut attempt: u32 = 0;
+            loop {
+                tokio::time::sleep(delay).await;
+                attempt = attempt.saturating_add(1);
+                let previous = generation.load(Ordering::Acquire);
+                match claim_route_generation(db.as_ref(), previous).await {
+                    Ok(claimed) => {
+                        let published = adopt_claimed_generation(&generation, claimed);
+                        pending.store(false, Ordering::Release);
+                        notify.notify_waiters();
+                        info!(
+                            generation = published,
+                            attempt,
+                            "Published route generation {published} after retrying its claim"
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        warn!(
+                            previous_generation = previous,
+                            attempt,
+                            retry_in_ms = delay.as_millis() as u64,
+                            "{error}; retrying the route generation claim"
+                        );
+                        delay = (delay * 2).min(ROUTE_GENERATION_RETRY_MAX_DELAY);
+                    }
+                }
+            }
+        });
     }
 
     /// Current in-memory route table generation. Bumped on every
@@ -1113,13 +1152,13 @@ impl CachedPeerTable {
 
     /// Whether the route table has completed at least one successful load.
     ///
-    /// `generation` only ever increments at the very end of a successful
-    /// `load_routes()`, so `generation == 0` reliably means "never loaded".
+    /// Set by every successful `load_routes()` before waiters are woken,
+    /// whether or not the reload's generation has been claimed yet.
     /// Used by the proxy to decide whether to wait for the first load before
     /// falling back to the console for an unmatched host (the proxy now binds
     /// its listeners before the initial route load completes).
     pub fn has_loaded(&self) -> bool {
-        self.current_generation() > 0
+        self.loaded.load(std::sync::atomic::Ordering::Acquire) || self.current_generation() > 0
     }
 
     /// Wait until the route table has loaded at least once, up to `timeout`.
@@ -2858,12 +2897,17 @@ impl CachedPeerTable {
         // never received. The claim is also the only write of that row, so
         // `mark_deployment_complete`'s target is always a generation the
         // snapshot endpoint has issued.
+        self.loaded
+            .store(true, std::sync::atomic::Ordering::Release);
         let new_gen = self.advance_generation().await;
         debug!(
-            generation = new_gen,
+            generation = ?new_gen,
             role = ?self.route_generation_role(),
-            "Route table generation advanced"
+            "Route table reloaded"
         );
+        // Always wake: first-load waiters key off `loaded`, and route-sync
+        // long-polls re-check the generation and keep waiting if it has not
+        // moved yet.
         self.generation_changed.notify_waiters();
 
         // Fire the async on-reload hook used by the deployment-DNS publisher
@@ -4657,11 +4701,24 @@ mod route_generation_tests {
         assert_eq!(persisted(&db).await, Some(highest as i64 + 3));
     }
 
-    /// A reload whose claim fails still advances (it must wake waiters) and
-    /// leaves the row alone; the next successful claim starts above it, so
-    /// neither counter ever repeats or lowers a generation.
+    /// Wait until the retry task publishes `expected`.
+    async fn wait_for_generation(table: &CachedPeerTable, expected: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while table.current_generation() != expected {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "generation stayed at {} instead of reaching {expected}",
+                table.current_generation()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// A reload whose claim fails publishes no generation, so no number a
+    /// worker sees can be missing from the row; its routes are live in the
+    /// process, and a background retry publishes them once a claim commits.
     #[tokio::test]
-    async fn a_failed_claim_numbers_locally_and_the_next_claim_starts_above_it() {
+    async fn a_failed_claim_publishes_nothing_until_a_retried_claim_commits() {
         let Some(database) = database_or_skip().await else {
             return;
         };
@@ -4686,7 +4743,8 @@ mod route_generation_tests {
             .load_routes()
             .await
             .expect("second load without the row");
-        assert_eq!(table.current_generation(), 3);
+        assert!(table.has_loaded());
+        assert_eq!(table.current_generation(), 1, "nothing published");
         assert_eq!(persisted(&db).await, None, "nothing re-creates the row");
 
         execute(
@@ -4694,16 +4752,19 @@ mod route_generation_tests {
             "INSERT INTO route_generation (id, current) VALUES (1, 0)",
         )
         .await;
+        wait_for_generation(&table, 2).await;
+        assert_eq!(persisted(&db).await, Some(2));
+
         table.load_routes().await.expect("load with the row back");
-        assert_eq!(table.current_generation(), 4);
-        assert_eq!(persisted(&db).await, Some(4));
+        assert_eq!(table.current_generation(), 3);
+        assert_eq!(persisted(&db).await, Some(3));
     }
 
     /// A stalled database cannot hold a reload's waiters asleep: the claim
-    /// gives up within its bound, Postgres cancels it so it never commits
-    /// behind the reload's back, and the reload numbers itself locally.
+    /// gives up within its bound, Postgres cancels it so it never commits,
+    /// and the generation is published by the retry once the stall ends.
     #[tokio::test]
-    async fn a_stalled_claim_gives_up_without_committing_and_the_reload_still_advances() {
+    async fn a_stalled_claim_gives_up_without_committing_and_is_retried() {
         use sea_orm::TransactionTrait;
         let Some(database) = database_or_skip().await else {
             return;
@@ -4750,25 +4811,18 @@ mod route_generation_tests {
             "the reload must not wait on the database beyond the claim bound, took {:?}",
             started.elapsed()
         );
-        assert_eq!(table.current_generation(), 2, "numbered locally");
+        assert_eq!(table.current_generation(), 1, "nothing published yet");
 
         blocker.rollback().await.expect("release the row");
-        // Neither cancelled claim committed once the lock was released.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert_eq!(persisted(&db).await, Some(1));
-
-        table.load_routes().await.expect("load after the stall");
-        assert_eq!(table.current_generation(), 3);
-        assert_eq!(persisted(&db).await, Some(3));
+        // Had any cancelled claim committed, the retry would land above 2.
+        wait_for_generation(&table, 2).await;
+        assert_eq!(persisted(&db).await, Some(2));
     }
 
-    /// Once the `UPDATE` has returned a generation, the reload publishes it
-    /// whatever happens to the commit: a commit that succeeded with a lost
-    /// reply must not leave the row ahead of every worker, and one that
-    /// failed leaves the row below the published value, which the next claim
-    /// starts above.
+    /// A claim whose commit fails is not published, and the row is
+    /// unchanged; once commits succeed the retry publishes the next value.
     #[tokio::test]
-    async fn a_claimed_generation_is_published_even_when_its_commit_fails() {
+    async fn a_claim_whose_commit_fails_is_never_published() {
         let Some(database) = database_or_skip().await else {
             return;
         };
@@ -4793,10 +4847,13 @@ mod route_generation_tests {
         )
         .await;
 
-        let claimed = claim_route_generation(db.as_ref(), 0)
+        let error = claim_route_generation(db.as_ref(), 0)
             .await
-            .expect("the value the UPDATE returned is used despite the failed commit");
-        assert_eq!(claimed, 101);
+            .expect_err("an uncommitted claim is an error");
+        assert!(
+            error.to_string().contains("synthetic commit failure"),
+            "{error}"
+        );
         assert_eq!(persisted(&db).await, Some(100), "the commit rolled back");
 
         let table = CachedPeerTable::new(db.clone());
@@ -4804,24 +4861,22 @@ mod route_generation_tests {
             .load_routes()
             .await
             .expect("load with failing commits");
-        assert_eq!(table.current_generation(), 101);
+        assert!(table.has_loaded(), "routes are live in this process");
+        assert_eq!(table.current_generation(), 0, "nothing published");
 
         execute(
             &db,
             "DROP TRIGGER fail_route_generation_commit ON route_generation",
         )
         .await;
-        table
-            .load_routes()
-            .await
-            .expect("load once commits succeed");
-        assert_eq!(table.current_generation(), 102);
-        assert_eq!(persisted(&db).await, Some(102));
+        wait_for_generation(&table, 101).await;
+        assert_eq!(persisted(&db).await, Some(101));
     }
 
-    /// A number published without being persisted (here: a lost commit,
-    /// then a restart) is never issued again once a node has acknowledged
-    /// it, so a worker holding it cannot mistake a new snapshot for its own.
+    /// A generation a node has acknowledged is never issued again, even when
+    /// the row is below it (for example a database restored from an older
+    /// backup), so a worker holding it cannot mistake a new snapshot for one
+    /// it already has.
     #[tokio::test]
     async fn a_restarted_process_never_reissues_a_generation_a_node_acknowledged() {
         let Some(database) = database_or_skip().await else {
@@ -4840,8 +4895,7 @@ mod route_generation_tests {
              'worker', 'active', '{}', '{}')",
         )
         .await;
-        // The previous process published 101, its commit was lost, and the
-        // worker acknowledged 101 before the process restarted.
+        // The worker acknowledged 101 before the row was set back to 100.
         execute(
             &db,
             "INSERT INTO node_route_state (node_id, applied_generation, health) \
