@@ -707,6 +707,28 @@ fn build_route_ownership_snapshot<'a>(
     snapshot
 }
 
+/// Why `CachedPeerTable::load_routes` did not complete.
+#[derive(Debug, thiserror::Error)]
+pub enum RouteLoadError {
+    /// Reading the routes failed; the previous route table stays in place.
+    #[error("Failed to load routes from the database: {0}")]
+    Database(#[from] sea_orm::DbErr),
+
+    /// The routes were read and are live in this process, but their
+    /// generation could not be claimed, so worker nodes have not been given
+    /// them yet. A background retry publishes the generation; callers must
+    /// not report this reload as complete.
+    #[error(
+        "Route table reloaded and live in this process ({route_count} routes), but not yet \
+         published to worker nodes: {source}"
+    )]
+    GenerationUnpublished {
+        route_count: usize,
+        #[source]
+        source: RouteGenerationError,
+    },
+}
+
 /// Whether a process numbers route generations from the durable
 /// `route_generation` row or only for itself.
 ///
@@ -1330,7 +1352,7 @@ impl CachedPeerTable {
     /// Load all routes from the database into the cache with full models.
     /// This queries environment_domains, custom_routes, and project_custom_domains.
     /// Returns a list of sleeping on-demand environments that were skipped during route loading.
-    pub async fn load_routes(&self) -> Result<Vec<SleepingEnvironmentEntry>, sea_orm::DbErr> {
+    pub async fn load_routes(&self) -> Result<Vec<SleepingEnvironmentEntry>, RouteLoadError> {
         let _reload_guard = self.route_reload_lock.lock().await;
         use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter};
         use temps_entities::{
@@ -2948,11 +2970,10 @@ impl CachedPeerTable {
         // retry) publishes the generation.
         match published {
             Ok(_) => Ok(sleeping_environments),
-            Err(error) => Err(sea_orm::DbErr::Custom(format!(
-                "Route table reloaded and live in this process ({} routes), but not yet \
-                 published to worker nodes: {error}",
-                self.len()
-            ))),
+            Err(source) => Err(RouteLoadError::GenerationUnpublished {
+                route_count: self.len(),
+                source,
+            }),
         }
     }
 
@@ -4760,6 +4781,16 @@ mod route_generation_tests {
                 .load_routes()
                 .await
                 .expect_err("a reload without a claimed generation is not complete");
+            assert!(
+                matches!(
+                    unpublished,
+                    super::RouteLoadError::GenerationUnpublished {
+                        source: RouteGenerationError::MissingRow { previous: 1 },
+                        ..
+                    }
+                ),
+                "{unpublished:?}"
+            );
             assert!(
                 unpublished
                     .to_string()
