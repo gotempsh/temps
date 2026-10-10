@@ -780,37 +780,66 @@ pub(crate) async fn claim_route_generation(
 /// row lock serializes concurrent claims, so each caller gets a distinct
 /// value, and the result is above both the stored and the in-memory value.
 ///
-/// The statement runs in its own transaction under `SET LOCAL
-/// statement_timeout`, so a claim that gives up is cancelled and rolled back
-/// by Postgres rather than committing after the caller already numbered the
-/// reload locally. That keeps the row from moving ahead of the generation
-/// workers were given. The client-side bound only adds a short grace for a
-/// connection that stalls outside the statement.
+/// Two phases share one deadline (`timeout` plus a short grace for a
+/// connection that stalls outside a statement):
+///
+/// 1. `BEGIN`, `SET LOCAL statement_timeout`, the `UPDATE`. Giving up here is
+///    always safe: Postgres cancels the statement, and a transaction dropped
+///    before `COMMIT` is sent rolls back, so nothing is claimed.
+/// 2. `COMMIT`. Once the `UPDATE` has returned a value, the claim is used
+///    whatever the commit outcome. If the commit succeeded (even with a
+///    late or lost reply) the row now holds that value and the reload must
+///    publish it, or workers could never reach the gate's target. If it did
+///    not, publishing it anyway is still safe: the row stays below what
+///    workers are given, and the next claim starts above both.
 pub(crate) async fn claim_route_generation_within(
     db: &DatabaseConnection,
     previous: u64,
     timeout: std::time::Duration,
 ) -> Result<u64, RouteGenerationError> {
     let timeout_ms = timeout.as_millis();
-    match tokio::time::timeout(
-        timeout + ROUTE_GENERATION_CLAIM_GRACE,
-        claim_in_transaction(db, previous, timeout_ms),
+    let deadline = tokio::time::Instant::now() + timeout + ROUTE_GENERATION_CLAIM_GRACE;
+    let (txn, claimed) = match tokio::time::timeout_at(
+        deadline,
+        claim_uncommitted(db, previous, timeout_ms),
     )
     .await
     {
-        Ok(result) => result,
-        Err(_) => Err(RouteGenerationError::Timeout {
-            previous,
+        Ok(result) => result?,
+        Err(_) => {
+            return Err(RouteGenerationError::Timeout {
+                previous,
+                timeout_ms,
+            })
+        }
+    };
+    match tokio::time::timeout_at(deadline, txn.commit()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => warn!(
+            previous_generation = previous,
+            claimed_generation = claimed,
+            %error,
+            "Committing route generation {claimed} failed; publishing it anyway so the \
+             durable generation can never be ahead of what workers are given"
+        ),
+        Err(_) => warn!(
+            previous_generation = previous,
+            claimed_generation = claimed,
             timeout_ms,
-        }),
+            "Committing route generation {claimed} did not answer within {timeout_ms} ms; \
+             publishing it anyway, since the commit may have succeeded"
+        ),
     }
+    Ok(claimed)
 }
 
-async fn claim_in_transaction(
+/// Phase 1 of [`claim_route_generation_within`]: the claimed value and the
+/// still-open transaction that holds it.
+async fn claim_uncommitted(
     db: &DatabaseConnection,
     previous: u64,
     timeout_ms: u128,
-) -> Result<u64, RouteGenerationError> {
+) -> Result<(sea_orm::DatabaseTransaction, u64), RouteGenerationError> {
     use sea_orm::{ConnectionTrait, TransactionTrait};
     let claim_error = |source| RouteGenerationError::Claim { previous, source };
     // Leave room for the `+ 1` below; 9.2e18 reloads is unreachable anyway.
@@ -837,8 +866,7 @@ async fn claim_in_transaction(
         .ok_or(RouteGenerationError::MissingRow { previous })?;
     let value = row.try_get::<i64>("", "current").map_err(claim_error)?;
     let claimed = u64::try_from(value).map_err(|_| RouteGenerationError::Negative { value })?;
-    txn.commit().await.map_err(claim_error)?;
-    Ok(claimed)
+    Ok((txn, claimed))
 }
 
 /// Raise `counter` to a generation claimed from the database and return the
@@ -4725,5 +4753,62 @@ mod route_generation_tests {
         table.load_routes().await.expect("load after the stall");
         assert_eq!(table.current_generation(), 3);
         assert_eq!(persisted(&db).await, Some(3));
+    }
+
+    /// Once the `UPDATE` has returned a generation, the reload publishes it
+    /// whatever happens to the commit: a commit that succeeded with a lost
+    /// reply must not leave the row ahead of every worker, and one that
+    /// failed leaves the row below the published value, which the next claim
+    /// starts above.
+    #[tokio::test]
+    async fn a_claimed_generation_is_published_even_when_its_commit_fails() {
+        let Some(database) = database_or_skip().await else {
+            return;
+        };
+        let db = database.db.clone();
+        execute(
+            &db,
+            "UPDATE route_generation SET current = 100 WHERE id = 1",
+        )
+        .await;
+        // Fails every transaction that changed the row, at COMMIT time.
+        execute(
+            &db,
+            "CREATE FUNCTION fail_route_generation_commit() RETURNS trigger \
+             LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic commit failure'; END $$",
+        )
+        .await;
+        execute(
+            &db,
+            "CREATE CONSTRAINT TRIGGER fail_route_generation_commit AFTER UPDATE ON \
+             route_generation DEFERRABLE INITIALLY DEFERRED FOR EACH ROW \
+             EXECUTE FUNCTION fail_route_generation_commit()",
+        )
+        .await;
+
+        let claimed = claim_route_generation(db.as_ref(), 0)
+            .await
+            .expect("the value the UPDATE returned is used despite the failed commit");
+        assert_eq!(claimed, 101);
+        assert_eq!(persisted(&db).await, Some(100), "the commit rolled back");
+
+        let table = CachedPeerTable::new(db.clone());
+        table
+            .load_routes()
+            .await
+            .expect("load with failing commits");
+        assert_eq!(table.current_generation(), 101);
+
+        execute(
+            &db,
+            "DROP TRIGGER fail_route_generation_commit ON route_generation",
+        )
+        .await;
+        table
+            .load_routes()
+            .await
+            .expect("load once commits succeed");
+        assert_eq!(table.current_generation(), 102);
+        assert_eq!(persisted(&db).await, Some(102));
     }
 }
