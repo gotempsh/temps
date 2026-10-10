@@ -857,6 +857,19 @@ impl WalgDeletionEngine {
     }
 }
 
+/// Longest engine error kept per service in an aggregated failure message.
+const MAX_FAILURE_CAUSE_CHARS: usize = 300;
+
+/// One service's failure cause, short enough to aggregate several of them
+/// into a single message an operator can read.
+fn bounded_failure_cause(cause: &str) -> String {
+    let cause = cause.trim();
+    match cause.char_indices().nth(MAX_FAILURE_CAUSE_CHARS) {
+        Some((cut, _)) => format!("{}...", &cause[..cut]),
+        None => cause.to_string(),
+    }
+}
+
 /// The complete user data WAL-G writes into a snapshot sentinel.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -2294,7 +2307,11 @@ SELECT cp.id
                 }
                 Err(e) => {
                     error!("Failed to backup external service {}: {}", service.name, e);
-                    failed_services.push(service.name.clone());
+                    failed_services.push(format!(
+                        "{} ({})",
+                        service.name,
+                        bounded_failure_cause(&e.to_string())
+                    ));
 
                     // Send notification about this specific failure
                     let error_msg = format!("External service backup failed: {}", e);
@@ -2321,13 +2338,13 @@ SELECT cp.id
         if !failed_services.is_empty() {
             error!(
                 "Backup completed with failures. Failed services: {}",
-                failed_services.join(", ")
+                failed_services.join("; ")
             );
             return Err(BackupError::Internal {
                 message: format!(
                     "Whole-instance backup {} is incomplete because these services failed: {}",
                     backup.backup_id,
-                    failed_services.join(", ")
+                    failed_services.join("; ")
                 ),
             });
         }
@@ -9299,8 +9316,6 @@ ORDER BY a.opened_at DESC
             expires_at: sea_orm::Set(None),
         };
 
-        let backup = backup.insert(self.db.as_ref()).await?;
-
         // Generate backup path
         let subpath = format!(
             "external_services/{}/{}/{}",
@@ -9333,6 +9348,9 @@ ORDER BY a.opened_at DESC
             .get_service_config(service_id)
             .await
             .map_err(|e| BackupError::ExternalService(e.to_string()))?;
+        // Resolved before the row exists, so a service that cannot be backed
+        // up at all leaves no `running` row behind.
+        let backup = backup.insert(self.db.as_ref()).await?;
 
         // Cluster topology: route through the manager which knows how
         // to find the current primary and dispatch exec to it (local
@@ -9351,7 +9369,7 @@ ORDER BY a.opened_at DESC
                         service.name, service.id, e
                     );
                     BackupError::ExternalService(e.to_string())
-                })?
+                })
         } else {
             // Standalone: use the per-engine trait impl as before.
             service_instance
@@ -9373,7 +9391,25 @@ ORDER BY a.opened_at DESC
                         service.name, service.service_type, service.id, e
                     );
                     BackupError::ExternalService(e.to_string())
-                })?
+                })
+        };
+        let backup_outcome = match backup_outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // Keep the cause on the row: callers such as the pre-upgrade
+                // backup report it, and the backup list shows it.
+                let mut failed: temps_entities::backups::ActiveModel = backup.clone().into();
+                failed.state = sea_orm::Set("failed".to_string());
+                failed.error_message = sea_orm::Set(Some(error.to_string()));
+                failed.finished_at = sea_orm::Set(Some(Utc::now()));
+                if let Err(update_error) = failed.update(self.db.as_ref()).await {
+                    error!(
+                        "Failed to mark backup {} of service '{}' (id={}) as failed: {}",
+                        backup.backup_id, service.name, service.id, update_error
+                    );
+                }
+                return Err(error);
+            }
         };
         info!(
             "Backup created at location: {} ({} bytes)",
@@ -10038,17 +10074,27 @@ impl temps_providers::externalsvc::postgres_upgrade::PreUpgradeBackupProvider fo
         s3_source_id: i32,
         created_by: i32,
     ) -> Result<i32, String> {
-        let backup = self
-            .create_backup(None, s3_source_id, "full", created_by)
+        // Back up the service being upgraded, not the whole instance: an
+        // unrelated service that cannot be backed up must not block this
+        // upgrade, and this service's own failure is reported with its cause
+        // rather than folded into an instance-wide summary.
+        let service = temps_entities::external_services::Entity::find_by_id(service_id)
+            .one(self.db.as_ref())
             .await
-            .map_err(|e| e.to_string())?;
-        // `create_backup` returns a `temps_entities::backups::Model`; the
-        // service-level backup id for external_services is surfaced via
-        // `external_service_backups`. For the upgrade row we record the
-        // `backups.id` itself (migration FK targets `backups(id)`), so we
-        // need the numeric id — which the model exposes directly.
-        let _ = service_id; // reserved for future: scope the search to this service
-        Ok(backup.id)
+            .map_err(|e| format!("failed to load service {service_id}: {e}"))?
+            .ok_or_else(|| format!("service {service_id} no longer exists"))?;
+        let child = self
+            .backup_external_service(&service, s3_source_id, "full", created_by)
+            .await
+            .map_err(|e| {
+                format!(
+                    "full backup of '{}' to S3 source {} failed: {}",
+                    service.name, s3_source_id, e
+                )
+            })?;
+        // The upgrade row's FK targets `backups(id)`, the parent of the
+        // per-service child row.
+        Ok(child.backup_id)
     }
 }
 
@@ -10815,6 +10861,20 @@ mod tests {
         // Assert.
         assert!(matches!(error, BackupError::Database(_)));
         assert!(error.to_string().contains("producer lookup failed"));
+    }
+
+    /// #1355: a whole-instance failure names each failed service with its
+    /// own cause, trimmed so one verbose engine error cannot bury the rest.
+    #[test]
+    fn bounded_failure_cause_keeps_short_causes_and_truncates_long_ones() {
+        assert_eq!(
+            bounded_failure_cause("  wal-g: command not found \n"),
+            "wal-g: command not found"
+        );
+        let long = "é".repeat(MAX_FAILURE_CAUSE_CHARS + 50);
+        let bounded = bounded_failure_cause(&long);
+        assert!(bounded.ends_with("..."));
+        assert_eq!(bounded.chars().count(), MAX_FAILURE_CAUSE_CHARS + 3);
     }
 
     #[test]

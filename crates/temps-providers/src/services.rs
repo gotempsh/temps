@@ -706,6 +706,34 @@ pub enum ExternalServiceError {
     #[error("Failed to stop service {id}: {reason}")]
     StopFailed { id: i32, reason: String },
 
+    #[error(
+        "Cannot {action} cluster service {service_id}: member '{container_name}' is still being \
+         provisioned ({status}). Wait until it is running or failed, then retry"
+    )]
+    ClusterMemberProvisioning {
+        service_id: i32,
+        action: &'static str,
+        container_name: String,
+        status: String,
+    },
+
+    #[error("Cannot {action} cluster service {service_id}: the cluster is '{status}'. {remedy}")]
+    ClusterNotSettled {
+        service_id: i32,
+        action: &'static str,
+        status: String,
+        remedy: &'static str,
+    },
+
+    #[error(
+        "Cannot {action} cluster service {service_id}: another Stop or Start is already in \
+         progress on it. Try again once it finishes"
+    )]
+    ClusterBusy {
+        service_id: i32,
+        action: &'static str,
+    },
+
     #[error("Failed to delete service {id}: {reason}")]
     DeletionFailed { id: i32, reason: String },
 
@@ -1512,6 +1540,249 @@ fn cluster_auth_upgrade_steps(
 
 fn is_role_primary(s: &str) -> bool {
     role_from_str(s) == Some(crate::ClusterRole::Primary)
+}
+
+/// Direction of a whole-cluster Stop or Start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClusterLifecycleAction {
+    Stop,
+    Start,
+}
+
+impl ClusterLifecycleAction {
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Start => "start",
+        }
+    }
+
+    /// `service_members.status` of a member this action succeeded on.
+    fn member_status(self) -> &'static str {
+        match self {
+            Self::Stop => "stopped",
+            Self::Start => "running",
+        }
+    }
+
+    /// Cluster `status` while this action holds it (see `claim_cluster`).
+    fn claim_status(self) -> &'static str {
+        match self {
+            Self::Stop => "stopping",
+            Self::Start => "starting",
+        }
+    }
+}
+
+/// What a cluster Stop/Start did to the members it reached.
+#[derive(Debug, Default)]
+struct ClusterLifecycleReport {
+    done: Vec<String>,
+    failures: Vec<String>,
+    not_attempted: Vec<String>,
+}
+
+/// The members a cluster Stop/Start acts on, in the order it acts on them.
+///
+/// Stop, when the monitor named the live `primary`: standbys, then the
+/// primary, then the monitor. The monitor stays up while the data nodes go
+/// down, and once no standby is running it has no candidate to promote, so
+/// stopping the primary cannot trigger a failover.
+///
+/// Stop, when the live primary is unknown (the monitor could not be
+/// queried): the monitor first, then the data members. Stored roles cannot
+/// stand in for the live primary (the role reconciler records every data
+/// member as `replica`), and promotion needs the monitor, so with it down no
+/// order of the data members can cause a failover. If the monitor cannot be
+/// stopped, Stop halts before touching any data member.
+///
+/// Start: the monitor first so every keeper can reach it, then the data
+/// members (a stored `primary` first).
+///
+/// A member whose provisioning failed is still stopped (it may have a
+/// running container the monitor could promote) but never started.
+fn cluster_lifecycle_order<'a>(
+    members: &'a [service_members::Model],
+    primary: Option<&str>,
+    action: ClusterLifecycleAction,
+) -> Vec<&'a service_members::Model> {
+    // Lower tiers go first.
+    let tier = |member: &service_members::Model| -> u8 {
+        let monitor = is_role_monitor(&member.role);
+        match (action, primary) {
+            (ClusterLifecycleAction::Stop, Some(_)) if monitor => 2,
+            (ClusterLifecycleAction::Stop, Some(primary)) => {
+                u8::from(primary == member.container_name)
+            }
+            (ClusterLifecycleAction::Stop, None) => u8::from(!monitor),
+            (ClusterLifecycleAction::Start, _) if monitor => 0,
+            (ClusterLifecycleAction::Start, _) => {
+                if is_role_primary(&member.role) {
+                    1
+                } else {
+                    2
+                }
+            }
+        }
+    };
+    let mut ordered: Vec<_> = members
+        .iter()
+        .filter(|member| action == ClusterLifecycleAction::Stop || member.status != "failed")
+        .collect();
+    ordered.sort_by_key(|m| (tier(m), m.ordinal));
+    ordered
+}
+
+/// How long a `stopping`/`starting` claim may go without progress before
+/// another Stop or Start may take it over. The claim is refreshed after
+/// every member and one member's agent call is bounded at 300s, so only a
+/// claim whose process died gets this old.
+const CLUSTER_CLAIM_STALE_AFTER: chrono::Duration = chrono::Duration::minutes(15);
+
+/// Whether `action` may claim a cluster whose status is `status`, last
+/// changed at `updated_at`.
+fn cluster_claim_decision(
+    service_id: i32,
+    status: &str,
+    updated_at: chrono::DateTime<Utc>,
+    now: chrono::DateTime<Utc>,
+    action: ClusterLifecycleAction,
+) -> Result<(), ExternalServiceError> {
+    let not_settled = |remedy| ExternalServiceError::ClusterNotSettled {
+        service_id,
+        action: action.verb(),
+        status: status.to_string(),
+        remedy,
+    };
+    match (status, action) {
+        ("creating", _) => Err(not_settled("Wait until provisioning finishes, then retry")),
+        ("failed", ClusterLifecycleAction::Start) => Err(not_settled(
+            "Its provisioning failed; use Retry to provision it again instead of starting it",
+        )),
+        ("stopping" | "starting", _) if now - updated_at < CLUSTER_CLAIM_STALE_AFTER => {
+            Err(ExternalServiceError::ClusterBusy {
+                service_id,
+                action: action.verb(),
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The error for a cluster Stop/Start that did not reach every member:
+/// each failed member, what was done, and what was left alone.
+fn cluster_lifecycle_failure(
+    service: &external_services::Model,
+    action: ClusterLifecycleAction,
+    report: &ClusterLifecycleReport,
+) -> ExternalServiceError {
+    let list = |names: &[String]| {
+        if names.is_empty() {
+            "none".to_string()
+        } else {
+            names.join(", ")
+        }
+    };
+    let mut reason = format!(
+        "cluster '{}': could not {} {}. Members {} so far: {}",
+        service.name,
+        action.verb(),
+        report.failures.join("; "),
+        action.member_status(),
+        list(&report.done)
+    );
+    if !report.not_attempted.is_empty() {
+        reason.push_str(&format!(
+            ". Left running so no standby is promoted: {}",
+            list(&report.not_attempted)
+        ));
+    }
+    reason.push_str(". Data volumes were not touched; fix the member above and retry");
+    match action {
+        ClusterLifecycleAction::Stop => ExternalServiceError::StopFailed {
+            id: service.id,
+            reason,
+        },
+        ClusterLifecycleAction::Start => ExternalServiceError::StartFailed {
+            id: service.id,
+            reason,
+        },
+    }
+}
+
+/// The status a cluster returns to when a lifecycle action does not
+/// complete: the one it had before. A claim taken over from a process that
+/// died has no meaningful "before", and its members may be running.
+fn cluster_status_before_claim(previous: &str) -> &str {
+    match previous {
+        "stopping" | "starting" => "running",
+        other => other,
+    }
+}
+
+/// The status to record for `member` once `action` succeeded on it, or
+/// `None` to keep its row as is. A member whose provisioning failed stays
+/// `failed`: stopping its leftover container does not make it startable,
+/// and the next Start must keep skipping it.
+fn recorded_member_status(
+    member: &service_members::Model,
+    action: ClusterLifecycleAction,
+) -> Option<&'static str> {
+    (member.status != "failed").then(|| action.member_status())
+}
+
+/// Treat members a failed cluster left `pending` or `creating` as failed.
+/// No provisioning task runs for a cluster whose provisioning failed (Retry
+/// takes the lifecycle lock before starting one), so such a member is not
+/// "still being provisioned": refusing a Stop because of it would leave the
+/// cluster's leftover containers impossible to stop.
+///
+/// Returns the ids of the members it changed, whose rows must say so too.
+fn settle_members_of_failed_cluster(members: &mut [service_members::Model]) -> Vec<i32> {
+    let mut abandoned = Vec::new();
+    for member in members {
+        if !cluster_member_is_settled(&member.status) {
+            member.status = "failed".to_string();
+            abandoned.push(member.id);
+        }
+    }
+    abandoned
+}
+
+/// Member states Stop/Start can act on. Anything else (`pending`,
+/// `creating`) is still being provisioned by a background task that would
+/// race the action.
+fn cluster_member_is_settled(status: &str) -> bool {
+    matches!(status, "running" | "stopped" | "failed")
+}
+
+/// What a remote member's observed container state already decides for
+/// `action`: `Some(Ok(()))` when there is nothing left to do, `Some(Err)`
+/// when it cannot be done, `None` when the agent must act.
+///
+/// Agents report Docker's "already stopped/started" and "no such
+/// container" as plain errors, so the state is checked rather than the
+/// error: a retried Stop must pass members an earlier attempt already
+/// stopped instead of halting on them again.
+fn remote_member_outcome(
+    member: &service_members::Model,
+    action: ClusterLifecycleAction,
+    status: &crate::remote_service_client::RemoteServiceStatus,
+) -> Option<Result<(), String>> {
+    let exists = status.container_id.is_some();
+    match action {
+        ClusterLifecycleAction::Stop
+            if !status.running && (exists || member.status == "failed") =>
+        {
+            Some(Ok(()))
+        }
+        ClusterLifecycleAction::Start if status.running => Some(Ok(())),
+        _ if !exists => Some(Err(format!(
+            "its container '{}' does not exist on that node",
+            member.container_name
+        ))),
+        _ => None,
+    }
 }
 
 /// `true` for any role that holds data — primary, replica, or any
@@ -7085,6 +7356,17 @@ echo "[restore] Pre-seed complete"
         &self,
         service_id: i32,
     ) -> Result<(), ExternalServiceError> {
+        self.record_cluster_auth_version(service_id, CLUSTER_AUTH_VERSION)
+            .await
+    }
+
+    /// Raise a cluster's recorded authentication version to at least
+    /// `reached`. Never lowers it.
+    async fn record_cluster_auth_version(
+        &self,
+        service_id: i32,
+        reached: u64,
+    ) -> Result<(), ExternalServiceError> {
         let txn = self.db.begin().await?;
         let service = external_services::Entity::find_by_id(service_id)
             .lock_exclusive()
@@ -7106,7 +7388,7 @@ echo "[restore] Pre-seed complete"
             })?;
         // Merge only the marker into the latest locked configuration, never a
         // pre-upgrade copy that can erase a concurrent settings update.
-        let version = cluster_auth_version(&parameters).max(CLUSTER_AUTH_VERSION);
+        let version = cluster_auth_version(&parameters).max(reached);
         parameters.insert(
             CLUSTER_AUTH_VERSION_KEY.to_string(),
             serde_json::json!(version),
@@ -8347,6 +8629,23 @@ echo "[restore] Pre-seed complete"
         service_update.updated_at = Set(Utc::now());
         service_update.update(self.db.as_ref()).await?;
 
+        // Every member was just built by this code (a retry removes the
+        // leftovers first), so the infrastructure roles already use SCRAM.
+        // Record that, or the next `add_cluster_member` treats this cluster
+        // as legacy and re-runs the in-place upgrade against members that may
+        // still be taking their initial base backup.
+        if let Err(e) = self
+            .record_cluster_auth_version(service_id, CLUSTER_INFRA_AUTH_VERSION)
+            .await
+        {
+            warn!(
+                service_id,
+                error = %e,
+                "Cluster created with SCRAM-native members, but its authentication version \
+                 could not be recorded; the next start re-runs the idempotent upgrade"
+            );
+        }
+
         // Start the per-cluster role reconciler (ADR-011 Phase 4). Best-effort:
         // skipped if no DnsRegistry is wired (legacy plugin) or if a reconciler
         // is already running for this service_id (idempotent retry).
@@ -8622,7 +8921,16 @@ echo "[restore] Pre-seed complete"
         service_id: i32,
         member_requests: &[ClusterMemberRequest],
     ) -> Result<ExternalServiceInfo, ExternalServiceError> {
-        let service = self.get_service(service_id).await?;
+        // Checked and switched to `creating` under the row lock, in one short
+        // transaction committed before any container is removed: from then
+        // on Stop, Start and Add Replica refuse the cluster, so none of them
+        // acts on the members this retry tears down. See `claim_cluster`.
+        let lock = self.db.begin().await?;
+        let service = external_services::Entity::find_by_id(service_id)
+            .lock_exclusive()
+            .one(&lock)
+            .await?
+            .ok_or(ExternalServiceError::ServiceNotFound { id: service_id })?;
 
         if service.topology != "cluster" {
             return Err(ExternalServiceError::ParameterValidationFailed {
@@ -8650,7 +8958,7 @@ echo "[restore] Pre-seed complete"
         let leftover_members = service_members::Entity::find()
             .filter(service_members::Column::ServiceId.eq(service_id))
             .order_by_asc(service_members::Column::Ordinal)
-            .all(self.db.as_ref())
+            .all(&lock)
             .await?;
 
         // Reconstruct member specs from preserved records if none were provided
@@ -8682,6 +8990,14 @@ echo "[restore] Pre-seed complete"
         // Before tearing anything down: a member list that cannot fit would
         // only fail again after the leftover members were removed.
         validate_cluster_member_count(&service.name, effective_members.len())?;
+
+        // Update status to "creating" and clear previous error
+        let mut service_update: external_services::ActiveModel = service.into();
+        service_update.status = Set("creating".to_string());
+        service_update.error_message = Set(None);
+        service_update.updated_at = Set(Utc::now());
+        service_update.update(&lock).await?;
+        lock.commit().await?;
 
         for member in &leftover_members {
             // Try to remove the container (ignore errors — it may not exist)
@@ -8733,13 +9049,6 @@ echo "[restore] Pre-seed complete"
                 service_id
             );
         }
-
-        // Update status to "creating" and clear previous error
-        let mut service_update: external_services::ActiveModel = service.into();
-        service_update.status = Set("creating".to_string());
-        service_update.error_message = Set(None);
-        service_update.updated_at = Set(Utc::now());
-        service_update.update(self.db.as_ref()).await?;
 
         // Spawn background task to re-initialize (same pattern as create).
         // `self.clone()`, not `ExternalServiceManager::new(...)` -- see the
@@ -8861,12 +9170,36 @@ echo "[restore] Pre-seed complete"
                     updated_at: Set(now),
                     ..Default::default()
                 };
-                match member_record.insert(self.db.as_ref()).await {
+                // The status check in `plan_add_cluster_member` is repeated
+                // under the cluster's row lock, in the transaction that
+                // inserts the member. A Stop claims the cluster under the
+                // same lock (`claim_cluster`), so it either sees this member
+                // or has already moved the cluster to `stopping` and this add
+                // is refused. Never a member the Stop did not see.
+                let lock = self.db.begin().await?;
+                let status = external_services::Entity::find_by_id(service_id)
+                    .lock_exclusive()
+                    .one(&lock)
+                    .await?
+                    .ok_or(ExternalServiceError::ServiceNotFound { id: service_id })?
+                    .status;
+                if status != "running" {
+                    return Err(ExternalServiceError::ParameterValidationFailed {
+                        service_id,
+                        reason: format!(
+                            "Cluster must be in 'running' status to add a member, current: '{}'",
+                            status
+                        ),
+                    });
+                }
+                match member_record.insert(&lock).await {
                     Ok(model) => {
+                        lock.commit().await?;
                         chosen_plan = Some(plan);
                         chosen_model = Some(model);
                         break;
                     }
+                    // Dropping `lock` rolls the failed insert back.
                     Err(e) if is_unique_violation(&e) => {
                         // Another `add_cluster_member` won this ordinal.
                         // Loop and recompute against the now-larger
@@ -10764,6 +11097,13 @@ echo "[restore] Pre-seed complete"
         self.ensure_no_active_upgrade(service_id).await?;
         let service = self.get_service(service_id).await?;
         self.ensure_unambiguous_service_name(&service).await?;
+        // Never fall back to `initialize_service` here: that builds a
+        // standalone container under the service's own name.
+        if service.topology == "cluster" {
+            self.run_cluster_lifecycle(service_id, ClusterLifecycleAction::Start)
+                .await?;
+            return self.get_service_info(service_id).await;
+        }
         let service_type_enum = ServiceType::from_str(&service.service_type).map_err(|_| {
             ExternalServiceError::InvalidServiceType {
                 id: service_id,
@@ -10966,12 +11306,383 @@ echo "[restore] Pre-seed complete"
         Ok(())
     }
 
+    /// Stop or start every member of cluster `service_id`, in
+    /// [`cluster_lifecycle_order`], and record the cluster's new status.
+    /// Volumes are never touched.
+    ///
+    /// The cluster is first claimed (`stopping`/`starting`, see
+    /// [`Self::claim_cluster`]); no transaction or connection is held while
+    /// containers change. Each member's row is written on its own as soon as
+    /// that member changed, so a failed write cannot undo the others; it
+    /// counts as that member's failure, which halts a Stop like any other.
+    ///
+    /// Stopping halts at the first member that cannot be stopped: carrying on
+    /// would stop the primary while a standby still runs, which is exactly
+    /// the failover the order exists to avoid. Starting attempts every
+    /// member. Either way the error names each failed member and what was
+    /// and was not done. A member whose provisioning failed keeps its
+    /// `failed` status, so the next Start still skips it.
+    async fn run_cluster_lifecycle(
+        &self,
+        service_id: i32,
+        action: ClusterLifecycleAction,
+    ) -> Result<(), ExternalServiceError> {
+        let service = self.claim_cluster(service_id, action).await?;
+        let outcome = self.drive_cluster_members(&service, action).await;
+
+        let previous = cluster_status_before_claim(&service.status);
+        let (status, error_message) = match &outcome {
+            // A cluster whose provisioning failed stays `failed` after a
+            // Stop, so Retry remains available.
+            Ok(report) if report.failures.is_empty() && service.status == "failed" => {
+                ("failed", service.error_message.clone())
+            }
+            Ok(report) if report.failures.is_empty() => (action.member_status(), None),
+            Ok(report) => (
+                previous,
+                Some(cluster_lifecycle_failure(&service, action, report).to_string()),
+            ),
+            // Refused, or the members could not be read: nothing changed.
+            Err(_) => (previous, service.error_message.clone()),
+        };
+
+        // The role reconciler keeps the cluster's primary DNS record
+        // pointed at the live primary. It is only started for running
+        // clusters at boot, so a cluster started here needs its own.
+        // Changed while the claim is held, so a Stop finishing late cannot
+        // shut down the reconciler of a Start that ran after it.
+        if let Ok(report) = &outcome {
+            match action {
+                ClusterLifecycleAction::Start if !report.done.is_empty() => {
+                    self.spawn_role_reconciler(service_id, service.name.clone())
+                        .await;
+                }
+                ClusterLifecycleAction::Stop if report.failures.is_empty() => {
+                    self.stop_role_reconciler(service_id).await;
+                }
+                _ => {}
+            }
+        }
+        self.release_cluster_claim(service_id, action, status, error_message)
+            .await?;
+
+        let report = outcome?;
+        if report.failures.is_empty() {
+            Ok(())
+        } else {
+            Err(cluster_lifecycle_failure(&service, action, &report))
+        }
+    }
+
+    /// Claim cluster `service_id` for `action`: under the row lock, check
+    /// [`cluster_claim_decision`] and move it to `stopping`/`starting`.
+    /// Returns the cluster as it was before the claim.
+    ///
+    /// The row lock lives only for this check and write. Add Replica and
+    /// Retry check the status under the same lock, so once the claim
+    /// commits neither can change the member set a Stop/Start is acting
+    /// on, and a second Stop/Start is refused as busy.
+    async fn claim_cluster(
+        &self,
+        service_id: i32,
+        action: ClusterLifecycleAction,
+    ) -> Result<external_services::Model, ExternalServiceError> {
+        let txn = self.db.begin().await?;
+        let service = external_services::Entity::find_by_id(service_id)
+            .lock_exclusive()
+            .one(&txn)
+            .await?
+            .ok_or(ExternalServiceError::ServiceNotFound { id: service_id })?;
+        cluster_claim_decision(
+            service_id,
+            &service.status,
+            service.updated_at,
+            Utc::now(),
+            action,
+        )?;
+        external_services::ActiveModel {
+            id: Set(service_id),
+            status: Set(action.claim_status().to_string()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .update(&txn)
+        .await?;
+        txn.commit().await?;
+        Ok(service)
+    }
+
+    /// Refresh this action's claim so it is not mistaken for one whose
+    /// process died (see [`CLUSTER_CLAIM_STALE_AFTER`]).
+    async fn refresh_cluster_claim(&self, service_id: i32, action: ClusterLifecycleAction) {
+        if let Err(e) = external_services::Entity::update_many()
+            .col_expr(
+                external_services::Column::UpdatedAt,
+                sea_orm::sea_query::Expr::value(Utc::now()),
+            )
+            .filter(external_services::Column::Id.eq(service_id))
+            .filter(external_services::Column::Status.eq(action.claim_status()))
+            .exec(self.db.as_ref())
+            .await
+        {
+            warn!(
+                service_id,
+                error = %e,
+                "Could not refresh the cluster's {} claim", action.verb()
+            );
+        }
+    }
+
+    /// End this action's claim with the cluster's resulting status. Only a
+    /// claim this action still holds is replaced.
+    async fn release_cluster_claim(
+        &self,
+        service_id: i32,
+        action: ClusterLifecycleAction,
+        status: &str,
+        error_message: Option<String>,
+    ) -> Result<(), ExternalServiceError> {
+        external_services::Entity::update_many()
+            .col_expr(
+                external_services::Column::Status,
+                sea_orm::sea_query::Expr::value(status),
+            )
+            .col_expr(
+                external_services::Column::ErrorMessage,
+                sea_orm::sea_query::Expr::value(error_message),
+            )
+            .col_expr(
+                external_services::Column::UpdatedAt,
+                sea_orm::sea_query::Expr::value(Utc::now()),
+            )
+            .filter(external_services::Column::Id.eq(service_id))
+            .filter(external_services::Column::Status.eq(action.claim_status()))
+            .exec(self.db.as_ref())
+            .await
+            .map_err(|e| {
+                error!(
+                    service_id,
+                    error = %e,
+                    "Cluster {} finished on its members but its status stayed '{}'; \
+                     another Stop or Start may take it over after {} minutes",
+                    action.verb(),
+                    action.claim_status(),
+                    CLUSTER_CLAIM_STALE_AFTER.num_minutes()
+                );
+                ExternalServiceError::from(e)
+            })?;
+        Ok(())
+    }
+
+    /// Act on the members of a claimed cluster. `Err` only when nothing
+    /// was done: the members could not be read, or one is still being
+    /// provisioned.
+    async fn drive_cluster_members(
+        &self,
+        service: &external_services::Model,
+        action: ClusterLifecycleAction,
+    ) -> Result<ClusterLifecycleReport, ExternalServiceError> {
+        let service_id = service.id;
+        let mut members = service_members::Entity::find()
+            .filter(service_members::Column::ServiceId.eq(service_id))
+            .order_by_asc(service_members::Column::Ordinal)
+            .all(self.db.as_ref())
+            .await?;
+        if service.status == "failed" {
+            let abandoned = settle_members_of_failed_cluster(&mut members);
+            if !abandoned.is_empty() {
+                // Saved before any container changes, so the API stops
+                // reporting these members as still being provisioned.
+                service_members::Entity::update_many()
+                    .col_expr(
+                        service_members::Column::Status,
+                        sea_orm::sea_query::Expr::value("failed"),
+                    )
+                    .col_expr(
+                        service_members::Column::ProvisioningStep,
+                        sea_orm::sea_query::Expr::value(Some(
+                            member_provisioning_step::FAILED.to_string(),
+                        )),
+                    )
+                    .col_expr(
+                        service_members::Column::UpdatedAt,
+                        sea_orm::sea_query::Expr::value(Utc::now()),
+                    )
+                    .filter(service_members::Column::Id.is_in(abandoned))
+                    .filter(service_members::Column::Status.is_in(["pending", "creating"]))
+                    .exec(self.db.as_ref())
+                    .await?;
+            }
+        }
+        if let Some(busy) = members
+            .iter()
+            .find(|m| !cluster_member_is_settled(&m.status))
+        {
+            return Err(ExternalServiceError::ClusterMemberProvisioning {
+                service_id,
+                action: action.verb(),
+                container_name: busy.container_name.clone(),
+                status: busy.status.clone(),
+            });
+        }
+        let live_primary = match action {
+            ClusterLifecycleAction::Stop => self
+                .find_live_primary_member(service, &members)
+                .await
+                .ok()
+                .flatten()
+                .map(|member| member.container_name.clone()),
+            ClusterLifecycleAction::Start => None,
+        };
+
+        let mut report = ClusterLifecycleReport::default();
+        for member in cluster_lifecycle_order(&members, live_primary.as_deref(), action) {
+            if action == ClusterLifecycleAction::Stop && !report.failures.is_empty() {
+                report.not_attempted.push(member.container_name.clone());
+                continue;
+            }
+            let result = match self.set_cluster_member_running(member, action).await {
+                Ok(()) => match recorded_member_status(member, action) {
+                    Some(status) => (service_members::ActiveModel {
+                        id: Set(member.id),
+                        status: Set(status.to_string()),
+                        updated_at: Set(Utc::now()),
+                        ..Default::default()
+                    })
+                    .update(self.db.as_ref())
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| {
+                        format!(
+                            "its container is now {} but its row could not be updated: {}",
+                            action.member_status(),
+                            e
+                        )
+                    }),
+                    None => Ok(()),
+                },
+                Err(reason) => Err(reason),
+            };
+            match result {
+                Ok(()) => {
+                    info!(
+                        service_id,
+                        member = %member.container_name,
+                        role = %member.role,
+                        "Cluster member is now {}",
+                        action.member_status()
+                    );
+                    report.done.push(member.container_name.clone());
+                }
+                Err(reason) => {
+                    error!(
+                        service_id,
+                        member = %member.container_name,
+                        "Failed to {} cluster member: {}",
+                        action.verb(),
+                        reason
+                    );
+                    report
+                        .failures
+                        .push(format!("'{}' ({})", member.container_name, reason));
+                }
+            }
+            self.refresh_cluster_claim(service_id, action).await;
+        }
+        Ok(report)
+    }
+
+    /// Stop or start one cluster member's container, locally or through
+    /// its node's agent. A container already in the wanted state is
+    /// success; so is a missing container of a member whose provisioning
+    /// failed, which has nothing to stop.
+    async fn set_cluster_member_running(
+        &self,
+        member: &service_members::Model,
+        action: ClusterLifecycleAction,
+    ) -> Result<(), String> {
+        if let Some(node_id) = member.node_id {
+            let client = self
+                .get_remote_client(node_id)
+                .await
+                .map_err(|e| format!("cannot reach node {node_id}: {e}"))?;
+            let observe = || async {
+                client
+                    .service_status(&member.container_name)
+                    .await
+                    .map_err(|e| format!("on node {node_id}: cannot read its state: {e}"))
+            };
+            if let Some(outcome) = remote_member_outcome(member, action, &observe().await?) {
+                return outcome;
+            }
+            let result = match action {
+                ClusterLifecycleAction::Stop => client.stop_service(&member.container_name).await,
+                ClusterLifecycleAction::Start => client.start_service(&member.container_name).await,
+            };
+            return match result {
+                Ok(()) => Ok(()),
+                // The container may have reached the wanted state anyway
+                // (it was stopped or started concurrently): judge by state.
+                Err(e) => match remote_member_outcome(member, action, &observe().await?) {
+                    Some(Ok(())) => Ok(()),
+                    _ => Err(format!("on node {node_id}: {e}")),
+                },
+            };
+        }
+
+        let docker = self.docker.get().ok_or_else(|| {
+            "this process has no local Docker daemon to manage the member".to_string()
+        })?;
+        let result = match action {
+            ClusterLifecycleAction::Stop => {
+                docker
+                    .stop_container(
+                        &member.container_name,
+                        None::<bollard::query_parameters::StopContainerOptions>,
+                    )
+                    .await
+            }
+            ClusterLifecycleAction::Start => {
+                docker
+                    .start_container(
+                        &member.container_name,
+                        None::<bollard::query_parameters::StartContainerOptions>,
+                    )
+                    .await
+            }
+        };
+        match result {
+            Ok(()) => Ok(()),
+            // 304: already stopped / already running.
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 304, ..
+            }) => Ok(()),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) if action == ClusterLifecycleAction::Stop && member.status == "failed" => Ok(()),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Err(format!(
+                "its container '{}' does not exist on this host",
+                member.container_name
+            )),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
     pub async fn stop_service(
         &self,
         service_id: i32,
     ) -> Result<ExternalServiceInfo, ExternalServiceError> {
         let service = self.get_service(service_id).await?;
         self.ensure_unambiguous_service_name(&service).await?;
+        // A cluster has no container under the service's own name: its
+        // monitor and data nodes are separate, suffixed members.
+        if service.topology == "cluster" {
+            self.run_cluster_lifecycle(service_id, ClusterLifecycleAction::Stop)
+                .await?;
+            return self.get_service_info(service_id).await;
+        }
         let service_type_enum = ServiceType::from_str(&service.service_type).map_err(|_| {
             ExternalServiceError::InvalidServiceType {
                 id: service_id,
@@ -18035,6 +18746,414 @@ mod tests {
         ));
     }
 
+    fn cluster_member(ordinal: i32, role: &str, status: &str) -> service_members::Model {
+        let container_name = if role == "monitor" {
+            "postgres-ha-monitor".to_string()
+        } else {
+            format!("postgres-ha-{ordinal}")
+        };
+        service_members::Model {
+            id: 100 + ordinal,
+            service_id: 7,
+            node_id: None,
+            role: role.to_string(),
+            container_id: None,
+            container_name,
+            hostname: None,
+            port: None,
+            compute_ip: None,
+            status: status.to_string(),
+            ordinal,
+            config: None,
+            provisioning_step: None,
+            provisioning_error: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn lifecycle_names(members: Vec<&service_members::Model>) -> Vec<&str> {
+        members
+            .into_iter()
+            .map(|member| member.container_name.as_str())
+            .collect()
+    }
+
+    /// Regression for #1353: with the live primary known, a cluster is
+    /// stopped standbys first, primary next and monitor last (so no standby
+    /// is left for the monitor to promote); it is started monitor first.
+    #[test]
+    fn cluster_lifecycle_order_stops_standbys_first_and_starts_the_monitor_first() {
+        let members = vec![
+            cluster_member(0, "monitor", "running"),
+            cluster_member(1, "primary", "running"),
+            cluster_member(2, "replica", "running"),
+            cluster_member(3, "replica", "failed"),
+        ];
+        assert_eq!(
+            lifecycle_names(cluster_lifecycle_order(
+                &members,
+                Some("postgres-ha-1"),
+                ClusterLifecycleAction::Stop
+            )),
+            [
+                "postgres-ha-2",
+                "postgres-ha-3",
+                "postgres-ha-1",
+                "postgres-ha-monitor"
+            ]
+        );
+        // A failed member may still run a container, so it is stopped, but
+        // it is never started.
+        assert_eq!(
+            lifecycle_names(cluster_lifecycle_order(
+                &members,
+                None,
+                ClusterLifecycleAction::Start
+            )),
+            ["postgres-ha-monitor", "postgres-ha-1", "postgres-ha-2"]
+        );
+        // After a failover the monitor's live primary wins over the stored
+        // role, so the old primary (now a standby) is stopped first.
+        assert_eq!(
+            lifecycle_names(cluster_lifecycle_order(
+                &members,
+                Some("postgres-ha-2"),
+                ClusterLifecycleAction::Stop
+            )),
+            [
+                "postgres-ha-1",
+                "postgres-ha-3",
+                "postgres-ha-2",
+                "postgres-ha-monitor"
+            ]
+        );
+    }
+
+    /// Greptile on #1366: when the monitor cannot name the live primary,
+    /// stored roles cannot stand in for it (data members are all stored as
+    /// `replica`), so Stop takes the monitor down first: without it no
+    /// standby can be promoted, whatever order the data members follow.
+    #[test]
+    fn cluster_stop_without_a_known_primary_stops_the_monitor_first() {
+        let members = vec![
+            cluster_member(1, "replica", "running"),
+            cluster_member(0, "monitor", "running"),
+            cluster_member(2, "replica", "running"),
+            cluster_member(3, "primary", "running"),
+        ];
+        assert_eq!(
+            lifecycle_names(cluster_lifecycle_order(
+                &members,
+                None,
+                ClusterLifecycleAction::Stop
+            )),
+            [
+                "postgres-ha-monitor",
+                "postgres-ha-1",
+                "postgres-ha-2",
+                "postgres-ha-3"
+            ]
+        );
+    }
+
+    /// Run a cluster Stop or Start against a mock database holding a
+    /// cluster with `parent_status`, last changed `age` ago. With `members`
+    /// the claim is expected to succeed and the members to be refused;
+    /// without, the claim itself must be refused. Returns the error and the
+    /// statements issued.
+    async fn refused_cluster_lifecycle(
+        action: &str,
+        parent_status: &str,
+        age: chrono::Duration,
+        members: Option<Vec<service_members::Model>>,
+    ) -> (ExternalServiceError, Vec<sea_orm::Statement>) {
+        let mut cluster = encrypted_service_model(7, serde_json::json!({}));
+        cluster.topology = "cluster".to_string();
+        cluster.status = parent_status.to_string();
+        cluster.updated_at = Utc::now() - age;
+        let mut db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres);
+        if action == "start" {
+            // `start_service` first checks for an active major upgrade.
+            db = db.append_query_results([
+                Vec::<temps_entities::postgres_major_upgrades::Model>::new(),
+            ]);
+        }
+        // `get_service`, the duplicate-name check (no other service has this
+        // name), then the claim's locked read.
+        db = db
+            .append_query_results([vec![cluster.clone()]])
+            .append_query_results([Vec::<external_services::Model>::new()])
+            .append_query_results([vec![cluster.clone()]]);
+        if let Some(members) = members {
+            let mut claimed = cluster.clone();
+            claimed.status = format!("{action}ping").replace("startping", "starting");
+            db = db
+                .append_query_results([vec![claimed]])
+                .append_query_results([members])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }]);
+        }
+        let db = Arc::new(db.into_connection());
+        let manager = mock_service_manager_with_db(db.clone());
+        let error = if action == "stop" {
+            manager.stop_service(7).await.unwrap_err()
+        } else {
+            manager.start_service(7).await.unwrap_err()
+        };
+        drop(manager);
+        let statements = Arc::try_unwrap(db)
+            .expect("the manager holds no other database handle")
+            .into_transaction_log()
+            .iter()
+            .flat_map(|transaction| transaction.statements().to_vec())
+            .collect();
+        (error, statements)
+    }
+
+    /// Regression for #1353: Stop/Start of a cluster never targets the
+    /// standalone container name, and refuses with a 409-class error while a
+    /// member is still being provisioned (`creating`, or `pending` before
+    /// its provisioning started) instead of a Docker 404. The members are
+    /// read only after the cluster is claimed, and the claim is released
+    /// back to the cluster's previous status.
+    #[tokio::test]
+    async fn cluster_stop_and_start_refuse_while_a_member_is_provisioning() {
+        for action in ["stop", "start"] {
+            for busy_status in ["creating", "pending"] {
+                let previous = if action == "stop" {
+                    "running"
+                } else {
+                    "stopped"
+                };
+                let (error, statements) = refused_cluster_lifecycle(
+                    action,
+                    previous,
+                    chrono::Duration::zero(),
+                    Some(vec![
+                        cluster_member(0, "monitor", "running"),
+                        cluster_member(1, "primary", "running"),
+                        cluster_member(2, "replica", busy_status),
+                    ]),
+                )
+                .await;
+                assert!(
+                    matches!(
+                        &error,
+                        ExternalServiceError::ClusterMemberProvisioning {
+                            service_id: 7,
+                            container_name,
+                            status,
+                            ..
+                        } if container_name == "postgres-ha-2" && status == busy_status
+                    ),
+                    "{action}/{busy_status}: {error:?}"
+                );
+                assert!(error.to_string().contains(action), "{error}");
+                assert!(!error.to_string().contains("No such container"));
+
+                let position = |needle: &str| {
+                    statements
+                        .iter()
+                        .position(|s| s.sql.contains(needle))
+                        .unwrap_or_else(|| panic!("{action}: no statement with {needle}"))
+                };
+                assert!(position("FOR UPDATE") < position("service_members"));
+                let release = statements.last().expect("the claim must be released");
+                assert!(release.sql.starts_with("UPDATE"), "{}", release.sql);
+                let values = format!("{:?}", release.values);
+                assert!(values.contains(&format!("\"{previous}\"")), "{values}");
+                let claim = if action == "stop" {
+                    "stopping"
+                } else {
+                    "starting"
+                };
+                assert!(values.contains(&format!("\"{claim}\"")), "{values}");
+            }
+        }
+    }
+
+    /// Greptile on #1366: a cluster still in its initial provisioning has
+    /// no member rows yet; Stop must not report success and mark it stopped
+    /// while the background job goes on to start it. A cluster whose
+    /// provisioning failed is not started either (Retry provisions it), and
+    /// one another Stop/Start holds is refused as busy. None of them is
+    /// claimed or read further.
+    #[tokio::test]
+    async fn cluster_lifecycle_refuses_a_cluster_it_cannot_claim() {
+        for (action, parent_status) in [
+            ("stop", "creating"),
+            ("start", "creating"),
+            ("start", "failed"),
+            ("stop", "starting"),
+            ("start", "stopping"),
+        ] {
+            let (error, statements) = refused_cluster_lifecycle(
+                action,
+                parent_status,
+                chrono::Duration::minutes(1),
+                None,
+            )
+            .await;
+            match parent_status {
+                "stopping" | "starting" => assert!(
+                    matches!(
+                        &error,
+                        ExternalServiceError::ClusterBusy { service_id: 7, .. }
+                    ),
+                    "{action}/{parent_status}: {error:?}"
+                ),
+                _ => assert!(
+                    matches!(
+                        &error,
+                        ExternalServiceError::ClusterNotSettled { service_id: 7, status, .. }
+                            if status == parent_status
+                    ),
+                    "{action}/{parent_status}: {error:?}"
+                ),
+            }
+            assert!(error.to_string().contains(action), "{error}");
+            assert!(statements.iter().any(|s| s.sql.contains("FOR UPDATE")));
+            assert!(statements
+                .iter()
+                .all(|s| !s.sql.contains("service_members")));
+            assert!(statements.iter().all(|s| !s.sql.starts_with("UPDATE")));
+        }
+    }
+
+    /// Greptile on #1366: a claim whose process died is taken over once it
+    /// has made no progress for `CLUSTER_CLAIM_STALE_AFTER`; a live one is
+    /// busy. Settled clusters can be claimed by either action.
+    #[test]
+    fn cluster_claims_expire_only_when_stale() {
+        let now = Utc::now();
+        let fresh = now - chrono::Duration::minutes(1);
+        let stale = now - CLUSTER_CLAIM_STALE_AFTER - chrono::Duration::seconds(1);
+        let stop = ClusterLifecycleAction::Stop;
+        let start = ClusterLifecycleAction::Start;
+        assert!(matches!(
+            cluster_claim_decision(7, "stopping", fresh, now, start),
+            Err(ExternalServiceError::ClusterBusy { .. })
+        ));
+        assert!(cluster_claim_decision(7, "stopping", stale, now, start).is_ok());
+        assert!(cluster_claim_decision(7, "starting", stale, now, stop).is_ok());
+        for status in ["running", "stopped"] {
+            assert!(cluster_claim_decision(7, status, fresh, now, stop).is_ok());
+            assert!(cluster_claim_decision(7, status, fresh, now, start).is_ok());
+        }
+        assert!(cluster_claim_decision(7, "failed", fresh, now, stop).is_ok());
+
+        assert_eq!(cluster_status_before_claim("stopped"), "stopped");
+        assert_eq!(cluster_status_before_claim("failed"), "failed");
+        assert_eq!(cluster_status_before_claim("stopping"), "running");
+    }
+
+    /// A cluster whose provisioning failed can still be stopped: members it
+    /// left `pending`/`creating` are failed, not being provisioned, and keep
+    /// that status.
+    #[test]
+    fn members_of_a_failed_cluster_are_settled_as_failed() {
+        let mut members = vec![
+            cluster_member(0, "monitor", "running"),
+            cluster_member(1, "primary", "pending"),
+            cluster_member(2, "replica", "creating"),
+            cluster_member(3, "replica", "stopped"),
+        ];
+        let abandoned = settle_members_of_failed_cluster(&mut members);
+        assert_eq!(abandoned, [members[1].id, members[2].id]);
+        let statuses: Vec<&str> = members.iter().map(|m| m.status.as_str()).collect();
+        assert_eq!(statuses, ["running", "failed", "failed", "stopped"]);
+        assert!(members.iter().all(|m| cluster_member_is_settled(&m.status)));
+        assert_eq!(
+            recorded_member_status(&members[1], ClusterLifecycleAction::Stop),
+            None
+        );
+    }
+
+    /// Greptile on #1366: stopping a member whose provisioning failed keeps
+    /// it `failed`, so the next Start still skips it.
+    #[test]
+    fn a_failed_member_stays_failed_after_a_lifecycle_action() {
+        for action in [ClusterLifecycleAction::Stop, ClusterLifecycleAction::Start] {
+            assert_eq!(
+                recorded_member_status(&cluster_member(3, "replica", "failed"), action),
+                None
+            );
+        }
+        assert_eq!(
+            recorded_member_status(
+                &cluster_member(1, "primary", "running"),
+                ClusterLifecycleAction::Stop
+            ),
+            Some("stopped")
+        );
+        assert_eq!(
+            recorded_member_status(
+                &cluster_member(1, "primary", "stopped"),
+                ClusterLifecycleAction::Start
+            ),
+            Some("running")
+        );
+        let stopped_failed = cluster_member(3, "replica", "failed");
+        assert!(cluster_lifecycle_order(
+            std::slice::from_ref(&stopped_failed),
+            None,
+            ClusterLifecycleAction::Start
+        )
+        .is_empty());
+    }
+
+    /// Greptile on #1366: a retried Stop/Start passes remote members an
+    /// earlier attempt already handled, judged by the container's state
+    /// because agents report "already stopped/started" as errors.
+    #[test]
+    fn remote_member_outcome_is_judged_by_container_state() {
+        use crate::remote_service_client::RemoteServiceStatus;
+        let observed = |exists: bool, running: bool| RemoteServiceStatus {
+            container_name: "postgres-ha-2".to_string(),
+            container_id: exists.then(|| "abc123".to_string()),
+            running,
+            health: None,
+        };
+        let healthy = cluster_member(2, "replica", "running");
+        let failed = cluster_member(2, "replica", "failed");
+        let stop = ClusterLifecycleAction::Stop;
+        let start = ClusterLifecycleAction::Start;
+
+        // Already in the wanted state: nothing to do.
+        assert_eq!(
+            remote_member_outcome(&healthy, stop, &observed(true, false)),
+            Some(Ok(()))
+        );
+        assert_eq!(
+            remote_member_outcome(&healthy, start, &observed(true, true)),
+            Some(Ok(()))
+        );
+        // The agent must act.
+        assert_eq!(
+            remote_member_outcome(&healthy, stop, &observed(true, true)),
+            None
+        );
+        assert_eq!(
+            remote_member_outcome(&healthy, start, &observed(true, false)),
+            None
+        );
+        // A missing container: fine to "stop" for a failed member only.
+        assert_eq!(
+            remote_member_outcome(&failed, stop, &observed(false, false)),
+            Some(Ok(()))
+        );
+        for (member, action) in [(&healthy, stop), (&healthy, start), (&failed, start)] {
+            let outcome = remote_member_outcome(member, action, &observed(false, false));
+            assert!(
+                matches!(&outcome, Some(Err(reason)) if reason.contains("does not exist")),
+                "{action:?}: {outcome:?}"
+            );
+        }
+    }
+
     fn encrypted_service_model(id: i32, parameters: serde_json::Value) -> external_services::Model {
         let encryption_service =
             EncryptionService::new_from_password("service-parameter-reveal-test");
@@ -19620,6 +20739,128 @@ mod tests {
         );
         // Converged clusters return without reading members again.
         manager.upgrade_cluster_auth(service_id).await.unwrap();
+    }
+
+    /// Greptile on #1366: a Stop/Start claims the cluster in a short
+    /// committed write, so no connection is held while containers change; a
+    /// second action is refused as busy, Add Replica's locked status check
+    /// refuses a claimed cluster, and releasing the claim records the
+    /// result only while this action still holds it.
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn cluster_claim_excludes_other_actions_until_released() {
+        let (manager, _test_db) = setup_test_manager_or_skip!();
+        let service_id =
+            insert_cluster_at_auth_version(&manager, "claim-test", None, &[("monitor", "running")])
+                .await;
+
+        let before = manager
+            .claim_cluster(service_id, ClusterLifecycleAction::Stop)
+            .await
+            .unwrap();
+        assert_eq!(before.status, "running");
+        assert_eq!(
+            manager.get_service(service_id).await.unwrap().status,
+            "stopping"
+        );
+
+        let busy = manager
+            .claim_cluster(service_id, ClusterLifecycleAction::Start)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(busy, ExternalServiceError::ClusterBusy { .. }),
+            "{busy:?}"
+        );
+
+        // A release by an action that no longer holds the claim changes nothing.
+        manager
+            .release_cluster_claim(service_id, ClusterLifecycleAction::Start, "running", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.get_service(service_id).await.unwrap().status,
+            "stopping"
+        );
+
+        manager
+            .release_cluster_claim(service_id, ClusterLifecycleAction::Stop, "stopped", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.get_service(service_id).await.unwrap().status,
+            "stopped"
+        );
+
+        // A claim whose process died is taken over once stale.
+        manager
+            .claim_cluster(service_id, ClusterLifecycleAction::Start)
+            .await
+            .unwrap();
+        external_services::Entity::update_many()
+            .col_expr(
+                external_services::Column::UpdatedAt,
+                sea_orm::sea_query::Expr::value(
+                    Utc::now() - CLUSTER_CLAIM_STALE_AFTER - chrono::Duration::minutes(1),
+                ),
+            )
+            .filter(external_services::Column::Id.eq(service_id))
+            .exec(manager.db.as_ref())
+            .await
+            .unwrap();
+        let taken_over = manager
+            .claim_cluster(service_id, ClusterLifecycleAction::Stop)
+            .await
+            .unwrap();
+        assert_eq!(taken_over.status, "starting");
+    }
+
+    /// Regression for #1352: a cluster built by `initialize_cluster` records
+    /// that its infrastructure roles are SCRAM-native, so adding a member
+    /// does not re-run the legacy NodePrepare step against existing members.
+    /// Recording that never lowers a version a later upgrade reached.
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn natively_created_cluster_records_infrastructure_auth_without_lowering() {
+        let (manager, _test_db) = setup_test_manager_or_skip!();
+        let service_id = insert_cluster_at_auth_version(
+            &manager,
+            "auth-native-new",
+            None,
+            &[("monitor", "running"), ("primary", "running")],
+        )
+        .await;
+        assert_eq!(
+            cluster_auth_upgrade_steps(stored_auth_version(&manager, service_id).await),
+            &crate::externalsvc::postgres_cluster::AuthUpgradeStep::ORDER
+        );
+
+        manager
+            .record_cluster_auth_version(service_id, CLUSTER_INFRA_AUTH_VERSION)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_auth_version(&manager, service_id).await,
+            CLUSTER_INFRA_AUTH_VERSION
+        );
+        assert_eq!(
+            cluster_auth_upgrade_steps(CLUSTER_INFRA_AUTH_VERSION),
+            &[crate::externalsvc::postgres_cluster::AuthUpgradeStep::NodeEnforce],
+            "a native cluster must not re-run NodePrepare when a member is added"
+        );
+
+        manager
+            .mark_cluster_auth_completed(service_id)
+            .await
+            .unwrap();
+        manager
+            .record_cluster_auth_version(service_id, CLUSTER_INFRA_AUTH_VERSION)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_auth_version(&manager, service_id).await,
+            CLUSTER_AUTH_VERSION
+        );
     }
 
     #[cfg(feature = "docker-tests")]

@@ -165,7 +165,7 @@ pub enum PostgresUpgradeError {
     #[error("No default S3 source configured for service {service_id} — required for pre-upgrade backup")]
     NoDefaultS3Source { service_id: i32 },
 
-    #[error("Pre-upgrade backup failed for service {service_id}: {reason}")]
+    #[error("Pre-upgrade backup failed for service {service_id}: {reason}. Nothing was migrated and the database is unchanged; fix the cause and retry the upgrade")]
     PreBackupFailed { service_id: i32, reason: String },
 
     #[error("Another upgrade is already active for service {service_id} (upgrade {existing_upgrade_id}, status {status})")]

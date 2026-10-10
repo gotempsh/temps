@@ -82474,7 +82474,7 @@
             "description": "Service not found"
           },
           "409": {
-            "description": "A Postgres major upgrade is in progress, or duplicate service names prevent safe resource control"
+            "description": "A Postgres major upgrade is in progress, duplicate service names prevent safe resource control, another cluster action is in progress, the cluster or one of its members is still being provisioned, or the cluster's provisioning failed"
           },
           "500": {
             "description": "Internal server error"
@@ -82555,7 +82555,7 @@
             "description": "Service not found"
           },
           "409": {
-            "description": "Duplicate service names prevent safe resource control"
+            "description": "Duplicate service names prevent safe resource control, another cluster action is in progress, or the cluster or one of its members is still being provisioned"
           },
           "500": {
             "description": "Internal server error"

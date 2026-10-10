@@ -113,7 +113,10 @@ pub(crate) fn worker_node_required(
         | E::ControlPlaneAddressRequired { .. }
         | E::ControlPlaneMemberUnreachable { .. }
         | E::ClusterPortsUnavailable { .. }
-        | E::ClusterMemberLimitExceeded { .. } => None,
+        | E::ClusterMemberLimitExceeded { .. }
+        | E::ClusterMemberProvisioning { .. }
+        | E::ClusterNotSettled { .. }
+        | E::ClusterBusy { .. } => None,
     }
 }
 
@@ -185,7 +188,10 @@ fn service_name_problem(error: &crate::services::ExternalServiceError) -> Option
         | E::ControlPlaneAddressRequired { .. }
         | E::ControlPlaneMemberUnreachable { .. }
         | E::ClusterPortsUnavailable { .. }
-        | E::ClusterMemberLimitExceeded { .. } => None,
+        | E::ClusterMemberLimitExceeded { .. }
+        | E::ClusterMemberProvisioning { .. }
+        | E::ClusterNotSettled { .. }
+        | E::ClusterBusy { .. } => None,
     }
 }
 
@@ -204,6 +210,9 @@ fn cluster_placement_problem(error: &crate::services::ExternalServiceError) -> O
             "Cluster Placement Not Reachable"
         }
         E::ClusterPortsUnavailable { .. } => "Cluster Ports Unavailable",
+        E::ClusterMemberProvisioning { .. } => "Cluster Member Still Provisioning",
+        E::ClusterNotSettled { .. } => "Cluster Not Ready",
+        E::ClusterBusy { .. } => "Cluster Busy",
         // The request itself is invalid, not in conflict with any state.
         E::ClusterMemberLimitExceeded { .. } => {
             return Some(
@@ -2041,7 +2050,7 @@ async fn list_service_health_statuses(
     responses(
         (status = 200, description = "Service started successfully", body = ExternalServiceInfo),
         (status = 404, description = "Service not found"),
-        (status = 409, description = "A Postgres major upgrade is in progress, or duplicate service names prevent safe resource control"),
+        (status = 409, description = "A Postgres major upgrade is in progress, duplicate service names prevent safe resource control, another cluster action is in progress, the cluster or one of its members is still being provisioned, or the cluster's provisioning failed"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -2510,7 +2519,7 @@ async fn promote_cluster_member(
     responses(
         (status = 200, description = "Service stopped successfully", body = ExternalServiceInfo),
         (status = 404, description = "Service not found"),
-        (status = 409, description = "Duplicate service names prevent safe resource control"),
+        (status = 409, description = "Duplicate service names prevent safe resource control, another cluster action is in progress, or the cluster or one of its members is still being provisioned"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -4361,6 +4370,40 @@ mod tests {
         assert_eq!(
             service_create_failure_code(&error),
             OperationFailureCode::InvalidConfiguration
+        );
+    }
+
+    /// #1353: stopping a cluster while a member is provisioning is a 409
+    /// naming the member, not a Docker 404 surfaced as a 500.
+    #[test]
+    fn cluster_member_provisioning_is_a_conflict() {
+        let error = crate::services::ExternalServiceError::ClusterMemberProvisioning {
+            service_id: 7,
+            action: "stop",
+            container_name: "postgres-ha-3".to_string(),
+            status: "creating".to_string(),
+        };
+        let problem = external_service_problem(&error, "Failed to stop service".to_string());
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        let detail = problem.body.get("detail").and_then(|v| v.as_str()).unwrap();
+        assert!(detail.contains("postgres-ha-3"), "{detail}");
+    }
+
+    /// Greptile on #1366: a lifecycle action on a cluster another one is
+    /// changing is refused at once with a 409, never queued on a database
+    /// connection.
+    #[test]
+    fn cluster_busy_is_a_conflict() {
+        let error = crate::services::ExternalServiceError::ClusterBusy {
+            service_id: 7,
+            action: "stop",
+        };
+        let problem = external_service_problem(&error, "Failed to stop service".to_string());
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        let detail = problem.body.get("detail").and_then(|v| v.as_str()).unwrap();
+        assert!(
+            detail.contains("service 7") && detail.contains("in progress"),
+            "{detail}"
         );
     }
 
