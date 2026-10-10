@@ -216,8 +216,9 @@ pub(crate) fn render(
     }
     let mut analysis = analyze(&app, &env, &registry).map_err(|e| e.to_string())?;
     // A nested application whose build needs the repository root as context
-    // (#1342: Python with a root requirements file; Go modules and Cargo
-    // crates with sibling dependencies, see `compiled_workspace_app`).
+    // (#1342: Python with a root requirements file; Go modules, Cargo
+    // crates and Elixir umbrella apps with sibling dependencies, see
+    // `compiled_workspace_app`).
     // Analysis stays on the selected application; install and build copy the
     // repository and run in the application's directory, so relative pip,
     // `replace` and `path` dependencies resolve.
@@ -237,6 +238,9 @@ pub(crate) fn render(
                         prefix.push_str("export GOWORK=off && ");
                     }
                     crate::CompiledLanguage::Go => {}
+                    // Mix reads the umbrella's lockfile, configuration and
+                    // sibling apps through the child's own relative paths.
+                    crate::CompiledLanguage::Elixir => {}
                     // A workspace member's output lands in the workspace's
                     // target directory. Use the cached /app/target either
                     // way, and keep the crate-relative `target/` path the
@@ -266,8 +270,8 @@ pub(crate) fn render(
                 }
             }
         }
-        // A Go or Cargo build's absolute start command is the built binary
-        // and runs as planned. Anything else, including an absolute Python
+        // A Go, Cargo or Elixir release build's absolute start command is
+        // the built binary and runs as planned. Anything else, including an absolute Python
         // launcher such as `/usr/bin/env gunicorn app:app`, names modules and
         // files relative to the application, so it starts in that directory.
         if let Some(start) = &mut analysis.plan.deploy.start_command {
@@ -981,6 +985,96 @@ mod tests {
         let nested = render(&config, Some("rust")).unwrap().content;
         assert!(nested.contains("cd /app/apps/api && "), "{nested}");
         assert!(nested.contains("CARGO_TARGET_DIR=/app/target"), "{nested}");
+    }
+
+    /// A minimal Elixir umbrella: the root `mix.exs`, an `apps/api` child
+    /// depending on its sibling with `{:shared, in_umbrella: true}`, and
+    /// `apps/shared`.
+    const ELIXIR_UMBRELLA: &[(&str, &str)] = &[
+        (
+            "mix.exs",
+            "defmodule Umbrella.MixProject do\n  use Mix.Project\n\n  def project do\n    [apps_path: \"apps\", version: \"0.1.0\", start_permanent: Mix.env() == :prod, deps: []]\n  end\nend\n",
+        ),
+        (
+            "apps/api/mix.exs",
+            "defmodule Api.MixProject do\n  use Mix.Project\n\n  def project do\n    [\n      app: :api,\n      version: \"0.1.0\",\n      build_path: \"../../_build\",\n      config_path: \"../../config/config.exs\",\n      deps_path: \"../../deps\",\n      lockfile: \"../../mix.lock\",\n      elixir: \"~> 1.17\",\n      deps: deps()\n    ]\n  end\n\n  def application do\n    [extra_applications: [:logger], mod: {Api.Application, []}]\n  end\n\n  defp deps do\n    [{:shared, in_umbrella: true}]\n  end\nend\n",
+        ),
+        (
+            "apps/api/lib/api/application.ex",
+            "defmodule Api.Application do\n  use Application\n\n  def start(_type, _args) do\n    Supervisor.start_link([], strategy: :one_for_one, name: Api.Supervisor)\n  end\nend\n",
+        ),
+        (
+            "apps/shared/mix.exs",
+            "defmodule Shared.MixProject do\n  use Mix.Project\n\n  def project do\n    [\n      app: :shared,\n      version: \"0.1.0\",\n      build_path: \"../../_build\",\n      config_path: \"../../config/config.exs\",\n      deps_path: \"../../deps\",\n      lockfile: \"../../mix.lock\",\n      elixir: \"~> 1.17\",\n      deps: []\n    ]\n  end\nend\n",
+        ),
+        (
+            "apps/shared/lib/shared.ex",
+            "defmodule Shared do\n  def hello, do: :world\nend\n",
+        ),
+    ];
+
+    /// #1386: an umbrella child keeps the umbrella in its build, so the
+    /// `in_umbrella` sibling and the root `mix.lock`/`config` resolve. Mix
+    /// runs in the child's directory; the release path stays absolute.
+    #[test]
+    fn nested_elixir_umbrella_app_builds_in_its_directory_with_its_siblings() {
+        let repo = fixture(ELIXIR_UMBRELLA);
+        let app = repo.path().join("apps/api");
+        let mut config = DockerfileConfig::new(repo.path(), &app, "fixture");
+        config.use_buildkit = true;
+        for provider in [Some("elixir"), None] {
+            let nested = render(&config, provider).unwrap().content;
+            assert!(
+                nested.contains("cd /app/apps/api && sh -c 'mix deps.get --only prod'"),
+                "{nested}"
+            );
+            assert!(
+                nested.contains("cd /app/apps/api && sh -c 'mix deps.compile'"),
+                "{nested}"
+            );
+            assert!(
+                nested.contains("cd /app/apps/api && sh -c 'mix release --overwrite --path /app/release'"),
+                "{nested}"
+            );
+            // The install step no longer copies the child's manifest alone.
+            assert!(!nested.contains("COPY mix.exs /app/mix.exs"), "{nested}");
+            assert!(nested.contains("/app/release/bin/api start"), "{nested}");
+            assert!(!nested.contains("cd /app/apps/api && /app/release"), "{nested}");
+        }
+
+        // The umbrella root itself, and the child built as its own
+        // repository, plan exactly as before. (Autopack's Elixir provider
+        // needs an `app:` name, which an umbrella root does not have; that
+        // refusal is unchanged.)
+        match render(&buildkit_config(repo.path()), Some("elixir")) {
+            Ok(root) => assert!(!root.content.contains("cd /app/apps"), "{}", root.content),
+            Err(error) => assert!(error.contains("app: :name"), "{error}"),
+        }
+        let alone = render(&buildkit_config(&app), Some("elixir"))
+            .unwrap()
+            .content;
+        assert!(!alone.contains("cd /app/apps/api"), "{alone}");
+    }
+
+    /// A standalone Phoenix application inside a larger repository has
+    /// nothing outside its directory to resolve, so it still builds alone.
+    #[test]
+    fn nested_standalone_phoenix_app_still_builds_alone() {
+        let repo = fixture(&[
+            ("README.md", "# docs"),
+            (
+                "services/web/mix.exs",
+                "defmodule Web.MixProject do\n  use Mix.Project\n\n  def project do\n    [app: :web, version: \"0.1.0\", elixir: \"~> 1.17\", deps: [{:phoenix, \"~> 1.7\"}, {:jason, \"~> 1.4\", only: [:prod]}]]\n  end\nend\n",
+            ),
+            ("services/web/mix.lock", "%{}"),
+            ("services/web/config/config.exs", "import Config\n"),
+        ]);
+        let app = repo.path().join("services/web");
+        let mut config = DockerfileConfig::new(repo.path(), &app, "fixture");
+        config.use_buildkit = true;
+        let content = render(&config, Some("elixir")).unwrap().content;
+        assert!(!content.contains("cd /app/services/web"), "{content}");
+        assert!(content.contains("/app/release/bin/web start"), "{content}");
     }
 
     #[test]
