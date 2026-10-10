@@ -562,16 +562,7 @@ fn collect_redactable_values(request: &ComposeDeployRequest) -> Vec<String> {
 const MIN_REDACTED_LINE_BYTES: usize = 8;
 
 fn sanitize_compose_diagnostic(diagnostic: &str, redact_values: &[String]) -> String {
-    let mut sanitized = diagnostic.to_string();
-    for value in redact_values {
-        if !value.is_empty() {
-            sanitized = sanitized.replace(value, "<redacted>");
-        }
-    }
-
-    for regex in CREDENTIAL_PATTERNS.iter() {
-        sanitized = regex.replace_all(&sanitized, "${1}<redacted>").into_owned();
-    }
+    let mut sanitized = redact_compose_text(diagnostic, redact_values);
 
     // Keep the tail: Compose and BuildKit print the failing step and its
     // error last, after everything that succeeded.
@@ -586,6 +577,54 @@ fn sanitize_compose_diagnostic(diagnostic: &str, redact_values: &[String]) -> St
         );
     }
     sanitized
+}
+
+/// Remove the start of a stderr capture whose front was trimmed away.
+///
+/// The trim can cut through a sensitive value, leaving its suffix at the very
+/// start, where no redaction rule recognises it. If a whole line follows, the
+/// capture starts there. Otherwise the capture is one line longer than the
+/// limit, whose ending is the error and must survive: redact it first, so
+/// every complete value is masked and the only unmasked fragment is that
+/// leading suffix, shorter than the longest sensitive value. Then drop that
+/// many bytes, plus the rest of the token they end in, which also removes a
+/// split credential-shaped token. A line with no whitespace keeps everything
+/// after the dropped bytes rather than losing its ending.
+fn drop_leading_fragment(captured: &mut Vec<u8>, redact_values: &[String]) {
+    if let Some(newline) = captured.iter().position(|byte| *byte == b'\n') {
+        if captured[newline + 1..]
+            .iter()
+            .any(|byte| !byte.is_ascii_whitespace())
+        {
+            captured.drain(..=newline);
+            return;
+        }
+    }
+    let redacted = redact_compose_text(&String::from_utf8_lossy(captured), redact_values);
+    let longest_value = redact_values.iter().map(String::len).max().unwrap_or(0);
+    let mut start = longest_value.min(redacted.len());
+    while !redacted.is_char_boundary(start) {
+        start += 1;
+    }
+    let start = redacted[start..]
+        .find(char::is_whitespace)
+        .map_or(start, |offset| start + offset);
+    *captured = format!("… {}", redacted[start..].trim_start()).into_bytes();
+}
+
+/// Mask every known sensitive value and credential-shaped token in `text`,
+/// without bounding its length.
+fn redact_compose_text(text: &str, redact_values: &[String]) -> String {
+    let mut redacted = text.to_string();
+    for value in redact_values {
+        if !value.is_empty() {
+            redacted = redacted.replace(value, "<redacted>");
+        }
+    }
+    for regex in CREDENTIAL_PATTERNS.iter() {
+        redacted = regex.replace_all(&redacted, "${1}<redacted>").into_owned();
+    }
+    redacted
 }
 
 /// Redacted head of an output line cut at [`MAX_STREAMED_LINE_BYTES`].
@@ -771,17 +810,11 @@ impl std::fmt::Debug for ComposeOutputSink {
     }
 }
 
-/// Where a streamed command's lines go, and the values they must not reveal.
+/// Where a command's output lines go, if anywhere, and the values neither the
+/// streamed lines nor the captured diagnostic may reveal.
 #[derive(Clone, Copy)]
 struct OutputStream<'a> {
-    sink: &'a ComposeOutputSink,
-    redact_values: &'a [String],
-}
-
-/// One reader's handle for sending redacted lines to the shared forwarder.
-#[derive(Clone)]
-struct LineSender<'a> {
-    tx: tokio::sync::mpsc::Sender<String>,
+    sink: Option<&'a ComposeOutputSink>,
     redact_values: &'a [String],
 }
 
@@ -991,8 +1024,8 @@ impl ComposeExecutor {
             })?;
         let run = async {
             let (stdout, stderr, status) = tokio::try_join!(
-                Self::read_bounded_stream(stdout, CapturedEnd::Head, None),
-                Self::read_bounded_stream(stderr, CapturedEnd::Tail, None),
+                Self::read_bounded_stream(stdout, CapturedEnd::Head, &[], None),
+                Self::read_bounded_stream(stderr, CapturedEnd::Tail, &[], None),
                 child.wait()
             )?;
             Ok::<_, std::io::Error>(std::process::Output {
@@ -6021,10 +6054,10 @@ impl ComposeExecutor {
             COMPOSE_BUILD_TIMEOUT,
             project_name,
             "docker compose build",
-            output_sink.map(|sink| OutputStream {
-                sink,
+            OutputStream {
+                sink: output_sink,
                 redact_values,
-            }),
+            },
         )
         .await?;
 
@@ -6073,7 +6106,17 @@ impl ComposeExecutor {
         project_name: &str,
         operation: &str,
     ) -> Result<std::process::Output, ComposeError> {
-        Self::bounded_command_output_streamed(command, timeout, project_name, operation, None).await
+        Self::bounded_command_output_streamed(
+            command,
+            timeout,
+            project_name,
+            operation,
+            OutputStream {
+                sink: None,
+                redact_values: &[],
+            },
+        )
+        .await
     }
 
     /// [`Self::bounded_command_output`], additionally forwarding every output
@@ -6083,7 +6126,7 @@ impl ComposeExecutor {
         timeout: std::time::Duration,
         project_name: &str,
         operation: &str,
-        stream: Option<OutputStream<'_>>,
+        stream: OutputStream<'_>,
     ) -> Result<std::process::Output, ComposeError> {
         command
             .kill_on_drop(true)
@@ -6106,21 +6149,13 @@ impl ComposeExecutor {
             })?;
         // Both readers feed one forwarder, so the sink sees a single ordered
         // writer instead of two concurrent ones.
-        let (stdout_lines, stderr_lines, forwarder) = match stream {
-            Some(stream) => {
+        let (stdout_lines, stderr_lines, forwarder) = match stream.sink {
+            Some(sink) => {
                 let (tx, rx) = tokio::sync::mpsc::channel(OUTPUT_CHANNEL_LINES);
-                let stdout_lines = LineSender {
-                    tx: tx.clone(),
-                    redact_values: stream.redact_values,
-                };
-                let stderr_lines = LineSender {
-                    tx,
-                    redact_values: stream.redact_values,
-                };
                 (
-                    Some(stdout_lines),
-                    Some(stderr_lines),
-                    Some(Self::forward_output(rx, stream.sink)),
+                    Some(tx.clone()),
+                    Some(tx),
+                    Some(Self::forward_output(rx, sink)),
                 )
             }
             None => (None, None, None),
@@ -6136,8 +6171,18 @@ impl ComposeExecutor {
             // tail could parse as a different document; stderr is only ever
             // a diagnostic, whose error is at the end.
             let (stdout, stderr, status, ()) = tokio::try_join!(
-                Self::read_bounded_stream(stdout, CapturedEnd::Head, stdout_lines),
-                Self::read_bounded_stream(stderr, CapturedEnd::Tail, stderr_lines),
+                Self::read_bounded_stream(
+                    stdout,
+                    CapturedEnd::Head,
+                    stream.redact_values,
+                    stdout_lines
+                ),
+                Self::read_bounded_stream(
+                    stderr,
+                    CapturedEnd::Tail,
+                    stream.redact_values,
+                    stderr_lines
+                ),
                 child.wait(),
                 forward
             )?;
@@ -6157,11 +6202,12 @@ impl ComposeExecutor {
     }
 
     /// Read `reader` to EOF, keeping at most [`MAX_COMPOSE_COMMAND_OUTPUT_BYTES`]
-    /// from the `keep` end and forwarding each line to `stream`.
+    /// from the `keep` end and sending each redacted line to `lines`.
     async fn read_bounded_stream<R>(
         mut reader: R,
         keep: CapturedEnd,
-        lines: Option<LineSender<'_>>,
+        redact_values: &[String],
+        lines: Option<tokio::sync::mpsc::Sender<String>>,
     ) -> Result<Vec<u8>, std::io::Error>
     where
         R: tokio::io::AsyncRead + Unpin,
@@ -6198,14 +6244,14 @@ impl ComposeExecutor {
                 for &byte in chunk {
                     if byte == b'\n' || byte == b'\r' {
                         if !skipping {
-                            Self::send_line(lines, &line).await;
+                            Self::send_line(lines, redact_values, &line).await;
                         }
                         line.clear();
                         skipping = false;
                     } else if !skipping {
                         line.push(byte);
                         if line.len() >= MAX_STREAMED_LINE_BYTES {
-                            Self::send_truncated_line(lines, &line).await;
+                            let _ = lines.send(truncated_line_head(&line, redact_values)).await;
                             line.clear();
                             skipping = true;
                         }
@@ -6215,7 +6261,7 @@ impl ComposeExecutor {
         }
         if let Some(lines) = lines.as_ref() {
             if !skipping {
-                Self::send_line(lines, &line).await;
+                Self::send_line(lines, redact_values, &line).await;
             }
         }
         if captured.len() > MAX_COMPOSE_COMMAND_OUTPUT_BYTES {
@@ -6223,50 +6269,28 @@ impl ComposeExecutor {
             trimmed = true;
         }
         if trimmed {
-            // The cut can land inside a sensitive value, leaving a fragment no
-            // redaction rule recognises. Start at the next whole line instead.
-            // When no complete line follows the cut (one line longer than the
-            // capture), it is kept as is: the diagnostic built from it keeps
-            // only its last MAX_COMPOSE_DIAGNOSTIC_BYTES, far from this cut,
-            // and dropping it would leave the error with no detail at all.
-            if let Some(newline) = captured.iter().position(|byte| *byte == b'\n') {
-                let rest_has_content = captured[newline + 1..]
-                    .iter()
-                    .any(|byte| !byte.is_ascii_whitespace());
-                if rest_has_content {
-                    captured.drain(..=newline);
-                }
-            }
+            drop_leading_fragment(&mut captured, redact_values);
         }
         Ok(captured)
     }
 
     /// Redact one complete line and hand it to the forwarder. Blank lines
-    /// (including the empty half of a `\r\n`) are dropped.
-    async fn send_line(lines: &LineSender<'_>, line: &[u8]) {
+    /// (including the empty half of a `\r\n`) are dropped. A line that
+    /// exceeded [`MAX_STREAMED_LINE_BYTES`] goes through
+    /// [`truncated_line_head`] instead.
+    async fn send_line(
+        lines: &tokio::sync::mpsc::Sender<String>,
+        redact_values: &[String],
+        line: &[u8],
+    ) {
         if line.iter().all(u8::is_ascii_whitespace) {
             return;
         }
-        let text = sanitize_compose_diagnostic(
-            String::from_utf8_lossy(line).trim_end(),
-            lines.redact_values,
-        );
+        let text =
+            sanitize_compose_diagnostic(String::from_utf8_lossy(line).trim_end(), redact_values);
         // The forwarder outlives both readers; a closed channel only means
         // the command is being abandoned (timeout), so the line is moot.
-        let _ = lines.tx.send(text).await;
-    }
-
-    /// Forward the head of a line that exceeded [`MAX_STREAMED_LINE_BYTES`].
-    /// The cut may fall inside a sensitive value whose remainder never
-    /// arrives, so after redacting the head as a whole, drop as many trailing
-    /// bytes as the longest known sensitive value and then back to the
-    /// previous whitespace: no partial value, and no partial credential-shaped
-    /// token such as a URL with userinfo, survives the cut.
-    async fn send_truncated_line(lines: &LineSender<'_>, head: &[u8]) {
-        let _ = lines
-            .tx
-            .send(truncated_line_head(head, lines.redact_values))
-            .await;
+        let _ = lines.send(text).await;
     }
 
     /// Drain redacted lines into batches and deliver each batch to `sink`.
@@ -6602,10 +6626,10 @@ impl ComposeExecutor {
             COMPOSE_PULL_TIMEOUT,
             project_name,
             "docker compose pull",
-            output_sink.map(|sink| OutputStream {
-                sink,
+            OutputStream {
+                sink: output_sink,
                 redact_values,
-            }),
+            },
         )
         .await?;
 
@@ -6651,10 +6675,10 @@ impl ComposeExecutor {
             COMPOSE_UP_TIMEOUT,
             project_name,
             "docker compose up",
-            output_sink.map(|sink| OutputStream {
-                sink,
+            OutputStream {
+                sink: output_sink,
                 redact_values,
-            }),
+            },
         )
         .await?;
 
@@ -13621,16 +13645,13 @@ services:
     async fn streamed_lines_are_redacted_and_the_last_unterminated_line_is_sent() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         let redact = vec!["s3cr3t-value".to_string()];
-        let lines = LineSender {
-            tx,
-            redact_values: &redact,
-        };
         let output: &[u8] =
             b"#1 [internal] load build definition\r\n\n#2 ARG TOKEN=s3cr3t-value\n#3 ERROR: boom";
 
-        let captured = ComposeExecutor::read_bounded_stream(output, CapturedEnd::Tail, Some(lines))
-            .await
-            .unwrap();
+        let captured =
+            ComposeExecutor::read_bounded_stream(output, CapturedEnd::Tail, &redact, Some(tx))
+                .await
+                .unwrap();
 
         assert_eq!(captured, output);
         let mut received = Vec::new();
@@ -13658,14 +13679,15 @@ services:
         output.extend_from_slice(secret.as_bytes());
         output.extend_from_slice(b" trailing\n#9 next line\n");
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        let lines = LineSender {
-            tx,
-            redact_values: &redact,
-        };
 
-        ComposeExecutor::read_bounded_stream(output.as_slice(), CapturedEnd::Tail, Some(lines))
-            .await
-            .unwrap();
+        ComposeExecutor::read_bounded_stream(
+            output.as_slice(),
+            CapturedEnd::Tail,
+            &redact,
+            Some(tx),
+        )
+        .await
+        .unwrap();
 
         let mut received = Vec::new();
         while let Some(line) = rx.recv().await {
@@ -13707,10 +13729,10 @@ services:
             std::time::Duration::from_secs(30),
             "temps-stream-test",
             "stream test",
-            Some(OutputStream {
-                sink: &sink,
+            OutputStream {
+                sink: Some(&sink),
                 redact_values: &redact,
-            }),
+            },
         )
         .await
         .unwrap();
@@ -13750,16 +13772,20 @@ services:
         let mut output = vec![b'a'; MAX_COMPOSE_COMMAND_OUTPUT_BYTES * 3];
         output.extend_from_slice(b"the error");
 
-        let tail = ComposeExecutor::read_bounded_stream(output.as_slice(), CapturedEnd::Tail, None)
-            .await
-            .unwrap();
-        let head = ComposeExecutor::read_bounded_stream(output.as_slice(), CapturedEnd::Head, None)
-            .await
-            .unwrap();
+        let tail =
+            ComposeExecutor::read_bounded_stream(output.as_slice(), CapturedEnd::Tail, &[], None)
+                .await
+                .unwrap();
+        let head =
+            ComposeExecutor::read_bounded_stream(output.as_slice(), CapturedEnd::Head, &[], None)
+                .await
+                .unwrap();
 
-        // No newline anywhere: the single line is kept as captured.
-        assert_eq!(tail.len(), MAX_COMPOSE_COMMAND_OUTPUT_BYTES);
-        assert!(tail.ends_with(b"the error"));
+        // No whole line follows the cut, so the line's ending is kept and
+        // only its cut-through first token is dropped.
+        assert!(tail.len() <= MAX_COMPOSE_COMMAND_OUTPUT_BYTES);
+        assert!(tail.starts_with("… ".as_bytes()));
+        assert!(tail.ends_with(b"error"));
         assert_eq!(head.len(), MAX_COMPOSE_COMMAND_OUTPUT_BYTES);
         assert!(head.iter().all(|byte| *byte == b'a'));
     }
@@ -13771,14 +13797,57 @@ services:
         let mut output = vec![b'a'; MAX_COMPOSE_COMMAND_OUTPUT_BYTES * 2];
         output.extend_from_slice(b" the actual error\n");
 
-        let tail = ComposeExecutor::read_bounded_stream(output.as_slice(), CapturedEnd::Tail, None)
-            .await
-            .unwrap();
+        let tail =
+            ComposeExecutor::read_bounded_stream(output.as_slice(), CapturedEnd::Tail, &[], None)
+                .await
+                .unwrap();
 
-        assert_eq!(tail.len(), MAX_COMPOSE_COMMAND_OUTPUT_BYTES);
-        assert!(tail.ends_with(b" the actual error\n"));
+        assert!(tail.len() <= MAX_COMPOSE_COMMAND_OUTPUT_BYTES);
+        assert!(tail.ends_with(b"the actual error\n"));
         let diagnostic = sanitize_compose_diagnostic(&String::from_utf8_lossy(&tail), &[]);
         assert!(diagnostic.contains("the actual error"));
+    }
+
+    #[tokio::test]
+    async fn trimmed_overlong_line_never_starts_with_a_secret_fragment() {
+        // One line over the capture limit made of a 1 KiB sensitive value
+        // repeated, ending in the error. The trim lands inside one copy, so
+        // the capture would open with the rest of it; redacting the other
+        // copies then shrinks the text so far that no later length cut
+        // would remove that fragment.
+        let secret: String = (0..1024)
+            .map(|index| {
+                let alphabet = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+                alphabet[(index * 7 + index / 13) % alphabet.len()] as char
+            })
+            .collect();
+        let mut output = format!("{secret} ").repeat(1100).into_bytes();
+        output.extend_from_slice(b"final error\n");
+        let offset_in_copy = (output.len() - MAX_COMPOSE_COMMAND_OUTPUT_BYTES) % (secret.len() + 1);
+        assert!(
+            (1..secret.len()).contains(&offset_in_copy),
+            "the cut must land inside a copy of the secret, got offset {offset_in_copy}"
+        );
+        let redact = vec![secret.clone()];
+
+        let tail = ComposeExecutor::read_bounded_stream(
+            output.as_slice(),
+            CapturedEnd::Tail,
+            &redact,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let diagnostic = sanitize_compose_diagnostic(&String::from_utf8_lossy(&tail), &redact);
+        assert!(diagnostic.ends_with("final error\n"), "{diagnostic:.200}");
+        for window in secret.as_bytes().windows(8) {
+            let fragment = std::str::from_utf8(window).unwrap();
+            assert!(
+                !diagnostic.contains(fragment),
+                "diagnostic leaked secret fragment {fragment:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -13788,9 +13857,10 @@ services:
             b"prefix TOKEN-VALUE-SPLIT-HERE\n".repeat(MAX_COMPOSE_COMMAND_OUTPUT_BYTES / 10);
         output.extend_from_slice(b"final error\n");
 
-        let tail = ComposeExecutor::read_bounded_stream(output.as_slice(), CapturedEnd::Tail, None)
-            .await
-            .unwrap();
+        let tail =
+            ComposeExecutor::read_bounded_stream(output.as_slice(), CapturedEnd::Tail, &[], None)
+                .await
+                .unwrap();
 
         assert!(tail.len() <= MAX_COMPOSE_COMMAND_OUTPUT_BYTES);
         assert!(tail.starts_with(b"prefix TOKEN-VALUE-SPLIT-HERE\n"));
