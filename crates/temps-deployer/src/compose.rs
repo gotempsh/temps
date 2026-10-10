@@ -584,12 +584,14 @@ fn sanitize_compose_diagnostic(diagnostic: &str, redact_values: &[String]) -> St
 /// The trim can cut through a sensitive value, leaving its suffix at the very
 /// start, where no redaction rule recognises it. If a whole line follows, the
 /// capture starts there. Otherwise the capture is one line longer than the
-/// limit, whose ending is the error and must survive: redact it first, so
-/// every complete value is masked and the only unmasked fragment is that
-/// leading suffix, shorter than the longest sensitive value. Then drop that
-/// many bytes, plus the rest of the token they end in, which also removes a
-/// split credential-shaped token. A line with no whitespace keeps everything
-/// after the dropped bytes rather than losing its ending.
+/// limit, whose ending is the error and must survive, so only the fragment is
+/// removed: the longest proper suffix of any sensitive value that the capture
+/// starts with, found on the raw bytes so the amount removed never depends on
+/// how much later masking shrinks the text. The rest of the token the cut went
+/// through is dropped too, which removes a split credential-shaped token (for
+/// example a URL whose userinfo lost its start); a line with no whitespace
+/// keeps everything after the fragment. Complete values that remain are
+/// masked by the diagnostic sanitizer as usual.
 fn drop_leading_fragment(captured: &mut Vec<u8>, redact_values: &[String]) {
     if let Some(newline) = captured.iter().position(|byte| *byte == b'\n') {
         if captured[newline + 1..]
@@ -600,16 +602,57 @@ fn drop_leading_fragment(captured: &mut Vec<u8>, redact_values: &[String]) {
             return;
         }
     }
-    let redacted = redact_compose_text(&String::from_utf8_lossy(captured), redact_values);
-    let longest_value = redact_values.iter().map(String::len).max().unwrap_or(0);
-    let mut start = longest_value.min(redacted.len());
-    while !redacted.is_char_boundary(start) {
-        start += 1;
+    let fragment = redact_values
+        .iter()
+        .map(|value| value_suffix_prefix_overlap(value.as_bytes(), captured))
+        .max()
+        .unwrap_or(0);
+    let start = captured[fragment..]
+        .iter()
+        .position(u8::is_ascii_whitespace)
+        .map_or(fragment, |offset| fragment + offset);
+    let kept = captured[start..]
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .map_or(captured.len(), |offset| start + offset);
+    let mut marked = "… ".as_bytes().to_vec();
+    marked.extend_from_slice(&captured[kept..]);
+    *captured = marked;
+}
+
+/// Length of the longest proper suffix of `value` that `text` starts with.
+/// Applied to reversed bytes, the longest proper prefix of `value` that a
+/// text ends with.
+///
+/// Linear in `value`'s length: a KMP prefix function over the candidate
+/// prefix of `text`, then one pass over `value`, ending in the state that
+/// says how much of that prefix matches the end of `value`.
+fn value_suffix_prefix_overlap(value: &[u8], text: &[u8]) -> usize {
+    let pattern = &text[..text.len().min(value.len().saturating_sub(1))];
+    if pattern.is_empty() {
+        return 0;
     }
-    let start = redacted[start..]
-        .find(char::is_whitespace)
-        .map_or(start, |offset| start + offset);
-    *captured = format!("… {}", redacted[start..].trim_start()).into_bytes();
+    let mut prefix_function = vec![0_usize; pattern.len()];
+    let mut matched = 0;
+    for index in 1..pattern.len() {
+        while matched > 0 && pattern[index] != pattern[matched] {
+            matched = prefix_function[matched - 1];
+        }
+        if pattern[index] == pattern[matched] {
+            matched += 1;
+        }
+        prefix_function[index] = matched;
+    }
+    let mut matched = 0;
+    for &byte in value {
+        while matched > 0 && (matched == pattern.len() || byte != pattern[matched]) {
+            matched = prefix_function[matched - 1];
+        }
+        if byte == pattern[matched] {
+            matched += 1;
+        }
+    }
+    matched
 }
 
 /// Mask every known sensitive value and credential-shaped token in `text`,
@@ -629,24 +672,32 @@ fn redact_compose_text(text: &str, redact_values: &[String]) -> String {
 
 /// Redacted head of an output line cut at [`MAX_STREAMED_LINE_BYTES`].
 ///
-/// Redaction runs on the whole head first, so every value fully inside it is
-/// masked. What can remain is a value the cut split in two: its first part
-/// sits in the last bytes of the head, unrecognisable on its own. Dropping as
-/// many trailing bytes as the longest sensitive value removes any such
-/// fragment, and backing up to the previous whitespace removes a split
+/// The cut may fall inside a sensitive value whose remainder never arrives,
+/// leaving its prefix at the end of the head, where no redaction rule
+/// recognises it. Only that fragment is removed: the longest proper prefix of
+/// any sensitive value that the head ends with, found on the raw bytes. The
+/// head then backs up to the previous whitespace, which removes a split
 /// credential-shaped token (for example a URL whose userinfo was cut before
-/// its `@`), which the pattern rules only match whole.
+/// its `@`), and is redacted as usual.
 fn truncated_line_head(head: &[u8], redact_values: &[String]) -> String {
-    let sanitized = sanitize_compose_diagnostic(&String::from_utf8_lossy(head), redact_values);
-    let longest_value = redact_values.iter().map(String::len).max().unwrap_or(0);
-    let mut end = sanitized.len().saturating_sub(longest_value);
-    while !sanitized.is_char_boundary(end) {
-        end -= 1;
-    }
-    let end = sanitized[..end].rfind(char::is_whitespace).unwrap_or(0);
+    let reversed_head: Vec<u8> = head.iter().rev().copied().collect();
+    let fragment = redact_values
+        .iter()
+        .map(|value| {
+            let reversed_value: Vec<u8> = value.bytes().rev().collect();
+            value_suffix_prefix_overlap(&reversed_value, &reversed_head)
+        })
+        .max()
+        .unwrap_or(0);
+    let end = head.len() - fragment;
+    let end = head[..end]
+        .iter()
+        .rposition(u8::is_ascii_whitespace)
+        .unwrap_or(end);
+    let kept = sanitize_compose_diagnostic(&String::from_utf8_lossy(&head[..end]), redact_values);
     format!(
         "{} … [line truncated after {} bytes]",
-        sanitized[..end].trim_end(),
+        kept.trim_end(),
         MAX_STREAMED_LINE_BYTES
     )
 }
@@ -13714,6 +13765,23 @@ services:
         assert!(line.starts_with("pulling from"), "{line}");
     }
 
+    #[test]
+    fn truncated_line_head_keeps_text_when_masking_shrinks_it() {
+        // Complete 4 KiB values shrink to `<redacted>` when masked, then the
+        // cut lands inside a further copy. Only that copy's prefix may go:
+        // the readable text around the complete copies must stay.
+        let secret = "k".repeat(4096);
+        let mut head = format!("step one {secret} step two {secret} step three ").into_bytes();
+        head.extend_from_slice(&secret.as_bytes()[..100]);
+
+        let line = truncated_line_head(&head, &[secret]);
+
+        assert_eq!(
+            line,
+            "step one <redacted> step two <redacted> step three … [line truncated after 16384 bytes]"
+        );
+    }
+
     #[tokio::test]
     async fn stdout_and_stderr_reach_the_sink_in_batches_from_a_single_writer() {
         let (sink, recording) = recording_sink();
@@ -13806,6 +13874,53 @@ services:
         assert!(tail.ends_with(b"the actual error\n"));
         let diagnostic = sanitize_compose_diagnostic(&String::from_utf8_lossy(&tail), &[]);
         assert!(diagnostic.contains("the actual error"));
+    }
+
+    #[test]
+    fn value_suffix_prefix_overlap_finds_the_split_value_suffix() {
+        assert_eq!(value_suffix_prefix_overlap(b"abcdef", b"def rest"), 3);
+        // Only a proper suffix counts: a whole value is masked as usual.
+        assert_eq!(value_suffix_prefix_overlap(b"abc", b"abc rest"), 0);
+        assert_eq!(value_suffix_prefix_overlap(b"abcabc", b"cabc tail"), 4);
+        assert_eq!(value_suffix_prefix_overlap(b"secret", b"unrelated"), 0);
+        assert_eq!(value_suffix_prefix_overlap(b"", b"anything"), 0);
+        assert_eq!(value_suffix_prefix_overlap(b"abcdef", b""), 0);
+    }
+
+    #[tokio::test]
+    async fn trimmed_line_of_large_secrets_keeps_the_error_after_masking() {
+        // 16 KiB sensitive values, repeated past the capture limit, then a
+        // 1 KiB error. Masking shrinks the kept text below one value's
+        // length, so the amount removed must not be measured after masking.
+        let secret: String = (0..16 * 1024)
+            .map(|index| (b'a' + ((index * 31 + index / 97) % 26) as u8) as char)
+            .collect();
+        let error = format!("ERROR: {}", "e".repeat(1024));
+        let mut output = format!("{secret} ").repeat(70).into_bytes();
+        output.extend_from_slice(error.as_bytes());
+        output.push(b'\n');
+        let offset_in_copy = (output.len() - MAX_COMPOSE_COMMAND_OUTPUT_BYTES) % (secret.len() + 1);
+        assert!((1..secret.len()).contains(&offset_in_copy));
+        let redact = vec![secret.clone()];
+
+        let tail = ComposeExecutor::read_bounded_stream(
+            output.as_slice(),
+            CapturedEnd::Tail,
+            &redact,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let diagnostic = sanitize_compose_diagnostic(&String::from_utf8_lossy(&tail), &redact);
+        assert!(diagnostic.contains(&error), "{diagnostic:.300}");
+        for window in secret.as_bytes().windows(16).step_by(97) {
+            let fragment = std::str::from_utf8(window).unwrap();
+            assert!(
+                !diagnostic.contains(fragment),
+                "diagnostic leaked secret fragment {fragment:?}"
+            );
+        }
     }
 
     #[tokio::test]
