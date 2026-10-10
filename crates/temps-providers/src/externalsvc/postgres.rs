@@ -3189,7 +3189,8 @@ impl PostgresService {
                         backup_record.id, update_err
                     );
                 }
-                Err(e)
+                // The trait returns anyhow; the typed error stays its source.
+                Err(e.into())
             }
         }
     }
@@ -3206,7 +3207,7 @@ impl PostgresService {
         s3_source: &temps_entities::s3_sources::Model,
         subpath: &str,
         postgres_config: &PostgresConfig,
-    ) -> anyhow::Result<(String, i64)> {
+    ) -> Result<(String, i64), PgDumpallBackupError> {
         use chrono::Utc;
 
         let db_container_name = self.get_live_container_name(postgres_config);
@@ -3215,12 +3216,10 @@ impl PostgresService {
         info!("Pulling sidecar image {} for pg_dump", sidecar_image);
         crate::utils::pull_image_with_retry(&self.docker, &sidecar_image, None)
             .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to pull pg_dump sidecar image {}: {}",
-                    sidecar_image,
-                    e
-                )
+            .map_err(|reason| PgDumpallBackupError::PullImage {
+                service: self.name.clone(),
+                image: sidecar_image.clone(),
+                reason,
             })?;
 
         // This attempt's own host directory, deleted when it goes out of
@@ -3228,14 +3227,10 @@ impl PostgresService {
         let work_dir = tempfile::Builder::new()
             .prefix("temps-extpg-backup-")
             .tempdir()
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to create a working directory for the pg_dumpall backup of service \
-                     '{}' under {}: {}",
-                    self.name,
-                    std::env::temp_dir().display(),
-                    e
-                )
+            .map_err(|e| PgDumpallBackupError::WorkDir {
+                service: self.name.clone(),
+                parent: std::env::temp_dir().display().to_string(),
+                reason: e.to_string(),
             })?;
         let port_str = POSTGRES_INTERNAL_PORT.to_string();
 
@@ -3257,7 +3252,11 @@ impl PostgresService {
             },
             work_dir.path(),
         )
-        .await?;
+        .await
+        .map_err(|source| PgDumpallBackupError::Sidecar {
+            service: self.name.clone(),
+            source: Box::new(source),
+        })?;
 
         let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
         let backup_key = format!(
@@ -3266,16 +3265,13 @@ impl PostgresService {
             timestamp
         );
 
-        let body = match aws_sdk_s3::primitives::ByteStream::from_path(&host_backup_path).await {
-            Ok(b) => b,
-            Err(e) => {
-                return Err(anyhow::anyhow!(
-                    "Failed to open backup file {} for upload: {}",
-                    host_backup_path.display(),
-                    e
-                ));
-            }
-        };
+        let body = aws_sdk_s3::primitives::ByteStream::from_path(&host_backup_path)
+            .await
+            .map_err(|e| PgDumpallBackupError::OpenDump {
+                service: self.name.clone(),
+                path: host_backup_path.display().to_string(),
+                reason: e.to_string(),
+            })?;
 
         if let Err(e) = s3_client
             .put_object()
@@ -3286,12 +3282,12 @@ impl PostgresService {
             .send()
             .await
         {
-            return Err(anyhow::anyhow!(
-                "Failed to upload backup to s3://{}/{}: {}",
-                s3_source.bucket_name,
-                backup_key,
-                e
-            ));
+            return Err(PgDumpallBackupError::Upload {
+                service: self.name.clone(),
+                bucket: s3_source.bucket_name.clone(),
+                key: backup_key.clone(),
+                reason: e.to_string(),
+            });
         }
 
         drop(work_dir);
@@ -3314,6 +3310,52 @@ struct PgDumpallSidecar<'a> {
     username: &'a str,
     password: &'a str,
     database: &'a str,
+}
+
+/// Why a pg_dumpall full backup of a PostgreSQL service failed. Every
+/// variant names the service, and the step and resource that failed.
+#[derive(Debug, thiserror::Error)]
+enum PgDumpallBackupError {
+    #[error("Failed to pull pg_dumpall sidecar image '{image}' for service '{service}': {reason}")]
+    PullImage {
+        service: String,
+        image: String,
+        reason: String,
+    },
+
+    #[error(
+        "Failed to create a working directory for the pg_dumpall backup of service '{service}' \
+         under '{parent}': {reason}"
+    )]
+    WorkDir {
+        service: String,
+        parent: String,
+        reason: String,
+    },
+
+    #[error("pg_dumpall backup of service '{service}' failed: {source}")]
+    Sidecar {
+        service: String,
+        /// Boxed: the sidecar error carries several paths and would make
+        /// every `Result` of this type large.
+        #[source]
+        source: Box<PgDumpallSidecarError>,
+    },
+
+    #[error("Failed to open the pg_dumpall backup of service '{service}' at '{path}' for upload: {reason}")]
+    OpenDump {
+        service: String,
+        path: String,
+        reason: String,
+    },
+
+    #[error("Failed to upload the pg_dumpall backup of service '{service}' to s3://{bucket}/{key}: {reason}")]
+    Upload {
+        service: String,
+        bucket: String,
+        key: String,
+        reason: String,
+    },
 }
 
 /// Why [`run_pg_dumpall_sidecar`] produced no dump. Every variant names the
@@ -5137,6 +5179,42 @@ mod tests {
             let message = error.to_string();
             assert!(message.contains("temps-pg-backup-7"), "{message}");
             assert!(message.contains("postgres-orders"), "{message}");
+            // The service-level error keeps the sidecar error as its source
+            // and names the service.
+            let backup = PgDumpallBackupError::Sidecar {
+                service: "orders".to_string(),
+                source: Box::new(error),
+            };
+            let message = backup.to_string();
+            assert!(message.contains("service 'orders'"), "{message}");
+            assert!(message.contains("temps-pg-backup-7"), "{message}");
+            assert!(std::error::Error::source(&backup).is_some());
+        }
+        for error in [
+            PgDumpallBackupError::PullImage {
+                service: "orders".to_string(),
+                image: "postgres:16".to_string(),
+                reason: "denied".to_string(),
+            },
+            PgDumpallBackupError::WorkDir {
+                service: "orders".to_string(),
+                parent: "/tmp".to_string(),
+                reason: "read-only".to_string(),
+            },
+            PgDumpallBackupError::OpenDump {
+                service: "orders".to_string(),
+                path: "/tmp/x.sql.gz".to_string(),
+                reason: "gone".to_string(),
+            },
+            PgDumpallBackupError::Upload {
+                service: "orders".to_string(),
+                bucket: "backups".to_string(),
+                key: "orders/x.sql.gz".to_string(),
+                reason: "denied".to_string(),
+            },
+        ] {
+            let message = error.to_string();
+            assert!(message.contains("service 'orders'"), "{message}");
         }
     }
 
