@@ -8433,12 +8433,17 @@
             "description": "Round-trip to query the monitor (ms).",
             "format": "int64",
             "type": "integer"
+          },
+          "protection": {
+            "$ref": "#/components/schemas/ClusterProtectionResponse",
+            "description": "Whether a standby could take over if the primary failed now. A new\ncluster accepts SQL before its first standby is `secondary`; until\nthen this is `not_protected`."
           }
         },
         "required": [
           "checked_at",
           "monitor_response_ms",
-          "members"
+          "members",
+          "protection"
         ],
         "type": "object"
       },
@@ -8558,6 +8563,34 @@
           "locked"
         ],
         "type": "object"
+      },
+      "ClusterProtectionResponse": {
+        "description": "Failover protection of a cluster, part of [`ClusterHealthReportResponse`].",
+        "properties": {
+          "detail": {
+            "description": "Names the protecting standby, or what is missing.",
+            "example": "Not yet protected: standby postgres-app-ha-2 (catchingup) is still copying or catching up with the primary. The cluster accepts writes, but cannot fail over until a standby reaches secondary",
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/ClusterProtectionState",
+            "description": "`protected` once a healthy, promotable standby is `secondary`;\n`not_protected` while none is (none configured, the first one still\ncopying the primary, or all unhealthy); `unknown` when the monitor\ncould not be read."
+          }
+        },
+        "required": [
+          "state",
+          "detail"
+        ],
+        "type": "object"
+      },
+      "ClusterProtectionState": {
+        "description": "Whether a cluster could fail over if its primary failed right now.",
+        "enum": [
+          "protected",
+          "not_protected",
+          "unknown"
+        ],
+        "type": "string"
       },
       "CmdBody": {
         "properties": {
@@ -18673,6 +18706,19 @@
             },
             "type": "array"
           },
+          "skippedEntries": {
+            "description": "What the deployment will leave out of this archive: version control,\ninstalled dependencies, environment files that may hold secrets, OS\nmetadata. Directories are listed once. At most 50 paths; see\n`skipped_file_count` for the total.",
+            "items": {
+              "$ref": "#/components/schemas/DropSkippedPath"
+            },
+            "type": "array"
+          },
+          "skippedFileCount": {
+            "description": "Archive entries left out in total, including any not listed.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "suggestedName": {
             "type": "string"
           }
@@ -18755,6 +18801,40 @@
           "confidence",
           "reason",
           "isStatic"
+        ],
+        "type": "object"
+      },
+      "DropSkipReason": {
+        "description": "Why an entry was left out of a Drop upload.",
+        "enum": [
+          "version_control",
+          "dependencies",
+          "environment_file",
+          "os_metadata"
+        ],
+        "type": "string"
+      },
+      "DropSkippedPath": {
+        "description": "One line of the \"left out of the upload\" notice.",
+        "properties": {
+          "files": {
+            "description": "Archive entries left out under this path.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "path": {
+            "description": "The file, or the directory (ending in `/`) whose files were left out.",
+            "type": "string"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/DropSkipReason"
+          }
+        },
+        "required": [
+          "path",
+          "reason",
+          "files"
         ],
         "type": "object"
       },
@@ -33654,6 +33734,46 @@
         ],
         "type": "object"
       },
+      "NodePlacementReference": {
+        "description": "A placement (an environment's, or a project's default) whose\n`target_nodes` names a node.",
+        "properties": {
+          "environment_id": {
+            "description": "`None` for the project's default placement, which environments\nwithout their own `target_nodes` inherit.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "environment_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "project_name": {
+            "type": "string"
+          },
+          "target_nodes": {
+            "description": "The placement's `target_nodes`: as stored when reporting a refusal,\nand what is left after the removed node was taken out when reporting\nan update.",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "project_id",
+          "project_name",
+          "target_nodes"
+        ],
+        "type": "object"
+      },
       "NodeSandboxEntry": {
         "description": "A live sandbox on a node, with its owner. For sandboxes the caller does\nnot own, owner-only details (preview password hint, source repository\nURL) are omitted.",
         "properties": {
@@ -35172,14 +35292,16 @@
             "description": "`pending` while background work (a screenshot capture) runs, then\n`completed` or `failed`. Poll\n`GET …/operations/{operation_type}` for the outcome."
           },
           "success": {
-            "description": "`true` only when `status` is `completed`.",
-            "type": "boolean"
+            "description": "The outcome, final only once `status` is terminal: `null` while the\noperation is `pending`, `true` when it `completed`, `false` when it\n`failed`. Read `status` first; a `null` here is not a failure.",
+            "type": [
+              "boolean",
+              "null"
+            ]
           }
         },
         "required": [
           "operation",
           "status",
-          "success",
           "message",
           "data",
           "executed_at"
@@ -42932,6 +43054,13 @@
             "description": "Containers Temps could not confirm were removed from the node before\nit was removed (only with `force=true`). They are recorded as\norphaned; remove them on that host by hand if it still exists.",
             "items": {
               "type": "string"
+            },
+            "type": "array"
+          },
+          "placements_updated": {
+            "description": "Environments (and project defaults) whose target nodes listed the\nremoved node. Its ID was taken out of each; `target_nodes` holds the\nnodes they still target.",
+            "items": {
+              "$ref": "#/components/schemas/NodePlacementReference"
             },
             "type": "array"
           }
@@ -87239,6 +87368,7 @@
     },
     "/internal/nodes/{node_id}": {
       "delete": {
+        "description": "The node's ID is taken out of every environment's (and project default's)\ntarget nodes, and the response lists them in `placements_updated`. When the\nnode is the only target of a placement the removal is refused with `409`\nnaming those environments, since emptying it would let them run anywhere.",
         "operationId": "admin_remove_node",
         "parameters": [
           {
@@ -87279,7 +87409,7 @@
             "description": "Node not found"
           },
           "409": {
-            "description": "Node still has active containers, live sandboxes, or containers Temps could not confirm were removed (retry with force=true only if the host is gone)"
+            "description": "Node still has active containers, live sandboxes, or containers Temps could not confirm were removed (retry with force=true only if the host is gone), or it is the only target node of an environment's placement (`placements` names them; change their target nodes first)"
           },
           "500": {
             "description": "Internal server error"
@@ -106087,7 +106217,7 @@
                 }
               }
             },
-            "description": "Operation accepted. `take_screenshot` returns `status: pending`; poll the operation status for `completed` (with `screenshot_location`) or `failed` (with the reason)"
+            "description": "Operation accepted. `take_screenshot` returns `status: pending` with `success: null`; poll the operation status for `completed` (with `screenshot_location`) or `failed` (with the reason)"
           },
           "400": {
             "content": {
@@ -106196,7 +106326,7 @@
                 }
               }
             },
-            "description": "Operation status"
+            "description": "Operation status. `success` is `null` until `status` is `completed` or `failed`"
           },
           "401": {
             "description": "Unauthorized"

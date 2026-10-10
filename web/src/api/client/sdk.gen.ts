@@ -4479,6 +4479,11 @@ export const registerNode = <ThrowOnError extends boolean = false>(options: Opti
  * it was offline, or ones a redeploy replaced while it was unreachable) are
  * removed first; if any cannot be, the removal is refused unless `force=true`,
  * which records them as orphaned.
+ *
+ * The node's ID is taken out of every environment's (and project default's)
+ * target nodes, and the response lists them in `placements_updated`. When the
+ * node is the only target of a placement the removal is refused with `409`
+ * naming those environments, since emptying it would let them run anywhere.
  */
 export const adminRemoveNode = <ThrowOnError extends boolean = false>(options: Options<AdminRemoveNodeData, ThrowOnError>): RequestResult<AdminRemoveNodeResponses, AdminRemoveNodeErrors, ThrowOnError> => (options.client ?? client).delete<AdminRemoveNodeResponses, AdminRemoveNodeErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],

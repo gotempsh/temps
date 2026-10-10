@@ -4045,6 +4045,12 @@ export type ClusterHealthReportResponse = {
      * Round-trip to query the monitor (ms).
      */
     monitor_response_ms: number;
+    /**
+     * Whether a standby could take over if the primary failed now. A new
+     * cluster accepts SQL before its first standby is `secondary`; until
+     * then this is `not_protected`.
+     */
+    protection: ClusterProtectionResponse;
 };
 
 /**
@@ -4109,6 +4115,28 @@ export type ClusterNetworkSettings = {
     locked: boolean;
     subnet_prefix_len: number;
 };
+
+/**
+ * Failover protection of a cluster, part of [`ClusterHealthReportResponse`].
+ */
+export type ClusterProtectionResponse = {
+    /**
+     * Names the protecting standby, or what is missing.
+     */
+    detail: string;
+    /**
+     * `protected` once a healthy, promotable standby is `secondary`;
+     * `not_protected` while none is (none configured, the first one still
+     * copying the primary, or all unhealthy); `unknown` when the monitor
+     * could not be read.
+     */
+    state: ClusterProtectionState;
+};
+
+/**
+ * Whether a cluster could fail over if its primary failed right now.
+ */
+export type ClusterProtectionState = 'protected' | 'not_protected' | 'unknown';
 
 export type CmdBody = {
     /**
@@ -8793,6 +8821,17 @@ export type DropArchiveUpload = {
 
 export type DropInspectionResponse = {
     candidates: Array<DropPresetCandidate>;
+    /**
+     * What the deployment will leave out of this archive: version control,
+     * installed dependencies, environment files that may hold secrets, OS
+     * metadata. Directories are listed once. At most 50 paths; see
+     * `skipped_file_count` for the total.
+     */
+    skippedEntries?: Array<DropSkippedPath>;
+    /**
+     * Archive entries left out in total, including any not listed.
+     */
+    skippedFileCount?: number;
     suggestedName: string;
 };
 
@@ -8834,6 +8873,26 @@ export type DropPresetCandidate = {
     label: string;
     preset: string;
     reason: string;
+};
+
+/**
+ * Why an entry was left out of a Drop upload.
+ */
+export type DropSkipReason = 'version_control' | 'dependencies' | 'environment_file' | 'os_metadata';
+
+/**
+ * One line of the "left out of the upload" notice.
+ */
+export type DropSkippedPath = {
+    /**
+     * Archive entries left out under this path.
+     */
+    files: number;
+    /**
+     * The file, or the directory (ending in `/`) whose files were left out.
+     */
+    path: string;
+    reason: DropSkipReason;
 };
 
 export type EligibleGitRepositoryResponse = {
@@ -15520,6 +15579,27 @@ export type NodePairingResponse = {
 };
 
 /**
+ * A placement (an environment's, or a project's default) whose
+ * `target_nodes` names a node.
+ */
+export type NodePlacementReference = {
+    /**
+     * `None` for the project's default placement, which environments
+     * without their own `target_nodes` inherit.
+     */
+    environment_id?: number | null;
+    environment_name?: string | null;
+    project_id: number;
+    project_name: string;
+    /**
+     * The placement's `target_nodes`: as stored when reporting a refusal,
+     * and what is left after the removed node was taken out when reporting
+     * an update.
+     */
+    target_nodes: Array<number>;
+};
+
+/**
  * A live sandbox on a node, with its owner. For sandboxes the caller does
  * not own, owner-only details (preview password hint, source repository
  * URL) are omitted.
@@ -16214,9 +16294,11 @@ export type OperationResultResponse = {
      */
     status: DeploymentOperationStatus;
     /**
-     * `true` only when `status` is `completed`.
+     * The outcome, final only once `status` is terminal: `null` while the
+     * operation is `pending`, `true` when it `completed`, `false` when it
+     * `failed`. Read `status` first; a `null` here is not a failure.
      */
-    success: boolean;
+    success?: boolean | null;
 };
 
 export type OperationResultsResponse = {
@@ -19906,6 +19988,12 @@ export type RemoveNodeResponse = {
      * orphaned; remove them on that host by hand if it still exists.
      */
     orphaned_containers?: Array<string>;
+    /**
+     * Environments (and project defaults) whose target nodes listed the
+     * removed node. Its ID was taken out of each; `target_nodes` holds the
+     * nodes they still target.
+     */
+    placements_updated?: Array<NodePlacementReference>;
 };
 
 export type RenameConversationRequest = {
@@ -44315,7 +44403,7 @@ export type AdminRemoveNodeErrors = {
      */
     404: unknown;
     /**
-     * Node still has active containers, live sandboxes, or containers Temps could not confirm were removed (retry with force=true only if the host is gone)
+     * Node still has active containers, live sandboxes, or containers Temps could not confirm were removed (retry with force=true only if the host is gone), or it is the only target node of an environment's placement (`placements` names them; change their target nodes first)
      */
     409: unknown;
     /**
@@ -55489,7 +55577,7 @@ export type ExecuteDeploymentOperationError = ExecuteDeploymentOperationErrors[k
 
 export type ExecuteDeploymentOperationResponses = {
     /**
-     * Operation accepted. `take_screenshot` returns `status: pending`; poll the operation status for `completed` (with `screenshot_location`) or `failed` (with the reason)
+     * Operation accepted. `take_screenshot` returns `status: pending` with `success: null`; poll the operation status for `completed` (with `screenshot_location`) or `failed` (with the reason)
      */
     202: OperationResultResponse;
 };
@@ -55528,7 +55616,7 @@ export type GetDeploymentOperationStatusErrors = {
 
 export type GetDeploymentOperationStatusResponses = {
     /**
-     * Operation status
+     * Operation status. `success` is `null` until `status` is `completed` or `failed`
      */
     200: OperationResultResponse;
 };
