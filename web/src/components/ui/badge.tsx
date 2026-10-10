@@ -21,6 +21,13 @@ const badgeVariants = cva(
           'border-transparent bg-success text-success-foreground hover:bg-success/80',
         warning:
           'border-transparent bg-warning text-warning-foreground hover:bg-warning/80',
+        // Tinted status badges. Text uses the *-strong / destructive tokens,
+        // which keep 4.5:1 (WCAG 1.4.3) on these tints in both themes.
+        'success-subtle': 'border-success/20 bg-success/10 text-success-strong',
+        'warning-subtle': 'border-warning/30 bg-warning/10 text-warning-strong',
+        'destructive-subtle':
+          'border-destructive/20 bg-destructive/10 text-destructive',
+        'neutral-subtle': 'border-border bg-muted text-muted-foreground',
         outline: 'text-foreground',
       },
     },

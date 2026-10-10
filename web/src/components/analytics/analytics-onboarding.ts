@@ -50,9 +50,13 @@ export function resolveAnalyticsInstallState(query: {
   return query.data.has_events ? 'installed' : 'not-installed'
 }
 
-/** Accessible label for the project header's live visitors pill. */
+/**
+ * Accessible label for the project header's live visitors pill. Starts with
+ * the count the pill displays, so the visible text is part of the accessible
+ * name (WCAG 2.5.3).
+ */
 export function liveVisitorsPillLabel(activeVisitors: number): string {
   if (activeVisitors <= 0)
-    return 'No active visitors right now. Open Live visitors'
+    return '0 active visitors right now. Open Live visitors'
   return `${activeVisitors} active visitor${activeVisitors === 1 ? '' : 's'}. Open Live visitors`
 }

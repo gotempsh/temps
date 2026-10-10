@@ -51,10 +51,18 @@ test('every onboarding state names the view and shows a concrete example', () =>
 
 test('the live visitors pill label always says where it leads', () => {
   expect(liveVisitorsPillLabel(0)).toBe(
-    'No active visitors right now. Open Live visitors'
+    '0 active visitors right now. Open Live visitors'
   )
   expect(liveVisitorsPillLabel(1)).toBe('1 active visitor. Open Live visitors')
   expect(liveVisitorsPillLabel(12)).toBe(
     '12 active visitors. Open Live visitors'
   )
+})
+
+// WCAG 2.5.3 (label in name): the pill shows only the count, so a speech
+// user says that number; the accessible name must start with it.
+test('the live visitors pill label starts with the count the pill shows', () => {
+  for (const count of [0, 1, 7, 120]) {
+    expect(liveVisitorsPillLabel(count).startsWith(`${count} `)).toBe(true)
+  }
 })

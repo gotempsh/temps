@@ -44,8 +44,15 @@
   --destructive-foreground: oklch(0.985 0 0);
   /* Status semantics — success (green) + warning (amber), matching the chart
      tones. Used by AlertStateBadge (ok/warn) and the metrics health surfaces. */
-  --success: oklch(0.627 0.1684 150.31); /* green — solid fill paired with white text */
+  --success: oklch(
+    0.627 0.1684 150.31
+  ); /* green — solid fill paired with white text */
   --success-foreground: oklch(0.985 0 0);
+  /* Green *text* on light surfaces. --success is a fill colour: as text it
+     falls short of 4.5:1 (WCAG 1.4.3), and Tailwind's green-700 on a green
+     tint measured 4.32:1. This (#197037) reaches 6.2:1 on white and 5.5:1 on
+     a success/10 tint. */
+  --success-strong: oklch(0.48 0.12 150);
   --warning: oklch(0.773 0.1776 69.61); /* amber */
   --warning-foreground: oklch(0.145 0 0);
   /* Amber *text* on light surfaces. --warning is a fill colour: as text on
@@ -131,8 +138,12 @@
   --destructive-foreground: oklch(0.985 0 0);
   /* Status semantics — same green/amber as light (chart tones are mode-stable);
      dark foreground reads well on both. */
-  --success: oklch(0.627 0.1684 150.31); /* green — solid fill paired with white text */
+  --success: oklch(
+    0.627 0.1684 150.31
+  ); /* green — solid fill paired with white text */
   --success-foreground: oklch(0.985 0 0);
+  /* Green text on dark surfaces: ~9.9:1 on the card colour. */
+  --success-strong: oklch(0.79 0.17 150);
   --warning: oklch(0.773 0.1776 69.61); /* amber */
   --warning-foreground: oklch(0.145 0 0);
   /* On dark surfaces the fill amber already reads at ~9:1. */
@@ -210,6 +221,7 @@
   --color-destructive-foreground: var(--destructive-foreground);
   --color-success: var(--success);
   --color-success-foreground: var(--success-foreground);
+  --color-success-strong: var(--success-strong);
   --color-warning: var(--warning);
   --color-warning-foreground: var(--warning-foreground);
   --color-warning-strong: var(--warning-strong);

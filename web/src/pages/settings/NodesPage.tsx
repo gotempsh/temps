@@ -109,22 +109,23 @@ import { client } from '@/api/client/client.gen'
 
 // ── Helpers ──
 
+/** Status tones, from the theme's contrast-checked status tokens. */
+const nodeStatusVariant: Record<
+  string,
+  'success-subtle' | 'destructive-subtle' | 'warning-subtle' | 'neutral-subtle'
+> = {
+  active: 'success-subtle',
+  offline: 'destructive-subtle',
+  draining: 'warning-subtle',
+  drained: 'neutral-subtle',
+  pending: 'warning-subtle',
+}
+
 function StatusBadge({ status }: { status: string }) {
-  const styles: Record<string, string> = {
-    active:
-      'bg-green-500/15 text-green-700 dark:text-green-400 border-green-500/20',
-    offline: 'bg-red-500/15 text-red-700 dark:text-red-400 border-red-500/20',
-    draining:
-      'bg-orange-500/15 text-orange-700 dark:text-orange-400 border-orange-500/20',
-    drained:
-      'bg-gray-500/15 text-gray-700 dark:text-gray-400 border-gray-500/20',
-    pending:
-      'bg-yellow-500/15 text-yellow-700 dark:text-yellow-400 border-yellow-500/20',
-  }
   return (
     <Badge
-      variant="default"
-      className={`${styles[status] ?? ''} text-xs capitalize`}
+      variant={nodeStatusVariant[status] ?? 'neutral-subtle'}
+      className="text-xs capitalize"
     >
       {status}
     </Badge>
@@ -423,10 +424,7 @@ function JoinTokenSection() {
     return (
       <div className="space-y-4">
         <div className="flex items-center gap-2 text-sm">
-          <Badge
-            variant="default"
-            className="bg-green-500/15 text-green-700 dark:text-green-400 border-green-500/20"
-          >
+          <Badge variant="success-subtle">
             <Shield className="h-3 w-3 mr-1" />
             Token configured
           </Badge>
@@ -845,7 +843,7 @@ function MiniStat({
 }) {
   const accentClass =
     accent === 'green'
-      ? 'text-green-600 dark:text-green-400'
+      ? 'text-success-strong'
       : accent === 'yellow'
         ? 'text-yellow-600 dark:text-yellow-400'
         : accent === 'blue'
@@ -1326,8 +1324,8 @@ function NodeDetail({
           <AlertTitle
             className={
               node.status === 'drained' || drainStatus?.drain_complete
-                ? 'text-green-700 dark:text-green-400'
-                : 'text-orange-700 dark:text-orange-400'
+                ? 'text-success-strong'
+                : 'text-warning-strong'
             }
           >
             {node.status === 'drained'
@@ -1339,8 +1337,8 @@ function NodeDetail({
           <AlertDescription
             className={
               node.status === 'drained' || drainStatus?.drain_complete
-                ? 'text-green-600 dark:text-green-300'
-                : 'text-orange-600 dark:text-orange-300'
+                ? 'text-success-strong'
+                : 'text-warning-strong'
             }
           >
             {node.status === 'drained'
@@ -1488,13 +1486,11 @@ function NodeDetail({
                           <TableCell>
                             <Badge
                               variant={
-                                c.status === 'running' ? 'default' : 'secondary'
-                              }
-                              className={`text-xs ${
                                 c.status === 'running'
-                                  ? 'bg-green-500/15 text-green-700 dark:text-green-400 border-green-500/20'
-                                  : ''
-                              }`}
+                                  ? 'success-subtle'
+                                  : 'secondary'
+                              }
+                              className="text-xs"
                             >
                               {c.status}
                             </Badge>

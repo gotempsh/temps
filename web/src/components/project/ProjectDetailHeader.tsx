@@ -268,7 +268,7 @@ export function ProjectDetailHeader({
                 {(activeVisitorsCount?.active_visitors ?? 0) > 0 && (
                   <Users className="h-3.5 w-3.5" />
                 )}
-                {activeVisitorsCount?.active_visitors}
+                {activeVisitorsCount?.active_visitors ?? 0}
               </span>
             </button>
           )}

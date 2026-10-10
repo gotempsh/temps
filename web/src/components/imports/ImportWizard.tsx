@@ -667,6 +667,7 @@ export function ImportWizard({
               </div>
             ) : (
               <RadioGroup
+                aria-label="Import source"
                 value={selectedSource || ''}
                 onValueChange={(value) =>
                   handleSourceSelect(value as ImportSource)
@@ -699,7 +700,10 @@ export function ImportWizard({
                               </CardDescription>
                             </div>
                           </div>
-                          <RadioGroupItem value={source.source} />
+                          <RadioGroupItem
+                            value={source.source}
+                            aria-label={source.name}
+                          />
                         </div>
                       </CardHeader>
                       <CardContent>
@@ -971,6 +975,7 @@ export function ImportWizard({
                   </Card>
                 ) : (
                   <RadioGroup
+                    aria-label="Workload to import"
                     value={selectedWorkload?.id || ''}
                     onValueChange={(value) => {
                       const workload = filteredWorkloads.find(
@@ -1003,7 +1008,10 @@ export function ImportWizard({
                                   </CardDescription>
                                 </div>
                               </div>
-                              <RadioGroupItem value={workload.id} />
+                              <RadioGroupItem
+                                value={workload.id}
+                                aria-label={workload.name || workload.id}
+                              />
                             </div>
                           </CardHeader>
                           <CardContent className="pt-0">
