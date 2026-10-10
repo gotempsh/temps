@@ -542,8 +542,24 @@ fn collect_redactable_values(request: &ComposeDeployRequest) -> Vec<String> {
             (!value.is_empty()).then(|| value.to_string())
         }));
     }
+    // Streamed output is redacted one line at a time, where a multi-line
+    // value (a PEM key, a JSON credential) never matches as a whole. Its
+    // lines are redacted individually; short ones such as `}` are skipped
+    // because they would blank unrelated output without protecting anything.
+    let value_lines = values
+        .iter()
+        .filter(|value| value.contains('\n'))
+        .flat_map(|value| value.lines())
+        .map(str::trim)
+        .filter(|line| line.len() >= MIN_REDACTED_LINE_BYTES)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    values.extend(value_lines);
     values
 }
+
+/// Shortest line of a multi-line sensitive value that is redacted on its own.
+const MIN_REDACTED_LINE_BYTES: usize = 8;
 
 fn sanitize_compose_diagnostic(diagnostic: &str, redact_values: &[String]) -> String {
     let mut sanitized = diagnostic.to_string();
@@ -553,30 +569,39 @@ fn sanitize_compose_diagnostic(diagnostic: &str, redact_values: &[String]) -> St
         }
     }
 
-    // Docker and application errors commonly echo credentials as assignments,
-    // bearer headers, or URI userinfo. Cover those forms even for literal
-    // values originating in a repository Compose document.
-    for pattern in [
-        r#"(?i)(bearer\s+)[A-Za-z0-9._~+/-]+={0,2}"#,
-        r#"(://[^\s:/@]+:)[^\s/@]+@"#,
-        r#"(?i)((?:password|passwd|token|api[_-]?key|client[_-]?secret|private[_-]?key|authorization)\s*[:=]\s*)[^\s,;]+"#,
-    ] {
-        if let Ok(regex) = Regex::new(pattern) {
-            sanitized = regex.replace_all(&sanitized, "${1}<redacted>").into_owned();
-        }
+    for regex in CREDENTIAL_PATTERNS.iter() {
+        sanitized = regex.replace_all(&sanitized, "${1}<redacted>").into_owned();
     }
 
+    // Keep the tail: Compose and BuildKit print the failing step and its
+    // error last, after everything that succeeded.
     if sanitized.len() > MAX_COMPOSE_DIAGNOSTIC_BYTES {
-        let mut boundary = MAX_COMPOSE_DIAGNOSTIC_BYTES;
+        let mut boundary = sanitized.len() - MAX_COMPOSE_DIAGNOSTIC_BYTES;
         while !sanitized.is_char_boundary(boundary) {
-            boundary -= 1;
+            boundary += 1;
         }
-        sanitized.truncate(boundary);
-        sanitized
-            .push_str("\n… diagnostic truncated; inspect authenticated container logs for more");
+        sanitized = format!(
+            "… earlier output truncated; the full output is in the deployment log\n{}",
+            &sanitized[boundary..]
+        );
     }
     sanitized
 }
+
+/// Docker and application errors commonly echo credentials as assignments,
+/// bearer headers, or URI userinfo. Cover those forms even for literal values
+/// originating in a repository Compose document. Compiled once: the
+/// sanitizer runs on every streamed line of build output.
+static CREDENTIAL_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    [
+        r#"(?i)(bearer\s+)[A-Za-z0-9._~+/-]+={0,2}"#,
+        r#"(://[^\s:/@]+:)[^\s/@]+@"#,
+        r#"(?i)((?:password|passwd|token|api[_-]?key|client[_-]?secret|private[_-]?key|authorization)\s*[:=]\s*)[^\s,;]+"#,
+    ]
+    .into_iter()
+    .filter_map(|pattern| Regex::new(pattern).ok())
+    .collect()
+});
 
 /// Compose can echo values from repository and included env files in stderr.
 /// Classify its diagnostic instead of copying untrusted text into a deployment
@@ -697,7 +722,41 @@ pub struct ComposeDeployRequest {
     /// routed service that exits — even with status 0 — fails the deploy,
     /// while other services may exit 0 as completed one-shot tasks.
     pub routed_services: Vec<String>,
+    /// Receives `docker compose build`, `pull`, and `up` output line by line
+    /// while each command runs, already redacted. Without it a failing build
+    /// shows only the diagnostic tail attached to the error.
+    pub output_sink: Option<ComposeOutputSink>,
 }
+
+/// Line-by-line receiver for live `docker compose` output, typically the
+/// deployment's job log.
+#[derive(Clone)]
+pub struct ComposeOutputSink(pub crate::LogCallback);
+
+impl std::fmt::Debug for ComposeOutputSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ComposeOutputSink(..)")
+    }
+}
+
+/// Where a streamed command's lines go, and the values they must not reveal.
+#[derive(Clone, Copy)]
+struct OutputStream<'a> {
+    sink: &'a ComposeOutputSink,
+    redact_values: &'a [String],
+}
+
+/// Which end of a command's output survives when it exceeds
+/// [`MAX_COMPOSE_COMMAND_OUTPUT_BYTES`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CapturedEnd {
+    Head,
+    Tail,
+}
+
+/// Longest single line forwarded to the sink. Output without newlines (a
+/// minified error blob) is forwarded in pieces rather than buffered unbounded.
+const MAX_STREAMED_LINE_BYTES: usize = 8 * 1024;
 
 /// Result for a single compose service after deployment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -881,8 +940,8 @@ impl ComposeExecutor {
             })?;
         let run = async {
             let (stdout, stderr, status) = tokio::try_join!(
-                Self::read_bounded_stream(stdout),
-                Self::read_bounded_stream(stderr),
+                Self::read_bounded_stream(stdout, CapturedEnd::Head, None),
+                Self::read_bounded_stream(stderr, CapturedEnd::Tail, None),
                 child.wait()
             )?;
             Ok::<_, std::io::Error>(std::process::Output {
@@ -1667,6 +1726,7 @@ impl ComposeExecutor {
                 &compose_file,
                 &redact_values,
                 &request.build_args,
+                request.output_sink.as_ref(),
             )
             .await?;
         }
@@ -1679,8 +1739,14 @@ impl ComposeExecutor {
         // `--ignore-buildable` skips services that only have a `build:` directive
         // (those were already handled above by `compose_build`), so this call is
         // safe regardless of whether the project mixes built and pulled services.
-        self.compose_pull(&effective_dir, &project_name, &compose_file, &redact_values)
-            .await?;
+        self.compose_pull(
+            &effective_dir,
+            &project_name,
+            &compose_file,
+            &redact_values,
+            request.output_sink.as_ref(),
+        )
+        .await?;
 
         // Docker's injected init process is useful for ordinary application
         // images, but it must not sit in front of an init system already owned
@@ -1750,7 +1816,13 @@ impl ComposeExecutor {
         // container, let Compose report the conflict instead of deleting
         // containers outside this Temps project boundary.
         if let Err(error) = self
-            .compose_up(&effective_dir, &project_name, &compose_file, &redact_values)
+            .compose_up(
+                &effective_dir,
+                &project_name,
+                &compose_file,
+                &redact_values,
+                request.output_sink.as_ref(),
+            )
             .await
         {
             return Err(Box::new(
@@ -5883,16 +5955,21 @@ impl ComposeExecutor {
         compose_file: &str,
         redact_values: &[String],
         build_args: &HashMap<String, String>,
+        output_sink: Option<&ComposeOutputSink>,
     ) -> Result<(), ComposeError> {
         let cmd = Self::compose_build_command(project_dir, project_name, compose_file, build_args);
 
         debug!(project = %project_name, "Running docker compose build");
 
-        let output = Self::bounded_command_output(
+        let output = Self::bounded_command_output_streamed(
             cmd,
             COMPOSE_BUILD_TIMEOUT,
             project_name,
             "docker compose build",
+            output_sink.map(|sink| OutputStream {
+                sink,
+                redact_values,
+            }),
         )
         .await?;
 
@@ -5936,10 +6013,22 @@ impl ComposeExecutor {
     }
 
     async fn bounded_command_output(
+        command: tokio::process::Command,
+        timeout: std::time::Duration,
+        project_name: &str,
+        operation: &str,
+    ) -> Result<std::process::Output, ComposeError> {
+        Self::bounded_command_output_streamed(command, timeout, project_name, operation, None).await
+    }
+
+    /// [`Self::bounded_command_output`], additionally forwarding every output
+    /// line to `stream` as it is produced.
+    async fn bounded_command_output_streamed(
         mut command: tokio::process::Command,
         timeout: std::time::Duration,
         project_name: &str,
         operation: &str,
+        stream: Option<OutputStream<'_>>,
     ) -> Result<std::process::Output, ComposeError> {
         command
             .kill_on_drop(true)
@@ -5961,9 +6050,12 @@ impl ComposeExecutor {
                 reason: format!("{operation} did not expose stderr"),
             })?;
         let run = async {
+            // stdout is parsed as data by some callers, where a truncated
+            // tail could parse as a different document; stderr is only ever
+            // a diagnostic, whose error is at the end.
             let (stdout, stderr, status) = tokio::try_join!(
-                Self::read_bounded_stream(stdout),
-                Self::read_bounded_stream(stderr),
+                Self::read_bounded_stream(stdout, CapturedEnd::Head, stream),
+                Self::read_bounded_stream(stderr, CapturedEnd::Tail, stream),
                 child.wait()
             )?;
             Ok::<_, std::io::Error>(std::process::Output {
@@ -5981,21 +6073,72 @@ impl ComposeExecutor {
             .map_err(ComposeError::Io)
     }
 
-    async fn read_bounded_stream<R>(mut reader: R) -> Result<Vec<u8>, std::io::Error>
+    /// Read `reader` to EOF, keeping at most [`MAX_COMPOSE_COMMAND_OUTPUT_BYTES`]
+    /// from the `keep` end and forwarding each line to `stream`.
+    async fn read_bounded_stream<R>(
+        mut reader: R,
+        keep: CapturedEnd,
+        stream: Option<OutputStream<'_>>,
+    ) -> Result<Vec<u8>, std::io::Error>
     where
         R: tokio::io::AsyncRead + Unpin,
     {
         let mut captured = Vec::new();
+        let mut line = Vec::new();
         let mut buffer = [0_u8; 8192];
         loop {
             let read = reader.read(&mut buffer).await?;
             if read == 0 {
                 break;
             }
-            let remaining = MAX_COMPOSE_COMMAND_OUTPUT_BYTES.saturating_sub(captured.len());
-            captured.extend_from_slice(&buffer[..read.min(remaining)]);
+            let chunk = &buffer[..read];
+            match keep {
+                CapturedEnd::Head => {
+                    let remaining = MAX_COMPOSE_COMMAND_OUTPUT_BYTES.saturating_sub(captured.len());
+                    captured.extend_from_slice(&chunk[..read.min(remaining)]);
+                }
+                CapturedEnd::Tail => {
+                    captured.extend_from_slice(chunk);
+                    // Trim only once the buffer doubles, so a long build does
+                    // not shift a megabyte on every read.
+                    if captured.len() > 2 * MAX_COMPOSE_COMMAND_OUTPUT_BYTES {
+                        captured.drain(..captured.len() - MAX_COMPOSE_COMMAND_OUTPUT_BYTES);
+                    }
+                }
+            }
+            if let Some(stream) = stream {
+                for &byte in chunk {
+                    if byte == b'\n' || byte == b'\r' {
+                        Self::forward_line(stream, &mut line).await;
+                    } else {
+                        line.push(byte);
+                        if line.len() >= MAX_STREAMED_LINE_BYTES {
+                            Self::forward_line(stream, &mut line).await;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(stream) = stream {
+            Self::forward_line(stream, &mut line).await;
+        }
+        if captured.len() > MAX_COMPOSE_COMMAND_OUTPUT_BYTES {
+            captured.drain(..captured.len() - MAX_COMPOSE_COMMAND_OUTPUT_BYTES);
         }
         Ok(captured)
+    }
+
+    /// Redact and forward one buffered line, then clear it. Blank lines
+    /// (including the empty half of a `\r\n`) are dropped.
+    async fn forward_line(stream: OutputStream<'_>, line: &mut Vec<u8>) {
+        if !line.iter().all(u8::is_ascii_whitespace) {
+            let text = sanitize_compose_diagnostic(
+                String::from_utf8_lossy(line).trim_end(),
+                stream.redact_values,
+            );
+            (stream.sink.0)(text).await;
+        }
+        line.clear();
     }
 
     /// The `-f` and `--env-file` arguments shared by every `docker compose`
@@ -6289,6 +6432,7 @@ impl ComposeExecutor {
         project_name: &str,
         compose_file: &str,
         redact_values: &[String],
+        output_sink: Option<&ComposeOutputSink>,
     ) -> Result<(), ComposeError> {
         let mut cmd = isolated_docker_command();
         cmd.args(["compose", "-p", project_name]);
@@ -6304,11 +6448,15 @@ impl ComposeExecutor {
 
         debug!(project = %project_name, "Running docker compose pull");
 
-        let output = Self::bounded_command_output(
+        let output = Self::bounded_command_output_streamed(
             cmd,
             COMPOSE_PULL_TIMEOUT,
             project_name,
             "docker compose pull",
+            output_sink.map(|sink| OutputStream {
+                sink,
+                redact_values,
+            }),
         )
         .await?;
 
@@ -6331,6 +6479,7 @@ impl ComposeExecutor {
         project_name: &str,
         compose_file: &str,
         redact_values: &[String],
+        output_sink: Option<&ComposeOutputSink>,
     ) -> Result<(), ComposeError> {
         let mut cmd = isolated_docker_command();
         cmd.args(["compose", "-p", project_name]);
@@ -6348,11 +6497,15 @@ impl ComposeExecutor {
 
         debug!(project = %project_name, "Running docker compose up");
 
-        let output = Self::bounded_command_output(
+        let output = Self::bounded_command_output_streamed(
             cmd,
             COMPOSE_UP_TIMEOUT,
             project_name,
             "docker compose up",
+            output_sink.map(|sink| OutputStream {
+                sink,
+                redact_values,
+            }),
         )
         .await?;
 
@@ -10054,6 +10207,7 @@ services:
       retries: 1
 "#;
         let request = ComposeDeployRequest {
+            output_sink: None,
             project_name: project_name.clone(),
             compose_content: compose.to_string(),
             env_content: None,
@@ -10181,6 +10335,7 @@ services:
     command: ["sh", "-c", "echo quick-exit-diagnostic; exit 17"]
 "#;
         let request = ComposeDeployRequest {
+            output_sink: None,
             project_name: project_name.clone(),
             compose_content: compose.to_string(),
             env_content: None,
@@ -10291,6 +10446,7 @@ services:
       retries: 1
 "#;
         let request = ComposeDeployRequest {
+            output_sink: None,
             project_name: project_name.clone(),
             compose_content: compose.to_string(),
             env_content: None,
@@ -10480,6 +10636,7 @@ services:
         .await
         .unwrap();
         let request = ComposeDeployRequest {
+            output_sink: None,
             project_name: "temps-test".to_string(),
             compose_content:
                 "services:\n  webserver:\n    image: paperlessngx/paperless-ngx:latest\n"
@@ -10553,6 +10710,7 @@ services:
         };
         let project_dir = tempfile::tempdir().unwrap();
         let request = ComposeDeployRequest {
+            output_sink: None,
             project_name: "temps-test".to_string(),
             compose_content: "services:\n  app:\n    image: nginx\n    env_file: \
                               docker-compose.temps-override.yml\n"
@@ -10599,6 +10757,7 @@ services:
         };
         let project_dir = tempfile::tempdir().unwrap();
         let request = ComposeDeployRequest {
+            output_sink: None,
             project_name: "temps-test".to_string(),
             compose_content: "services:\n  app:\n    image: nginx\n    env_file:\n      \
                               - path: docker-compose.temps-security.yml\n        required: false\n"
@@ -10634,6 +10793,7 @@ services:
         };
         let project_dir = tempfile::tempdir().unwrap();
         let request = ComposeDeployRequest {
+            output_sink: None,
             project_name: "temps-test".to_string(),
             compose_content: "services:\n  app:\n    image: nginx\n".to_string(),
             env_content: None,
@@ -10668,6 +10828,7 @@ services:
         };
         let project_dir = tempfile::tempdir().unwrap();
         let request = ComposeDeployRequest {
+            output_sink: None,
             project_name: "temps-test".to_string(),
             compose_content: "services:\n  app:\n    image: nginx\n    env_file: app.env\n"
                 .to_string(),
@@ -10773,6 +10934,7 @@ services:
         secrets: HashMap<String, String>,
     ) -> ComposeDeployRequest {
         ComposeDeployRequest {
+            output_sink: None,
             project_name: project_name.to_string(),
             compose_content: compose_content.to_string(),
             env_content: None,
@@ -13196,7 +13358,227 @@ services:
         let sanitized = sanitize_compose_diagnostic(&diagnostic, &[]);
 
         assert!(sanitized.len() < diagnostic.len());
-        assert!(sanitized.contains("diagnostic truncated"));
+        assert!(sanitized.contains("earlier output truncated"));
+    }
+
+    #[test]
+    fn compose_diagnostics_keep_the_tail_where_the_error_is() {
+        // A long BuildKit log: every successful step first, the failure last.
+        let mut diagnostic = "#5 [build 2/9] RUN npm ci\n".repeat(4096);
+        diagnostic.push_str("#9 ERROR: process \"/bin/sh -c npm run build\" did not complete successfully: exit code: 1\n");
+        diagnostic.push_str(
+            "failed to solve: process \"/bin/sh -c npm run build\" did not complete successfully",
+        );
+
+        let sanitized = sanitize_compose_diagnostic(&diagnostic, &[]);
+
+        assert!(sanitized.len() <= MAX_COMPOSE_DIAGNOSTIC_BYTES + 128);
+        assert!(sanitized.starts_with("… earlier output truncated"));
+        assert!(sanitized.contains("#9 ERROR: process"), "{sanitized}");
+        assert!(sanitized.ends_with("did not complete successfully"));
+    }
+
+    #[test]
+    fn multi_line_sensitive_values_are_redacted_line_by_line() {
+        let key = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n}\n-----END PRIVATE KEY-----";
+        let mut request = test_deploy_request_for_redaction();
+        request
+            .environment_vars
+            .insert("SIGNING_KEY".to_string(), key.to_string());
+
+        let values = collect_redactable_values(&request);
+
+        assert!(values.contains(&key.to_string()));
+        assert!(values.contains(&"MIIEvQIBADANBgkqhkiG9w0BAQEFAASC".to_string()));
+        // Too short to redact on its own without blanking unrelated output.
+        assert!(!values.contains(&"}".to_string()));
+        assert_eq!(
+            sanitize_compose_diagnostic("#7 0.31 MIIEvQIBADANBgkqhkiG9w0BAQEFAASC", &values),
+            "#7 0.31 <redacted>"
+        );
+    }
+
+    fn test_deploy_request_for_redaction() -> ComposeDeployRequest {
+        ComposeDeployRequest {
+            project_name: "temps-1-1".to_string(),
+            compose_content: "services: {}\n".to_string(),
+            env_content: None,
+            work_dir: PathBuf::from("/tmp"),
+            compose_path: None,
+            environment_vars: HashMap::new(),
+            secrets: HashMap::new(),
+            secret_compose_services: HashMap::new(),
+            build_args: HashMap::new(),
+            labels: HashMap::new(),
+            repo_dir: None,
+            compose_override: None,
+            relaxed_capability_services: Vec::new(),
+            unsandboxed_services: Vec::new(),
+            ready_timeout: None,
+            routed_services: Vec::new(),
+            output_sink: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_output_is_forwarded_per_line_redacted_and_tail_captured() {
+        let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let received = lines.clone();
+        let sink = ComposeOutputSink(Arc::new(move |line: String| {
+            let received = received.clone();
+            Box::pin(async move {
+                if let Ok(mut lines) = received.lock() {
+                    lines.push(line);
+                }
+            })
+        }));
+        let redact = vec!["s3cr3t-value".to_string()];
+        let stream = OutputStream {
+            sink: &sink,
+            redact_values: &redact,
+        };
+        let output: &[u8] =
+            b"#1 [internal] load build definition\r\n\n#2 ARG TOKEN=s3cr3t-value\n#3 ERROR: boom";
+
+        let captured =
+            ComposeExecutor::read_bounded_stream(output, CapturedEnd::Tail, Some(stream))
+                .await
+                .unwrap();
+
+        assert_eq!(captured, output);
+        let lines = lines.lock().unwrap().clone();
+        assert_eq!(
+            lines,
+            vec![
+                "#1 [internal] load build definition".to_string(),
+                "#2 ARG TOKEN=<redacted>".to_string(),
+                // The final line has no newline and is still delivered.
+                "#3 ERROR: boom".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn stderr_capture_keeps_the_last_bytes_and_stdout_the_first() {
+        let mut output = vec![b'a'; MAX_COMPOSE_COMMAND_OUTPUT_BYTES * 3];
+        output.extend_from_slice(b"the error");
+
+        let tail = ComposeExecutor::read_bounded_stream(output.as_slice(), CapturedEnd::Tail, None)
+            .await
+            .unwrap();
+        let head = ComposeExecutor::read_bounded_stream(output.as_slice(), CapturedEnd::Head, None)
+            .await
+            .unwrap();
+
+        assert_eq!(tail.len(), MAX_COMPOSE_COMMAND_OUTPUT_BYTES);
+        assert!(tail.ends_with(b"the error"));
+        assert_eq!(head.len(), MAX_COMPOSE_COMMAND_OUTPUT_BYTES);
+        assert!(head.iter().all(|byte| *byte == b'a'));
+    }
+
+    /// A real failing `docker compose build`: project variables reach the
+    /// Dockerfile as build args, every line streams to the sink with secrets
+    /// redacted, and the error keeps the failing step instead of the start
+    /// of the build log.
+    #[tokio::test]
+    async fn failing_compose_build_streams_output_and_reports_the_failing_step() {
+        let Some(executor) = test_executor() else {
+            return;
+        };
+        let compose_available = isolated_docker_command()
+            .args(["compose", "version"])
+            .output()
+            .await
+            .is_ok_and(|output| output.status.success());
+        let alpine_available = match executor.docker.require() {
+            Ok(docker) => docker.inspect_image("alpine:latest").await.is_ok(),
+            Err(_) => false,
+        };
+        if !compose_available || !alpine_available {
+            println!("Docker Compose or alpine:latest is unavailable; skipping runtime test");
+            return;
+        }
+
+        let project_dir = tempfile::tempdir().unwrap();
+        let compose = "services:\n  app:\n    build: .\n";
+        tokio::fs::write(project_dir.path().join("compose.yml"), compose)
+            .await
+            .unwrap();
+        tokio::fs::write(
+            project_dir.path().join("Dockerfile"),
+            "FROM alpine:latest\n\
+             ARG GREETING\n\
+             ARG API_TOKEN\n\
+             RUN echo \"greeting=$GREETING token=$API_TOKEN\"\n\
+             RUN echo \"about to fail\" && exit 3\n",
+        )
+        .await
+        .unwrap();
+        // Unique per run: a cached layer would not print its output again.
+        let greeting = format!(
+            "hello-from-project-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or_default()
+        );
+        let project_vars = HashMap::from([
+            ("GREETING".to_string(), greeting.clone()),
+            ("API_TOKEN".to_string(), "tok-7f3a9c1e5b".to_string()),
+        ]);
+        let env_path = project_dir.path().join(".env.temps");
+        tokio::fs::write(&env_path, render_env_file(&project_vars).unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(
+            project_dir.path().join("docker-compose.temps-env.yml"),
+            executor.generate_env_override(compose, &env_path.to_string_lossy(), &project_vars),
+        )
+        .await
+        .unwrap();
+
+        let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let received = lines.clone();
+        let sink = ComposeOutputSink(Arc::new(move |line: String| {
+            let received = received.clone();
+            Box::pin(async move {
+                if let Ok(mut lines) = received.lock() {
+                    lines.push(line);
+                }
+            })
+        }));
+        // Only the token is sensitive here, so the greeting stays readable.
+        let redact = vec!["tok-7f3a9c1e5b".to_string()];
+        let project_name = format!("temps-build-stream-{}", std::process::id());
+
+        let error = executor
+            .compose_build(
+                project_dir.path(),
+                &project_name,
+                "compose.yml",
+                &redact,
+                &HashMap::new(),
+                Some(&sink),
+            )
+            .await
+            .expect_err("the Dockerfile exits 3, so the build must fail");
+
+        let streamed = lines.lock().unwrap().join("\n");
+        assert!(
+            streamed.contains(&format!("greeting={greeting}")),
+            "project variables must reach the Dockerfile as build args:\n{streamed}"
+        );
+        assert!(streamed.contains("about to fail"), "{streamed}");
+        assert!(!streamed.contains("tok-7f3a9c1e5b"), "{streamed}");
+        assert!(streamed.contains("token=<redacted>"), "{streamed}");
+
+        // BuildKit and the classic builder word the failing step differently.
+        let message = error.to_string();
+        assert!(
+            message.contains("exit code: 3") || message.contains("non-zero code: 3"),
+            "{message}"
+        );
+        assert!(!message.contains("tok-7f3a9c1e5b"), "{message}");
     }
 
     #[test]

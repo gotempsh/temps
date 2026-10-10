@@ -20,9 +20,11 @@ use temps_core::{
     JobResult, WorkflowCancellationProvider, WorkflowContext, WorkflowError, WorkflowTask,
 };
 use temps_database::DbConnection;
-use temps_deployer::compose::{ComposeDeployRequest, ComposeExecutor, EnvFileSource};
+use temps_deployer::compose::{
+    ComposeDeployRequest, ComposeExecutor, ComposeOutputSink, EnvFileSource,
+};
 use temps_entities::{deployment_containers, deployments, preset::ComposePublicPort};
-use temps_logs::LogService;
+use temps_logs::{LogLevel, LogService};
 use tracing::debug;
 
 fn route_binding_for_service<'a>(
@@ -384,7 +386,50 @@ impl DeployComposeJobBuilder {
     }
 }
 
+/// Log level for one line of `docker compose` output. BuildKit marks a
+/// failing step `ERROR` and ends with `failed to solve`; Compose prefixes its
+/// own failures with `Error`/`error`. Everything else is progress.
+fn compose_output_level(line: &str) -> LogLevel {
+    let trimmed = line.trim_start();
+    if trimmed.contains("ERROR")
+        || trimmed.starts_with("Error")
+        || trimmed.starts_with("error")
+        || trimmed.starts_with("failed to solve")
+    {
+        LogLevel::Error
+    } else if trimmed.starts_with("WARN") || trimmed.contains(" WARN") {
+        LogLevel::Warning
+    } else {
+        LogLevel::Info
+    }
+}
+
 impl DeployComposeJob {
+    /// Stream `docker compose build`/`pull`/`up` output into this job's log
+    /// as it happens, so a failing build shows the step that broke and its
+    /// full error rather than only the tail attached to the job failure.
+    /// Lines arrive already redacted by the executor.
+    fn compose_output_sink(&self) -> Option<ComposeOutputSink> {
+        let log_id = self.log_id.clone()?;
+        let log_service = self.log_service.clone();
+        Some(ComposeOutputSink(Arc::new(move |line: String| {
+            let log_service = log_service.clone();
+            let log_id = log_id.clone();
+            Box::pin(async move {
+                let level = compose_output_level(&line);
+                if let Err(error) = log_service
+                    .append_structured_log(&log_id, level, line)
+                    .await
+                {
+                    tracing::warn!(
+                        log_id = %log_id,
+                        "Failed to append docker compose output to deployment log: {error}"
+                    );
+                }
+            })
+        })))
+    }
+
     /// Mark any prior Compose container rows for this environment as replaced.
     /// The runtime stack uses one deterministic Compose project name per
     /// environment, so `docker compose up` cannot leave more than one candidate
@@ -1089,6 +1134,7 @@ impl DeployComposeJob {
                 .iter()
                 .map(|port| port.service.clone())
                 .collect(),
+            output_sink: self.compose_output_sink(),
         };
 
         // Prepare compose files, build (if needed), and pull images BEFORE
@@ -1807,6 +1853,24 @@ pub(crate) fn canonicalize_confined_repo_path(
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn compose_output_level_marks_build_failures_as_errors() {
+        for line in [
+            "#9 ERROR: process \"/bin/sh -c npm run build\" did not complete successfully",
+            "failed to solve: process \"/bin/sh -c npm run build\" did not complete successfully",
+            "Error response from daemon: pull access denied",
+        ] {
+            assert!(
+                matches!(compose_output_level(line), LogLevel::Error),
+                "{line}"
+            );
+        }
+        assert!(matches!(
+            compose_output_level("#4 [build 1/6] FROM docker.io/library/node:22-alpine"),
+            LogLevel::Info
+        ));
+    }
 
     fn test_db() -> Arc<DbConnection> {
         Arc::new(sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection())
