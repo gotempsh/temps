@@ -6225,11 +6225,17 @@ impl ComposeExecutor {
         if trimmed {
             // The cut can land inside a sensitive value, leaving a fragment no
             // redaction rule recognises. Start at the next whole line instead.
-            // Output with no newline at all is kept: the diagnostic built from
-            // it keeps only its last MAX_COMPOSE_DIAGNOSTIC_BYTES, far from
-            // this cut.
+            // When no complete line follows the cut (one line longer than the
+            // capture), it is kept as is: the diagnostic built from it keeps
+            // only its last MAX_COMPOSE_DIAGNOSTIC_BYTES, far from this cut,
+            // and dropping it would leave the error with no detail at all.
             if let Some(newline) = captured.iter().position(|byte| *byte == b'\n') {
-                captured.drain(..=newline);
+                let rest_has_content = captured[newline + 1..]
+                    .iter()
+                    .any(|byte| !byte.is_ascii_whitespace());
+                if rest_has_content {
+                    captured.drain(..=newline);
+                }
             }
         }
         Ok(captured)
@@ -13756,6 +13762,23 @@ services:
         assert!(tail.ends_with(b"the error"));
         assert_eq!(head.len(), MAX_COMPOSE_COMMAND_OUTPUT_BYTES);
         assert!(head.iter().all(|byte| *byte == b'a'));
+    }
+
+    #[tokio::test]
+    async fn trimmed_stderr_keeps_a_single_overlong_final_line() {
+        // One error line longer than the capture, ending in a newline: there
+        // is no whole line after the cut, so the tail must survive.
+        let mut output = vec![b'a'; MAX_COMPOSE_COMMAND_OUTPUT_BYTES * 2];
+        output.extend_from_slice(b" the actual error\n");
+
+        let tail = ComposeExecutor::read_bounded_stream(output.as_slice(), CapturedEnd::Tail, None)
+            .await
+            .unwrap();
+
+        assert_eq!(tail.len(), MAX_COMPOSE_COMMAND_OUTPUT_BYTES);
+        assert!(tail.ends_with(b" the actual error\n"));
+        let diagnostic = sanitize_compose_diagnostic(&String::from_utf8_lossy(&tail), &[]);
+        assert!(diagnostic.contains("the actual error"));
     }
 
     #[tokio::test]
