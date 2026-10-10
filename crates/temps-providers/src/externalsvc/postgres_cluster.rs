@@ -263,7 +263,7 @@ pub fn monitor_connection_string(
 ///
 /// Cluster members advertise bare addresses (pg_autoctl `--hostname`, Docker
 /// port bindings and libpq `host=` all take `fd00::10` as is), but in a URI
-/// `user@fd00::10:6030` is unparseable: a data member given that monitor URI
+/// `user@fd00::10:6030` is unparsable: a data member given that monitor URI
 /// could never register.
 pub(crate) fn uri_host(host: &str) -> std::borrow::Cow<'_, str> {
     if host.parse::<std::net::Ipv6Addr>().is_ok() {
@@ -363,6 +363,15 @@ chmod 600 "$PGPASS_FILE""#;
 /// replicates to the standbys). Expects `PGDATA`, `NODE_PORT`,
 /// `AUTOCTL_NODE_PASSWORD` and `REPLICATION_PASSWORD`. Starts a background
 /// retry loop.
+///
+/// During the in-place upgrade (`TEMPS_AUTH_UPGRADE=1`, see
+/// [`PostgresClusterService::auth_upgrade_command`]), a standby that is still
+/// taking its initial base backup has pg_autoctl configuration but no
+/// database (`$PGDATA/PG_VERSION`) yet. It is not the primary and receives
+/// every role from the primary with that backup, so it has nothing to set and
+/// the loop exits 0 instead of waiting for a server that cannot start until
+/// the backup completes. The entrypoint does not set the flag: there the loop
+/// must keep waiting for `pg_autoctl run` to start PostgreSQL.
 const NODE_PREPARE_SNIPPET: &str = r#"if gosu postgres pg_autoctl config get --pgdata "$PGDATA" postgresql.pgdata >/dev/null 2>&1; then
   gosu postgres pg_autoctl config set --pgdata "$PGDATA" replication.password "$REPLICATION_PASSWORD" >/dev/null 2>&1 || exit 1
   gosu postgres pg_autoctl config set --pgdata "$PGDATA" postgresql.auth_method scram-sha-256 >/dev/null 2>&1 || true
@@ -376,6 +385,10 @@ const NODE_PREPARE_SNIPPET: &str = r#"if gosu postgres pg_autoctl config get --p
 fi
 (
   for _ in $(seq 1 300); do
+    if [ "${TEMPS_AUTH_UPGRADE:-}" = 1 ] && [ ! -f "$PGDATA/PG_VERSION" ]; then
+      echo "temps: $PGDATA holds no database yet (standby awaiting its initial base backup); the replication password is set on the primary" >&2
+      exit 0
+    fi
     IN_RECOVERY=$(gosu postgres psql -X -At -p "$NODE_PORT" -d postgres -c "SELECT pg_is_in_recovery()" 2>/dev/null || true)
     if [ "$IN_RECOVERY" = "t" ]; then
       exit 0
@@ -388,6 +401,7 @@ fi
     fi
     sleep 1
   done
+  echo "temps: PostgreSQL on port $NODE_PORT did not accept local connections within 300s; the replication password was not confirmed on this member" >&2
   exit 1
 ) &"#;
 
@@ -446,11 +460,17 @@ WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'app_db')\gexec"#;
 /// once the rules are decided (keeping `md5` is a decision), and 1 when
 /// PostgreSQL never answered, so nothing was decided: the member keeps its
 /// current rules, and an upgrade waiting on the job must not record the
-/// cluster as converged. The entrypoint does not wait on it.
+/// cluster as converged. The entrypoint does not wait on it. During the
+/// upgrade a member with no database yet exits 0, for the reason given on
+/// [`NODE_PREPARE_SNIPPET`]: its base backup brings the primary's rules.
 const NODE_APP_AUTH_SNIPPET: &str = r#"(
   HBA="$PGDATA/pg_hba.conf"
   APP_RULE='^([[:space:]]*host(ssl)?[[:space:]]+all[[:space:]]+all[[:space:]]+(0\.0\.0\.0/0|::/0)[[:space:]]+)(md5|scram-sha-256)([[:space:]]|$)'
   for _ in $(seq 1 300); do
+    if [ "${TEMPS_AUTH_UPGRADE:-}" = 1 ] && [ ! -f "$PGDATA/PG_VERSION" ]; then
+      echo "temps: $PGDATA holds no database yet (standby awaiting its initial base backup); it takes the primary's pg_hba rules with that backup" >&2
+      exit 0
+    fi
     MD5_ROLES=$(gosu postgres psql -X -At -p "$NODE_PORT" -d postgres -c "SELECT count(*) FROM pg_authid WHERE rolcanlogin AND rolpassword LIKE 'md5%'" 2>/dev/null || true)
     case "$MD5_ROLES" in
       ''|*[!0-9]*) sleep 1; continue ;;
@@ -630,17 +650,25 @@ impl PostgresClusterService {
             AuthUpgradeStep::NodePrepare => ("/var/lib/postgresql/pgdata", NODE_PREPARE_SNIPPET),
             AuthUpgradeStep::NodeEnforce => ("/var/lib/postgresql/pgdata", NODE_ENFORCE_SNIPPET),
         };
-        let mut script = vec!["set -e".to_string(), format!("PGDATA={pgdata}")];
+        let mut script = vec![
+            "set -e".to_string(),
+            format!("PGDATA={pgdata}"),
+            // Lets the shared snippets tell this exec from the entrypoint.
+            "TEMPS_AUTH_UPGRADE=1".to_string(),
+        ];
         if matches!(
             step,
             AuthUpgradeStep::MonitorPrepare | AuthUpgradeStep::NodePrepare
         ) {
             // Preserve legacy entrypoints' initialization guard on restart,
             // while asking pg_autoctl for its actual XDG config location.
+            // A standby still taking its initial base backup has the config
+            // but no `$PGDATA` directory yet; creating one would collide with
+            // the backup that pg_autoctl moves into place, so it is skipped.
             script.push(
                 r#"CONFIG_FILE=$(gosu postgres pg_autoctl show file --pgdata "$PGDATA" --config)
 [ -f "$CONFIG_FILE" ]
-if [ "$CONFIG_FILE" != "$PGDATA/pg_autoctl.cfg" ] && [ ! -e "$PGDATA/pg_autoctl.cfg" ]; then
+if [ -d "$PGDATA" ] && [ "$CONFIG_FILE" != "$PGDATA/pg_autoctl.cfg" ] && [ ! -e "$PGDATA/pg_autoctl.cfg" ]; then
   ln -s "$CONFIG_FILE" "$PGDATA/pg_autoctl.cfg"
   chown -h postgres:postgres "$PGDATA/pg_autoctl.cfg"
 fi"#
@@ -1666,6 +1694,117 @@ exit 0
                 !calls.contains("psql"),
                 "restart must not change credentials independently"
             );
+        }
+    }
+
+    /// Regression for #1352: adding a replica re-ran the in-place upgrade on
+    /// an existing standby still waiting for its initial base backup. It has
+    /// pg_autoctl configuration but no `$PGDATA` directory, so NodePrepare
+    /// failed with "ln: failed to create symbolic link .../pg_autoctl.cfg".
+    /// Both data-node steps must instead converge without creating `$PGDATA`
+    /// (pg_autoctl moves the backup into place there) and without waiting for
+    /// a server that cannot start until the backup completes.
+    #[test]
+    fn data_node_upgrade_steps_converge_on_a_standby_without_a_database() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        for command in ["chown", "chmod"] {
+            let path = bin.join(command);
+            std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let config_file = dir.path().join("xdg/pg_autoctl.cfg");
+        std::fs::create_dir_all(config_file.parent().unwrap()).unwrap();
+        std::fs::write(&config_file, "[pg_autoctl]\n").unwrap();
+        // pg_autoctl answers from its configuration; PostgreSQL is not
+        // running, so every psql call fails.
+        let gosu = bin.join("gosu");
+        std::fs::write(
+            &gosu,
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "$COMMAND_LOG"
+case "$*" in
+  *"pg_autoctl show file"*) printf '%s\n' "$CONFIG_FILE" ;;
+  *psql*) exit 2 ;;
+esac
+exit 0
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(gosu, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let pgdata = dir.path().join("pgdata");
+        let pgpass = dir.path().join(".pgpass");
+        for step in [AuthUpgradeStep::NodePrepare, AuthUpgradeStep::NodeEnforce] {
+            let log = dir.path().join("commands");
+            std::fs::write(&log, "").unwrap();
+            let script = PostgresClusterService::auth_upgrade_command(step)[2]
+                .replace("/var/lib/postgresql/pgdata", pgdata.to_str().unwrap())
+                .replace("/var/lib/postgresql/.pgpass", pgpass.to_str().unwrap());
+            let Ok(mut child) = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(&script)
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .env("COMMAND_LOG", &log)
+                .env("CONFIG_FILE", &config_file)
+                .env("NODE_PORT", "6201")
+                .env("AUTOCTL_NODE_PASSWORD", "node-secret")
+                .env("REPLICATION_PASSWORD", "replication-secret")
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+            else {
+                eprintln!("bash unavailable; skipping {step:?} script test");
+                return;
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if std::time::Instant::now() > deadline {
+                    let _ = child.kill();
+                    panic!(
+                        "{step:?} waited for a server a standby without a database cannot start"
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            };
+            let mut stderr = String::new();
+            std::io::Read::read_to_string(child.stderr.as_mut().unwrap(), &mut stderr).unwrap();
+            assert!(status.success(), "{step:?} failed: {stderr}");
+            assert!(
+                !pgdata.exists(),
+                "{step:?} must not create PGDATA ahead of the base backup"
+            );
+            assert!(stderr.contains("no database yet"), "{step:?}: {stderr}");
+            if step == AuthUpgradeStep::NodePrepare {
+                // The standby still records the credentials it will use.
+                let calls = std::fs::read_to_string(&log).unwrap();
+                assert!(calls.contains("config set"), "{calls}");
+                assert!(calls.contains("replication.password"), "{calls}");
+                assert!(std::fs::read_to_string(&pgpass)
+                    .unwrap()
+                    .contains("pgautofailover_replicator:replication-secret"));
+            }
+        }
+    }
+
+    /// The no-database shortcut belongs to the exec'd upgrade only: in the
+    /// entrypoint, the replicator-password loop must keep waiting for
+    /// `pg_autoctl run` to start PostgreSQL on a freshly initialized primary.
+    #[test]
+    fn entrypoint_keeps_waiting_for_postgres_before_setting_the_replicator_password() {
+        let docker =
+            Docker::connect_with_http("http://127.0.0.1:1", 120, bollard::API_DEFAULT_VERSION)
+                .unwrap();
+        let service = PostgresClusterService::new("test".into(), Arc::new(docker));
+        let entrypoint = &service.node_command()[2];
+        assert!(!entrypoint.contains("TEMPS_AUTH_UPGRADE=1"));
+        for step in [AuthUpgradeStep::NodePrepare, AuthUpgradeStep::NodeEnforce] {
+            assert!(PostgresClusterService::auth_upgrade_command(step)[2]
+                .contains("TEMPS_AUTH_UPGRADE=1"));
         }
     }
 

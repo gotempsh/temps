@@ -5,10 +5,8 @@ import { HighlightedCode } from '@/components/ui/code-block'
 /**
  * Postgres WAL health surface on the service detail page.
  *
- * Renders nothing when the probe has no warnings — the absence of an alert
- * is the success state. When warnings are present, shows a single Alert
- * with one row per warning and a remediation SQL snippet the operator can
- * copy/paste.
+ * Shows disabled continuous archiving with a full-backup action, and one
+ * row per WAL warning with guidance matched to the active SQL settings.
  */
 import {
   formatBytes,
@@ -29,9 +27,17 @@ interface Props {
   serviceId: number
   serviceType: string
   onUpgrade?: () => void
+  onBackup?: () => void
+  isImported?: boolean
 }
 
-export function WalHealthPanel({ serviceId, serviceType, onUpgrade }: Props) {
+export function WalHealthPanel({
+  serviceId,
+  serviceType,
+  onUpgrade,
+  onBackup,
+  isImported = false,
+}: Props) {
   // Only Postgres services produce WAL health snapshots. Bail out early so
   // we don't spam the API with 404s for Redis / Mongo / S3 services.
   const enabled = serviceType === 'postgres'
@@ -53,9 +59,11 @@ export function WalHealthPanel({ serviceId, serviceType, onUpgrade }: Props) {
 
   const snapshot = data?.wal_health ?? null
   const incompatible = backupCapability.data?.cloud_backup_compatible === false
+  const archivingDisabled = snapshot?.archive_mode === 'off' && !incompatible
   if (
     (!snapshot || snapshot.warnings.length === 0) &&
     !incompatible &&
+    !archivingDisabled &&
     !backupCapability.isError
   ) {
     return null
@@ -113,6 +121,41 @@ export function WalHealthPanel({ serviceId, serviceType, onUpgrade }: Props) {
           </AlertDescription>
         </Alert>
       ) : null}
+      {archivingDisabled ? (
+        <Alert>
+          <AlertTriangle className="h-4 w-4" />
+          <AlertDescription className="space-y-3">
+            <div>
+              <p className="font-medium">
+                Continuous WAL archiving is disabled
+              </p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {isImported ? (
+                  <>
+                    This imported database’s startup settings are managed outside
+                    Temps. Enable archive_mode in its external PostgreSQL startup
+                    settings and restart it before creating a full backup.
+                    Alternatively, restore into a new managed service. Temps
+                    cannot change the imported container’s startup command.
+                  </>
+                ) : (
+                  <>
+                    A restore disables WAL pushes to protect its source backup.
+                    Point-in-time recovery needs a new full backup to configure and
+                    verify this service’s pinned archive destination. Restarting
+                    alone keeps archiving disabled.
+                  </>
+                )}
+              </p>
+            </div>
+            {onBackup && !isImported ? (
+              <Button size="sm" onClick={onBackup}>
+                Create full backup
+              </Button>
+            ) : null}
+          </AlertDescription>
+        </Alert>
+      ) : null}
       {snapshot && snapshot.warnings.length > 0 ? (
         <Alert variant={hasCritical ? 'destructive' : 'default'}>
           {hasCritical ? (
@@ -155,7 +198,11 @@ export function WalHealthPanel({ serviceId, serviceType, onUpgrade }: Props) {
 
             <ul className="space-y-2">
               {snapshot.warnings.map((w, idx) => (
-                <WarningRow key={`${w.kind}-${idx}`} warning={w} />
+                <WarningRow
+                  key={`${w.kind}-${idx}`}
+                  warning={w}
+                  archiveCommand={snapshot.archive_command}
+                />
               ))}
             </ul>
           </AlertDescription>
@@ -165,8 +212,14 @@ export function WalHealthPanel({ serviceId, serviceType, onUpgrade }: Props) {
   )
 }
 
-function WarningRow({ warning }: { warning: WalWarning }) {
-  const { title, body, fix } = describeWarning(warning)
+function WarningRow({
+  warning,
+  archiveCommand,
+}: {
+  warning: WalWarning
+  archiveCommand?: string | null
+}) {
+  const { title, body, fix } = describeWarning(warning, archiveCommand)
   return (
     <li className="flex flex-col gap-1 border-t border-border/50 pt-2 first:border-t-0 first:pt-0">
       <p className="text-sm font-medium">{title}</p>
@@ -191,7 +244,10 @@ interface WarningView {
   fix?: string
 }
 
-function describeWarning(w: WalWarning): WarningView {
+function describeWarning(
+  w: WalWarning,
+  archiveCommand?: string | null
+): WarningView {
   switch (w.kind) {
     case 'wal_bloat':
       return {
@@ -213,8 +269,12 @@ function describeWarning(w: WalWarning): WarningView {
       }
     case 'archive_mode_without_command':
       return {
-        title: 'archive_mode is on, but archive_command is empty',
-        body: 'WAL is being held forever waiting for a destination that never accepts it. Stop and start this service from the actions menu — Temps reconciles archive_mode on start and the container will come back up with archive_mode=off (or =on if you’ve since configured WAL-G).',
+        title: archiveCommand?.trim()
+          ? 'archive_mode is on, but archive_command discards WAL'
+          : 'archive_mode is on, but archive_command is empty',
+        body: archiveCommand?.trim()
+          ? 'The no-op archive command reports success without storing WAL. Continuous recovery coverage is unavailable. Create a full backup to configure and verify the pinned archive destination.'
+          : 'An empty archive command leaves WAL waiting for a destination and can fill disk. Create a full backup to configure and verify the pinned archive destination.',
       }
     case 'wal_not_recycled':
       return {

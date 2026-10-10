@@ -678,6 +678,12 @@ Current limits of worker builds:
   Dockerfile may declare an `ARG` that no project variable sets (for example
   `ARG NODE_VERSION=22`); an `ARG` that one would set is refused by name.
 
+Build caches stay separate per project on a shared worker: like the control
+plane, a worker scopes `RUN --mount=type=cache` mounts by project, environment
+and branch, so one project's build cannot read or overwrite another's package
+or compiler cache. Upgrade `temps agent` on build nodes to get this; an older
+agent builds without the namespace.
+
 ---
 
 ## Mixed architectures {{ anchor: true, id: 'mixed-architectures' }}

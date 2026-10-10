@@ -412,6 +412,73 @@ fn cluster_member_host_port(base: u16, ordinal: i32, is_monitor: bool) -> Option
     }
 }
 
+/// A short database reservation shared by every service-name writer,
+/// including restore admission and final clone registration.
+#[derive(Debug, thiserror::Error)]
+pub enum ServiceIdentityReservationError {
+    #[error("Database error while reserving service name: {0}")]
+    Database(#[from] sea_orm::DbErr),
+    #[error("Service name '{name}' is already used by service {existing_service_id}. Choose a unique name before creating or changing a service.")]
+    Registered {
+        name: String,
+        existing_service_id: i32,
+    },
+    #[error("Service name '{name}' is reserved by restore run {restore_run_id}. Wait for that restore to finish or choose a unique name.")]
+    Restoring { name: String, restore_run_id: i32 },
+}
+
+/// Reserve the name only until this transaction commits. A clone restore
+/// persists an active target-name reservation before it releases the lock;
+/// Docker and WAL-G work never hold this transaction open.
+pub async fn reserve_service_identity(
+    txn: &sea_orm::DatabaseTransaction,
+    name: &str,
+    exclude_service_id: Option<i32>,
+    exclude_restore_run_id: Option<i32>,
+) -> Result<(), ServiceIdentityReservationError> {
+    use sea_orm::ConnectionTrait;
+    txn.execute(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT pg_advisory_xact_lock(hashtextextended('external-service-name:' || $1, 0))",
+        [name.into()],
+    ))
+    .await?;
+    let mut query =
+        external_services::Entity::find().filter(external_services::Column::Name.eq(name));
+    if let Some(id) = exclude_service_id {
+        query = query.filter(external_services::Column::Id.ne(id));
+    }
+    if let Some(existing) = query.one(txn).await? {
+        return Err(ServiceIdentityReservationError::Registered {
+            name: name.to_string(),
+            existing_service_id: existing.id,
+        });
+    }
+    let mut query = temps_entities::restore_runs::Entity::find()
+        .filter(temps_entities::restore_runs::Column::TargetServiceName.eq(name))
+        .filter(temps_entities::restore_runs::Column::Status.is_in(["pending", "running"]));
+    if let Some(id) = exclude_restore_run_id {
+        query = query.filter(temps_entities::restore_runs::Column::Id.ne(id));
+    }
+    if let Some(run) = query.one(txn).await? {
+        return Err(ServiceIdentityReservationError::Restoring {
+            name: name.to_string(),
+            restore_run_id: run.id,
+        });
+    }
+    Ok(())
+}
+
+async fn reserve_service_name(
+    txn: &sea_orm::DatabaseTransaction,
+    name: &str,
+    exclude_service_id: Option<i32>,
+) -> Result<(), ExternalServiceError> {
+    reserve_service_identity(txn, name, exclude_service_id, None)
+        .await
+        .map_err(ExternalServiceError::from)
+}
+
 /// `pg_advisory_xact_lock` key serializing cluster port-block reservation
 /// ("TEMPSPRT"), so two concurrent creations cannot pick the same block.
 const CLUSTER_PORT_LOCK_KEY: i64 = 0x5445_4D50_5350_5254;
@@ -497,6 +564,37 @@ fn select_remote_container_name(
 pub enum ExternalServiceError {
     #[error("Service {id} not found")]
     ServiceNotFound { id: i32 },
+
+    #[error("Service name '{name}' is already used by service {existing_service_id}. Choose a unique name before creating or changing a service.")]
+    ServiceNameConflict {
+        name: String,
+        existing_service_id: i32,
+    },
+
+    #[error("Service name '{name}' is reserved by restore run {restore_run_id}. Wait for that restore to finish or choose a unique name.")]
+    ServiceNameRestoreConflict { name: String, restore_run_id: i32 },
+
+    #[error("Docker container '{container}' is being created by restore run {restore_run_id}. Wait for that restore to finish before importing an unowned container.")]
+    ServiceContainerRestoreConflict {
+        container: String,
+        restore_run_id: i32,
+    },
+
+    #[error("Service {service_id} cannot control resources for name '{name}': it is also used by service {existing_service_id}. Resolve the duplicate service records before retrying.")]
+    AmbiguousServiceName {
+        service_id: i32,
+        name: String,
+        existing_service_id: i32,
+    },
+
+    #[error("Cannot create service '{name}': Docker resource '{resource}' already exists. Choose a unique name, or use the explicit import flow to validate and adopt an existing container.")]
+    ServiceResourceConflict { name: String, resource: String },
+
+    #[error("Docker container '{container}' is already managed by service {existing_service_id}. Choose an unowned container to import; keep the existing service and its data")]
+    ServiceContainerConflict {
+        container: String,
+        existing_service_id: i32,
+    },
 
     #[error("Service with name '{name}' not found")]
     ServiceNotFoundByName { name: String },
@@ -607,6 +705,34 @@ pub enum ExternalServiceError {
 
     #[error("Failed to stop service {id}: {reason}")]
     StopFailed { id: i32, reason: String },
+
+    #[error(
+        "Cannot {action} cluster service {service_id}: member '{container_name}' is still being \
+         provisioned ({status}). Wait until it is running or failed, then retry"
+    )]
+    ClusterMemberProvisioning {
+        service_id: i32,
+        action: &'static str,
+        container_name: String,
+        status: String,
+    },
+
+    #[error("Cannot {action} cluster service {service_id}: the cluster is '{status}'. {remedy}")]
+    ClusterNotSettled {
+        service_id: i32,
+        action: &'static str,
+        status: String,
+        remedy: &'static str,
+    },
+
+    #[error(
+        "Cannot {action} cluster service {service_id}: another Stop or Start is already in \
+         progress on it. Try again once it finishes"
+    )]
+    ClusterBusy {
+        service_id: i32,
+        action: &'static str,
+    },
 
     #[error("Failed to delete service {id}: {reason}")]
     DeletionFailed { id: i32, reason: String },
@@ -723,6 +849,28 @@ fn validate_creator_claim(
         Err(ExternalServiceError::ServiceClaimDenied { service_id })
     } else {
         Ok(())
+    }
+}
+
+impl From<ServiceIdentityReservationError> for ExternalServiceError {
+    fn from(error: ServiceIdentityReservationError) -> Self {
+        match error {
+            ServiceIdentityReservationError::Database(error) => error.into(),
+            ServiceIdentityReservationError::Registered {
+                name,
+                existing_service_id,
+            } => Self::ServiceNameConflict {
+                name,
+                existing_service_id,
+            },
+            ServiceIdentityReservationError::Restoring {
+                name,
+                restore_run_id,
+            } => Self::ServiceNameRestoreConflict {
+                name,
+                restore_run_id,
+            },
+        }
     }
 }
 
@@ -1392,6 +1540,249 @@ fn cluster_auth_upgrade_steps(
 
 fn is_role_primary(s: &str) -> bool {
     role_from_str(s) == Some(crate::ClusterRole::Primary)
+}
+
+/// Direction of a whole-cluster Stop or Start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClusterLifecycleAction {
+    Stop,
+    Start,
+}
+
+impl ClusterLifecycleAction {
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Start => "start",
+        }
+    }
+
+    /// `service_members.status` of a member this action succeeded on.
+    fn member_status(self) -> &'static str {
+        match self {
+            Self::Stop => "stopped",
+            Self::Start => "running",
+        }
+    }
+
+    /// Cluster `status` while this action holds it (see `claim_cluster`).
+    fn claim_status(self) -> &'static str {
+        match self {
+            Self::Stop => "stopping",
+            Self::Start => "starting",
+        }
+    }
+}
+
+/// What a cluster Stop/Start did to the members it reached.
+#[derive(Debug, Default)]
+struct ClusterLifecycleReport {
+    done: Vec<String>,
+    failures: Vec<String>,
+    not_attempted: Vec<String>,
+}
+
+/// The members a cluster Stop/Start acts on, in the order it acts on them.
+///
+/// Stop, when the monitor named the live `primary`: standbys, then the
+/// primary, then the monitor. The monitor stays up while the data nodes go
+/// down, and once no standby is running it has no candidate to promote, so
+/// stopping the primary cannot trigger a failover.
+///
+/// Stop, when the live primary is unknown (the monitor could not be
+/// queried): the monitor first, then the data members. Stored roles cannot
+/// stand in for the live primary (the role reconciler records every data
+/// member as `replica`), and promotion needs the monitor, so with it down no
+/// order of the data members can cause a failover. If the monitor cannot be
+/// stopped, Stop halts before touching any data member.
+///
+/// Start: the monitor first so every keeper can reach it, then the data
+/// members (a stored `primary` first).
+///
+/// A member whose provisioning failed is still stopped (it may have a
+/// running container the monitor could promote) but never started.
+fn cluster_lifecycle_order<'a>(
+    members: &'a [service_members::Model],
+    primary: Option<&str>,
+    action: ClusterLifecycleAction,
+) -> Vec<&'a service_members::Model> {
+    // Lower tiers go first.
+    let tier = |member: &service_members::Model| -> u8 {
+        let monitor = is_role_monitor(&member.role);
+        match (action, primary) {
+            (ClusterLifecycleAction::Stop, Some(_)) if monitor => 2,
+            (ClusterLifecycleAction::Stop, Some(primary)) => {
+                u8::from(primary == member.container_name)
+            }
+            (ClusterLifecycleAction::Stop, None) => u8::from(!monitor),
+            (ClusterLifecycleAction::Start, _) if monitor => 0,
+            (ClusterLifecycleAction::Start, _) => {
+                if is_role_primary(&member.role) {
+                    1
+                } else {
+                    2
+                }
+            }
+        }
+    };
+    let mut ordered: Vec<_> = members
+        .iter()
+        .filter(|member| action == ClusterLifecycleAction::Stop || member.status != "failed")
+        .collect();
+    ordered.sort_by_key(|m| (tier(m), m.ordinal));
+    ordered
+}
+
+/// How long a `stopping`/`starting` claim may go without progress before
+/// another Stop or Start may take it over. The claim is refreshed after
+/// every member and one member's agent call is bounded at 300s, so only a
+/// claim whose process died gets this old.
+const CLUSTER_CLAIM_STALE_AFTER: chrono::Duration = chrono::Duration::minutes(15);
+
+/// Whether `action` may claim a cluster whose status is `status`, last
+/// changed at `updated_at`.
+fn cluster_claim_decision(
+    service_id: i32,
+    status: &str,
+    updated_at: chrono::DateTime<Utc>,
+    now: chrono::DateTime<Utc>,
+    action: ClusterLifecycleAction,
+) -> Result<(), ExternalServiceError> {
+    let not_settled = |remedy| ExternalServiceError::ClusterNotSettled {
+        service_id,
+        action: action.verb(),
+        status: status.to_string(),
+        remedy,
+    };
+    match (status, action) {
+        ("creating", _) => Err(not_settled("Wait until provisioning finishes, then retry")),
+        ("failed", ClusterLifecycleAction::Start) => Err(not_settled(
+            "Its provisioning failed; use Retry to provision it again instead of starting it",
+        )),
+        ("stopping" | "starting", _) if now - updated_at < CLUSTER_CLAIM_STALE_AFTER => {
+            Err(ExternalServiceError::ClusterBusy {
+                service_id,
+                action: action.verb(),
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The error for a cluster Stop/Start that did not reach every member:
+/// each failed member, what was done, and what was left alone.
+fn cluster_lifecycle_failure(
+    service: &external_services::Model,
+    action: ClusterLifecycleAction,
+    report: &ClusterLifecycleReport,
+) -> ExternalServiceError {
+    let list = |names: &[String]| {
+        if names.is_empty() {
+            "none".to_string()
+        } else {
+            names.join(", ")
+        }
+    };
+    let mut reason = format!(
+        "cluster '{}': could not {} {}. Members {} so far: {}",
+        service.name,
+        action.verb(),
+        report.failures.join("; "),
+        action.member_status(),
+        list(&report.done)
+    );
+    if !report.not_attempted.is_empty() {
+        reason.push_str(&format!(
+            ". Left running so no standby is promoted: {}",
+            list(&report.not_attempted)
+        ));
+    }
+    reason.push_str(". Data volumes were not touched; fix the member above and retry");
+    match action {
+        ClusterLifecycleAction::Stop => ExternalServiceError::StopFailed {
+            id: service.id,
+            reason,
+        },
+        ClusterLifecycleAction::Start => ExternalServiceError::StartFailed {
+            id: service.id,
+            reason,
+        },
+    }
+}
+
+/// The status a cluster returns to when a lifecycle action does not
+/// complete: the one it had before. A claim taken over from a process that
+/// died has no meaningful "before", and its members may be running.
+fn cluster_status_before_claim(previous: &str) -> &str {
+    match previous {
+        "stopping" | "starting" => "running",
+        other => other,
+    }
+}
+
+/// The status to record for `member` once `action` succeeded on it, or
+/// `None` to keep its row as is. A member whose provisioning failed stays
+/// `failed`: stopping its leftover container does not make it startable,
+/// and the next Start must keep skipping it.
+fn recorded_member_status(
+    member: &service_members::Model,
+    action: ClusterLifecycleAction,
+) -> Option<&'static str> {
+    (member.status != "failed").then(|| action.member_status())
+}
+
+/// Treat members a failed cluster left `pending` or `creating` as failed.
+/// No provisioning task runs for a cluster whose provisioning failed (Retry
+/// takes the lifecycle lock before starting one), so such a member is not
+/// "still being provisioned": refusing a Stop because of it would leave the
+/// cluster's leftover containers impossible to stop.
+///
+/// Returns the ids of the members it changed, whose rows must say so too.
+fn settle_members_of_failed_cluster(members: &mut [service_members::Model]) -> Vec<i32> {
+    let mut abandoned = Vec::new();
+    for member in members {
+        if !cluster_member_is_settled(&member.status) {
+            member.status = "failed".to_string();
+            abandoned.push(member.id);
+        }
+    }
+    abandoned
+}
+
+/// Member states Stop/Start can act on. Anything else (`pending`,
+/// `creating`) is still being provisioned by a background task that would
+/// race the action.
+fn cluster_member_is_settled(status: &str) -> bool {
+    matches!(status, "running" | "stopped" | "failed")
+}
+
+/// What a remote member's observed container state already decides for
+/// `action`: `Some(Ok(()))` when there is nothing left to do, `Some(Err)`
+/// when it cannot be done, `None` when the agent must act.
+///
+/// Agents report Docker's "already stopped/started" and "no such
+/// container" as plain errors, so the state is checked rather than the
+/// error: a retried Stop must pass members an earlier attempt already
+/// stopped instead of halting on them again.
+fn remote_member_outcome(
+    member: &service_members::Model,
+    action: ClusterLifecycleAction,
+    status: &crate::remote_service_client::RemoteServiceStatus,
+) -> Option<Result<(), String>> {
+    let exists = status.container_id.is_some();
+    match action {
+        ClusterLifecycleAction::Stop
+            if !status.running && (exists || member.status == "failed") =>
+        {
+            Some(Ok(()))
+        }
+        ClusterLifecycleAction::Start if status.running => Some(Ok(())),
+        _ if !exists => Some(Err(format!(
+            "its container '{}' does not exist on that node",
+            member.container_name
+        ))),
+        _ => None,
+    }
 }
 
 /// `true` for any role that holds data — primary, replica, or any
@@ -2758,6 +3149,227 @@ impl ExternalServiceManager {
         })
     }
 
+    async fn ensure_new_local_service_resources_unused(
+        &self,
+        service: &external_services::Model,
+    ) -> Result<(), ExternalServiceError> {
+        if service.node_id.is_some() {
+            return Ok(());
+        }
+        let parameters = self.get_service_parameters(service.id).await?;
+        let service_type = ServiceType::from_str(&service.service_type).map_err(|_| {
+            ExternalServiceError::InvalidServiceType {
+                id: service.id,
+                service_type: service.service_type.clone(),
+            }
+        })?;
+        let instance = self.create_service_instance_for_parameters(
+            service.name.clone(),
+            service_type,
+            &parameters,
+        )?;
+        let names = instance.docker_resource_names().ok_or_else(|| {
+            ExternalServiceError::InternalError {
+                reason: format!("Cannot safely create service '{}': its engine does not report owned Docker resources", service.name),
+            }
+        })?;
+        let docker = self.require_docker()?;
+        for container in names.containers {
+            match docker
+                .inspect_container(
+                    &container,
+                    None::<bollard::query_parameters::InspectContainerOptions>,
+                )
+                .await
+            {
+                Ok(_) => {
+                    return Err(ExternalServiceError::ServiceResourceConflict {
+                        name: service.name.clone(),
+                        resource: container,
+                    })
+                }
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => {}
+                Err(error) => {
+                    return Err(ExternalServiceError::DockerError {
+                        id: service.id,
+                        reason: format!(
+                            "Failed to inspect new service '{}' container '{container}': {error}",
+                            service.name
+                        ),
+                    })
+                }
+            }
+        }
+        // A stale volume must not become a new service's data by name alone.
+        for volume in names.volumes {
+            match docker.inspect_volume(&volume).await {
+                Ok(_) => {
+                    return Err(ExternalServiceError::ServiceResourceConflict {
+                        name: service.name.clone(),
+                        resource: volume,
+                    })
+                }
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => {}
+                Err(error) => {
+                    return Err(ExternalServiceError::DockerError {
+                        id: service.id,
+                        reason: format!(
+                            "Failed to inspect new service '{}' volume '{volume}': {error}",
+                            service.name
+                        ),
+                    })
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn reserve_imported_container(
+        &self,
+        txn: &sea_orm::DatabaseTransaction,
+        container_id: &str,
+        container_name: &str,
+    ) -> Result<(), ExternalServiceError> {
+        use sea_orm::ConnectionTrait;
+        txn.execute(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT pg_advisory_xact_lock(hashtextextended('external-service-container:' || $1, 0))",
+            [container_id.into()],
+        ))
+        .await?;
+        let canonical_owner = Expr::cust_with_values(
+            "CASE service_type WHEN 'postgres' THEN 'postgres-' WHEN 'redis' THEN 'redis-' WHEN 'kv' THEN 'redis-' WHEN 'mariadb' THEN 'mariadb-' WHEN 'mongodb' THEN 'temps-mongodb-' WHEN 'rustfs' THEN 'rustfs-' WHEN 'blob' THEN 'rustfs-' WHEN 's3' THEN 'rustfs-' WHEN 'minio' THEN 'minio-' ELSE NULL END || name = $1",
+            [container_name],
+        );
+        let minio_owner = Expr::cust_with_values(
+            "service_type = 's3' AND 'minio-' || name = $1",
+            [container_name],
+        );
+        // Only the two built-in services have historical aliases. Arbitrary
+        // user names must not claim another service's prefixed workload.
+        let legacy_builtin_owner = Expr::cust_with_values(
+            "(service_type = 'blob' AND name = 'temps-blob' AND $1 = 'rustfs-blob-temps-blob') OR (service_type IN ('kv', 'redis') AND name = 'temps-kv' AND $1 = 'redis-kv-temps-kv')",
+            [container_name],
+        );
+        let registered_owners = external_services::Entity::find()
+            .filter(external_services::Column::NodeId.is_null())
+            .filter(
+                Condition::any()
+                    .add(external_services::Column::ContainerName.eq(container_name))
+                    .add(canonical_owner)
+                    .add(minio_owner)
+                    .add(legacy_builtin_owner),
+            );
+        if let Some(existing) = registered_owners.clone().one(txn).await? {
+            return Err(ExternalServiceError::ServiceContainerConflict {
+                container: container_name.to_string(),
+                existing_service_id: existing.id,
+            });
+        }
+        // A clone's active run owns its canonical container before its
+        // service row is registered. An alias import must not adopt it in
+        // that interval. Join its template in one bounded ownership query.
+        let restore = txn.query_one(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT r.id FROM restore_runs r JOIN external_services s ON s.id = r.source_service_id WHERE r.status IN ('pending', 'running') AND r.target_service_name IS NOT NULL AND ((CASE s.service_type WHEN 'postgres' THEN 'postgres-' WHEN 'redis' THEN 'redis-' WHEN 'kv' THEN 'redis-' WHEN 'mariadb' THEN 'mariadb-' WHEN 'mongodb' THEN 'temps-mongodb-' WHEN 'rustfs' THEN 'rustfs-' WHEN 'blob' THEN 'rustfs-' WHEN 's3' THEN 'rustfs-' WHEN 'minio' THEN 'minio-' ELSE NULL END || r.target_service_name) = $1 OR (s.service_type = 's3' AND 'minio-' || r.target_service_name = $1)) LIMIT 1",
+            [container_name.into()],
+        )).await?;
+        if let Some(restore) = restore {
+            return Err(ExternalServiceError::ServiceContainerRestoreConflict {
+                container: container_name.to_string(),
+                restore_run_id: restore.try_get("", "id")?,
+            });
+        }
+        // Registration commits its service row before the run becomes
+        // terminal. Recheck after the active-run snapshot to cover that
+        // handoff when a differently named import uses a different name lock.
+        if let Some(existing) = registered_owners.one(txn).await? {
+            return Err(ExternalServiceError::ServiceContainerConflict {
+                container: container_name.to_string(),
+                existing_service_id: existing.id,
+            });
+        }
+        // Imports made before the plaintext ownership column existed may
+        // retain their actual container name only in encrypted parameters.
+        // Stream this compatibility check; do not load all service configs.
+        {
+            use futures::TryStreamExt;
+            let mut legacy = external_services::Entity::find()
+                .filter(external_services::Column::NodeId.is_null())
+                .filter(external_services::Column::ContainerName.is_null())
+                .filter(external_services::Column::Config.is_not_null())
+                .stream(txn)
+                .await?;
+            while let Some(service) = legacy.try_next().await? {
+                let config = service.config.as_deref().unwrap_or_default();
+                let plaintext =
+                    self.encryption_service
+                        .decrypt_string(config)
+                        .map_err(|error| ExternalServiceError::DecryptionFailed {
+                            service_id: service.id,
+                            param_name: "config".to_string(),
+                            reason: format!("Cannot verify existing container ownership: {error}"),
+                        })?;
+                let parameters: serde_json::Value =
+                    serde_json::from_str(&plaintext).map_err(|error| {
+                        ExternalServiceError::InternalError {
+                            reason: format!(
+                                "Cannot verify container ownership for service {}: {error}",
+                                service.id
+                            ),
+                        }
+                    })?;
+                if parameters
+                    .get("container_name")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|name| {
+                        name.trim_start_matches('/') == container_name || name == container_id
+                    })
+                {
+                    return Err(ExternalServiceError::ServiceContainerConflict {
+                        container: container_name.to_string(),
+                        existing_service_id: service.id,
+                    });
+                }
+            }
+        }
+        if let Some(member) = service_members::Entity::find()
+            .filter(service_members::Column::NodeId.is_null())
+            .filter(service_members::Column::ContainerName.eq(container_name))
+            .one(txn)
+            .await?
+        {
+            return Err(ExternalServiceError::ServiceContainerConflict {
+                container: container_name.to_string(),
+                existing_service_id: member.service_id,
+            });
+        }
+        Ok(())
+    }
+
+    async fn ensure_unambiguous_service_name(
+        &self,
+        service: &external_services::Model,
+    ) -> Result<(), ExternalServiceError> {
+        if let Some(existing) = external_services::Entity::find()
+            .filter(external_services::Column::Name.eq(&service.name))
+            .filter(external_services::Column::Id.ne(service.id))
+            .one(self.db.as_ref())
+            .await?
+        {
+            return Err(ExternalServiceError::AmbiguousServiceName {
+                service_id: service.id,
+                name: service.name.clone(),
+                existing_service_id: existing.id,
+            });
+        }
+        Ok(())
+    }
+
     pub async fn create_service(
         &self,
         request: CreateExternalServiceRequest,
@@ -2906,6 +3518,7 @@ impl ExternalServiceManager {
             .db
             .transaction::<_, external_services::Model, ExternalServiceError>(|txn| {
                 Box::pin(async move {
+                    reserve_service_name(txn, &request.name, None).await?;
                     // Create service record with encrypted config
                     let new_service = external_services::ActiveModel {
                         name: Set(request.name.clone()),
@@ -3005,7 +3618,12 @@ impl ExternalServiceManager {
             self.get_service_info(service.id).await
         } else {
             // Standalone: initialize synchronously
-            let init_result = self.initialize_service(service.id).await;
+            let init_result = async {
+                self.ensure_new_local_service_resources_unused(&service)
+                    .await?;
+                self.initialize_service(service.id).await
+            }
+            .await;
 
             if let Err(e) = init_result {
                 error!(
@@ -3023,6 +3641,9 @@ impl ExternalServiceManager {
                     );
                 }
 
+                if matches!(e, ExternalServiceError::ServiceResourceConflict { .. }) {
+                    return Err(e);
+                }
                 return Err(ExternalServiceError::InitializationFailed {
                     id: service.id,
                     reason: e.to_string(),
@@ -3072,6 +3693,8 @@ impl ExternalServiceManager {
         ingest_key: String,
         ingest_url: String,
     ) -> Result<(), ExternalServiceError> {
+        let service = self.get_service(service_id).await?;
+        self.ensure_unambiguous_service_name(&service).await?;
         // Merge the key + URL into the existing encrypted params.
         let mut params = self.get_service_parameters(service_id).await?;
         params.insert(
@@ -3142,6 +3765,7 @@ impl ExternalServiceManager {
         service_id: i32,
     ) -> Result<(), ExternalServiceError> {
         let service = self.get_service(service_id).await?;
+        self.ensure_unambiguous_service_name(&service).await?;
         let service_type = ServiceType::from_str(&service.service_type).map_err(|_| {
             ExternalServiceError::InvalidServiceType {
                 id: service_id,
@@ -3334,6 +3958,7 @@ impl ExternalServiceManager {
         self.ensure_no_active_upgrade(service_id).await?;
 
         let service = self.get_service(service_id).await?;
+        self.ensure_unambiguous_service_name(&service).await?;
         let old_parameters = self.get_service_parameters(service_id).await?;
 
         // Get old configuration
@@ -3452,6 +4077,7 @@ impl ExternalServiceManager {
         request: UpdateExternalServiceRequest,
     ) -> Result<ExternalServiceInfo, ExternalServiceError> {
         let service = self.get_service(service_id).await?;
+        self.ensure_unambiguous_service_name(&service).await?;
 
         // Get the parameter strategy for this service type
         let strategy = parameter_strategies::get_strategy(&service.service_type).ok_or(
@@ -3512,6 +4138,14 @@ impl ExternalServiceManager {
                 reason: format!("Failed to encrypt config: {}", e),
             })?;
 
+        let name_transaction = if let Some(new_name) = request.name.as_deref() {
+            let txn = self.db.begin().await?;
+            reserve_service_name(&txn, new_name, Some(service_id)).await?;
+            Some(txn)
+        } else {
+            None
+        };
+
         // Update service config (and optionally name/slug) in database.
         // `name` was previously accepted by the request but silently dropped;
         // applying it here keeps the API contract honest.
@@ -3519,6 +4153,13 @@ impl ExternalServiceManager {
         service_update.config = Set(Some(encrypted_config));
         if let Some(new_name) = request.name {
             if new_name != service.name {
+                // Reserving a database name does not grant ownership of an
+                // existing Docker resource. Refuse a rename destination before
+                // stopping the original service or persisting its new identity.
+                let mut renamed_service = service.clone();
+                renamed_service.name = new_name.clone();
+                self.ensure_new_local_service_resources_unused(&renamed_service)
+                    .await?;
                 // The running container is identified by the service's
                 // current (pre-rename) name (see create_service_instance).
                 // initialize_service() below rebuilds its stop-then-recreate
@@ -3549,8 +4190,14 @@ impl ExternalServiceManager {
             service_update.slug = Set(Some(new_slug));
         }
         service_update.updated_at = Set(Utc::now());
-        self.persist_service_config(service_id, service_update)
-            .await?;
+        if let Some(txn) = name_transaction {
+            self.persist_service_config_in_transaction(service_id, service_update, &txn)
+                .await?;
+            txn.commit().await?;
+        } else {
+            self.persist_service_config(service_id, service_update)
+                .await?;
+        }
 
         // Reinitialize the service (this will stop, remove, and recreate the container with new image)
         self.initialize_service(service_id).await?;
@@ -3561,6 +4208,7 @@ impl ExternalServiceManager {
     pub async fn delete_service(&self, service_id: i32) -> Result<(), ExternalServiceError> {
         // Get service to check if it exists
         let service = self.get_service(service_id).await?;
+        self.ensure_unambiguous_service_name(&service).await?;
         let service_type_enum = ServiceType::from_str(&service.service_type).map_err(|_| {
             ExternalServiceError::InvalidServiceType {
                 id: service_id,
@@ -3593,13 +4241,35 @@ impl ExternalServiceManager {
         // get_service_parameters looks the service up by ID, which would fail
         // once the row is gone.
         let parameters = self.get_service_parameters(service_id).await?;
-        let service_name_snapshot = service.name.clone();
-        let service_type_snapshot = service.service_type.clone();
 
         // Delete from database first
         self.db
             .transaction::<_, (), ExternalServiceError>(|txn| {
                 Box::pin(async move {
+                    // Restore admission holds this source row while it
+                    // records its active run. Never cascade that reservation
+                    // away while the clone's engine can still create resources.
+                    let source = external_services::Entity::find_by_id(service_id)
+                        .lock_exclusive()
+                        .one(txn)
+                        .await?
+                        .ok_or(ExternalServiceError::ServiceNotFound { id: service_id })?;
+                    if let Some(run) = temps_entities::restore_runs::Entity::find()
+                        .filter(
+                            temps_entities::restore_runs::Column::SourceServiceId.eq(service_id),
+                        )
+                        .filter(
+                            temps_entities::restore_runs::Column::Status
+                                .is_in(["pending", "running"]),
+                        )
+                        .one(txn)
+                        .await?
+                    {
+                        return Err(ExternalServiceError::ServiceNameRestoreConflict {
+                            name: source.name,
+                            restore_run_id: run.id,
+                        });
+                    }
                     // Auto-generated per-service schedules are lifecycle-owned
                     // by Temps. Disable one in the same transaction when its
                     // final target is removed; user-created schedules are left
@@ -3632,20 +4302,25 @@ impl ExternalServiceManager {
                         .exec(txn)
                         .await?;
 
-                    // Backup audit rows intentionally outlive their source
-                    // service. Capture immutable provenance before deleting
-                    // the mutable service record; the migration removes the
-                    // former ON DELETE CASCADE foreign key.
+                    // Admission captured the repository's immutable identity.
+                    // Preserve it across renames; backfill only missing legacy
+                    // fields using the service row locked above.
                     external_service_backups::Entity::update_many()
                         .col_expr(
                             external_service_backups::Column::ServiceNameSnapshot,
-                            Expr::value(service_name_snapshot.clone()),
-                        )
-                        .col_expr(
-                            external_service_backups::Column::ServiceTypeSnapshot,
-                            Expr::value(service_type_snapshot.clone()),
+                            Expr::value(source.name.clone()),
                         )
                         .filter(external_service_backups::Column::ServiceId.eq(service_id))
+                        .filter(external_service_backups::Column::ServiceNameSnapshot.is_null())
+                        .exec(txn)
+                        .await?;
+                    external_service_backups::Entity::update_many()
+                        .col_expr(
+                            external_service_backups::Column::ServiceTypeSnapshot,
+                            Expr::value(source.service_type.clone()),
+                        )
+                        .filter(external_service_backups::Column::ServiceId.eq(service_id))
+                        .filter(external_service_backups::Column::ServiceTypeSnapshot.is_null())
                         .exec(txn)
                         .await?;
 
@@ -6445,12 +7120,28 @@ echo "[restore] Pre-seed complete"
     async fn persist_service_config(
         &self,
         service_id: i32,
-        mut active: external_services::ActiveModel,
+        active: external_services::ActiveModel,
     ) -> Result<external_services::Model, ExternalServiceError> {
         let txn = self.db.begin().await?;
+        let updated = self
+            .persist_service_config_in_transaction(service_id, active, &txn)
+            .await?;
+        txn.commit().await?;
+        Ok(updated)
+    }
+
+    async fn persist_service_config_in_transaction(
+        &self,
+        service_id: i32,
+        mut active: external_services::ActiveModel,
+        txn: &sea_orm::DatabaseTransaction,
+    ) -> Result<external_services::Model, ExternalServiceError> {
+        if let sea_orm::ActiveValue::Set(name) = &active.name {
+            reserve_service_name(txn, name, Some(service_id)).await?;
+        }
         let current = external_services::Entity::find_by_id(service_id)
             .lock_exclusive()
-            .one(&txn)
+            .one(txn)
             .await?
             .ok_or(ExternalServiceError::ServiceNotFound { id: service_id })?;
         let parse =
@@ -6516,9 +7207,7 @@ echo "[restore] Pre-seed complete"
                 ));
             }
         }
-        let updated = active.update(&txn).await?;
-        txn.commit().await?;
-        Ok(updated)
+        Ok(active.update(txn).await?)
     }
 
     async fn ensure_cluster_auth_secrets(
@@ -6667,6 +7356,17 @@ echo "[restore] Pre-seed complete"
         &self,
         service_id: i32,
     ) -> Result<(), ExternalServiceError> {
+        self.record_cluster_auth_version(service_id, CLUSTER_AUTH_VERSION)
+            .await
+    }
+
+    /// Raise a cluster's recorded authentication version to at least
+    /// `reached`. Never lowers it.
+    async fn record_cluster_auth_version(
+        &self,
+        service_id: i32,
+        reached: u64,
+    ) -> Result<(), ExternalServiceError> {
         let txn = self.db.begin().await?;
         let service = external_services::Entity::find_by_id(service_id)
             .lock_exclusive()
@@ -6688,7 +7388,7 @@ echo "[restore] Pre-seed complete"
             })?;
         // Merge only the marker into the latest locked configuration, never a
         // pre-upgrade copy that can erase a concurrent settings update.
-        let version = cluster_auth_version(&parameters).max(CLUSTER_AUTH_VERSION);
+        let version = cluster_auth_version(&parameters).max(reached);
         parameters.insert(
             CLUSTER_AUTH_VERSION_KEY.to_string(),
             serde_json::json!(version),
@@ -6975,6 +7675,7 @@ echo "[restore] Pre-seed complete"
         info!("Initializing service: {}", service_id);
         self.ensure_no_active_upgrade(service_id).await?;
         let service = self.get_service(service_id).await?;
+        self.ensure_unambiguous_service_name(&service).await?;
         let parameters = self.get_service_parameters(service_id).await?;
         let service_type_enum = ServiceType::from_str(&service.service_type).map_err(|_| {
             ExternalServiceError::InvalidServiceType {
@@ -7928,6 +8629,23 @@ echo "[restore] Pre-seed complete"
         service_update.updated_at = Set(Utc::now());
         service_update.update(self.db.as_ref()).await?;
 
+        // Every member was just built by this code (a retry removes the
+        // leftovers first), so the infrastructure roles already use SCRAM.
+        // Record that, or the next `add_cluster_member` treats this cluster
+        // as legacy and re-runs the in-place upgrade against members that may
+        // still be taking their initial base backup.
+        if let Err(e) = self
+            .record_cluster_auth_version(service_id, CLUSTER_INFRA_AUTH_VERSION)
+            .await
+        {
+            warn!(
+                service_id,
+                error = %e,
+                "Cluster created with SCRAM-native members, but its authentication version \
+                 could not be recorded; the next start re-runs the idempotent upgrade"
+            );
+        }
+
         // Start the per-cluster role reconciler (ADR-011 Phase 4). Best-effort:
         // skipped if no DnsRegistry is wired (legacy plugin) or if a reconciler
         // is already running for this service_id (idempotent retry).
@@ -8203,7 +8921,16 @@ echo "[restore] Pre-seed complete"
         service_id: i32,
         member_requests: &[ClusterMemberRequest],
     ) -> Result<ExternalServiceInfo, ExternalServiceError> {
-        let service = self.get_service(service_id).await?;
+        // Checked and switched to `creating` under the row lock, in one short
+        // transaction committed before any container is removed: from then
+        // on Stop, Start and Add Replica refuse the cluster, so none of them
+        // acts on the members this retry tears down. See `claim_cluster`.
+        let lock = self.db.begin().await?;
+        let service = external_services::Entity::find_by_id(service_id)
+            .lock_exclusive()
+            .one(&lock)
+            .await?
+            .ok_or(ExternalServiceError::ServiceNotFound { id: service_id })?;
 
         if service.topology != "cluster" {
             return Err(ExternalServiceError::ParameterValidationFailed {
@@ -8231,7 +8958,7 @@ echo "[restore] Pre-seed complete"
         let leftover_members = service_members::Entity::find()
             .filter(service_members::Column::ServiceId.eq(service_id))
             .order_by_asc(service_members::Column::Ordinal)
-            .all(self.db.as_ref())
+            .all(&lock)
             .await?;
 
         // Reconstruct member specs from preserved records if none were provided
@@ -8263,6 +8990,14 @@ echo "[restore] Pre-seed complete"
         // Before tearing anything down: a member list that cannot fit would
         // only fail again after the leftover members were removed.
         validate_cluster_member_count(&service.name, effective_members.len())?;
+
+        // Update status to "creating" and clear previous error
+        let mut service_update: external_services::ActiveModel = service.into();
+        service_update.status = Set("creating".to_string());
+        service_update.error_message = Set(None);
+        service_update.updated_at = Set(Utc::now());
+        service_update.update(&lock).await?;
+        lock.commit().await?;
 
         for member in &leftover_members {
             // Try to remove the container (ignore errors — it may not exist)
@@ -8314,13 +9049,6 @@ echo "[restore] Pre-seed complete"
                 service_id
             );
         }
-
-        // Update status to "creating" and clear previous error
-        let mut service_update: external_services::ActiveModel = service.into();
-        service_update.status = Set("creating".to_string());
-        service_update.error_message = Set(None);
-        service_update.updated_at = Set(Utc::now());
-        service_update.update(self.db.as_ref()).await?;
 
         // Spawn background task to re-initialize (same pattern as create).
         // `self.clone()`, not `ExternalServiceManager::new(...)` -- see the
@@ -8442,12 +9170,36 @@ echo "[restore] Pre-seed complete"
                     updated_at: Set(now),
                     ..Default::default()
                 };
-                match member_record.insert(self.db.as_ref()).await {
+                // The status check in `plan_add_cluster_member` is repeated
+                // under the cluster's row lock, in the transaction that
+                // inserts the member. A Stop claims the cluster under the
+                // same lock (`claim_cluster`), so it either sees this member
+                // or has already moved the cluster to `stopping` and this add
+                // is refused. Never a member the Stop did not see.
+                let lock = self.db.begin().await?;
+                let status = external_services::Entity::find_by_id(service_id)
+                    .lock_exclusive()
+                    .one(&lock)
+                    .await?
+                    .ok_or(ExternalServiceError::ServiceNotFound { id: service_id })?
+                    .status;
+                if status != "running" {
+                    return Err(ExternalServiceError::ParameterValidationFailed {
+                        service_id,
+                        reason: format!(
+                            "Cluster must be in 'running' status to add a member, current: '{}'",
+                            status
+                        ),
+                    });
+                }
+                match member_record.insert(&lock).await {
                     Ok(model) => {
+                        lock.commit().await?;
                         chosen_plan = Some(plan);
                         chosen_model = Some(model);
                         break;
                     }
+                    // Dropping `lock` rolls the failed insert back.
                     Err(e) if is_unique_violation(&e) => {
                         // Another `add_cluster_member` won this ordinal.
                         // Loop and recompute against the now-larger
@@ -10344,6 +11096,14 @@ echo "[restore] Pre-seed complete"
     ) -> Result<ExternalServiceInfo, ExternalServiceError> {
         self.ensure_no_active_upgrade(service_id).await?;
         let service = self.get_service(service_id).await?;
+        self.ensure_unambiguous_service_name(&service).await?;
+        // Never fall back to `initialize_service` here: that builds a
+        // standalone container under the service's own name.
+        if service.topology == "cluster" {
+            self.run_cluster_lifecycle(service_id, ClusterLifecycleAction::Start)
+                .await?;
+            return self.get_service_info(service_id).await;
+        }
         let service_type_enum = ServiceType::from_str(&service.service_type).map_err(|_| {
             ExternalServiceError::InvalidServiceType {
                 id: service_id,
@@ -10546,11 +11306,383 @@ echo "[restore] Pre-seed complete"
         Ok(())
     }
 
+    /// Stop or start every member of cluster `service_id`, in
+    /// [`cluster_lifecycle_order`], and record the cluster's new status.
+    /// Volumes are never touched.
+    ///
+    /// The cluster is first claimed (`stopping`/`starting`, see
+    /// [`Self::claim_cluster`]); no transaction or connection is held while
+    /// containers change. Each member's row is written on its own as soon as
+    /// that member changed, so a failed write cannot undo the others; it
+    /// counts as that member's failure, which halts a Stop like any other.
+    ///
+    /// Stopping halts at the first member that cannot be stopped: carrying on
+    /// would stop the primary while a standby still runs, which is exactly
+    /// the failover the order exists to avoid. Starting attempts every
+    /// member. Either way the error names each failed member and what was
+    /// and was not done. A member whose provisioning failed keeps its
+    /// `failed` status, so the next Start still skips it.
+    async fn run_cluster_lifecycle(
+        &self,
+        service_id: i32,
+        action: ClusterLifecycleAction,
+    ) -> Result<(), ExternalServiceError> {
+        let service = self.claim_cluster(service_id, action).await?;
+        let outcome = self.drive_cluster_members(&service, action).await;
+
+        let previous = cluster_status_before_claim(&service.status);
+        let (status, error_message) = match &outcome {
+            // A cluster whose provisioning failed stays `failed` after a
+            // Stop, so Retry remains available.
+            Ok(report) if report.failures.is_empty() && service.status == "failed" => {
+                ("failed", service.error_message.clone())
+            }
+            Ok(report) if report.failures.is_empty() => (action.member_status(), None),
+            Ok(report) => (
+                previous,
+                Some(cluster_lifecycle_failure(&service, action, report).to_string()),
+            ),
+            // Refused, or the members could not be read: nothing changed.
+            Err(_) => (previous, service.error_message.clone()),
+        };
+
+        // The role reconciler keeps the cluster's primary DNS record
+        // pointed at the live primary. It is only started for running
+        // clusters at boot, so a cluster started here needs its own.
+        // Changed while the claim is held, so a Stop finishing late cannot
+        // shut down the reconciler of a Start that ran after it.
+        if let Ok(report) = &outcome {
+            match action {
+                ClusterLifecycleAction::Start if !report.done.is_empty() => {
+                    self.spawn_role_reconciler(service_id, service.name.clone())
+                        .await;
+                }
+                ClusterLifecycleAction::Stop if report.failures.is_empty() => {
+                    self.stop_role_reconciler(service_id).await;
+                }
+                _ => {}
+            }
+        }
+        self.release_cluster_claim(service_id, action, status, error_message)
+            .await?;
+
+        let report = outcome?;
+        if report.failures.is_empty() {
+            Ok(())
+        } else {
+            Err(cluster_lifecycle_failure(&service, action, &report))
+        }
+    }
+
+    /// Claim cluster `service_id` for `action`: under the row lock, check
+    /// [`cluster_claim_decision`] and move it to `stopping`/`starting`.
+    /// Returns the cluster as it was before the claim.
+    ///
+    /// The row lock lives only for this check and write. Add Replica and
+    /// Retry check the status under the same lock, so once the claim
+    /// commits neither can change the member set a Stop/Start is acting
+    /// on, and a second Stop/Start is refused as busy.
+    async fn claim_cluster(
+        &self,
+        service_id: i32,
+        action: ClusterLifecycleAction,
+    ) -> Result<external_services::Model, ExternalServiceError> {
+        let txn = self.db.begin().await?;
+        let service = external_services::Entity::find_by_id(service_id)
+            .lock_exclusive()
+            .one(&txn)
+            .await?
+            .ok_or(ExternalServiceError::ServiceNotFound { id: service_id })?;
+        cluster_claim_decision(
+            service_id,
+            &service.status,
+            service.updated_at,
+            Utc::now(),
+            action,
+        )?;
+        external_services::ActiveModel {
+            id: Set(service_id),
+            status: Set(action.claim_status().to_string()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .update(&txn)
+        .await?;
+        txn.commit().await?;
+        Ok(service)
+    }
+
+    /// Refresh this action's claim so it is not mistaken for one whose
+    /// process died (see [`CLUSTER_CLAIM_STALE_AFTER`]).
+    async fn refresh_cluster_claim(&self, service_id: i32, action: ClusterLifecycleAction) {
+        if let Err(e) = external_services::Entity::update_many()
+            .col_expr(
+                external_services::Column::UpdatedAt,
+                sea_orm::sea_query::Expr::value(Utc::now()),
+            )
+            .filter(external_services::Column::Id.eq(service_id))
+            .filter(external_services::Column::Status.eq(action.claim_status()))
+            .exec(self.db.as_ref())
+            .await
+        {
+            warn!(
+                service_id,
+                error = %e,
+                "Could not refresh the cluster's {} claim", action.verb()
+            );
+        }
+    }
+
+    /// End this action's claim with the cluster's resulting status. Only a
+    /// claim this action still holds is replaced.
+    async fn release_cluster_claim(
+        &self,
+        service_id: i32,
+        action: ClusterLifecycleAction,
+        status: &str,
+        error_message: Option<String>,
+    ) -> Result<(), ExternalServiceError> {
+        external_services::Entity::update_many()
+            .col_expr(
+                external_services::Column::Status,
+                sea_orm::sea_query::Expr::value(status),
+            )
+            .col_expr(
+                external_services::Column::ErrorMessage,
+                sea_orm::sea_query::Expr::value(error_message),
+            )
+            .col_expr(
+                external_services::Column::UpdatedAt,
+                sea_orm::sea_query::Expr::value(Utc::now()),
+            )
+            .filter(external_services::Column::Id.eq(service_id))
+            .filter(external_services::Column::Status.eq(action.claim_status()))
+            .exec(self.db.as_ref())
+            .await
+            .map_err(|e| {
+                error!(
+                    service_id,
+                    error = %e,
+                    "Cluster {} finished on its members but its status stayed '{}'; \
+                     another Stop or Start may take it over after {} minutes",
+                    action.verb(),
+                    action.claim_status(),
+                    CLUSTER_CLAIM_STALE_AFTER.num_minutes()
+                );
+                ExternalServiceError::from(e)
+            })?;
+        Ok(())
+    }
+
+    /// Act on the members of a claimed cluster. `Err` only when nothing
+    /// was done: the members could not be read, or one is still being
+    /// provisioned.
+    async fn drive_cluster_members(
+        &self,
+        service: &external_services::Model,
+        action: ClusterLifecycleAction,
+    ) -> Result<ClusterLifecycleReport, ExternalServiceError> {
+        let service_id = service.id;
+        let mut members = service_members::Entity::find()
+            .filter(service_members::Column::ServiceId.eq(service_id))
+            .order_by_asc(service_members::Column::Ordinal)
+            .all(self.db.as_ref())
+            .await?;
+        if service.status == "failed" {
+            let abandoned = settle_members_of_failed_cluster(&mut members);
+            if !abandoned.is_empty() {
+                // Saved before any container changes, so the API stops
+                // reporting these members as still being provisioned.
+                service_members::Entity::update_many()
+                    .col_expr(
+                        service_members::Column::Status,
+                        sea_orm::sea_query::Expr::value("failed"),
+                    )
+                    .col_expr(
+                        service_members::Column::ProvisioningStep,
+                        sea_orm::sea_query::Expr::value(Some(
+                            member_provisioning_step::FAILED.to_string(),
+                        )),
+                    )
+                    .col_expr(
+                        service_members::Column::UpdatedAt,
+                        sea_orm::sea_query::Expr::value(Utc::now()),
+                    )
+                    .filter(service_members::Column::Id.is_in(abandoned))
+                    .filter(service_members::Column::Status.is_in(["pending", "creating"]))
+                    .exec(self.db.as_ref())
+                    .await?;
+            }
+        }
+        if let Some(busy) = members
+            .iter()
+            .find(|m| !cluster_member_is_settled(&m.status))
+        {
+            return Err(ExternalServiceError::ClusterMemberProvisioning {
+                service_id,
+                action: action.verb(),
+                container_name: busy.container_name.clone(),
+                status: busy.status.clone(),
+            });
+        }
+        let live_primary = match action {
+            ClusterLifecycleAction::Stop => self
+                .find_live_primary_member(service, &members)
+                .await
+                .ok()
+                .flatten()
+                .map(|member| member.container_name.clone()),
+            ClusterLifecycleAction::Start => None,
+        };
+
+        let mut report = ClusterLifecycleReport::default();
+        for member in cluster_lifecycle_order(&members, live_primary.as_deref(), action) {
+            if action == ClusterLifecycleAction::Stop && !report.failures.is_empty() {
+                report.not_attempted.push(member.container_name.clone());
+                continue;
+            }
+            let result = match self.set_cluster_member_running(member, action).await {
+                Ok(()) => match recorded_member_status(member, action) {
+                    Some(status) => (service_members::ActiveModel {
+                        id: Set(member.id),
+                        status: Set(status.to_string()),
+                        updated_at: Set(Utc::now()),
+                        ..Default::default()
+                    })
+                    .update(self.db.as_ref())
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| {
+                        format!(
+                            "its container is now {} but its row could not be updated: {}",
+                            action.member_status(),
+                            e
+                        )
+                    }),
+                    None => Ok(()),
+                },
+                Err(reason) => Err(reason),
+            };
+            match result {
+                Ok(()) => {
+                    info!(
+                        service_id,
+                        member = %member.container_name,
+                        role = %member.role,
+                        "Cluster member is now {}",
+                        action.member_status()
+                    );
+                    report.done.push(member.container_name.clone());
+                }
+                Err(reason) => {
+                    error!(
+                        service_id,
+                        member = %member.container_name,
+                        "Failed to {} cluster member: {}",
+                        action.verb(),
+                        reason
+                    );
+                    report
+                        .failures
+                        .push(format!("'{}' ({})", member.container_name, reason));
+                }
+            }
+            self.refresh_cluster_claim(service_id, action).await;
+        }
+        Ok(report)
+    }
+
+    /// Stop or start one cluster member's container, locally or through
+    /// its node's agent. A container already in the wanted state is
+    /// success; so is a missing container of a member whose provisioning
+    /// failed, which has nothing to stop.
+    async fn set_cluster_member_running(
+        &self,
+        member: &service_members::Model,
+        action: ClusterLifecycleAction,
+    ) -> Result<(), String> {
+        if let Some(node_id) = member.node_id {
+            let client = self
+                .get_remote_client(node_id)
+                .await
+                .map_err(|e| format!("cannot reach node {node_id}: {e}"))?;
+            let observe = || async {
+                client
+                    .service_status(&member.container_name)
+                    .await
+                    .map_err(|e| format!("on node {node_id}: cannot read its state: {e}"))
+            };
+            if let Some(outcome) = remote_member_outcome(member, action, &observe().await?) {
+                return outcome;
+            }
+            let result = match action {
+                ClusterLifecycleAction::Stop => client.stop_service(&member.container_name).await,
+                ClusterLifecycleAction::Start => client.start_service(&member.container_name).await,
+            };
+            return match result {
+                Ok(()) => Ok(()),
+                // The container may have reached the wanted state anyway
+                // (it was stopped or started concurrently): judge by state.
+                Err(e) => match remote_member_outcome(member, action, &observe().await?) {
+                    Some(Ok(())) => Ok(()),
+                    _ => Err(format!("on node {node_id}: {e}")),
+                },
+            };
+        }
+
+        let docker = self.docker.get().ok_or_else(|| {
+            "this process has no local Docker daemon to manage the member".to_string()
+        })?;
+        let result = match action {
+            ClusterLifecycleAction::Stop => {
+                docker
+                    .stop_container(
+                        &member.container_name,
+                        None::<bollard::query_parameters::StopContainerOptions>,
+                    )
+                    .await
+            }
+            ClusterLifecycleAction::Start => {
+                docker
+                    .start_container(
+                        &member.container_name,
+                        None::<bollard::query_parameters::StartContainerOptions>,
+                    )
+                    .await
+            }
+        };
+        match result {
+            Ok(()) => Ok(()),
+            // 304: already stopped / already running.
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 304, ..
+            }) => Ok(()),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) if action == ClusterLifecycleAction::Stop && member.status == "failed" => Ok(()),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Err(format!(
+                "its container '{}' does not exist on this host",
+                member.container_name
+            )),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
     pub async fn stop_service(
         &self,
         service_id: i32,
     ) -> Result<ExternalServiceInfo, ExternalServiceError> {
         let service = self.get_service(service_id).await?;
+        self.ensure_unambiguous_service_name(&service).await?;
+        // A cluster has no container under the service's own name: its
+        // monitor and data nodes are separate, suffixed members.
+        if service.topology == "cluster" {
+            self.run_cluster_lifecycle(service_id, ClusterLifecycleAction::Stop)
+                .await?;
+            return self.get_service_info(service_id).await;
+        }
         let service_type_enum = ServiceType::from_str(&service.service_type).map_err(|_| {
             ExternalServiceError::InvalidServiceType {
                 id: service_id,
@@ -12439,6 +13571,8 @@ echo "[restore] Pre-seed complete"
         request: ImportExternalServiceRequest,
         created_by_user_id: Option<i32>,
     ) -> Result<ExternalServiceInfo> {
+        let name_transaction = self.db.begin().await?;
+        reserve_service_name(&name_transaction, &request.name, None).await?;
         // Get the service-specific implementation based on Docker inspection
         let docker = self
             .require_docker()
@@ -12456,6 +13590,26 @@ echo "[restore] Pre-seed complete"
                     e
                 )
             })?;
+
+        let container_name = container
+            .name
+            .as_deref()
+            .map(|name| name.trim_start_matches('/'))
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| ExternalServiceError::InternalError {
+                reason: "The import container has no canonical Docker name".to_string(),
+            })?;
+        let container_id =
+            container
+                .id
+                .as_deref()
+                .ok_or_else(|| ExternalServiceError::InternalError {
+                    reason: "The import container has no immutable Docker identity".to_string(),
+                })?;
+        // Name and ID aliases of the same Docker workload share this lock,
+        // even when concurrent callers choose different service names.
+        self.reserve_imported_container(&name_transaction, container_id, container_name)
+            .await?;
 
         let _image = container.config.and_then(|c| c.image).ok_or_else(|| {
             anyhow::anyhow!(
@@ -12646,9 +13800,11 @@ echo "[restore] Pre-seed complete"
             created_by_user_id: Set(created_by_user_id),
             ..Default::default()
         }
-        .insert(self.db.as_ref())
+        .insert(&name_transaction)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to save service to database: {}", e))?;
+
+        name_transaction.commit().await?;
 
         // Return the created service info
         Ok(ExternalServiceInfo {
@@ -15492,6 +16648,8 @@ mod tests {
     // ── End container stats helpers ──────────────────────────────────────────
 
     #[cfg(feature = "docker-tests")]
+    use crate::externalsvc::postgres::{postgres_container_name, postgres_volume_names};
+    #[cfg(feature = "docker-tests")]
     use bollard::Docker;
     #[cfg(feature = "docker-tests")]
     use serde_json::Value as JsonValue;
@@ -15557,6 +16715,482 @@ mod tests {
                 }
             }
         };
+    }
+
+    #[cfg(feature = "docker-tests")]
+    struct NameRaceResources {
+        docker: Arc<Docker>,
+        name: String,
+    }
+
+    #[cfg(feature = "docker-tests")]
+    impl Drop for NameRaceResources {
+        fn drop(&mut self) {
+            let docker = self.docker.clone();
+            let name = self.name.clone();
+            let cleanup = std::thread::spawn(move || {
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    eprintln!("Could not start cleanup for name-race fixture '{name}'");
+                    return;
+                };
+                runtime.block_on(async {
+                    let cleanup = async {
+                        let _ = docker
+                            .remove_container(
+                                &postgres_container_name(&name),
+                                Some(bollard::query_parameters::RemoveContainerOptions {
+                                    force: true,
+                                    v: true,
+                                    ..Default::default()
+                                }),
+                            )
+                            .await;
+                        for volume in postgres_volume_names(&name) {
+                            let _ = docker
+                                .remove_volume(
+                                    &volume,
+                                    None::<bollard::query_parameters::RemoveVolumeOptions>,
+                                )
+                                .await;
+                        }
+                    };
+                    if tokio::time::timeout(std::time::Duration::from_secs(20), cleanup)
+                        .await
+                        .is_err()
+                    {
+                        eprintln!("Cleanup timed out for name-race fixture '{name}'");
+                    }
+                });
+            });
+            let _ = cleanup.join();
+        }
+    }
+
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn concurrent_duplicate_service_names_preserve_original_database() {
+        let (manager, _test_db) = setup_test_manager_or_skip!();
+        let name = format!("name-race-{}", uuid::Uuid::new_v4());
+        let docker = manager.require_docker().unwrap();
+        assert!(matches!(
+            docker
+                .inspect_container(
+                    &postgres_container_name(&name),
+                    None::<bollard::query_parameters::InspectContainerOptions>
+                )
+                .await,
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404,
+                ..
+            })
+        ));
+        for volume in postgres_volume_names(&name) {
+            assert!(matches!(
+                docker.inspect_volume(&volume).await,
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404,
+                    ..
+                })
+            ));
+        }
+        // Register the unique, absent fixture resources before the first
+        // create so failed initialization and early assertions clean up too.
+        let _resources = NameRaceResources {
+            docker,
+            name: name.clone(),
+        };
+        let port = get_unused_port();
+        let request = || CreateExternalServiceRequest {
+            name: name.clone(),
+            service_type: ServiceType::Postgres,
+            version: None,
+            parameters: HashMap::from([
+                ("database".to_string(), serde_json::json!("app")),
+                ("username".to_string(), serde_json::json!("app")),
+                (
+                    "password".to_string(),
+                    serde_json::json!("TestPassword123!"),
+                ),
+                ("port".to_string(), serde_json::json!(port.to_string())),
+                (
+                    "docker_image".to_string(),
+                    serde_json::json!(std::env::var("TEMPS_TEST_POSTGRES_DOCKER_IMAGE")
+                        .unwrap_or_else(|_| "gotempsh/postgres-walg:18-bookworm".to_string())),
+                ),
+            ]),
+            node_id: None,
+            topology: "standalone".to_string(),
+            members: vec![],
+        };
+        let (left, right) = tokio::join!(
+            manager.create_service(request()),
+            manager.create_service(request())
+        );
+        let (original, rejected) = match (left, right) {
+            (Ok(service), Err(error)) | (Err(error), Ok(service)) => (service, error),
+            other => panic!("exactly one create must succeed: {other:?}"),
+        };
+        let result = async {
+            assert!(
+                matches!(rejected, ExternalServiceError::ServiceNameConflict { existing_service_id, .. } if existing_service_id == original.id)
+            );
+            assert_eq!(
+                external_services::Entity::find()
+                    .filter(external_services::Column::Name.eq(&name))
+                    .count(manager.db.as_ref())
+                    .await
+                    .unwrap(),
+                1
+            );
+            let connection = format!("postgres://app:TestPassword123!@127.0.0.1:{port}/app");
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&connection)
+                .await
+                .unwrap();
+            sqlx::raw_sql("CREATE TABLE name_guard_marker (id integer PRIMARY KEY, marker text); INSERT INTO name_guard_marker VALUES (1, 'preserved')")
+                .execute(&pool).await.unwrap();
+            let retry = manager.create_service(request()).await.unwrap_err();
+            assert!(matches!(
+                retry,
+                ExternalServiceError::ServiceNameConflict { .. }
+            ));
+            let marker: String =
+                sqlx::query_scalar("SELECT marker FROM name_guard_marker WHERE id = 1")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(marker, "preserved");
+            let container_name = postgres_container_name(&name);
+            let before = manager
+                .require_docker()
+                .unwrap()
+                .inspect_container(
+                    &container_name,
+                    None::<bollard::query_parameters::InspectContainerOptions>,
+                )
+                .await
+                .unwrap();
+            // Historical built-in aliases remain lifecycle targets. Query
+            // real PostgreSQL ownership without touching any host-wide alias.
+            for (builtin, service_type, alias) in [
+                ("temps-blob", "blob", "rustfs-blob-temps-blob"),
+                ("temps-kv", "redis", "redis-kv-temps-kv"),
+            ] {
+                let mut owner: external_services::ActiveModel =
+                    manager.get_service(original.id).await.unwrap().into();
+                owner.id = sea_orm::ActiveValue::NotSet;
+                owner.name = Set(builtin.to_string());
+                owner.service_type = Set(service_type.to_string());
+                owner.config = Set(None);
+                owner.status = Set("stopped".to_string());
+                let owner = owner.insert(manager.db.as_ref()).await.unwrap();
+                let txn = manager.db.begin().await.unwrap();
+                let conflict = manager
+                    .reserve_imported_container(
+                        &txn,
+                        &format!("owned-alias-id-{}", uuid::Uuid::new_v4()),
+                        alias,
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(conflict, ExternalServiceError::ServiceContainerConflict { existing_service_id, .. } if existing_service_id == owner.id)
+                );
+                txn.rollback().await.unwrap();
+                external_services::Entity::delete_by_id(owner.id)
+                    .exec(manager.db.as_ref())
+                    .await
+                    .unwrap();
+            }
+            let txn = manager.db.begin().await.unwrap();
+            manager
+                .reserve_imported_container(
+                    &txn,
+                    "owned-unused-alias-id",
+                    &format!("rustfs-blob-{name}"),
+                )
+                .await
+                .unwrap();
+            txn.rollback().await.unwrap();
+            // The internal rename path must reserve its destination before
+            // stopping the original container, just as create/import do.
+            let existing_name = format!("rename-existing-{}", uuid::Uuid::new_v4());
+            let mut existing: external_services::ActiveModel =
+                manager.get_service(original.id).await.unwrap().into();
+            existing.id = sea_orm::ActiveValue::NotSet;
+            existing.name = Set(existing_name.clone());
+            existing.status = Set("stopped".to_string());
+            let existing = existing.insert(manager.db.as_ref()).await.unwrap();
+            let rename = |name: String| UpdateExternalServiceRequest {
+                name: Some(name),
+                parameters: HashMap::new(),
+                docker_image: None,
+            };
+            let conflict = manager
+                .update_service(original.id, rename(existing_name))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(conflict, ExternalServiceError::ServiceNameConflict { existing_service_id, .. } if existing_service_id == existing.id)
+            );
+            external_services::Entity::delete_by_id(existing.id)
+                .exec(manager.db.as_ref())
+                .await
+                .unwrap();
+            let occupied_name = format!("rename-occupied-{}", uuid::Uuid::new_v4());
+            let occupied_container = postgres_container_name(&occupied_name);
+            let docker = manager.require_docker().unwrap();
+            assert!(matches!(
+                docker
+                    .inspect_container(
+                        &occupied_container,
+                        None::<bollard::query_parameters::InspectContainerOptions>
+                    )
+                    .await,
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404,
+                    ..
+                })
+            ));
+            for volume in postgres_volume_names(&occupied_name) {
+                assert!(matches!(
+                    docker.inspect_volume(&volume).await,
+                    Err(bollard::errors::Error::DockerResponseServerError {
+                        status_code: 404,
+                        ..
+                    })
+                ));
+            }
+            let _occupied_resources = NameRaceResources {
+                docker: docker.clone(),
+                name: occupied_name.clone(),
+            };
+            let occupied = docker
+                .create_container(
+                    Some(bollard::query_parameters::CreateContainerOptions {
+                        name: Some(occupied_container.clone()),
+                        ..Default::default()
+                    }),
+                    bollard::models::ContainerCreateBody {
+                        image: Some(
+                            std::env::var("TEMPS_TEST_POSTGRES_DOCKER_IMAGE").unwrap_or_else(
+                                |_| "gotempsh/postgres-walg:18-bookworm".to_string(),
+                            ),
+                        ),
+                        entrypoint: Some(vec!["sh".to_string()]),
+                        cmd: Some(vec!["-c".to_string(), "sleep 300".to_string()]),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let conflict = manager
+                .update_service(original.id, rename(occupied_name))
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                conflict,
+                ExternalServiceError::ServiceResourceConflict { .. }
+            ));
+            let after = docker
+                .inspect_container(
+                    &container_name,
+                    None::<bollard::query_parameters::InspectContainerOptions>,
+                )
+                .await
+                .unwrap();
+            assert_eq!(before.id, after.id);
+            assert_eq!(before.state.unwrap().status, after.state.unwrap().status);
+            assert_eq!(manager.get_service(original.id).await.unwrap().name, name);
+            assert_eq!(
+                docker
+                    .inspect_container(
+                        &occupied_container,
+                        None::<bollard::query_parameters::InspectContainerOptions>
+                    )
+                    .await
+                    .unwrap()
+                    .id,
+                Some(occupied.id)
+            );
+            let marker: String =
+                sqlx::query_scalar("SELECT marker FROM name_guard_marker WHERE id = 1")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(marker, "preserved");
+            pool.close().await;
+        };
+        let assertion = std::panic::AssertUnwindSafe(result);
+        use futures::FutureExt;
+        let assertion = assertion.catch_unwind().await;
+        manager.delete_service(original.id).await.unwrap();
+        if let Err(error) = assertion {
+            std::panic::resume_unwind(error);
+        }
+    }
+
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn deleting_renamed_service_preserves_admitted_backup_provenance() {
+        use temps_entities::{backups, s3_sources, users};
+        let (manager, test_db) = setup_test_manager_or_skip!();
+        let now = Utc::now();
+        let original_name = format!("backup-original-{}", uuid::Uuid::new_v4());
+        let renamed_name = format!("backup-renamed-{}", uuid::Uuid::new_v4());
+        // Only database fixtures are needed. Verify the uniquely named cleanup
+        // targets are absent before exercising the real service deletion path.
+        let docker = manager.require_docker().unwrap();
+        for name in [&original_name, &renamed_name] {
+            assert!(matches!(
+                docker
+                    .inspect_container(
+                        &postgres_container_name(name),
+                        None::<bollard::query_parameters::InspectContainerOptions>
+                    )
+                    .await,
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404,
+                    ..
+                })
+            ));
+            for volume in postgres_volume_names(name) {
+                assert!(matches!(
+                    docker.inspect_volume(&volume).await,
+                    Err(bollard::errors::Error::DockerResponseServerError {
+                        status_code: 404,
+                        ..
+                    })
+                ));
+            }
+        }
+        let user = users::ActiveModel {
+            name: Set("Backup Owner".to_string()),
+            email: Set(format!("backup-owner-{}@test.local", uuid::Uuid::new_v4())),
+            email_verified: Set(true),
+            mfa_enabled: Set(false),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await
+        .unwrap();
+        let service = external_services::ActiveModel {
+            name: Set(original_name.clone()),
+            service_type: Set("postgres".to_string()),
+            status: Set("stopped".to_string()),
+            config: Set(Some(
+                manager.encryption_service.encrypt_string("{}").unwrap(),
+            )),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await
+        .unwrap();
+        let source = s3_sources::ActiveModel {
+            name: Set(format!("backup-source-{}", uuid::Uuid::new_v4())),
+            bucket_name: Set("test-bucket".to_string()),
+            region: Set("us-east-1".to_string()),
+            bucket_path: Set("owned".to_string()),
+            access_key_id: Set("test-access".to_string()),
+            secret_key: Set("test-secret".to_string()),
+            is_default: Set(false),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await
+        .unwrap();
+        let location =
+            format!("s3://test-bucket/owned/external_services/postgres/{original_name}/walg");
+        let backup = backups::ActiveModel {
+            name: Set("admitted backup".to_string()),
+            backup_id: Set(uuid::Uuid::new_v4().to_string()),
+            backup_type: Set("full".to_string()),
+            state: Set("completed".to_string()),
+            started_at: Set(now),
+            finished_at: Set(Some(now)),
+            size_bytes: Set(Some(1024)),
+            s3_source_id: Set(source.id),
+            s3_location: Set(location.clone()),
+            metadata: Set("{}".to_string()),
+            compression_type: Set("gzip".to_string()),
+            created_by: Set(user.id),
+            tags: Set("[]".to_string()),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await
+        .unwrap();
+        let mut child_ids = Vec::new();
+        for (name, kind) in [
+            (Some(original_name.clone()), Some("postgres".to_string())),
+            (Some(original_name.clone()), None),
+            (None, None),
+        ] {
+            let child = external_service_backups::ActiveModel {
+                service_id: Set(service.id),
+                backup_id: Set(backup.id),
+                backup_type: Set("full".to_string()),
+                state: Set("completed".to_string()),
+                started_at: Set(now),
+                finished_at: Set(Some(now)),
+                size_bytes: Set(Some(1024)),
+                s3_location: Set(location.clone()),
+                metadata: Set(serde_json::json!({})),
+                compression_type: Set("gzip".to_string()),
+                created_by: Set(user.id),
+                service_name_snapshot: Set(name),
+                service_type_snapshot: Set(kind),
+                ..Default::default()
+            }
+            .insert(test_db.db.as_ref())
+            .await
+            .unwrap();
+            child_ids.push(child.id);
+        }
+        let mut renamed: external_services::ActiveModel = service.clone().into();
+        renamed.name = Set(renamed_name.clone());
+        renamed.update(test_db.db.as_ref()).await.unwrap();
+        manager.delete_service(service.id).await.unwrap();
+        assert!(external_services::Entity::find_by_id(service.id)
+            .one(test_db.db.as_ref())
+            .await
+            .unwrap()
+            .is_none());
+        let retained = external_service_backups::Entity::find()
+            .filter(external_service_backups::Column::Id.is_in(child_ids))
+            .order_by_asc(external_service_backups::Column::Id)
+            .all(test_db.db.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(retained.len(), 3);
+        assert_eq!(
+            retained[0].service_name_snapshot.as_deref(),
+            Some(original_name.as_str())
+        );
+        assert_eq!(
+            retained[1].service_name_snapshot.as_deref(),
+            Some(original_name.as_str())
+        );
+        assert_eq!(
+            retained[2].service_name_snapshot.as_deref(),
+            Some(renamed_name.as_str())
+        );
+        assert!(retained
+            .iter()
+            .all(
+                |child| child.service_type_snapshot.as_deref() == Some("postgres")
+                    && child.s3_location == location
+            ));
     }
 
     /// The core safety guard: only PENDING/RUNNING/ROLLING_BACK upgrade rows
@@ -15795,19 +17429,145 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_create_s3_service() {
+        struct S3FixtureResources {
+            name: String,
+        }
+
+        impl Drop for S3FixtureResources {
+            fn drop(&mut self) {
+                let name = self.name.clone();
+                let cleanup = std::thread::spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("Failed to start S3 fixture cleanup runtime");
+                    runtime.block_on(async {
+                        let cleanup = async {
+                            // A fresh client keeps cleanup independent of the test runtime.
+                            let docker = Docker::connect_with_local_defaults()
+                                .map_err(|error| error.to_string())?;
+                            let container_name = format!("rustfs-{name}");
+                            match docker
+                                .inspect_container(
+                                    &container_name,
+                                    None::<bollard::query_parameters::InspectContainerOptions>,
+                                )
+                                .await
+                            {
+                                Ok(container) => {
+                                    let labels = container.config.and_then(|config| config.labels);
+                                    if labels
+                                        .as_ref()
+                                        .and_then(|labels| labels.get("temps.service_name"))
+                                        != Some(&name)
+                                    {
+                                        return Err(format!(
+                                            "Refusing to clean S3 fixture container '{container_name}': ownership label changed"
+                                        ));
+                                    }
+                                    let id = container.id.ok_or_else(|| {
+                                        format!("S3 fixture container '{container_name}' has no ID")
+                                    })?;
+                                    docker
+                                        .remove_container(
+                                            &id,
+                                            Some(bollard::query_parameters::RemoveContainerOptions {
+                                                force: true,
+                                                ..Default::default()
+                                            }),
+                                        )
+                                        .await
+                                        .map_err(|error| error.to_string())?;
+                                }
+                                Err(bollard::errors::Error::DockerResponseServerError {
+                                    status_code: 404,
+                                    ..
+                                }) => {}
+                                Err(error) => return Err(error.to_string()),
+                            }
+                            for volume in [format!("rustfs_{name}_data"), format!("rustfs_{name}_logs")] {
+                                match docker
+                                    .remove_volume(
+                                        &volume,
+                                        None::<bollard::query_parameters::RemoveVolumeOptions>,
+                                    )
+                                    .await
+                                {
+                                    Ok(())
+                                    | Err(bollard::errors::Error::DockerResponseServerError {
+                                        status_code: 404,
+                                        ..
+                                    }) => {}
+                                    Err(error) => return Err(format!("Volume '{volume}': {error}")),
+                                }
+                            }
+                            Ok::<(), String>(())
+                        };
+                        match tokio::time::timeout(std::time::Duration::from_secs(20), cleanup).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => eprintln!("S3 fixture '{name}' cleanup failed: {error}"),
+                            Err(_) => eprintln!("S3 fixture '{name}' cleanup exceeded 20 seconds"),
+                        }
+                    });
+                });
+                if cleanup.join().is_err() {
+                    eprintln!("S3 fixture '{}' cleanup thread panicked", self.name);
+                }
+            }
+        }
+
         let (manager, _test_db) = setup_test_manager_or_skip!();
-
-        let random_unused_port = get_unused_port();
-        let mut params = HashMap::new();
-        params.insert(
-            "port".to_string(),
-            JsonValue::String(random_unused_port.to_string()),
+        let name = format!("test-s3-{}", uuid::Uuid::new_v4());
+        let docker = manager.require_docker().unwrap();
+        let container_name = format!("rustfs-{name}");
+        assert!(
+            matches!(
+                docker
+                    .inspect_container(
+                        &container_name,
+                        None::<bollard::query_parameters::InspectContainerOptions>
+                    )
+                    .await,
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404,
+                    ..
+                })
+            ),
+            "S3 fixture container '{container_name}' must not exist before creation"
         );
-        // Note: bucket_name is not a parameter - buckets are created dynamically during provisioning
-        // access_key and secret_key have defaults, so they're optional
-
+        for volume in [format!("rustfs_{name}_data"), format!("rustfs_{name}_logs")] {
+            assert!(
+                matches!(
+                    docker.inspect_volume(&volume).await,
+                    Err(bollard::errors::Error::DockerResponseServerError {
+                        status_code: 404,
+                        ..
+                    })
+                ),
+                "S3 fixture volume '{volume}' must not exist before creation"
+            );
+        }
+        // These UUID-derived resources were absent above; clean them even if
+        // creation or a readiness assertion fails before delete_service runs.
+        let _cleanup = S3FixtureResources { name: name.clone() };
+        let api_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let console_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut params = HashMap::from([
+            (
+                "port".to_string(),
+                JsonValue::String(api_listener.local_addr().unwrap().port().to_string()),
+            ),
+            (
+                "console_port".to_string(),
+                JsonValue::String(console_listener.local_addr().unwrap().port().to_string()),
+            ),
+        ]);
+        // A test-only override lets shared-host runs use a run-owned image.
+        if let Ok(image) = std::env::var("TEMPS_TEST_RUSTFS_DOCKER_IMAGE") {
+            params.insert("docker_image".to_string(), JsonValue::String(image));
+        }
         let request = CreateExternalServiceRequest {
-            name: "test-s3".to_string(),
+            name: name.clone(),
             service_type: ServiceType::S3,
             version: None,
             parameters: params,
@@ -15815,16 +17575,54 @@ mod tests {
             topology: "standalone".to_string(),
             members: Vec::new(),
         };
-
-        let result = manager.create_service(request).await;
-
-        let service = result.expect("Failed to create S3 service");
-        assert_eq!(service.name, "test-s3");
+        drop(api_listener);
+        drop(console_listener);
+        let mut service = manager
+            .create_service(request)
+            .await
+            .expect("Failed to create S3 service");
+        assert_eq!(service.name, name);
         assert_eq!(service.service_type, ServiceType::S3);
-        assert_eq!(service.status, "running");
+        eprintln!(
+            "S3 fixture '{name}' created with status '{}'",
+            service.status
+        );
 
-        // Cleanup
-        let _ = manager.delete_service(service.id).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(190);
+        while service.status != "running" {
+            // Readiness is additive: this test also compiles on versions that
+            // mark the service running synchronously and omit the field.
+            let snapshot = serde_json::to_value(&service).unwrap();
+            let diagnostic = format!(
+                "status={}, error={:?}, readiness={:?}",
+                service.status,
+                service.error_message,
+                snapshot.get("readiness")
+            );
+            assert_ne!(
+                service.status, "failed",
+                "S3 fixture '{name}' failed: {diagnostic}"
+            );
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "S3 fixture '{name}' did not become ready within 190 seconds: {diagnostic}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            service = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                manager.get_service_info(service.id),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("S3 fixture '{name}' status read timed out: {diagnostic}"))
+            .unwrap_or_else(|error| {
+                panic!("S3 fixture '{name}' status read failed: {error}; {diagnostic}")
+            });
+        }
+        eprintln!("S3 fixture '{name}' reached running");
+        manager
+            .delete_service(service.id)
+            .await
+            .expect("Failed to delete owned S3 fixture");
     }
 
     #[cfg(feature = "docker-tests")]
@@ -16708,6 +18506,650 @@ mod tests {
                     .expect("health lookup should succeed"),
                 expected,
                 "persisted health_status {persisted:?} should report {expected}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn service_name_reservation_locks_before_check_and_rejects_collision() {
+        let existing = encrypted_service_model(17, serde_json::json!({}));
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .append_query_results([vec![existing]])
+            .into_connection();
+        let txn = db.begin().await.unwrap();
+        let error = reserve_service_name(&txn, "postgres-test", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ExternalServiceError::ServiceNameConflict {
+                existing_service_id: 17,
+                ..
+            }
+        ));
+        txn.rollback().await.unwrap();
+        let log = db.into_transaction_log();
+        let statements = log[0].statements();
+        let lock = statements
+            .iter()
+            .position(|statement| statement.sql.contains("pg_advisory_xact_lock"))
+            .unwrap();
+        let check = statements
+            .iter()
+            .position(|statement| {
+                statement.sql.contains("SELECT") && statement.sql.contains("external_services")
+            })
+            .unwrap();
+        assert!(lock < check);
+        assert!(statements
+            .iter()
+            .all(|statement| !statement.sql.contains("INSERT")));
+    }
+
+    #[tokio::test]
+    async fn imported_container_reservation_rejects_existing_owner_before_validation() {
+        let existing = encrypted_service_model(17, serde_json::json!({}));
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .append_query_results([vec![existing]])
+                .into_connection(),
+        );
+        let manager = mock_service_manager_with_db(db.clone());
+        let txn = db.begin().await.unwrap();
+        let error = manager
+            .reserve_imported_container(&txn, "immutable-container-id", "postgres-test")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ExternalServiceError::ServiceContainerConflict {
+                existing_service_id: 17,
+                ..
+            }
+        ));
+        txn.rollback().await.unwrap();
+        drop(manager);
+        let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("test database still has owners"));
+        let log = db.into_transaction_log();
+        let statements = log[0].statements();
+        let lock = statements
+            .iter()
+            .position(|s| s.sql.contains("pg_advisory_xact_lock"))
+            .unwrap();
+        let owner = statements
+            .iter()
+            .position(|s| s.sql.contains("SELECT") && s.sql.contains("external_services"))
+            .unwrap();
+        assert!(lock < owner);
+        assert!(statements.iter().all(|s| !s.sql.contains("INSERT")));
+    }
+
+    fn active_name_restore(id: i32, name: &str) -> temps_entities::restore_runs::Model {
+        temps_entities::restore_runs::Model {
+            id,
+            source_backup_id: 1,
+            source_service_id: 17,
+            target_service_id: None,
+            target_service_name: Some(name.to_string()),
+            mode: "new_service".to_string(),
+            status: "running".to_string(),
+            phase: "provision".to_string(),
+            recovery_target: None,
+            parameter_overrides: serde_json::json!({}),
+            resume_token: None,
+            log_id: "owned-log".to_string(),
+            error_message: None,
+            attempt: 1,
+            started_at: Some(Utc::now()),
+            finished_at: None,
+            created_by: 1,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            cancel_requested_at: None,
+            cancel_requested_by: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn service_name_reservation_refuses_a_durable_clone_reservation() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .append_query_results([Vec::<external_services::Model>::new()])
+            .append_query_results([vec![active_name_restore(41, "copy")]])
+            .into_connection();
+        let txn = db.begin().await.unwrap();
+        let error = reserve_service_name(&txn, "copy", None).await.unwrap_err();
+        assert!(matches!(
+            error,
+            ExternalServiceError::ServiceNameRestoreConflict {
+                restore_run_id: 41,
+                ..
+            }
+        ));
+        txn.rollback().await.unwrap();
+        let log = db.into_transaction_log();
+        assert!(log[0]
+            .statements()
+            .iter()
+            .all(|s| !s.sql.contains("INSERT")));
+    }
+
+    #[tokio::test]
+    async fn imported_container_reservation_refuses_an_unregistered_clone() {
+        let owner =
+            std::collections::BTreeMap::from([("id".to_string(), sea_orm::Value::Int(Some(41)))]);
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .append_query_results([Vec::<external_services::Model>::new()])
+                .append_query_results([vec![owner]])
+                .into_connection(),
+        );
+        let manager = mock_service_manager_with_db(db.clone());
+        let txn = db.begin().await.unwrap();
+        let error = manager
+            .reserve_imported_container(&txn, "owned-clone-id", "postgres-copy")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ExternalServiceError::ServiceContainerRestoreConflict {
+                restore_run_id: 41,
+                ..
+            }
+        ));
+        txn.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn imported_container_reservation_rechecks_registration_after_clone_handoff() {
+        let owner = encrypted_service_model(23, serde_json::json!({}));
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .append_query_results([Vec::<external_services::Model>::new()])
+                .append_query_results([
+                    Vec::<std::collections::BTreeMap<String, sea_orm::Value>>::new(),
+                ])
+                .append_query_results([vec![owner]])
+                .into_connection(),
+        );
+        let manager = mock_service_manager_with_db(db.clone());
+        let txn = db.begin().await.unwrap();
+        let error = manager
+            .reserve_imported_container(&txn, "owned-clone-id", "postgres-copy")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ExternalServiceError::ServiceContainerConflict {
+                existing_service_id: 23,
+                ..
+            }
+        ));
+        txn.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_duplicate_service_cannot_stop_shared_container() {
+        let existing = encrypted_service_model(17, serde_json::json!({}));
+        let duplicate = encrypted_service_model(23, serde_json::json!({}));
+        let manager = mock_service_manager(vec![vec![duplicate], vec![existing]]);
+        let error = manager.stop_service(23).await.unwrap_err();
+        assert!(matches!(
+            error,
+            ExternalServiceError::AmbiguousServiceName {
+                service_id: 23,
+                existing_service_id: 17,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_duplicate_service_cannot_apply_metrics_to_shared_container() {
+        let existing = encrypted_service_model(17, serde_json::json!({}));
+        let duplicate = encrypted_service_model(23, serde_json::json!({}));
+        let manager = mock_service_manager(vec![vec![duplicate], vec![existing]]);
+        let error = manager
+            .store_and_apply_ingest_key(
+                23,
+                "unused-key".to_string(),
+                "http://localhost/unused".to_string(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ExternalServiceError::AmbiguousServiceName {
+                service_id: 23,
+                existing_service_id: 17,
+                ..
+            }
+        ));
+    }
+
+    fn cluster_member(ordinal: i32, role: &str, status: &str) -> service_members::Model {
+        let container_name = if role == "monitor" {
+            "postgres-ha-monitor".to_string()
+        } else {
+            format!("postgres-ha-{ordinal}")
+        };
+        service_members::Model {
+            id: 100 + ordinal,
+            service_id: 7,
+            node_id: None,
+            role: role.to_string(),
+            container_id: None,
+            container_name,
+            hostname: None,
+            port: None,
+            compute_ip: None,
+            status: status.to_string(),
+            ordinal,
+            config: None,
+            provisioning_step: None,
+            provisioning_error: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn lifecycle_names(members: Vec<&service_members::Model>) -> Vec<&str> {
+        members
+            .into_iter()
+            .map(|member| member.container_name.as_str())
+            .collect()
+    }
+
+    /// Regression for #1353: with the live primary known, a cluster is
+    /// stopped standbys first, primary next and monitor last (so no standby
+    /// is left for the monitor to promote); it is started monitor first.
+    #[test]
+    fn cluster_lifecycle_order_stops_standbys_first_and_starts_the_monitor_first() {
+        let members = vec![
+            cluster_member(0, "monitor", "running"),
+            cluster_member(1, "primary", "running"),
+            cluster_member(2, "replica", "running"),
+            cluster_member(3, "replica", "failed"),
+        ];
+        assert_eq!(
+            lifecycle_names(cluster_lifecycle_order(
+                &members,
+                Some("postgres-ha-1"),
+                ClusterLifecycleAction::Stop
+            )),
+            [
+                "postgres-ha-2",
+                "postgres-ha-3",
+                "postgres-ha-1",
+                "postgres-ha-monitor"
+            ]
+        );
+        // A failed member may still run a container, so it is stopped, but
+        // it is never started.
+        assert_eq!(
+            lifecycle_names(cluster_lifecycle_order(
+                &members,
+                None,
+                ClusterLifecycleAction::Start
+            )),
+            ["postgres-ha-monitor", "postgres-ha-1", "postgres-ha-2"]
+        );
+        // After a failover the monitor's live primary wins over the stored
+        // role, so the old primary (now a standby) is stopped first.
+        assert_eq!(
+            lifecycle_names(cluster_lifecycle_order(
+                &members,
+                Some("postgres-ha-2"),
+                ClusterLifecycleAction::Stop
+            )),
+            [
+                "postgres-ha-1",
+                "postgres-ha-3",
+                "postgres-ha-2",
+                "postgres-ha-monitor"
+            ]
+        );
+    }
+
+    /// Greptile on #1366: when the monitor cannot name the live primary,
+    /// stored roles cannot stand in for it (data members are all stored as
+    /// `replica`), so Stop takes the monitor down first: without it no
+    /// standby can be promoted, whatever order the data members follow.
+    #[test]
+    fn cluster_stop_without_a_known_primary_stops_the_monitor_first() {
+        let members = vec![
+            cluster_member(1, "replica", "running"),
+            cluster_member(0, "monitor", "running"),
+            cluster_member(2, "replica", "running"),
+            cluster_member(3, "primary", "running"),
+        ];
+        assert_eq!(
+            lifecycle_names(cluster_lifecycle_order(
+                &members,
+                None,
+                ClusterLifecycleAction::Stop
+            )),
+            [
+                "postgres-ha-monitor",
+                "postgres-ha-1",
+                "postgres-ha-2",
+                "postgres-ha-3"
+            ]
+        );
+    }
+
+    /// Run a cluster Stop or Start against a mock database holding a
+    /// cluster with `parent_status`, last changed `age` ago. With `members`
+    /// the claim is expected to succeed and the members to be refused;
+    /// without, the claim itself must be refused. Returns the error and the
+    /// statements issued.
+    async fn refused_cluster_lifecycle(
+        action: &str,
+        parent_status: &str,
+        age: chrono::Duration,
+        members: Option<Vec<service_members::Model>>,
+    ) -> (ExternalServiceError, Vec<sea_orm::Statement>) {
+        let mut cluster = encrypted_service_model(7, serde_json::json!({}));
+        cluster.topology = "cluster".to_string();
+        cluster.status = parent_status.to_string();
+        cluster.updated_at = Utc::now() - age;
+        let mut db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres);
+        if action == "start" {
+            // `start_service` first checks for an active major upgrade.
+            db = db.append_query_results([
+                Vec::<temps_entities::postgres_major_upgrades::Model>::new(),
+            ]);
+        }
+        // `get_service`, the duplicate-name check (no other service has this
+        // name), then the claim's locked read.
+        db = db
+            .append_query_results([vec![cluster.clone()]])
+            .append_query_results([Vec::<external_services::Model>::new()])
+            .append_query_results([vec![cluster.clone()]]);
+        if let Some(members) = members {
+            let mut claimed = cluster.clone();
+            claimed.status = format!("{action}ping").replace("startping", "starting");
+            db = db
+                .append_query_results([vec![claimed]])
+                .append_query_results([members])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }]);
+        }
+        let db = Arc::new(db.into_connection());
+        let manager = mock_service_manager_with_db(db.clone());
+        let error = if action == "stop" {
+            manager.stop_service(7).await.unwrap_err()
+        } else {
+            manager.start_service(7).await.unwrap_err()
+        };
+        drop(manager);
+        let statements = Arc::try_unwrap(db)
+            .expect("the manager holds no other database handle")
+            .into_transaction_log()
+            .iter()
+            .flat_map(|transaction| transaction.statements().to_vec())
+            .collect();
+        (error, statements)
+    }
+
+    /// Regression for #1353: Stop/Start of a cluster never targets the
+    /// standalone container name, and refuses with a 409-class error while a
+    /// member is still being provisioned (`creating`, or `pending` before
+    /// its provisioning started) instead of a Docker 404. The members are
+    /// read only after the cluster is claimed, and the claim is released
+    /// back to the cluster's previous status.
+    #[tokio::test]
+    async fn cluster_stop_and_start_refuse_while_a_member_is_provisioning() {
+        for action in ["stop", "start"] {
+            for busy_status in ["creating", "pending"] {
+                let previous = if action == "stop" {
+                    "running"
+                } else {
+                    "stopped"
+                };
+                let (error, statements) = refused_cluster_lifecycle(
+                    action,
+                    previous,
+                    chrono::Duration::zero(),
+                    Some(vec![
+                        cluster_member(0, "monitor", "running"),
+                        cluster_member(1, "primary", "running"),
+                        cluster_member(2, "replica", busy_status),
+                    ]),
+                )
+                .await;
+                assert!(
+                    matches!(
+                        &error,
+                        ExternalServiceError::ClusterMemberProvisioning {
+                            service_id: 7,
+                            container_name,
+                            status,
+                            ..
+                        } if container_name == "postgres-ha-2" && status == busy_status
+                    ),
+                    "{action}/{busy_status}: {error:?}"
+                );
+                assert!(error.to_string().contains(action), "{error}");
+                assert!(!error.to_string().contains("No such container"));
+
+                let position = |needle: &str| {
+                    statements
+                        .iter()
+                        .position(|s| s.sql.contains(needle))
+                        .unwrap_or_else(|| panic!("{action}: no statement with {needle}"))
+                };
+                assert!(position("FOR UPDATE") < position("service_members"));
+                let release = statements.last().expect("the claim must be released");
+                assert!(release.sql.starts_with("UPDATE"), "{}", release.sql);
+                let values = format!("{:?}", release.values);
+                assert!(values.contains(&format!("\"{previous}\"")), "{values}");
+                let claim = if action == "stop" {
+                    "stopping"
+                } else {
+                    "starting"
+                };
+                assert!(values.contains(&format!("\"{claim}\"")), "{values}");
+            }
+        }
+    }
+
+    /// Greptile on #1366: a cluster still in its initial provisioning has
+    /// no member rows yet; Stop must not report success and mark it stopped
+    /// while the background job goes on to start it. A cluster whose
+    /// provisioning failed is not started either (Retry provisions it), and
+    /// one another Stop/Start holds is refused as busy. None of them is
+    /// claimed or read further.
+    #[tokio::test]
+    async fn cluster_lifecycle_refuses_a_cluster_it_cannot_claim() {
+        for (action, parent_status) in [
+            ("stop", "creating"),
+            ("start", "creating"),
+            ("start", "failed"),
+            ("stop", "starting"),
+            ("start", "stopping"),
+        ] {
+            let (error, statements) = refused_cluster_lifecycle(
+                action,
+                parent_status,
+                chrono::Duration::minutes(1),
+                None,
+            )
+            .await;
+            match parent_status {
+                "stopping" | "starting" => assert!(
+                    matches!(
+                        &error,
+                        ExternalServiceError::ClusterBusy { service_id: 7, .. }
+                    ),
+                    "{action}/{parent_status}: {error:?}"
+                ),
+                _ => assert!(
+                    matches!(
+                        &error,
+                        ExternalServiceError::ClusterNotSettled { service_id: 7, status, .. }
+                            if status == parent_status
+                    ),
+                    "{action}/{parent_status}: {error:?}"
+                ),
+            }
+            assert!(error.to_string().contains(action), "{error}");
+            assert!(statements.iter().any(|s| s.sql.contains("FOR UPDATE")));
+            assert!(statements
+                .iter()
+                .all(|s| !s.sql.contains("service_members")));
+            assert!(statements.iter().all(|s| !s.sql.starts_with("UPDATE")));
+        }
+    }
+
+    /// Greptile on #1366: a claim whose process died is taken over once it
+    /// has made no progress for `CLUSTER_CLAIM_STALE_AFTER`; a live one is
+    /// busy. Settled clusters can be claimed by either action.
+    #[test]
+    fn cluster_claims_expire_only_when_stale() {
+        let now = Utc::now();
+        let fresh = now - chrono::Duration::minutes(1);
+        let stale = now - CLUSTER_CLAIM_STALE_AFTER - chrono::Duration::seconds(1);
+        let stop = ClusterLifecycleAction::Stop;
+        let start = ClusterLifecycleAction::Start;
+        assert!(matches!(
+            cluster_claim_decision(7, "stopping", fresh, now, start),
+            Err(ExternalServiceError::ClusterBusy { .. })
+        ));
+        assert!(cluster_claim_decision(7, "stopping", stale, now, start).is_ok());
+        assert!(cluster_claim_decision(7, "starting", stale, now, stop).is_ok());
+        for status in ["running", "stopped"] {
+            assert!(cluster_claim_decision(7, status, fresh, now, stop).is_ok());
+            assert!(cluster_claim_decision(7, status, fresh, now, start).is_ok());
+        }
+        assert!(cluster_claim_decision(7, "failed", fresh, now, stop).is_ok());
+
+        assert_eq!(cluster_status_before_claim("stopped"), "stopped");
+        assert_eq!(cluster_status_before_claim("failed"), "failed");
+        assert_eq!(cluster_status_before_claim("stopping"), "running");
+    }
+
+    /// A cluster whose provisioning failed can still be stopped: members it
+    /// left `pending`/`creating` are failed, not being provisioned, and keep
+    /// that status.
+    #[test]
+    fn members_of_a_failed_cluster_are_settled_as_failed() {
+        let mut members = vec![
+            cluster_member(0, "monitor", "running"),
+            cluster_member(1, "primary", "pending"),
+            cluster_member(2, "replica", "creating"),
+            cluster_member(3, "replica", "stopped"),
+        ];
+        let abandoned = settle_members_of_failed_cluster(&mut members);
+        assert_eq!(abandoned, [members[1].id, members[2].id]);
+        let statuses: Vec<&str> = members.iter().map(|m| m.status.as_str()).collect();
+        assert_eq!(statuses, ["running", "failed", "failed", "stopped"]);
+        assert!(members.iter().all(|m| cluster_member_is_settled(&m.status)));
+        assert_eq!(
+            recorded_member_status(&members[1], ClusterLifecycleAction::Stop),
+            None
+        );
+    }
+
+    /// Greptile on #1366: stopping a member whose provisioning failed keeps
+    /// it `failed`, so the next Start still skips it.
+    #[test]
+    fn a_failed_member_stays_failed_after_a_lifecycle_action() {
+        for action in [ClusterLifecycleAction::Stop, ClusterLifecycleAction::Start] {
+            assert_eq!(
+                recorded_member_status(&cluster_member(3, "replica", "failed"), action),
+                None
+            );
+        }
+        assert_eq!(
+            recorded_member_status(
+                &cluster_member(1, "primary", "running"),
+                ClusterLifecycleAction::Stop
+            ),
+            Some("stopped")
+        );
+        assert_eq!(
+            recorded_member_status(
+                &cluster_member(1, "primary", "stopped"),
+                ClusterLifecycleAction::Start
+            ),
+            Some("running")
+        );
+        let stopped_failed = cluster_member(3, "replica", "failed");
+        assert!(cluster_lifecycle_order(
+            std::slice::from_ref(&stopped_failed),
+            None,
+            ClusterLifecycleAction::Start
+        )
+        .is_empty());
+    }
+
+    /// Greptile on #1366: a retried Stop/Start passes remote members an
+    /// earlier attempt already handled, judged by the container's state
+    /// because agents report "already stopped/started" as errors.
+    #[test]
+    fn remote_member_outcome_is_judged_by_container_state() {
+        use crate::remote_service_client::RemoteServiceStatus;
+        let observed = |exists: bool, running: bool| RemoteServiceStatus {
+            container_name: "postgres-ha-2".to_string(),
+            container_id: exists.then(|| "abc123".to_string()),
+            running,
+            health: None,
+        };
+        let healthy = cluster_member(2, "replica", "running");
+        let failed = cluster_member(2, "replica", "failed");
+        let stop = ClusterLifecycleAction::Stop;
+        let start = ClusterLifecycleAction::Start;
+
+        // Already in the wanted state: nothing to do.
+        assert_eq!(
+            remote_member_outcome(&healthy, stop, &observed(true, false)),
+            Some(Ok(()))
+        );
+        assert_eq!(
+            remote_member_outcome(&healthy, start, &observed(true, true)),
+            Some(Ok(()))
+        );
+        // The agent must act.
+        assert_eq!(
+            remote_member_outcome(&healthy, stop, &observed(true, true)),
+            None
+        );
+        assert_eq!(
+            remote_member_outcome(&healthy, start, &observed(true, false)),
+            None
+        );
+        // A missing container: fine to "stop" for a failed member only.
+        assert_eq!(
+            remote_member_outcome(&failed, stop, &observed(false, false)),
+            Some(Ok(()))
+        );
+        for (member, action) in [(&healthy, stop), (&healthy, start), (&failed, start)] {
+            let outcome = remote_member_outcome(member, action, &observed(false, false));
+            assert!(
+                matches!(&outcome, Some(Err(reason)) if reason.contains("does not exist")),
+                "{action:?}: {outcome:?}"
             );
         }
     }
@@ -18297,6 +20739,128 @@ mod tests {
         );
         // Converged clusters return without reading members again.
         manager.upgrade_cluster_auth(service_id).await.unwrap();
+    }
+
+    /// Greptile on #1366: a Stop/Start claims the cluster in a short
+    /// committed write, so no connection is held while containers change; a
+    /// second action is refused as busy, Add Replica's locked status check
+    /// refuses a claimed cluster, and releasing the claim records the
+    /// result only while this action still holds it.
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn cluster_claim_excludes_other_actions_until_released() {
+        let (manager, _test_db) = setup_test_manager_or_skip!();
+        let service_id =
+            insert_cluster_at_auth_version(&manager, "claim-test", None, &[("monitor", "running")])
+                .await;
+
+        let before = manager
+            .claim_cluster(service_id, ClusterLifecycleAction::Stop)
+            .await
+            .unwrap();
+        assert_eq!(before.status, "running");
+        assert_eq!(
+            manager.get_service(service_id).await.unwrap().status,
+            "stopping"
+        );
+
+        let busy = manager
+            .claim_cluster(service_id, ClusterLifecycleAction::Start)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(busy, ExternalServiceError::ClusterBusy { .. }),
+            "{busy:?}"
+        );
+
+        // A release by an action that no longer holds the claim changes nothing.
+        manager
+            .release_cluster_claim(service_id, ClusterLifecycleAction::Start, "running", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.get_service(service_id).await.unwrap().status,
+            "stopping"
+        );
+
+        manager
+            .release_cluster_claim(service_id, ClusterLifecycleAction::Stop, "stopped", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.get_service(service_id).await.unwrap().status,
+            "stopped"
+        );
+
+        // A claim whose process died is taken over once stale.
+        manager
+            .claim_cluster(service_id, ClusterLifecycleAction::Start)
+            .await
+            .unwrap();
+        external_services::Entity::update_many()
+            .col_expr(
+                external_services::Column::UpdatedAt,
+                sea_orm::sea_query::Expr::value(
+                    Utc::now() - CLUSTER_CLAIM_STALE_AFTER - chrono::Duration::minutes(1),
+                ),
+            )
+            .filter(external_services::Column::Id.eq(service_id))
+            .exec(manager.db.as_ref())
+            .await
+            .unwrap();
+        let taken_over = manager
+            .claim_cluster(service_id, ClusterLifecycleAction::Stop)
+            .await
+            .unwrap();
+        assert_eq!(taken_over.status, "starting");
+    }
+
+    /// Regression for #1352: a cluster built by `initialize_cluster` records
+    /// that its infrastructure roles are SCRAM-native, so adding a member
+    /// does not re-run the legacy NodePrepare step against existing members.
+    /// Recording that never lowers a version a later upgrade reached.
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn natively_created_cluster_records_infrastructure_auth_without_lowering() {
+        let (manager, _test_db) = setup_test_manager_or_skip!();
+        let service_id = insert_cluster_at_auth_version(
+            &manager,
+            "auth-native-new",
+            None,
+            &[("monitor", "running"), ("primary", "running")],
+        )
+        .await;
+        assert_eq!(
+            cluster_auth_upgrade_steps(stored_auth_version(&manager, service_id).await),
+            &crate::externalsvc::postgres_cluster::AuthUpgradeStep::ORDER
+        );
+
+        manager
+            .record_cluster_auth_version(service_id, CLUSTER_INFRA_AUTH_VERSION)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_auth_version(&manager, service_id).await,
+            CLUSTER_INFRA_AUTH_VERSION
+        );
+        assert_eq!(
+            cluster_auth_upgrade_steps(CLUSTER_INFRA_AUTH_VERSION),
+            &[crate::externalsvc::postgres_cluster::AuthUpgradeStep::NodeEnforce],
+            "a native cluster must not re-run NodePrepare when a member is added"
+        );
+
+        manager
+            .mark_cluster_auth_completed(service_id)
+            .await
+            .unwrap();
+        manager
+            .record_cluster_auth_version(service_id, CLUSTER_INFRA_AUTH_VERSION)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_auth_version(&manager, service_id).await,
+            CLUSTER_AUTH_VERSION
+        );
     }
 
     #[cfg(feature = "docker-tests")]

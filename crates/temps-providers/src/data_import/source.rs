@@ -21,7 +21,7 @@
 use std::net::IpAddr;
 
 use percent_encoding::percent_decode_str;
-use temps_core::url_validation::{resolve_and_validate_domain, validate_ipv4, validate_ipv6};
+use temps_core::url_validation::{resolve_and_validate_domain, validate_outbound_ip};
 
 use super::DataImportError;
 
@@ -459,15 +459,16 @@ pub async fn pin_source_hosts(source: &ImportSource) -> Result<Vec<PinnedHost>, 
         let refused = |reason: String| {
             DataImportError::invalid_source(format!(
                 "host '{}' cannot be used as an import source: {} — the source must be a \
-                 publicly reachable database server",
+                 publicly reachable database server or inside a trusted private network",
                 endpoint.host, reason
             ))
         };
         match endpoint.ip_literal() {
-            Some(IpAddr::V4(ip)) => validate_ipv4(&ip).map_err(|e| refused(e.to_string()))?,
-            Some(IpAddr::V6(ip)) => validate_ipv6(&ip).map_err(|e| refused(e.to_string()))?,
+            Some(ip) => validate_outbound_ip(ip).map_err(|e| refused(e.to_string()))?,
             None => {
-                if endpoint.host == "localhost" || endpoint.host.ends_with(".localhost") {
+                if (endpoint.host == "localhost" || endpoint.host.ends_with(".localhost"))
+                    && validate_outbound_ip(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)).is_err()
+                {
                     return Err(refused("it is a loopback name".to_string()));
                 }
                 let addresses = resolve_and_validate_domain(&endpoint.host, endpoint.port)

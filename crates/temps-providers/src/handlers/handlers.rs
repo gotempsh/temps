@@ -76,7 +76,47 @@ pub(crate) fn worker_node_required(
         E::LocalWorkloadsDisabled { .. } => {
             Some(temps_core::worker_node_required_problem(error.to_string()))
         }
-        _ => None,
+        E::ServiceNameConflict { .. }
+        | E::ServiceNameRestoreConflict { .. }
+        | E::ServiceContainerRestoreConflict { .. }
+        | E::AmbiguousServiceName { .. }
+        | E::ServiceResourceConflict { .. }
+        | E::ServiceContainerConflict { .. }
+        | E::ServiceNotFound { .. }
+        | E::ServiceNotFoundByName { .. }
+        | E::ServiceNotFoundBySlug { .. }
+        | E::InitializationFailed { .. }
+        | E::UpgradeRejected { .. }
+        | E::EncryptionFailed { .. }
+        | E::DecryptionFailed { .. }
+        | E::InvalidServiceType { .. }
+        | E::ServiceNotLinkedToProject { .. }
+        | E::ServiceClaimDenied { .. }
+        | E::InvalidDatabaseProvisioning { .. }
+        | E::ProjectNotFound { .. }
+        | E::EnvironmentNotFound { .. }
+        | E::DatabaseError { .. }
+        | E::ArchiveSourceDesynced { .. }
+        | E::ParameterValidationFailed { .. }
+        | E::StartFailed { .. }
+        | E::UpgradeInProgress { .. }
+        | E::StopFailed { .. }
+        | E::DeletionFailed { .. }
+        | E::ServiceHasLinkedProjects { .. }
+        | E::EnvironmentVariableNotFound { .. }
+        | E::ParameterNotFound { .. }
+        | E::ParameterNotSensitive { .. }
+        | E::EncryptedVariableAccessDenied { .. }
+        | E::DockerError { .. }
+        | E::DuplicateServiceType { .. }
+        | E::InternalError { .. }
+        | E::ControlPlaneAddressRequired { .. }
+        | E::ControlPlaneMemberUnreachable { .. }
+        | E::ClusterPortsUnavailable { .. }
+        | E::ClusterMemberLimitExceeded { .. }
+        | E::ClusterMemberProvisioning { .. }
+        | E::ClusterNotSettled { .. }
+        | E::ClusterBusy { .. } => None,
     }
 }
 
@@ -94,8 +134,65 @@ pub(crate) fn external_service_problem(
     detail: String,
 ) -> Problem {
     worker_node_required(error)
+        .or_else(|| service_name_problem(error))
         .or_else(|| cluster_placement_problem(error))
         .unwrap_or_else(|| internal_server_error().detail(detail).build())
+}
+
+fn service_name_problem(error: &crate::services::ExternalServiceError) -> Option<Problem> {
+    use crate::services::ExternalServiceError as E;
+    match error {
+        E::ServiceNameConflict { .. }
+        | E::ServiceNameRestoreConflict { .. }
+        | E::ServiceContainerRestoreConflict { .. }
+        | E::AmbiguousServiceName { .. }
+        | E::ServiceResourceConflict { .. }
+        | E::ServiceContainerConflict { .. } => Some(
+            conflict()
+                .title("Service Name Conflict")
+                .detail(error.to_string())
+                .value("error_code", "SERVICE_NAME_CONFLICT")
+                .build(),
+        ),
+        // Other conditions retain the worker, placement or handler classification.
+        E::ServiceNotFound { .. }
+        | E::ServiceNotFoundByName { .. }
+        | E::ServiceNotFoundBySlug { .. }
+        | E::InitializationFailed { .. }
+        | E::UpgradeRejected { .. }
+        | E::EncryptionFailed { .. }
+        | E::DecryptionFailed { .. }
+        | E::InvalidServiceType { .. }
+        | E::ServiceNotLinkedToProject { .. }
+        | E::ServiceClaimDenied { .. }
+        | E::InvalidDatabaseProvisioning { .. }
+        | E::ProjectNotFound { .. }
+        | E::EnvironmentNotFound { .. }
+        | E::DatabaseError { .. }
+        | E::ArchiveSourceDesynced { .. }
+        | E::ParameterValidationFailed { .. }
+        | E::StartFailed { .. }
+        | E::UpgradeInProgress { .. }
+        | E::StopFailed { .. }
+        | E::DeletionFailed { .. }
+        | E::ServiceHasLinkedProjects { .. }
+        | E::EnvironmentVariableNotFound { .. }
+        | E::ParameterNotFound { .. }
+        | E::ParameterNotSensitive { .. }
+        | E::EncryptedVariableAccessDenied { .. }
+        | E::DockerError { .. }
+        | E::DuplicateServiceType { .. }
+        | E::InternalError { .. }
+        | E::DockerUnavailable(_)
+        | E::LocalWorkloadsDisabled { .. }
+        | E::ControlPlaneAddressRequired { .. }
+        | E::ControlPlaneMemberUnreachable { .. }
+        | E::ClusterPortsUnavailable { .. }
+        | E::ClusterMemberLimitExceeded { .. }
+        | E::ClusterMemberProvisioning { .. }
+        | E::ClusterNotSettled { .. }
+        | E::ClusterBusy { .. } => None,
+    }
 }
 
 /// A cluster placement the current configuration cannot serve: members on
@@ -113,6 +210,9 @@ fn cluster_placement_problem(error: &crate::services::ExternalServiceError) -> O
             "Cluster Placement Not Reachable"
         }
         E::ClusterPortsUnavailable { .. } => "Cluster Ports Unavailable",
+        E::ClusterMemberProvisioning { .. } => "Cluster Member Still Provisioning",
+        E::ClusterNotSettled { .. } => "Cluster Not Ready",
+        E::ClusterBusy { .. } => "Cluster Busy",
         // The request itself is invalid, not in conflict with any state.
         E::ClusterMemberLimitExceeded { .. } => {
             return Some(
@@ -124,7 +224,13 @@ fn cluster_placement_problem(error: &crate::services::ExternalServiceError) -> O
         }
         // Not placement conditions: each handler classifies these itself
         // (and `worker_node_required` owns the two "no daemon" variants).
-        E::ServiceNotFound { .. }
+        E::ServiceNameConflict { .. }
+        | E::ServiceNameRestoreConflict { .. }
+        | E::ServiceContainerRestoreConflict { .. }
+        | E::AmbiguousServiceName { .. }
+        | E::ServiceResourceConflict { .. }
+        | E::ServiceContainerConflict { .. }
+        | E::ServiceNotFound { .. }
         | E::ServiceNotFoundByName { .. }
         | E::ServiceNotFoundBySlug { .. }
         | E::InitializationFailed { .. }
@@ -276,6 +382,7 @@ async fn list_available_containers(
     request_body = ImportExternalServiceRequest,
     responses(
         (status = 201, description = "Service imported successfully", body = ExternalServiceInfo),
+        (status = 409, description = "Service name, container, or volumes are already owned by another service or an active restore"),
         (status = 400, description = "Invalid request"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
@@ -314,6 +421,11 @@ async fn import_external_service(
         .await
         .map_err(|e| {
             error!("Failed to import service: {}", e);
+            if let Some(error) = e.downcast_ref::<crate::services::ExternalServiceError>() {
+                if let Some(problem) = service_name_problem(error) {
+                    return problem;
+                }
+            }
             bad_request()
                 .detail(format!("Failed to import service: {}", e))
                 .build()
@@ -659,6 +771,7 @@ async fn get_service(
     responses(
         (status = 201, description = "Service created successfully", body = ExternalServiceInfo),
         (status = 400, description = "Invalid request"),
+        (status = 409, description = "Service name, container, or volumes are already owned by another service or an active restore"),
         (status = 500, description = "Internal server error")
     )
 )]
@@ -943,7 +1056,7 @@ async fn rollback_unlinked_service(
         (status = 200, description = "Service updated successfully", body = ExternalServiceInfo),
         (status = 400, description = "Invalid request"),
         (status = 404, description = "Service not found"),
-        (status = 409, description = "A major upgrade is in progress for this service"),
+        (status = 409, description = "A major upgrade is in progress, or duplicate service names prevent safe resource control"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -1251,7 +1364,7 @@ fn upgrade_error_problem(e: &crate::services::ExternalServiceError) -> Option<Pr
         (status = 200, description = "Service upgraded successfully", body = ExternalServiceInfo),
         (status = 400, description = "Invalid request or upgrade not supported"),
         (status = 404, description = "Service not found"),
-        (status = 409, description = "A major upgrade is already in progress for this service"),
+        (status = 409, description = "A major upgrade is already in progress, or duplicate service names prevent safe resource control"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -1319,6 +1432,7 @@ async fn upgrade_service(
     responses(
         (status = 204, description = "Service deleted successfully"),
         (status = 400, description = "Cannot delete: service is still linked to projects"),
+        (status = 409, description = "An active restore uses this service, or duplicate service names prevent safe resource control"),
         (status = 404, description = "Service not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -1936,7 +2050,7 @@ async fn list_service_health_statuses(
     responses(
         (status = 200, description = "Service started successfully", body = ExternalServiceInfo),
         (status = 404, description = "Service not found"),
-        (status = 409, description = "A Postgres major upgrade is in progress for this service"),
+        (status = 409, description = "A Postgres major upgrade is in progress, duplicate service names prevent safe resource control, another cluster action is in progress, the cluster or one of its members is still being provisioned, or the cluster's provisioning failed"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -2405,6 +2519,7 @@ async fn promote_cluster_member(
     responses(
         (status = 200, description = "Service stopped successfully", body = ExternalServiceInfo),
         (status = 404, description = "Service not found"),
+        (status = 409, description = "Duplicate service names prevent safe resource control, another cluster action is in progress, or the cluster or one of its members is still being provisioned"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -4084,6 +4199,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn service_name_errors_return_actionable_conflict() {
+        let error = crate::services::ExternalServiceError::ServiceNameConflict {
+            name: "app-db".to_string(),
+            existing_service_id: 7,
+        };
+        let problem = external_service_problem(&error, "fallback".to_string());
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert!(problem.body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("Choose a unique name"));
+    }
+
     // Guards the shared error->status mapping used by update_service /
     // upgrade_service / start_service. The exact bug this class of test exists
     // for (a dead `e.to_string() == "Service not found"` arm returning 500
@@ -4241,6 +4370,40 @@ mod tests {
         assert_eq!(
             service_create_failure_code(&error),
             OperationFailureCode::InvalidConfiguration
+        );
+    }
+
+    /// #1353: stopping a cluster while a member is provisioning is a 409
+    /// naming the member, not a Docker 404 surfaced as a 500.
+    #[test]
+    fn cluster_member_provisioning_is_a_conflict() {
+        let error = crate::services::ExternalServiceError::ClusterMemberProvisioning {
+            service_id: 7,
+            action: "stop",
+            container_name: "postgres-ha-3".to_string(),
+            status: "creating".to_string(),
+        };
+        let problem = external_service_problem(&error, "Failed to stop service".to_string());
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        let detail = problem.body.get("detail").and_then(|v| v.as_str()).unwrap();
+        assert!(detail.contains("postgres-ha-3"), "{detail}");
+    }
+
+    /// Greptile on #1366: a lifecycle action on a cluster another one is
+    /// changing is refused at once with a 409, never queued on a database
+    /// connection.
+    #[test]
+    fn cluster_busy_is_a_conflict() {
+        let error = crate::services::ExternalServiceError::ClusterBusy {
+            service_id: 7,
+            action: "stop",
+        };
+        let problem = external_service_problem(&error, "Failed to stop service".to_string());
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        let detail = problem.body.get("detail").and_then(|v| v.as_str()).unwrap();
+        assert!(
+            detail.contains("service 7") && detail.contains("in progress"),
+            "{detail}"
         );
     }
 

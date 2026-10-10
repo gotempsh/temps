@@ -1883,6 +1883,7 @@ impl BackupCommand {
                 backup: backup_model,
                 backup_location: &backup_model.s3_location,
                 source_service: service_model,
+                live_target_config: service_config.clone(),
                 source_config: service_config,
                 pool: db,
                 gate: &temps_providers::externalsvc::NoopRestoreGate,

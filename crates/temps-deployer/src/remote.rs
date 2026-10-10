@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use crate::build_protocol::{
     validate_archive_path, BuildEvent, BuildFailureKind, BuildSpec, DockerIgnore,
-    BUILD_PROTOCOL_VERSION, MAX_BUILD_CONTEXT_BYTES, MAX_BUILD_CONTEXT_ENTRIES,
-    MAX_BUILD_EVENT_BYTES, WORKSPACE_ROOT_IGNORE_MARKER,
+    BUILD_PROTOCOL_VERSION, CACHE_MOUNT_NAMESPACE_ARG, MAX_BUILD_CONTEXT_BYTES,
+    MAX_BUILD_CONTEXT_ENTRIES, MAX_BUILD_EVENT_BYTES, WORKSPACE_ROOT_IGNORE_MARKER,
 };
 
 use crate::{
@@ -384,11 +384,21 @@ fn prepare_build_context(
             )));
         }
     }
+    // The cache namespace is the one argument a worker receives: it is
+    // derived by the control plane per project, environment and ref, carries
+    // no project variable, and keeps builds of different projects on the same
+    // worker from reading or poisoning each other's cache mounts.
+    let cache_namespace = request
+        .build_args
+        .get(CACHE_MOUNT_NAMESPACE_ARG)
+        .or_else(|| request.build_args_buildkit.get(CACHE_MOUNT_NAMESPACE_ARG))
+        .cloned();
     let spec = BuildSpec {
         version: BUILD_PROTOCOL_VERSION,
         image_name: request.image_name.clone(),
         dockerfile: dockerfile.to_string_lossy().into_owned(),
         platform: request.platform.clone(),
+        cache_namespace,
     };
     spec.validate().map_err(BuilderError::InvalidContext)?;
     let archive_file = tempfile::NamedTempFile::new().map_err(BuilderError::IoError)?;
@@ -1809,6 +1819,46 @@ mod tests {
             platform: None,
             log_path: root.join("build.log"),
         }
+    }
+
+    /// The control plane's cache namespace is the only build argument a
+    /// worker receives; every other value stays on the control plane.
+    #[test]
+    fn worker_build_spec_carries_only_the_cache_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Dockerfile"),
+            "FROM scratch\nRUN --mount=type=cache,target=/cache true\n",
+        )
+        .unwrap();
+        let namespace = "0123456789abcdef".repeat(4);
+        let mut request = context_request(dir.path(), None);
+        request
+            .build_args
+            .insert(CACHE_MOUNT_NAMESPACE_ARG.into(), namespace.clone());
+        request
+            .build_args
+            .insert("DATABASE_URL".into(), "must-not-transfer".into());
+        let (_archive, spec) = prepare_build_context(&request).expect("accepted");
+        assert_eq!(spec.cache_namespace.as_deref(), Some(namespace.as_str()));
+        let wire = serde_json::to_string(&spec).expect("serialize spec");
+        assert!(wire.contains(&namespace), "{wire}");
+        assert!(!wire.contains("must-not-transfer"), "{wire}");
+
+        // No namespace planned (an older control-plane path): none is sent.
+        let (_archive, spec) =
+            prepare_build_context(&context_request(dir.path(), None)).expect("accepted");
+        assert!(spec.cache_namespace.is_none());
+
+        // A namespace a worker would refuse is refused here first.
+        let mut request = context_request(dir.path(), None);
+        request
+            .build_args
+            .insert(CACHE_MOUNT_NAMESPACE_ARG.into(), "ns with space".into());
+        assert!(matches!(
+            prepare_build_context(&request),
+            Err(BuilderError::InvalidContext(_))
+        ));
     }
 
     /// Files the project keeps out of its image must not leave the control

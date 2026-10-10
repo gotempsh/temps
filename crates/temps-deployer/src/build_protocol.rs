@@ -33,6 +33,30 @@ pub struct BuildSpec {
     pub image_name: String,
     pub dockerfile: String,
     pub platform: Option<String>,
+    /// BuildKit's predefined `BUILDKIT_CACHE_MOUNT_NS`: the control plane's
+    /// per-project/environment/ref namespace for `RUN --mount=type=cache`.
+    /// Not a project variable and not a credential, so it is the one build
+    /// argument a worker receives. Without it, every project built on the
+    /// same worker shares writable cache mounts. Optional on the wire: an
+    /// agent that predates it ignores the field and builds as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_namespace: Option<String>,
+}
+
+/// BuildKit's predefined build argument that prefixes every cache mount ID.
+pub const CACHE_MOUNT_NAMESPACE_ARG: &str = "BUILDKIT_CACHE_MOUNT_NS";
+
+/// Longest cache namespace a worker accepts; the control plane sends 64 hex
+/// characters.
+pub const MAX_CACHE_NAMESPACE_LEN: usize = 128;
+
+/// Whether `namespace` is safe to hand to BuildKit as a cache mount ID prefix.
+pub fn is_valid_cache_namespace(namespace: &str) -> bool {
+    !namespace.is_empty()
+        && namespace.len() <= MAX_CACHE_NAMESPACE_LEN
+        && namespace
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 impl BuildSpec {
@@ -56,6 +80,16 @@ impl BuildSpec {
             .is_some_and(|platform| !crate::platform::is_buildable_platform(platform))
         {
             return Err("Worker build platform is not supported".to_string());
+        }
+        if self
+            .cache_namespace
+            .as_deref()
+            .is_some_and(|namespace| !is_valid_cache_namespace(namespace))
+        {
+            return Err(format!(
+                "Worker build cache namespace must be 1-{MAX_CACHE_NAMESPACE_LEN} ASCII letters, \
+                 digits, '-', '_' or '.'"
+            ));
         }
         Ok(())
     }
@@ -194,6 +228,7 @@ mod tests {
             image_name: "app:latest".to_string(),
             dockerfile: "src/Dockerfile".to_string(),
             platform: Some("linux/amd64".to_string()),
+            cache_namespace: None,
         };
         assert!(spec.validate().is_ok());
         for path in ["../Dockerfile", "/etc/passwd", "a\\..\\b", "C:foo"] {
@@ -203,6 +238,34 @@ mod tests {
         spec.dockerfile = "Dockerfile".to_string();
         spec.version += 1;
         assert!(spec.validate().is_err());
+    }
+
+    #[test]
+    fn build_spec_cache_namespace_is_optional_and_constrained() {
+        // An older control plane sends no namespace; an older agent ignores it.
+        let legacy: BuildSpec = serde_json::from_str(
+            r#"{"version":1,"image_name":"app:latest","dockerfile":"Dockerfile","platform":null}"#,
+        )
+        .expect("spec without a cache namespace");
+        assert!(legacy.cache_namespace.is_none());
+        assert!(legacy.validate().is_ok());
+        assert!(!serde_json::to_string(&legacy)
+            .expect("serialize")
+            .contains("cache_namespace"));
+
+        let mut spec = legacy;
+        spec.cache_namespace = Some("a".repeat(64));
+        assert!(spec.validate().is_ok());
+        for bad in [
+            String::new(),
+            "a".repeat(MAX_CACHE_NAMESPACE_LEN + 1),
+            "ns with space".to_string(),
+            "ns/../x".to_string(),
+            "ns,other=1".to_string(),
+        ] {
+            spec.cache_namespace = Some(bad.clone());
+            assert!(spec.validate().is_err(), "accepted {bad:?}");
+        }
     }
 
     #[test]

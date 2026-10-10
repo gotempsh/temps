@@ -171,9 +171,21 @@ impl PostgresUpgradeService {
             });
         }
 
-        // 5. Insert the row. Any pre-existing default-S3 gap is caught by
-        //    the orchestrator's pre_backup phase — we don't probe it here
-        //    to keep the service call cheap and the error surface typed.
+        // 5. The migration never runs without a verified backup, and that
+        //    backup needs a default S3 source. Refuse here, as a typed 412,
+        //    rather than accepting an upgrade that can only fail later.
+        self.backup_provider
+            .default_s3_source_id(req.service_id)
+            .await
+            .map_err(|reason| PostgresUpgradeError::PreBackupFailed {
+                service_id: req.service_id,
+                reason: format!("failed to resolve default S3 source: {}", reason),
+            })?
+            .ok_or(PostgresUpgradeError::NoDefaultS3Source {
+                service_id: req.service_id,
+            })?;
+
+        // 6. Insert the row.
         let log_id = format!("pg-upgrade-{}", Uuid::new_v4());
         let active = postgres_major_upgrades::ActiveModel {
             service_id: Set(req.service_id),
@@ -190,7 +202,7 @@ impl PostgresUpgradeService {
         };
         let inserted = active.insert(self.db.as_ref()).await?;
 
-        // 6. Spawn the orchestrator; it owns its own Arc clones so the task
+        // 7. Spawn the orchestrator; it owns its own Arc clones so the task
         //    lifetime is independent of this request.
         let orchestrator = PostgresUpgradeOrchestrator::new(
             self.db.clone(),
@@ -1086,5 +1098,106 @@ mod tests {
             statements.is_empty(),
             "Docker unavailability must be caught before any DB query: {statements:?}"
         );
+    }
+
+    struct NoDefaultSourceProvider;
+
+    #[async_trait]
+    impl PreUpgradeBackupProvider for NoDefaultSourceProvider {
+        async fn default_s3_source_id(&self, _service_id: i32) -> Result<Option<i32>, String> {
+            Ok(None)
+        }
+
+        async fn create_pre_upgrade_backup(
+            &self,
+            service_id: i32,
+            _s3_source_id: i32,
+            _created_by: i32,
+        ) -> Result<i32, String> {
+            panic!("service {service_id}: no backup may start without a default S3 source")
+        }
+    }
+
+    #[tokio::test]
+    async fn test_start_major_upgrade_without_default_s3_source_is_refused_before_insert() {
+        let service_row = external_services::Model {
+            id: 7,
+            name: "postgres-upgrade".to_string(),
+            service_type: "postgres".to_string(),
+            version: Some("16".to_string()),
+            status: "running".to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            slug: Some("postgres-upgrade".to_string()),
+            config: None,
+            node_id: None,
+            topology: "standalone".to_string(),
+            error_message: None,
+            health_status: None,
+            last_health_check_at: None,
+            last_health_error: None,
+            consecutive_health_failures: 0,
+            health_metadata: None,
+            metrics_enabled: false,
+            default_backup_provisioned: false,
+            ai_data_access: false,
+            container_name: None,
+            created_by_user_id: None,
+            continuous_archive_s3_source_id: None,
+            continuous_archive_pinned_at: None,
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![service_row]])
+                // No active upgrade for the service.
+                .append_query_results(vec![Vec::<postgres_major_upgrades::Model>::new()])
+                .into_connection(),
+        );
+        let logs = tempfile::tempdir().expect("create log tempdir");
+        let service = PostgresUpgradeService::new(
+            db.clone(),
+            Arc::new(DockerHandle::available(Arc::new(
+                bollard::Docker::connect_with_local_defaults()
+                    .expect("construct Docker client without contacting daemon"),
+            ))),
+            Arc::new(NoDefaultSourceProvider),
+            Arc::new(StubLifecycle),
+            Arc::new(LogService::new(logs.path().to_path_buf())),
+        );
+
+        let error = service
+            .start_major_upgrade(sample_request())
+            .await
+            .expect_err("an upgrade that cannot take its backup must not be accepted");
+
+        assert!(
+            matches!(
+                error,
+                PostgresUpgradeError::NoDefaultS3Source { service_id: 7 }
+            ),
+            "{error}"
+        );
+        drop(service);
+        let statements = Arc::try_unwrap(db)
+            .expect("service dropped, leaving one DB reference")
+            .into_transaction_log();
+        assert!(
+            statements
+                .iter()
+                .all(|statement| !format!("{statement:?}").contains("INSERT")),
+            "no upgrade row may be inserted: {statements:?}"
+        );
+    }
+
+    #[test]
+    fn pre_backup_failure_says_nothing_was_migrated_and_retry_is_safe() {
+        let message = PostgresUpgradeError::PreBackupFailed {
+            service_id: 7,
+            reason: "full backup of 'db' to S3 source 1 failed: pg_dump exited 1".to_string(),
+        }
+        .to_string();
+        assert!(message.contains("pg_dump exited 1"), "{message}");
+        assert!(message.contains("database is unchanged"), "{message}");
+        assert!(message.contains("retry the upgrade"), "{message}");
     }
 }

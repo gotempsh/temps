@@ -3868,6 +3868,14 @@
               "boolean",
               "null"
             ]
+          },
+          "trusted_private_networks": {
+            "default": [],
+            "description": "Private networks (CIDRs or single addresses) that user-configured\noutbound requests may reach: webhooks, notification channels, uptime\nchecks, AI gateway providers, self-hosted git, importers. Empty by\ndefault, which keeps the SSRF guard blocking every private, loopback\nand CGNAT destination. Only private ranges are accepted, and cloud\nmetadata endpoints stay blocked regardless. Published process-wide via\n`url_validation::set_trusted_private_networks`.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           }
         },
         "type": "object"
@@ -4058,6 +4066,13 @@
           "trust_loopback_forwarded_ip": {
             "description": "Database-backed opt-in; this is the sole control surface for every\nproxy process, including a standalone `temps proxy`.",
             "type": "boolean"
+          },
+          "trusted_private_networks": {
+            "description": "Private networks (normalized CIDRs) that user-configured outbound\nrequests may reach despite the SSRF guard. Empty means none.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -4087,6 +4102,7 @@
           "effective_metrics_store",
           "effective_observability_store",
           "insecure_tls",
+          "trusted_private_networks",
           "setup_complete",
           "require_mfa_for_admins",
           "on_demand_tls",
@@ -79378,6 +79394,9 @@
           "400": {
             "description": "Invalid request"
           },
+          "409": {
+            "description": "Service name, container, or volumes are already owned by another service or an active restore"
+          },
           "500": {
             "description": "Internal server error"
           }
@@ -79529,6 +79548,9 @@
           },
           "403": {
             "description": "Insufficient permissions"
+          },
+          "409": {
+            "description": "Service name, container, or volumes are already owned by another service or an active restore"
           },
           "500": {
             "description": "Internal server error"
@@ -79828,6 +79850,9 @@
           "404": {
             "description": "Service not found"
           },
+          "409": {
+            "description": "An active restore uses this service, or duplicate service names prevent safe resource control"
+          },
           "500": {
             "description": "Internal server error"
           }
@@ -79916,7 +79941,7 @@
             "description": "Service not found"
           },
           "409": {
-            "description": "A major upgrade is in progress for this service"
+            "description": "A major upgrade is in progress, or duplicate service names prevent safe resource control"
           },
           "500": {
             "description": "Internal server error"
@@ -82093,7 +82118,7 @@
                 }
               }
             },
-            "description": "Conflict: a destructive cross-service restore requires explicit confirmation (`cross-service-restore-not-confirmed`), another restore is already active on this service (`restore-already-active`, with `active_restore_run_id`), data is being imported into it (`data-import-active`, with `active_data_import_run_id`), or the backup is being deleted"
+            "description": "Conflict: a destructive cross-service restore requires explicit confirmation (`cross-service-restore-not-confirmed`), another restore is already active on this service (`restore-already-active`, with `active_restore_run_id`), data is being imported into it (`data-import-active`, with `active_data_import_run_id`), the backup is being deleted, or a requested new-service name is already owned by a service or another active restore"
           }
         },
         "security": [
@@ -82456,7 +82481,7 @@
             "description": "Service not found"
           },
           "409": {
-            "description": "A Postgres major upgrade is in progress for this service"
+            "description": "A Postgres major upgrade is in progress, duplicate service names prevent safe resource control, another cluster action is in progress, the cluster or one of its members is still being provisioned, or the cluster's provisioning failed"
           },
           "500": {
             "description": "Internal server error"
@@ -82536,6 +82561,9 @@
           "404": {
             "description": "Service not found"
           },
+          "409": {
+            "description": "Duplicate service names prevent safe resource control, another cluster action is in progress, or the cluster or one of its members is still being provisioned"
+          },
           "500": {
             "description": "Internal server error"
           }
@@ -82589,7 +82617,7 @@
             "description": "Service not found"
           },
           "409": {
-            "description": "A major upgrade is already in progress for this service"
+            "description": "A major upgrade is already in progress, or duplicate service names prevent safe resource control"
           },
           "500": {
             "description": "Internal server error"
