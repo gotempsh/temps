@@ -3316,6 +3316,61 @@ struct PgDumpallSidecar<'a> {
     database: &'a str,
 }
 
+/// Why [`run_pg_dumpall_sidecar`] produced no dump. Every variant names the
+/// sidecar container and the database host it dumped.
+#[derive(Debug, thiserror::Error)]
+enum PgDumpallSidecarError {
+    #[error(
+        "Failed to create pg_dumpall backup container '{container}' from image '{image}' for \
+         database host '{host}': {reason}"
+    )]
+    Create {
+        container: String,
+        image: String,
+        host: String,
+        reason: String,
+    },
+
+    #[error("Failed to start pg_dumpall backup container '{container}' for database host '{host}': {reason}")]
+    Start {
+        container: String,
+        host: String,
+        reason: String,
+    },
+
+    #[error(
+        "pg_dumpall of database host '{host}' failed in backup container '{container}': \
+         {reason}{diagnostics}"
+    )]
+    Export {
+        container: String,
+        host: String,
+        reason: String,
+        /// The tail of pg_dumpall's stderr, prefixed for display, or empty.
+        diagnostics: String,
+    },
+
+    #[error(
+        "pg_dumpall exported database host '{host}', but copying '{container_path}' out of \
+         backup container '{container}' through the Docker API into '{host_path}' on the Temps \
+         host failed: {reason}. Check that the Docker daemon is reachable and that the Temps \
+         host has free space in its temporary directory, then retry"
+    )]
+    CopyOut {
+        container: String,
+        host: String,
+        container_path: String,
+        host_path: String,
+        reason: String,
+    },
+
+    #[error(
+        "pg_dumpall of database host '{host}' in backup container '{container}' produced an \
+         empty dump"
+    )]
+    EmptyDump { container: String, host: String },
+}
+
 /// Run `pg_dumpall | gzip` in a one-shot sidecar and leave the dump in
 /// `host_dir`, returning its path and size. The sidecar is removed on every
 /// path.
@@ -3331,7 +3386,7 @@ async fn run_pg_dumpall_sidecar(
     docker: &Docker,
     spec: &PgDumpallSidecar<'_>,
     host_dir: &std::path::Path,
-) -> anyhow::Result<(std::path::PathBuf, i64)> {
+) -> Result<(std::path::PathBuf, i64), PgDumpallSidecarError> {
     use bollard::models::ContainerCreateBody as Config;
     use bollard::query_parameters::RemoveContainerOptions;
 
@@ -3375,7 +3430,12 @@ async fn run_pg_dumpall_sidecar(
             sidecar_config,
         )
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to create pg_dump sidecar container: {}", e))?;
+        .map_err(|e| PgDumpallSidecarError::Create {
+            container: sidecar_name.clone(),
+            image: spec.image.to_string(),
+            host: spec.host.to_string(),
+            reason: e.to_string(),
+        })?;
 
     let outcome = async {
         docker
@@ -3384,7 +3444,11 @@ async fn run_pg_dumpall_sidecar(
                 Some(bollard::query_parameters::StartContainerOptionsBuilder::new().build()),
             )
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to start pg_dump sidecar container: {}", e))?;
+            .map_err(|e| PgDumpallSidecarError::Start {
+                container: sidecar_name.clone(),
+                host: spec.host.to_string(),
+                reason: e.to_string(),
+            })?;
 
         // pg_dumpall dumps the entire cluster (all DBs, roles, tablespaces);
         // `--database` is just the bootstrap connection target.
@@ -3426,15 +3490,16 @@ async fn run_pg_dumpall_sidecar(
         };
 
         if let Err(e) = exec_result {
-            return Err(anyhow::anyhow!(
-                "pg_dumpall exec failed: {}{}",
-                e,
-                if stderr_from_file.is_empty() {
+            return Err(PgDumpallSidecarError::Export {
+                container: sidecar_name.clone(),
+                host: spec.host.to_string(),
+                reason: e.to_string(),
+                diagnostics: if stderr_from_file.is_empty() {
                     String::new()
                 } else {
                     format!("\npg_dumpall stderr:\n{}", stderr_from_file)
-                }
-            ));
+                },
+            });
         }
         if !stderr_from_file.is_empty() {
             debug!("pg_dumpall stderr for host '{}': {}", spec.host, stderr_from_file);
@@ -3453,21 +3518,19 @@ async fn run_pg_dumpall_sidecar(
                 super::container_download::CopyOutFailure::Cancelled => "cancelled".to_string(),
                 super::container_download::CopyOutFailure::Failed(reason) => reason,
             };
-            anyhow::anyhow!(
-                "pg_dumpall exported the backup, but copying '{}' out of backup container '{}' \
-                 through the Docker API into '{}' on the Temps host failed: {}. Check that the \
-                 Docker daemon is reachable and that the Temps host has free space in its \
-                 temporary directory, then retry",
-                container_backup_path,
-                sidecar_name,
-                host_backup_path.display(),
-                reason
-            )
+            PgDumpallSidecarError::CopyOut {
+                container: sidecar_name.clone(),
+                host: spec.host.to_string(),
+                container_path: container_backup_path.clone(),
+                host_path: host_backup_path.display().to_string(),
+                reason,
+            }
         })? as i64;
         if size_bytes == 0 {
-            return Err(anyhow::anyhow!(
-                "PostgreSQL backup failed: backup file has zero size (pg_dumpall produced no output)"
-            ));
+            return Err(PgDumpallSidecarError::EmptyDump {
+                container: sidecar_name.clone(),
+                host: spec.host.to_string(),
+            });
         }
         Ok((host_backup_path.clone(), size_bytes))
     }
@@ -5034,6 +5097,48 @@ mod data_import;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every pg_dumpall sidecar failure names the sidecar container and the
+    /// database host, so the log line is enough to find what failed.
+    #[test]
+    fn pg_dumpall_sidecar_errors_name_the_container_and_host() {
+        let container = || "temps-pg-backup-7".to_string();
+        let host = || "postgres-orders".to_string();
+        for error in [
+            PgDumpallSidecarError::Create {
+                container: container(),
+                image: "postgres:16".to_string(),
+                host: host(),
+                reason: "no such image".to_string(),
+            },
+            PgDumpallSidecarError::Start {
+                container: container(),
+                host: host(),
+                reason: "port in use".to_string(),
+            },
+            PgDumpallSidecarError::Export {
+                container: container(),
+                host: host(),
+                reason: "exit code 1".to_string(),
+                diagnostics: "\npg_dumpall stderr:\nconnection refused".to_string(),
+            },
+            PgDumpallSidecarError::CopyOut {
+                container: container(),
+                host: host(),
+                container_path: "/backup/x.sql.gz".to_string(),
+                host_path: "/tmp/x.sql.gz".to_string(),
+                reason: "the Docker archive download failed".to_string(),
+            },
+            PgDumpallSidecarError::EmptyDump {
+                container: container(),
+                host: host(),
+            },
+        ] {
+            let message = error.to_string();
+            assert!(message.contains("temps-pg-backup-7"), "{message}");
+            assert!(message.contains("postgres-orders"), "{message}");
+        }
+    }
 
     /// #1387: the pg_dumpall sidecar must deliver its dump to the Temps host
     /// even when the Docker daemon does not share the host's temporary
