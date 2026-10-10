@@ -163,6 +163,21 @@ export TEMPS_DB_MIN_CONNECTIONS=2
 export TEMPS_DB_IDLE_TIMEOUT=300
 ```
 
+### Waiting for the Database at Startup
+
+`temps serve` waits for its database instead of exiting when PostgreSQL is not reachable yet, for example when both start together, or after a short outage under a supervisor with a restart policy.
+
+| Variable                | Flag                      | Default | Description                                                  |
+| ----------------------- | ------------------------- | ------- | ------------------------------------------------------------ |
+| `TEMPS_DB_STARTUP_WAIT` | `--database-startup-wait` | `120`   | Seconds to keep retrying before startup fails. `0` tries once |
+
+While the database is unreachable (connection refused, no route to host, name not resolving yet, or PostgreSQL still starting up), the server retries after 1, 2, 4, 8 … seconds, up to 30 seconds between attempts, and logs every attempt with its reason. Once the wait is used up it exits with an error that names the database host, the number of attempts and the last error. Wrong credentials or a missing database are reported at once, because waiting cannot fix them.
+
+```bash
+# Example: allow up to 10 minutes for a slow database host
+export TEMPS_DB_STARTUP_WAIT=600
+```
+
 ### Data Directory
 
 Temps stores sensitive data in the data directory (`~/.temps` by default):

@@ -1095,6 +1095,7 @@ All use `TEMPS_` prefix:
 | `TEMPS_CONSOLE_ADDRESS` | -- | No |
 | `TEMPS_DATA_DIR` | `~/.temps` | No |
 | `TEMPS_LOG_LEVEL` | -- | No |
+| `TEMPS_DB_STARTUP_WAIT` | `120` | No -- seconds `temps serve` keeps retrying an unreachable database at startup (exponential backoff, one log line per attempt) before it exits; `0` tries once. Bootstrap-time: it is read before any database connection exists. |
 
 Process-wide ops/debug toggles (not bootstrap config, not per-tenant -- see the admin-tuning-knob exception to the "no env vars" rule above):
 

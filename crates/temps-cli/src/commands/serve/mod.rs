@@ -236,6 +236,19 @@ pub struct ServeCommand {
     #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
     pub database_url: String,
 
+    /// Seconds to wait for the database at startup before giving up. While
+    /// it is unreachable (refused, no route, still starting up) the server
+    /// retries with exponential backoff (1 s, 2 s, 4 s, ... up to 30 s) and
+    /// logs each attempt with its reason. Wrong credentials or a missing
+    /// database fail at once. 0 makes a single attempt.
+    #[arg(
+        long,
+        env = "TEMPS_DB_STARTUP_WAIT",
+        value_name = "SECONDS",
+        default_value_t = temps_database::DEFAULT_DATABASE_STARTUP_WAIT.as_secs()
+    )]
+    pub database_startup_wait: u64,
+
     /// Data directory for storing configuration and runtime files
     #[arg(long, env = "TEMPS_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
@@ -475,6 +488,14 @@ impl ServeCommand {
         // detached plugin tasks) shuts down before the ownership guard drops.
         let _control_plane_owner;
         let rt = tokio::runtime::Runtime::new()?;
+        // Before anything opens a connection: a database that is briefly or
+        // slowly unavailable (started alongside this server, a short outage)
+        // is waited for here, instead of exiting and letting a supervisor's
+        // restart policy turn it into a restart loop.
+        rt.block_on(temps_database::wait_for_database(
+            &self.database_url,
+            std::time::Duration::from_secs(self.database_startup_wait),
+        ))?;
         let bootstrap_stateless = temps_config::bootstrap_stateless_requested()?;
         _control_plane_owner = if bootstrap_stateless {
             stateless::validate_profile(self.profile, self.role)?;
@@ -1278,6 +1299,19 @@ mod serve_profile_tests {
         TestCli::try_parse_from(argv)
             .expect("serve arguments should parse")
             .serve
+    }
+
+    #[test]
+    fn database_startup_wait_defaults_to_a_bounded_wait_and_is_configurable() {
+        assert_eq!(parse(&[]).database_startup_wait, 120);
+        assert_eq!(
+            parse(&["--database-startup-wait", "600"]).database_startup_wait,
+            600
+        );
+        assert_eq!(
+            parse(&["--database-startup-wait", "0"]).database_startup_wait,
+            0
+        );
     }
 
     #[test]

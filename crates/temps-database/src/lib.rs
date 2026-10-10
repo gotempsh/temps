@@ -12,11 +12,12 @@ pub use approx_count::{approximate_row_count, count_for_pagination, CountKind};
 pub use connection::{
     cancel_migration_backend, connect_for_migrate, connect_options, connect_without_migrations,
     defined_migration_count, ensure_no_unprotected_upgrade, establish_connection,
-    get_pending_migration_names, reconcile_otel_trace_summaries, run_migrations,
-    run_migrations_reported, run_migrations_streaming, run_post_migration_backfill,
+    get_pending_migration_names, reconcile_otel_trace_summaries, retry_database_startup,
+    run_migrations, run_migrations_reported, run_migrations_streaming, run_post_migration_backfill,
     run_post_migration_backfill_streaming, run_post_migration_indexes,
-    run_post_migration_indexes_streaming, DbConnection, MaintenanceProgress, MigrationProgress,
-    MigrationRunReport, MigrationStepResult,
+    run_post_migration_indexes_streaming, wait_for_database, DbConnection, MaintenanceProgress,
+    MigrationProgress, MigrationRunReport, MigrationStepResult, StartupAttemptFailure,
+    DEFAULT_DATABASE_STARTUP_WAIT,
 };
 pub use schema_guard::{check_schema_compatibility, SchemaGuardError, SchemaStatus};
 
