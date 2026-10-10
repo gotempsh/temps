@@ -707,6 +707,97 @@ fn build_route_ownership_snapshot<'a>(
     snapshot
 }
 
+/// Whether a process numbers route generations from the durable
+/// `route_generation` row or only for itself.
+///
+/// The row is what `mark_deployment_complete` waits for every worker to ACK,
+/// and workers ACK the generation the route-sync snapshot endpoint gave them.
+/// So the row must have exactly one writer: the process serving that endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RouteGenerationRole {
+    /// Serves `/internal/nodes/{id}/routes/snapshot` (`temps serve`): every
+    /// reload claims its generation from `route_generation`.
+    #[default]
+    Authoritative,
+    /// Loads routes without answering workers (split-mode `temps proxy`):
+    /// generations are local to the process and the row is never written.
+    Local,
+}
+
+/// Why a reload could not claim its generation from `route_generation`.
+#[derive(Debug, thiserror::Error)]
+pub enum RouteGenerationError {
+    #[error(
+        "Failed to claim the next route generation after in-memory generation {previous} \
+         from route_generation (id = 1): {source}"
+    )]
+    Claim {
+        previous: u64,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+
+    #[error(
+        "route_generation singleton row (id = 1) is missing, so the route generation after \
+         {previous} cannot be persisted and the worker completion gate cannot advance"
+    )]
+    MissingRow { previous: u64 },
+
+    #[error("route_generation (id = 1) returned negative generation {value}")]
+    Negative { value: i64 },
+}
+
+/// Atomically claim the generation after `previous` from the durable counter.
+///
+/// `GREATEST(current, previous) + 1` in a single `UPDATE ... RETURNING`: the
+/// row lock serializes concurrent claims, so each caller gets a distinct
+/// value, and the result is above both the stored and the in-memory value.
+pub(crate) async fn claim_route_generation(
+    db: &DatabaseConnection,
+    previous: u64,
+) -> Result<u64, RouteGenerationError> {
+    // Leave room for the `+ 1` below; 9.2e18 reloads is unreachable anyway.
+    let previous_i64 = i64::try_from(previous)
+        .unwrap_or(i64::MAX - 1)
+        .min(i64::MAX - 1);
+    let statement = sea_orm::Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "UPDATE route_generation SET current = GREATEST(current, $1) + 1, updated_at = now() \
+         WHERE id = 1 RETURNING current",
+        [previous_i64.into()],
+    );
+    let row = sea_orm::ConnectionTrait::query_one(db, statement)
+        .await
+        .map_err(|source| RouteGenerationError::Claim { previous, source })?
+        .ok_or(RouteGenerationError::MissingRow { previous })?;
+    let value = row
+        .try_get::<i64>("", "current")
+        .map_err(|source| RouteGenerationError::Claim { previous, source })?;
+    u64::try_from(value).map_err(|_| RouteGenerationError::Negative { value })
+}
+
+/// Raise `counter` to a generation claimed from the database and return the
+/// generation this reload publishes.
+///
+/// Always strictly above the value the counter held, so every reload wakes
+/// the long-poll waiters even if `claimed` were somehow not ahead of it, and
+/// never below `claimed`, so the in-memory sequence matches the durable one
+/// whenever the claim is ahead (the normal case).
+pub(crate) fn adopt_claimed_generation(
+    counter: &std::sync::atomic::AtomicU64,
+    claimed: u64,
+) -> u64 {
+    use std::sync::atomic::Ordering;
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let next = claimed.max(current.saturating_add(1));
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return next,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 pub struct CachedPeerTable {
     /// All route indexes and wake-gate ownership published as one immutable,
     /// lock-free snapshot. A reload can never expose mismatched generations.
@@ -740,14 +831,19 @@ pub struct CachedPeerTable {
     /// Bumped at the end of every successful `load_routes()`. Workers
     /// long-poll `GET /internal/.../routes/snapshot?since=N` and the
     /// handler waits until this counter exceeds `N` (or a timeout)
-    /// before returning the current snapshot. The first successful load
-    /// continues from the persisted `route_generation.current`, so the
-    /// numbering agents ACK and the completion gate compares stays
-    /// monotonic across restarts.
+    /// before returning the current snapshot.
+    ///
+    /// In the [`RouteGenerationRole::Authoritative`] process each value is
+    /// claimed from the durable `route_generation` row (see
+    /// [`Self::advance_generation`]), so the numbering agents ACK and the
+    /// completion gate compares is one sequence, monotonic across restarts.
     generation: std::sync::atomic::AtomicU64,
 
-    /// Whether `generation` has been raised to the persisted value yet.
-    generation_seeded: std::sync::atomic::AtomicBool,
+    /// Whether this process owns the durable `route_generation` row
+    /// ([`RouteGenerationRole::Authoritative`], the default) or only numbers
+    /// its own reloads ([`RouteGenerationRole::Local`]). Read once per reload,
+    /// never on the request path.
+    generation_authoritative: std::sync::atomic::AtomicBool,
 
     /// Notify hookup so long-poll handlers can sleep until the next
     /// generation bump rather than spinning. Awoken on every
@@ -788,7 +884,7 @@ impl CachedPeerTable {
             on_reload_callback: parking_lot::Mutex::new(None),
             on_cert_eligible_callback: parking_lot::Mutex::new(None),
             generation: std::sync::atomic::AtomicU64::new(0),
-            generation_seeded: std::sync::atomic::AtomicBool::new(false),
+            generation_authoritative: std::sync::atomic::AtomicBool::new(true),
             generation_changed: Arc::new(tokio::sync::Notify::new()),
             // Off until the bootstrap says otherwise: label discovery is
             // opt-in, so the safe default is "adopt nothing".
@@ -824,43 +920,81 @@ impl CachedPeerTable {
         *self.traefik_discovery_network.write() = network;
     }
 
-    /// Raise the in-memory generation to the persisted
-    /// `route_generation.current` once per process. A read failure leaves it
-    /// unseeded so the next successful load tries again.
-    async fn seed_generation_from_database(&self) {
-        use std::sync::atomic::Ordering;
-        if self.generation_seeded.load(Ordering::Acquire) {
-            return;
-        }
-        let statement = sea_orm::Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT current FROM route_generation WHERE id = 1".to_string(),
-        );
-        match sea_orm::ConnectionTrait::query_one(self.db.as_ref(), statement).await {
-            Ok(row) => {
-                let persisted = row
-                    .and_then(|row| row.try_get::<i64>("", "current").ok())
-                    .and_then(|current| u64::try_from(current).ok())
-                    .unwrap_or(0);
-                self.generation.fetch_max(persisted, Ordering::AcqRel);
-                self.generation_seeded.store(true, Ordering::Release);
-            }
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    "failed to read route_generation; the route generation restarts from the \
-                     in-memory value until a later reload can read it"
-                );
-            }
+    /// Choose whether this process owns the durable `route_generation` row.
+    ///
+    /// Exactly one process per control plane numbers the generations workers
+    /// ACK: the one serving `GET /internal/nodes/{id}/routes/snapshot`
+    /// (`temps serve`). The split-mode `temps proxy` loads the same routes
+    /// from the same database but never answers workers, so it uses
+    /// [`RouteGenerationRole::Local`]. When both wrote the row, whichever
+    /// process had reloaded more often could set the completion gate's target
+    /// to a generation the snapshot endpoint had never issued, and a worker
+    /// deployment then timed out waiting for ACKs that could not arrive.
+    ///
+    /// Call it before the first `load_routes()`.
+    pub fn set_route_generation_role(&self, role: RouteGenerationRole) {
+        let authoritative = role == RouteGenerationRole::Authoritative;
+        self.generation_authoritative
+            .store(authoritative, std::sync::atomic::Ordering::Release);
+        if authoritative {
+            debug!("Route generations are claimed from the durable route_generation row");
+        } else {
+            info!(
+                "Route generations are numbered locally in this process; route_generation is \
+                 owned by the process serving the worker route-sync endpoint"
+            );
         }
     }
 
-    /// Behave as if the persisted generation had already been read, so a test
-    /// can stand in for a process whose startup read failed.
-    #[cfg(test)]
-    pub(crate) fn skip_generation_seed_for_test(&self) {
-        self.generation_seeded
-            .store(true, std::sync::atomic::Ordering::Release);
+    /// The role set by [`Self::set_route_generation_role`].
+    pub fn route_generation_role(&self) -> RouteGenerationRole {
+        if self
+            .generation_authoritative
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            RouteGenerationRole::Authoritative
+        } else {
+            RouteGenerationRole::Local
+        }
+    }
+
+    /// Number the reload that just finished and return its generation.
+    ///
+    /// Authoritative: one atomic statement claims the next value of the
+    /// durable counter, `GREATEST(current, <in-memory>) + 1`. A single-row
+    /// update cannot interleave with another writer's, so two claims never
+    /// return the same value, and taking the greater of the two counters means
+    /// neither the durable nor the in-memory sequence goes backwards: a
+    /// restored database below this process's numbering, or a process that
+    /// restarted below the database's, both continue from the higher one.
+    ///
+    /// When the claim fails (the database is briefly unreachable) the reload
+    /// still has to wake waiters, so the in-memory counter advances on its own
+    /// and the row is left alone; the next successful claim starts above it.
+    /// An agent that ACKs such a generation has the newest routes, and the
+    /// completion gate's target (the row) is at or below its ACK.
+    ///
+    /// Local: the in-memory counter only; the row is never touched.
+    ///
+    /// Runs once per reload (control plane, serialized by
+    /// `route_reload_lock`), never per request.
+    async fn advance_generation(&self) -> u64 {
+        use std::sync::atomic::Ordering;
+        if !self.generation_authoritative.load(Ordering::Acquire) {
+            return self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        }
+        let previous = self.generation.load(Ordering::Acquire);
+        match claim_route_generation(self.db.as_ref(), previous).await {
+            Ok(claimed) => adopt_claimed_generation(&self.generation, claimed),
+            Err(error) => {
+                warn!(
+                    previous_generation = previous,
+                    "{error}; numbering this reload locally until a later reload can claim \
+                     from the database"
+                );
+                self.generation.fetch_add(1, Ordering::AcqRel) + 1
+            }
+        }
     }
 
     /// Current in-memory route table generation. Bumped on every
@@ -2615,16 +2749,20 @@ impl CachedPeerTable {
         // waiters are released as soon as the in-memory maps are live —
         // they must never be gated on DNS work.
         //
-        // The first load continues the persisted numbering. Restarting at 1
-        // would leave every agent long-polling with a `since` above it -- not
-        // woken by new generations until its 25s poll expires -- and leave
-        // their old, higher ACKs satisfying the completion gate for routes
-        // they never received.
-        self.seed_generation_from_database().await;
-        let new_gen = self
-            .generation
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-            + 1;
+        // The authoritative process claims the number from the durable
+        // counter, so it continues across restarts. Restarting at 1 would
+        // leave every agent long-polling with a `since` above it -- not woken
+        // by new generations until its 25s poll expires -- and leave their
+        // old, higher ACKs satisfying the completion gate for routes they
+        // never received. The claim is also the only write of that row, so
+        // `mark_deployment_complete`'s target is always a generation the
+        // snapshot endpoint has issued.
+        let new_gen = self.advance_generation().await;
+        debug!(
+            generation = new_gen,
+            role = ?self.route_generation_role(),
+            "Route table generation advanced"
+        );
         self.generation_changed.notify_waiters();
 
         // Fire the async on-reload hook used by the deployment-DNS publisher
@@ -2659,28 +2797,6 @@ impl CachedPeerTable {
                     callback(cert_hosts).await;
                 });
             }
-        }
-
-        // Persist the new generation into the durable singleton so
-        // `mark_deployment_complete` can wait until every active
-        // worker's `node_route_state.applied_generation` reaches it.
-        // Best-effort — a transient DB error here doesn't block the
-        // route table itself, and the next successful reload will
-        // overwrite the stale value.
-        //
-        // Never lower it: when the startup read of the persisted value
-        // failed, this process numbers from 1 until a later reload can seed
-        // it, and writing that over the durable value would make every
-        // node's earlier ACK look ahead of the routes it actually has.
-        let new_gen_i64: i64 = new_gen.try_into().unwrap_or(i64::MAX);
-        let stmt = sea_orm::Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "UPDATE route_generation SET current = GREATEST(current, $1), updated_at = now() \
-             WHERE id = 1",
-            [new_gen_i64.into()],
-        );
-        if let Err(e) = sea_orm::ConnectionTrait::execute(self.db.as_ref(), stmt).await {
-            tracing::warn!(error = %e, "failed to persist route_generation");
         }
 
         Ok(sleeping_environments)
@@ -4201,5 +4317,283 @@ mod unavailable_route_tests {
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod route_generation_tests {
+    // ── One authoritative route generation (issue #1356) ──────────────
+    //
+    // `route_generation` is the target the worker completion gate waits for
+    // every node to ACK, and nodes ACK what the route-sync endpoint of
+    // `temps serve` gave them. The split-mode `temps proxy` used to write the
+    // same row from its own reload counter, so the target could be a number
+    // no worker would ever be given.
+
+    use super::{
+        adopt_claimed_generation, claim_route_generation, CachedPeerTable, RouteGenerationRole,
+    };
+    use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+    use std::collections::HashSet;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+    use temps_database::test_utils::TestDatabase;
+
+    /// Isolated database, or `None` when Docker is unavailable.
+    async fn database_or_skip() -> Option<TestDatabase> {
+        match TestDatabase::with_migrations().await {
+            Ok(database) => Some(database),
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Skipping route generation test: Docker runtime unavailable: {error}");
+                None
+            }
+            Err(error) => panic!("Could not create isolated test database: {error}"),
+        }
+    }
+
+    async fn persisted(db: &DatabaseConnection) -> Option<i64> {
+        db.query_one(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT current FROM route_generation WHERE id = 1".to_string(),
+        ))
+        .await
+        .expect("read route_generation")
+        .map(|row| row.try_get::<i64>("", "current").expect("current column"))
+    }
+
+    async fn execute(db: &DatabaseConnection, sql: &str) {
+        db.execute(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            sql.to_string(),
+        ))
+        .await
+        .unwrap_or_else(|error| panic!("{sql}: {error}"));
+    }
+
+    #[test]
+    fn adopted_generations_strictly_increase_and_never_fall_below_a_claim() {
+        let counter = AtomicU64::new(0);
+        // The normal case: the claim is ahead, and is used as-is.
+        assert_eq!(adopt_claimed_generation(&counter, 41), 41);
+        assert_eq!(adopt_claimed_generation(&counter, 42), 42);
+        // A claim at or below the current value still advances by one, so
+        // the reload wakes its waiters and never repeats a generation.
+        assert_eq!(adopt_claimed_generation(&counter, 42), 43);
+        assert_eq!(adopt_claimed_generation(&counter, 7), 44);
+        // A claim far ahead (a restored database) is adopted.
+        assert_eq!(adopt_claimed_generation(&counter, 1_000), 1_000);
+        // Saturates instead of wrapping to 0 ("never loaded").
+        let full = AtomicU64::new(u64::MAX);
+        assert_eq!(adopt_claimed_generation(&full, 3), u64::MAX);
+    }
+
+    #[test]
+    fn concurrent_adoption_never_hands_out_a_generation_twice() {
+        let counter = Arc::new(AtomicU64::new(0));
+        let handles: Vec<_> = (0..8u64)
+            .map(|thread| {
+                let counter = counter.clone();
+                std::thread::spawn(move || {
+                    (0..500u64)
+                        .map(|i| adopt_claimed_generation(&counter, (i * 8 + thread) / 3))
+                        .collect::<Vec<u64>>()
+                })
+            })
+            .collect();
+        let mut seen = HashSet::new();
+        for handle in handles {
+            let values = handle.join().expect("adopting thread");
+            assert!(
+                values.windows(2).all(|pair| pair[0] < pair[1]),
+                "one caller's generations must strictly increase"
+            );
+            for value in values {
+                assert!(
+                    seen.insert(value),
+                    "generation {value} was handed out twice"
+                );
+            }
+        }
+        assert_eq!(seen.len(), 8 * 500);
+    }
+
+    #[test]
+    fn route_generation_role_defaults_to_authoritative_and_can_be_made_local() {
+        let table = CachedPeerTable::new(Arc::new(DatabaseConnection::Disconnected));
+        assert_eq!(
+            table.route_generation_role(),
+            RouteGenerationRole::Authoritative
+        );
+        table.set_route_generation_role(RouteGenerationRole::Local);
+        assert_eq!(table.route_generation_role(), RouteGenerationRole::Local);
+    }
+
+    /// A restarted control plane continues the persisted route generation
+    /// instead of starting again at 1 below every agent's last ACK, and the
+    /// row always equals the generation the snapshot endpoint serves.
+    #[tokio::test]
+    async fn authoritative_generation_continues_across_restarts() {
+        let Some(database) = database_or_skip().await else {
+            return;
+        };
+        let db = database.db.clone();
+
+        let first = CachedPeerTable::new(db.clone());
+        first.load_routes().await.expect("first load");
+        first.load_routes().await.expect("second load");
+        assert_eq!(first.current_generation(), 2);
+        assert_eq!(persisted(&db).await, Some(2));
+
+        // A previous process got further than this one ever will on its own.
+        execute(&db, "UPDATE route_generation SET current = 41 WHERE id = 1").await;
+        let restarted = CachedPeerTable::new(db.clone());
+        restarted.load_routes().await.expect("load after restart");
+        assert_eq!(restarted.current_generation(), 42);
+        assert_eq!(persisted(&db).await, Some(42));
+        restarted.load_routes().await.expect("reload");
+        assert_eq!(restarted.current_generation(), 43);
+        assert_eq!(persisted(&db).await, Some(43));
+
+        // A database restored below the running process never takes the
+        // numbering backwards: the next claim starts above both.
+        execute(&db, "UPDATE route_generation SET current = 3 WHERE id = 1").await;
+        restarted.load_routes().await.expect("reload after restore");
+        assert_eq!(restarted.current_generation(), 44);
+        assert_eq!(persisted(&db).await, Some(44));
+    }
+
+    /// The split-mode regression: a `temps proxy` that reloads more often
+    /// than `temps serve` must not move the completion gate's target.
+    #[tokio::test]
+    async fn a_local_table_never_moves_the_persisted_generation() {
+        let Some(database) = database_or_skip().await else {
+            return;
+        };
+        let db = database.db.clone();
+
+        let serve = CachedPeerTable::new(db.clone());
+        let proxy = CachedPeerTable::new(db.clone());
+        proxy.set_route_generation_role(RouteGenerationRole::Local);
+
+        serve.load_routes().await.expect("serve load");
+        assert_eq!(serve.current_generation(), 1);
+        for _ in 0..5 {
+            proxy.load_routes().await.expect("proxy load");
+        }
+        assert_eq!(proxy.current_generation(), 5, "the proxy still counts");
+        assert_eq!(
+            persisted(&db).await,
+            Some(1),
+            "the gate's target is still the generation serve gave the workers"
+        );
+
+        serve.load_routes().await.expect("serve reload");
+        assert_eq!(serve.current_generation(), 2);
+        assert_eq!(persisted(&db).await, Some(2));
+        // A proxy restart neither continues from nor writes the row.
+        let restarted_proxy = CachedPeerTable::new(db.clone());
+        restarted_proxy.set_route_generation_role(RouteGenerationRole::Local);
+        restarted_proxy.load_routes().await.expect("proxy restart");
+        assert_eq!(restarted_proxy.current_generation(), 1);
+        assert_eq!(persisted(&db).await, Some(2));
+    }
+
+    /// Concurrent claimers (two control-plane replicas, or a racing reload)
+    /// each get a distinct generation, and the row ends at the highest one.
+    #[tokio::test]
+    async fn concurrent_claims_never_collide_or_go_backwards() {
+        let Some(database) = database_or_skip().await else {
+            return;
+        };
+        let db = database.db.clone();
+
+        let tasks: Vec<_> = (0..32u64)
+            .map(|i| {
+                let db = db.clone();
+                tokio::spawn(async move {
+                    let mut claimed = Vec::new();
+                    for _ in 0..5 {
+                        // Stale and fresh in-memory values alike.
+                        claimed.push(
+                            claim_route_generation(db.as_ref(), i % 4)
+                                .await
+                                .expect("claim"),
+                        );
+                    }
+                    claimed
+                })
+            })
+            .collect();
+        let mut seen = HashSet::new();
+        for task in tasks {
+            let claimed = task.await.expect("claim task");
+            assert!(
+                claimed.windows(2).all(|pair| pair[0] < pair[1]),
+                "one claimer's generations must strictly increase: {claimed:?}"
+            );
+            for value in claimed {
+                assert!(seen.insert(value), "generation {value} was claimed twice");
+            }
+        }
+        assert_eq!(seen.len(), 32 * 5);
+        let highest = seen.iter().copied().max().expect("claims");
+        assert_eq!(persisted(&db).await, Some(highest as i64));
+
+        // Two authoritative tables sharing the row interleave without
+        // repeating a number.
+        let a = CachedPeerTable::new(db.clone());
+        let b = CachedPeerTable::new(db.clone());
+        a.load_routes().await.expect("a");
+        b.load_routes().await.expect("b");
+        a.load_routes().await.expect("a again");
+        assert_eq!(b.current_generation(), highest + 2);
+        assert_eq!(a.current_generation(), highest + 3);
+        assert_eq!(persisted(&db).await, Some(highest as i64 + 3));
+    }
+
+    /// A reload whose claim fails still advances (it must wake waiters) and
+    /// leaves the row alone; the next successful claim starts above it, so
+    /// neither counter ever repeats or lowers a generation.
+    #[tokio::test]
+    async fn a_failed_claim_numbers_locally_and_the_next_claim_starts_above_it() {
+        let Some(database) = database_or_skip().await else {
+            return;
+        };
+        let db = database.db.clone();
+
+        let table = CachedPeerTable::new(db.clone());
+        table.load_routes().await.expect("load");
+        assert_eq!(table.current_generation(), 1);
+
+        execute(&db, "DELETE FROM route_generation WHERE id = 1").await;
+        let missing = claim_route_generation(db.as_ref(), 1)
+            .await
+            .expect_err("no row to claim from");
+        assert!(
+            missing
+                .to_string()
+                .contains("route_generation singleton row (id = 1)"),
+            "{missing}"
+        );
+        table.load_routes().await.expect("load without the row");
+        table
+            .load_routes()
+            .await
+            .expect("second load without the row");
+        assert_eq!(table.current_generation(), 3);
+        assert_eq!(persisted(&db).await, None, "nothing re-creates the row");
+
+        execute(
+            &db,
+            "INSERT INTO route_generation (id, current) VALUES (1, 0)",
+        )
+        .await;
+        table.load_routes().await.expect("load with the row back");
+        assert_eq!(table.current_generation(), 4);
+        assert_eq!(persisted(&db).await, Some(4));
     }
 }
