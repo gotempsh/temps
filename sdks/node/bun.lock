@@ -59,7 +59,7 @@
     },
     "packages/analytics-browser": {
       "name": "@temps-sdk/analytics-browser",
-      "version": "0.0.1",
+      "version": "0.0.5",
       "dependencies": {
         "@temps-sdk/analytics-core": "workspace:*",
       },
@@ -69,7 +69,7 @@
     },
     "packages/analytics-core": {
       "name": "@temps-sdk/analytics-core",
-      "version": "0.0.2",
+      "version": "0.0.5",
       "dependencies": {
         "@rrweb/packer": "^2.0.0-alpha.17",
         "rrweb": "^2.0.0-alpha.17",
@@ -84,7 +84,7 @@
     },
     "packages/blob": {
       "name": "@temps-sdk/blob",
-      "version": "0.0.3",
+      "version": "0.0.4",
       "devDependencies": {
         "@types/node": "^20.0.0",
         "@vitest/coverage-v8": "^4.1.0",
@@ -94,7 +94,7 @@
     },
     "packages/kv": {
       "name": "@temps-sdk/kv",
-      "version": "0.0.3",
+      "version": "0.0.4",
       "devDependencies": {
         "@types/node": "^20.0.0",
         "@vitest/coverage-v8": "^4.1.0",
@@ -104,7 +104,7 @@
     },
     "packages/node-sdk": {
       "name": "@temps-sdk/node-sdk",
-      "version": "0.0.4",
+      "version": "0.0.7",
       "dependencies": {
         "@hey-api/client-fetch": "^0.13.1",
       },
@@ -136,7 +136,7 @@
     },
     "packages/react-analytics": {
       "name": "@temps-sdk/react-analytics",
-      "version": "0.0.3",
+      "version": "0.0.7",
       "dependencies": {
         "@rrweb/packer": "^2.0.0-alpha.17",
         "@temps-sdk/analytics-core": "workspace:*",
@@ -181,7 +181,7 @@
     },
     "packages/svelte-analytics": {
       "name": "@temps-sdk/svelte-analytics",
-      "version": "0.0.1",
+      "version": "0.0.4",
       "dependencies": {
         "@temps-sdk/analytics-core": "workspace:*",
       },
@@ -195,7 +195,7 @@
     },
     "packages/vue-analytics": {
       "name": "@temps-sdk/vue-analytics",
-      "version": "0.0.1",
+      "version": "0.0.4",
       "dependencies": {
         "@temps-sdk/analytics-core": "workspace:*",
       },

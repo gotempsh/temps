@@ -8,7 +8,7 @@ description: |
 
 Implement privacy-aware session recording with `@temps-sdk/react-analytics` (rrweb under the hood).
 
-> **Verified against `@temps-sdk/react-analytics@0.0.4`.** A prior version of
+> **Verified against `@temps-sdk/react-analytics@0.0.7`.** A prior version of
 > this skill documented `<SessionRecordingProvider enabled maskAllInputs
 > blockClass sampling>` and `startRecording`/`stopRecording`/`isRecording` —
 > **none of those exist**. Use the API described in this skill. If a maintainer
@@ -20,7 +20,7 @@ Implement privacy-aware session recording with `@temps-sdk/react-analytics` (rrw
 ## Installation
 
 ```bash
-npm install --ignore-scripts --save-exact @temps-sdk/react-analytics@0.0.4
+npm install --ignore-scripts --save-exact @temps-sdk/react-analytics@0.0.7
 ```
 
 Before running the install, explain that it changes the application's

@@ -276,7 +276,7 @@ a headless agent machine, suppress the best-effort local browser launch without
 disabling browser authorization:
 
 ```bash
-TEMPS_NO_BROWSER=1 bunx @temps-sdk/cli@0.1.36 \
+TEMPS_NO_BROWSER=1 bunx @temps-sdk/cli@0.1.37 \
   login "$console_url" --context "$context_name"
 ```
 
@@ -297,7 +297,7 @@ When those values appear:
 5. On approval, verify the stored context read-only:
 
 ```bash
-bunx @temps-sdk/cli@0.1.36 --target-context "$context_name" whoami
+bunx @temps-sdk/cli@0.1.37 --target-context "$context_name" whoami
 ```
 
 Report the authenticated identity, server URL, and context name without
@@ -323,7 +323,7 @@ place them in command arguments or reproduce credential-reveal output.
 List users with an explicit context:
 
 ```bash
-bunx @temps-sdk/cli@0.1.36 --target-context <CONTEXT> users list
+bunx @temps-sdk/cli@0.1.37 --target-context <CONTEXT> users list
 ```
 
 Creating, disabling, deleting, or changing a role affects platform access.
@@ -337,8 +337,8 @@ and revocation state.
 Safe read-only checks include:
 
 ```bash
-bunx @temps-sdk/cli@0.1.36 --target-context <CONTEXT> dns list
-bunx @temps-sdk/cli@0.1.36 --target-context <CONTEXT> domains orders list
+bunx @temps-sdk/cli@0.1.37 --target-context <CONTEXT> dns list
+bunx @temps-sdk/cli@0.1.37 --target-context <CONTEXT> domains orders list
 ```
 
 For provider creation, identify the provider and zones, explain minimum
@@ -358,9 +358,9 @@ deleting, or changing storage.
 Read-only inventory examples:
 
 ```bash
-bunx @temps-sdk/cli@0.1.36 --target-context <CONTEXT> services list
-bunx @temps-sdk/cli@0.1.36 --target-context <CONTEXT> projects list
-bunx @temps-sdk/cli@0.1.36 --target-context <CONTEXT> domains list
+bunx @temps-sdk/cli@0.1.37 --target-context <CONTEXT> services list
+bunx @temps-sdk/cli@0.1.37 --target-context <CONTEXT> projects list
+bunx @temps-sdk/cli@0.1.37 --target-context <CONTEXT> domains list
 ```
 
 Connection strings and generated passwords belong in Temps secrets or a secret
