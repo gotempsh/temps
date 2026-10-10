@@ -12,7 +12,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use thiserror::Error;
 
-use temps_entities::{deployment_containers, deployments, environments, nodes, sandboxes};
+use temps_entities::{
+    deployment_containers, deployments, environments, nodes, projects, sandboxes,
+};
 
 /// `deployment_containers.status` for a container Temps confirmed is gone from
 /// Docker. Nothing needs to be cleaned up for it any more.
@@ -377,11 +379,84 @@ pub enum NodeError {
         source: temps_network::mesh::MeshError,
     },
 
+    #[error(
+        "Cannot remove node {node_id} ('{node_name}'): it is the only target node of {}. \
+         Removing it would leave that placement with no node, which would silently let \
+         those deployments run on any node. Change their target nodes first",
+        describe_placements(placements)
+    )]
+    OnlyPlacementTarget {
+        node_id: i32,
+        node_name: String,
+        placements: Vec<NodePlacementReference>,
+    },
+
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
 
     #[error("DNS registry operation failed: {0}")]
     DnsRegistry(#[from] temps_dns::DnsRegistryError),
+}
+
+/// The row a [`NodePlacementReference`] was read from, to rewrite it.
+enum PlacementRow {
+    Environment(Box<environments::Model>),
+    Project(Box<projects::Model>),
+}
+
+/// `targets` without `node_id`, order kept.
+fn remaining_targets(targets: &[i32], node_id: i32) -> Vec<i32> {
+    targets
+        .iter()
+        .copied()
+        .filter(|id| *id != node_id)
+        .collect()
+}
+
+/// `environment 'production' (id 4) of project 'shop', ...` for messages.
+fn describe_placements(placements: &[NodePlacementReference]) -> String {
+    placements
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A placement (an environment's, or a project's default) whose
+/// `target_nodes` names a node.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct NodePlacementReference {
+    pub project_id: i32,
+    pub project_name: String,
+    /// `None` for the project's default placement, which environments
+    /// without their own `target_nodes` inherit.
+    pub environment_id: Option<i32>,
+    pub environment_name: Option<String>,
+    /// The placement's `target_nodes`: as stored when reporting a refusal,
+    /// and what is left after the removed node was taken out when reporting
+    /// an update.
+    pub target_nodes: Vec<i32>,
+}
+
+impl std::fmt::Display for NodePlacementReference {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (&self.environment_name, self.environment_id) {
+            (Some(name), Some(id)) => write!(
+                f,
+                "environment '{}' (id {}) of project '{}'",
+                name, id, self.project_name
+            ),
+            _ => write!(f, "project '{}' (default placement)", self.project_name),
+        }
+    }
+}
+
+/// What removing a node changed besides deleting its row.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NodeRemoval {
+    /// Placements that named the node and still name other nodes; the
+    /// node's ID was taken out of each, and `target_nodes` holds the rest.
+    pub placements_updated: Vec<NodePlacementReference>,
 }
 
 /// Request to register a new worker node.
@@ -1733,7 +1808,15 @@ impl NodeService {
     ///
     /// The node's internal DNS records are deleted in the same transaction,
     /// so resolvers stop answering with its addresses as soon as it is gone.
-    pub async fn remove(&self, node_id: i32) -> Result<(), NodeError> {
+    ///
+    /// Its ID is taken out of every environment's and project's
+    /// `target_nodes` in the same transaction, and the changed placements are
+    /// returned: node IDs are never reused (a rejoining machine gets a new
+    /// one), so a stale ID would silently stop targeting anything. A
+    /// placement that names only this node is refused instead
+    /// ([`NodeError::OnlyPlacementTarget`]): emptying it would turn a pinned
+    /// environment into one that runs on any node.
+    pub async fn remove(&self, node_id: i32) -> Result<NodeRemoval, NodeError> {
         let txn = self.db.begin().await?;
 
         // Drop the node's DNS records first, under the DNS registry's
@@ -1783,6 +1866,12 @@ impl NodeService {
             });
         }
 
+        // Read and rewritten under the node row lock, in this transaction: a
+        // settings save that adds this node concurrently either committed
+        // first and is rewritten here, or validates against a node that no
+        // longer exists once this commits.
+        let placements_updated = Self::remove_from_placements(&txn, node_id, &locked.name).await?;
+
         // `deployment_containers.node_id` is `ON DELETE SET NULL`, and NULL
         // means "the local Docker daemon". Any container not confirmed gone
         // would therefore be re-homed to this process, and a later project
@@ -1819,13 +1908,151 @@ impl NodeService {
                 "Node removed with containers Temps could not confirm were removed; recorded as orphaned"
             );
         }
+        for placement in &placements_updated {
+            tracing::info!(
+                node_id = node_id,
+                project_id = placement.project_id,
+                environment_id = ?placement.environment_id,
+                remaining_target_nodes = ?placement.target_nodes,
+                "Removed node taken out of {placement}'s target nodes"
+            );
+        }
         tracing::info!(
             node_id = node_id,
             removed_dns_endpoints = removed_endpoints,
+            placements_updated = placements_updated.len(),
             "Node removed from cluster"
         );
 
-        Ok(())
+        Ok(NodeRemoval { placements_updated })
+    }
+
+    /// Environments (of live projects) and projects whose `target_nodes`
+    /// names `node_id`. One query each; the environment query joins its
+    /// project for the name.
+    async fn placements_targeting<C: sea_orm::ConnectionTrait>(
+        conn: &C,
+        node_id: i32,
+    ) -> Result<Vec<(NodePlacementReference, PlacementRow)>, sea_orm::DbErr> {
+        let names_node = |table: &str| {
+            Expr::cust_with_values(
+                format!("{table}.deployment_config -> 'targetNodes' @> jsonb_build_array($1::int)"),
+                [node_id],
+            )
+        };
+        let environments = environments::Entity::find()
+            .find_also_related(projects::Entity)
+            .filter(environments::Column::DeletedAt.is_null())
+            .filter(projects::Column::IsDeleted.eq(false))
+            .filter(names_node("environments"))
+            .order_by_asc(environments::Column::Id)
+            .all(conn)
+            .await?;
+        let projects = projects::Entity::find()
+            .filter(projects::Column::IsDeleted.eq(false))
+            .filter(names_node("projects"))
+            .order_by_asc(projects::Column::Id)
+            .all(conn)
+            .await?;
+
+        let mut placements = Vec::with_capacity(environments.len() + projects.len());
+        for (environment, project) in environments {
+            let Some(project) = project else { continue };
+            let target_nodes = environment
+                .deployment_config
+                .as_ref()
+                .and_then(|config| config.target_nodes.clone())
+                .unwrap_or_default();
+            placements.push((
+                NodePlacementReference {
+                    project_id: project.id,
+                    project_name: project.name,
+                    environment_id: Some(environment.id),
+                    environment_name: Some(environment.name.clone()),
+                    target_nodes,
+                },
+                PlacementRow::Environment(Box::new(environment)),
+            ));
+        }
+        for project in projects {
+            let target_nodes = project
+                .deployment_config
+                .as_ref()
+                .and_then(|config| config.target_nodes.clone())
+                .unwrap_or_default();
+            placements.push((
+                NodePlacementReference {
+                    project_id: project.id,
+                    project_name: project.name.clone(),
+                    environment_id: None,
+                    environment_name: None,
+                    target_nodes,
+                },
+                PlacementRow::Project(Box::new(project)),
+            ));
+        }
+        Ok(placements)
+    }
+
+    /// Placements that name only `node_id`, which its removal would leave
+    /// with no target. Checked before anything is removed from the node, and
+    /// again under the lock in [`Self::remove`].
+    pub async fn placements_pinned_only_to(
+        &self,
+        node_id: i32,
+    ) -> Result<Vec<NodePlacementReference>, NodeError> {
+        Ok(Self::placements_targeting(self.db.as_ref(), node_id)
+            .await?
+            .into_iter()
+            .map(|(placement, _)| placement)
+            .filter(|placement| remaining_targets(&placement.target_nodes, node_id).is_empty())
+            .collect())
+    }
+
+    async fn remove_from_placements(
+        txn: &sea_orm::DatabaseTransaction,
+        node_id: i32,
+        node_name: &str,
+    ) -> Result<Vec<NodePlacementReference>, NodeError> {
+        let placements = Self::placements_targeting(txn, node_id).await?;
+        let only_target: Vec<NodePlacementReference> = placements
+            .iter()
+            .filter(|(placement, _)| remaining_targets(&placement.target_nodes, node_id).is_empty())
+            .map(|(placement, _)| placement.clone())
+            .collect();
+        if !only_target.is_empty() {
+            return Err(NodeError::OnlyPlacementTarget {
+                node_id,
+                node_name: node_name.to_string(),
+                placements: only_target,
+            });
+        }
+
+        let mut updated = Vec::with_capacity(placements.len());
+        for (mut placement, row) in placements {
+            let remaining = remaining_targets(&placement.target_nodes, node_id);
+            match row {
+                PlacementRow::Environment(environment) => {
+                    let mut config = environment.deployment_config.clone().unwrap_or_default();
+                    config.target_nodes = Some(remaining.clone());
+                    let mut active: environments::ActiveModel = (*environment).into();
+                    active.deployment_config = Set(Some(config));
+                    active.updated_at = Set(chrono::Utc::now());
+                    active.update(txn).await?;
+                }
+                PlacementRow::Project(project) => {
+                    let mut config = project.deployment_config.clone().unwrap_or_default();
+                    config.target_nodes = Some(remaining.clone());
+                    let mut active: projects::ActiveModel = (*project).into();
+                    active.deployment_config = Set(Some(config));
+                    active.updated_at = Set(chrono::Utc::now());
+                    active.update(txn).await?;
+                }
+            }
+            placement.target_nodes = remaining;
+            updated.push(placement);
+        }
+        Ok(updated)
     }
 
     /// Rows for containers that may still exist in Docker: anything not
@@ -2681,6 +2908,9 @@ mod tests {
             )])]])
             // nothing serving on the node under the lock
             .append_query_results(vec![vec![count_row(0)]])
+            // no environment or project targets the node
+            .append_query_results(vec![Vec::<environments::Model>::new()])
+            .append_query_results(vec![Vec::<projects::Model>::new()])
             // orphan any unconfirmed containers (none here)
             .append_exec_results(vec![sea_orm::MockExecResult {
                 last_insert_id: 0,
@@ -2693,7 +2923,8 @@ mod tests {
             .into_connection();
         let service = NodeService::new(Arc::new(db));
 
-        service.remove(1).await.unwrap();
+        let removal = service.remove(1).await.unwrap();
+        assert!(removal.placements_updated.is_empty());
     }
 
     /// A deployment that placed a container on the node after the caller
@@ -2774,6 +3005,173 @@ mod tests {
             owner_id,
             node_id,
         }
+    }
+
+    /// A live project and one environment of it with `target_nodes` set.
+    async fn seed_placement(
+        db: &sea_orm::DatabaseConnection,
+        slug: &str,
+        project_targets: Option<Vec<i32>>,
+        environment_targets: Option<Vec<i32>>,
+    ) -> (temps_entities::projects::Model, environments::Model) {
+        use temps_entities::deployment_config::DeploymentConfig;
+        use temps_entities::{preset::Preset, upstream_config::UpstreamList};
+        let config = |targets: Option<Vec<i32>>| {
+            targets.map(|target_nodes| DeploymentConfig {
+                target_nodes: Some(target_nodes),
+                ..Default::default()
+            })
+        };
+        let project = projects::ActiveModel {
+            name: Set(format!("Project {slug}")),
+            slug: Set(slug.to_string()),
+            repo_owner: Set("owner".to_string()),
+            repo_name: Set("repo".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::NextJs),
+            directory: Set("/".to_string()),
+            deployment_config: Set(config(project_targets)),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            is_deleted: Set(false),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            slug: Set(format!("{slug}-production")),
+            host: Set(format!("{slug}.example.test")),
+            subdomain: Set(format!("{slug}.example.test")),
+            upstreams: Set(UpstreamList::default()),
+            deployment_config: Set(config(environment_targets)),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        (project, environment)
+    }
+
+    fn stored_targets(environment: &environments::Model) -> Option<Vec<i32>> {
+        environment
+            .deployment_config
+            .as_ref()
+            .and_then(|config| config.target_nodes.clone())
+    }
+
+    /// #1390: the removed node's ID used to stay in `target_nodes`, so the
+    /// placement silently stopped targeting the machine once it rejoined
+    /// under a new ID.
+    #[tokio::test]
+    async fn removing_a_node_takes_it_out_of_every_placement_and_reports_them() {
+        let Some(test_db) = migrated_test_db().await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        let service = NodeService::new(db.clone());
+        let first = service
+            .register(register_req("worker-1", "hash", "https://10.100.0.2:3100"))
+            .await
+            .unwrap();
+        let mut second_request = register_req("worker-2", "hash-2", "https://10.100.0.3:3100");
+        second_request.private_address = "10.100.0.3".to_string();
+        let second = service.register(second_request).await.unwrap();
+        let (a, b) = (first.id, second.id);
+
+        let (shop, shop_production) =
+            seed_placement(db.as_ref(), "shop", Some(vec![a, b]), Some(vec![0, a, b])).await;
+        let (_, untouched) = seed_placement(db.as_ref(), "blog", None, Some(vec![0, a])).await;
+
+        let removal = service.remove(b).await.unwrap();
+
+        let mut reported: Vec<(Option<i32>, Vec<i32>)> = removal
+            .placements_updated
+            .iter()
+            .map(|p| (p.environment_id, p.target_nodes.clone()))
+            .collect();
+        reported.sort();
+        assert_eq!(
+            reported,
+            vec![(None, vec![a]), (Some(shop_production.id), vec![0, a])]
+        );
+        let production = environments::Entity::find_by_id(shop_production.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_targets(&production), Some(vec![0, a]));
+        let project = projects::Entity::find_by_id(shop.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            project.deployment_config.and_then(|c| c.target_nodes),
+            Some(vec![a])
+        );
+        let blog = environments::Entity::find_by_id(untouched.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_targets(&blog), Some(vec![0, a]), "not targeting it");
+    }
+
+    /// Emptying a pinned placement would let it run on any node, so the
+    /// removal is refused, names the environment, and changes nothing.
+    #[tokio::test]
+    async fn removing_the_only_target_of_a_placement_is_refused_and_changes_nothing() {
+        let Some(test_db) = migrated_test_db().await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        let service = NodeService::new(db.clone());
+        let node = service
+            .register(register_req("worker-1", "hash", "https://10.100.0.2:3100"))
+            .await
+            .unwrap();
+        let (_, pinned) = seed_placement(db.as_ref(), "pinned", None, Some(vec![node.id])).await;
+        let (_, shared) = seed_placement(db.as_ref(), "shared", None, Some(vec![0, node.id])).await;
+
+        let only_here = service.placements_pinned_only_to(node.id).await.unwrap();
+        assert_eq!(
+            only_here
+                .iter()
+                .map(|p| p.environment_id)
+                .collect::<Vec<_>>(),
+            vec![Some(pinned.id)]
+        );
+
+        let error = service.remove(node.id).await.unwrap_err();
+        match &error {
+            NodeError::OnlyPlacementTarget { placements, .. } => {
+                assert_eq!(placements.len(), 1);
+                assert_eq!(placements[0].environment_id, Some(pinned.id));
+            }
+            other => panic!("expected OnlyPlacementTarget, got {other:?}"),
+        }
+        let message = error.to_string();
+        assert!(
+            message.contains("environment 'production'") && message.contains("Project pinned"),
+            "{message}"
+        );
+
+        assert!(nodes::Entity::find_by_id(node.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .is_some());
+        let shared = environments::Entity::find_by_id(shared.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_targets(&shared), Some(vec![0, node.id]));
     }
 
     #[tokio::test]

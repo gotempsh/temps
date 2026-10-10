@@ -19,6 +19,28 @@ use tracing::{info, warn};
 /// An empty target-node list means "remove this environment override".
 /// Persisting `Some([])` would instead create an explicit placement constraint
 /// that no node can satisfy, leaving workloads impossible to redeploy or drain.
+/// Synthetic `target_nodes` ID of the control plane, which has no `nodes` row.
+const CONTROL_PLANE_NODE_ID: i32 = 0;
+
+fn join_node_ids(ids: &[i32]) -> String {
+    ids.iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// IDs in `requested` that name neither the control plane nor an existing
+/// node, in ascending order without duplicates.
+fn unknown_target_node_ids(requested: &[i32], existing: &[i32]) -> Vec<i32> {
+    requested
+        .iter()
+        .copied()
+        .filter(|id| *id != CONTROL_PLANE_NODE_ID && !existing.contains(id))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 fn normalize_target_nodes(target_nodes: Vec<i32>) -> Option<Vec<i32>> {
     (!target_nodes.is_empty()).then_some(target_nodes)
 }
@@ -56,6 +78,18 @@ pub enum EnvironmentError {
 
     #[error("Invalid input: {0}")]
     InvalidInput(String),
+
+    #[error(
+        "Environment {environment_id}: target_nodes lists node ID(s) {} that do not exist (removed \
+         nodes keep their ID retired; a rejoined machine gets a new one). Existing nodes: {available}",
+        join_node_ids(unknown)
+    )]
+    UnknownTargetNodes {
+        environment_id: i32,
+        unknown: Vec<i32>,
+        /// `0 (control plane), 1 (worker-1), ...`, for the message.
+        available: String,
+    },
 
     #[error(
         "Branch '{branch}' is already used by environment '{env_name}' in project {project_id}"
@@ -101,6 +135,14 @@ impl From<EnvironmentError> for Problem {
             }
             EnvironmentError::InvalidInput(msg) => {
                 temps_core::error_builder::bad_request().detail(msg).build()
+            }
+            EnvironmentError::UnknownTargetNodes { ref unknown, .. } => {
+                let unknown = unknown.clone();
+                temps_core::error_builder::bad_request()
+                    .title("Unknown Target Nodes")
+                    .detail(error.to_string())
+                    .value("unknown_node_ids", unknown)
+                    .build()
             }
             EnvironmentError::DatabaseConnectionError(_) => {
                 // Log full details server-side, return generic message to client
@@ -848,6 +890,67 @@ impl EnvironmentService {
         Ok(environment)
     }
 
+    /// Refuse a placement that names nodes which do not exist.
+    ///
+    /// A stored unknown ID silently stops targeting anything: a removed node's
+    /// ID is never reused, and the same machine rejoining gets a new one, so
+    /// the scheduler would quietly place replicas on fewer nodes than asked.
+    async fn ensure_target_nodes_exist(
+        &self,
+        environment_id: i32,
+        requested: &[i32],
+    ) -> Result<(), EnvironmentError> {
+        let candidates: Vec<i32> = requested
+            .iter()
+            .copied()
+            .filter(|id| *id != CONTROL_PLANE_NODE_ID)
+            .collect();
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let existing: Vec<i32> = temps_entities::nodes::Entity::find()
+            .select_only()
+            .column(temps_entities::nodes::Column::Id)
+            .filter(temps_entities::nodes::Column::Id.is_in(candidates))
+            .into_tuple()
+            .all(self.db.as_ref())
+            .await
+            .map_err(|e| EnvironmentError::DatabaseError {
+                reason: format!(
+                    "Failed to look up target nodes for environment {environment_id}: {e}"
+                ),
+            })?;
+        let unknown = unknown_target_node_ids(requested, &existing);
+        if unknown.is_empty() {
+            return Ok(());
+        }
+        // Bounded: clusters have a handful of nodes, and the message only
+        // needs enough to pick the right IDs.
+        let nodes: Vec<(i32, String)> = temps_entities::nodes::Entity::find()
+            .select_only()
+            .column(temps_entities::nodes::Column::Id)
+            .column(temps_entities::nodes::Column::Name)
+            .order_by_asc(temps_entities::nodes::Column::Id)
+            .limit(50)
+            .into_tuple()
+            .all(self.db.as_ref())
+            .await
+            .map_err(|e| EnvironmentError::DatabaseError {
+                reason: format!(
+                    "Failed to list nodes for environment {environment_id}'s placement error: {e}"
+                ),
+            })?;
+        let available = std::iter::once(format!("{CONTROL_PLANE_NODE_ID} (control plane)"))
+            .chain(nodes.into_iter().map(|(id, name)| format!("{id} ({name})")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(EnvironmentError::UnknownTargetNodes {
+            environment_id,
+            unknown,
+            available,
+        })
+    }
+
     /// Update an environment's settings.
     ///
     /// `ceiling_enforcement` reflects the caller's `SettingsWrite` permission:
@@ -939,6 +1042,8 @@ impl EnvironmentService {
             deployment_config.security = Some(security);
         }
         if let Some(target_nodes) = settings.target_nodes {
+            self.ensure_target_nodes_exist(env_id, &target_nodes)
+                .await?;
             deployment_config.target_nodes = normalize_target_nodes(target_nodes);
         }
         if let Some(target_labels) = settings.target_labels {
@@ -1601,6 +1706,40 @@ mod tests {
     }
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
+
+    #[test]
+    fn unknown_target_nodes_ignore_the_control_plane_and_existing_nodes() {
+        assert_eq!(
+            unknown_target_node_ids(&[0, 1, 3], &[1, 3]),
+            Vec::<i32>::new()
+        );
+        assert_eq!(
+            unknown_target_node_ids(&[0, 1, 2, 2, 7], &[1, 3]),
+            vec![2, 7]
+        );
+        assert_eq!(unknown_target_node_ids(&[], &[1]), Vec::<i32>::new());
+    }
+
+    #[test]
+    fn unknown_target_nodes_are_a_400_that_names_them() {
+        let error = EnvironmentError::UnknownTargetNodes {
+            environment_id: 4,
+            unknown: vec![2],
+            available: "0 (control plane), 1 (worker-1), 3 (worker-2)".to_string(),
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("node ID(s) 2 that do not exist"),
+            "{message}"
+        );
+        assert!(message.contains("3 (worker-2)"), "{message}");
+
+        let problem = Problem::from(error);
+        assert_eq!(problem.status_code, axum::http::StatusCode::BAD_REQUEST);
+        let body = serde_json::to_value(&problem.body).unwrap();
+        assert_eq!(body["title"], "Unknown Target Nodes");
+        assert_eq!(body["unknown_node_ids"], serde_json::json!([2]));
+    }
 
     #[test]
     fn empty_target_nodes_clears_environment_placement_override() {

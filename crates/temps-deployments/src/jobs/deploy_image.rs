@@ -2583,6 +2583,9 @@ impl DeployImageJob {
                         };
                         self.log(context, line).await?;
                     }
+                    for warning in &outcome.warnings {
+                        self.log(context, format!("WARNING: {warning}")).await?;
+                    }
 
                     let assignments = outcome.assignments;
                     // Log where replicas will be deployed
@@ -6365,8 +6368,9 @@ mod tests {
             updated_at: chrono::Utc::now(),
         };
 
+        // `list_active`, then `list_all` to say why node 99 is not usable.
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results(vec![vec![node]])
+            .append_query_results(vec![vec![node.clone()], vec![node]])
             .into_connection();
         let node_service = Arc::new(NodeService::new(Arc::new(db)));
         let scheduler = Arc::new(NodeScheduler::new(node_service));
@@ -6380,7 +6384,7 @@ mod tests {
         match error {
             NodeError::PlacementConstraintsUnsatisfied { excluded } => {
                 assert!(
-                    excluded.contains("no active node matched"),
+                    excluded.contains("'node 99' is listed in target_nodes but does not exist"),
                     "unexpected placement diagnostic: {excluded}"
                 );
             }

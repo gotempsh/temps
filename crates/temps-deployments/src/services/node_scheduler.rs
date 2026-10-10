@@ -142,6 +142,14 @@ pub enum ExclusionReason {
     /// The node is labelled `temps.sh/role=dedicated` and this placement does
     /// not name it in `target_nodes`.
     DedicatedNode,
+    /// `target_nodes` names an ID that no node has: the node was removed (a
+    /// machine that rejoins gets a new ID). Permanent until the placement is
+    /// edited, so it counts toward the anti-affinity shortfall.
+    TargetNodeMissing,
+    /// `target_nodes` names a node that exists but cannot take replicas now
+    /// (offline, draining, no recent heartbeat). Transient, so like load it
+    /// does not fail an anti-affinity placement; it is reported instead.
+    TargetNodeUnavailable { state: String },
 }
 
 impl std::fmt::Display for ExclusionReason {
@@ -177,6 +185,15 @@ impl std::fmt::Display for ExclusionReason {
                 f,
                 "is dedicated ({NODE_ROLE_LABEL}={DEDICATED_NODE_ROLE}) and only runs \
                  environments that pin it in target_nodes"
+            ),
+            ExclusionReason::TargetNodeMissing => write!(
+                f,
+                "is listed in target_nodes but does not exist (it was removed; a machine \
+                 that rejoins gets a new node ID) — update the environment's target nodes"
+            ),
+            ExclusionReason::TargetNodeUnavailable { state } => write!(
+                f,
+                "is listed in target_nodes but is {state}, so it cannot take replicas right now"
             ),
         }
     }
@@ -257,6 +274,9 @@ pub struct SchedulingOutcome {
     /// instead of quietly running a service without the thing it exists to
     /// use. `false` on every ordinary placement.
     pub docker_socket_required: bool,
+    /// Placement-wide warnings for the deploy log, e.g. anti-affinity that
+    /// had to put more than one replica on a node.
+    pub warnings: Vec<String>,
 }
 
 /// Scheduling strategy for distributing replicas across nodes.
@@ -896,6 +916,22 @@ impl NodeScheduler {
         } else {
             active_nodes
         };
+        // Targets that are not active nodes. Counted here, before any other
+        // filter, so a node dropped later for its labels or architecture is
+        // not misreported as missing.
+        let inactive_target_ids: Vec<i32> = target_node_ids
+            .map(|ids| {
+                ids.iter()
+                    .copied()
+                    .filter(|id| {
+                        *id != CONTROL_PLANE_NODE_ID
+                            && !eligible_nodes.iter().any(|node| node.id == *id)
+                    })
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect()
+            })
+            .unwrap_or_default();
 
         // Filter by label selectors if specified
         if let (Some(selector), Some(selector_map)) = (labels, selector_map) {
@@ -907,6 +943,66 @@ impl NodeScheduler {
         // Collected rather than only logged: the caller writes these into the
         // deploy log, which is the only place the user can see them.
         let mut exclusions: Vec<NodeExclusion> = Vec::new();
+
+        // A target that is not an active node used to vanish from the pool
+        // without a word, and anti-affinity then quietly stacked replicas on
+        // the targets that were left. Name each one and why.
+        if !inactive_target_ids.is_empty() {
+            // Only to say *why*; a failed read must not fail the placement.
+            let known = match self.node_service.list_all().await {
+                Ok(known) => Some(known),
+                Err(error) => {
+                    tracing::warn!(
+                        target_node_ids = ?inactive_target_ids,
+                        "Could not read nodes to explain inactive placement targets: {error}"
+                    );
+                    None
+                }
+            };
+            for id in &inactive_target_ids {
+                let exclusion = match known
+                    .as_ref()
+                    .map(|known| known.iter().find(|node| node.id == *id))
+                {
+                    None => NodeExclusion {
+                        node_id: *id,
+                        node_name: format!("node {id}"),
+                        reason: ExclusionReason::TargetNodeUnavailable {
+                            state: "not an active node".to_string(),
+                        },
+                        excluded: true,
+                    },
+                    Some(Some(node)) => NodeExclusion {
+                        node_id: node.id,
+                        node_name: node.name.clone(),
+                        reason: ExclusionReason::TargetNodeUnavailable {
+                            state: if node.status == "active" {
+                                format!(
+                                    "not sending heartbeats (none in the last {}s)",
+                                    self.heartbeat_threshold_secs
+                                )
+                            } else {
+                                node.status.clone()
+                            },
+                        },
+                        excluded: true,
+                    },
+                    Some(None) => NodeExclusion {
+                        node_id: *id,
+                        node_name: format!("node {id}"),
+                        reason: ExclusionReason::TargetNodeMissing,
+                        excluded: true,
+                    },
+                };
+                tracing::warn!(
+                    node_id = exclusion.node_id,
+                    node_name = %exclusion.node_name,
+                    "Placement target is not an active node: {}",
+                    exclusion.reason
+                );
+                exclusions.push(exclusion);
+            }
+        }
 
         // Build-only nodes are never placement targets, even when named
         // explicitly: they exist to keep build load off application hosts.
@@ -1103,10 +1199,19 @@ impl NodeScheduler {
         // from a node that does not exist. Counting it would make marking a
         // node dedicated break every unpinned multi-replica deployment that
         // previously wrapped around on the nodes it has.
+        // Nor a targeted node that is offline or draining: that is transient,
+        // like load, and failing would also stop the failover redeploy that
+        // moves its replicas while it is down. It is reported in the deploy
+        // log, and the stacking is warned about below.
         let shortfall_exclusions: Vec<&NodeExclusion> = hard_exclusions
             .iter()
             .copied()
-            .filter(|e| e.reason != ExclusionReason::DedicatedNode)
+            .filter(|e| {
+                !matches!(
+                    e.reason,
+                    ExclusionReason::DedicatedNode | ExclusionReason::TargetNodeUnavailable { .. }
+                )
+            })
             .collect();
         let has_node_constraints = target_node_ids.is_some()
             || selector_map.is_some_and(|selector_map| !selector_map.is_empty());
@@ -1209,10 +1314,13 @@ impl NodeScheduler {
                         .unwrap_or_else(|| "unknown".to_string()),
                 });
             }
+            let assignments = vec![NodeAssignment::Local; replica_count as usize];
+            let warnings = anti_affinity_warnings(anti_affinity, &assignments);
             return Ok(SchedulingOutcome {
-                assignments: vec![NodeAssignment::Local; replica_count as usize],
+                assignments,
                 exclusions,
                 docker_socket_required,
+                warnings,
             });
         }
 
@@ -1358,10 +1466,12 @@ impl NodeScheduler {
             }
         };
 
+        let warnings = anti_affinity_warnings(anti_affinity, &assignments);
         Ok(SchedulingOutcome {
             assignments,
             exclusions,
             docker_socket_required,
+            warnings,
         })
     }
 
@@ -1414,6 +1524,31 @@ fn docker_socket_gate(
     })
 }
 
+/// A warning when anti-affinity was asked for but some replicas share a node,
+/// so the deploy log says so instead of only listing the placements.
+fn anti_affinity_warnings(anti_affinity: bool, assignments: &[NodeAssignment]) -> Vec<String> {
+    if !anti_affinity || assignments.len() < 2 {
+        return Vec::new();
+    }
+    let distinct: std::collections::HashSet<Option<i32>> = assignments
+        .iter()
+        .map(|assignment| match assignment {
+            NodeAssignment::Local => None,
+            NodeAssignment::Remote { node_id, .. } => Some(*node_id),
+        })
+        .collect();
+    if distinct.len() >= assignments.len() {
+        return Vec::new();
+    }
+    vec![format!(
+        "anti-affinity is on, but {} replicas share {} node(s): not enough eligible nodes for \
+         one replica each. Add an eligible node, lower the replica count, or check the \
+         skipped nodes above",
+        assignments.len(),
+        distinct.len()
+    )]
+}
+
 /// One phrase naming why these nodes were dropped from the pool.
 ///
 /// The exclusion list mixes causes — an architecture mismatch and the ADR-045
@@ -1426,6 +1561,7 @@ fn exclusion_cause(exclusions: &[&NodeExclusion]) -> &'static str {
     let mut architecture = false;
     let mut docker_socket = false;
     let mut build_only = false;
+    let mut missing_target = false;
     for exclusion in exclusions {
         match exclusion.reason {
             ExclusionReason::IncompatibleArchitecture { .. } => architecture = true,
@@ -1436,7 +1572,17 @@ fn exclusion_cause(exclusions: &[&NodeExclusion]) -> &'static str {
             ExclusionReason::DedicatedNode => {}
             // Never `excluded: true`; it is a warning, not a drop.
             ExclusionReason::UnverifiedArchitecture => {}
+            ExclusionReason::TargetNodeMissing => missing_target = true,
+            // Filtered out before the shortfall check, like dedicated nodes.
+            ExclusionReason::TargetNodeUnavailable { .. } => {}
         }
+    }
+    if missing_target {
+        return if architecture || docker_socket || build_only {
+            "some are listed in target_nodes but no longer exist, and others cannot run it"
+        } else {
+            "they are listed in target_nodes but no longer exist"
+        };
     }
     if build_only && !architecture && !docker_socket {
         return "they are build-only nodes (temps.sh/role=builder), which never host replicas";
@@ -2588,6 +2734,130 @@ mod tests {
         assert!(assignments.iter().all(|a| a.is_local()));
     }
 
+    // ── Placement targets that are not active nodes (#1390) ──────────────
+
+    /// `list_active` answers `active`; the follow-up `list_all`, which tells
+    /// a removed target from an offline one, answers `all`.
+    fn scheduler_with_active_and_all(
+        active: Vec<nodes::Model>,
+        all: Vec<nodes::Model>,
+    ) -> NodeScheduler {
+        NodeScheduler::new(Arc::new(NodeService::new(Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![active, all])
+                .into_connection(),
+        ))))
+        .with_local_platform("linux/amd64")
+    }
+
+    /// The reported deploy: targets `[0, 1, 2]` after node 2 was removed and
+    /// its machine rejoined as node 3. It used to stack two replicas on
+    /// worker-1 despite anti-affinity and report success.
+    #[tokio::test]
+    async fn a_removed_target_node_fails_an_anti_affinity_placement_by_name() {
+        let workers = vec![make_node(1, "worker-1"), make_node(3, "worker-2")];
+        let scheduler = scheduler_with_active_and_all(workers.clone(), workers);
+
+        let error = scheduler
+            .schedule_replicas_excluding(3, None, Some(&[0, 1, 2]), true, &[], &[])
+            .await
+            .unwrap_err();
+
+        match error {
+            NodeError::InsufficientCompatibleNodes {
+                replicas,
+                available,
+                ref cause,
+                ref excluded,
+            } => {
+                assert_eq!(replicas, 3);
+                assert_eq!(available, 2, "the control plane and worker-1");
+                assert!(cause.contains("no longer exist"), "{cause}");
+                assert!(excluded.contains("'node 2'"), "{excluded}");
+                assert!(excluded.contains("does not exist"), "{excluded}");
+            }
+            other => panic!("expected InsufficientCompatibleNodes, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_removed_target_node_is_named_in_the_deploy_log_without_anti_affinity() {
+        let workers = vec![make_node(1, "worker-1"), make_node(3, "worker-2")];
+        let scheduler = scheduler_with_active_and_all(workers.clone(), workers);
+
+        let outcome = scheduler
+            .schedule_replicas_excluding(2, None, Some(&[0, 1, 2]), false, &[], &[])
+            .await
+            .expect("without anti-affinity the remaining targets take the replicas");
+
+        assert_eq!(outcome.assignments.len(), 2);
+        assert!(outcome
+            .assignments
+            .iter()
+            .all(|a| a.is_local() || a.node_id() == Some(1)));
+        assert_eq!(
+            outcome
+                .exclusions
+                .iter()
+                .map(|e| (e.node_id, e.reason.clone()))
+                .collect::<Vec<_>>(),
+            vec![(2, ExclusionReason::TargetNodeMissing)]
+        );
+    }
+
+    /// An offline target is transient: the failover redeploy that moves its
+    /// replicas must still run, so it is reported rather than fatal, and the
+    /// stacking it causes is warned about.
+    #[tokio::test]
+    async fn an_offline_target_node_is_reported_and_the_stacking_warned_about() {
+        let mut offline = make_node(2, "worker-2");
+        offline.status = "offline".to_string();
+        let scheduler = scheduler_with_active_and_all(
+            vec![make_node(1, "worker-1")],
+            vec![make_node(1, "worker-1"), offline],
+        );
+
+        let outcome = scheduler
+            .schedule_replicas_excluding(3, None, Some(&[0, 1, 2]), true, &[], &[])
+            .await
+            .expect("an offline target does not fail the placement");
+
+        assert_eq!(outcome.assignments.len(), 3);
+        let excluded = &outcome.exclusions;
+        assert_eq!(excluded.len(), 1, "{excluded:?}");
+        assert_eq!(excluded[0].node_name, "worker-2");
+        assert_eq!(
+            excluded[0].reason,
+            ExclusionReason::TargetNodeUnavailable {
+                state: "offline".to_string()
+            }
+        );
+        assert!(excluded[0].to_string().contains("is offline"));
+        assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
+        assert!(
+            outcome.warnings[0].contains("3 replicas share 2 node(s)"),
+            "{}",
+            outcome.warnings[0]
+        );
+    }
+
+    #[test]
+    fn anti_affinity_warns_only_when_replicas_share_a_node() {
+        let remote = |id: i32| NodeAssignment::Remote {
+            node_id: id,
+            node_name: format!("worker-{id}"),
+            address: String::new(),
+            private_address: String::new(),
+            platform: None,
+        };
+        let spread = vec![NodeAssignment::Local, remote(1), remote(2)];
+        assert!(anti_affinity_warnings(true, &spread).is_empty());
+        let stacked = vec![NodeAssignment::Local, remote(1), remote(1)];
+        assert_eq!(anti_affinity_warnings(true, &stacked).len(), 1);
+        assert!(anti_affinity_warnings(false, &stacked).is_empty());
+        assert!(anti_affinity_warnings(true, &[NodeAssignment::Local]).is_empty());
+    }
+
     // ── Replica shortfall and exclusion reporting ────────────────────────
 
     /// Anti-affinity asks for one replica per node. When an architecture
@@ -2779,7 +3049,7 @@ mod tests {
     /// still enforced strictly, with no control-plane fallback.
     #[tokio::test]
     async fn test_non_empty_target_nodes_still_refuses_local_fallback() {
-        let scheduler = scheduler_with_nodes(vec![], "linux/amd64");
+        let scheduler = scheduler_with_active_and_all(vec![], vec![]);
 
         let err = scheduler
             .schedule_replicas_excluding(
@@ -3507,8 +3777,9 @@ mod tests {
     async fn test_schedule_with_target_nodes_none_active_fails_closed() {
         let node_a = make_node(1, "worker-a");
 
+        // `list_active`, then `list_all` to say why node 99 is not usable.
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results(vec![vec![node_a]])
+            .append_query_results(vec![vec![node_a.clone()], vec![node_a]])
             .into_connection();
         let node_service = Arc::new(NodeService::new(Arc::new(db)));
         let scheduler = NodeScheduler::new(node_service);

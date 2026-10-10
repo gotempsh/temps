@@ -33,8 +33,8 @@ use crate::handlers::audit::{
 };
 use crate::handlers::types::AppState;
 use crate::services::node_service::{
-    node_address_host, remove_owned_container, HeartbeatRequest, NodeError, NodeService,
-    RegisterNodeRequest, RegistrationContext, MAX_DESCRIBED_UNREMOVED,
+    node_address_host, remove_owned_container, HeartbeatRequest, NodeError, NodePlacementReference,
+    NodeService, RegisterNodeRequest, RegistrationContext, MAX_DESCRIBED_UNREMOVED,
 };
 use crate::services::{DockerDiskUsage, DockerDiskUsageCategory, DockerDiskUsageError};
 use crate::services::{CONTROL_PLANE_NODE_ID, MAX_REDEPLOY_PLAN_BATCH};
@@ -358,6 +358,11 @@ pub struct RemoveNodeResponse {
     /// orphaned; remove them on that host by hand if it still exists.
     #[serde(default)]
     pub orphaned_containers: Vec<String>,
+    /// Environments (and project defaults) whose target nodes listed the
+    /// removed node. Its ID was taken out of each; `target_nodes` holds the
+    /// nodes they still target.
+    #[serde(default)]
+    pub placements_updated: Vec<NodePlacementReference>,
 }
 
 /// Query parameters for removing a node.
@@ -548,6 +553,7 @@ pub struct ClusterDnsStatusResponse {
         DrainNodeResponse,
         UndrainNodeResponse,
         RemoveNodeResponse,
+        NodePlacementReference,
         DrainStatusResponse,
         NodeDnsStatusEntry,
         ClusterDnsStatusResponse,
@@ -3297,6 +3303,11 @@ async fn admin_undrain_node(
 /// it was offline, or ones a redeploy replaced while it was unreachable) are
 /// removed first; if any cannot be, the removal is refused unless `force=true`,
 /// which records them as orphaned.
+///
+/// The node's ID is taken out of every environment's (and project default's)
+/// target nodes, and the response lists them in `placements_updated`. When the
+/// node is the only target of a placement the removal is refused with `409`
+/// naming those environments, since emptying it would let them run anywhere.
 #[utoipa::path(
     tag = "Nodes",
     delete,
@@ -3309,7 +3320,7 @@ async fn admin_undrain_node(
         (status = 200, description = "Node removed", body = RemoveNodeResponse),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Node not found"),
-        (status = 409, description = "Node still has active containers, live sandboxes, or containers Temps could not confirm were removed (retry with force=true only if the host is gone)"),
+        (status = 409, description = "Node still has active containers, live sandboxes, or containers Temps could not confirm were removed (retry with force=true only if the host is gone), or it is the only target node of an environment's placement (`placements` names them; change their target nodes first)"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -3359,7 +3370,30 @@ async fn admin_remove_node(
             outcome: outcome.to_string(),
             containers_confirmed_gone: confirmed_gone,
             containers_unconfirmed: unconfirmed,
+            placements_updated: Vec::new(),
         };
+    // Refused before anything is removed from the host: a placement that
+    // names only this node would be left with none. `remove` checks again
+    // under the node's row lock.
+    let pinned_only_here = app_state
+        .node_service
+        .placements_pinned_only_to(node_id)
+        .await
+        .map_err(Problem::from)?;
+    if !pinned_only_here.is_empty() {
+        record_audit(
+            &app_state,
+            &audit_removal("refused_only_placement_target", 0, 0),
+            node_id,
+        )
+        .await;
+        return Err(Problem::from(NodeError::OnlyPlacementTarget {
+            node_id,
+            node_name: node.name.clone(),
+            placements: pinned_only_here,
+        }));
+    }
+
     let leftovers = match app_state
         .node_service
         .remove_leftover_containers(&node, remote_deployer.as_deref())
@@ -3413,21 +3447,30 @@ async fn admin_remove_node(
 
     let node_name = node.name.clone();
 
-    if let Err(error) = app_state.node_service.remove(node_id).await {
-        record_audit(
-            &app_state,
-            &audit_removal("failed", confirmed_gone, unremoved_count),
-            node_id,
-        )
-        .await;
-        return Err(Problem::from(error));
-    }
-    record_audit(
-        &app_state,
-        &audit_removal("removed", confirmed_gone, unremoved_count),
-        node_id,
-    )
-    .await;
+    let removal = match app_state.node_service.remove(node_id).await {
+        Ok(removal) => removal,
+        Err(error) => {
+            let outcome = match &error {
+                NodeError::OnlyPlacementTarget { .. } => "refused_only_placement_target",
+                _ => "failed",
+            };
+            record_audit(
+                &app_state,
+                &audit_removal(outcome, confirmed_gone, unremoved_count),
+                node_id,
+            )
+            .await;
+            return Err(Problem::from(error));
+        }
+    };
+    let placement_notes: Vec<String> = removal
+        .placements_updated
+        .iter()
+        .map(|placement| format!("{placement} now targets {:?}", placement.target_nodes))
+        .collect();
+    let mut removed_audit = audit_removal("removed", confirmed_gone, unremoved_count);
+    removed_audit.placements_updated = placement_notes.clone();
+    record_audit(&app_state, &removed_audit, node_id).await;
 
     info!(
         node_id,
@@ -3436,7 +3479,7 @@ async fn admin_remove_node(
         "Node removed from cluster"
     );
 
-    let message = if unremoved_count == 0 {
+    let mut message = if unremoved_count == 0 {
         format!("Node '{}' removed from cluster", node_name)
     } else {
         format!(
@@ -3448,10 +3491,19 @@ async fn admin_remove_node(
             unremoved.join("; ")
         )
     };
+    if !placement_notes.is_empty() {
+        message.push_str(&format!(
+            ". Its ID was removed from the target nodes of {} placement(s): {}. A machine \
+             that rejoins gets a new node ID; add it to these placements if they should use it",
+            placement_notes.len(),
+            placement_notes.join("; ")
+        ));
+    }
     Ok(Json(RemoveNodeResponse {
         id: node_id,
         message,
         orphaned_containers: unremoved,
+        placements_updated: removal.placements_updated,
     }))
 }
 
@@ -3829,6 +3881,19 @@ fn node_hosts_sandboxes_detail(error: &NodeError, node_name: &str) -> String {
 impl From<NodeError> for Problem {
     fn from(error: NodeError) -> Self {
         match error {
+            NodeError::OnlyPlacementTarget {
+                node_id,
+                ref node_name,
+                ref placements,
+            } => {
+                let placements = serde_json::to_value(placements).unwrap_or_default();
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Node Is The Only Target Of A Placement")
+                    .with_detail(error.to_string())
+                    .with_value("node_id", node_id)
+                    .with_value("node_name", node_name.clone())
+                    .with_value("placements", placements)
+            }
             NodeError::NotFound { ref name } => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Node Not Found")
                 .with_detail(format!("Node '{}' not found", name)),

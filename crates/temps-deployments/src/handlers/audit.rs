@@ -240,6 +240,9 @@ pub struct NodeRemovalAudit {
     /// Containers that may still exist on the host. With `force` they are
     /// recorded as orphaned.
     pub containers_unconfirmed: usize,
+    /// Placements whose `target_nodes` named the node and were rewritten
+    /// without it, each with the target nodes left.
+    pub placements_updated: Vec<String>,
 }
 
 /// An operator drained a node: redeploys were queued elsewhere and the
@@ -545,6 +548,9 @@ mod node_audit_tests {
             outcome: "removed".to_string(),
             containers_confirmed_gone: 4,
             containers_unconfirmed: 2,
+            placements_updated: vec![
+                "environment 'production' (id 4) of project 'shop' now targets [0, 1]".to_string(),
+            ],
         };
         assert_eq!(audit.operation_type(), "NODE_REMOVAL");
         assert_eq!(AuditOperation::user_id(&audit), Some(3));
@@ -555,6 +561,10 @@ mod node_audit_tests {
         assert_eq!(json["outcome"], "removed");
         assert_eq!(json["containers_confirmed_gone"], 4);
         assert_eq!(json["containers_unconfirmed"], 2);
+        assert_eq!(
+            json["placements_updated"][0],
+            "environment 'production' (id 4) of project 'shop' now targets [0, 1]"
+        );
     }
 
     #[test]

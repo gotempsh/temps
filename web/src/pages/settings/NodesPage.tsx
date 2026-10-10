@@ -65,6 +65,7 @@ import {
 import type {
   NodeInfoResponse,
   NodeContainerResponse,
+  NodePlacementReference,
   RemoveNodeResponse,
   WireguardMeshStatusResponse,
 } from '@/api/client/types.gen'
@@ -106,6 +107,7 @@ import {
 } from '@/components/ui/alert-dialog'
 import { toast } from 'sonner'
 import { client } from '@/api/client/client.gen'
+import { describeUpdatedPlacements } from '@/lib/node-placements'
 
 // ── Helpers ──
 
@@ -920,6 +922,10 @@ function NodeDetail({
   // dialog lists them and offers to remove the node anyway.
   const [unremovedContainers, setUnremovedContainers] =
     useState<UnremovedNodeContainers | null>(null)
+  // Environments pinned only to this node, from a refused removal.
+  const [pinnedPlacements, setPinnedPlacements] = useState<
+    NodePlacementReference[] | null
+  >(null)
   const [undrainPending, setUndrainPending] = useState(false)
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
@@ -1019,6 +1025,13 @@ function NodeDetail({
         // Containers Temps placed on the node may still exist: keep the
         // dialog open with the list so the operator decides whether the
         // host is gone for good.
+        const pinned = (resp.error as { placements?: unknown }).placements
+        if (Array.isArray(pinned) && pinned.length > 0) {
+          setPinnedPlacements(pinned as NodePlacementReference[])
+          keepDialogOpen = true
+          setShowRemoveDialog(true)
+          return
+        }
         const unremoved = unremovedNodeContainers(resp.error)
         if (unremoved && !force) {
           setUnremovedContainers(unremoved)
@@ -1052,13 +1065,22 @@ function NodeDetail({
         })
         return
       }
-      const orphaned =
-        (resp.data as RemoveNodeResponse | undefined)?.orphaned_containers ?? []
+      const removal = resp.data as RemoveNodeResponse | undefined
+      const orphaned = removal?.orphaned_containers ?? []
+      // Environments whose target nodes listed this node no longer do; say
+      // which, since a rejoined machine gets a new ID and is not targeted.
+      const placements = describeUpdatedPlacements(removal?.placements_updated)
       if (orphaned.length > 0) {
         toast.warning('Node removed', {
-          description:
+          description: [
             'Some containers could not be removed and were recorded as orphaned. If the host still exists, remove them there with docker rm -f.',
+            placements,
+          ]
+            .filter(Boolean)
+            .join(' '),
         })
+      } else if (placements) {
+        toast.warning('Node removed', { description: placements })
       } else {
         toast.success('Node removed')
       }
@@ -1074,6 +1096,7 @@ function NodeDetail({
       if (!keepDialogOpen) {
         setShowRemoveDialog(false)
         setUnremovedContainers(null)
+        setPinnedPlacements(null)
       }
     }
   }
@@ -1242,18 +1265,36 @@ function NodeDetail({
         open={showRemoveDialog}
         onOpenChange={(open) => {
           setShowRemoveDialog(open)
-          if (!open) setUnremovedContainers(null)
+          if (!open) {
+            setUnremovedContainers(null)
+            setPinnedPlacements(null)
+          }
         }}
       >
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>Remove node “{node.name}”?</AlertDialogTitle>
             <AlertDialogDescription>
-              {unremovedContainers
-                ? `Temps could not confirm that ${unremovedContainers.count} container(s) it placed on this node are gone, so the node was not removed. Start the agent on the node and try again, or remove them on that host with docker rm -f. If the host is gone for good, remove the node anyway: these containers are then recorded as orphaned and never touched again.`
-                : 'This will permanently remove the node from the cluster. This action cannot be undone. The node must be drained first (no active containers) and host no sandboxes. Containers Temps left on it are removed first.'}
+              {pinnedPlacements
+                ? 'The node was not removed: it is the only target node of the environments below. Removing it would leave them with no target, so they could run on any node. Change their target nodes in each environment’s settings, then remove the node.'
+                : unremovedContainers
+                  ? `Temps could not confirm that ${unremovedContainers.count} container(s) it placed on this node are gone, so the node was not removed. Start the agent on the node and try again, or remove them on that host with docker rm -f. If the host is gone for good, remove the node anyway: these containers are then recorded as orphaned and never touched again.`
+                  : 'This will permanently remove the node from the cluster. This action cannot be undone. The node must be drained first (no active containers) and host no sandboxes. Containers Temps left on it are removed first, and it is taken out of the target nodes of every environment that lists it.'}
             </AlertDialogDescription>
           </AlertDialogHeader>
+          {pinnedPlacements && (
+            <ul className="max-h-48 space-y-1 overflow-y-auto rounded-md border p-2 text-sm">
+              {pinnedPlacements.map((placement) => (
+                <li
+                  key={`${placement.project_id}-${placement.environment_id ?? 'default'}`}
+                >
+                  {placement.environment_name
+                    ? `${placement.project_name} / ${placement.environment_name}`
+                    : `${placement.project_name} (project default)`}
+                </li>
+              ))}
+            </ul>
+          )}
           {unremovedContainers && (
             <ul className="max-h-48 space-y-1 overflow-y-auto rounded-md border p-2 font-mono text-xs break-all">
               {unremovedContainers.lines.map((container) => (
