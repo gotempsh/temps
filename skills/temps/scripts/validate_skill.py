@@ -12,7 +12,7 @@ from pathlib import Path
 
 
 LINK = re.compile(r"\[[^]]*\]\(([^)]+)\)")
-PINNED_CLI = "@temps-sdk/cli@0.1.36"
+PINNED_CLI = "@temps-sdk/cli@0.1.37"
 # sha512 of the published tarball for PINNED_CLI, as reported by
 # `npm view @temps-sdk/cli@<version> dist.integrity`. Refresh it in the same
 # commit that bumps PINNED_CLI, once the release is actually on npm — the value

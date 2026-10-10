@@ -8,7 +8,7 @@ description: |
 
 Integrate the `@temps-sdk/react-analytics` SDK into a React application.
 
-> **Verified against `@temps-sdk/react-analytics@0.0.4`.** A prior version of
+> **Verified against `@temps-sdk/react-analytics@0.0.7`.** A prior version of
 > this skill documented props and hooks that do not exist
 > (`autoTrack={{...}}`, `debug`, `useAnalytics()` as the accessor, `reset`,
 > `getVisitorId`) and broke integrations. Use the API described in this skill.
@@ -20,7 +20,7 @@ Integrate the `@temps-sdk/react-analytics` SDK into a React application.
 ## Installation
 
 ```bash
-npm install --ignore-scripts --save-exact @temps-sdk/react-analytics@0.0.4
+npm install --ignore-scripts --save-exact @temps-sdk/react-analytics@0.0.7
 ```
 
 Before running the install, explain that it changes the application's

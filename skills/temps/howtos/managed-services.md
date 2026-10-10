@@ -29,7 +29,7 @@ service on the control-plane host. PostgreSQL, MariaDB/MySQL, MongoDB, and
 Redis are supported; check before assuming:
 
 ```bash
-bunx @temps-sdk/cli@0.1.36 --target-context production services import-data-availability --id <service-id>
+bunx @temps-sdk/cli@0.1.37 --target-context production services import-data-availability --id <service-id>
 ```
 
 It reports whether the engine supports imports, whether one can start now
@@ -53,7 +53,7 @@ to raw API calls.
 4. **Run and wait for the result:**
 
    ```bash
-   bunx @temps-sdk/cli@0.1.36 --target-context production services import-data \
+   bunx @temps-sdk/cli@0.1.37 --target-context production services import-data \
      --id <service-id> --target <database> --source-url-env SOURCE_DATABASE_URL --yes
    ```
 
@@ -67,7 +67,7 @@ to raw API calls.
 5. **Report from the run, not from assumptions:**
 
    ```bash
-   bunx @temps-sdk/cli@0.1.36 --target-context production services import-data-run --id <service-id> --run <run-id>
+   bunx @temps-sdk/cli@0.1.37 --target-context production services import-data-run --id <service-id> --run <run-id>
    ```
 
    A succeeded run reports the tables/collections/keys and size it measured
