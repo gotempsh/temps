@@ -33,6 +33,12 @@ pub const CONTAINER_STATUS_ORPHANED: &str = "orphaned";
 /// addition, the replica count it left short is restored once that node
 /// sends heartbeats again, after which the row becomes `retired`.
 pub const CONTAINER_STATUS_FAILED_OVER: &str = "failed_over";
+/// `deployment_containers.status` for a failed-over replica whose restoring
+/// redeploy was queued. It stays pending until its deployment is no longer
+/// the one its environment serves (the redeploy replaced it); if that has
+/// not happened when the retry interval passes (the redeploy failed), the
+/// redeploy is queued again.
+pub const CONTAINER_STATUS_FAILED_OVER_RECOVERING: &str = "failed_over_recovering";
 
 /// Why [`NodeService::retire_containers_on_node`] takes containers out of
 /// routing. It decides how an unconfirmed container is recorded and what
@@ -2428,11 +2434,15 @@ impl NodeService {
 
     /// Replicas a failover took out of routing whose node is active again,
     /// with their deployment's project and environment and whether that
-    /// deployment is still the one the environment serves. At most `limit`
-    /// rows, oldest first, so a pass is bounded however many accumulated.
+    /// deployment is still the one the environment serves: those never
+    /// restored, and those whose restoring redeploy was queued before
+    /// `retry_queued_before` without replacing their deployment yet. At most
+    /// `limit` rows, least recently handled first, so a pass is bounded
+    /// however many accumulated.
     pub async fn failed_over_replicas_on_recovered_nodes(
         &self,
         limit: u64,
+        retry_queued_before: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<FailedOverReplica>, NodeError> {
         let rows = deployment_containers::Entity::find()
             .join(
@@ -2447,8 +2457,22 @@ impl NodeService {
                 JoinType::InnerJoin,
                 deployment_containers::Relation::Node.def(),
             )
-            .filter(deployment_containers::Column::Status.eq(CONTAINER_STATUS_FAILED_OVER))
+            .filter(
+                Condition::any()
+                    .add(deployment_containers::Column::Status.eq(CONTAINER_STATUS_FAILED_OVER))
+                    .add(
+                        Condition::all()
+                            .add(
+                                deployment_containers::Column::Status
+                                    .eq(CONTAINER_STATUS_FAILED_OVER_RECOVERING),
+                            )
+                            // `deleted_at` of a row out of routing is
+                            // re-stamped each time its restore is queued.
+                            .add(deployment_containers::Column::DeletedAt.lt(retry_queued_before)),
+                    ),
+            )
             .filter(nodes::Column::Status.eq("active"))
+            .order_by_asc(deployment_containers::Column::DeletedAt)
             .order_by_asc(deployment_containers::Column::Id)
             .limit(limit)
             .select_only()
@@ -2467,10 +2491,41 @@ impl NodeService {
         Ok(rows)
     }
 
-    /// Record that the failed-over replicas `container_row_ids` were handled
-    /// (their replica count restored, or no longer needed): they become
-    /// ordinary `retired` rows that cleanup still removes from their node.
-    /// Only rows still `failed_over` change, so a concurrent cleanup that
+    /// Record that a restoring redeploy was queued for the failed-over
+    /// replicas `container_row_ids`. They stay pending
+    /// ([`CONTAINER_STATUS_FAILED_OVER_RECOVERING`]) until their deployment
+    /// is replaced, and the stamp (their `deleted_at`, the time they were last
+    /// handled while out of routing) decides when a retry is due.
+    pub async fn mark_failed_over_recovery_queued(
+        &self,
+        container_row_ids: &[i32],
+    ) -> Result<u64, NodeError> {
+        if container_row_ids.is_empty() {
+            return Ok(0);
+        }
+        let result = deployment_containers::Entity::update_many()
+            .col_expr(
+                deployment_containers::Column::Status,
+                Expr::value(CONTAINER_STATUS_FAILED_OVER_RECOVERING),
+            )
+            .col_expr(
+                deployment_containers::Column::DeletedAt,
+                Expr::value(Some(chrono::Utc::now())),
+            )
+            .filter(deployment_containers::Column::Id.is_in(container_row_ids.to_vec()))
+            .filter(deployment_containers::Column::Status.is_in([
+                CONTAINER_STATUS_FAILED_OVER,
+                CONTAINER_STATUS_FAILED_OVER_RECOVERING,
+            ]))
+            .exec(self.db.as_ref())
+            .await?;
+        Ok(result.rows_affected)
+    }
+
+    /// Record that the failed-over replicas `container_row_ids` no longer
+    /// need restoring (their deployment is no longer the serving one): they
+    /// become ordinary `retired` rows that cleanup still removes from their
+    /// node. Only rows still pending change, so a concurrent cleanup that
     /// already confirmed one removed is never overwritten.
     pub async fn settle_failed_over_replicas(
         &self,
@@ -2485,7 +2540,10 @@ impl NodeService {
                 Expr::value(CONTAINER_STATUS_RETIRED),
             )
             .filter(deployment_containers::Column::Id.is_in(container_row_ids.to_vec()))
-            .filter(deployment_containers::Column::Status.eq(CONTAINER_STATUS_FAILED_OVER))
+            .filter(deployment_containers::Column::Status.is_in([
+                CONTAINER_STATUS_FAILED_OVER,
+                CONTAINER_STATUS_FAILED_OVER_RECOVERING,
+            ]))
             .exec(self.db.as_ref())
             .await?;
         Ok(result.rows_affected)
@@ -5157,6 +5215,64 @@ mod tests {
         }
     }
 
+    /// Greptile on #1395: a queued restore must not end the restore. Rows
+    /// stay pending as `failed_over_recovering`, are selected again once the
+    /// retry interval has passed, and settle only from a pending status.
+    #[tokio::test]
+    async fn test_queued_replica_restores_stay_pending_and_are_retried() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![Vec::<
+                    std::collections::BTreeMap<String, sea_orm::Value>,
+                >::new()])
+                .append_exec_results(vec![sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let service = NodeService::new(db.clone());
+        let retry_before = chrono::Utc::now() - chrono::Duration::minutes(10);
+        service
+            .failed_over_replicas_on_recovered_nodes(100, retry_before)
+            .await
+            .unwrap();
+        assert_eq!(
+            service.mark_failed_over_recovery_queued(&[]).await.unwrap(),
+            0
+        );
+        assert_eq!(
+            service
+                .mark_failed_over_recovery_queued(&[9])
+                .await
+                .unwrap(),
+            1
+        );
+        drop(service);
+
+        let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("db still has owners"));
+        let log = db.into_transaction_log();
+        assert_eq!(log.len(), 2, "an empty mark issues no statement");
+        let select = &log[0].statements()[0];
+        assert!(select.sql.contains(r#""deleted_at" <"#), "{}", select.sql);
+        let select_values = format!("{:?}", select.values);
+        assert!(
+            select_values.contains(CONTAINER_STATUS_FAILED_OVER_RECOVERING),
+            "{select_values}"
+        );
+        let mark = &log[1].statements()[0];
+        assert!(mark.sql.contains(r#""deleted_at" ="#), "{}", mark.sql);
+        let mark_values = format!("{:?}", mark.values);
+        assert!(
+            mark_values.contains(CONTAINER_STATUS_FAILED_OVER_RECOVERING),
+            "{mark_values}"
+        );
+        assert!(
+            !mark_values.contains("\"retired\""),
+            "a queued restore is not settled: {mark_values}"
+        );
+    }
+
     #[tokio::test]
     async fn test_failed_over_replicas_are_found_only_on_active_nodes_and_settled_once() {
         let db = Arc::new(
@@ -5172,7 +5288,7 @@ mod tests {
         );
         let service = NodeService::new(db.clone());
         assert!(service
-            .failed_over_replicas_on_recovered_nodes(100)
+            .failed_over_replicas_on_recovered_nodes(100, chrono::Utc::now())
             .await
             .unwrap()
             .is_empty());

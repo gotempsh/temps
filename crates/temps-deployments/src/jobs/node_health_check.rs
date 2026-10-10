@@ -37,6 +37,12 @@ const MAX_HEALTH_TICK_GAP_SECS: i64 = 180;
 /// however many accumulated while nodes were offline.
 const MAX_REPLICA_RESTORES_PER_TICK: u64 = 100;
 
+/// How long a queued restoring redeploy has to replace its deployment before
+/// it is queued again. Long enough for a build and rollout; a redeploy still
+/// in flight when it passes is not duplicated (the job processor drops a
+/// recovery of a deployment that already has one in flight).
+const REPLICA_RESTORE_RETRY_SECS: i64 = 600;
+
 /// When the control plane started watching node heartbeats, for the current
 /// stretch of uninterrupted health ticks.
 ///
@@ -874,16 +880,21 @@ async fn failover_node(
 /// already in flight. The redeploy supersedes the deployment, and the
 /// superseding cleanup then removes the retired replica from its node.
 ///
-/// Rows are settled to `retired` once handled (queued, or no longer the
-/// serving deployment), and left `failed_over` when queuing failed, so the
-/// next tick retries. At most [`MAX_REPLICA_RESTORES_PER_TICK`] rows per
-/// tick. Returns how many deployments were queued for a redeploy.
+/// The replicas stay pending until that happens: once queued they are
+/// marked as recovering, and if their deployment is still the serving one
+/// [`REPLICA_RESTORE_RETRY_SECS`] later (the redeploy failed, or was never
+/// started), it is queued again. Only when the deployment is no longer
+/// served are the rows settled to `retired`. Queuing failures are retried
+/// on the next tick. At most [`MAX_REPLICA_RESTORES_PER_TICK`] rows per tick.
+/// Returns how many deployments were queued for a redeploy.
 pub async fn restore_recovered_replicas(
     node_service: &NodeService,
     deployment_service: &DeploymentService,
 ) -> usize {
+    let retry_queued_before =
+        chrono::Utc::now() - chrono::Duration::seconds(REPLICA_RESTORE_RETRY_SECS);
     let replicas = match node_service
-        .failed_over_replicas_on_recovered_nodes(MAX_REPLICA_RESTORES_PER_TICK)
+        .failed_over_replicas_on_recovered_nodes(MAX_REPLICA_RESTORES_PER_TICK, retry_queued_before)
         .await
     {
         Ok(replicas) => replicas,
@@ -902,48 +913,56 @@ pub async fn restore_recovered_replicas(
     let mut queued = 0;
     for (deployment, group) in group_by_deployment(&replicas) {
         let rows: Vec<i32> = group.iter().map(|r| r.container_row_id).collect();
-        if deployment.is_current() {
-            match deployment_service
-                .redeploy_environment_for_failover(
-                    deployment.project_id,
-                    deployment.environment_id,
-                    deployment.deployment_id,
-                )
-                .await
-            {
-                Ok(()) => {
-                    queued += 1;
-                    tracing::info!(
-                        project_id = deployment.project_id,
-                        environment_id = deployment.environment_id,
-                        deployment_id = deployment.deployment_id,
-                        node_id = deployment.node_id,
-                        replicas = rows.len(),
-                        "Node recovered: queued a recovery redeploy to restore the replicas a \
-                         failover took out of routing"
-                    );
-                }
-                Err(e) => {
+        if !deployment.is_current() {
+            // Replaced (by the restoring redeploy or anything newer): the
+            // replica count is the new deployment's now.
+            if let Err(e) = node_service.settle_failed_over_replicas(&rows).await {
+                tracing::error!(
+                    deployment_id = deployment.deployment_id,
+                    "Failed to settle failed-over replicas of a replaced deployment; retrying \
+                     next health check: {}",
+                    e
+                );
+            }
+            continue;
+        }
+        match deployment_service
+            .redeploy_environment_for_failover(
+                deployment.project_id,
+                deployment.environment_id,
+                deployment.deployment_id,
+            )
+            .await
+        {
+            Ok(()) => {
+                queued += 1;
+                tracing::info!(
+                    project_id = deployment.project_id,
+                    environment_id = deployment.environment_id,
+                    deployment_id = deployment.deployment_id,
+                    node_id = deployment.node_id,
+                    replicas = rows.len(),
+                    "Node recovered: queued a recovery redeploy to restore the replicas a \
+                     failover took out of routing"
+                );
+                if let Err(e) = node_service.mark_failed_over_recovery_queued(&rows).await {
                     tracing::error!(
-                        project_id = deployment.project_id,
-                        environment_id = deployment.environment_id,
                         deployment_id = deployment.deployment_id,
-                        node_id = deployment.node_id,
-                        "Node recovered, but restoring its failed-over replicas could not be \
-                         queued; retrying next health check: {}",
+                        "Failed to record the queued replica restore; the next health check \
+                         repeats it, which the recovery redeploy fencing absorbs: {}",
                         e
                     );
-                    continue;
                 }
             }
-        }
-        if let Err(e) = node_service.settle_failed_over_replicas(&rows).await {
-            tracing::error!(
+            Err(e) => tracing::error!(
+                project_id = deployment.project_id,
+                environment_id = deployment.environment_id,
                 deployment_id = deployment.deployment_id,
-                "Failed to record restored replicas; the next health check repeats it, which \
-                 the recovery redeploy fencing absorbs: {}",
+                node_id = deployment.node_id,
+                "Node recovered, but restoring its failed-over replicas could not be queued; \
+                 retrying next health check: {}",
                 e
-            );
+            ),
         }
     }
     queued
