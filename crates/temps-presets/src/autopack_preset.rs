@@ -223,7 +223,7 @@ pub(crate) fn render(
     // `replace` and `path` dependencies resolve.
     let nested_prefix = if analysis.provider == "python" {
         python_app_directory(config.root_local_path, config.local_path)?
-            .map(|relative| (format!("cd /app/{relative} && "), relative))
+            .map(|relative| (format!("cd /app/{relative} && "), relative, false))
     } else if let Some(language) =
         crate::CompiledLanguage::from_autopack_provider(&analysis.provider)
     {
@@ -246,12 +246,12 @@ pub(crate) fn render(
                          && ln -s /app/target target; fi && ",
                     ),
                 }
-                (prefix, compiled.relative)
+                (prefix, compiled.relative, true)
             })
     } else {
         None
     };
-    if let Some((prefix, relative)) = nested_prefix {
+    if let Some((prefix, relative, compiled_binary)) = nested_prefix {
         for step in &mut analysis.plan.steps {
             if matches!(step.name.as_str(), "install" | "build") {
                 for input in &mut step.inputs {
@@ -266,10 +266,12 @@ pub(crate) fn render(
                 }
             }
         }
-        // An absolute start command (a built binary) runs as planned; a
-        // relative one is relative to the directory the build ran in.
+        // A Go or Cargo build's absolute start command is the built binary
+        // and runs as planned. Anything else, including an absolute Python
+        // launcher such as `/usr/bin/env gunicorn app:app`, names modules and
+        // files relative to the application, so it starts in that directory.
         if let Some(start) = &mut analysis.plan.deploy.start_command {
-            if !start.starts_with('/') {
+            if !(compiled_binary && start.starts_with('/')) {
                 *start = format!("cd /app/{relative} && {start}");
             }
         }
@@ -1049,6 +1051,34 @@ mod tests {
         );
         assert!(
             rendered.contains("cd /app/apps/api && gunicorn app:app"),
+            "{rendered}"
+        );
+    }
+
+    /// An absolute launcher does not make the module it serves absolute: a
+    /// nested Python app's `Procfile` start still runs in the app directory.
+    #[test]
+    fn nested_python_absolute_start_command_keeps_the_app_directory() {
+        let repo = fixture(&[
+            (
+                "apps/api/requirements.txt",
+                "../../packages/shared\nflask==3.1.2\ngunicorn==23.0.0",
+            ),
+            (
+                "apps/api/app.py",
+                "from flask import Flask\napp = Flask(__name__)",
+            ),
+            ("apps/api/Procfile", "web: /usr/bin/env gunicorn app:app"),
+            (
+                "packages/shared/pyproject.toml",
+                "[project]\nname='fixture-shared'\nversion='1.0.0'",
+            ),
+        ]);
+        let app = repo.path().join("apps/api");
+        let config = DockerfileConfig::new(repo.path(), &app, "fixture").with_buildkit(true);
+        let rendered = render(&config, Some("python")).unwrap().content;
+        assert!(
+            rendered.contains("cd /app/apps/api && /usr/bin/env gunicorn app:app"),
             "{rendered}"
         );
     }

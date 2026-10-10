@@ -113,7 +113,20 @@ enum DeploymentDuplicateKey {
     /// Uploaded-source redeploy, keyed by the retained archive path.
     SourceBundle(String),
     DurableCommand(uuid::Uuid),
+    /// Uploaded-source redeploy delivered as a durable queue job. Both keys
+    /// apply: a replay of the same job is detected by its id, and a second job
+    /// for the same archive (a concurrent drain, or a retried partial drain)
+    /// by the in-flight rebuild of that archive. The durable id alone would
+    /// let the second job cancel the first rebuild and start another.
+    DurableSourceBundle {
+        job_id: uuid::Uuid,
+        bundle_path: String,
+    },
 }
+
+/// States in which a deployment is still being built or rolled out.
+const IN_FLIGHT_DEPLOYMENT_STATES: [&str; 5] =
+    ["pending", "running", "deploying", "built", "ready"];
 
 enum DeploymentCreationOutcome {
     Created {
@@ -345,7 +358,47 @@ impl JobProcessorService {
                 DeploymentDuplicateKey::Commit(_)
                     | DeploymentDuplicateKey::SourceBundle(_)
                     | DeploymentDuplicateKey::DurableCommand(_)
+                    | DeploymentDuplicateKey::DurableSourceBundle { .. }
             );
+        if let DeploymentDuplicateKey::DurableSourceBundle { bundle_path, .. } = &duplicate_key {
+            // Checked before the durable-id replay logic below, which may
+            // deliberately create a fresh generation: that must never happen
+            // while another rebuild of the same archive is still in flight.
+            let in_flight_query = deployments::Entity::find()
+                .filter(deployments::Column::ProjectId.eq(project_id))
+                .filter(deployments::Column::EnvironmentId.eq(environment_id))
+                .filter(deployments::Column::State.is_in(IN_FLIGHT_DEPLOYMENT_STATES))
+                .filter(Expr::cust_with_values(
+                    "metadata ->> 'sourceBundlePath' = $1",
+                    [bundle_path.clone()],
+                ));
+            let in_flight_query = if let Some(source_deployment_id) = recovery_of_deployment_id {
+                in_flight_query.filter(deployments::Column::Id.ne(source_deployment_id))
+            } else {
+                in_flight_query
+            };
+            if let Some(existing) = in_flight_query
+                .order_by_desc(deployments::Column::CreatedAt)
+                .order_by_desc(deployments::Column::Id)
+                .one(&transaction)
+                .await
+                .map_err(|error| {
+                    creation_error(
+                        "check in-flight rebuilds of the same source before creating",
+                        error,
+                    )
+                })?
+            {
+                let outcome = DeploymentCreationOutcome::Duplicate {
+                    deployment_id: existing.id,
+                    state: existing.state,
+                };
+                transaction.commit().await.map_err(|error| {
+                    creation_error("finish duplicate source validation for", error)
+                })?;
+                return Ok(outcome);
+            }
+        }
         if should_check_duplicate {
             let duplicate_query = deployments::Entity::find()
                 .filter(deployments::Column::ProjectId.eq(project_id))
@@ -389,12 +442,12 @@ impl JobProcessorService {
                         "metadata ->> 'sourceBundlePath' = $1",
                         [bundle_path.clone()],
                     )),
-                DeploymentDuplicateKey::DurableCommand(job_id) => {
-                    duplicate_query.filter(Expr::cust_with_values(
+                DeploymentDuplicateKey::DurableCommand(job_id)
+                | DeploymentDuplicateKey::DurableSourceBundle { job_id, .. } => duplicate_query
+                    .filter(Expr::cust_with_values(
                         "context_vars ->> 'durable_job_id' = $1",
                         [job_id.to_string()],
-                    ))
-                }
+                    )),
             };
             if let Some(existing) = duplicate_query
                 .order_by_desc(deployments::Column::CreatedAt)
@@ -410,8 +463,11 @@ impl JobProcessorService {
                 // as history and create a fresh generation with fresh jobs. If
                 // a retry is already active or completed, it sorts first and
                 // remains an ordinary duplicate, preventing two workflows.
-                if matches!(duplicate_key, DeploymentDuplicateKey::DurableCommand(_))
-                    && is_restart_interrupted_durable_deployment(&existing)
+                if matches!(
+                    duplicate_key,
+                    DeploymentDuplicateKey::DurableCommand(_)
+                        | DeploymentDuplicateKey::DurableSourceBundle { .. }
+                ) && is_restart_interrupted_durable_deployment(&existing)
                 {
                     let newer_generation = deployments::Entity::find()
                         .filter(deployments::Column::ProjectId.eq(project_id))
@@ -1519,7 +1575,10 @@ WHERE d.id = a.deployment_id
                 job.recovery_of_deployment_id,
                 durable_job_id.map_or_else(
                     || DeploymentDuplicateKey::SourceBundle(bundle_path.clone()),
-                    DeploymentDuplicateKey::DurableCommand,
+                    |job_id| DeploymentDuplicateKey::DurableSourceBundle {
+                        job_id,
+                        bundle_path: bundle_path.clone(),
+                    },
                 ),
                 new_deployment,
             )
@@ -3498,6 +3557,87 @@ mod tests {
             _ => panic!("a second rebuild of an in-flight bundle must be a duplicate"),
         }
         assert!(matches!(created, DeploymentCreationOutcome::Created { .. }));
+    }
+
+    /// Two durable jobs for the same uploaded source (a concurrent drain, or
+    /// a retried partial drain) carry different job ids. The second must find
+    /// the first one's in-flight rebuild instead of cancelling it.
+    #[tokio::test]
+    async fn test_second_durable_job_for_an_in_flight_source_bundle_is_a_duplicate() {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping durable source bundle duplicate test");
+            return;
+        }
+
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("create test database");
+        let db = test_db.connection_arc();
+        let (project_id, environment_id) = setup_git_push_test_data(db.as_ref())
+            .await
+            .expect("seed project and environment");
+        let now = Utc::now();
+        let bundle_path = "source-bundles/app/source.zip";
+        let bundle_generation = |slug: &str, offset: i64| {
+            let mut model = generation_model(
+                project_id,
+                environment_id,
+                slug,
+                "pending",
+                slug,
+                now + chrono::Duration::seconds(offset),
+            );
+            model.metadata = Set(Some(DeploymentMetadata {
+                source_bundle_path: Some(bundle_path.to_string()),
+                ..Default::default()
+            }));
+            model
+        };
+
+        let first = JobProcessorService::create_deployment_with_generation_fence(
+            db.as_ref(),
+            project_id,
+            environment_id,
+            None,
+            DeploymentDuplicateKey::DurableSourceBundle {
+                job_id: uuid::Uuid::new_v4(),
+                bundle_path: bundle_path.to_string(),
+            },
+            bundle_generation("first-drain", 0),
+        )
+        .await
+        .expect("fence first drain job");
+        let DeploymentCreationOutcome::Created { deployment, .. } = first else {
+            panic!("the first rebuild of the source bundle must be created");
+        };
+
+        let second = JobProcessorService::create_deployment_with_generation_fence(
+            db.as_ref(),
+            project_id,
+            environment_id,
+            None,
+            DeploymentDuplicateKey::DurableSourceBundle {
+                job_id: uuid::Uuid::new_v4(),
+                bundle_path: bundle_path.to_string(),
+            },
+            bundle_generation("second-drain", 1),
+        )
+        .await
+        .expect("fence second drain job");
+
+        match second {
+            DeploymentCreationOutcome::Duplicate { deployment_id, .. } => {
+                assert_eq!(deployment_id, deployment.id)
+            }
+            _ => panic!("a second durable job for an in-flight bundle must be a duplicate"),
+        }
+        let first_state = deployments::Entity::find_by_id(deployment.id)
+            .one(db.as_ref())
+            .await
+            .expect("reload first rebuild")
+            .expect("first rebuild exists")
+            .state;
+        assert_eq!(first_state, "pending", "the first rebuild is not cancelled");
     }
 
     #[tokio::test]

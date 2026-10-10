@@ -231,7 +231,9 @@ pub struct NodeRemovalAudit {
     /// Whether the operator chose to remove the node even with containers
     /// Temps could not confirm are gone.
     pub force: bool,
-    /// `removed`, `refused_unconfirmed_containers` or `failed`.
+    /// `removed`, `refused_unconfirmed_containers`, `refused_still_serving`,
+    /// `cleanup_interrupted` (containers may already have been removed; the
+    /// counts say how many), `cleanup_failed` or `failed`.
     pub outcome: String,
     /// Leftover containers removed from the host, or confirmed already gone.
     pub containers_confirmed_gone: usize,

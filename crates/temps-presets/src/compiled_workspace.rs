@@ -604,8 +604,11 @@ fn cargo_needs_repository(root: &Path, relative: &Path) -> Result<bool, Compiled
         return Ok(path_dependency_outside);
     };
     let workspace_manifest = workspace_root.join("Cargo.toml");
-    let workspace = parse_cargo(root, &workspace_manifest)?
-        .and_then(|manifest| manifest.get("workspace").and_then(toml::Value::as_table).cloned())
+    let workspace_toml = parse_cargo(root, &workspace_manifest)?.unwrap_or_default();
+    let workspace = workspace_toml
+        .get("workspace")
+        .and_then(toml::Value::as_table)
+        .cloned()
         .ok_or_else(|| CompiledWorkspaceError::MissingWorkspaceTable {
             crate_manifest: cargo_toml.display().to_string(),
             workspace_manifest: workspace_manifest.display().to_string(),
@@ -633,6 +636,16 @@ fn cargo_needs_repository(root: &Path, relative: &Path) -> Result<bool, Compiled
         .any(|excluded| member.starts_with(excluded))
     {
         return Ok(path_dependency_outside);
+    }
+    // Inside the workspace, Cargo also loads the root manifest's paths
+    // (`[workspace.dependencies]` a member inherits with `workspace = true`,
+    // `[patch]`, `[replace]`, the root package's own dependencies). They are
+    // relative to the workspace root and must be in the repository too, or
+    // the build would start only to fail in Cargo.
+    for path in cargo_path_dependencies(&workspace_toml) {
+        let resolved =
+            resolve(&workspace_root, &path).ok_or_else(|| escapes(&path, &workspace_manifest))?;
+        require_dependency(root, &resolved, "Cargo.toml", &path, &workspace_manifest)?;
     }
     if listed("members")
         .iter()
@@ -892,6 +905,65 @@ mod tests {
             ("apps/api/Cargo.toml", "[package]\nname = \"qa-api\"\nversion = \"0.1.0\"\n"),
         ]);
         assert_eq!(app(&root), Ok(None));
+    }
+
+    /// A member inherits `[workspace.dependencies]` paths, and Cargo loads
+    /// root `[patch]` paths, relative to the workspace root. Both are checked
+    /// before the build, like the crate's own path dependencies.
+    #[test]
+    fn cargo_workspace_root_paths_are_checked_for_members() {
+        let member = (
+            "apps/api/Cargo.toml",
+            "[package]\nname = \"qa-api\"\nversion = \"0.1.0\"\n[dependencies]\nqa-shared = { workspace = true }\n",
+        );
+        let root = repository(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"apps/*\"]\n[workspace.dependencies]\nqa-shared = { path = \"packages/shared\" }\n",
+            ),
+            member,
+            SHARED_CARGO,
+        ]);
+        assert_eq!(app(&root).unwrap().unwrap().relative, "apps/api");
+
+        let root = repository(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"apps/*\"]\n[workspace.dependencies]\nqa-shared = { path = \"packages/missing\" }\n",
+            ),
+            member,
+        ]);
+        assert!(matches!(
+            app(&root),
+            Err(CompiledWorkspaceError::DependencyMissing { .. })
+        ));
+
+        let root = repository(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"apps/*\"]\n[workspace.dependencies]\nqa-shared = { path = \"../outside\" }\n",
+            ),
+            member,
+        ]);
+        assert!(matches!(
+            app(&root),
+            Err(CompiledWorkspaceError::DependencyEscapes { .. })
+        ));
+
+        let root = repository(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"apps/*\"]\n[patch.crates-io]\nserde = { path = \"vendor/serde\" }\n",
+            ),
+            (
+                "apps/api/Cargo.toml",
+                "[package]\nname = \"qa-api\"\nversion = \"0.1.0\"\n",
+            ),
+        ]);
+        assert!(matches!(
+            app(&root),
+            Err(CompiledWorkspaceError::DependencyMissing { .. })
+        ));
     }
 
     /// Cargo makes a member's in-repository path dependencies members too,

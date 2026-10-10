@@ -33,6 +33,10 @@ pub const CONTAINER_STATUS_ORPHANED: &str = "orphaned";
 const FINISHED_DEPLOYMENT_STATES: [&str; 5] =
     ["cancelled", "stopped", "completed", "deployed", "failed"];
 
+/// Finished states of a deployment that was fully live; the one a failed
+/// rollout falls back to is chosen among these.
+const SUCCESSFUL_DEPLOYMENT_STATES: [&str; 2] = ["completed", "deployed"];
+
 /// What [`NodeService::remove_leftover_containers`] did.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct LeftoverRemoval {
@@ -184,6 +188,21 @@ fn orphaned_container_note(node_name: &str, node_id: i32) -> String {
 
 #[derive(Error, Debug)]
 pub enum NodeError {
+    /// Cleaning up a node's leftover containers stopped partway; the counts
+    /// say what had already happened on the host so it can be audited.
+    #[error(
+        "Cleaning up leftover containers on node '{node_name}' (id {node_id}) stopped after \
+         {confirmed_gone} were removed or confirmed gone and {unremoved_count} could not be: \
+         {reason}"
+    )]
+    LeftoverCleanupInterrupted {
+        node_id: i32,
+        node_name: String,
+        confirmed_gone: usize,
+        unremoved_count: usize,
+        reason: String,
+    },
+
     #[error("Node '{name}' not found")]
     NotFound { name: String },
 
@@ -204,8 +223,9 @@ pub enum NodeError {
 
     #[error(
         "Node '{node_name}' (id {node_id}) still has {count} container(s) of current or \
-         in-progress deployments; drain it with POST /internal/nodes/{node_id}/drain and wait \
-         for its redeploys to finish before removing it"
+         in-progress deployments, or of the deployment a rollout in progress would fall back \
+         to; drain it with POST /internal/nodes/{node_id}/drain and wait for its redeploys \
+         to finish before removing it"
     )]
     StillServing {
         node_id: i32,
@@ -1833,9 +1853,14 @@ impl NodeService {
             .filter(Self::not_confirmed_gone())
     }
 
-    /// A live row of the deployment its environment serves, or of one still
-    /// in progress. Moving these is a drain's job; a node holding any cannot
-    /// be removed. Never NULL, so its negation selects exactly the rest.
+    /// A live row of the deployment its environment serves, of one still in
+    /// progress, or of the rollout fallback: while another deployment of the
+    /// environment is in progress, its newest successful one is what a failed
+    /// readiness check restores the route to (see
+    /// `find_last_successful_deployment` in `mark_deployment_complete`), so
+    /// its containers are needed until the replacement finishes. Moving these
+    /// is a drain's job; a node holding any cannot be removed. Never NULL, so
+    /// its negation selects exactly the rest.
     fn serving_condition() -> Condition {
         let current_deployment = (
             environments::Entity,
@@ -1853,8 +1878,38 @@ impl NodeService {
                                     .equals((deployments::Entity, deployments::Column::Id)),
                             ),
                     )
-                    .add(deployments::Column::State.is_not_in(FINISHED_DEPLOYMENT_STATES)),
+                    .add(deployments::Column::State.is_not_in(FINISHED_DEPLOYMENT_STATES))
+                    .add(Self::rollout_fallback_condition()),
             )
+    }
+
+    /// The joined `deployments` row is the newest successful deployment of an
+    /// environment that has another deployment in progress. "Newest" follows
+    /// the rollback query's `ORDER BY finished_at DESC`, where Postgres sorts
+    /// NULL first; rows that tie are all kept.
+    fn rollout_fallback_condition() -> Condition {
+        let in_progress = FINISHED_DEPLOYMENT_STATES
+            .iter()
+            .map(|state| format!("'{state}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Condition::all()
+            .add(deployments::Column::State.is_in(SUCCESSFUL_DEPLOYMENT_STATES))
+            .add(Expr::cust(format!(
+                "EXISTS (SELECT 1 FROM deployments AS rollout \
+                 WHERE rollout.environment_id = deployments.environment_id \
+                 AND rollout.id <> deployments.id \
+                 AND rollout.state NOT IN ({in_progress}))"
+            )))
+            .add(Expr::cust(
+                "NOT EXISTS (SELECT 1 FROM deployments AS newer \
+                 WHERE newer.environment_id = deployments.environment_id \
+                 AND newer.id <> deployments.id \
+                 AND newer.state IN ('completed', 'deployed') \
+                 AND deployments.finished_at IS NOT NULL \
+                 AND (newer.finished_at IS NULL \
+                      OR newer.finished_at > deployments.finished_at))",
+            ))
     }
 
     /// How many containers on the node a deployment still uses. One COUNT,
@@ -1910,8 +1965,6 @@ impl NodeService {
         node: &nodes::Model,
         deployer: Option<&dyn temps_deployer::ContainerDeployer>,
     ) -> Result<LeftoverRemoval, NodeError> {
-        use futures::StreamExt;
-
         let serving = Self::serving_container_count_on(self.db.as_ref(), node.id).await?;
         if serving > 0 {
             return Err(NodeError::StillServing {
@@ -1921,6 +1974,42 @@ impl NodeService {
             });
         }
         let mut outcome = LeftoverRemoval::default();
+        match self
+            .remove_leftover_pages(node, deployer, &mut outcome)
+            .await
+        {
+            Ok(()) => {}
+            // Containers may already have been removed: keep the counts.
+            Err(error) => {
+                return Err(NodeError::LeftoverCleanupInterrupted {
+                    node_id: node.id,
+                    node_name: node.name.clone(),
+                    confirmed_gone: outcome.confirmed_gone,
+                    unremoved_count: outcome.unremoved_count,
+                    reason: error.to_string(),
+                })
+            }
+        }
+        if outcome.confirmed_gone > 0 {
+            tracing::info!(
+                node_id = node.id,
+                confirmed_gone = outcome.confirmed_gone,
+                "Removed or confirmed gone the leftover containers before removing node"
+            );
+        }
+        Ok(outcome)
+    }
+
+    /// The paged part of [`Self::remove_leftover_containers`], recording into
+    /// `outcome` as it goes so a failure still reports what was done.
+    async fn remove_leftover_pages(
+        &self,
+        node: &nodes::Model,
+        deployer: Option<&dyn temps_deployer::ContainerDeployer>,
+        outcome: &mut LeftoverRemoval,
+    ) -> Result<(), NodeError> {
+        use futures::StreamExt;
+
         let mut after_id = 0;
         loop {
             let page = self.leftover_container_page(node.id, after_id).await?;
@@ -1975,14 +2064,7 @@ impl NodeService {
                 break;
             }
         }
-        if outcome.confirmed_gone > 0 {
-            tracing::info!(
-                node_id = node.id,
-                confirmed_gone = outcome.confirmed_gone,
-                "Removed or confirmed gone the leftover containers before removing node"
-            );
-        }
-        Ok(outcome)
+        Ok(())
     }
 
     pub async fn mark_container_removed(&self, container_row_id: i32) -> Result<(), NodeError> {
@@ -4120,6 +4202,46 @@ mod tests {
             );
         }
 
+        /// A database failure partway through still reports what had already
+        /// been done on the host, so the removal attempt can be audited with it.
+        #[tokio::test]
+        async fn an_interrupted_cleanup_keeps_its_progress() {
+            let db = removable_database(|db| {
+                db.append_exec_results(vec![updated()])
+                    .append_exec_errors(vec![sea_orm::DbErr::Custom(
+                        "connection reset".to_string(),
+                    )])
+            });
+            let service = NodeService::new(Arc::new(db.into_connection()));
+            let mut deployer = MockDeployer::new();
+            deployer
+                .expect_get_container_info()
+                .times(2)
+                .returning(|id| Err(not_found(id)));
+            deployer.expect_remove_container().never();
+
+            let err = service
+                .remove_leftover_containers(&node(), Some(&deployer))
+                .await
+                .unwrap_err();
+
+            match err {
+                NodeError::LeftoverCleanupInterrupted {
+                    node_id,
+                    confirmed_gone,
+                    unremoved_count,
+                    ref reason,
+                    ..
+                } => {
+                    assert_eq!(node_id, 5);
+                    assert_eq!(confirmed_gone, 1);
+                    assert_eq!(unremoved_count, 0);
+                    assert!(reason.contains("connection reset"), "{reason}");
+                }
+                other => panic!("expected an interrupted cleanup, got {other:?}"),
+            }
+        }
+
         /// A leftover that cannot be inspected, or whose labels name another
         /// project, may still exist: it is reported and its row is left
         /// unconfirmed, so a forced removal orphans it instead of
@@ -4262,6 +4384,17 @@ mod tests {
             let running = seed_deployment(db.as_ref(), p, e, "running", "running").await;
             let superseded = seed_deployment(db.as_ref(), p, e, "superseded", "completed").await;
             let failed = seed_deployment(db.as_ref(), p, e, "failed", "failed").await;
+            let finish = |deployment: &deployments::Model, hours_ago: i64| {
+                let mut finished: deployments::ActiveModel = deployment.clone().into();
+                finished.finished_at = Set(Some(
+                    chrono::Utc::now() - chrono::Duration::hours(hours_ago),
+                ));
+                finished
+            };
+            // `current` finished last, so it (not `superseded`) is what the
+            // in-progress `running` rollout would fall back to.
+            finish(&current, 1).update(db.as_ref()).await.unwrap();
+            finish(&superseded, 2).update(db.as_ref()).await.unwrap();
             let mut serving_environment: environments::ActiveModel = environment.into();
             serving_environment.current_deployment_id = Set(Some(current.id));
             let environment = serving_environment.update(db.as_ref()).await.unwrap();
@@ -4305,6 +4438,19 @@ mod tests {
                 matches!(err, NodeError::StillServing { count: 2, .. }),
                 "{err:?}"
             );
+
+            // A newer successful deployment that is not current is the
+            // rollout's fallback: its container is kept too.
+            finish(&superseded, 0).update(db.as_ref()).await.unwrap();
+            let err = service
+                .remove_leftover_containers(&node, Some(&deployer))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, NodeError::StillServing { count: 3, .. }),
+                "{err:?}"
+            );
+            finish(&superseded, 2).update(db.as_ref()).await.unwrap();
 
             // Once neither is serving, every unconfirmed row is a leftover:
             // five recorded above plus enough to need a second page.

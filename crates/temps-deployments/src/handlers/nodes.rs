@@ -3346,31 +3346,60 @@ async fn admin_remove_node(
         &app_state.encryption_service,
     )
     .await;
-    let leftovers = app_state
+    let audit_removal =
+        |outcome: &str, confirmed_gone: usize, unconfirmed: usize| NodeRemovalAudit {
+            context: AuditContext {
+                user_id: auth.user_id(),
+                ip_address: Some(metadata.ip_address.clone()),
+                user_agent: metadata.user_agent.clone(),
+            },
+            node_id,
+            node_name: node.name.clone(),
+            force: query.force,
+            outcome: outcome.to_string(),
+            containers_confirmed_gone: confirmed_gone,
+            containers_unconfirmed: unconfirmed,
+        };
+    let leftovers = match app_state
         .node_service
         .remove_leftover_containers(&node, remote_deployer.as_deref())
         .await
-        .map_err(Problem::from)?;
-    let unremoved_count = leftovers.unremoved_count;
-    let unremoved = leftovers.unremoved_report();
-    let audit_removal = |outcome: &str| NodeRemovalAudit {
-        context: AuditContext {
-            user_id: auth.user_id(),
-            ip_address: Some(metadata.ip_address.clone()),
-            user_agent: metadata.user_agent.clone(),
-        },
-        node_id,
-        node_name: node.name.clone(),
-        force: query.force,
-        outcome: outcome.to_string(),
-        containers_confirmed_gone: leftovers.confirmed_gone,
-        containers_unconfirmed: unremoved_count,
+    {
+        Ok(leftovers) => leftovers,
+        Err(error) => {
+            // A cleanup that stopped partway may already have removed
+            // containers from the host; a refusal before it started records
+            // zero of each.
+            let (outcome, confirmed_gone, unconfirmed) = match &error {
+                NodeError::LeftoverCleanupInterrupted {
+                    confirmed_gone,
+                    unremoved_count,
+                    ..
+                } => ("cleanup_interrupted", *confirmed_gone, *unremoved_count),
+                NodeError::StillServing { .. } => ("refused_still_serving", 0, 0),
+                _ => ("cleanup_failed", 0, 0),
+            };
+            record_audit(
+                &app_state,
+                &audit_removal(outcome, confirmed_gone, unconfirmed),
+                node_id,
+            )
+            .await;
+            return Err(Problem::from(error));
+        }
     };
+    let unremoved_count = leftovers.unremoved_count;
+    let confirmed_gone = leftovers.confirmed_gone;
+    let unremoved = leftovers.unremoved_report();
     if unremoved_count > 0 && !query.force {
         // Containers may already have been removed from the host above.
         record_audit(
             &app_state,
-            &audit_removal("refused_unconfirmed_containers"),
+            &audit_removal(
+                "refused_unconfirmed_containers",
+                confirmed_gone,
+                unremoved_count,
+            ),
             node_id,
         )
         .await;
@@ -3385,10 +3414,20 @@ async fn admin_remove_node(
     let node_name = node.name.clone();
 
     if let Err(error) = app_state.node_service.remove(node_id).await {
-        record_audit(&app_state, &audit_removal("failed"), node_id).await;
+        record_audit(
+            &app_state,
+            &audit_removal("failed", confirmed_gone, unremoved_count),
+            node_id,
+        )
+        .await;
         return Err(Problem::from(error));
     }
-    record_audit(&app_state, &audit_removal("removed"), node_id).await;
+    record_audit(
+        &app_state,
+        &audit_removal("removed", confirmed_gone, unremoved_count),
+        node_id,
+    )
+    .await;
 
     info!(
         node_id,
@@ -3810,6 +3849,19 @@ impl From<NodeError> for Problem {
                 .with_value("node_id", node_id)
                 .with_value("node_name", node_name.clone())
                 .with_value("live_sandboxes", count),
+            NodeError::LeftoverCleanupInterrupted {
+                node_id,
+                ref node_name,
+                confirmed_gone,
+                unremoved_count,
+                ..
+            } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Node Container Cleanup Interrupted")
+                .with_detail(error.to_string())
+                .with_value("node_id", node_id)
+                .with_value("node_name", node_name.clone())
+                .with_value("containers_confirmed_gone", confirmed_gone)
+                .with_value("containers_unconfirmed", unremoved_count),
             NodeError::StillServing {
                 node_id,
                 ref node_name,
