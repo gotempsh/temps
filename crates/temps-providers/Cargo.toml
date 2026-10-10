@@ -28,6 +28,7 @@ temps-metrics = { path = "../temps-metrics" }
 temps-monitoring = { path = "../temps-monitoring" }
 serde = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 bollard = { workspace = true }

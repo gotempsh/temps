@@ -3194,8 +3194,8 @@ impl PostgresService {
         }
     }
 
-    /// Pull image, spin up the sidecar, run `pg_dumpall | gzip` to a bind
-    /// mount, upload to S3, clean up. Returns `(backup_key, size_bytes)`.
+    /// Pull image, run `pg_dumpall | gzip` in a sidecar, copy the dump out,
+    /// upload it to S3, clean up. Returns `(backup_key, size_bytes)`.
     ///
     /// All cleanup (sidecar removal, temp file deletion) is best-effort and
     /// runs regardless of which step failed — so the caller only has to
@@ -3207,8 +3207,6 @@ impl PostgresService {
         subpath: &str,
         postgres_config: &PostgresConfig,
     ) -> anyhow::Result<(String, i64)> {
-        use bollard::models::ContainerCreateBody as Config;
-        use bollard::query_parameters::RemoveContainerOptions;
         use chrono::Utc;
 
         let db_container_name = self.get_live_container_name(postgres_config);
@@ -3225,170 +3223,41 @@ impl PostgresService {
                 )
             })?;
 
-        let sidecar_name = format!("temps-pg-backup-{}", uuid::Uuid::new_v4());
-        let password_env = format!("PGPASSWORD={}", postgres_config.password);
-
-        // Create a host directory for the bind mount so pg_dump writes
-        // directly to disk, bypassing the Temps process entirely.
-        let backup_dir = std::env::temp_dir().join("temps-extpg-backup");
-        tokio::fs::create_dir_all(&backup_dir).await.map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to create backup temp directory {}: {}",
-                backup_dir.display(),
-                e
-            )
-        })?;
-        let backup_filename = format!("{}.sql.gz", uuid::Uuid::new_v4());
-        let host_backup_path = backup_dir.join(&backup_filename);
-        let container_backup_path = format!("/backup/{}", backup_filename);
-        let stderr_path_in_container = format!("/backup/{}.stderr", uuid::Uuid::new_v4());
-        let host_stderr_path = backup_dir.join(
-            std::path::Path::new(&stderr_path_in_container)
-                .file_name()
-                .unwrap(),
-        );
-
-        let sidecar_config = Config {
-            image: Some(sidecar_image.clone()),
-            entrypoint: Some(vec!["/bin/sleep".to_string()]),
-            cmd: Some(vec!["86400".to_string()]),
-            env: Some(vec![password_env.clone()]),
-            user: Some("root".to_string()),
-            host_config: Some(bollard::models::HostConfig {
-                oom_score_adj: Some(-500),
-                binds: Some(vec![format!("{}:/backup:rw", backup_dir.display())]),
-                ..Default::default()
-            }),
-            networking_config: Some(bollard::models::NetworkingConfig {
-                endpoints_config: Some(std::collections::HashMap::from([(
-                    temps_core::NETWORK_NAME.to_string(),
-                    bollard::models::EndpointSettings {
-                        ..Default::default()
-                    },
-                )])),
-            }),
-            ..Default::default()
-        };
-
-        self.docker
-            .create_container(
-                Some(
-                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
-                        .name(&sidecar_name)
-                        .build(),
-                ),
-                sidecar_config,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to create pg_dump sidecar container: {}", e))?;
-
-        self.docker
-            .start_container(
-                &sidecar_name,
-                Some(bollard::query_parameters::StartContainerOptionsBuilder::new().build()),
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to start pg_dump sidecar container: {}", e))?;
-
-        // Cleanup runs regardless of success/failure. We capture clones so
-        // the closure outlives the function-level `?` boundary.
-        let cleanup = || {
-            let docker = self.docker.clone();
-            let sidecar = sidecar_name.clone();
-            let host_backup = host_backup_path.clone();
-            let host_stderr = host_stderr_path.clone();
-            async move {
-                let _ = docker
-                    .remove_container(
-                        &sidecar,
-                        Some(RemoveContainerOptions {
-                            force: true,
-                            ..Default::default()
-                        }),
-                    )
-                    .await;
-                let _ = tokio::fs::remove_file(&host_backup).await;
-                let _ = tokio::fs::remove_file(&host_stderr).await;
-            }
-        };
-
+        // This attempt's own host directory, deleted when it goes out of
+        // scope on every path.
+        let work_dir = tempfile::Builder::new()
+            .prefix("temps-extpg-backup-")
+            .tempdir()
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to create a working directory for the pg_dumpall backup of service \
+                     '{}' under {}: {}",
+                    self.name,
+                    std::env::temp_dir().display(),
+                    e
+                )
+            })?;
         let port_str = POSTGRES_INTERNAL_PORT.to_string();
 
         info!(
-            "Running pg_dumpall sidecar for service '{}' (host={}, bind-mount mode)",
+            "Running pg_dumpall sidecar for service '{}' (host={})",
             self.name, db_container_name
         );
 
-        // Run pg_dumpall | gzip inside the sidecar, writing directly to the
-        // bind-mounted host filesystem. pg_dumpall dumps the entire cluster
-        // (all DBs, roles, tablespaces); `--database` is just the bootstrap
-        // connection target.
-        let pg_dump_shell_cmd = format!(
-            "pg_dumpall --clean --if-exists --no-password --host={} --port={} --username={} --database={} 2>{} | gzip > {}",
-            shell_escape(&db_container_name),
-            shell_escape(&port_str),
-            shell_escape(&postgres_config.username),
-            shell_escape(&postgres_config.database),
-            stderr_path_in_container,
-            container_backup_path,
-        );
-
-        let exec_result = super::exec_util::run_exec(
+        let (host_backup_path, size_bytes) = run_pg_dumpall_sidecar(
             &self.docker,
-            &sidecar_name,
-            vec!["sh".into(), "-c".into(), pg_dump_shell_cmd],
-            Some(vec![password_env.clone()]),
-            BACKUP_EXEC_TIMEOUT,
+            &PgDumpallSidecar {
+                image: &sidecar_image,
+                network: &temps_core::NETWORK_NAME,
+                host: &db_container_name,
+                port: &port_str,
+                username: &postgres_config.username,
+                password: &postgres_config.password,
+                database: &postgres_config.database,
+            },
+            work_dir.path(),
         )
-        .await;
-
-        // Read sidecar-side stderr (pg_dumpall writes to it via 2>) for
-        // diagnostics. Best-effort; missing file is fine.
-        let stderr_from_file = tokio::fs::read(&host_stderr_path)
-            .await
-            .ok()
-            .map(|b| String::from_utf8_lossy(&b).into_owned())
-            .unwrap_or_default();
-
-        if let Err(e) = exec_result {
-            cleanup().await;
-            return Err(anyhow::anyhow!(
-                "pg_dumpall exec failed: {}{}",
-                e,
-                if stderr_from_file.is_empty() {
-                    String::new()
-                } else {
-                    format!("\npg_dumpall stderr:\n{}", stderr_from_file)
-                }
-            ));
-        }
-
-        if !stderr_from_file.is_empty() {
-            tracing::debug!(
-                "pg_dumpall stderr for service '{}': {}",
-                self.name,
-                stderr_from_file
-            );
-        }
-
-        let size_bytes = match tokio::fs::metadata(&host_backup_path).await {
-            Ok(m) => m.len() as i64,
-            Err(e) => {
-                cleanup().await;
-                return Err(anyhow::anyhow!(
-                    "Failed to stat backup file {}: {}",
-                    host_backup_path.display(),
-                    e
-                ));
-            }
-        };
-
-        if size_bytes == 0 {
-            cleanup().await;
-            return Err(anyhow::anyhow!(
-                "PostgreSQL backup failed: backup file has zero size (pg_dumpall produced no output)"
-            ));
-        }
+        .await?;
 
         let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
         let backup_key = format!(
@@ -3400,7 +3269,6 @@ impl PostgresService {
         let body = match aws_sdk_s3::primitives::ByteStream::from_path(&host_backup_path).await {
             Ok(b) => b,
             Err(e) => {
-                cleanup().await;
                 return Err(anyhow::anyhow!(
                     "Failed to open backup file {} for upload: {}",
                     host_backup_path.display(),
@@ -3418,7 +3286,6 @@ impl PostgresService {
             .send()
             .await
         {
-            cleanup().await;
             return Err(anyhow::anyhow!(
                 "Failed to upload backup to s3://{}/{}: {}",
                 s3_source.bucket_name,
@@ -3427,7 +3294,7 @@ impl PostgresService {
             ));
         }
 
-        cleanup().await;
+        drop(work_dir);
         info!(
             "Successfully uploaded pg_dumpall backup to s3://{}/{} ({} bytes)",
             s3_source.bucket_name, backup_key, size_bytes
@@ -3435,6 +3302,187 @@ impl PostgresService {
 
         Ok((backup_key, size_bytes))
     }
+}
+
+/// Where a [`run_pg_dumpall_sidecar`] connects, and with what.
+struct PgDumpallSidecar<'a> {
+    image: &'a str,
+    /// Docker network shared with the database container.
+    network: &'a str,
+    host: &'a str,
+    port: &'a str,
+    username: &'a str,
+    password: &'a str,
+    database: &'a str,
+}
+
+/// Run `pg_dumpall | gzip` in a one-shot sidecar and leave the dump in
+/// `host_dir`, returning its path and size. The sidecar is removed on every
+/// path.
+///
+/// The dump is written into the sidecar's own filesystem and copied out
+/// through the Docker archive API, never through a bind mount: a bind source
+/// on the Temps host only reaches the container when the Docker daemon sees
+/// the host's filesystem, which it does not with Docker in a VM (Colima,
+/// Docker Desktop) or on a remote host. There the dump landed inside the VM
+/// and the backup failed with "Failed to stat backup file" (#1387). The copy
+/// streams through a bounded channel, so memory does not grow with the dump.
+async fn run_pg_dumpall_sidecar(
+    docker: &Docker,
+    spec: &PgDumpallSidecar<'_>,
+    host_dir: &std::path::Path,
+) -> anyhow::Result<(std::path::PathBuf, i64)> {
+    use bollard::models::ContainerCreateBody as Config;
+    use bollard::query_parameters::RemoveContainerOptions;
+
+    let sidecar_name = format!("temps-pg-backup-{}", uuid::Uuid::new_v4());
+    let password_env = format!("PGPASSWORD={}", spec.password);
+    let backup_filename = format!("{}.sql.gz", uuid::Uuid::new_v4());
+    let stderr_filename = format!("{}.stderr", uuid::Uuid::new_v4());
+    let host_backup_path = host_dir.join(&backup_filename);
+    let host_stderr_path = host_dir.join(&stderr_filename);
+    let container_backup_path = format!("/backup/{}", backup_filename);
+    let container_stderr_path = format!("/backup/{}", stderr_filename);
+
+    let sidecar_config = Config {
+        image: Some(spec.image.to_string()),
+        entrypoint: Some(vec!["/bin/sleep".to_string()]),
+        cmd: Some(vec!["86400".to_string()]),
+        env: Some(vec![password_env.clone()]),
+        user: Some("root".to_string()),
+        host_config: Some(bollard::models::HostConfig {
+            oom_score_adj: Some(-500),
+            ..Default::default()
+        }),
+        networking_config: Some(bollard::models::NetworkingConfig {
+            endpoints_config: Some(std::collections::HashMap::from([(
+                spec.network.to_string(),
+                bollard::models::EndpointSettings {
+                    ..Default::default()
+                },
+            )])),
+        }),
+        ..Default::default()
+    };
+
+    docker
+        .create_container(
+            Some(
+                bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                    .name(&sidecar_name)
+                    .build(),
+            ),
+            sidecar_config,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to create pg_dump sidecar container: {}", e))?;
+
+    let outcome = async {
+        docker
+            .start_container(
+                &sidecar_name,
+                Some(bollard::query_parameters::StartContainerOptionsBuilder::new().build()),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to start pg_dump sidecar container: {}", e))?;
+
+        // pg_dumpall dumps the entire cluster (all DBs, roles, tablespaces);
+        // `--database` is just the bootstrap connection target.
+        let pg_dump_shell_cmd = format!(
+            "mkdir -p /backup && pg_dumpall --clean --if-exists --no-password --host={} --port={} --username={} --database={} 2>{} | gzip > {}",
+            shell_escape(spec.host),
+            shell_escape(spec.port),
+            shell_escape(spec.username),
+            shell_escape(spec.database),
+            container_stderr_path,
+            container_backup_path,
+        );
+
+        let exec_result = super::exec_util::run_exec(
+            docker,
+            &sidecar_name,
+            vec!["sh".into(), "-c".into(), pg_dump_shell_cmd],
+            Some(vec![password_env.clone()]),
+            BACKUP_EXEC_TIMEOUT,
+        )
+        .await;
+
+        // pg_dumpall's stderr, for diagnostics. Best-effort; missing is fine.
+        // Only its tail is read: a failing dump can write a lot of it.
+        let stderr_from_file = match super::container_download::copy_file_out_of_container(
+            docker,
+            &sidecar_name,
+            &container_stderr_path,
+            &host_stderr_path,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        {
+            Ok(_) => super::container_download::read_file_tail(&host_stderr_path, 4_000)
+                .await
+                .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
+                .unwrap_or_default(),
+            Err(_) => String::new(),
+        };
+
+        if let Err(e) = exec_result {
+            return Err(anyhow::anyhow!(
+                "pg_dumpall exec failed: {}{}",
+                e,
+                if stderr_from_file.is_empty() {
+                    String::new()
+                } else {
+                    format!("\npg_dumpall stderr:\n{}", stderr_from_file)
+                }
+            ));
+        }
+        if !stderr_from_file.is_empty() {
+            debug!("pg_dumpall stderr for host '{}': {}", spec.host, stderr_from_file);
+        }
+
+        let size_bytes = super::container_download::copy_file_out_of_container(
+            docker,
+            &sidecar_name,
+            &container_backup_path,
+            &host_backup_path,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .map_err(|failure| {
+            let reason = match failure {
+                super::container_download::CopyOutFailure::Cancelled => "cancelled".to_string(),
+                super::container_download::CopyOutFailure::Failed(reason) => reason,
+            };
+            anyhow::anyhow!(
+                "pg_dumpall exported the backup, but copying '{}' out of backup container '{}' \
+                 through the Docker API into '{}' on the Temps host failed: {}. Check that the \
+                 Docker daemon is reachable and that the Temps host has free space in its \
+                 temporary directory, then retry",
+                container_backup_path,
+                sidecar_name,
+                host_backup_path.display(),
+                reason
+            )
+        })? as i64;
+        if size_bytes == 0 {
+            return Err(anyhow::anyhow!(
+                "PostgreSQL backup failed: backup file has zero size (pg_dumpall produced no output)"
+            ));
+        }
+        Ok((host_backup_path.clone(), size_bytes))
+    }
+    .await;
+
+    let _ = docker
+        .remove_container(
+            &sidecar_name,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+    outcome
 }
 
 fn postgres_recovery_target_setting(recovery_target: Option<&super::RecoveryTarget>) -> String {
@@ -4986,6 +5034,137 @@ mod data_import;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1387: the pg_dumpall sidecar must deliver its dump to the Temps host
+    /// even when the Docker daemon does not share the host's temporary
+    /// directory (Docker in a VM such as Colima or Docker Desktop, or a
+    /// remote daemon). The host directory here is a fresh `tempfile`
+    /// directory, which such a daemon cannot see. Skips without Docker.
+    #[tokio::test]
+    async fn pg_dumpall_sidecar_delivers_the_dump_without_a_shared_temp_dir() {
+        use bollard::query_parameters::{
+            CreateContainerOptionsBuilder, RemoveContainerOptions, StartContainerOptionsBuilder,
+        };
+        const IMAGE: &str = "postgres:16-bookworm";
+        let Ok(docker) = Docker::connect_with_local_defaults() else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not available, skipping");
+            return;
+        }
+        if docker.inspect_image(IMAGE).await.is_err()
+            && crate::utils::pull_image_with_retry(&docker, IMAGE, None)
+                .await
+                .is_err()
+        {
+            println!("{IMAGE} not available, skipping");
+            return;
+        }
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let database = format!("temps-test-pgdumpall-db-{}", &suffix[..12]);
+        // Docker's default bridge: creating a network can fail on a host
+        // whose address pools are used up, and the sidecar only needs to
+        // reach the database by address.
+        let network = "bridge";
+
+        let outcome = async {
+            docker
+                .create_container(
+                    Some(CreateContainerOptionsBuilder::new().name(&database).build()),
+                    bollard::models::ContainerCreateBody {
+                        image: Some(IMAGE.to_string()),
+                        env: Some(vec!["POSTGRES_PASSWORD=test-password".to_string()]),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|e| format!("create database: {e}"))?;
+            docker
+                .start_container(&database, Some(StartContainerOptionsBuilder::new().build()))
+                .await
+                .map_err(|e| format!("start database: {e}"))?;
+            let mut ready = false;
+            for _ in 0..60 {
+                let probe = super::super::exec_util::run_exec(
+                    &docker,
+                    &database,
+                    vec![
+                        "pg_isready".into(),
+                        "-h".into(),
+                        "127.0.0.1".into(),
+                        "-U".into(),
+                        "postgres".into(),
+                    ],
+                    None,
+                    Duration::from_secs(10),
+                )
+                .await;
+                if probe.is_ok_and(|result| result.exit_code == 0) {
+                    ready = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            if !ready {
+                return Err("database did not become ready".to_string());
+            }
+            let address = docker
+                .inspect_container(&database, None::<InspectContainerOptions>)
+                .await
+                .map_err(|e| format!("inspect database: {e}"))?
+                .network_settings
+                .and_then(|settings| settings.networks)
+                .and_then(|networks| networks.get(network).cloned())
+                .and_then(|endpoint| endpoint.ip_address)
+                .filter(|ip| !ip.is_empty())
+                .ok_or_else(|| "database has no address on the default bridge".to_string())?;
+
+            let host_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+            let (dump, size) = run_pg_dumpall_sidecar(
+                &docker,
+                &PgDumpallSidecar {
+                    image: IMAGE,
+                    network,
+                    host: &address,
+                    port: POSTGRES_INTERNAL_PORT,
+                    username: "postgres",
+                    password: "test-password",
+                    database: "postgres",
+                },
+                host_dir.path(),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+
+            let compressed = std::fs::read(&dump).map_err(|e| e.to_string())?;
+            let mut sql = String::new();
+            std::io::Read::read_to_string(
+                &mut flate2::read::GzDecoder::new(compressed.as_slice()),
+                &mut sql,
+            )
+            .map_err(|e| e.to_string())?;
+            Ok::<_, String>((size, compressed.len(), sql))
+        }
+        .await;
+
+        let _ = docker
+            .remove_container(
+                &database,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    v: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        let (size, read, sql) = outcome.expect("pg_dumpall backup through the sidecar");
+        assert_eq!(size as usize, read);
+        assert!(sql.contains("PostgreSQL database cluster dump"), "{sql}");
+    }
 
     #[tokio::test]
     async fn restored_postgres_readiness_retries_transport_and_recovery() {
