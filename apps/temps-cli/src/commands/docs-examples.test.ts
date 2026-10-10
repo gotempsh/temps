@@ -161,11 +161,16 @@ function looksLikeFlag(word: string): boolean {
   return /^--?[A-Za-z]/.test(word)
 }
 
-/** Returns why `args` would be rejected by the CLI, or null when every command and flag exists. */
+/**
+ * Returns why `args` would be rejected by the CLI, or null when every command
+ * and flag exists and every mandatory option and required argument is given.
+ */
 function rejectReason(program: Command, args: string[]): string | null {
   const chain: Command[] = [program]
   let command = program
   const operands: string[] = []
+  const supplied = new Set<Option>()
+  let help = false
 
   for (let i = 0; i < args.length; i++) {
     const word = args[i]!
@@ -176,11 +181,15 @@ function rejectReason(program: Command, args: string[]): string | null {
     if (word.startsWith('-') && word !== '-') {
       const inlineValue = word.includes('=')
       const flag = inlineValue ? word.slice(0, word.indexOf('=')) : word
-      if (flag === '-h' || flag === '--help') continue
+      if (flag === '-h' || flag === '--help') {
+        help = true
+        continue
+      }
       const option = findOption(chain, flag)
       if (!option) {
         return `unknown option '${flag}' for '${chain.map((c) => c.name()).join(' ')}'`
       }
+      supplied.add(option)
       const next = args[i + 1]
       if (!inlineValue && option.required) {
         // Commander would take even `--other` as the value; in a docs example
@@ -215,6 +224,22 @@ function rejectReason(program: Command, args: string[]): string | null {
   if (!variadic && operands.length > declared.length && (command as CommandInternals)._allowExcessArguments !== true) {
     return `too many arguments for '${chain.map((c) => c.name()).join(' ')}': ${operands.join(' ')}`
   }
+  // `--help` prints usage before Commander checks for missing input.
+  if (help) return null
+
+  // Commander checks mandatory options on the command and all its parents. A
+  // default satisfies one; an env-backed one is left to the reader's shell.
+  for (const owner of chain) {
+    for (const option of owner.options) {
+      if (!option.mandatory || supplied.has(option)) continue
+      if (option.defaultValue !== undefined || option.envVar) continue
+      return `'${chain.map((c) => c.name()).join(' ')}' is missing required option '${option.long ?? option.flags}'`
+    }
+  }
+  const missing = declared.filter((argument) => argument.required).slice(operands.length)
+  if (missing.length > 0) {
+    return `'${chain.map((c) => c.name()).join(' ')}' is missing argument <${missing.map((a) => a.name()).join('> <')}>`
+  }
   return null
 }
 
@@ -236,6 +261,8 @@ const SERVER_COMMANDS: Record<string, { file: string; subcommandEnum: string }> 
 interface ServerSubcommand {
   /** `--flag` → whether it takes a value. */
   flags: Map<string, boolean>
+  /** Flags clap rejects the command without: no default, no env fallback, not optional. */
+  required: Set<string>
   positionals: number
 }
 
@@ -259,6 +286,7 @@ function serverArgs(source: string, structName: string): ServerSubcommand {
   const body = rustBlock(source, new RegExp(`struct ${structName} \\{`))
   if (body === undefined) throw new Error(`clap struct ${structName} not found`)
   const flags = new Map<string, boolean>()
+  const required = new Set<string>()
   let positionals = 0
   let attribute = ''
   let collecting = false
@@ -273,13 +301,17 @@ function serverArgs(source: string, structName: string): ServerSubcommand {
     if (!field) continue
     if (/\blong\b/.test(attribute)) {
       const custom = /\blong\s*=\s*"([^"]+)"/.exec(attribute)
-      flags.set(`--${custom ? custom[1] : kebab(field[1]!)}`, field[2]!.trim() !== 'bool')
+      const flag = `--${custom ? custom[1] : kebab(field[1]!)}`
+      const type = field[2]!.trim()
+      flags.set(flag, type !== 'bool')
+      const optional = type === 'bool' || /^(Option|Vec)</.test(type)
+      if (!optional && !/\b(default_value\w*|env)\b/.test(attribute)) required.add(flag)
     } else if (!/\bshort\b/.test(attribute)) {
       positionals++
     }
     attribute = ''
   }
-  return { flags, positionals }
+  return { flags, required, positionals }
 }
 
 async function serverCommandShapes(): Promise<Map<string, Map<string, ServerSubcommand>>> {
@@ -305,13 +337,19 @@ function serverRejectReason(shapes: Map<string, Map<string, ServerSubcommand>>, 
   const shape = subcommands.get(subcommand ?? '')
   if (!shape) return `unknown server subcommand 'temps ${command} ${subcommand ?? ''}'`
   let positionals = 0
+  const supplied = new Set<string>()
+  let help = false
   for (let i = 0; i < rest.length; i++) {
     const word = rest[i]!
     if (looksLikeFlag(word)) {
       const flag = word.includes('=') ? word.slice(0, word.indexOf('=')) : word
-      if (flag === '-h' || flag === '--help') continue
+      if (flag === '-h' || flag === '--help') {
+        help = true
+        continue
+      }
       const takesValue = shape.flags.get(flag)
       if (takesValue === undefined) return `unknown option '${flag}' for server 'temps ${command} ${subcommand}'`
+      supplied.add(flag)
       if (takesValue && !word.includes('=')) {
         const next = rest[i + 1]
         if (next === undefined || looksLikeFlag(next)) {
@@ -324,6 +362,11 @@ function serverRejectReason(shapes: Map<string, Map<string, ServerSubcommand>>, 
     positionals++
   }
   if (positionals > shape.positionals) return `too many arguments for server 'temps ${command} ${subcommand}'`
+  if (help) return null
+  const missing = [...shape.required].filter((flag) => !supplied.has(flag))
+  if (missing.length > 0) {
+    return `server 'temps ${command} ${subcommand}' is missing required option ${missing.join(', ')}`
+  }
   return null
 }
 
@@ -374,6 +417,16 @@ describe('documented CLI examples', () => {
     expect(rejectReason(program, ['backups', 'show', '--id=12'])).toBeNull()
   })
 
+  test('requires mandatory options and required arguments', () => {
+    const program = createProgram()
+    expect(rejectReason(program, ['containers', 'list'])).toContain("missing required option '--project-id")
+    expect(rejectReason(program, ['containers', 'list', '--project-id', '7'])).toBeNull()
+    expect(
+      rejectReason(program, ['environments', 'vars', 'set', '--project', 'my-app', '--environments', 'production']),
+    ).toContain('missing argument <key>')
+    expect(rejectReason(program, ['containers', 'list', '--help'])).toBeNull()
+  })
+
   test('checks server binary examples against the full clap shape', async () => {
     const program = createProgram()
     const shapes = await serverCommandShapes()
@@ -384,6 +437,9 @@ describe('documented CLI examples', () => {
     expect(either(['backup', 'restore', '--backup-id'])).toContain('needs a value')
     expect(either(['backup', 'restore', '--backup-id', 'b-1', '--bogus'])).toContain("unknown option '--bogus'")
     expect(either(['backup', 'restores'])).toContain('unknown server subcommand')
+    // `--backup-id` has no default and no env fallback; the S3 flags read the environment.
+    expect(either(['backup', 'restore', '--dry-run'])).toContain('missing required option --backup-id')
+    expect(either(['backup', 'restore-service', '--backup-id', 'b-1'])).toContain('--service-name')
     // Names both binaries share are not a free pass for the npm CLI's flags.
     expect(either(['services', 'create', '--version', '16'])).not.toBeNull()
     // `bunx @temps-sdk/cli …` never falls back to the server binary.

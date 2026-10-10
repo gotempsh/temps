@@ -463,19 +463,44 @@ export BACKUP_ID='00000000-0000-4000-8000-000000000000'   # from the Backup ID c
 temps backup restore --backup-id "$BACKUP_ID" --dry-run
 ```
 
-**Step 3: Restore**
+Do not continue if the dry run fails. Fix the reported problem or pick another backup, then rerun it.
+
+**Step 3: Stop Temps**
+
+The restore replaces the Temps database and the instance's secret files, so nothing may write to them while it runs. Stop every Temps process, but leave PostgreSQL and Docker running:
+
+```bash
+sudo systemctl stop temps
+sudo systemctl stop temps-proxy 2>/dev/null || true
+
+# Must print `inactive` or `failed` before you continue
+sudo systemctl is-active temps
+```
+
+Do not run the restore while `temps serve` is still active.
+
+**Step 4: Restore**
 
 ```bash
 temps backup restore --backup-id "$BACKUP_ID"
 ```
 
-**Step 4: Restart Temps**
+**Step 5: Start Temps**
 
-After a restore, restart the Temps service to pick up the restored data:
+Start Temps on the restored data and check its startup log:
 
 ```bash
-sudo systemctl restart temps
+sudo systemctl start temps
+sudo journalctl -u temps -n 200 --no-pager
 ```
+
+If you run the separate proxy service, start it once your applications are back:
+
+```bash
+sudo systemctl start temps-proxy
+```
+
+See [Start and verify Temps](/docs/restore-instance-from-s3#start-and-verify-temps) for the checks to run before sending traffic back.
 
 ### Restore a single managed service
 
