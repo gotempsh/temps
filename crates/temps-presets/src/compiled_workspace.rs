@@ -466,32 +466,86 @@ fn go_needs_repository(
     Ok(needs.then_some(ignore_go_work))
 }
 
-/// `mix.exs` without its `#` comments. A `#` inside a string (`"#{...}"`
-/// interpolation, say) is kept.
-fn strip_elixir_comments(contents: &str) -> String {
-    let mut stripped = String::with_capacity(contents.len());
-    for line in contents.lines() {
-        let mut in_string = false;
-        let mut escaped = false;
-        for c in line.chars() {
-            if in_string {
-                if escaped {
-                    escaped = false;
-                } else if c == '\\' {
-                    escaped = true;
-                } else if c == '"' {
-                    in_string = false;
-                }
-            } else if c == '"' {
-                in_string = true;
-            } else if c == '#' {
-                break;
-            }
-            stripped.push(c);
+/// `mix.exs` reduced to its code: `#` comments removed, and the bodies of
+/// heredocs (`"""`/`'''`, sigil-prefixed or not) blanked, since that is where
+/// documentation and examples such as `{:shared, in_umbrella: true}` live.
+/// Ordinary string literals are kept: dependency paths are read from them,
+/// and [`outside_strings`] skips them when looking for code. Line breaks are
+/// preserved.
+fn elixir_code(contents: &str) -> String {
+    let mut code = String::with_capacity(contents.len());
+    let mut rest = contents;
+    while let Some(c) = rest.chars().next() {
+        if rest.starts_with("\"\"\"") || rest.starts_with("'''") {
+            let delimiter = &rest[..3];
+            let end = rest[3..]
+                .find(delimiter)
+                .map_or(rest.len(), |index| 3 + index + 3);
+            code.extend(
+                rest[..end]
+                    .chars()
+                    .map(|c| if c == '\n' { '\n' } else { ' ' }),
+            );
+            rest = &rest[end..];
+            continue;
         }
-        stripped.push('\n');
+        match c {
+            '"' | '\'' => {
+                let length = string_literal_len(rest);
+                code.push_str(&rest[..length]);
+                rest = &rest[length..];
+            }
+            '#' => rest = &rest[rest.find('\n').unwrap_or(rest.len())..],
+            c => {
+                code.push(c);
+                rest = &rest[c.len_utf8()..];
+            }
+        }
     }
-    stripped
+    code
+}
+
+/// Length of the string or charlist literal `text` starts with, through its
+/// closing quote (or the end of `text` when it is unterminated).
+fn string_literal_len(text: &str) -> usize {
+    let mut chars = text.char_indices();
+    let Some((_, quote)) = chars.next() else {
+        return 0;
+    };
+    let mut escaped = false;
+    for (index, c) in chars {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == quote {
+            return index + c.len_utf8();
+        }
+    }
+    text.len()
+}
+
+/// Byte offsets in `text` where `needle` starts outside any string literal.
+fn outside_strings(text: &str, needle: &str) -> Vec<usize> {
+    let mut found = Vec::new();
+    let mut offset = 0;
+    while offset < text.len() {
+        let rest = &text[offset..];
+        if rest.starts_with(needle) {
+            found.push(offset);
+            offset += needle.len();
+            continue;
+        }
+        let Some(c) = rest.chars().next() else {
+            break;
+        };
+        offset += if c == '"' || c == '\'' {
+            string_literal_len(rest)
+        } else {
+            c.len_utf8()
+        };
+    }
+    found
 }
 
 /// The string literal at the start of `text` (after whitespace), unescaped.
@@ -516,10 +570,8 @@ fn elixir_string_literal(text: &str) -> Option<String> {
 fn mix_keyword_strings(text: &str, key: &str) -> Vec<String> {
     let needle = format!("{key}:");
     let mut found = Vec::new();
-    let mut offset = 0;
-    while let Some(position) = text[offset..].find(&needle) {
-        let start = offset + position;
-        offset = start + needle.len();
+    for start in outside_strings(text, &needle) {
+        let offset = start + needle.len();
         let preceded_by_identifier = text[..start]
             .chars()
             .next_back()
@@ -537,15 +589,12 @@ fn mix_keyword_strings(text: &str, key: &str) -> Vec<String> {
 /// A dependency tuple, `{:name, ...}`: its name and the text inside it.
 fn mix_dependency_tuples(text: &str) -> Vec<(String, &str)> {
     let mut tuples = Vec::new();
-    let mut offset = 0;
-    while let Some(position) = text[offset..].find("{:") {
-        let start = offset + position;
+    for start in outside_strings(text, "{:") {
         let body = &text[start + 2..];
         let name: String = body
             .chars()
             .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
             .collect();
-        offset = start + 2;
         if name.is_empty() {
             continue;
         }
@@ -616,7 +665,7 @@ fn mix_flag_enabled(tuple: &str, key: &str) -> bool {
 /// evaluated. A computed path is left to Mix.
 fn mix_needs_repository(root: &Path, relative: &Path) -> Result<bool, CompiledWorkspaceError> {
     let mix_exs = relative.join("mix.exs");
-    let contents = strip_elixir_comments(&read_manifest(root, &mix_exs)?.unwrap_or_default());
+    let contents = elixir_code(&read_manifest(root, &mix_exs)?.unwrap_or_default());
     let mut needs = false;
     for (name, tuple) in mix_dependency_tuples(&contents) {
         let mut targets: Vec<(String, String)> = mix_keyword_strings(tuple, "path")
@@ -1072,9 +1121,34 @@ mod tests {
         assert_eq!(app(&root), Ok(None));
     }
 
+    /// Dependency examples in documentation or strings are not dependencies:
+    /// a standalone app whose `@moduledoc` shows an umbrella declaration, or
+    /// whose code mentions one in a string, still builds alone.
+    #[test]
+    fn dependency_examples_in_docs_and_strings_are_ignored() {
+        let mix_exs = "defmodule Api.MixProject do\n  @moduledoc \"\"\"\n  Add it to an umbrella with:\n\n      {:shared, in_umbrella: true}\n      config_path: \"../../config/config.exs\"\n  \"\"\"\n  use Mix.Project\n\n  @doc ~S'''\n  {:other, path: \"../../other\"}\n  '''\n  def project, do: [app: :api, deps: deps()]\n\n  def hint, do: \"use {:shared, in_umbrella: true} in an umbrella\"\n\n  defp deps, do: [{:jason, \"~> 1.4\"}]\nend\n";
+        let root = repository(&[("apps/api/mix.exs", mix_exs)]);
+        assert_eq!(app(&root), Ok(None));
+
+        let code = elixir_code(mix_exs);
+        let names: Vec<_> = mix_dependency_tuples(&code)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, ["jason"]);
+        assert!(mix_keyword_strings(&code, "config_path").is_empty());
+        // Line structure survives blanking, and a real declaration after a
+        // heredoc is still found.
+        assert_eq!(code.lines().count(), mix_exs.lines().count());
+        let after = elixir_code("@doc \"\"\"\n{:x, path: \"y\"}\n\"\"\"\n[{:z, path: \"w\"}]\n");
+        let tuples = mix_dependency_tuples(&after);
+        assert_eq!(tuples.len(), 1);
+        assert_eq!(tuples[0].0, "z");
+    }
+
     #[test]
     fn mix_manifest_scanning_handles_strings_and_nesting() {
-        let text = strip_elixir_comments(
+        let text = elixir_code(
             "[{:a, path: \"x#y\"}, # {:b, path: \"z\"}\n {:c, \"~> 1.0\", only: [:dev], runtime: false}, {:d, in_umbrella: true}]\n",
         );
         let tuples = mix_dependency_tuples(&text);
