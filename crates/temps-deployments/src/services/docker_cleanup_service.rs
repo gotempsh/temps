@@ -33,7 +33,24 @@ pub trait DockerClient: Send + Sync {
     /// removed its deployment rows keep naming it, so without this filter the
     /// oldest-first candidate window would refill with already-removed tags
     /// every night and never reach newer ones.
-    async fn list_image_tags(&self) -> Result<Vec<String>, String>;
+    async fn list_image_tags(&self) -> Result<Vec<String>, DockerImageListError>;
+}
+
+/// Why the local image listing used by the retention pass failed. Keeps the
+/// underlying Docker error as its source instead of flattening it to text.
+#[derive(Debug, thiserror::Error)]
+pub enum DockerImageListError {
+    #[error("Failed to connect to Docker daemon to list local images: {source}")]
+    Connect {
+        #[source]
+        source: bollard::errors::Error,
+    },
+
+    #[error("Failed to list local Docker images (all=false): {source}")]
+    List {
+        #[source]
+        source: bollard::errors::Error,
+    },
 }
 
 /// Result of attempting to remove one image during the retention pass.
@@ -135,18 +152,18 @@ impl DockerClient for DefaultDockerClient {
         outcomes
     }
 
-    async fn list_image_tags(&self) -> Result<Vec<String>, String> {
+    async fn list_image_tags(&self) -> Result<Vec<String>, DockerImageListError> {
         use bollard::Docker;
 
         let docker = Docker::connect_with_unix_defaults()
-            .map_err(|e| format!("Failed to connect to Docker daemon: {}", e))?;
+            .map_err(|source| DockerImageListError::Connect { source })?;
         let images = docker
             .list_images(Some(bollard::query_parameters::ListImagesOptions {
                 all: false,
                 ..Default::default()
             }))
             .await
-            .map_err(|e| format!("Failed to list local Docker images: {}", e))?;
+            .map_err(|source| DockerImageListError::List { source })?;
 
         Ok(images
             .into_iter()
@@ -1342,7 +1359,7 @@ mod tests {
                 .collect()
         }
 
-        async fn list_image_tags(&self) -> Result<Vec<String>, String> {
+        async fn list_image_tags(&self) -> Result<Vec<String>, DockerImageListError> {
             Ok(Vec::new())
         }
     }
@@ -1409,7 +1426,7 @@ mod tests {
                 .collect()
         }
 
-        async fn list_image_tags(&self) -> Result<Vec<String>, String> {
+        async fn list_image_tags(&self) -> Result<Vec<String>, DockerImageListError> {
             Ok(self.local_images.clone())
         }
     }
@@ -1441,8 +1458,13 @@ mod tests {
             Vec::new()
         }
 
-        async fn list_image_tags(&self) -> Result<Vec<String>, String> {
-            Err("Failed to list local Docker images: daemon unreachable".to_string())
+        async fn list_image_tags(&self) -> Result<Vec<String>, DockerImageListError> {
+            Err(DockerImageListError::List {
+                source: bollard::errors::Error::DockerResponseServerError {
+                    status_code: 500,
+                    message: "daemon unreachable".to_string(),
+                },
+            })
         }
     }
 
