@@ -637,30 +637,97 @@ fn cargo_needs_repository(root: &Path, relative: &Path) -> Result<bool, Compiled
     {
         return Ok(path_dependency_outside);
     }
-    // Inside the workspace, Cargo also loads the root manifest's paths
-    // (`[workspace.dependencies]` a member inherits with `workspace = true`,
-    // `[patch]`, `[replace]`, the root package's own dependencies). They are
-    // relative to the workspace root and must be in the repository too, or
-    // the build would start only to fail in Cargo.
-    for path in cargo_path_dependencies(&workspace_toml) {
-        let resolved =
-            resolve(&workspace_root, &path).ok_or_else(|| escapes(&path, &workspace_manifest))?;
-        require_dependency(root, &resolved, "Cargo.toml", &path, &workspace_manifest)?;
-    }
-    if listed("members")
-        .iter()
-        .any(|pattern| member_matches(pattern, &member))
-    {
-        return Ok(true);
-    }
     // Not listed, but Cargo also makes every in-repository path dependency
     // of a member a member. Whether this crate is one depends on the whole
     // workspace graph, so when it needs the workspace (a sibling dependency,
     // an explicit `package.workspace`, or inherited `workspace = true`
     // settings) build from the repository and let Cargo decide: an automatic
     // member builds, and a crate that is neither gets Cargo's own error
-    // naming the workspace and how to list or exclude it.
-    Ok(path_dependency_outside || explicit.is_some() || inherits_from_workspace(&manifest))
+    // naming the workspace and how to list or exclude it. A crate that needs
+    // none of it builds alone, and the workspace's paths do not matter.
+    let needs_workspace = listed("members")
+        .iter()
+        .any(|pattern| member_matches(pattern, &member))
+        || path_dependency_outside
+        || explicit.is_some()
+        || inherits_from_workspace(&manifest);
+    if needs_workspace {
+        // Built inside the workspace, the crate also uses root manifest
+        // paths, relative to the workspace root: the `[workspace.dependencies]`
+        // it inherits, `[patch]`, `[replace]` and the root package's own
+        // dependencies. They must be in the repository too, or the build
+        // would start only to fail in Cargo.
+        for path in workspace_root_paths(&workspace_toml, &manifest) {
+            let resolved = resolve(&workspace_root, &path)
+                .ok_or_else(|| escapes(&path, &workspace_manifest))?;
+            require_dependency(root, &resolved, "Cargo.toml", &path, &workspace_manifest)?;
+        }
+    }
+    Ok(needs_workspace)
+}
+
+/// The root manifest paths a workspace member's build uses: the
+/// `[workspace.dependencies]` entries `member` inherits (`name = { workspace
+/// = true }` in any of its dependency tables), plus the root's `[patch]`,
+/// `[replace]` and, when the root is also a package, its own dependencies.
+/// Workspace dependencies no member of this build inherits are not loaded.
+fn workspace_root_paths(workspace_toml: &toml::Table, member: &toml::Table) -> Vec<String> {
+    let mut inherited = std::collections::HashSet::new();
+    let mut tables = vec![member];
+    if let Some(targets) = member.get("target").and_then(toml::Value::as_table) {
+        tables.extend(targets.values().filter_map(toml::Value::as_table));
+    }
+    for table in tables {
+        for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
+            for (name, dependency) in table
+                .get(key)
+                .and_then(toml::Value::as_table)
+                .into_iter()
+                .flatten()
+            {
+                if dependency
+                    .as_table()
+                    .and_then(|dependency| dependency.get("workspace"))
+                    .and_then(toml::Value::as_bool)
+                    == Some(true)
+                {
+                    inherited.insert(name.clone());
+                }
+            }
+        }
+    }
+
+    let mut paths = Vec::new();
+    if let Some(dependencies) = workspace_toml
+        .get("workspace")
+        .and_then(toml::Value::as_table)
+        .and_then(|workspace| workspace.get("dependencies"))
+        .and_then(toml::Value::as_table)
+    {
+        paths.extend(
+            dependencies
+                .iter()
+                .filter(|(name, _)| inherited.contains(*name))
+                .filter_map(|(_, dependency)| {
+                    dependency
+                        .as_table()
+                        .and_then(|dependency| dependency.get("path"))
+                        .and_then(toml::Value::as_str)
+                        .map(str::to_string)
+                }),
+        );
+    }
+    // Everything else the root declares, without `[workspace]`: patches,
+    // replacements and, for a root package, its own dependencies.
+    let mut root_rest = workspace_toml.clone();
+    root_rest.remove("workspace");
+    if !root_rest.contains_key("package") {
+        for key in ["dependencies", "dev-dependencies", "build-dependencies", "target"] {
+            root_rest.remove(key);
+        }
+    }
+    paths.extend(cargo_path_dependencies(&root_rest));
+    paths
 }
 
 /// Whether a manifest takes any setting from its workspace
@@ -949,6 +1016,32 @@ mod tests {
             app(&root),
             Err(CompiledWorkspaceError::DependencyEscapes { .. })
         ));
+
+        // Only inherited entries are loaded: an unrelated missing one does
+        // not block a member that never uses it.
+        let root = repository(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"apps/*\"]\n[workspace.dependencies]\nqa-shared = { path = \"packages/shared\" }\nunused = { path = \"packages/missing\" }\n",
+            ),
+            member,
+            SHARED_CARGO,
+        ]);
+        assert_eq!(app(&root).unwrap().unwrap().relative, "apps/api");
+
+        // A standalone crate the workspace does not list, that needs nothing
+        // from it, builds alone however broken the workspace's paths are.
+        let root = repository(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"packages/*\"]\n[workspace.dependencies]\nunused = { path = \"packages/missing\" }\n[patch.crates-io]\nserde = { path = \"vendor/serde\" }\n",
+            ),
+            (
+                "apps/api/Cargo.toml",
+                "[package]\nname = \"qa-api\"\nversion = \"0.1.0\"\n",
+            ),
+        ]);
+        assert_eq!(app(&root), Ok(None));
 
         let root = repository(&[
             (
