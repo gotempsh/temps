@@ -8072,24 +8072,47 @@ RETURNING id
         }
 
         // A change to where or how the destination is reached is verified
-        // exactly like a new destination, before anything is saved.
-        let connection_changed = request.bucket_name.is_some()
-            || request.access_key_id.is_some()
-            || request.secret_key.is_some()
-            || request.region.is_some()
-            || request.endpoint.is_some()
-            || request.force_path_style.is_some();
+        // exactly like a new destination, before anything is saved. A field
+        // sent back with its stored value (an edit form resubmitting the
+        // whole record for a rename, say) is not a change, so a temporarily
+        // unreachable destination never blocks an unrelated edit.
+        let decrypt = |field: &str, value: &str| {
+            self.encryption_service
+                .decrypt_string(value)
+                .map_err(|error| BackupError::Internal {
+                    message: format!(
+                        "Failed to decrypt the {} of S3 source {} ('{}'): {}",
+                        field, current.id, current.name, error
+                    ),
+                })
+        };
+        let differs = |supplied: &Option<String>, stored: &str| {
+            supplied.as_deref().is_some_and(|value| value != stored)
+        };
+        // Stored credentials are only decrypted when one was supplied.
+        let credential_changed = |supplied: &Option<String>, field: &str, stored: &str| {
+            supplied
+                .as_deref()
+                .map(|value| decrypt(field, stored).map(|stored| value != stored))
+                .transpose()
+                .map(|changed| changed.unwrap_or(false))
+        };
+        let connection_changed = differs(&request.bucket_name, &current.bucket_name)
+            || credential_changed(
+                &request.access_key_id,
+                "access key ID",
+                &current.access_key_id,
+            )?
+            || credential_changed(&request.secret_key, "secret key", &current.secret_key)?
+            || differs(&request.region, &current.region)
+            || request
+                .endpoint
+                .as_deref()
+                .is_some_and(|endpoint| current.endpoint.as_deref() != Some(endpoint))
+            || request
+                .force_path_style
+                .is_some_and(|path_style| current.force_path_style != Some(path_style));
         if connection_changed {
-            let decrypt = |field: &str, value: &str| {
-                self.encryption_service
-                    .decrypt_string(value)
-                    .map_err(|error| BackupError::Internal {
-                        message: format!(
-                            "Failed to decrypt the {} of S3 source {} ('{}'): {}",
-                            field, current.id, current.name, error
-                        ),
-                    })
-            };
             let probe = CreateS3SourceRequest {
                 name: current.name.clone(),
                 bucket_name: request
@@ -13332,6 +13355,47 @@ mod tests {
             1,
             "only the source lookup may run; nothing is written"
         );
+    }
+
+    /// An edit form resubmits the whole record. Fields sent with their
+    /// stored values are not a change, so a rename never probes the
+    /// destination -- here one whose endpoint is unreachable -- and is saved.
+    #[tokio::test]
+    async fn test_update_s3_source_resubmitting_stored_values_does_not_probe() {
+        let encryption = EncryptionService::new("test_encryption_key_1234567890ab").unwrap();
+        let mut source = operator_s3_source(&encryption);
+        source.endpoint = Some("http://temps-s3-probe.invalid:9000".to_string());
+        let renamed = s3_sources::Model {
+            name: "renamed".to_string(),
+            ..source.clone()
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![source.clone()]])
+                .append_query_results(vec![vec![renamed]])
+                .into_connection(),
+        );
+        let Ok(service) = build_service_for_mock(db.clone()) else {
+            return;
+        };
+
+        let updated = service
+            .update_s3_source(
+                31,
+                crate::handlers::backup_handler::UpdateS3SourceRequest {
+                    name: Some("renamed".to_string()),
+                    bucket_name: Some(source.bucket_name.clone()),
+                    bucket_path: None,
+                    access_key_id: Some("stored-access-key".to_string()),
+                    secret_key: Some("stored-secret-key".to_string()),
+                    region: Some(source.region.clone()),
+                    endpoint: source.endpoint.clone(),
+                    force_path_style: source.force_path_style,
+                },
+            )
+            .await
+            .expect("unchanged connection settings need no connectivity check");
+        assert_eq!(updated.name, "renamed");
     }
 
     /// A rename sends the masked credentials back unchanged: nothing about
