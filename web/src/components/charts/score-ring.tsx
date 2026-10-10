@@ -25,7 +25,7 @@ const TONE_STROKE: Record<MetricTone, string> = {
 
 const TONE_TEXT: Record<MetricTone, string> = {
   good: 'text-emerald-600 dark:text-emerald-400',
-  warn: 'text-amber-600 dark:text-amber-400',
+  warn: 'text-amber-700 dark:text-amber-400',
   poor: 'text-red-600 dark:text-red-400',
   neutral: 'text-foreground',
 }

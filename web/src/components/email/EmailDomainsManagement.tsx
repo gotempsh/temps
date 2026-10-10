@@ -205,7 +205,7 @@ function DnsRecordStatusBadge({ status }: { status?: DnsRecordStatus }) {
       )
     case 'pending':
       return (
-        <div className="flex items-center gap-1.5 text-amber-600 dark:text-amber-500">
+        <div className="flex items-center gap-1.5 text-amber-700 dark:text-amber-500">
           <Clock className="size-4" />
           <span className="text-xs font-medium">Pending</span>
         </div>
@@ -274,7 +274,7 @@ export function DnsVerificationSummary({
   if (allVerified && awaitingProvider) {
     return (
       <div className="flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 dark:border-amber-900 dark:bg-amber-950/30">
-        <Clock className="size-5 text-amber-600 dark:text-amber-500" />
+        <Clock className="size-5 text-amber-700 dark:text-amber-500" />
         <span className="text-sm font-medium text-amber-700 dark:text-amber-400">
           All {totalCount} required DNS records resolve — waiting for your email
           provider to confirm the domain before it can send
@@ -304,7 +304,7 @@ export function DnsVerificationSummary({
         </div>
       )}
       {pendingCount > 0 && (
-        <div className="flex items-center gap-1 text-sm text-amber-600 dark:text-amber-500">
+        <div className="flex items-center gap-1 text-sm text-amber-700 dark:text-amber-500">
           <Clock className="size-4" />
           <span>{pendingCount} pending</span>
         </div>

@@ -110,7 +110,7 @@ export function RetainedFailedContainers({
     <Card className="border-amber-500/40 bg-amber-500/5">
       <CardContent className="p-6">
         <div className="mb-2 flex items-center gap-2">
-          <AlertTriangle className="h-4 w-4 text-amber-600 dark:text-amber-400" />
+          <AlertTriangle className="h-4 w-4 text-amber-700 dark:text-amber-400" />
           <h3 className="text-sm font-semibold">
             Failed deployment containers retained for debugging
           </h3>

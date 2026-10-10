@@ -136,7 +136,7 @@ export function EditWebhookPage({ project }: EditWebhookPageProps) {
     return (
       <div className="space-y-6">
         <div className="flex items-center gap-4">
-          <Button variant="ghost" size="icon" disabled>
+          <Button aria-label="Back" variant="ghost" size="icon" disabled>
             <ArrowLeft className="h-4 w-4" />
           </Button>
           <div className="flex-1">
@@ -169,6 +169,7 @@ export function EditWebhookPage({ project }: EditWebhookPageProps) {
       <div className="space-y-6">
         <div className="flex items-center gap-4">
           <Button
+            aria-label="Back"
             variant="ghost"
             size="icon"
             onClick={() =>
@@ -204,6 +205,7 @@ export function EditWebhookPage({ project }: EditWebhookPageProps) {
     <div className="space-y-6">
       <div className="flex items-center gap-4">
         <Button
+          aria-label="Back"
           variant="ghost"
           size="icon"
           onClick={() =>

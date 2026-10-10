@@ -359,7 +359,7 @@ export function Settings() {
                 </p>
               )}
               {!settings?.letsencrypt?.email && (
-                <p className="text-sm text-amber-600 dark:text-amber-500">
+                <p className="text-sm text-amber-700 dark:text-amber-500">
                   No contact email configured — certificate issuance and
                   automatic renewal will fail until this is set.
                 </p>

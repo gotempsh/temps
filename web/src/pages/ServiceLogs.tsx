@@ -278,11 +278,11 @@ export function ServiceLogs() {
         {/* Header — mirrors ServiceDetail so the Logs view reads as one app. */}
         <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex items-center gap-3">
-            <Link to={`/storage/${id}`}>
-              <Button variant="ghost" size="icon">
+            <Button asChild variant="ghost" size="icon">
+              <Link to={`/storage/${id}`} aria-label="Back to service">
                 <ArrowLeft className="h-4 w-4" />
-              </Button>
-            </Link>
+              </Link>
+            </Button>
             {svc ? (
               <ServiceLogo service={svc.service_type} className="h-8 w-8" />
             ) : (

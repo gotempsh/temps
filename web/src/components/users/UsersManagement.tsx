@@ -57,7 +57,7 @@ import {
   UserPlus,
 } from 'lucide-react'
 import { useState } from 'react'
-import { useNavigate } from 'react-router'
+import { Link, useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import { ResetPasswordDialog, ResetPasswordTarget } from './ResetPasswordDialog'
 import { RolePermissionDetails } from './RolePermissionDetails'
@@ -429,16 +429,7 @@ export function UsersManagement({
             {users.map((user) => (
               <div
                 key={user.user.id}
-                role="button"
-                tabIndex={0}
-                onClick={() => navigate(`/settings/users/${user.user.id}`)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' || e.key === ' ') {
-                    e.preventDefault()
-                    navigate(`/settings/users/${user.user.id}`)
-                  }
-                }}
-                className="flex cursor-pointer items-center justify-between p-4 transition-colors hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                className="relative flex items-center justify-between p-4 transition-colors hover:bg-accent/40"
               >
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-4">
@@ -453,7 +444,15 @@ export function UsersManagement({
                     <div>
                       <div className="flex items-center gap-2">
                         <h3 className="truncate font-medium">
-                          {user.user.name || user.user.username}
+                          {/* Stretched over the row (after:inset-0), so the
+                              whole row opens the user without the row itself
+                              being a control that contains another one. */}
+                          <Link
+                            to={`/settings/users/${user.user.id}`}
+                            className="after:absolute after:inset-0 focus-visible:outline-none focus-visible:after:ring-2 focus-visible:after:ring-inset focus-visible:after:ring-ring"
+                          >
+                            {user.user.name || user.user.username}
+                          </Link>
                         </h3>
                         <div className="flex flex-wrap gap-1">
                           {/* Deduplicate roles by name to prevent showing duplicates */}
@@ -478,7 +477,7 @@ export function UsersManagement({
                     </div>
                   </div>
                 </div>
-                <div className="ml-4" onClick={(e) => e.stopPropagation()}>
+                <div className="relative z-10 ml-4">
                   <DropdownMenu>
                     <DropdownMenuTrigger asChild>
                       <Button variant="ghost" size="icon">

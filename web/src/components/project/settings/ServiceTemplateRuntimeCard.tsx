@@ -590,7 +590,7 @@ function ServiceTemplateUpgradeCard({
 
         {instance.missing_services.length > 0 && (
           <div className="flex gap-3 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-sm">
-            <Database className="mt-0.5 size-4 shrink-0 text-amber-600" />
+            <Database className="mt-0.5 size-4 shrink-0 text-amber-700 dark:text-amber-600" />
             <div className="flex-1">
               <p className="font-medium">Link the required managed service</p>
               <p className="mt-1 text-muted-foreground">

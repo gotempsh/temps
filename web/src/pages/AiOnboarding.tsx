@@ -236,7 +236,7 @@ export function AiOnboarding() {
         >
           <div className="space-y-3">
             <Alert className="border-amber-500/25 bg-amber-500/5">
-              <ShieldAlert className="size-4 text-amber-600 dark:text-amber-400" />
+              <ShieldAlert className="size-4 text-amber-700 dark:text-amber-400" />
               <AlertTitle>Full platform access</AlertTitle>
               <AlertDescription>
                 This admin key can change the entire instance. Use a dedicated

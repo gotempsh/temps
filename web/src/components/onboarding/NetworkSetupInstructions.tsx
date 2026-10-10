@@ -90,6 +90,7 @@ export function NetworkSetupInstructions({
                       </div>
                       {publicIp && (
                         <Button
+                          aria-label="Copy IP address"
                           variant="ghost"
                           size="sm"
                           onClick={() => copyToClipboard(publicIp)}

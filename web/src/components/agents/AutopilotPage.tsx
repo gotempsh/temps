@@ -299,7 +299,12 @@ function AgentCard({
                 }
                 disabled={toggleEnabled.isPending}
               />
-              <Button variant="ghost" size="sm" onClick={() => onEdit(agent)}>
+              <Button
+                aria-label="Edit agent"
+                variant="ghost"
+                size="sm"
+                onClick={() => onEdit(agent)}
+              >
                 <Pencil className="h-3 w-3" />
               </Button>
               {agent.trigger_config?.manual && (

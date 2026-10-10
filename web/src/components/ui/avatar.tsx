@@ -24,9 +24,13 @@ Avatar.displayName = AvatarPrimitive.Root.displayName
 const AvatarImage = React.forwardRef<
   React.ElementRef<typeof AvatarPrimitive.Image>,
   React.ComponentPropsWithoutRef<typeof AvatarPrimitive.Image>
->(({ className, ...props }, ref) => (
+>(({ className, alt = '', ...props }, ref) => (
   <AvatarPrimitive.Image
     ref={ref}
+    // Decorative by default: an avatar is shown beside the name it depicts,
+    // and an <img> without alt is announced by its file name (WCAG 1.1.1).
+    // Pass `alt` where the image is the only thing identifying the person.
+    alt={alt}
     className={cn('aspect-square h-full w-full', className)}
     {...props}
   />

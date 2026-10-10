@@ -42,6 +42,8 @@ import {
 } from '@/lib/worker-nodes'
 import { ProblemDetails } from './api/client'
 import { client } from './api/client/client.gen'
+import { attachHttpStatus } from './lib/http-error-status'
+import { shouldRetryQuery } from './lib/query-retry'
 import { Header } from './components/dashboard/Header'
 import AppSidebar from './components/dashboard/Sidebar'
 import { DiskSpaceAlert } from './components/alerts/DiskSpaceAlert'
@@ -1152,10 +1154,11 @@ const queryClient = new QueryClient({
       // Rust Problem type serializes only what was explicitly set via
       // .with_title()/.with_detail()/etc, and status is communicated solely
       // via the HTTP status line (see temps-core's problemdetails::Problem::
-      // into_response). So `error.status` is always undefined here; matching
-      // on it silently never fires. `title` is the only reliable signal in
-      // the body, and it's exactly what ProtectedLayout already keys off of
-      // to decide whether to show the login screen -- match it the same way.
+      // into_response). The client's error interceptor below copies it onto
+      // the thrown body, but errors from hand-written fetchers still lack it,
+      // so `title` remains the signal here -- it is exactly what
+      // ProtectedLayout keys off of to decide whether to show the login
+      // screen, and this handler must agree with it.
       const problem = error as { title?: string } | null
       const isUnauthorized =
         problem?.title === 'Authentication Required' ||
@@ -1198,6 +1201,10 @@ const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
       refetchOnWindowFocus: false,
+      // A 4xx is deterministic: retrying a 404 or 403 three times only
+      // delays the message by ~7s and repeats requests that cannot succeed.
+      // Network failures and 5xx keep their retries.
+      retry: shouldRetryQuery,
     },
     mutations: {
       onError: (error: unknown, _variables, context) => {
@@ -1274,6 +1281,12 @@ const queryClient = new QueryClient({
   },
 })
 client.setConfig({ baseUrl: '/api' })
+// Problem bodies carry no `status`; copy the HTTP status line onto every
+// thrown error so pages can tell a missing record (404) from a refused
+// (403) or failed (5xx) read, and the retry policy above can tell them apart.
+if (!client.interceptors.error.exists(attachHttpStatus)) {
+  client.interceptors.error.use(attachHttpStatus)
+}
 
 export interface TempsConsoleProps {
   extensions?: ConsoleExtensions
@@ -1285,6 +1298,13 @@ export const TempsConsole = ({
   baseUrl = '/api',
 }: TempsConsoleProps) => {
   client.setConfig({ baseUrl })
+
+  // Our own HTML shell declares `lang="en"`; an edition that mounts the
+  // console in its own shell may not. The console's text is English, so
+  // declare it unless the host page already chose a language (WCAG 3.1.1).
+  useEffect(() => {
+    if (!document.documentElement.lang) document.documentElement.lang = 'en'
+  }, [])
 
   return (
     <ThemeProvider defaultTheme="system" enableSystem attribute="class">

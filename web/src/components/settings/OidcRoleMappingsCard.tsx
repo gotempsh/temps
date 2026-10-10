@@ -156,6 +156,7 @@ export function OidcRoleMappingsCard({
                     {mapping.role}
                   </span>
                   <Button
+                    aria-label="Remove rule"
                     variant="ghost"
                     size="sm"
                     disabled={readOnly || deleteMapping.isPending}

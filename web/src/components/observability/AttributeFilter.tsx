@@ -108,7 +108,7 @@ export function AttributeFilterNotice({
         aria-hidden="true"
         className={cn(
           'size-3.5 shrink-0',
-          body.tone === 'warning' && 'text-amber-600',
+          body.tone === 'warning' && 'text-amber-700 dark:text-amber-600',
           body.tone === 'error' && 'text-destructive'
         )}
       />

@@ -167,7 +167,7 @@ function MemberRow({
             </span>
           ) : null}
           {showRestartWarning && (
-            <span className="font-medium text-amber-600 dark:text-amber-400">
+            <span className="font-medium text-amber-700 dark:text-amber-400">
               {restartCount} restart{restartCount === 1 ? '' : 's'}
             </span>
           )}

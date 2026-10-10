@@ -89,7 +89,7 @@ export function WebhookDetail({ project }: WebhookDetailProps) {
     return (
       <div className="space-y-6">
         <div className="flex items-center gap-4">
-          <Button variant="ghost" size="icon" disabled>
+          <Button aria-label="Back" variant="ghost" size="icon" disabled>
             <ArrowLeft className="h-4 w-4" />
           </Button>
           <div className="flex-1">
@@ -115,6 +115,7 @@ export function WebhookDetail({ project }: WebhookDetailProps) {
       <div className="space-y-6">
         <div className="flex items-center gap-4">
           <Button
+            aria-label="Back"
             variant="ghost"
             size="icon"
             onClick={() =>
@@ -160,6 +161,7 @@ export function WebhookDetail({ project }: WebhookDetailProps) {
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-4">
           <Button
+            aria-label="Back"
             variant="ghost"
             size="icon"
             onClick={() =>
@@ -253,6 +255,7 @@ export function WebhookDetail({ project }: WebhookDetailProps) {
                 {webhook.url}
               </code>
               <Button
+                aria-label="Open webhook URL in a new tab"
                 variant="ghost"
                 size="sm"
                 onClick={() => window.open(webhook.url, '_blank')}

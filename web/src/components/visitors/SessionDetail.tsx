@@ -254,6 +254,7 @@ export function SessionDetail({
       {/* Header */}
       <div className="flex items-center gap-4">
         <Button
+          aria-label="Back"
           variant="ghost"
           size="icon"
           onClick={() =>

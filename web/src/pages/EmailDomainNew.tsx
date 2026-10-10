@@ -490,7 +490,7 @@ function ConfigureStep({
                   it appears in your provider console.
                 </p>
               ) : mode === 'import' && discoverableDomains?.error ? (
-                <p className="flex items-start gap-1.5 text-sm text-amber-600 dark:text-amber-500">
+                <p className="flex items-start gap-1.5 text-sm text-amber-700 dark:text-amber-500">
                   <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
                   Couldn&apos;t list domains from your provider (
                   {discoverableDomains.error}). Enter the domain name manually

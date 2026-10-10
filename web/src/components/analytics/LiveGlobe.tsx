@@ -357,6 +357,7 @@ export function LiveGlobePage({ project }: LiveGlobePageProps) {
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex items-center gap-3">
           <Button
+            aria-label="Back"
             variant="ghost"
             size="icon"
             onClick={() => navigate(`/projects/${project.slug}/analytics`)}

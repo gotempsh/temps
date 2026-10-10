@@ -62,6 +62,11 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { resolveStableUrl } from '@/lib/deployment-url'
 import { legacyDatabasesRedirectPath } from '@/lib/project-detail-routes'
+import { projectLoadState } from '@/lib/project-load-state'
+import {
+  readFailureExplanation,
+  readFailureServerDetail,
+} from '@/lib/read-failure'
 import {
   deploymentsAfterStartPath,
   projectDeployLaunchMode,
@@ -112,9 +117,12 @@ export function ProjectDetail() {
 
   // Check for confetti query parameter
   const showConfetti = searchParams.get('showConfetti') === 'true'
+  // Uses the shared retry policy: a 404 or 403 settles at once, while a
+  // transient 5xx or dropped connection is retried before the page gives up.
   const {
     data: project,
     isLoading,
+    isFetching,
     error,
     refetch,
   } = useQuery({
@@ -123,7 +131,6 @@ export function ProjectDetail() {
         slug: slug || '',
       },
     }),
-    retry: false,
     enabled: !!slug,
   })
 
@@ -352,27 +359,35 @@ export function ProjectDetail() {
 
   usePageTitle(project?.slug ? `${project.slug}` : '')
 
-  if (error?.message?.includes('404') || (!isLoading && !project)) {
+  const loadState = projectLoadState({
+    slug,
+    error,
+    isLoading,
+    hasProject: !!project,
+  })
+
+  // Only a verified 404 means the project is gone. A 5xx, a 403 or a dropped
+  // connection says nothing about whether it exists, so those offer a retry.
+  if (loadState === 'not-found') {
     return <NotFound />
   }
 
-  if (error) {
+  if (loadState === 'failed') {
     return (
       <div className="p-4 sm:p-6">
         <ErrorAlert
           title="Failed to load project"
           description={
-            error instanceof Error
-              ? error.message
-              : 'An unexpected error occurred'
+            readFailureServerDetail(error) ?? readFailureExplanation(error)
           }
           retry={() => refetch()}
+          retrying={isFetching}
         />
       </div>
     )
   }
 
-  if (isLoading) {
+  if (loadState === 'loading') {
     return (
       <div className="flex-1">
         <div className="p-0 sm:p-4 space-y-6 md:p-6">

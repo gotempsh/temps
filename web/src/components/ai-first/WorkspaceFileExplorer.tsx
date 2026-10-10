@@ -423,14 +423,14 @@ export function WorkspaceFileExplorer({
                 <Icon
                   className={cn(
                     'size-3.5 shrink-0',
-                    isDirectory && 'text-amber-600 dark:text-amber-300'
+                    isDirectory && 'text-amber-700 dark:text-amber-300'
                   )}
                 />
                 <span className="min-w-0 flex-1 truncate">{entry.name}</span>
                 {status && (
                   <span
                     aria-label={`${status} file`}
-                    className="shrink-0 font-sans text-[8px] font-semibold uppercase text-amber-600 dark:text-amber-300"
+                    className="shrink-0 font-sans text-[8px] font-semibold uppercase text-amber-700 dark:text-amber-300"
                   >
                     {status.slice(0, 1)}
                   </span>
@@ -487,7 +487,7 @@ export function WorkspaceFileExplorer({
           </button>
         )}
         {directory.truncated && !directory.nextCursor && (
-          <p className="px-2 py-2 text-[9px] text-amber-600 dark:text-amber-300">
+          <p className="px-2 py-2 text-[9px] text-amber-700 dark:text-amber-300">
             Some entries are hidden by the workspace safety limit.
           </p>
         )}
@@ -670,7 +670,7 @@ export function WorkspaceFileExplorer({
                 />
               </pre>
               {preview?.truncated && (
-                <p className="border-t border-border px-3 py-2 text-[9px] text-amber-600 dark:text-amber-300">
+                <p className="border-t border-border px-3 py-2 text-[9px] text-amber-700 dark:text-amber-300">
                   Preview limited to the first {importLimits.maxTextPreviewKb}{' '}
                   KB.
                 </p>

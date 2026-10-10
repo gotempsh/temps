@@ -117,7 +117,7 @@ export function AnomalyBacktest({
     return (
       <div className="rounded-lg border border-border/60 p-3">
         {header}
-        <p className="mt-1 flex items-center gap-1.5 text-xs text-amber-600 dark:text-amber-400">
+        <p className="mt-1 flex items-center gap-1.5 text-xs text-amber-700 dark:text-amber-400">
           <AlertTriangle className="size-3.5" />
           Couldn&apos;t run the backtest for this metric.
         </p>
@@ -140,7 +140,7 @@ export function AnomalyBacktest({
     <div className="rounded-lg border border-border/60 p-3">
       {header}
       {!sufficient ? (
-        <p className="mt-1 flex items-center gap-1.5 text-xs text-amber-600 dark:text-amber-400">
+        <p className="mt-1 flex items-center gap-1.5 text-xs text-amber-700 dark:text-amber-400">
           <AlertTriangle className="size-3.5" />
           Not enough history to backtest yet — the band needs more data.
         </p>

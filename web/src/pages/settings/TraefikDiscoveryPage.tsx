@@ -110,11 +110,11 @@ function TlsStatusCell({
       <span className="flex max-w-[280px] flex-col gap-1">
         <Badge
           variant="outline"
-          className="w-fit border-amber-500 text-xs text-amber-600 dark:text-amber-400"
+          className="w-fit border-amber-500 text-xs text-amber-700 dark:text-amber-400"
         >
           TLS
         </Badge>
-        <span className="text-xs text-amber-600 dark:text-amber-400">
+        <span className="text-xs text-amber-700 dark:text-amber-400">
           HTTPS will fail — no cert authorized
         </span>
         <span className="flex items-start justify-between gap-1 rounded-md bg-muted px-1.5 py-1">
@@ -452,7 +452,7 @@ function RunningStatus({ status }: { status: TraefikDiscoveryStatusResponse }) {
             <span>
               Conflicts:{' '}
               <span
-                className={`tabular-nums ${conflicts.length > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-foreground'}`}
+                className={`tabular-nums ${conflicts.length > 0 ? 'text-amber-700 dark:text-amber-400' : 'text-foreground'}`}
               >
                 {conflicts.length.toLocaleString()}
               </span>
@@ -494,7 +494,7 @@ function RouteRow({
           {route.target_container_name}:{route.target_port}
         </span>
         {route.contested_by.length > 0 && (
-          <span className="mt-0.5 block text-xs text-amber-600 dark:text-amber-400">
+          <span className="mt-0.5 block text-xs text-amber-700 dark:text-amber-400">
             Also claimed by {route.contested_by.join(', ')}
           </span>
         )}

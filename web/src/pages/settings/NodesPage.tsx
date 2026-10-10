@@ -392,7 +392,7 @@ function JoinTokenSection() {
           <AlertTitle className="text-amber-700 dark:text-amber-400">
             Save this token now
           </AlertTitle>
-          <AlertDescription className="text-amber-600 dark:text-amber-300">
+          <AlertDescription className="text-amber-700 dark:text-amber-300">
             This is the only time the join token will be displayed. Copy the
             command below and store the token securely.
           </AlertDescription>
@@ -476,7 +476,7 @@ function JoinTokenSection() {
         <AlertTitle className="text-amber-700 dark:text-amber-400">
           No join token configured
         </AlertTitle>
-        <AlertDescription className="text-amber-600 dark:text-amber-300">
+        <AlertDescription className="text-amber-700 dark:text-amber-300">
           Without a join token, any machine that knows the endpoint can register
           as a worker node. Generate a token to secure node registration.
         </AlertDescription>
@@ -951,7 +951,8 @@ function NodeDetail({
   })
   const liveSandboxes = sandboxesQuery.data?.total ?? 0
   const [searchParams, setSearchParams] = useSearchParams()
-  const tab = searchParams.get('tab') === 'sandboxes' ? 'sandboxes' : 'containers'
+  const tab =
+    searchParams.get('tab') === 'sandboxes' ? 'sandboxes' : 'containers'
 
   // Drain status decides whether the node can be removed; the server folds
   // in live sandboxes, which draining does not move. Poll every 5s while
@@ -1032,7 +1033,10 @@ function NodeDetail({
         const hostsSandboxes =
           (resp.error as { type?: unknown }).type === NODE_HOSTS_SANDBOXES_TYPE
         toast.error('Could not remove node', {
-          description: problemDetail(resp.error, 'Check your permissions and try again.'),
+          description: problemDetail(
+            resp.error,
+            'Check your permissions and try again.'
+          ),
           action: hostsSandboxes
             ? {
                 label: 'Show sandboxes',
@@ -1138,6 +1142,7 @@ function NodeDetail({
       {/* Header */}
       <div className="flex items-center gap-3">
         <Button
+          aria-label="Back"
           variant="ghost"
           size="icon"
           onClick={onBack}
@@ -1352,14 +1357,13 @@ function NodeDetail({
       {blockedBySandboxes && (
         <Alert>
           <AlertCircle className="h-4 w-4" />
-          <AlertTitle>This node still hosts {remainingSandboxes} sandbox(es)</AlertTitle>
+          <AlertTitle>
+            This node still hosts {remainingSandboxes} sandbox(es)
+          </AlertTitle>
           <AlertDescription>
             Draining does not move sandboxes, so the node can&rsquo;t be removed
             yet. Destroy them on the{' '}
-            <Link
-              to="?tab=sandboxes"
-              className="underline underline-offset-2"
-            >
+            <Link to="?tab=sandboxes" className="underline underline-offset-2">
               Sandboxes tab
             </Link>
             , then remove the node.
@@ -1784,7 +1788,7 @@ export function NodesPage() {
                 {stranded.map((node) => node.name).join(', ')} joined with a
                 public address
               </AlertTitle>
-              <AlertDescription className="text-amber-600 dark:text-amber-300">
+              <AlertDescription className="text-amber-700 dark:text-amber-300">
                 {mesh?.state === 'starting'
                   ? 'They move onto the WireGuard mesh as soon as it is up.'
                   : 'Without the WireGuard mesh they cannot reach the control plane or other nodes privately, so cross-node networking does not work for them. Enable it under “Over the internet” above.'}

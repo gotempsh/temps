@@ -298,6 +298,7 @@ export default function ApiKeyCreate() {
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-4">
           <Button
+            aria-label="Back"
             variant="ghost"
             size="icon"
             onClick={() => navigate(returnTo)}

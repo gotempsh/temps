@@ -102,7 +102,7 @@ function ProjectSwitcher({
       <PopoverTrigger asChild>
         <button
           type="button"
-          aria-label="Switch project"
+          aria-label={`${label}: switch project`}
           className="inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-md px-1.5 py-0.5 text-sm font-normal text-foreground transition-colors hover:bg-accent"
         >
           <span className="max-w-[120px] truncate sm:max-w-[200px] lg:max-w-[280px]">

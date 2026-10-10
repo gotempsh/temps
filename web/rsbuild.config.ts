@@ -46,6 +46,8 @@ export const isApiWebSocket = (pathname: string, req: ProxyRequest) =>
   isApiPath(pathname) && isWebSocketUpgrade(req)
 export const isApiHttpRequest = (pathname: string, req: ProxyRequest) =>
   isApiPath(pathname) && !isWebSocketUpgrade(req)
+/** HTML shell for the console; carries `<html lang="en">`. */
+export const htmlTemplatePath = path.resolve(import.meta.dirname, 'index.html')
 const consoleKitEntry = path.resolve(
   import.meta.dirname,
   'packages/console-kit/src/index.ts'
@@ -72,6 +74,10 @@ export default defineConfig({
   html: {
     title: 'Temps',
     favicon: './src/favicon.png',
+    // Rsbuild's built-in shell is a bare `<html>`; this one declares the
+    // document language so assistive technology reads it correctly
+    // (WCAG 3.1.1).
+    template: htmlTemplatePath,
   },
   server: {
     // API WebSockets go to the Console listener, the remaining /api surface

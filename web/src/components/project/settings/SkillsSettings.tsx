@@ -162,6 +162,7 @@ export function SkillsSettings({ project }: SkillsSettingsProps) {
                     onClick={(e) => e.stopPropagation()}
                   >
                     <Button
+                      aria-label="Open menu"
                       variant="ghost"
                       size="icon"
                       className="h-8 w-8 shrink-0"

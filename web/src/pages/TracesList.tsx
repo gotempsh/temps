@@ -996,6 +996,7 @@ export default function TracesList({ project }: TracesListProps) {
         actions={
           <>
             <Button
+              aria-label="Refresh"
               variant="ghost"
               size="icon"
               onClick={() => {
@@ -1373,6 +1374,7 @@ export default function TracesList({ project }: TracesListProps) {
                 </div>
                 <div className="flex items-center justify-center gap-1">
                   <Button
+                    aria-label="Previous page"
                     variant="outline"
                     size="sm"
                     onClick={() => setPage((p) => Math.max(1, p - 1))}
@@ -1384,6 +1386,7 @@ export default function TracesList({ project }: TracesListProps) {
                     {page} / {totalPages}
                   </span>
                   <Button
+                    aria-label="Next page"
                     variant="outline"
                     size="sm"
                     onClick={() => setPage((p) => p + 1)}

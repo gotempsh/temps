@@ -62,7 +62,7 @@ function statusClassName(status: unknown): string {
     return 'text-emerald-600 dark:text-emerald-400'
   }
   if (['warning', 'pending', 'queued', 'running', 'starting'].includes(value)) {
-    return 'text-amber-600 dark:text-amber-400'
+    return 'text-amber-700 dark:text-amber-400'
   }
   if (['error', 'failed', 'failure', 'down', 'unhealthy'].includes(value)) {
     return 'text-red-600 dark:text-red-400'
@@ -86,7 +86,7 @@ function CredentialRequestArtifact({
   return (
     <section className="rounded-lg border border-border bg-background p-4">
       <div className="flex items-center gap-2">
-        <KeyRound className="size-4 text-amber-600 dark:text-amber-400" />
+        <KeyRound className="size-4 text-amber-700 dark:text-amber-400" />
         <div className="min-w-0 flex-1">
           <p className="truncate text-sm font-medium">
             {artifact.title ?? 'Credentials required'}

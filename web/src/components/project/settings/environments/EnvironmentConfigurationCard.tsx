@@ -977,6 +977,7 @@ export function EnvironmentConfigurationCard({
                         >
                           {key}={value}
                           <button
+                            aria-label="Remove label"
                             type="button"
                             className="ml-1 hover:text-destructive"
                             onClick={() => {
@@ -1010,6 +1011,7 @@ export function EnvironmentConfigurationCard({
                     className="flex-1"
                   />
                   <Button
+                    aria-label="Add label"
                     type="button"
                     variant="outline"
                     size="icon"

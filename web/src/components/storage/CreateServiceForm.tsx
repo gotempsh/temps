@@ -91,7 +91,7 @@ function BackupWarning({
 
   return (
     <div className="rounded-lg border border-amber-500/20 bg-amber-500/10 p-3 flex gap-2">
-      <AlertTriangle className="h-4 w-4 text-amber-600 dark:text-amber-400 mt-0.5 flex-shrink-0" />
+      <AlertTriangle className="h-4 w-4 text-amber-700 dark:text-amber-400 mt-0.5 flex-shrink-0" />
       <div className="space-y-1">
         <p className="text-sm font-medium text-amber-800 dark:text-amber-200">
           Atomic backups only

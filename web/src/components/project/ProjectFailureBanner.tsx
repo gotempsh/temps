@@ -209,7 +209,7 @@ function DegradedContainersNotice({
       data-testid="project-degraded-banner"
       className="mb-4 flex items-start gap-2.5 rounded-lg border border-amber-500/40 bg-amber-500/5 p-4"
     >
-      <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-600 dark:text-amber-400" />
+      <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-700 dark:text-amber-400" />
       <div className="min-w-0 flex-1 space-y-2">
         <p className="text-sm font-medium text-amber-700 dark:text-amber-400">
           {`${issues.length} ${noun} down or restarting in ${environment.name}`}

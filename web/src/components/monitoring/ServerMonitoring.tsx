@@ -113,7 +113,7 @@ const lastValue = (points: MetricDataPoint[] | undefined) =>
 
 const TONE_TEXT: Record<UsageTone, string> = {
   good: 'text-emerald-600 dark:text-emerald-400',
-  warn: 'text-amber-600 dark:text-amber-400',
+  warn: 'text-amber-700 dark:text-amber-400',
   poor: 'text-rose-600 dark:text-rose-400',
 }
 const TONE_BAR: Record<UsageTone, string> = {

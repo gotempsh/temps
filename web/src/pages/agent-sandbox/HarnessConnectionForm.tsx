@@ -340,7 +340,7 @@ export function HarnessConnectionForm({
               />
             ) : (
               <AlertTriangle
-                className="mt-0.5 size-4 shrink-0 text-amber-600 dark:text-amber-400"
+                className="mt-0.5 size-4 shrink-0 text-amber-700 dark:text-amber-400"
                 aria-hidden="true"
               />
             )}

@@ -249,7 +249,7 @@ export function ApiKeyTable({
       render: (key) => (
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
-            <Button variant="ghost" size="sm">
+            <Button aria-label="Open menu" variant="ghost" size="sm">
               <MoreHorizontal className="h-4 w-4" />
             </Button>
           </DropdownMenuTrigger>

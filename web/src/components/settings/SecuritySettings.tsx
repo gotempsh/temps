@@ -430,6 +430,7 @@ export function SecuritySettings({
                         placeholder="192.168.1.1 or 10.0.0.0/24"
                       />
                       <Button
+                        aria-label="Remove IP address"
                         type="button"
                         variant="outline"
                         size="icon"

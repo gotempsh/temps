@@ -1167,6 +1167,7 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
                     </TableCell>
                     <TableCell>
                       <Button
+                        aria-label="Delete alert rule"
                         variant="ghost"
                         size="icon"
                         className="size-7 text-muted-foreground hover:text-destructive"
@@ -1490,6 +1491,7 @@ export function ServiceMonitoring() {
               {/* Breadcrumb */}
               <div className="flex min-w-0 items-center gap-1.5 mb-1">
                 <button
+                  aria-label="Back"
                   type="button"
                   onClick={() => navigate(`/storage/${id}`)}
                   className="text-muted-foreground hover:text-foreground transition-colors"

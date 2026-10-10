@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, it } from 'bun:test'
+import { readFileSync } from 'node:fs'
 
 import {
   deriveConsoleTarget,
+  htmlTemplatePath,
   isApiHttpRequest,
   isApiWebSocket,
   isWebSocketUpgrade,
@@ -56,5 +58,17 @@ describe('API proxy routing', () => {
   it('leaves non-API sockets such as dev-server HMR alone', () => {
     expect(isApiWebSocket('/rsbuild-hmr', upgrade)).toBe(false)
     expect(isApiHttpRequest('/apiary', plain)).toBe(false)
+  })
+})
+
+describe('HTML shell', () => {
+  const template = readFileSync(htmlTemplatePath, 'utf8')
+
+  it('declares the document language on <html>', () => {
+    expect(template).toMatch(/<html[^>]*\slang="en"/)
+  })
+
+  it('keeps the mount point Rsbuild renders the app into', () => {
+    expect(template).toContain('<div id="<%= mountId %>"></div>')
   })
 })
