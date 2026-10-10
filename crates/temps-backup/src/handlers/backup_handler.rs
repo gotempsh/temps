@@ -106,6 +106,21 @@ impl From<BackupError> for Problem {
                 .with_title("Insufficient Permissions")
                 .with_detail(error.to_string()),
 
+            BackupError::S3Unreachable {
+                ref endpoint, kind, ..
+            } => {
+                let status = if kind.is_configuration_error() {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::BAD_GATEWAY
+                };
+                problemdetails::new(status)
+                    .with_title(kind.title())
+                    .with_value("failure", kind.slug())
+                    .with_value("endpoint", endpoint.clone())
+                    .with_detail(error.to_string())
+            }
+
             BackupError::PartialDeletion { .. } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Backup Was Partially Deleted")
@@ -1660,10 +1675,17 @@ async fn update_s3_source(
     if request.bucket_path.is_some() {
         updated_fields.insert("bucket_path".to_string(), "updated".to_string());
     }
-    if request.access_key_id.is_some() {
+    // A masked (`***`) or empty credential is sent back unchanged by edit
+    // forms and is not stored; see `BackupService::update_s3_source`.
+    let credential_changed = |value: &Option<String>| {
+        value
+            .as_deref()
+            .is_some_and(|v| !v.is_empty() && v != "***")
+    };
+    if credential_changed(&request.access_key_id) {
         updated_fields.insert("access_key_id".to_string(), "updated".to_string());
     }
-    if request.secret_key.is_some() {
+    if credential_changed(&request.secret_key) {
         updated_fields.insert("secret_key".to_string(), "updated".to_string());
     }
     if request.region.is_some() {

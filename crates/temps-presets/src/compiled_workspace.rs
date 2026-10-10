@@ -1,12 +1,13 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Repository context for a nested Go module or Cargo crate.
+//! Repository context for a nested Go module, Cargo crate or Mix project.
 //!
 //! A generated build copies only the selected application. That loses what a
 //! compiled workspace resolves relative to it: a Go `replace` pointing at a
 //! sibling module, a `go.work` listing the module, a Cargo `path` dependency
-//! outside the crate, or an enclosing Cargo workspace the crate belongs to.
+//! outside the crate, an enclosing Cargo workspace the crate belongs to, or
+//! an Elixir umbrella's sibling apps, lockfile and configuration.
 //! [`compiled_workspace_app`] says when the build needs the repository root
 //! instead, and refuses a dependency that would leave the repository.
 //!
@@ -22,6 +23,8 @@ const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 pub enum CompiledLanguage {
     Go,
     Cargo,
+    /// A Mix project, typically an app inside an Elixir umbrella.
+    Elixir,
 }
 
 impl CompiledLanguage {
@@ -30,18 +33,21 @@ impl CompiledLanguage {
         match provider {
             "go" => Some(CompiledLanguage::Go),
             "rust" => Some(CompiledLanguage::Cargo),
+            "elixir" => Some(CompiledLanguage::Elixir),
             _ => None,
         }
     }
 
     /// The language a preset builds the application at `app` with: fixed for
     /// a language preset, detected the way autopack detects it for an
-    /// auto-detecting one. `None` when the build is not Go or Cargo, so a
-    /// `go.mod` or `Cargo.toml` the build never reads is never inspected.
+    /// auto-detecting one. `None` when the build is not Go, Cargo or Mix, so
+    /// a `go.mod`, `Cargo.toml` or `mix.exs` the build never reads is never
+    /// inspected.
     pub fn for_preset(preset: &str, app: &Path) -> Option<Self> {
         match preset {
             "go" | "nixpacks-go" => Some(CompiledLanguage::Go),
             "rust" | "nixpacks-rust" => Some(CompiledLanguage::Cargo),
+            "nixpacks-elixir" => Some(CompiledLanguage::Elixir),
             "nixpacks" | "autopack" => crate::NixpacksPreset::detect_provider_id(app)
                 .as_deref()
                 .and_then(Self::from_autopack_provider),
@@ -50,7 +56,7 @@ impl CompiledLanguage {
     }
 }
 
-/// Why a nested Go module or Cargo crate cannot be planned for a repository
+/// Why a nested Go module, Cargo crate or Mix project cannot be planned for a repository
 /// build. Every variant names the directory, manifest or declaration at fault.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CompiledWorkspaceError {
@@ -117,8 +123,9 @@ pub struct CompiledWorkspaceApp {
     pub ignore_go_work: bool,
 }
 
-/// The selected Go module or Cargo crate when it needs sibling directories of
-/// the repository at `root`; `None` when building it alone is enough.
+/// The selected Go module, Cargo crate or Mix project when it needs sibling
+/// directories of the repository at `root`; `None` when building it alone is
+/// enough.
 ///
 /// Only the manifest of `language`, the one the build uses, is read: a
 /// `go.mod` beside a JavaScript application, or a `package.json` beside a Go
@@ -157,7 +164,15 @@ pub fn compiled_workspace_app(
             }
             false
         }
-        CompiledLanguage::Go | CompiledLanguage::Cargo => return Ok(None),
+        CompiledLanguage::Elixir if is_regular_file(&selected.join("mix.exs")) => {
+            if !mix_needs_repository(root, relative)? {
+                return Ok(None);
+            }
+            false
+        }
+        CompiledLanguage::Go | CompiledLanguage::Cargo | CompiledLanguage::Elixir => {
+            return Ok(None)
+        }
     };
     let text = relative
         .to_str()
@@ -449,6 +464,235 @@ fn go_needs_repository(
         }
     }
     Ok(needs.then_some(ignore_go_work))
+}
+
+/// `mix.exs` reduced to its code: `#` comments removed, and the bodies of
+/// heredocs (`"""`/`'''`, sigil-prefixed or not) blanked, since that is where
+/// documentation and examples such as `{:shared, in_umbrella: true}` live.
+/// Ordinary string literals are kept: dependency paths are read from them,
+/// and [`outside_strings`] skips them when looking for code. Line breaks are
+/// preserved.
+fn elixir_code(contents: &str) -> String {
+    let mut code = String::with_capacity(contents.len());
+    let mut rest = contents;
+    while let Some(c) = rest.chars().next() {
+        if rest.starts_with("\"\"\"") || rest.starts_with("'''") {
+            let delimiter = &rest[..3];
+            let end = rest[3..]
+                .find(delimiter)
+                .map_or(rest.len(), |index| 3 + index + 3);
+            code.extend(
+                rest[..end]
+                    .chars()
+                    .map(|c| if c == '\n' { '\n' } else { ' ' }),
+            );
+            rest = &rest[end..];
+            continue;
+        }
+        match c {
+            '"' | '\'' => {
+                let length = string_literal_len(rest);
+                code.push_str(&rest[..length]);
+                rest = &rest[length..];
+            }
+            '#' => rest = &rest[rest.find('\n').unwrap_or(rest.len())..],
+            c => {
+                code.push(c);
+                rest = &rest[c.len_utf8()..];
+            }
+        }
+    }
+    code
+}
+
+/// Length of the string or charlist literal `text` starts with, through its
+/// closing quote (or the end of `text` when it is unterminated).
+fn string_literal_len(text: &str) -> usize {
+    let mut chars = text.char_indices();
+    let Some((_, quote)) = chars.next() else {
+        return 0;
+    };
+    let mut escaped = false;
+    for (index, c) in chars {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == quote {
+            return index + c.len_utf8();
+        }
+    }
+    text.len()
+}
+
+/// Byte offsets in `text` where `needle` starts outside any string literal.
+fn outside_strings(text: &str, needle: &str) -> Vec<usize> {
+    let mut found = Vec::new();
+    let mut offset = 0;
+    while offset < text.len() {
+        let rest = &text[offset..];
+        if rest.starts_with(needle) {
+            found.push(offset);
+            offset += needle.len();
+            continue;
+        }
+        let Some(c) = rest.chars().next() else {
+            break;
+        };
+        offset += if c == '"' || c == '\'' {
+            string_literal_len(rest)
+        } else {
+            c.len_utf8()
+        };
+    }
+    found
+}
+
+/// The string literal at the start of `text` (after whitespace), unescaped.
+/// `None` when the value is not a plain literal, such as an expression or an
+/// interpolated string, which planning cannot evaluate.
+fn elixir_string_literal(text: &str) -> Option<String> {
+    let quoted = text.trim_start().strip_prefix('"')?;
+    let mut value = String::new();
+    let mut chars = quoted.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(value),
+            '\\' => value.push(chars.next()?),
+            '#' if chars.as_str().starts_with('{') => return None,
+            c => value.push(c),
+        }
+    }
+    None
+}
+
+/// The string values of every `key: "..."` keyword entry in `text`.
+fn mix_keyword_strings(text: &str, key: &str) -> Vec<String> {
+    let needle = format!("{key}:");
+    let mut found = Vec::new();
+    for start in outside_strings(text, &needle) {
+        let offset = start + needle.len();
+        let preceded_by_identifier = text[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':');
+        if preceded_by_identifier {
+            continue;
+        }
+        if let Some(value) = elixir_string_literal(&text[offset..]) {
+            found.push(value);
+        }
+    }
+    found
+}
+
+/// A dependency tuple, `{:name, ...}`: its name and the text inside it.
+fn mix_dependency_tuples(text: &str) -> Vec<(String, &str)> {
+    let mut tuples = Vec::new();
+    for start in outside_strings(text, "{:") {
+        let body = &text[start + 2..];
+        let name: String = body
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if name.is_empty() {
+            continue;
+        }
+        // The tuple ends at its matching brace; strings may hold braces.
+        let mut depth = 1usize;
+        let mut in_string = false;
+        let mut escaped = false;
+        let mut end = None;
+        for (index, c) in body.char_indices() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match c {
+                '"' => in_string = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(index);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else {
+            break;
+        };
+        tuples.push((name, &body[..end]));
+    }
+    tuples
+}
+
+/// Whether a `key: true` entry appears in a dependency tuple's options.
+fn mix_flag_enabled(tuple: &str, key: &str) -> bool {
+    let needle = format!("{key}:");
+    tuple.match_indices(&needle).any(|(start, _)| {
+        let preceded_by_identifier = tuple[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+        !preceded_by_identifier
+            && tuple[start + needle.len()..]
+                .trim_start()
+                .strip_prefix("true")
+                .is_some_and(|rest| {
+                    !rest
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+                })
+    })
+}
+
+/// Whether the Mix project at `relative` needs the repository: a local
+/// dependency outside the project (`path:`, or `in_umbrella: true`, which Mix
+/// resolves to the sibling `../<name>`), or a lockfile, configuration, deps
+/// or build directory that an umbrella child keeps at the umbrella root.
+///
+/// The manifest is Elixir code; only literal paths are read, never
+/// evaluated. A computed path is left to Mix.
+fn mix_needs_repository(root: &Path, relative: &Path) -> Result<bool, CompiledWorkspaceError> {
+    let mix_exs = relative.join("mix.exs");
+    let contents = elixir_code(&read_manifest(root, &mix_exs)?.unwrap_or_default());
+    let mut needs = false;
+    for (name, tuple) in mix_dependency_tuples(&contents) {
+        let mut targets: Vec<(String, String)> = mix_keyword_strings(tuple, "path")
+            .into_iter()
+            .map(|path| (format!("{{:{name}, path: \"{path}\"}}"), path))
+            .collect();
+        if mix_flag_enabled(tuple, "in_umbrella") {
+            targets.push((format!("{{:{name}, in_umbrella: true}}"), format!("../{name}")));
+        }
+        for (declaration, target) in targets {
+            let resolved =
+                resolve(relative, &target).ok_or_else(|| escapes(&declaration, &mix_exs))?;
+            require_dependency(root, &resolved, "mix.exs", &declaration, &mix_exs)?;
+            needs |= !resolved.starts_with(relative);
+        }
+    }
+    // Umbrella children share the umbrella's lockfile, configuration and
+    // output directories. A path leaving the repository is not ours to
+    // check: the build behaves as it did before, and Mix reports it.
+    for key in ["config_path", "lockfile", "deps_path", "build_path"] {
+        for path in mix_keyword_strings(&contents, key) {
+            if let Some(resolved) = resolve(relative, &path) {
+                needs |= !resolved.starts_with(relative);
+            }
+        }
+    }
+    Ok(needs)
 }
 
 /// Path dependency declarations in a Cargo manifest: every dependency table,
@@ -765,6 +1009,8 @@ mod tests {
         let selected = root.path().join("apps/api");
         let language = if selected.join("go.mod").is_file() {
             CompiledLanguage::Go
+        } else if selected.join("mix.exs").is_file() {
+            CompiledLanguage::Elixir
         } else {
             CompiledLanguage::Cargo
         };
@@ -776,6 +1022,148 @@ mod tests {
         "packages/shared/Cargo.toml",
         "[package]\nname = \"qa-shared\"\nversion = \"0.1.0\"\n",
     );
+
+    const UMBRELLA_ROOT: (&str, &str) = (
+        "mix.exs",
+        "defmodule U.MixProject do\n  use Mix.Project\n  def project, do: [apps_path: \"apps\", deps: []]\nend\n",
+    );
+    const SHARED_MIX: (&str, &str) = (
+        "apps/shared/mix.exs",
+        "defmodule Shared.MixProject do\n  use Mix.Project\n  def project, do: [app: :shared]\nend\n",
+    );
+
+    fn mix_project(project: &str, deps: &str) -> String {
+        format!(
+            "defmodule Api.MixProject do\n  use Mix.Project\n\n  def project do\n    [app: :api, version: \"0.1.0\"{project}, deps: deps()]\n  end\n\n  def application, do: [mod: {{Api.Application, []}}]\n\n  defp deps do\n    [\n{deps}\n    ]\n  end\nend\n"
+        )
+    }
+
+    fn elixir_api() -> CompiledWorkspaceApp {
+        CompiledWorkspaceApp {
+            relative: "apps/api".into(),
+            language: CompiledLanguage::Elixir,
+            ignore_go_work: false,
+        }
+    }
+
+    /// #1386: an umbrella child keeps its `in_umbrella` sibling, and the
+    /// lockfile, config and deps directories it shares with the umbrella.
+    #[test]
+    fn elixir_umbrella_children_need_the_repository() {
+        let in_umbrella = mix_project("", "      {:shared, in_umbrella: true},\n      {:jason, \"~> 1.4\"}");
+        let path = mix_project("", "      {:shared, path: \"../shared\", override: true}");
+        let generated_child = mix_project(
+            ",\n      build_path: \"../../_build\",\n      config_path: \"../../config/config.exs\",\n      deps_path: \"../../deps\",\n      lockfile: \"../../mix.lock\"",
+            "",
+        );
+        for mix_exs in [&in_umbrella, &path, &generated_child] {
+            let root = repository(&[UMBRELLA_ROOT, ("apps/api/mix.exs", mix_exs), SHARED_MIX]);
+            assert_eq!(app(&root), Ok(Some(elixir_api())), "{mix_exs}");
+        }
+    }
+
+    /// A Mix app with only Hex/git dependencies, or local ones inside its own
+    /// directory, builds alone -- as do the same declarations in comments.
+    #[test]
+    fn standalone_mix_apps_build_alone() {
+        for deps in [
+            "      {:phoenix, \"~> 1.7\"},\n      {:plug, git: \"https://example.test/plug.git\", tag: \"v1\"}",
+            "      {:local, path: \"vendor/local\"}",
+            "      # {:shared, in_umbrella: true},\n      {:jason, \"~> 1.4\"} # path: \"../../x\"",
+            "      {:shared, in_umbrella: false}",
+        ] {
+            let root = repository(&[
+                ("apps/api/mix.exs", &mix_project("", deps)),
+                ("apps/api/vendor/local/mix.exs", "defmodule L.MixProject do\nend\n"),
+            ]);
+            assert_eq!(app(&root), Ok(None), "{deps}");
+        }
+        // Paths Mix computes at runtime are not evaluated.
+        let root = repository(&[(
+            "apps/api/mix.exs",
+            &mix_project(",\n      deps_path: Path.expand(\"../deps\", __DIR__)", ""),
+        )]);
+        assert_eq!(app(&root), Ok(None));
+    }
+
+    #[test]
+    fn elixir_dependencies_missing_or_outside_the_repository_are_refused() {
+        // The umbrella sibling was not uploaded.
+        let root = repository(&[
+            UMBRELLA_ROOT,
+            ("apps/api/mix.exs", &mix_project("", "      {:shared, in_umbrella: true}")),
+        ]);
+        assert_eq!(
+            app(&root),
+            Err(CompiledWorkspaceError::DependencyMissing {
+                declaration: "{:shared, in_umbrella: true}".into(),
+                owner: "apps/api/mix.exs".into(),
+                manifest: "mix.exs".into(),
+            })
+        );
+        // A path dependency leaving the repository.
+        let root = repository(&[(
+            "apps/api/mix.exs",
+            &mix_project("", "      {:outside, path: \"../../../outside\"}"),
+        )]);
+        assert_eq!(
+            app(&root),
+            Err(CompiledWorkspaceError::DependencyEscapes {
+                declaration: "{:outside, path: \"../../../outside\"}".into(),
+                owner: "apps/api/mix.exs".into(),
+            })
+        );
+        // A shared lockfile outside the repository is Mix's to report.
+        let root = repository(&[(
+            "apps/api/mix.exs",
+            &mix_project(",\n      lockfile: \"../../../mix.lock\"", ""),
+        )]);
+        assert_eq!(app(&root), Ok(None));
+    }
+
+    /// Dependency examples in documentation or strings are not dependencies:
+    /// a standalone app whose `@moduledoc` shows an umbrella declaration, or
+    /// whose code mentions one in a string, still builds alone.
+    #[test]
+    fn dependency_examples_in_docs_and_strings_are_ignored() {
+        let mix_exs = "defmodule Api.MixProject do\n  @moduledoc \"\"\"\n  Add it to an umbrella with:\n\n      {:shared, in_umbrella: true}\n      config_path: \"../../config/config.exs\"\n  \"\"\"\n  use Mix.Project\n\n  @doc ~S'''\n  {:other, path: \"../../other\"}\n  '''\n  def project, do: [app: :api, deps: deps()]\n\n  def hint, do: \"use {:shared, in_umbrella: true} in an umbrella\"\n\n  defp deps, do: [{:jason, \"~> 1.4\"}]\nend\n";
+        let root = repository(&[("apps/api/mix.exs", mix_exs)]);
+        assert_eq!(app(&root), Ok(None));
+
+        let code = elixir_code(mix_exs);
+        let names: Vec<_> = mix_dependency_tuples(&code)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, ["jason"]);
+        assert!(mix_keyword_strings(&code, "config_path").is_empty());
+        // Line structure survives blanking, and a real declaration after a
+        // heredoc is still found.
+        assert_eq!(code.lines().count(), mix_exs.lines().count());
+        let after = elixir_code("@doc \"\"\"\n{:x, path: \"y\"}\n\"\"\"\n[{:z, path: \"w\"}]\n");
+        let tuples = mix_dependency_tuples(&after);
+        assert_eq!(tuples.len(), 1);
+        assert_eq!(tuples[0].0, "z");
+    }
+
+    #[test]
+    fn mix_manifest_scanning_handles_strings_and_nesting() {
+        let text = elixir_code(
+            "[{:a, path: \"x#y\"}, # {:b, path: \"z\"}\n {:c, \"~> 1.0\", only: [:dev], runtime: false}, {:d, in_umbrella: true}]\n",
+        );
+        let tuples = mix_dependency_tuples(&text);
+        let names: Vec<_> = tuples.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["a", "c", "d"]);
+        assert_eq!(mix_keyword_strings(tuples[0].1, "path"), ["x#y"]);
+        assert!(mix_flag_enabled(tuples[2].1, "in_umbrella"));
+        assert!(!mix_flag_enabled("not_in_umbrella: true", "in_umbrella"));
+        assert!(!mix_flag_enabled("in_umbrella: true_ish", "in_umbrella"));
+        // `elixirc_paths:` is not `path:`, and interpolation is not a literal.
+        assert!(mix_keyword_strings("elixirc_paths: \"lib\"", "path").is_empty());
+        assert!(mix_keyword_strings("path: \"#{root}/x\"", "path").is_empty());
+        // An unterminated tuple ends the scan instead of reading past it.
+        assert!(mix_dependency_tuples("{:broken, path: \"x\"").is_empty());
+    }
 
     #[test]
     fn go_replace_of_a_sibling_module_needs_the_repository() {

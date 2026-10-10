@@ -21,20 +21,94 @@ use std::collections::HashSet;
 use temps_entities::nodes;
 use temps_monitoring::alarm_service::{AlarmService, AlarmSeverity, AlarmType, FireAlarmRequest};
 
-use crate::services::node_service::NodeService;
+use crate::services::node_service::{FailedOverReplica, NodeService, RetireReason};
 use crate::DeploymentService;
 
 /// Threshold in seconds — nodes with older heartbeats are marked offline.
 const HEARTBEAT_STALE_THRESHOLD_SECS: i64 = 90;
+
+/// Longest gap between two health ticks that still counts as watching
+/// heartbeats continuously. The loop ticks every 60s; a longer gap means the
+/// control plane was not running (or not scheduling), so it recorded no
+/// heartbeat in the meantime.
+const MAX_HEALTH_TICK_GAP_SECS: i64 = 180;
+
+/// Failed-over replicas restored per health tick, so one pass stays bounded
+/// however many accumulated while nodes were offline.
+const MAX_REPLICA_RESTORES_PER_TICK: u64 = 100;
+
+/// How long a queued restoring redeploy has to replace its deployment before
+/// it is queued again. Long enough for a build and rollout; a redeploy still
+/// in flight when it passes is not duplicated (the job processor drops a
+/// recovery of a deployment that already has one in flight).
+const REPLICA_RESTORE_RETRY_SECS: i64 = 600;
+
+/// When the control plane started watching node heartbeats, for the current
+/// stretch of uninterrupted health ticks.
+///
+/// A node's silence is only counted from this moment: while the control
+/// plane is down it records no heartbeat, so a heartbeat older than this says
+/// nothing about the node. Without it, the first tick after an outage longer
+/// than the failover grace period marked every worker offline from its
+/// pre-outage heartbeat and failed its workloads over in the same second,
+/// before any agent could report (#1384).
+#[derive(Debug, Clone)]
+pub struct HeartbeatWatch {
+    since: chrono::DateTime<chrono::Utc>,
+    last_tick: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl HeartbeatWatch {
+    /// Start watching at `now` (control plane start).
+    pub fn start(now: chrono::DateTime<chrono::Utc>) -> Self {
+        Self {
+            since: now,
+            last_tick: None,
+        }
+    }
+
+    /// Record a health tick at `now` and return when the current stretch of
+    /// watching began. A gap longer than [`MAX_HEALTH_TICK_GAP_SECS`] since
+    /// the previous tick starts a new stretch.
+    pub fn tick(&mut self, now: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+        if let Some(last_tick) = self.last_tick {
+            if now - last_tick > chrono::Duration::seconds(MAX_HEALTH_TICK_GAP_SECS) {
+                tracing::warn!(
+                    gap_secs = (now - last_tick).num_seconds(),
+                    "Node health checks were interrupted; node heartbeat grace periods restart now"
+                );
+                self.since = now;
+            }
+        }
+        self.last_tick = Some(now);
+        self.since
+    }
+}
 
 /// Runs a single health check pass across all active nodes.
 ///
 /// This is designed to be called by a scheduler (e.g., every 60 seconds).
 /// It does NOT run in a loop itself.
 ///
+/// Silence is counted from `watching_since` at the earliest (see
+/// [`HeartbeatWatch`]), so no node is marked offline until the control
+/// plane has itself been watching for the whole threshold.
+///
 /// Returns the list of node IDs that were marked offline (for failover).
-pub async fn check_node_health(node_service: &NodeService, db: &DatabaseConnection) -> Vec<i32> {
+pub async fn check_node_health(
+    node_service: &NodeService,
+    db: &DatabaseConnection,
+    watching_since: chrono::DateTime<chrono::Utc>,
+) -> Vec<i32> {
     let cutoff = chrono::Utc::now() - chrono::Duration::seconds(HEARTBEAT_STALE_THRESHOLD_SECS);
+    if watching_since >= cutoff {
+        tracing::debug!(
+            watching_since = %watching_since,
+            "Node health check: within the heartbeat threshold of the control plane starting to \
+             watch; not marking any node offline yet"
+        );
+        return vec![];
+    }
 
     // Find nodes that are still marked "active" but have a stale heartbeat
     let stale_nodes = match nodes::Entity::find()
@@ -470,12 +544,16 @@ fn effective_failover_after_secs(configured: u64) -> i64 {
 /// Returns the node IDs whose failover completed this tick.
 pub async fn failover_due_nodes(
     failover_after_secs: u64,
+    watching_since: chrono::DateTime<chrono::Utc>,
     node_service: &NodeService,
     deployment_service: &DeploymentService,
     alarm_service: Option<&std::sync::Arc<AlarmService>>,
 ) -> Vec<i32> {
     let after_secs = effective_failover_after_secs(failover_after_secs);
-    let due = match node_service.list_due_for_failover(after_secs).await {
+    let due = match node_service
+        .list_due_for_failover(after_secs, watching_since)
+        .await
+    {
         Ok(nodes) => nodes,
         Err(e) => {
             tracing::error!("Failed to query offline nodes due for failover: {}", e);
@@ -675,6 +753,7 @@ async fn failover_node(
                         // containers are gone, so cleanup must still
                         // remove them if it comes back.
                         &std::collections::HashSet::new(),
+                        RetireReason::FailoverHistorical,
                     )
                     .await
                 {
@@ -747,7 +826,10 @@ async fn failover_node(
                     }
                 }
             } else {
-                // Other nodes have healthy replicas — just retire stale containers
+                // Other nodes have healthy replicas — take these out of
+                // routing. They are recorded as failed over, so the replica
+                // count is restored once the node sends heartbeats again
+                // (see `restore_recovered_replicas`).
                 match node_service
                     .retire_containers_on_node(
                         node_id,
@@ -756,6 +838,7 @@ async fn failover_node(
                         // containers are gone, so cleanup must still
                         // remove them if it comes back.
                         &std::collections::HashSet::new(),
+                        RetireReason::FailoverReplica,
                     )
                     .await
                 {
@@ -782,6 +865,125 @@ async fn failover_node(
         }
     }
     complete
+}
+
+/// Restore the replica count of deployments whose replicas a failover took
+/// out of routing, once the node they were on sends heartbeats again.
+///
+/// A failover only retires replicas when the environment keeps serving from
+/// other nodes, so nothing else would ever bring the count back: the
+/// environment kept running short until someone redeployed it. For each such
+/// deployment that its environment still serves, this queues the same
+/// recovery redeploy a failover uses (`redeploy_environment_for_failover`),
+/// so the job processor's existing fencing applies: it is dropped when a
+/// newer generation exists or another recovery of the same deployment is
+/// already in flight. The redeploy supersedes the deployment, and the
+/// superseding cleanup then removes the retired replica from its node.
+///
+/// The replicas stay pending until that happens: once queued they are
+/// marked as recovering, and if their deployment is still the serving one
+/// [`REPLICA_RESTORE_RETRY_SECS`] later (the redeploy failed, or was never
+/// started), it is queued again. Only when the deployment is no longer
+/// served are the rows settled to `retired`. Queuing failures are retried
+/// on the next tick. At most [`MAX_REPLICA_RESTORES_PER_TICK`] rows per tick.
+/// Returns how many deployments were queued for a redeploy.
+pub async fn restore_recovered_replicas(
+    node_service: &NodeService,
+    deployment_service: &DeploymentService,
+) -> usize {
+    let retry_queued_before =
+        chrono::Utc::now() - chrono::Duration::seconds(REPLICA_RESTORE_RETRY_SECS);
+    let replicas = match node_service
+        .failed_over_replicas_on_recovered_nodes(MAX_REPLICA_RESTORES_PER_TICK, retry_queued_before)
+        .await
+    {
+        Ok(replicas) => replicas,
+        Err(e) => {
+            tracing::error!(
+                "Failed to query failed-over replicas on recovered nodes: {}",
+                e
+            );
+            return 0;
+        }
+    };
+    if replicas.is_empty() {
+        return 0;
+    }
+
+    let mut queued = 0;
+    for (deployment, group) in group_by_deployment(&replicas) {
+        let rows: Vec<i32> = group.iter().map(|r| r.container_row_id).collect();
+        if !deployment.is_current() {
+            // Replaced (by the restoring redeploy or anything newer): the
+            // replica count is the new deployment's now.
+            if let Err(e) = node_service.settle_failed_over_replicas(&rows).await {
+                tracing::error!(
+                    deployment_id = deployment.deployment_id,
+                    "Failed to settle failed-over replicas of a replaced deployment; retrying \
+                     next health check: {}",
+                    e
+                );
+            }
+            continue;
+        }
+        match deployment_service
+            .redeploy_environment_for_failover(
+                deployment.project_id,
+                deployment.environment_id,
+                deployment.deployment_id,
+            )
+            .await
+        {
+            Ok(()) => {
+                queued += 1;
+                tracing::info!(
+                    project_id = deployment.project_id,
+                    environment_id = deployment.environment_id,
+                    deployment_id = deployment.deployment_id,
+                    node_id = deployment.node_id,
+                    replicas = rows.len(),
+                    "Node recovered: queued a recovery redeploy to restore the replicas a \
+                     failover took out of routing"
+                );
+                if let Err(e) = node_service.mark_failed_over_recovery_queued(&rows).await {
+                    tracing::error!(
+                        deployment_id = deployment.deployment_id,
+                        "Failed to record the queued replica restore; the next health check \
+                         repeats it, which the recovery redeploy fencing absorbs: {}",
+                        e
+                    );
+                }
+            }
+            Err(e) => tracing::error!(
+                project_id = deployment.project_id,
+                environment_id = deployment.environment_id,
+                deployment_id = deployment.deployment_id,
+                node_id = deployment.node_id,
+                "Node recovered, but restoring its failed-over replicas could not be queued; \
+                 retrying next health check: {}",
+                e
+            ),
+        }
+    }
+    queued
+}
+
+/// `replicas` grouped by deployment, in first-seen order. The first row of
+/// each group stands for the deployment.
+fn group_by_deployment(
+    replicas: &[FailedOverReplica],
+) -> Vec<(&FailedOverReplica, Vec<&FailedOverReplica>)> {
+    let mut groups: Vec<(&FailedOverReplica, Vec<&FailedOverReplica>)> = Vec::new();
+    for replica in replicas {
+        match groups
+            .iter_mut()
+            .find(|(first, _)| first.deployment_id == replica.deployment_id)
+        {
+            Some((_, group)) => group.push(replica),
+            None => groups.push((replica, vec![replica])),
+        }
+    }
+    groups
 }
 
 #[cfg(test)]
@@ -832,6 +1034,106 @@ mod tests {
         }
     }
 
+    /// A watch that started long before any heartbeat in these tests, so
+    /// only the heartbeat ages decide.
+    fn long_ago() -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now() - chrono::Duration::days(1)
+    }
+
+    /// #1384: right after the control plane starts, a heartbeat recorded
+    /// before its outage says nothing about the node. No node is marked
+    /// offline, and the node table is not even read.
+    #[tokio::test]
+    async fn test_no_node_is_marked_offline_from_heartbeats_older_than_the_watch() {
+        let db =
+            std::sync::Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let node_service = NodeService::new(db.clone());
+
+        let marked = check_node_health(&node_service, db.as_ref(), chrono::Utc::now()).await;
+        assert!(marked.is_empty());
+
+        // 89s into the watch: still inside the threshold.
+        let started = chrono::Utc::now() - chrono::Duration::seconds(89);
+        assert!(check_node_health(&node_service, db.as_ref(), started)
+            .await
+            .is_empty());
+        drop(node_service);
+        let db = std::sync::Arc::try_unwrap(db).unwrap_or_else(|_| panic!("db still has owners"));
+        assert!(db.into_transaction_log().is_empty());
+    }
+
+    /// #1384: three hours of control-plane outage must not count toward the
+    /// failover grace period. Nothing is due until the grace period has
+    /// passed since the control plane started watching again.
+    #[tokio::test]
+    async fn test_no_node_is_due_for_failover_before_the_grace_period_since_the_watch() {
+        let db =
+            std::sync::Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let node_service = NodeService::new(db.clone());
+
+        for watching_for in [0, 60, 299] {
+            let since = chrono::Utc::now() - chrono::Duration::seconds(watching_for);
+            let due = node_service
+                .list_due_for_failover(300, since)
+                .await
+                .expect("no query, no error");
+            assert!(due.is_empty(), "watching for {watching_for}s");
+        }
+        drop(node_service);
+        let db = std::sync::Arc::try_unwrap(db).unwrap_or_else(|_| panic!("db still has owners"));
+        assert!(db.into_transaction_log().is_empty());
+    }
+
+    #[test]
+    fn test_heartbeat_watch_restarts_after_an_interrupted_tick_loop() {
+        let start = chrono::Utc::now();
+        let mut watch = HeartbeatWatch::start(start);
+        assert_eq!(watch.tick(start), start);
+        let regular = start + chrono::Duration::seconds(60);
+        assert_eq!(watch.tick(regular), start);
+        let still_regular = regular + chrono::Duration::seconds(MAX_HEALTH_TICK_GAP_SECS);
+        assert_eq!(watch.tick(still_regular), start);
+        // The process stalled (or the runtime was paused) for longer: the
+        // control plane was not watching, so the watch restarts.
+        let resumed = still_regular + chrono::Duration::seconds(MAX_HEALTH_TICK_GAP_SECS + 1);
+        assert_eq!(watch.tick(resumed), resumed);
+        assert_eq!(watch.tick(resumed + chrono::Duration::seconds(60)), resumed);
+    }
+
+    #[test]
+    fn test_failed_over_replicas_are_grouped_per_deployment() {
+        let replica = |row: i32, node: i32, deployment: i32, current: i32| FailedOverReplica {
+            container_row_id: row,
+            node_id: node,
+            deployment_id: deployment,
+            project_id: 1,
+            environment_id: 2,
+            current_deployment_id: Some(current),
+        };
+        let replicas = vec![
+            replica(10, 1, 2, 2),
+            replica(11, 2, 2, 2),
+            replica(12, 1, 3, 9),
+        ];
+        let groups = group_by_deployment(&replicas);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0.deployment_id, 2);
+        assert!(groups[0].0.is_current());
+        assert_eq!(
+            groups[0]
+                .1
+                .iter()
+                .map(|r| r.container_row_id)
+                .collect::<Vec<_>>(),
+            [10, 11]
+        );
+        assert_eq!(groups[1].0.deployment_id, 3);
+        assert!(
+            !groups[1].0.is_current(),
+            "superseded: settle only, no redeploy"
+        );
+    }
+
     #[test]
     fn test_heartbeat_threshold_is_reasonable() {
         // Heartbeat threshold should be greater than the heartbeat interval (30s)
@@ -850,7 +1152,7 @@ mod tests {
             MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
         ));
 
-        let marked = check_node_health(&node_service, &db).await;
+        let marked = check_node_health(&node_service, &db, long_ago()).await;
         assert!(marked.is_empty());
     }
 
@@ -880,7 +1182,7 @@ mod tests {
             .into_connection();
         let node_service = NodeService::new(std::sync::Arc::new(service_db));
 
-        let marked = check_node_health(&node_service, &db).await;
+        let marked = check_node_health(&node_service, &db, long_ago()).await;
         assert_eq!(marked.len(), 2);
         assert!(marked.contains(&1));
         assert!(marked.contains(&2));
@@ -903,7 +1205,7 @@ mod tests {
             .into_connection();
         let node_service = NodeService::new(std::sync::Arc::new(service_db));
 
-        let marked = check_node_health(&node_service, &db).await;
+        let marked = check_node_health(&node_service, &db, long_ago()).await;
         assert_eq!(marked, vec![5]);
     }
 
@@ -942,7 +1244,7 @@ mod tests {
         let node_service = NodeService::new(db.clone());
 
         let nodes = node_service
-            .list_due_for_failover(300)
+            .list_due_for_failover(300, long_ago())
             .await
             .expect("query should succeed");
         assert_eq!(nodes.len(), 1);

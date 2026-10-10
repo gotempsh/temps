@@ -3774,6 +3774,19 @@ impl WorkflowExecutionService {
             }
         }
 
+        // Containers a drain or failover took out of routing on a worker
+        // without confirming they were removed (`retired`, `failed_over`)
+        // are no longer live rows, so neither query above sees them. Once
+        // their deployment is superseded nothing else removes them, and one
+        // on a node that came back keeps running unrouted (#1384). Each is
+        // removed only after Docker's labels confirm it belongs to this
+        // project, like node removal does, and recorded as removed; one that
+        // cannot be confirmed yet (node offline) is left for the next
+        // successful deployment. Bounded per deployment.
+        total_containers_cleaned += self
+            .remove_retired_worker_containers(project_id, environment_id, current_deployment)
+            .await;
+
         if total_containers_cleaned > 0 {
             info!(
                 "Cleaned up {} containers from previous deployments",
@@ -3782,6 +3795,130 @@ impl WorkflowExecutionService {
         }
 
         Ok(first_stopped_container_id)
+    }
+
+    /// See the end of [`Self::teardown_previous_deployment`]. Returns how many
+    /// containers were confirmed gone. Failures are logged, never returned:
+    /// the new deployment is already live.
+    async fn remove_retired_worker_containers(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        current_deployment: &deployments::Model,
+    ) -> usize {
+        use crate::services::node_service::{
+            remove_retired_container, CONTAINER_STATUS_FAILED_OVER,
+            CONTAINER_STATUS_FAILED_OVER_RECOVERING, CONTAINER_STATUS_RETIRED,
+        };
+        use sea_orm::{JoinType, RelationTrait};
+        use temps_entities::{deployment_containers, nodes};
+
+        const MAX_RETIRED_WORKER_CLEANUPS: u64 = 20;
+        // Least recently attempted first, and a failed attempt moves to the
+        // back (below), so containers on one unreachable worker never keep
+        // the ones on other workers from being attempted. Offline nodes are
+        // skipped: nothing on them can be removed until they return.
+        let retired = match deployment_containers::Entity::find()
+            .find_also_related(deployments::Entity)
+            .join(
+                JoinType::InnerJoin,
+                deployment_containers::Relation::Node.def(),
+            )
+            .filter(nodes::Column::Status.ne("offline"))
+            .filter(deployment_containers::Column::DeletedAt.is_not_null())
+            .filter(deployment_containers::Column::NodeId.is_not_null())
+            .filter(deployment_containers::Column::Status.is_in([
+                CONTAINER_STATUS_RETIRED,
+                CONTAINER_STATUS_FAILED_OVER,
+                CONTAINER_STATUS_FAILED_OVER_RECOVERING,
+            ]))
+            .filter(deployments::Column::ProjectId.eq(project_id))
+            .filter(deployments::Column::EnvironmentId.eq(environment_id))
+            .filter(
+                Condition::any()
+                    .add(deployments::Column::CreatedAt.lt(current_deployment.created_at))
+                    .add(
+                        Condition::all()
+                            .add(deployments::Column::CreatedAt.eq(current_deployment.created_at))
+                            .add(deployments::Column::Id.lt(current_deployment.id)),
+                    ),
+            )
+            .order_by_asc(deployment_containers::Column::DeletedAt)
+            .order_by_asc(deployment_containers::Column::Id)
+            .limit(MAX_RETIRED_WORKER_CLEANUPS)
+            .all(self.db.as_ref())
+            .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                warn!(
+                    project_id,
+                    environment_id,
+                    "Could not look up retired worker containers of superseded deployments: {error}"
+                );
+                return 0;
+            }
+        };
+
+        let mut removed = 0;
+        for (container, _) in retired {
+            let outcome = match self.teardown_deployer_for_node(container.node_id).await {
+                Ok(deployer) => remove_retired_container(
+                    self.db.as_ref(),
+                    deployer.as_ref(),
+                    &container,
+                    project_id,
+                )
+                .await
+                .map_err(|error| error.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            match outcome {
+                Ok(()) => {
+                    removed += 1;
+                    info!(
+                        project_id,
+                        deployment_id = container.deployment_id,
+                        node_id = ?container.node_id,
+                        container_id = %container.container_id,
+                        "Removed retired worker container of a superseded deployment"
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        project_id,
+                        deployment_id = container.deployment_id,
+                        node_id = ?container.node_id,
+                        container_id = %container.container_id,
+                        "Retired worker container left for a later cleanup: {error}"
+                    );
+                    // Move it behind the rows not yet attempted: `deleted_at`
+                    // of a row out of routing is when it was last handled.
+                    // Only while the row is as read, so no other outcome is
+                    // overwritten.
+                    let read_status = match &container.status {
+                        Some(status) => deployment_containers::Column::Status.eq(status.clone()),
+                        None => deployment_containers::Column::Status.is_null(),
+                    };
+                    if let Err(error) = deployment_containers::Entity::update_many()
+                        .col_expr(
+                            deployment_containers::Column::DeletedAt,
+                            Expr::value(Some(chrono::Utc::now())),
+                        )
+                        .filter(deployment_containers::Column::Id.eq(container.id))
+                        .filter(read_status)
+                        .exec(self.db.as_ref())
+                        .await
+                    {
+                        warn!(
+                            container_id = %container.container_id,
+                            "Could not reschedule the cleanup of a retired worker container: {error}"
+                        );
+                    }
+                }
+            }
+        }
+        removed
     }
 }
 
@@ -5443,6 +5580,149 @@ mod tests {
         > {
             unimplemented!("not exercised by this test")
         }
+    }
+
+    /// Greptile on #1395: cleanup of retired worker containers must not be
+    /// starved by one unreachable worker. A failed attempt moves the row to
+    /// the back (its `deleted_at` is re-stamped), and containers on offline
+    /// nodes are not attempted at all.
+    #[tokio::test]
+    async fn test_retired_worker_cleanup_rotates_failures_and_skips_offline_nodes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::services::node_service::{
+            CONTAINER_STATUS_FAILED_OVER, CONTAINER_STATUS_RETIRED,
+        };
+        use temps_entities::{deployment_containers, nodes};
+
+        if !docker_available().await {
+            eprintln!("Skipping retired worker cleanup test: Docker unavailable");
+            return Ok(());
+        }
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, current_deployment) = create_test_data(&db).await?;
+
+        let previous_deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("superseded-deployment".to_string()),
+            state: Set("stopped".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            created_at: Set(Utc::now() - chrono::Duration::minutes(30)),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let node = |name: &str, status: &str| nodes::ActiveModel {
+            name: Set(name.to_string()),
+            token_hash: Set("unused".to_string()),
+            // No agent token: the node's deployer cannot be built, so every
+            // attempt on it fails like an unreachable worker.
+            token_encrypted: Set(None),
+            address: Set("https://127.0.0.1:39999".to_string()),
+            private_address: Set("127.0.0.1".to_string()),
+            role: Set("worker".to_string()),
+            status: Set(status.to_string()),
+            labels: Set(serde_json::json!({})),
+            capacity: Set(serde_json::json!({})),
+            dns_resolver_consecutive_failures: Set(0),
+            ..Default::default()
+        };
+        let unreachable = node("unreachable-worker", "active")
+            .insert(db.as_ref())
+            .await?;
+        let offline = node("offline-worker", "offline")
+            .insert(db.as_ref())
+            .await?;
+
+        let handled_at = Utc::now() - chrono::Duration::hours(2);
+        let retired =
+            |container_id: &str, node_id: i32, status: &str| deployment_containers::ActiveModel {
+                deployment_id: Set(previous_deployment.id),
+                container_id: Set(container_id.to_string()),
+                container_name: Set(container_id.to_string()),
+                container_port: Set(3000),
+                status: Set(Some(status.to_string())),
+                node_id: Set(Some(node_id)),
+                deleted_at: Set(Some(handled_at)),
+                deployed_at: Set(Utc::now()),
+                ..Default::default()
+            };
+        let on_unreachable = retired(
+            "retired-unreachable",
+            unreachable.id,
+            CONTAINER_STATUS_RETIRED,
+        )
+        .insert(db.as_ref())
+        .await?;
+        let on_offline = retired(
+            "failed-over-offline",
+            offline.id,
+            CONTAINER_STATUS_FAILED_OVER,
+        )
+        .insert(db.as_ref())
+        .await?;
+
+        let (queue, _receiver) = temps_queue::BroadcastQueueService::create_broadcast_channel(100);
+        let config_service = create_mock_config_service(db.clone());
+        let service = WorkflowExecutionService::new(
+            db.clone(),
+            Arc::new(queue) as Arc<dyn temps_core::JobQueue>,
+            Arc::new(MockGitProvider),
+            Arc::new(MockImageBuilder { should_fail: false }),
+            Arc::new(MockContainerDeployer { should_fail: false }),
+            Arc::new(MockStaticDeployer),
+            Arc::new(LogService::new(std::env::temp_dir())),
+            Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>,
+            Arc::new(crate::jobs::NoOpMetricAlertConfigService)
+                as Arc<dyn crate::jobs::MetricAlertConfigService>,
+            Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
+            config_service.clone(),
+            Arc::new(ScreenshotService::new(config_service).await?),
+            Arc::new(crate::jobs::DeploymentCaptureGuard::default()),
+            Arc::new(DockerHandle::available(Arc::new(
+                bollard::Docker::connect_with_local_defaults()?,
+            ))),
+        );
+
+        let removed = service
+            .remove_retired_worker_containers(project.id, environment.id, &current_deployment)
+            .await;
+        assert_eq!(removed, 0, "nothing could be removed");
+
+        let reread = |id: i32| {
+            let db = db.clone();
+            async move {
+                deployment_containers::Entity::find_by_id(id)
+                    .one(db.as_ref())
+                    .await
+                    .map(|row| row.expect("row exists"))
+            }
+        };
+        let after_unreachable = reread(on_unreachable.id).await?;
+        assert_eq!(
+            after_unreachable.status.as_deref(),
+            Some(CONTAINER_STATUS_RETIRED)
+        );
+        assert!(
+            after_unreachable.deleted_at > Some(handled_at),
+            "a failed attempt moves the row behind those not yet attempted"
+        );
+        let after_offline = reread(on_offline.id).await?;
+        assert_eq!(
+            after_offline.status.as_deref(),
+            Some(CONTAINER_STATUS_FAILED_OVER)
+        );
+        assert_eq!(
+            after_offline.deleted_at.map(|at| at.timestamp_micros()),
+            Some(handled_at.timestamp_micros()),
+            "containers on an offline node are not attempted"
+        );
+        Ok(())
     }
 
     #[tokio::test]

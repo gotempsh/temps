@@ -79,9 +79,10 @@ fn preset_build_root(
             }
         }
     }
-    // A nested Go module or Cargo crate whose `replace`/`path` dependencies or
-    // workspace live beside it builds from the repository root; the preset
-    // runs its commands in the application's directory.
+    // A nested Go module, Cargo crate or Elixir umbrella app whose
+    // `replace`/`path`/`in_umbrella` dependencies or workspace live beside it
+    // builds from the repository root; the preset runs its commands in the
+    // application's directory.
     if let Some(language) = temps_presets::CompiledLanguage::for_preset(preset, app) {
         if temps_presets::compiled_workspace_app(source_root, app, language)
             .map_err(|error| WorkflowError::JobValidationFailed(error.to_string()))?
@@ -2251,6 +2252,59 @@ mod tests {
             );
         }
         assert!(preset_build_root("go", &root, &go_app).is_err());
+    }
+
+    /// #1386: an Elixir umbrella child with an `in_umbrella` sibling builds
+    /// from the repository root for the presets that generate its
+    /// Dockerfile; the umbrella root and a standalone Mix app keep their own
+    /// directory.
+    #[test]
+    fn elixir_umbrella_child_uses_repository_context_for_generated_presets() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        let api = root.join("apps/api");
+        for (path, contents) in [
+            ("mix.exs", "defmodule U.MixProject do\n  use Mix.Project\n  def project, do: [apps_path: \"apps\", deps: []]\nend\n"),
+            (
+                "apps/api/mix.exs",
+                "defmodule Api.MixProject do\n  use Mix.Project\n  def project, do: [app: :api, deps: [{:shared, in_umbrella: true}]]\nend\n",
+            ),
+            (
+                "apps/shared/mix.exs",
+                "defmodule Shared.MixProject do\n  use Mix.Project\n  def project, do: [app: :shared, deps: []]\nend\n",
+            ),
+            ("tools/worker/mix.exs", "defmodule W.MixProject do\n  use Mix.Project\n  def project, do: [app: :worker, deps: [{:jason, \"~> 1.4\"}]]\nend\n"),
+        ] {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+        for preset in ["nixpacks-elixir", "nixpacks", "autopack"] {
+            assert_eq!(
+                preset_build_root(preset, &root, &api).unwrap(),
+                root,
+                "{preset}"
+            );
+            let worker = root.join("tools/worker");
+            assert_eq!(
+                preset_build_root(preset, &root, &worker).unwrap(),
+                worker,
+                "{preset}"
+            );
+            assert_eq!(
+                preset_build_root(preset, &root, &root).unwrap(),
+                root,
+                "{preset}"
+            );
+        }
+        assert_eq!(preset_build_root("dockerfile", &root, &api).unwrap(), api);
+
+        // A sibling that is not in the repository fails before any build.
+        std::fs::remove_dir_all(root.join("apps/shared")).unwrap();
+        assert!(matches!(
+            preset_build_root("nixpacks-elixir", &root, &api),
+            Err(WorkflowError::JobValidationFailed(_))
+        ));
     }
 
     #[test]

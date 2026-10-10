@@ -13,6 +13,7 @@ mod restore_reconcile;
 // can reuse `is_unsupported_error` to decide whether a tagging failure is
 // "this provider doesn't support tags" (warn + continue) vs a real error.
 pub(crate) mod s3_lifecycle;
+pub(crate) mod s3_probe;
 pub use alerts::{sweep_backup_alerts, SweepStats, OVERDUE_GRACE};
 pub use backup::{
     BackupAccessScope, BackupAlertEntry, BackupCollectionAccessScope, BackupError,
@@ -36,3 +37,4 @@ pub use restore_reconcile::{
     RestoreHelperFence, RestoreReconcileReport, INTERRUPTED_STATUS,
 };
 pub use s3_lifecycle::{ReconcileOutcome, S3LifecycleService};
+pub use s3_probe::S3ProbeFailureKind;

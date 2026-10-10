@@ -2400,6 +2400,17 @@ async fn remove_cluster_member(
                 "Failed to remove cluster member {} from service {}: {}",
                 member_id, id, e
             );
+            // Classified before the message matching below, whose "Cannot
+            // remove" would turn this conflict into a 400.
+            if matches!(
+                e,
+                crate::services::ExternalServiceError::ClusterMemberProvisioning { .. }
+            ) {
+                return Err(external_service_problem(
+                    &e,
+                    format!("Failed to remove cluster member: {}", e),
+                ));
+            }
             let msg = e.to_string();
             if msg.contains("not found") {
                 Err(not_found().detail(msg).build())
