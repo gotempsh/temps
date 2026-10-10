@@ -1046,15 +1046,39 @@ pub struct ClusterHealthReportResponse {
     /// Set when the monitor itself was unreachable. UI shows a banner.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub monitor_error: Option<String>,
+    /// Whether a standby could take over if the primary failed now. A new
+    /// cluster accepts SQL before its first standby is `secondary`; until
+    /// then this is `not_protected`.
+    pub protection: ClusterProtectionResponse,
+}
+
+/// Failover protection of a cluster, part of [`ClusterHealthReportResponse`].
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ClusterProtectionResponse {
+    /// `protected` once a healthy, promotable standby is `secondary`;
+    /// `not_protected` while none is (none configured, the first one still
+    /// copying the primary, or all unhealthy); `unknown` when the monitor
+    /// could not be read.
+    pub state: crate::services::ClusterProtectionState,
+    /// Names the protecting standby, or what is missing.
+    #[schema(
+        example = "Not yet protected: standby postgres-app-ha-2 (catchingup) is still copying or catching up with the primary. The cluster accepts writes, but cannot fail over until a standby reaches secondary"
+    )]
+    pub detail: String,
 }
 
 impl From<crate::services::ClusterHealthReport> for ClusterHealthReportResponse {
     fn from(r: crate::services::ClusterHealthReport) -> Self {
+        let protection = r.protection();
         Self {
             checked_at: r.checked_at.to_rfc3339(),
             monitor_response_ms: r.monitor_response_ms,
             members: r.members.into_iter().map(Into::into).collect(),
             monitor_error: r.monitor_error,
+            protection: ClusterProtectionResponse {
+                state: protection.state,
+                detail: protection.detail,
+            },
         }
     }
 }

@@ -1260,6 +1260,149 @@ pub struct ClusterHealthReport {
     /// Set when the monitor itself was unreachable. UI should show a
     /// banner instead of (or above) the table in this case.
     pub monitor_error: Option<String>,
+    /// Data members Temps runs for this cluster beyond the primary, whether
+    /// or not they have registered with the monitor yet. Tells "a standby is
+    /// still being set up" apart from "the cluster has no standby".
+    pub configured_standbys: usize,
+}
+
+/// Whether a cluster could fail over if its primary failed right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ClusterProtectionState {
+    /// At least one healthy, promotable standby is `secondary`.
+    Protected,
+    /// No standby could take over: none is configured, the first one is
+    /// still being cloned (`wait_standby`/`catchingup`), or all are unhealthy.
+    /// The cluster accepts writes, but a primary failure would be an outage.
+    NotProtected,
+    /// The monitor could not be read, so it is not known.
+    Unknown,
+}
+
+/// [`ClusterProtectionState`] plus the sentence that explains it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ClusterProtection {
+    pub state: ClusterProtectionState,
+    /// Names the standby that protects the cluster, or what is missing and
+    /// whether it is expected to resolve on its own.
+    pub detail: String,
+}
+
+impl ClusterHealthReport {
+    /// Whether a standby could take over now, from the monitor's view.
+    ///
+    /// A standby protects the cluster only once pg_auto_failover reports it
+    /// `secondary` (and wants it there), healthy, and promotable
+    /// (`candidate_priority > 0`). Until then a new cluster accepts SQL and
+    /// lists every member as running, yet a primary failure cannot fail over,
+    /// which is what this tells the operator.
+    pub fn protection(&self) -> ClusterProtection {
+        use crate::externalsvc::cluster_role::PgAutoFailoverState;
+
+        if let Some(error) = &self.monitor_error {
+            return ClusterProtection {
+                state: ClusterProtectionState::Unknown,
+                detail: format!(
+                    "Failover protection is unknown: the monitor could not be read ({error})"
+                ),
+            };
+        }
+        let state_of = |m: &ClusterMemberHealth| {
+            m.reported_state
+                .parse::<PgAutoFailoverState>()
+                .unwrap_or(PgAutoFailoverState::Other("(other)"))
+        };
+        // A member the monitor is turning into the primary (`init` → `single`
+        // while the cluster starts) is not a standby, whatever it reports.
+        let becoming_primary = |m: &ClusterMemberHealth| {
+            state_of(m).is_primary()
+                || m.goal_state
+                    .parse::<PgAutoFailoverState>()
+                    .is_ok_and(|goal| goal.is_primary())
+        };
+        let standbys: Vec<&ClusterMemberHealth> = self
+            .members
+            .iter()
+            .filter(|m| !becoming_primary(m))
+            .collect();
+        let ready: Vec<&str> = standbys
+            .iter()
+            .filter(|m| {
+                state_of(m) == PgAutoFailoverState::Secondary
+                    && m.goal_state == "secondary"
+                    && m.health == 1
+                    && m.candidate_priority > 0
+            })
+            .map(|m| m.nodename.as_str())
+            .collect();
+        if !ready.is_empty() {
+            return ClusterProtection {
+                state: ClusterProtectionState::Protected,
+                detail: if ready.len() == 1 {
+                    format!(
+                        "Protected: standby {} is in sync and can take over if the primary fails",
+                        ready[0]
+                    )
+                } else {
+                    format!(
+                        "Protected: standbys {} are in sync and can take over if the primary fails",
+                        ready.join(", ")
+                    )
+                },
+            };
+        }
+        if standbys.is_empty() {
+            return ClusterProtection {
+                state: ClusterProtectionState::NotProtected,
+                detail: if self.configured_standbys > 0 {
+                    format!(
+                        "Not yet protected: {} standby member(s) are still being set up and \
+                         have not registered with the monitor. The cluster cannot fail over \
+                         until a standby reaches secondary",
+                        self.configured_standbys
+                    )
+                } else {
+                    "Not protected: the cluster has no standby, so a primary failure \
+                     cannot fail over. Add a replica member"
+                        .to_string()
+                },
+            };
+        }
+        let cloning: Vec<String> = standbys
+            .iter()
+            .filter(|m| {
+                matches!(m.reported_state.as_str(), "wait_standby" | "catchingup")
+                    || (m.reported_state == "init" && m.goal_state != "init")
+            })
+            .map(|m| format!("{} ({})", m.nodename, m.reported_state))
+            .collect();
+        if !cloning.is_empty() {
+            return ClusterProtection {
+                state: ClusterProtectionState::NotProtected,
+                detail: format!(
+                    "Not yet protected: standby {} is still copying or catching up with \
+                     the primary. The cluster accepts writes, but cannot fail over until a \
+                     standby reaches secondary",
+                    cloning.join(", ")
+                ),
+            };
+        }
+        ClusterProtection {
+            state: ClusterProtectionState::NotProtected,
+            detail: format!(
+                "Not protected: no standby is a healthy, promotable secondary ({})",
+                standbys
+                    .iter()
+                    .map(|m| format!(
+                        "{}: {} → {}, health {}, candidate priority {}",
+                        m.nodename, m.reported_state, m.goal_state, m.health, m.candidate_priority
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        }
+    }
 }
 
 /// Public info about a cluster member.
@@ -5461,6 +5604,7 @@ impl ExternalServiceManager {
             Ok(m) => m,
             Err(e) => {
                 return ClusterHealthReport {
+                    configured_standbys: 0,
                     checked_at: chrono::Utc::now(),
                     monitor_response_ms: 0,
                     members: vec![],
@@ -5471,10 +5615,17 @@ impl ExternalServiceManager {
                 };
             }
         };
+        // Every data member but the primary is meant to be a standby.
+        let configured_standbys = members
+            .iter()
+            .filter(|m| is_role_data_member(&m.role))
+            .count()
+            .saturating_sub(1);
         let monitor = match members.iter().find(|m| is_role_monitor(&m.role)) {
             Some(m) => m,
             None => {
                 return ClusterHealthReport {
+                    configured_standbys: 0,
                     checked_at: chrono::Utc::now(),
                     monitor_response_ms: 0,
                     members: vec![],
@@ -5496,6 +5647,7 @@ impl ExternalServiceManager {
                 Ok(Some(n)) => n.data_address().to_string(),
                 _ => {
                     return ClusterHealthReport {
+                        configured_standbys: 0,
                         checked_at: chrono::Utc::now(),
                         monitor_response_ms: 0,
                         members: vec![],
@@ -5546,6 +5698,7 @@ impl ExternalServiceManager {
         {
             Err(_) => {
                 return ClusterHealthReport {
+                    configured_standbys: 0,
                     checked_at: chrono::Utc::now(),
                     monitor_response_ms: PROBE_TIMEOUT.as_millis() as i64,
                     members: vec![],
@@ -5557,6 +5710,7 @@ impl ExternalServiceManager {
             }
             Ok(Err(e)) => {
                 return ClusterHealthReport {
+                    configured_standbys: 0,
                     checked_at: chrono::Utc::now(),
                     monitor_response_ms: 0,
                     members: vec![],
@@ -5587,6 +5741,7 @@ impl ExternalServiceManager {
         {
             Err(_) => {
                 return ClusterHealthReport {
+                    configured_standbys: 0,
                     checked_at: chrono::Utc::now(),
                     monitor_response_ms: start.elapsed().as_millis() as i64,
                     members: vec![],
@@ -5597,6 +5752,7 @@ impl ExternalServiceManager {
             }
             Ok(Err(e)) => {
                 return ClusterHealthReport {
+                    configured_standbys: 0,
                     checked_at: chrono::Utc::now(),
                     monitor_response_ms: start.elapsed().as_millis() as i64,
                     members: vec![],
@@ -5769,6 +5925,7 @@ impl ExternalServiceManager {
         });
 
         ClusterHealthReport {
+            configured_standbys,
             checked_at: chrono::Utc::now(),
             monitor_response_ms,
             members,
@@ -15435,6 +15592,131 @@ mod tests {
         }
     }
 
+    fn health_report(members: Vec<ClusterMemberHealth>) -> ClusterHealthReport {
+        ClusterHealthReport {
+            configured_standbys: 0,
+            checked_at: chrono::Utc::now(),
+            monitor_response_ms: 5,
+            monitor_error: None,
+            members,
+        }
+    }
+
+    /// The window from the issue: SQL is accepted and every member runs, but
+    /// the only standby is still taking its base backup.
+    #[test]
+    fn a_new_cluster_is_not_yet_protected_while_its_standby_is_cloning() {
+        for standby_state in ["wait_standby", "catchingup"] {
+            let mut standby = cluster_member_health("app-ha-2", standby_state);
+            standby.goal_state = "secondary".to_string();
+            standby.health = -1;
+            let report = health_report(vec![
+                cluster_member_health("app-ha-1", "wait_primary"),
+                standby,
+            ]);
+            let protection = report.protection();
+            assert_eq!(protection.state, ClusterProtectionState::NotProtected);
+            assert!(
+                protection.detail.starts_with("Not yet protected")
+                    && protection.detail.contains("app-ha-2")
+                    && protection.detail.contains(standby_state),
+                "{}",
+                protection.detail
+            );
+        }
+    }
+
+    #[test]
+    fn a_healthy_promotable_secondary_protects_the_cluster() {
+        let report = health_report(vec![
+            cluster_member_health("app-ha-1", "primary"),
+            cluster_member_health("app-ha-2", "secondary"),
+        ]);
+        let protection = report.protection();
+        assert_eq!(protection.state, ClusterProtectionState::Protected);
+        assert!(
+            protection.detail.contains("app-ha-2"),
+            "{}",
+            protection.detail
+        );
+    }
+
+    #[test]
+    fn a_secondary_that_cannot_take_over_does_not_protect_the_cluster() {
+        let mut never_promoted = cluster_member_health("app-ha-2", "secondary");
+        never_promoted.candidate_priority = 0;
+        let mut unhealthy = cluster_member_health("app-ha-3", "secondary");
+        unhealthy.health = 0;
+        let mut leaving = cluster_member_health("app-ha-4", "secondary");
+        leaving.goal_state = "draining".to_string();
+        let report = health_report(vec![
+            cluster_member_health("app-ha-1", "primary"),
+            never_promoted,
+            unhealthy,
+            leaving,
+        ]);
+        let protection = report.protection();
+        assert_eq!(protection.state, ClusterProtectionState::NotProtected);
+        for name in ["app-ha-2", "app-ha-3", "app-ha-4"] {
+            assert!(protection.detail.contains(name), "{}", protection.detail);
+        }
+    }
+
+    /// Before the standby registers with the monitor, only the primary is
+    /// listed; the member being created must not read as "no standby".
+    #[test]
+    fn a_standby_still_being_created_is_not_yet_protected_not_missing() {
+        let mut report = health_report(vec![cluster_member_health("app-ha-1", "single")]);
+        report.configured_standbys = 1;
+        let protection = report.protection();
+        assert_eq!(protection.state, ClusterProtectionState::NotProtected);
+        assert!(
+            protection
+                .detail
+                .starts_with("Not yet protected: 1 standby member(s)"),
+            "{}",
+            protection.detail
+        );
+    }
+
+    /// Seen live: the first member registers as `init` with goal `single`
+    /// while it becomes the primary. It must not be described as a standby.
+    #[test]
+    fn the_member_becoming_primary_is_not_reported_as_a_cloning_standby() {
+        let mut starting = cluster_member_health("app-ha-1", "init");
+        starting.goal_state = "single".to_string();
+        let mut report = health_report(vec![starting]);
+        report.configured_standbys = 1;
+        let protection = report.protection();
+        assert_eq!(protection.state, ClusterProtectionState::NotProtected);
+        assert!(
+            protection
+                .detail
+                .starts_with("Not yet protected: 1 standby member(s)")
+                && !protection.detail.contains("app-ha-1"),
+            "{}",
+            protection.detail
+        );
+    }
+
+    #[test]
+    fn a_cluster_without_a_standby_or_monitor_says_so() {
+        let alone = health_report(vec![cluster_member_health("app-ha-1", "single")]);
+        let protection = alone.protection();
+        assert_eq!(protection.state, ClusterProtectionState::NotProtected);
+        assert!(
+            protection.detail.contains("no standby"),
+            "{}",
+            protection.detail
+        );
+
+        let mut unreadable = health_report(vec![]);
+        unreadable.monitor_error = Some("connection refused".to_string());
+        let protection = unreadable.protection();
+        assert_eq!(protection.state, ClusterProtectionState::Unknown);
+        assert!(protection.detail.contains("connection refused"));
+    }
+
     /// Regression for deployment environment resolution and cluster backups:
     /// both paths used to hand-match only `primary | single`, so an application
     /// deployment could fail with "no running primary data node" during the
@@ -15467,6 +15749,7 @@ mod tests {
         unhealthy_primary.seconds_since_report = 1;
         let promoted = cluster_member_health("orders-2", "wait_primary");
         let unhealthy_report = ClusterHealthReport {
+            configured_standbys: 0,
             checked_at: chrono::Utc::now(),
             monitor_response_ms: 5,
             monitor_error: None,
@@ -15481,6 +15764,7 @@ mod tests {
         stale_primary.health = 1;
         stale_primary.seconds_since_report = 30;
         let stale_report = ClusterHealthReport {
+            configured_standbys: 0,
             checked_at: chrono::Utc::now(),
             monitor_response_ms: 5,
             monitor_error: None,
@@ -15492,6 +15776,7 @@ mod tests {
         );
 
         let ambiguous = ClusterHealthReport {
+            configured_standbys: 0,
             checked_at: chrono::Utc::now(),
             monitor_response_ms: 5,
             monitor_error: None,
@@ -15503,6 +15788,7 @@ mod tests {
         assert!(healthy_writable_primary_nodename(&ambiguous).is_none());
 
         let unreachable = ClusterHealthReport {
+            configured_standbys: 0,
             checked_at: chrono::Utc::now(),
             monitor_response_ms: 0,
             monitor_error: Some("monitor unavailable".to_string()),
@@ -15525,6 +15811,7 @@ mod tests {
     #[test]
     fn primary_member_from_health_blocks_deletion_of_a_wait_primary_member() {
         let health = ClusterHealthReport {
+            configured_standbys: 0,
             checked_at: chrono::Utc::now(),
             monitor_response_ms: 5,
             monitor_error: None,
@@ -15539,6 +15826,7 @@ mod tests {
         // Sanity: an unambiguous non-primary state must not be blocked,
         // and a name absent from the health report must never match.
         let secondary_health = ClusterHealthReport {
+            configured_standbys: 0,
             checked_at: chrono::Utc::now(),
             monitor_response_ms: 5,
             monitor_error: None,

@@ -1,68 +1,63 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import type {
+  ClusterMemberHealthResponse,
+  ClusterProtectionResponse,
+} from '@/api/client'
+
 /**
- * Hand-written helper for the per-cluster health endpoint, pending OpenAPI
- * SDK regeneration.
- *
- * TODO(sdk-regen): replace with generated SDK helper for
- *   - GET /external-services/{id}/cluster-health
- * once `bun run openapi-ts` is re-run against a server that includes the
- * endpoint.
+ * Pure helpers for the cluster Members table. The data comes from the
+ * generated SDK (`getClusterHealthOptions`).
  */
+export type ClusterMemberHealth = ClusterMemberHealthResponse
 
-export interface ClusterMemberHealth {
-  nodename: string
-  nodehost: string
-  nodeport: number
-  /** What the node *last told the monitor* it was. Stale during outages. */
-  reported_state: string
-  /** What the monitor *wants* this node to be. Different mid-transition. */
-  goal_state: string
-  /** pg_auto_failover liveness: 1 healthy, 0 unknown (no recent report), -1 unhealthy. */
-  health: number
-  /** Wall-clock seconds since the node last reported in. */
-  seconds_since_report: number
-  candidate_priority: number
-  replication_quorum: boolean
-  /** sync | quorum | async — null on the primary itself. */
-  sync_state: string | null
-  /** Replay lag from pg_stat_replication, in milliseconds. */
-  replay_lag_ms: number | null
+/** How the panel presents the cluster's failover protection. */
+export interface ProtectionPresentation {
+  tone: 'protected' | 'not-protected' | 'unknown'
+  title: string
+  /** The server's detail without the title it already starts with. */
+  body: string
 }
 
-export interface ClusterHealthReport {
-  /** ISO-8601 wall-clock when the report was generated. */
-  checked_at: string
-  /** Round-trip to query the monitor (ms). */
-  monitor_response_ms: number
-  members: ClusterMemberHealth[]
-  /** Set when the monitor itself was unreachable. */
-  monitor_error?: string | null
+function withoutPrefix(detail: string, title: string): string {
+  if (!detail.startsWith(`${title}: `)) return detail
+  const rest = detail.slice(title.length + 2)
+  return rest.charAt(0).toUpperCase() + rest.slice(1)
 }
 
-async function readJsonOrThrow<T>(response: Response): Promise<T> {
-  if (!response.ok) {
-    let detail = `${response.status} ${response.statusText}`
-    try {
-      const body = await response.json()
-      detail = (body && (body.detail || body.title)) || detail
-    } catch {
-      // fall through with statusText
+/**
+ * `not_protected` is the state a new cluster is in while its first standby
+ * copies the primary: it accepts SQL and every member runs, yet a primary
+ * failure could not fail over. Say so instead of looking ready.
+ */
+export function describeProtection(
+  protection: ClusterProtectionResponse
+): ProtectionPresentation {
+  switch (protection.state) {
+    case 'protected':
+      return {
+        tone: 'protected',
+        title: 'Protected by a standby',
+        body: protection.detail,
+      }
+    case 'not_protected': {
+      const title = protection.detail.startsWith('Not yet protected')
+        ? 'Not yet protected'
+        : 'Not protected'
+      return {
+        tone: 'not-protected',
+        title,
+        body: withoutPrefix(protection.detail, title),
+      }
     }
-    throw new Error(detail)
+    case 'unknown':
+      return {
+        tone: 'unknown',
+        title: 'Protection unknown',
+        body: protection.detail,
+      }
   }
-  return (await response.json()) as T
-}
-
-export async function getClusterHealth(
-  serviceId: number
-): Promise<ClusterHealthReport> {
-  const response = await fetch(
-    `/api/external-services/${serviceId}/cluster-health`,
-    { credentials: 'include' }
-  )
-  return readJsonOrThrow<ClusterHealthReport>(response)
 }
 
 /**
