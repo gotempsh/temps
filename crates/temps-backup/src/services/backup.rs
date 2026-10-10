@@ -990,6 +990,21 @@ pub enum BackupError {
     #[error("S3 error: {0}")]
     S3(String),
 
+    /// An S3 destination could not be verified: it is unreachable, or it
+    /// rejected the configured credentials or bucket. Returned by creating,
+    /// updating and testing a destination; nothing is saved.
+    #[error(
+        "Could not verify S3 bucket '{bucket}' at {endpoint}: {}. {}. Cause: {cause}",
+        .kind.summary(),
+        .kind.hint()
+    )]
+    S3Unreachable {
+        endpoint: String,
+        bucket: String,
+        kind: crate::services::s3_probe::S3ProbeFailureKind,
+        cause: String,
+    },
+
     #[error("Schedule error: {0}")]
     Schedule(String),
 
@@ -3359,241 +3374,42 @@ SELECT cp.id
             // See create_s3_client() above for why this is forced to WhenRequired.
             .request_checksum_calculation(
                 aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+            )
+            // This client only verifies a destination while an operator
+            // waits; bound it so an endpoint that never answers cannot hold
+            // the request open.
+            .timeout_config(
+                aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+                    .operation_timeout(crate::services::s3_probe::S3_PROBE_OPERATION_TIMEOUT)
+                    .build(),
             );
 
         // Only set endpoint URL if endpoint is specified (for MinIO)
         if let Some(endpoint) = &request.endpoint {
-            let endpoint_url = if endpoint.starts_with("http") {
-                endpoint.clone()
-            } else {
-                format!("http://{}", endpoint)
-            };
-            config_builder = config_builder.endpoint_url(endpoint_url);
+            config_builder =
+                config_builder.endpoint_url(crate::services::s3_probe::endpoint_url(endpoint));
         }
 
         let config = config_builder.build();
         Ok(S3Client::from_conf(config))
     }
 
-    /// Test S3 connection and auto-create bucket if it doesn't exist
-    async fn test_and_create_s3_bucket(
+    /// Verify that the destination described by `request` is reachable and
+    /// accepts its credentials, classifying the failure when it is not.
+    async fn verify_s3_destination(
         &self,
-        s3_client: &S3Client,
-        bucket_name: &str,
+        request: &CreateS3SourceRequest,
+        on_missing: crate::services::s3_probe::MissingBucket,
     ) -> Result<(), BackupError> {
-        // Try to check if bucket exists by listing objects with max-keys=1
-        // This is a lightweight way to test access to the bucket
-        match s3_client
-            .list_objects_v2()
-            .bucket(bucket_name)
-            .max_keys(1)
-            .send()
-            .await
-        {
-            Ok(_) => {
-                debug!("S3 bucket '{}' exists and is accessible", bucket_name);
-                Ok(())
-            }
-            Err(e) => {
-                // Check if it's a "NoSuchBucket" error
-                let error_code = e
-                    .as_service_error()
-                    .and_then(|se| se.code())
-                    .map(|s| s.to_string());
-
-                if error_code.as_deref() == Some("NoSuchBucket") {
-                    // Bucket doesn't exist, try to create it
-                    debug!("S3 bucket '{}' does not exist, creating it...", bucket_name);
-                    s3_client
-                        .create_bucket()
-                        .bucket(bucket_name)
-                        .send()
-                        .await
-                        .map_err(|e| {
-                            // Parse create bucket error for better messaging
-                            let error_msg = self.parse_s3_error(&e, bucket_name, "create");
-                            BackupError::S3(error_msg)
-                        })?;
-                    info!("Successfully created S3 bucket '{}'", bucket_name);
-                    Ok(())
-                } else {
-                    // Other S3 error (invalid credentials, no access, etc.)
-                    let error_msg = self.parse_s3_error(&e, bucket_name, "access");
-                    Err(BackupError::S3(error_msg))
-                }
-            }
-        }
-    }
-
-    /// Parse S3 SDK errors and provide user-friendly, actionable error messages
-    fn parse_s3_error<E>(&self, error: &E, bucket_name: &str, operation: &str) -> String
-    where
-        E: std::error::Error + std::fmt::Display,
-    {
-        let error_str = error.to_string();
-
-        // Check for common error patterns and provide actionable guidance
-
-        // Connection/Network errors
-        if error_str.contains("ConnectorError")
-            || error_str.contains("connection")
-            || error_str.contains("ConnectionRefused")
-            || error_str.contains("tcp connect error")
-        {
-            return format!(
-                "Unable to connect to S3 endpoint for bucket '{}'. \
-                Please verify:\n\
-                • The endpoint URL is correct and reachable\n\
-                • Network/firewall allows connections to the S3 service\n\
-                • The S3 service is running (for MinIO/LocalStack)\n\
-                Technical details: {}",
-                bucket_name, error_str
-            );
-        }
-
-        // DNS resolution errors
-        if error_str.contains("dns error")
-            || error_str.contains("failed to lookup address")
-            || error_str.contains("Name or service not known")
-        {
-            return format!(
-                "Failed to resolve S3 endpoint hostname for bucket '{}'. \
-                Please verify:\n\
-                • The endpoint URL is correct\n\
-                • DNS is properly configured\n\
-                • The hostname is valid and resolvable\n\
-                Technical details: {}",
-                bucket_name, error_str
-            );
-        }
-
-        // Timeout errors
-        if error_str.contains("timeout") || error_str.contains("timed out") {
-            return format!(
-                "Connection to S3 endpoint timed out for bucket '{}'. \
-                Please verify:\n\
-                • The S3 service is running and responsive\n\
-                • Network latency is acceptable\n\
-                • Firewall rules allow connections\n\
-                Technical details: {}",
-                bucket_name, error_str
-            );
-        }
-
-        // Authentication errors
-        if error_str.contains("InvalidAccessKeyId")
-            || error_str.contains("SignatureDoesNotMatch")
-            || error_str.contains("InvalidSecurity")
-        {
-            return format!(
-                "Authentication failed for bucket '{}'. \
-                Please verify:\n\
-                • Access Key ID is correct\n\
-                • Secret Access Key is correct\n\
-                • Credentials have not expired\n\
-                • The credentials match the S3 service configuration\n\
-                Technical details: {}",
-                bucket_name, error_str
-            );
-        }
-
-        // Permission/Authorization errors
-        if error_str.contains("AccessDenied")
-            || error_str.contains("Forbidden")
-            || error_str.contains("403")
-        {
-            return format!(
-                "Access denied when trying to {} bucket '{}'. \
-                Please verify:\n\
-                • The credentials have sufficient permissions\n\
-                • The bucket exists and you have access to it\n\
-                • IAM policies allow the required S3 operations\n\
-                • Bucket policies do not restrict access\n\
-                Technical details: {}",
-                operation, bucket_name, error_str
-            );
-        }
-
-        // Bucket already exists (from another account)
-        if error_str.contains("BucketAlreadyExists") {
-            return format!(
-                "Bucket '{}' already exists in another account or region. \
-                Please:\n\
-                • Choose a different bucket name (bucket names must be globally unique)\n\
-                • Or verify you have access to this existing bucket\n\
-                Technical details: {}",
-                bucket_name, error_str
-            );
-        }
-
-        // Region mismatch
-        if error_str.contains("AuthorizationHeaderMalformed") || error_str.contains("region") {
-            return format!(
-                "Region configuration issue for bucket '{}'. \
-                Please verify:\n\
-                • The region is correctly specified\n\
-                • The bucket exists in the specified region\n\
-                • For MinIO/LocalStack, use a valid region (e.g., 'us-east-1')\n\
-                Technical details: {}",
-                bucket_name, error_str
-            );
-        }
-
-        // Invalid bucket name
-        if error_str.contains("InvalidBucketName") {
-            return format!(
-                "Invalid bucket name '{}'. \
-                Bucket names must:\n\
-                • Be between 3 and 63 characters long\n\
-                • Contain only lowercase letters, numbers, dots (.), and hyphens (-)\n\
-                • Begin and end with a letter or number\n\
-                • Not be formatted as an IP address\n\
-                Technical details: {}",
-                bucket_name, error_str
-            );
-        }
-
-        // SSL/TLS errors
-        if error_str.contains("ssl")
-            || error_str.contains("tls")
-            || error_str.contains("certificate")
-        {
-            return format!(
-                "SSL/TLS error when connecting to S3 for bucket '{}'. \
-                Please verify:\n\
-                • The endpoint URL scheme matches the service (http:// for local, https:// for AWS)\n\
-                • SSL certificates are valid (for custom endpoints)\n\
-                • For local development, ensure HTTP is configured correctly\n\
-                Technical details: {}",
-                bucket_name, error_str
-            );
-        }
-
-        // Generic S3 service error
-        if error_str.contains("service error") {
-            return format!(
-                "S3 service error when trying to {} bucket '{}'. \
-                This may be a temporary issue. Please:\n\
-                • Verify the S3 service is operational\n\
-                • Check service status/logs\n\
-                • Try again in a few moments\n\
-                Technical details: {}",
-                operation, bucket_name, error_str
-            );
-        }
-
-        // Default: return a formatted version of the error
-        format!(
-            "Failed to {} S3 bucket '{}': {}\n\
-            \n\
-            Please verify your S3 configuration:\n\
-            • Endpoint URL is correct\n\
-            • Access credentials are valid\n\
-            • Region is correctly specified\n\
-            • Bucket name is valid\n\
-            • Network connectivity to S3 service",
-            operation, bucket_name, error_str
+        let client = self.create_s3_client_from_request(request).await?;
+        verify_s3_bucket(
+            &client,
+            request.endpoint.as_deref(),
+            &request.region,
+            &request.bucket_name,
+            on_missing,
         )
+        .await
     }
 
     async fn upload_backup(
@@ -5815,8 +5631,7 @@ SELECT cp.id
         }
 
         // Test S3 connection and auto-create bucket before persisting
-        let s3_client = self.create_s3_client_from_request(&request).await?;
-        self.test_and_create_s3_bucket(&s3_client, &request.bucket_name)
+        self.verify_s3_destination(&request, crate::services::s3_probe::MissingBucket::Create)
             .await?;
 
         // First source is automatically default; subsequent sources require an explicit
@@ -5883,35 +5698,42 @@ SELECT cp.id
     }
 
     /// Test an S3 connection using stored (encrypted) credentials for an existing source.
-    /// Returns `Ok(())` on success, or `BackupError::S3` with user-friendly guidance on failure.
+    /// Returns `Ok(())` on success, or `BackupError::S3Unreachable` naming the
+    /// endpoint and the classified cause on failure.
     pub async fn test_s3_source_connection(&self, id: i32) -> Result<(), BackupError> {
         let source = self.get_s3_source(id).await?;
+        // The source's own client, so a temporary credential keeps its
+        // session token, bounded like every other reachability check.
         let client = self
             .create_s3_client(&source)
             .await
             .map_err(|e| BackupError::Internal {
                 message: format!("Failed to build S3 client for source {}: {}", id, e),
             })?;
-
-        match client
-            .list_objects_v2()
-            .bucket(&source.bucket_name)
-            .max_keys(1)
-            .send()
-            .await
-        {
-            Ok(_) => {
-                debug!(
-                    "S3 connection test succeeded for source {} (bucket {})",
-                    id, source.bucket_name
-                );
-                Ok(())
-            }
-            Err(e) => {
-                let error_msg = self.parse_s3_error(&e, &source.bucket_name, "access");
-                Err(BackupError::S3(error_msg))
-            }
-        }
+        let client = S3Client::from_conf(
+            client
+                .config()
+                .to_builder()
+                .timeout_config(
+                    aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+                        .operation_timeout(crate::services::s3_probe::S3_PROBE_OPERATION_TIMEOUT)
+                        .build(),
+                )
+                .build(),
+        );
+        verify_s3_bucket(
+            &client,
+            source.endpoint.as_deref(),
+            &source.region,
+            &source.bucket_name,
+            crate::services::s3_probe::MissingBucket::Fail,
+        )
+        .await?;
+        debug!(
+            "S3 connection test succeeded for source {} (bucket {})",
+            id, source.bucket_name
+        );
+        Ok(())
     }
 
     /// Test an S3 connection using credentials from a prospective request (before persistence).
@@ -5926,35 +5748,10 @@ SELECT cp.id
             ));
         }
 
-        let client = self.create_s3_client_from_request(request).await?;
-        match client
-            .list_objects_v2()
-            .bucket(&request.bucket_name)
-            .max_keys(1)
-            .send()
+        // A missing bucket is not a failure: the credentials work, and
+        // creating the source creates the bucket.
+        self.verify_s3_destination(request, crate::services::s3_probe::MissingBucket::Accept)
             .await
-        {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                let error_code = e
-                    .as_service_error()
-                    .and_then(|se| se.code())
-                    .map(|s| s.to_string());
-
-                // NoSuchBucket is not a hard failure — credentials are valid, bucket is
-                // just missing (would be auto-created on actual source creation).
-                if error_code.as_deref() == Some("NoSuchBucket") {
-                    debug!(
-                        "S3 connection test: credentials valid, bucket '{}' does not yet exist",
-                        request.bucket_name
-                    );
-                    Ok(())
-                } else {
-                    let error_msg = self.parse_s3_error(&e, &request.bucket_name, "access");
-                    Err(BackupError::S3(error_msg))
-                }
-            }
-        }
     }
 
     /// Atomically make the given source the default. All other sources will be set to
@@ -8261,6 +8058,69 @@ RETURNING id
             )));
         }
 
+        // Responses mask stored credentials as `***`, and an edit form sends
+        // that value back for a field the operator did not retype. It means
+        // "unchanged": storing it would replace a working credential.
+        let is_unchanged_credential =
+            |value: &Option<String>| value.as_deref().is_none_or(|v| v.is_empty() || v == "***");
+        let mut request = request;
+        if is_unchanged_credential(&request.access_key_id) {
+            request.access_key_id = None;
+        }
+        if is_unchanged_credential(&request.secret_key) {
+            request.secret_key = None;
+        }
+
+        // A change to where or how the destination is reached is verified
+        // exactly like a new destination, before anything is saved.
+        let connection_changed = request.bucket_name.is_some()
+            || request.access_key_id.is_some()
+            || request.secret_key.is_some()
+            || request.region.is_some()
+            || request.endpoint.is_some()
+            || request.force_path_style.is_some();
+        if connection_changed {
+            let decrypt = |field: &str, value: &str| {
+                self.encryption_service
+                    .decrypt_string(value)
+                    .map_err(|error| BackupError::Internal {
+                        message: format!(
+                            "Failed to decrypt the {} of S3 source {} ('{}'): {}",
+                            field, current.id, current.name, error
+                        ),
+                    })
+            };
+            let probe = CreateS3SourceRequest {
+                name: current.name.clone(),
+                bucket_name: request
+                    .bucket_name
+                    .clone()
+                    .unwrap_or_else(|| current.bucket_name.clone()),
+                bucket_path: current.bucket_path.clone(),
+                access_key_id: match &request.access_key_id {
+                    Some(access_key_id) => access_key_id.clone(),
+                    None => decrypt("access key ID", &current.access_key_id)?,
+                },
+                secret_key: match &request.secret_key {
+                    Some(secret_key) => secret_key.clone(),
+                    None => decrypt("secret key", &current.secret_key)?,
+                },
+                region: request
+                    .region
+                    .clone()
+                    .unwrap_or_else(|| current.region.clone()),
+                endpoint: request
+                    .endpoint
+                    .clone()
+                    .or_else(|| current.endpoint.clone()),
+                force_path_style: request.force_path_style.or(current.force_path_style),
+                is_default: None,
+                backing_service_id: current.backing_service_id,
+            };
+            self.verify_s3_destination(&probe, crate::services::s3_probe::MissingBucket::Create)
+                .await?;
+        }
+
         let mut active = current.into_active_model();
 
         if let Some(name) = request.name {
@@ -10096,6 +9956,35 @@ impl temps_providers::externalsvc::postgres_upgrade::PreUpgradeBackupProvider fo
         // per-service child row.
         Ok(child.backup_id)
     }
+}
+
+/// Verify `bucket` through `client`, turning a failure into
+/// [`BackupError::S3Unreachable`] that names the endpoint and the cause.
+async fn verify_s3_bucket(
+    client: &S3Client,
+    endpoint: Option<&str>,
+    region: &str,
+    bucket: &str,
+    on_missing: crate::services::s3_probe::MissingBucket,
+) -> Result<(), BackupError> {
+    crate::services::s3_probe::check_bucket(client, bucket, on_missing)
+        .await
+        .map_err(|failure| {
+            let endpoint = crate::services::s3_probe::display_endpoint(endpoint, region);
+            warn!(
+                endpoint = %endpoint,
+                bucket = %bucket,
+                failure = failure.kind.slug(),
+                cause = %failure.cause,
+                "S3 destination could not be verified"
+            );
+            BackupError::S3Unreachable {
+                endpoint,
+                bucket: bucket.to_string(),
+                kind: failure.kind,
+                cause: failure.cause,
+            }
+        })
 }
 
 #[cfg(test)]
@@ -13291,6 +13180,206 @@ mod tests {
             }
             _ => panic!("Expected validation error for empty name"),
         }
+    }
+
+    fn s3_probe_test_request(endpoint: &str) -> CreateS3SourceRequest {
+        CreateS3SourceRequest {
+            name: "probe".to_string(),
+            bucket_name: "probe".to_string(),
+            bucket_path: "p".to_string(),
+            access_key_id: "test-access-key".to_string(),
+            secret_key: "test-secret-key-never-in-messages".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: Some(endpoint.to_string()),
+            force_path_style: Some(true),
+            is_default: Some(false),
+            backing_service_id: None,
+        }
+    }
+
+    /// An S3 destination whose endpoint cannot be reached is the operator's
+    /// configuration to fix, so the create call must answer with a status and
+    /// a detail that say which endpoint failed and why -- not a bare 500. The
+    /// mock database has no results queued, so reaching the insert would
+    /// surface as a `Database` error instead of the connectivity failure.
+    #[tokio::test]
+    async fn test_create_s3_source_with_unresolvable_endpoint_names_endpoint_and_cause() {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let Ok(backup_service) = build_service_for_mock(db) else {
+            return;
+        };
+        let endpoint = "http://temps-s3-probe.invalid:9000";
+
+        let error = backup_service
+            .create_s3_source(s3_probe_test_request(endpoint))
+            .await
+            .expect_err("an unresolvable endpoint must not be saved");
+
+        let problem = temps_core::problemdetails::Problem::from(error);
+        assert_eq!(problem.status_code, axum::http::StatusCode::BAD_REQUEST);
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(detail.contains(endpoint), "detail: {detail}");
+        assert!(detail.contains("DNS"), "detail: {detail}");
+        assert!(!detail.contains("test-secret-key-never-in-messages"));
+    }
+
+    #[tokio::test]
+    async fn test_create_s3_source_with_refused_endpoint_names_endpoint_and_cause() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let Ok(backup_service) = build_service_for_mock(db) else {
+            return;
+        };
+        let endpoint = format!("http://127.0.0.1:{port}");
+
+        let error = backup_service
+            .create_s3_source(s3_probe_test_request(&endpoint))
+            .await
+            .expect_err("a refused endpoint must not be saved");
+
+        let problem = temps_core::problemdetails::Problem::from(error);
+        assert_eq!(problem.status_code, axum::http::StatusCode::BAD_GATEWAY);
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(detail.contains(&endpoint), "detail: {detail}");
+        assert!(detail.contains("refused"), "detail: {detail}");
+    }
+
+    fn operator_s3_source(encryption: &EncryptionService) -> s3_sources::Model {
+        s3_sources::Model {
+            id: 31,
+            backing_service_id: None,
+            name: "offsite".to_string(),
+            bucket_name: "offsite-bucket".to_string(),
+            bucket_path: "/".to_string(),
+            access_key_id: encryption.encrypt_string("stored-access-key").unwrap(),
+            secret_key: encryption.encrypt_string("stored-secret-key").unwrap(),
+            session_token: None,
+            credentials_expire_at: None,
+            region: "us-east-1".to_string(),
+            endpoint: Some("http://127.0.0.1:9".to_string()),
+            force_path_style: Some(true),
+            is_default: true,
+            managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// Repointing a destination at an endpoint that cannot be reached is
+    /// refused with the classified cause, before anything is written.
+    #[tokio::test]
+    async fn test_update_s3_source_to_an_unreachable_endpoint_saves_nothing() {
+        let encryption = EncryptionService::new("test_encryption_key_1234567890ab").unwrap();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![operator_s3_source(&encryption)]])
+                .into_connection(),
+        );
+        let Ok(service) = build_service_for_mock(db.clone()) else {
+            return;
+        };
+
+        let error = service
+            .update_s3_source(
+                31,
+                crate::handlers::backup_handler::UpdateS3SourceRequest {
+                    name: None,
+                    bucket_name: None,
+                    bucket_path: None,
+                    access_key_id: Some("***".to_string()),
+                    secret_key: Some(String::new()),
+                    region: None,
+                    endpoint: Some("http://temps-s3-probe.invalid:9000".to_string()),
+                    force_path_style: None,
+                },
+            )
+            .await
+            .expect_err("an unreachable endpoint must not be saved");
+
+        match &error {
+            BackupError::S3Unreachable {
+                endpoint,
+                bucket,
+                kind,
+                ..
+            } => {
+                assert_eq!(endpoint, "http://temps-s3-probe.invalid:9000");
+                assert_eq!(bucket, "offsite-bucket");
+                assert_eq!(*kind, crate::services::S3ProbeFailureKind::DnsResolution);
+            }
+            other => panic!("expected S3Unreachable, got {other:?}"),
+        }
+        assert!(!error.to_string().contains("stored-secret-key"));
+        drop(service);
+        let db = Arc::try_unwrap(db).expect("service must release the mock database");
+        assert_eq!(
+            db.into_transaction_log().len(),
+            1,
+            "only the source lookup may run; nothing is written"
+        );
+    }
+
+    /// A rename sends the masked credentials back unchanged: nothing about
+    /// the connection changed, so nothing is probed and the stored
+    /// credentials are kept instead of being replaced by `***`.
+    #[tokio::test]
+    async fn test_update_s3_source_keeps_credentials_sent_back_masked() {
+        let encryption = EncryptionService::new("test_encryption_key_1234567890ab").unwrap();
+        let source = operator_s3_source(&encryption);
+        let renamed = s3_sources::Model {
+            name: "renamed".to_string(),
+            ..source.clone()
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![source.clone()]])
+                .append_query_results(vec![vec![renamed]])
+                .into_connection(),
+        );
+        let Ok(service) = build_service_for_mock(db.clone()) else {
+            return;
+        };
+
+        let updated = service
+            .update_s3_source(
+                31,
+                crate::handlers::backup_handler::UpdateS3SourceRequest {
+                    name: Some("renamed".to_string()),
+                    bucket_name: None,
+                    bucket_path: None,
+                    access_key_id: Some("***".to_string()),
+                    secret_key: Some("***".to_string()),
+                    region: None,
+                    endpoint: None,
+                    force_path_style: None,
+                },
+            )
+            .await
+            .expect("a rename needs no connectivity check");
+        assert_eq!(updated.name, "renamed");
+
+        drop(service);
+        let db = Arc::try_unwrap(db).expect("service must release the mock database");
+        let log = format!("{:?}", db.into_transaction_log());
+        assert!(
+            !log.contains("\"***\""),
+            "masked credentials were written: {log}"
+        );
     }
 
     // -------------------------------------------------------------------------
