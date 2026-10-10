@@ -404,27 +404,45 @@ fn compose_output_level(line: &str) -> LogLevel {
     }
 }
 
+/// Split a batch of output lines into runs of consecutive lines sharing a
+/// log level, preserving order, so an error line is never filed as info.
+fn group_compose_output(batch: Vec<String>) -> Vec<(LogLevel, Vec<String>)> {
+    let mut groups: Vec<(LogLevel, Vec<String>)> = Vec::new();
+    for line in batch {
+        let level = compose_output_level(&line);
+        match groups.last_mut() {
+            Some((last_level, lines)) if *last_level == level => lines.push(line),
+            _ => groups.push((level, vec![line])),
+        }
+    }
+    groups
+}
+
 impl DeployComposeJob {
     /// Stream `docker compose build`/`pull`/`up` output into this job's log
     /// as it happens, so a failing build shows the step that broke and its
     /// full error rather than only the tail attached to the job failure.
-    /// Lines arrive already redacted by the executor.
+    /// Lines arrive already redacted, in batches from a single forwarder, so
+    /// appends never race each other for a line number. Each run of
+    /// consecutive same-level lines becomes one entry, which keeps a verbose
+    /// build to a handful of log writes per batch instead of one per line.
     fn compose_output_sink(&self) -> Option<ComposeOutputSink> {
         let log_id = self.log_id.clone()?;
         let log_service = self.log_service.clone();
-        Some(ComposeOutputSink(Arc::new(move |line: String| {
+        Some(ComposeOutputSink(Arc::new(move |batch: Vec<String>| {
             let log_service = log_service.clone();
             let log_id = log_id.clone();
             Box::pin(async move {
-                let level = compose_output_level(&line);
-                if let Err(error) = log_service
-                    .append_structured_log(&log_id, level, line)
-                    .await
-                {
-                    tracing::warn!(
-                        log_id = %log_id,
-                        "Failed to append docker compose output to deployment log: {error}"
-                    );
+                for (level, lines) in group_compose_output(batch) {
+                    if let Err(error) = log_service
+                        .append_structured_log(&log_id, level, lines.join("\n"))
+                        .await
+                    {
+                        tracing::warn!(
+                            log_id = %log_id,
+                            "Failed to append docker compose output to deployment log: {error}"
+                        );
+                    }
                 }
             })
         })))
@@ -1853,6 +1871,30 @@ pub(crate) fn canonicalize_confined_repo_path(
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn group_compose_output_keeps_order_and_separates_error_runs() {
+        let groups = group_compose_output(vec![
+            "#1 [internal] load build definition".to_string(),
+            "#2 [build 1/3] FROM alpine".to_string(),
+            "#3 ERROR: process did not complete successfully".to_string(),
+            "failed to solve: exit code: 1".to_string(),
+            "#4 DONE".to_string(),
+        ]);
+        let shape: Vec<(LogLevel, usize)> = groups
+            .iter()
+            .map(|(level, lines)| (*level, lines.len()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (LogLevel::Info, 2),
+                (LogLevel::Error, 2),
+                (LogLevel::Info, 1)
+            ]
+        );
+        assert_eq!(groups[1].1[1], "failed to solve: exit code: 1");
+    }
 
     #[test]
     fn compose_output_level_marks_build_failures_as_errors() {

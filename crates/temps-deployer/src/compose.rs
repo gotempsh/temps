@@ -588,6 +588,30 @@ fn sanitize_compose_diagnostic(diagnostic: &str, redact_values: &[String]) -> St
     sanitized
 }
 
+/// Redacted head of an output line cut at [`MAX_STREAMED_LINE_BYTES`].
+///
+/// Redaction runs on the whole head first, so every value fully inside it is
+/// masked. What can remain is a value the cut split in two: its first part
+/// sits in the last bytes of the head, unrecognisable on its own. Dropping as
+/// many trailing bytes as the longest sensitive value removes any such
+/// fragment, and backing up to the previous whitespace removes a split
+/// credential-shaped token (for example a URL whose userinfo was cut before
+/// its `@`), which the pattern rules only match whole.
+fn truncated_line_head(head: &[u8], redact_values: &[String]) -> String {
+    let sanitized = sanitize_compose_diagnostic(&String::from_utf8_lossy(head), redact_values);
+    let longest_value = redact_values.iter().map(String::len).max().unwrap_or(0);
+    let mut end = sanitized.len().saturating_sub(longest_value);
+    while !sanitized.is_char_boundary(end) {
+        end -= 1;
+    }
+    let end = sanitized[..end].rfind(char::is_whitespace).unwrap_or(0);
+    format!(
+        "{} … [line truncated after {} bytes]",
+        sanitized[..end].trim_end(),
+        MAX_STREAMED_LINE_BYTES
+    )
+}
+
 /// Docker and application errors commonly echo credentials as assignments,
 /// bearer headers, or URI userinfo. Cover those forms even for literal values
 /// originating in a repository Compose document. Compiled once: the
@@ -722,16 +746,24 @@ pub struct ComposeDeployRequest {
     /// routed service that exits — even with status 0 — fails the deploy,
     /// while other services may exit 0 as completed one-shot tasks.
     pub routed_services: Vec<String>,
-    /// Receives `docker compose build`, `pull`, and `up` output line by line
-    /// while each command runs, already redacted. Without it a failing build
-    /// shows only the diagnostic tail attached to the error.
+    /// Receives `docker compose build`, `pull`, and `up` output while each
+    /// command runs, already redacted. Without it a failing build shows only
+    /// the diagnostic tail attached to the error.
     pub output_sink: Option<ComposeOutputSink>,
 }
 
-/// Line-by-line receiver for live `docker compose` output, typically the
-/// deployment's job log.
+/// Callback receiving one batch of redacted output lines, in order.
+pub type ComposeOutputCallback = Arc<
+    dyn Fn(Vec<String>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Receiver for live `docker compose` output, typically the deployment's job
+/// log. Lines arrive in batches from a single forwarder, so the callback is
+/// never invoked concurrently and a log writer can number entries safely.
 #[derive(Clone)]
-pub struct ComposeOutputSink(pub crate::LogCallback);
+pub struct ComposeOutputSink(pub ComposeOutputCallback);
 
 impl std::fmt::Debug for ComposeOutputSink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -746,6 +778,13 @@ struct OutputStream<'a> {
     redact_values: &'a [String],
 }
 
+/// One reader's handle for sending redacted lines to the shared forwarder.
+#[derive(Clone)]
+struct LineSender<'a> {
+    tx: tokio::sync::mpsc::Sender<String>,
+    redact_values: &'a [String],
+}
+
 /// Which end of a command's output survives when it exceeds
 /// [`MAX_COMPOSE_COMMAND_OUTPUT_BYTES`].
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -754,9 +793,21 @@ enum CapturedEnd {
     Tail,
 }
 
-/// Longest single line forwarded to the sink. Output without newlines (a
-/// minified error blob) is forwarded in pieces rather than buffered unbounded.
-const MAX_STREAMED_LINE_BYTES: usize = 8 * 1024;
+/// Longest single line forwarded to the sink. A longer line (a minified error
+/// blob) is truncated rather than buffered unbounded, and never forwarded in
+/// pieces: a piece could carry a fragment of a sensitive value that no
+/// redaction rule recognises on its own.
+const MAX_STREAMED_LINE_BYTES: usize = 16 * 1024;
+/// Lines waiting between the readers and the forwarder. A full channel makes
+/// the readers wait, which in turn backpressures the Compose CLI.
+const OUTPUT_CHANNEL_LINES: usize = 1024;
+/// A batch is flushed once it holds this many lines or bytes, or once
+/// [`OUTPUT_BATCH_WINDOW`] has passed since its first line. Batching keeps a
+/// verbose build from issuing one log write per line, and the byte bound
+/// stays well under the durable log's per-entry limit.
+const MAX_OUTPUT_BATCH_LINES: usize = 200;
+const MAX_OUTPUT_BATCH_BYTES: usize = 256 * 1024;
+const OUTPUT_BATCH_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Result for a single compose service after deployment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4324,10 +4375,13 @@ impl ComposeExecutor {
                     && normalized.bytes().all(|byte| byte.is_ascii_hexdigit()));
             let is_temps_internal =
                 normalized == "temps.internal" || normalized.starts_with("temps.internal/");
-            // Each cause gets its own reason naming the offending value and
-            // the fix that applies to it: a shared message cannot tell the
-            // reader which of the three rules fired, nor which one they can
-            // actually change.
+            // Each cause gets its own reason and the fix that applies to it: a
+            // shared message cannot tell the reader which of the rules fired,
+            // nor which one they can change. Only an unresolved `${...}`
+            // expression is quoted. It is repository text, never a value:
+            // when the interpolation check is relaxed, this runs on the
+            // resolved model, where a literal may have come from a project
+            // variable and must not be copied into a deployment error.
             let rejection = if Self::contains_interpolation(image) {
                 Some(if has_build {
                     format!(
@@ -4345,17 +4399,19 @@ impl ComposeExecutor {
                     )
                 })
             } else if self.enforced(PolicyCheck::ImageReferences) && is_temps_internal {
-                Some(format!(
-                    "image '{image}' refers to a Temps-internal image, which may belong to \
-                     another deployment. Use build: to build this service from source, or a \
-                     registry reference"
-                ))
+                Some(
+                    "image refers to a Temps-internal (temps.internal/...) image, which may \
+                     belong to another deployment. Use build: to build this service from \
+                     source, or a registry reference"
+                        .to_string(),
+                )
             } else if self.enforced(PolicyCheck::ImageReferences) && is_raw_image_id {
-                Some(format!(
-                    "image '{image}' is a raw image ID, which can select another deployment's \
-                     local image. Use a registry reference such as ghcr.io/org/app:1.2.3 or \
-                     ghcr.io/org/app@sha256:<digest>"
-                ))
+                Some(
+                    "image is a raw image ID (sha256:...), which can select another \
+                     deployment's local image. Use a registry reference such as \
+                     ghcr.io/org/app:1.2.3 or ghcr.io/org/app@sha256:<digest>"
+                        .to_string(),
+                )
             } else {
                 None
             };
@@ -4370,11 +4426,10 @@ impl ComposeExecutor {
                 return Err(ComposeError::SecurityPolicyViolation {
                     service: service_name.to_string(),
                     field: "image".to_string(),
-                    reason: format!(
-                        "image '{image}' is set on a service that also has build:. Remove \
-                         image:; Temps assigns a deployment-scoped name to the image it builds \
-                         so it cannot collide with another deployment's tag"
-                    ),
+                    reason: "image is set on a service that also has build:. Remove image:; \
+                             Temps assigns a deployment-scoped name to the image it builds so \
+                             it cannot collide with another deployment's tag"
+                        .to_string(),
                 });
             }
         }
@@ -6049,14 +6104,42 @@ impl ComposeExecutor {
                 project: project_name.to_string(),
                 reason: format!("{operation} did not expose stderr"),
             })?;
+        // Both readers feed one forwarder, so the sink sees a single ordered
+        // writer instead of two concurrent ones.
+        let (stdout_lines, stderr_lines, forwarder) = match stream {
+            Some(stream) => {
+                let (tx, rx) = tokio::sync::mpsc::channel(OUTPUT_CHANNEL_LINES);
+                let stdout_lines = LineSender {
+                    tx: tx.clone(),
+                    redact_values: stream.redact_values,
+                };
+                let stderr_lines = LineSender {
+                    tx,
+                    redact_values: stream.redact_values,
+                };
+                (
+                    Some(stdout_lines),
+                    Some(stderr_lines),
+                    Some(Self::forward_output(rx, stream.sink)),
+                )
+            }
+            None => (None, None, None),
+        };
         let run = async {
+            let forward = async {
+                if let Some(forwarder) = forwarder {
+                    forwarder.await;
+                }
+                Ok::<_, std::io::Error>(())
+            };
             // stdout is parsed as data by some callers, where a truncated
             // tail could parse as a different document; stderr is only ever
             // a diagnostic, whose error is at the end.
-            let (stdout, stderr, status) = tokio::try_join!(
-                Self::read_bounded_stream(stdout, CapturedEnd::Head, stream),
-                Self::read_bounded_stream(stderr, CapturedEnd::Tail, stream),
-                child.wait()
+            let (stdout, stderr, status, ()) = tokio::try_join!(
+                Self::read_bounded_stream(stdout, CapturedEnd::Head, stdout_lines),
+                Self::read_bounded_stream(stderr, CapturedEnd::Tail, stderr_lines),
+                child.wait(),
+                forward
             )?;
             Ok::<_, std::io::Error>(std::process::Output {
                 status,
@@ -6078,13 +6161,17 @@ impl ComposeExecutor {
     async fn read_bounded_stream<R>(
         mut reader: R,
         keep: CapturedEnd,
-        stream: Option<OutputStream<'_>>,
+        lines: Option<LineSender<'_>>,
     ) -> Result<Vec<u8>, std::io::Error>
     where
         R: tokio::io::AsyncRead + Unpin,
     {
         let mut captured = Vec::new();
+        let mut trimmed = false;
         let mut line = Vec::new();
+        // Set once the current line passes MAX_STREAMED_LINE_BYTES: its head
+        // has been forwarded and the rest is skipped until the next newline.
+        let mut skipping = false;
         let mut buffer = [0_u8; 8192];
         loop {
             let read = reader.read(&mut buffer).await?;
@@ -6103,42 +6190,98 @@ impl ComposeExecutor {
                     // not shift a megabyte on every read.
                     if captured.len() > 2 * MAX_COMPOSE_COMMAND_OUTPUT_BYTES {
                         captured.drain(..captured.len() - MAX_COMPOSE_COMMAND_OUTPUT_BYTES);
+                        trimmed = true;
                     }
                 }
             }
-            if let Some(stream) = stream {
+            if let Some(lines) = lines.as_ref() {
                 for &byte in chunk {
                     if byte == b'\n' || byte == b'\r' {
-                        Self::forward_line(stream, &mut line).await;
-                    } else {
+                        if !skipping {
+                            Self::send_line(lines, &line).await;
+                        }
+                        line.clear();
+                        skipping = false;
+                    } else if !skipping {
                         line.push(byte);
                         if line.len() >= MAX_STREAMED_LINE_BYTES {
-                            Self::forward_line(stream, &mut line).await;
+                            Self::send_truncated_line(lines, &line).await;
+                            line.clear();
+                            skipping = true;
                         }
                     }
                 }
             }
         }
-        if let Some(stream) = stream {
-            Self::forward_line(stream, &mut line).await;
+        if let Some(lines) = lines.as_ref() {
+            if !skipping {
+                Self::send_line(lines, &line).await;
+            }
         }
         if captured.len() > MAX_COMPOSE_COMMAND_OUTPUT_BYTES {
             captured.drain(..captured.len() - MAX_COMPOSE_COMMAND_OUTPUT_BYTES);
+            trimmed = true;
+        }
+        if trimmed {
+            // The cut can land inside a sensitive value, leaving a fragment no
+            // redaction rule recognises. Start at the next whole line instead.
+            // Output with no newline at all is kept: the diagnostic built from
+            // it keeps only its last MAX_COMPOSE_DIAGNOSTIC_BYTES, far from
+            // this cut.
+            if let Some(newline) = captured.iter().position(|byte| *byte == b'\n') {
+                captured.drain(..=newline);
+            }
         }
         Ok(captured)
     }
 
-    /// Redact and forward one buffered line, then clear it. Blank lines
+    /// Redact one complete line and hand it to the forwarder. Blank lines
     /// (including the empty half of a `\r\n`) are dropped.
-    async fn forward_line(stream: OutputStream<'_>, line: &mut Vec<u8>) {
-        if !line.iter().all(u8::is_ascii_whitespace) {
-            let text = sanitize_compose_diagnostic(
-                String::from_utf8_lossy(line).trim_end(),
-                stream.redact_values,
-            );
-            (stream.sink.0)(text).await;
+    async fn send_line(lines: &LineSender<'_>, line: &[u8]) {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            return;
         }
-        line.clear();
+        let text = sanitize_compose_diagnostic(
+            String::from_utf8_lossy(line).trim_end(),
+            lines.redact_values,
+        );
+        // The forwarder outlives both readers; a closed channel only means
+        // the command is being abandoned (timeout), so the line is moot.
+        let _ = lines.tx.send(text).await;
+    }
+
+    /// Forward the head of a line that exceeded [`MAX_STREAMED_LINE_BYTES`].
+    /// The cut may fall inside a sensitive value whose remainder never
+    /// arrives, so after redacting the head as a whole, drop as many trailing
+    /// bytes as the longest known sensitive value and then back to the
+    /// previous whitespace: no partial value, and no partial credential-shaped
+    /// token such as a URL with userinfo, survives the cut.
+    async fn send_truncated_line(lines: &LineSender<'_>, head: &[u8]) {
+        let _ = lines
+            .tx
+            .send(truncated_line_head(head, lines.redact_values))
+            .await;
+    }
+
+    /// Drain redacted lines into batches and deliver each batch to `sink`.
+    /// Runs until both readers have finished and the channel is empty.
+    async fn forward_output(mut rx: tokio::sync::mpsc::Receiver<String>, sink: &ComposeOutputSink) {
+        while let Some(first) = rx.recv().await {
+            let deadline = tokio::time::Instant::now() + OUTPUT_BATCH_WINDOW;
+            let mut batch_bytes = first.len();
+            let mut batch = vec![first];
+            while batch.len() < MAX_OUTPUT_BATCH_LINES && batch_bytes < MAX_OUTPUT_BATCH_BYTES {
+                match tokio::time::timeout_at(deadline, rx.recv()).await {
+                    Ok(Some(line)) => {
+                        batch_bytes += line.len();
+                        batch.push(line);
+                    }
+                    // Channel closed or window elapsed: deliver what we have.
+                    Ok(None) | Err(_) => break,
+                }
+            }
+            (sink.0)(batch).await;
+        }
     }
 
     /// The `-f` and `--env-file` arguments shared by every `docker compose`
@@ -12096,30 +12239,41 @@ volumes:
     }
 
     #[test]
-    fn test_image_rejection_names_the_value_and_the_fix_for_each_cause() {
+    fn test_image_rejection_explains_each_cause_without_echoing_resolved_values() {
         let Some(executor) = test_executor() else {
             return;
         };
-        for (compose, expected) in [
+        // (compose, fragments the message must contain, fragment it must not)
+        for (compose, expected, absent) in [
             (
                 "services:\n  app:\n    image: ${IMAGE}\n    build: .\n",
                 ["'${IMAGE}'", "Remove image:"],
+                None,
             ),
             (
                 "services:\n  app:\n    image: ghcr.io/org/app:${TAG:-latest}\n",
-                ["'ghcr.io/org/app:${TAG:-latest}'", "Block variables in guarded fields"],
+                [
+                    "'ghcr.io/org/app:${TAG:-latest}'",
+                    "Block variables in guarded fields",
+                ],
+                None,
             ),
             (
                 "services:\n  app:\n    image: temps.internal/victim:latest\n",
-                ["'temps.internal/victim:latest'", "Temps-internal image"],
+                ["Temps-internal", "registry reference"],
+                Some("victim"),
             ),
             (
                 "services:\n  app:\n    image: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
-                ["'sha256:aaaa", "raw image ID"],
+                ["raw image ID", "registry reference"],
+                Some("aaaaaaaa"),
             ),
+            // With the interpolation check relaxed this runs on the resolved
+            // model, where the literal may be a project variable's value.
             (
-                "services:\n  app:\n    image: alpine\n    build: .\n",
-                ["'alpine'", "Remove image:"],
+                "services:\n  app:\n    image: resolved-private-value\n    build: .\n",
+                ["Remove image:", "service 'app'"],
+                Some("resolved-private-value"),
             ),
         ] {
             let message = executor
@@ -12130,6 +12284,12 @@ volumes:
                 assert!(
                     message.contains(fragment),
                     "rejection of {compose:?} should mention {fragment:?}: {message}"
+                );
+            }
+            if let Some(absent) = absent {
+                assert!(
+                    !message.contains(absent),
+                    "rejection of {compose:?} must not echo {absent:?}: {message}"
                 );
             }
         }
@@ -13420,41 +13580,162 @@ services:
         }
     }
 
-    #[tokio::test]
-    async fn streamed_output_is_forwarded_per_line_redacted_and_tail_captured() {
-        let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let received = lines.clone();
-        let sink = ComposeOutputSink(Arc::new(move |line: String| {
-            let received = received.clone();
+    /// What a [`recording_sink`] saw: every batch, in delivery order, and
+    /// whether two deliveries ever overlapped.
+    struct SinkRecording {
+        batches: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+        overlapped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    fn recording_sink() -> (ComposeOutputSink, SinkRecording) {
+        let recording = SinkRecording {
+            batches: Arc::new(std::sync::Mutex::new(Vec::new())),
+            overlapped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (received, overlap) = (recording.batches.clone(), recording.overlapped.clone());
+        let sink = ComposeOutputSink(Arc::new(move |batch: Vec<String>| {
+            let (received, overlap, busy) = (received.clone(), overlap.clone(), in_flight.clone());
             Box::pin(async move {
-                if let Ok(mut lines) = received.lock() {
-                    lines.push(line);
+                if busy.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    overlap.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
+                // Yield so an overlapping delivery would actually interleave.
+                tokio::task::yield_now().await;
+                if let Ok(mut batches) = received.lock() {
+                    batches.push(batch);
+                }
+                busy.store(false, std::sync::atomic::Ordering::SeqCst);
             })
         }));
+        (sink, recording)
+    }
+
+    #[tokio::test]
+    async fn streamed_lines_are_redacted_and_the_last_unterminated_line_is_sent() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         let redact = vec!["s3cr3t-value".to_string()];
-        let stream = OutputStream {
-            sink: &sink,
+        let lines = LineSender {
+            tx,
             redact_values: &redact,
         };
         let output: &[u8] =
             b"#1 [internal] load build definition\r\n\n#2 ARG TOKEN=s3cr3t-value\n#3 ERROR: boom";
 
-        let captured =
-            ComposeExecutor::read_bounded_stream(output, CapturedEnd::Tail, Some(stream))
-                .await
-                .unwrap();
+        let captured = ComposeExecutor::read_bounded_stream(output, CapturedEnd::Tail, Some(lines))
+            .await
+            .unwrap();
 
         assert_eq!(captured, output);
-        let lines = lines.lock().unwrap().clone();
+        let mut received = Vec::new();
+        while let Some(line) = rx.recv().await {
+            received.push(line);
+        }
         assert_eq!(
-            lines,
+            received,
             vec![
                 "#1 [internal] load build definition".to_string(),
                 "#2 ARG TOKEN=<redacted>".to_string(),
-                // The final line has no newline and is still delivered.
                 "#3 ERROR: boom".to_string(),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_overlong_line_never_forwards_a_fragment_of_a_sensitive_value() {
+        let secret = "Zq7Xw2Lp9Vn4Rb8T".to_string();
+        let redact = vec![secret.clone()];
+        // The secret starts just before the cut, so the head carries only
+        // its first bytes, and the rest of it arrives after the cut.
+        let mut output = "x".repeat(MAX_STREAMED_LINE_BYTES - 5).into_bytes();
+        output.push(b' ');
+        output.extend_from_slice(secret.as_bytes());
+        output.extend_from_slice(b" trailing\n#9 next line\n");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let lines = LineSender {
+            tx,
+            redact_values: &redact,
+        };
+
+        ComposeExecutor::read_bounded_stream(output.as_slice(), CapturedEnd::Tail, Some(lines))
+            .await
+            .unwrap();
+
+        let mut received = Vec::new();
+        while let Some(line) = rx.recv().await {
+            received.push(line);
+        }
+        assert_eq!(received.len(), 2, "{received:?}");
+        assert!(received[0].ends_with("[line truncated after 16384 bytes]"));
+        for fragment in [&secret[..4], &secret[..3]] {
+            assert!(
+                !received[0].contains(fragment),
+                "truncated line leaked {fragment:?}"
+            );
+        }
+        // The remainder of the overlong line is skipped, not forwarded.
+        assert!(!received.iter().any(|line| line.contains("trailing")));
+        assert_eq!(received[1], "#9 next line");
+    }
+
+    #[test]
+    fn truncated_line_head_drops_a_split_credential_token() {
+        let head = b"pulling from https://deploy:hunter2-long-pass";
+        let line = truncated_line_head(head, &[]);
+        assert!(!line.contains("hunter2"), "{line}");
+        assert!(line.starts_with("pulling from"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn stdout_and_stderr_reach_the_sink_in_batches_from_a_single_writer() {
+        let (sink, recording) = recording_sink();
+        let redact: Vec<String> = Vec::new();
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "i=0; while [ $i -lt 300 ]; do echo out-$i; echo err-$i >&2; i=$((i+1)); done",
+        ]);
+
+        let output = ComposeExecutor::bounded_command_output_streamed(
+            command,
+            std::time::Duration::from_secs(30),
+            "temps-stream-test",
+            "stream test",
+            Some(OutputStream {
+                sink: &sink,
+                redact_values: &redact,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(output.status.success());
+        assert!(!recording
+            .overlapped
+            .load(std::sync::atomic::Ordering::SeqCst));
+        let batches = recording.batches.lock().unwrap().clone();
+        assert!(
+            batches.len() < 600,
+            "600 lines must be batched, got {} deliveries",
+            batches.len()
+        );
+        assert!(batches
+            .iter()
+            .all(|batch| !batch.is_empty() && batch.len() <= MAX_OUTPUT_BATCH_LINES));
+        let lines: Vec<&String> = batches.iter().flatten().collect();
+        assert_eq!(lines.len(), 600);
+        // Each stream's own order is preserved.
+        let stdout_order: Vec<&&String> = lines
+            .iter()
+            .filter(|line| line.starts_with("out-"))
+            .collect();
+        assert_eq!(
+            stdout_order.first().map(|line| line.as_str()),
+            Some("out-0")
+        );
+        assert_eq!(
+            stdout_order.last().map(|line| line.as_str()),
+            Some("out-299")
         );
     }
 
@@ -13470,10 +13751,27 @@ services:
             .await
             .unwrap();
 
+        // No newline anywhere: the single line is kept as captured.
         assert_eq!(tail.len(), MAX_COMPOSE_COMMAND_OUTPUT_BYTES);
         assert!(tail.ends_with(b"the error"));
         assert_eq!(head.len(), MAX_COMPOSE_COMMAND_OUTPUT_BYTES);
         assert!(head.iter().all(|byte| *byte == b'a'));
+    }
+
+    #[tokio::test]
+    async fn trimmed_stderr_starts_at_a_whole_line() {
+        // A sensitive value split by the trim must not open the capture.
+        let mut output =
+            b"prefix TOKEN-VALUE-SPLIT-HERE\n".repeat(MAX_COMPOSE_COMMAND_OUTPUT_BYTES / 10);
+        output.extend_from_slice(b"final error\n");
+
+        let tail = ComposeExecutor::read_bounded_stream(output.as_slice(), CapturedEnd::Tail, None)
+            .await
+            .unwrap();
+
+        assert!(tail.len() <= MAX_COMPOSE_COMMAND_OUTPUT_BYTES);
+        assert!(tail.starts_with(b"prefix TOKEN-VALUE-SPLIT-HERE\n"));
+        assert!(tail.ends_with(b"final error\n"));
     }
 
     /// A real failing `docker compose build`: project variables reach the
@@ -13537,16 +13835,7 @@ services:
         .await
         .unwrap();
 
-        let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let received = lines.clone();
-        let sink = ComposeOutputSink(Arc::new(move |line: String| {
-            let received = received.clone();
-            Box::pin(async move {
-                if let Ok(mut lines) = received.lock() {
-                    lines.push(line);
-                }
-            })
-        }));
+        let (sink, recording) = recording_sink();
         // Only the token is sensitive here, so the greeting stays readable.
         let redact = vec!["tok-7f3a9c1e5b".to_string()];
         let project_name = format!("temps-build-stream-{}", std::process::id());
@@ -13563,7 +13852,7 @@ services:
             .await
             .expect_err("the Dockerfile exits 3, so the build must fail");
 
-        let streamed = lines.lock().unwrap().join("\n");
+        let streamed = recording.batches.lock().unwrap().concat().join("\n");
         assert!(
             streamed.contains(&format!("greeting={greeting}")),
             "project variables must reach the Dockerfile as build args:\n{streamed}"
