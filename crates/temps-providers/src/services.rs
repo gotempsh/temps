@@ -9620,8 +9620,32 @@ echo "[restore] Pre-seed complete"
             container = %plan.container_name,
             "Provisioning replica container"
         );
-        self.set_provisioning_step(member_id, member_provisioning_step::PROVISIONING_CONTAINER)
-            .await;
+        // Fence the irreversible step: the container is only created while
+        // the member row still exists. A row deleted meanwhile (its cluster
+        // was deleted) means nothing must be created for it.
+        match self
+            .claim_provisioning_step(member_id, member_provisioning_step::PROVISIONING_CONTAINER)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                info!(
+                    service_id,
+                    member_id,
+                    container = %plan.container_name,
+                    "Cluster member was deleted before its container was created; not creating it"
+                );
+                return;
+            }
+            Err(e) => {
+                self.fail_member(
+                    member_id,
+                    format!("Could not record the provisioning step: {}", e),
+                )
+                .await;
+                return;
+            }
+        }
 
         let create_outcome: Result<(String, Option<i32>, Option<String>), ExternalServiceError> =
             if let Some(nid) = plan.spec.node_id {
@@ -9719,13 +9743,30 @@ echo "[restore] Pre-seed complete"
             .filter(service_members::Column::Id.eq(member_id))
             .exec(self.db.as_ref())
             .await;
-        if let Err(e) = update_result {
-            self.fail_member(
-                member_id,
-                format!("Container created but DB update failed: {}", e),
-            )
-            .await;
-            return;
+        match update_result {
+            Ok(result) if result.rows_affected == 0 => {
+                // The row was deleted while the container was being created
+                // (its cluster was deleted): nothing tracks this container,
+                // so it would run, restart and keep its volume forever.
+                warn!(
+                    service_id,
+                    member_id,
+                    container = %plan.container_name,
+                    "Cluster member was deleted while its container was being created; \
+                     removing the container and its volume"
+                );
+                self.discard_member_container(&plan).await;
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                self.fail_member(
+                    member_id,
+                    format!("Container created but DB update failed: {}", e),
+                )
+                .await;
+                return;
+            }
         }
 
         // Register Tier-2 DNS A record using the same topology-aware
@@ -9781,8 +9822,30 @@ echo "[restore] Pre-seed complete"
             }
         }
 
-        self.set_provisioning_step(member_id, member_provisioning_step::DONE)
-            .await;
+        if let Ok(false) = self
+            .claim_provisioning_step(member_id, member_provisioning_step::DONE)
+            .await
+        {
+            // Removed while its DNS record was being registered: the removal
+            // already deleted the container and the row, so the record just
+            // written would point at nothing.
+            if let Err(e) = self
+                .dns_registry
+                .delete_by_owner(
+                    temps_dns::InternalOwnerKind::ServiceMember,
+                    member_id as i64,
+                )
+                .await
+            {
+                warn!(
+                    service_id,
+                    member_id,
+                    error = %e,
+                    "Failed to drop the DNS record of a cluster member removed during provisioning"
+                );
+            }
+            return;
+        }
         info!(
             service_id,
             member_id,
@@ -9791,22 +9854,85 @@ echo "[restore] Pre-seed complete"
         );
     }
 
-    /// Update the member row's `provisioning_step` field. Used by the
-    /// background provisioning task at each phase boundary so the
-    /// frontend's polling loop can render progress.
-    async fn set_provisioning_step(&self, member_id: i32, step: &str) {
+    /// Record `step` on the member row. `Ok(false)` when the row no longer
+    /// exists, which is what fences each irreversible provisioning step: the
+    /// update is a single statement, so it either lands on the live row or
+    /// tells the task the member is gone.
+    async fn claim_provisioning_step(
+        &self,
+        member_id: i32,
+        step: &str,
+    ) -> Result<bool, sea_orm::DbErr> {
         let result = service_members::Entity::update_many()
             .col_expr(service_members::Column::ProvisioningStep, Expr::value(step))
             .col_expr(service_members::Column::UpdatedAt, Expr::value(Utc::now()))
             .filter(service_members::Column::Id.eq(member_id))
             .exec(self.db.as_ref())
-            .await;
-        if let Err(e) = result {
-            warn!(
-                member_id,
-                step,
+            .await?;
+        Ok(result.rows_affected > 0)
+    }
+
+    /// Remove the container (and its data volume) that provisioning created
+    /// for a member whose row is gone. Best effort, logged: there is no row
+    /// left to record a failure on.
+    async fn discard_member_container(&self, plan: &AddMemberPlan) {
+        let service_id = plan.service_id;
+        if let Some(node_id) = plan.spec.node_id {
+            match self.get_remote_client(node_id).await {
+                Ok(client) => {
+                    if let Err(e) = client.remove_service(&plan.container_name).await {
+                        error!(
+                            service_id,
+                            node_id,
+                            container = %plan.container_name,
+                            error = %e,
+                            "Failed to remove the container of a deleted cluster member on its worker"
+                        );
+                    }
+                }
+                Err(e) => error!(
+                    service_id,
+                    node_id,
+                    container = %plan.container_name,
+                    error = %e,
+                    "Could not reach the worker to remove the container of a deleted cluster member"
+                ),
+            }
+            return;
+        }
+        let Some(docker) = self.docker.get() else {
+            return;
+        };
+        if let Err(e) = docker
+            .remove_container(
+                &plan.container_name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+        {
+            error!(
+                service_id,
+                container = %plan.container_name,
                 error = %e,
-                "Failed to write provisioning_step"
+                "Failed to remove the container of a deleted cluster member"
+            );
+        }
+        let volume_name = format!("{}_data", plan.container_name);
+        if let Err(e) = docker
+            .remove_volume(
+                &volume_name,
+                None::<bollard::query_parameters::RemoveVolumeOptions>,
+            )
+            .await
+        {
+            warn!(
+                service_id,
+                volume = %volume_name,
+                error = %e,
+                "Failed to remove the data volume of a deleted cluster member"
             );
         }
     }
@@ -9941,6 +10067,23 @@ echo "[restore] Pre-seed complete"
                 service_id,
                 reason: "Cannot remove the monitor — it is required for cluster operation"
                     .to_string(),
+            });
+        }
+        // A member still `creating` has a provisioning task that has not yet
+        // recorded its container. Deleting the row now would let that task
+        // create the container afterwards, untracked by anything (#1385).
+        // The task reaches `running` or `failed` on its own, and a control
+        // plane restart moves an abandoned `creating` row to `failed`, so
+        // this never blocks removal for good.
+        if member.status == "creating" {
+            return Err(ExternalServiceError::ClusterMemberProvisioning {
+                service_id,
+                action: "remove a member from",
+                container_name: member.container_name.clone(),
+                status: format!(
+                    "creating, step '{}'",
+                    member.provisioning_step.as_deref().unwrap_or("unknown")
+                ),
             });
         }
         // Block removal of whichever node pg_auto_failover *currently*
@@ -15509,6 +15652,232 @@ mod tests {
             members: vec![cluster_member_health("orders-2", "wait_primary")],
         };
         assert!(healthy_writable_primary_nodename(&unreachable).is_none());
+    }
+
+    /// #1385: a replica removed while its provisioning task was still
+    /// running was deleted from the database, and the task then created its
+    /// container anyway -- untracked, crash-looping, and surviving even the
+    /// cluster's deletion. Removal is refused while the member is still
+    /// `creating`, before anything is deleted. (A control plane restart moves
+    /// an abandoned `creating` row to `failed`, so this cannot block forever.)
+    #[tokio::test]
+    async fn removing_a_member_that_is_still_provisioning_is_refused() {
+        for step in [
+            member_provisioning_step::INSERTING_ROW,
+            member_provisioning_step::PROVISIONING_CONTAINER,
+        ] {
+            let mut cluster = encrypted_service_model(7, serde_json::json!({}));
+            cluster.topology = "cluster".to_string();
+            let mut member = service_member_model(8, 3, "replica");
+            member.status = "creating".to_string();
+            member.provisioning_step = Some(step.to_string());
+            let db = Arc::new(
+                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                    .append_query_results([vec![cluster]])
+                    .append_query_results([vec![member]])
+                    .into_connection(),
+            );
+            let Ok(docker) = Docker::connect_with_local_defaults() else {
+                println!("Docker client configuration unavailable, skipping");
+                return;
+            };
+            let manager = ExternalServiceManager::new(
+                db.clone(),
+                Arc::new(EncryptionService::new_from_password(
+                    "service-parameter-reveal-test",
+                )),
+                Arc::new(docker),
+                Arc::new(temps_dns::DnsRegistry::new(db.clone())),
+            );
+
+            let error = manager
+                .remove_cluster_member(7, 8)
+                .await
+                .expect_err("a provisioning member must not be removed");
+            assert!(
+                matches!(
+                    &error,
+                    ExternalServiceError::ClusterMemberProvisioning {
+                        service_id: 7,
+                        container_name,
+                        status,
+                        ..
+                    } if container_name == "cluster-member-3" && status.contains(step)
+                ),
+                "{step}: {error:?}"
+            );
+            assert!(
+                error.to_string().contains("still being provisioned"),
+                "{error}"
+            );
+            drop(manager);
+            let db = Arc::try_unwrap(db).expect("manager released the database");
+            assert_eq!(
+                db.into_transaction_log().len(),
+                2,
+                "{step}: only the service and member lookups may run"
+            );
+        }
+    }
+
+    fn local_member_plan(container_name: &str) -> AddMemberPlan {
+        AddMemberPlan {
+            service_id: 7,
+            service_name: "orders".to_string(),
+            spec: ClusterMemberSpec {
+                role: "replica".to_string(),
+                node_id: None,
+                ordinal: 3,
+                hostname: None,
+            },
+            container_name: container_name.to_string(),
+            member_fqdn: "orders-3.orders.temps.local".to_string(),
+            member_port: 6073,
+            member_params: crate::externalsvc::postgres_cluster::ClusterMemberCreateParams {
+                container_name: container_name.to_string(),
+                image: "temps-test-image-never-pulled:missing".to_string(),
+                environment: HashMap::new(),
+                command: None,
+                container_port: 6073,
+                volume_path: "/var/lib/postgres".to_string(),
+                resource_limits: Default::default(),
+            },
+            control_plane_address: None,
+        }
+    }
+
+    fn mock_manager(db: Arc<DatabaseConnection>) -> Option<Arc<ExternalServiceManager>> {
+        let docker = Docker::connect_with_local_defaults().ok()?;
+        Some(Arc::new(ExternalServiceManager::new(
+            db.clone(),
+            Arc::new(EncryptionService::new_from_password(
+                "service-parameter-reveal-test",
+            )),
+            Arc::new(docker),
+            Arc::new(temps_dns::DnsRegistry::new(db)),
+        )))
+    }
+
+    /// #1385: the provisioning task claims each irreversible step on the
+    /// member row. When the row is gone (its cluster was deleted), it stops
+    /// before creating anything -- no image pull, no volume, no container --
+    /// and writes nothing else.
+    #[tokio::test]
+    async fn provisioning_a_deleted_member_creates_nothing() {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 0,
+                }])
+                .into_connection(),
+        );
+        let Some(manager) = mock_manager(db.clone()) else {
+            println!("Docker client configuration unavailable, skipping");
+            return;
+        };
+
+        manager
+            .clone()
+            .complete_add_cluster_member(8, local_member_plan("temps-test-unused-member"))
+            .await;
+
+        drop(manager);
+        let db = Arc::try_unwrap(db).expect("manager released the database");
+        let log = db.into_transaction_log();
+        assert_eq!(log.len(), 1, "only the step claim may run: {log:?}");
+        assert!(
+            format!("{log:?}").contains(member_provisioning_step::PROVISIONING_CONTAINER),
+            "{log:?}"
+        );
+    }
+
+    /// #1385: a container that provisioning created after its member was
+    /// deleted is removed together with its data volume, instead of being
+    /// left running (`unless-stopped`) and crash-looping. Skips without
+    /// Docker.
+    #[tokio::test]
+    async fn a_container_created_for_a_deleted_member_is_removed_with_its_volume() {
+        const IMAGE: &str = "redis:7-alpine";
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        );
+        let Some(manager) = mock_manager(db) else {
+            println!("Docker client configuration unavailable, skipping");
+            return;
+        };
+        let Some(docker) = manager.docker.get() else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        if docker.ping().await.is_err() || docker.inspect_image(IMAGE).await.is_err() {
+            println!("Docker or {IMAGE} not available, skipping");
+            return;
+        }
+        let name = format!(
+            "temps-test-orphan-member-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        );
+        let volume = format!("{name}_data");
+        docker
+            .create_volume(bollard::models::VolumeCreateRequest {
+                name: Some(volume.clone()),
+                ..Default::default()
+            })
+            .await
+            .expect("create test volume");
+        docker
+            .create_container(
+                Some(
+                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                        .name(&name)
+                        .build(),
+                ),
+                bollard::models::ContainerCreateBody {
+                    image: Some(IMAGE.to_string()),
+                    host_config: Some(bollard::models::HostConfig {
+                        binds: Some(vec![format!("{volume}:/data")]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create test container");
+
+        manager
+            .discard_member_container(&local_member_plan(&name))
+            .await;
+
+        let container_left = docker
+            .inspect_container(
+                &name,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .is_ok();
+        let volume_left = docker.inspect_volume(&volume).await.is_ok();
+        // Clean up whatever the code under test left behind.
+        let _ = docker
+            .remove_container(
+                &name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+        let _ = docker
+            .remove_volume(
+                &volume,
+                None::<bollard::query_parameters::RemoveVolumeOptions>,
+            )
+            .await;
+        assert!(!container_left, "the orphaned container must be removed");
+        assert!(
+            !volume_left,
+            "the orphaned container's volume must be removed"
+        );
     }
 
     /// Regression for `remove_cluster_member`'s delete-protection gate
