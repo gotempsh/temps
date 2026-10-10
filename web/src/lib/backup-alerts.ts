@@ -82,3 +82,15 @@ export function listBackupAlertsOptions() {
     refetchInterval: 60_000,
   }
 }
+
+/**
+ * Query options for the header's backup-alert poll. The alerts are
+ * instance-wide and served to instance administrators only, so the poll is
+ * disabled for every other role: it would be refused every minute.
+ */
+export function backupAlertsQueryOptions(isInstanceAdmin: boolean) {
+  return {
+    ...listBackupAlertsOptions(),
+    enabled: isInstanceAdmin,
+  }
+}

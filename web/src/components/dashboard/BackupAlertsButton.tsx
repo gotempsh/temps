@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import {
-  listBackupAlertsOptions,
+  backupAlertsQueryOptions,
   type BackupAlertResponse,
 } from '@/lib/backup-alerts'
 import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
@@ -36,10 +36,7 @@ import { Separator } from '../ui/separator'
  */
 export function BackupAlertsButton() {
   const isAdmin = useIsInstanceAdmin()
-  const { data, isLoading } = useQuery({
-    ...listBackupAlertsOptions(),
-    enabled: isAdmin,
-  })
+  const { data, isLoading } = useQuery(backupAlertsQueryOptions(isAdmin))
   const alerts = data?.alerts ?? []
   const count = alerts.length
   const hasAlerts = count > 0
