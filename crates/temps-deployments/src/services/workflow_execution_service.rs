@@ -346,6 +346,9 @@ pub struct WorkflowExecutionService {
     agent_sync_service: Arc<dyn AgentSyncService>,
     config_service: Arc<temps_config::ConfigService>,
     screenshot_service: Arc<ScreenshotService>,
+    /// Shared with on-demand `take_screenshot` operations, so the pipeline's
+    /// capture never overlaps one of the same deployment.
+    capture_guard: Arc<crate::jobs::DeploymentCaptureGuard>,
     docker_handle: Arc<DockerHandle>,
     source_map_service: OnceCell<Arc<SourceMapService>>,
     node_scheduler: OnceCell<Arc<crate::services::NodeScheduler>>,
@@ -379,6 +382,7 @@ impl WorkflowExecutionService {
         agent_sync_service: Arc<dyn AgentSyncService>,
         config_service: Arc<temps_config::ConfigService>,
         screenshot_service: Arc<ScreenshotService>,
+        capture_guard: Arc<crate::jobs::DeploymentCaptureGuard>,
         docker_handle: Arc<DockerHandle>,
     ) -> Self {
         Self {
@@ -394,6 +398,7 @@ impl WorkflowExecutionService {
             agent_sync_service,
             config_service,
             screenshot_service,
+            capture_guard,
             docker_handle,
             source_map_service: OnceCell::new(),
             node_scheduler: OnceCell::new(),
@@ -1904,6 +1909,7 @@ impl WorkflowExecutionService {
                     .job_id(db_job.job_id.clone())
                     .deployment_id(deployment_id)
                     .screenshot_service(screenshot_service.clone())
+                    .capture_guard(self.capture_guard.clone())
                     .config_service(self.config_service.clone())
                     .db(self.db.clone())
                     .log_id(db_job.log_id.clone())
@@ -4828,6 +4834,7 @@ mod tests {
             Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
             config_service,
             screenshot_service,
+            Arc::new(crate::jobs::DeploymentCaptureGuard::default()),
             docker,
         );
 
@@ -4861,6 +4868,7 @@ mod tests {
             Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
             config_service,
             screenshot_service,
+            Arc::new(crate::jobs::DeploymentCaptureGuard::default()),
             docker_handle,
         ))
     }
@@ -5006,6 +5014,7 @@ mod tests {
             Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
             config_service,
             screenshot_service,
+            Arc::new(crate::jobs::DeploymentCaptureGuard::default()),
             docker,
         );
 
@@ -5084,6 +5093,7 @@ mod tests {
             Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
             config_service,
             screenshot_service,
+            Arc::new(crate::jobs::DeploymentCaptureGuard::default()),
             docker,
         );
 
@@ -5161,6 +5171,7 @@ mod tests {
             Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
             config_service,
             screenshot_service,
+            Arc::new(crate::jobs::DeploymentCaptureGuard::default()),
             Arc::new(DockerHandle::available(Arc::new(
                 bollard::Docker::connect_with_local_defaults()?,
             ))),
@@ -5602,6 +5613,7 @@ mod tests {
             Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
             config_service,
             screenshot_service,
+            Arc::new(crate::jobs::DeploymentCaptureGuard::default()),
             docker,
         );
 

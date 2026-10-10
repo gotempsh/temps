@@ -422,6 +422,7 @@ export function Settings() {
         </section>
 
         <section
+          id="screenshots"
           aria-labelledby="screenshot-settings-heading"
           className="grid min-w-0 gap-5 md:grid-cols-[minmax(0,1fr)_minmax(0,2fr)] md:gap-10"
         >

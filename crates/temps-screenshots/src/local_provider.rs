@@ -31,6 +31,27 @@ use crate::provider::ScreenshotProvider;
 static CHROME_LAUNCH_LOCK: LazyLock<Arc<AsyncMutex<()>>> =
     LazyLock::new(|| Arc::new(AsyncMutex::new(())));
 
+/// Run blocking `work` while holding `lock` for exactly as long as it runs.
+///
+/// The guard is moved into the blocking task rather than kept on the caller's
+/// stack, because dropping the returned future (a timeout, a cancelled
+/// request) does not stop work already running on a blocking thread.
+async fn run_blocking_holding_lock<T, F>(
+    lock: Arc<AsyncMutex<()>>,
+    work: F,
+) -> Result<T, tokio::task::JoinError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let guard = lock.lock_owned().await;
+    tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        work()
+    })
+    .await
+}
+
 /// Whether headless Chrome is currently failing to launch on this host.
 ///
 /// Chrome is an optional dependency: hosts without it simply don't get local
@@ -120,13 +141,13 @@ impl ScreenshotProvider for LocalScreenshotProvider {
             return Err(ScreenshotError::InvalidUrl(format!("Invalid URL: {}", url)));
         }
 
-        // Hold this for the whole capture (not just the launch): the closure
-        // below is fully synchronous, so there's no cheaper point to release it
-        // at without splitting Browser::new() out of spawn_blocking.
-        let _launch_guard = CHROME_LAUNCH_LOCK.lock().await;
-
-        // Launch browser in a blocking context since headless_chrome is sync
-        let browser = tokio::task::spawn_blocking({
+        // Hold the launch lock for the whole capture (not just the launch),
+        // and inside the blocking task: a caller's timeout drops this future
+        // but cannot stop the blocking Chrome work, so a lock held here would
+        // be released while that Chrome still runs and let a retry start a
+        // second browser beside it. The browser is owned by the closure, so it
+        // is shut down exactly when the lock is released.
+        let browser = run_blocking_holding_lock(CHROME_LAUNCH_LOCK.clone(), {
             let timeout = self.timeout_seconds;
             let width = self.viewport_width;
             let height = self.viewport_height;
@@ -331,6 +352,35 @@ impl ScreenshotProvider for LocalScreenshotProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn lock_outlives_a_timed_out_caller_until_the_blocking_work_ends() {
+        let lock = Arc::new(AsyncMutex::new(()));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+        // The caller gives up long before the blocking work finishes.
+        let gave_up = tokio::time::timeout(
+            Duration::from_millis(50),
+            run_blocking_holding_lock(lock.clone(), move || {
+                let _ = release_rx.recv();
+            }),
+        )
+        .await;
+        assert!(gave_up.is_err(), "the caller should have timed out");
+
+        // The work is still running, so a retry must not get the lock.
+        assert!(
+            lock.try_lock().is_err(),
+            "the lock was released while the blocking work still ran"
+        );
+
+        release_tx.send(()).expect("release the blocking work");
+        let reacquired = tokio::time::timeout(Duration::from_secs(5), lock.lock()).await;
+        assert!(
+            reacquired.is_ok(),
+            "the lock must be released once the blocking work ends"
+        );
+    }
 
     #[test]
     fn missing_chrome_is_reported_once_until_it_becomes_available() {

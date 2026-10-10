@@ -367,6 +367,11 @@ impl TempsPlugin for DeploymentsPlugin {
                 );
             }
 
+            // One capture slot per deployment, shared by the pipeline's
+            // TakeScreenshotJob and on-demand `take_screenshot` operations.
+            let capture_guard = Arc::new(crate::jobs::DeploymentCaptureGuard::default());
+            context.register_service(capture_guard.clone());
+
             // Create WorkflowExecutionService
             let workflow_execution_service = Arc::new(WorkflowExecutionService::new(
                 db.clone(),
@@ -383,6 +388,7 @@ impl TempsPlugin for DeploymentsPlugin {
                     .unwrap_or_else(|| Arc::new(crate::jobs::NoOpAgentSyncService)),
                 config_service.clone(),
                 screenshot_service,
+                capture_guard.clone(),
                 docker_handle,
             ));
 
@@ -718,6 +724,13 @@ impl TempsPlugin for DeploymentsPlugin {
         let db = context.require_service::<sea_orm::DatabaseConnection>();
         let queue_service = context.require_service::<dyn temps_core::JobQueue>();
         let config_service = context.require_service::<temps_config::ConfigService>();
+        let screenshot_operations = Arc::new(crate::services::ScreenshotOperationService::new(
+            db.clone(),
+            context.require_service::<temps_screenshots::ScreenshotService>(),
+            config_service.clone(),
+            external_deployment_manager.clone(),
+            context.require_service::<crate::jobs::DeploymentCaptureGuard>(),
+        ));
         let external_service_manager =
             context.require_service::<temps_providers::ExternalServiceManager>();
         let dsn_service = context.require_service::<temps_error_tracking::DSNService>();
@@ -888,6 +901,7 @@ impl TempsPlugin for DeploymentsPlugin {
             log_service,
             cron_service,
             external_deployment_manager,
+            screenshot_operations,
             remote_deployment_service,
             db,
             workflow_planner,

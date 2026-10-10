@@ -16,14 +16,15 @@ use axum::{
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
-use temps_core::problemdetails::{self, Problem};
+use temps_core::problemdetails::{self, Problem, ProblemDetails};
 use temps_core::{AuditContext, RequestMetadata, UtcDateTime};
 use tracing::{debug, error, info};
 use utoipa::OpenApi;
 
 use crate::services::{
-    DeploymentOperation, ExternalImage, OperationResult, PushImageRequest,
-    PushedExternalImageResponse,
+    DeploymentOperation, DeploymentOperationDetails, DeploymentScreenshotCapture, ExternalImage,
+    OperationResult, OperationStatus, PushImageRequest, PushedExternalImageResponse,
+    ScreenshotOperationError, SCREENSHOT_SETTINGS_PATH,
 };
 
 #[derive(OpenApi)]
@@ -41,7 +42,10 @@ use crate::services::{
         PushedExternalImageResponse,
         ExecuteOperationRequest,
         OperationResultResponse,
-        OperationResultsResponse
+        OperationResultsResponse,
+        OperationStatus,
+        DeploymentOperationDetails,
+        DeploymentScreenshotCapture
     )),
     info(
         title = "External Images API",
@@ -61,9 +65,16 @@ pub struct ExecuteOperationRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct OperationResultResponse {
     pub operation: String,
+    /// `pending` while background work (a screenshot capture) runs, then
+    /// `completed` or `failed`. Poll
+    /// `GET …/operations/{operation_type}` for the outcome.
+    pub status: OperationStatus,
+    /// `true` only when `status` is `completed`.
     pub success: bool,
     pub message: String,
-    pub data: Option<serde_json::Value>,
+    /// The project and deployment the record belongs to, plus the stored
+    /// image once a `take_screenshot` has completed.
+    pub data: DeploymentOperationDetails,
     #[schema(value_type = String, format = DateTime, example = "2025-10-12T12:15:47.609192Z")]
     pub executed_at: UtcDateTime,
 }
@@ -72,6 +83,7 @@ impl From<OperationResult> for OperationResultResponse {
     fn from(result: OperationResult) -> Self {
         Self {
             operation: result.operation.to_string(),
+            status: result.status,
             success: result.success,
             message: result.message,
             data: result.data,
@@ -247,12 +259,14 @@ pub async fn get_external_image(
     path = "/projects/{project_id}/deployments/{deployment_id}/operations",
     request_body = ExecuteOperationRequest,
     responses(
-        (status = 202, description = "Operation executed", body = OperationResultResponse),
-        (status = 400, description = "Invalid operation"),
+        (status = 202, description = "Operation accepted. `take_screenshot` returns `status: pending`; poll the operation status for `completed` (with `screenshot_location`) or `failed` (with the reason)", body = OperationResultResponse),
+        (status = 400, description = "Invalid operation or deployment ID", body = ProblemDetails),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
-        (status = 404, description = "Deployment not found"),
-        (status = 500, description = "Internal server error")
+        (status = 404, description = "Deployment not found in this project", body = ProblemDetails),
+        (status = 409, description = "Screenshots are disabled (see `setup_path`), or a capture of this deployment is already running", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails),
+        (status = 503, description = "The screenshot provider is unavailable; `detail` gives the reason and `setup_path` where to change it", body = ProblemDetails)
     ),
     security(("bearer_auth" = []))
 )]
@@ -266,6 +280,7 @@ pub async fn execute_deployment_operation(
     permission_guard!(auth, DeploymentsWrite);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
+    let deployment_id = operation_deployment_key(&deployment_id);
 
     debug!(
         "Executing operation {} for deployment {} in project {}",
@@ -284,29 +299,25 @@ pub async fn execute_deployment_operation(
         }
     };
 
-    // Execute the operation
-    let result = OperationResult {
-        operation,
-        success: true,
-        message: "Operation executed successfully".to_string(),
-        data: Some(serde_json::json!({
-            "deployment_id": deployment_id,
-            "project_id": project_id,
-            "timestamp": Utc::now()
-        })),
-        executed_at: Utc::now(),
+    let result = if operation == DeploymentOperation::TakeScreenshot {
+        let deployment_number: i32 = deployment_id.parse().map_err(|_| {
+            problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid Deployment ID")
+                .with_detail(format!(
+                    "Deployment ID '{}' in project {} is not a number",
+                    deployment_id, project_id
+                ))
+        })?;
+        // Starts the capture in the background; the response is `pending`.
+        state
+            .screenshot_operations
+            .start(project_id, deployment_number)
+            .await?
+    } else {
+        let result = legacy_operation_record(operation, project_id, &deployment_id);
+        record_legacy_operation(&state, project_id, &deployment_id, &result)?;
+        result
     };
-
-    // Record the operation
-    if let Err(err) = state
-        .external_deployment_manager
-        .record_operation(&deployment_id, result.clone())
-    {
-        error!("Failed to record operation: {}", err);
-        return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-            .with_title("Operation Failed")
-            .with_detail(&err));
-    }
 
     let audit = DeploymentOperationAudit {
         context: AuditContext {
@@ -333,6 +344,86 @@ pub async fn execute_deployment_operation(
     ))
 }
 
+/// Operation-history key for a deployment ID taken from the path. Numeric IDs
+/// are put in canonical form (`007` and `+7` become `7`), matching how
+/// `take_screenshot` parses them, so a record written by one request is found
+/// by every later one however the ID was spelled. Other IDs are kept as-is.
+fn operation_deployment_key(deployment_id: &str) -> String {
+    deployment_id
+        .parse::<i32>()
+        .map(|id| id.to_string())
+        .unwrap_or_else(|_| deployment_id.to_string())
+}
+
+/// `deploy` and `mark_complete` only record that they were requested; they
+/// perform no work through this endpoint.
+fn legacy_operation_record(
+    operation: DeploymentOperation,
+    project_id: i32,
+    deployment_id: &str,
+) -> OperationResult {
+    OperationResult {
+        operation,
+        status: OperationStatus::Completed,
+        success: true,
+        message: "Operation executed successfully".to_string(),
+        data: DeploymentOperationDetails::new(project_id, deployment_id),
+        executed_at: Utc::now(),
+    }
+}
+
+fn record_legacy_operation(
+    state: &AppState,
+    project_id: i32,
+    deployment_id: &str,
+    result: &OperationResult,
+) -> Result<(), Problem> {
+    state
+        .external_deployment_manager
+        .record_operation(project_id, deployment_id, result.clone())
+        .map_err(|err| {
+            error!(
+                "Failed to record operation {} for deployment {} in project {}: {}",
+                result.operation, deployment_id, project_id, err
+            );
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Operation Failed")
+                .with_detail(&err)
+        })
+}
+
+impl From<ScreenshotOperationError> for Problem {
+    fn from(error: ScreenshotOperationError) -> Self {
+        match error {
+            ScreenshotOperationError::DeploymentNotFound { .. } => {
+                problemdetails::new(StatusCode::NOT_FOUND)
+                    .with_title("Deployment Not Found")
+                    .with_detail(error.to_string())
+            }
+            ScreenshotOperationError::Disabled { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Screenshots Disabled")
+                .with_detail(error.to_string())
+                .with_value("setup_path", SCREENSHOT_SETTINGS_PATH),
+            ScreenshotOperationError::ProviderUnavailable { .. } => {
+                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .with_title("Screenshot Provider Unavailable")
+                    .with_detail(error.to_string())
+                    .with_value("setup_path", SCREENSHOT_SETTINGS_PATH)
+            }
+            ScreenshotOperationError::AlreadyRunning { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Screenshot Already In Progress")
+                    .with_detail(error.to_string())
+            }
+            ScreenshotOperationError::Record { .. } | ScreenshotOperationError::Database { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Screenshot Operation Failed")
+                    .with_detail(error.to_string())
+            }
+        }
+    }
+}
+
 /// Get all operations for a deployment
 #[utoipa::path(
     get,
@@ -355,6 +446,7 @@ pub async fn get_deployment_operations(
     permission_guard!(auth, DeploymentsRead);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
+    let deployment_id = operation_deployment_key(&deployment_id);
 
     debug!(
         "Getting operations for deployment {} in project {}",
@@ -363,7 +455,7 @@ pub async fn get_deployment_operations(
 
     let operations = state
         .external_deployment_manager
-        .get_operations(&deployment_id);
+        .get_operations(project_id, &deployment_id);
 
     let responses: Vec<OperationResultResponse> = operations
         .into_iter()
@@ -398,6 +490,7 @@ pub async fn get_deployment_operation_status(
     permission_guard!(auth, DeploymentsRead);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
+    let deployment_id = operation_deployment_key(&deployment_id);
 
     debug!(
         "Getting {} operation status for deployment {} in project {}",
@@ -416,10 +509,11 @@ pub async fn get_deployment_operation_status(
         }
     };
 
-    match state
-        .external_deployment_manager
-        .get_latest_operation(&deployment_id, &operation)
-    {
+    match state.external_deployment_manager.get_latest_operation(
+        project_id,
+        &deployment_id,
+        &operation,
+    ) {
         Some(result) => Ok(Json(OperationResultResponse::from(result))),
         None => Err(problemdetails::new(StatusCode::NOT_FOUND)
             .with_title("Operation Not Found")
@@ -455,4 +549,42 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             "/projects/{project_id}/deployments/{deployment_id}/operations/{operation_type}",
             get(get_deployment_operation_status),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::ExternalDeploymentManager;
+
+    #[test]
+    fn numeric_deployment_ids_have_one_canonical_key() {
+        assert_eq!(operation_deployment_key("7"), "7");
+        assert_eq!(operation_deployment_key("007"), "7");
+        assert_eq!(operation_deployment_key("+7"), "7");
+        assert_eq!(operation_deployment_key("ext-image-1"), "ext-image-1");
+    }
+
+    #[test]
+    fn an_operation_started_with_a_padded_id_can_be_polled_with_it() {
+        let manager = ExternalDeploymentManager::new();
+        let written_as = operation_deployment_key("007");
+        manager
+            .record_operation(
+                3,
+                &written_as,
+                legacy_operation_record(DeploymentOperation::MarkComplete, 3, &written_as),
+            )
+            .unwrap();
+
+        for spelling in ["007", "7"] {
+            let key = operation_deployment_key(spelling);
+            assert!(
+                manager
+                    .get_latest_operation(3, &key, &DeploymentOperation::MarkComplete)
+                    .is_some(),
+                "polling with {spelling:?} must find the record"
+            );
+            assert_eq!(manager.get_operations(3, &key).len(), 1);
+        }
+    }
 }

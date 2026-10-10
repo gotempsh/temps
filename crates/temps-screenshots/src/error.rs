@@ -18,6 +18,9 @@ pub enum ScreenshotError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("Screenshot of {url} is not a usable image: {reason}")]
+    InvalidImage { url: String, reason: String },
+
     #[error("Failed to store screenshot '{path}' in durable storage: {reason}")]
     Storage { path: String, reason: String },
 

@@ -7,8 +7,10 @@
 
 use async_trait::async_trait;
 use sea_orm::{ActiveModelTrait, EntityTrait, Set};
-use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 use temps_config::ConfigService;
 use temps_core::{JobResult, UtcDateTime, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_database::DbConnection;
@@ -16,17 +18,106 @@ use temps_entities::{deployments, prelude::*};
 use temps_logs::{LogLevel, LogService};
 use temps_screenshots::ScreenshotServiceTrait;
 
-/// Output from TakeScreenshotJob
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScreenshotOutput {
-    pub captured_at: UtcDateTime,
+/// Job for capturing screenshots of deployed applications
+/// Hard ceiling for one on-demand capture. Providers bound page loads
+/// themselves; this guarantees a capture always ends, so it cannot hold its
+/// deployment's capture slot forever.
+pub const SCREENSHOT_CAPTURE_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// How long the deployment pipeline waits for a capture of the same
+/// deployment that is already running (an on-demand one) before giving up.
+const RUNNING_CAPTURE_WAIT: Duration = Duration::from_secs(200);
+
+/// One screenshot capture per deployment at a time, shared by the deployment
+/// pipeline's [`TakeScreenshotJob`] and on-demand `take_screenshot`
+/// operations, so two captures never race to record a deployment's
+/// screenshot.
+///
+/// A single instance is registered by the deployments plugin and handed to
+/// both paths.
+#[derive(Debug, Default)]
+pub struct DeploymentCaptureGuard {
+    in_flight: Arc<Mutex<HashMap<i32, UtcDateTime>>>,
 }
 
-/// Job for capturing screenshots of deployed applications
+/// A deployment's claim on its capture slot; dropping it frees the slot.
+#[derive(Debug)]
+pub struct DeploymentCaptureSlot {
+    in_flight: Arc<Mutex<HashMap<i32, UtcDateTime>>>,
+    deployment_id: i32,
+}
+
+impl Drop for DeploymentCaptureSlot {
+    fn drop(&mut self) {
+        lock_in_flight(&self.in_flight).remove(&self.deployment_id);
+    }
+}
+
+fn lock_in_flight(
+    in_flight: &Mutex<HashMap<i32, UtcDateTime>>,
+) -> MutexGuard<'_, HashMap<i32, UtcDateTime>> {
+    // Every critical section is a single insert or remove, so a panic while
+    // holding the lock cannot leave the map half-updated; keep using it.
+    in_flight
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+impl DeploymentCaptureGuard {
+    /// Claim `deployment_id`'s slot, or return when the capture holding it
+    /// started.
+    pub fn try_claim(&self, deployment_id: i32) -> Result<DeploymentCaptureSlot, UtcDateTime> {
+        match lock_in_flight(&self.in_flight).entry(deployment_id) {
+            Entry::Occupied(running) => Err(*running.get()),
+            Entry::Vacant(slot) => {
+                slot.insert(chrono::Utc::now());
+                Ok(DeploymentCaptureSlot {
+                    in_flight: self.in_flight.clone(),
+                    deployment_id,
+                })
+            }
+        }
+    }
+
+    /// Claim `deployment_id`'s slot, waiting up to `max_wait` for a running
+    /// capture to finish. Returns when the blocking capture started if it is
+    /// still running after that.
+    pub async fn claim_within(
+        &self,
+        deployment_id: i32,
+        max_wait: Duration,
+    ) -> Result<DeploymentCaptureSlot, UtcDateTime> {
+        let deadline = tokio::time::Instant::now() + max_wait;
+        loop {
+            match self.try_claim(deployment_id) {
+                Ok(slot) => return Ok(slot),
+                Err(started_at) if tokio::time::Instant::now() >= deadline => {
+                    return Err(started_at)
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(250)).await,
+            }
+        }
+    }
+}
+
+/// Storage path for a new screenshot of `deployment_id`. Millisecond
+/// precision plus a random suffix, so two captures can never write the same
+/// file even when they start in the same instant.
+fn screenshot_location(deployment_id: i32, captured_at: UtcDateTime) -> String {
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    format!(
+        "screenshots/deployment-{}-{}-{}.png",
+        deployment_id,
+        captured_at.format("%Y%m%d-%H%M%S-%3f"),
+        &suffix[..8]
+    )
+}
+
 pub struct TakeScreenshotJob {
     job_id: String,
     deployment_id: i32,
     screenshot_service: Arc<dyn ScreenshotServiceTrait>,
+    capture_guard: Arc<DeploymentCaptureGuard>,
     config_service: Arc<ConfigService>,
     db: Arc<DbConnection>,
     log_id: Option<String>,
@@ -48,6 +139,7 @@ impl TakeScreenshotJob {
         job_id: String,
         deployment_id: i32,
         screenshot_service: Arc<dyn ScreenshotServiceTrait>,
+        capture_guard: Arc<DeploymentCaptureGuard>,
         config_service: Arc<ConfigService>,
         db: Arc<DbConnection>,
     ) -> Self {
@@ -55,6 +147,7 @@ impl TakeScreenshotJob {
             job_id,
             deployment_id,
             screenshot_service,
+            capture_guard,
             config_service,
             db,
             log_id: None,
@@ -105,46 +198,108 @@ impl TakeScreenshotJob {
             LogLevel::Info
         }
     }
+}
 
-    /// Capture screenshot using the screenshot service and save to disk
-    async fn capture_screenshot(
-        &self,
-        deployment_url: &str,
-        filename: &str,
-    ) -> Result<ScreenshotOutput, WorkflowError> {
-        self.log(format!("Capturing screenshot of: {}", deployment_url))
-            .await?;
+/// Why capturing a deployment's screenshot failed.
+#[derive(Debug, thiserror::Error)]
+pub enum DeploymentScreenshotError {
+    #[error("Failed to resolve the public URL of deployment {deployment_id}: {reason}")]
+    Url { deployment_id: i32, reason: String },
 
-        // Generate screenshot path with timestamp structure
-        let now = chrono::Utc::now();
+    #[error("Screenshot provider '{provider}' failed to capture deployment {deployment_id} at {url}: {source}")]
+    Capture {
+        deployment_id: i32,
+        provider: &'static str,
+        url: String,
+        #[source]
+        source: temps_screenshots::ScreenshotError,
+    },
 
-        self.log(format!(
-            "Using screenshot service: {}",
-            self.screenshot_service.provider_name()
-        ))
-        .await?;
+    #[error("Screenshot of deployment {deployment_id} did not finish within {timeout_secs}s")]
+    TimedOut {
+        deployment_id: i32,
+        timeout_secs: u64,
+    },
 
-        // Capture and save screenshot using the screenshot service
-        let screenshot_path = self
-            .screenshot_service
-            .capture_and_save(deployment_url, filename)
-            .await
-            .map_err(|e| {
-                WorkflowError::JobExecutionFailed(format!("Failed to capture screenshot: {}", e))
-            })?;
+    #[error("Deployment {deployment_id} no longer exists; its screenshot was not recorded")]
+    DeploymentNotFound { deployment_id: i32 },
 
-        // Log relative path for cleaner output
-        let static_dir = self.config_service.static_dir();
-        let relative_display = screenshot_path
-            .strip_prefix(&static_dir)
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| screenshot_path.display().to_string());
+    #[error("Failed to record screenshot location for deployment {deployment_id}: {source}")]
+    Database {
+        deployment_id: i32,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+}
 
-        self.log(format!("Screenshot saved to: {}", relative_display))
-            .await?;
+/// A screenshot that was captured, validated as an image, stored, and
+/// recorded on the deployment.
+#[derive(Debug, Clone)]
+pub struct CapturedScreenshot {
+    pub url: String,
+    /// Path relative to the static directory, as stored on the deployment.
+    pub screenshot_location: String,
+    pub captured_at: UtcDateTime,
+}
 
-        Ok(ScreenshotOutput { captured_at: now })
-    }
+/// Capture the deployment's public URL, store the image and point
+/// `deployments.screenshot_location` at it.
+///
+/// Returns only after all three happened: the screenshot service rejects
+/// anything that is not an image before storing it, and the location is
+/// written last, so `Ok` means a real image is readable at the recorded path.
+pub async fn capture_deployment_screenshot(
+    deployment_id: i32,
+    screenshot_service: &dyn ScreenshotServiceTrait,
+    config_service: &ConfigService,
+    db: &DbConnection,
+) -> Result<CapturedScreenshot, DeploymentScreenshotError> {
+    let url = config_service
+        .get_deployment_url(deployment_id)
+        .await
+        .map_err(|e| DeploymentScreenshotError::Url {
+            deployment_id,
+            reason: e.to_string(),
+        })?;
+
+    let captured_at = chrono::Utc::now();
+    let screenshot_location = screenshot_location(deployment_id, captured_at);
+
+    screenshot_service
+        .capture_and_save(&url, &screenshot_location)
+        .await
+        .map_err(|source| DeploymentScreenshotError::Capture {
+            deployment_id,
+            provider: screenshot_service.provider_name(),
+            url: url.clone(),
+            source,
+        })?;
+
+    let deployment = Deployments::find_by_id(deployment_id)
+        .one(db)
+        .await
+        .map_err(|source| DeploymentScreenshotError::Database {
+            deployment_id,
+            source,
+        })?
+        .ok_or(DeploymentScreenshotError::DeploymentNotFound { deployment_id })?;
+
+    let mut active_deployment: deployments::ActiveModel = deployment.into();
+    active_deployment.screenshot_location = Set(Some(screenshot_location.clone()));
+    active_deployment.updated_at = Set(chrono::Utc::now());
+    active_deployment
+        .update(db)
+        .await
+        .map_err(|source| DeploymentScreenshotError::Database {
+            deployment_id,
+            source,
+        })?;
+
+    Ok(CapturedScreenshot {
+        url,
+        screenshot_location,
+        captured_at,
+    })
 }
 
 #[async_trait]
@@ -180,58 +335,51 @@ impl WorkflowTask for TakeScreenshotJob {
         ))
         .await?;
 
-        // Get deployment URL from config service using deployment_id
-        let deployment_url = self
-            .config_service
-            .get_deployment_url(self.deployment_id)
-            .await
-            .map_err(|e| {
-                WorkflowError::JobExecutionFailed(format!("Failed to get deployment URL: {}", e))
-            })?;
-
-        self.log(format!("Deployment URL: {}", deployment_url))
-            .await?;
-
-        // Generate screenshot filename with timestamp
-        let now = chrono::Utc::now();
-        let filename = format!(
-            "screenshots/deployment-{}-{}.png",
-            self.deployment_id,
-            now.format("%Y%m%d-%H%M%S")
-        );
-
-        // Capture screenshot
-        let screenshot_output = self.capture_screenshot(&deployment_url, &filename).await?;
-
-        self.log(format!("Screenshot captured: {}", filename))
-            .await?;
-
-        // Update deployment with screenshot location (relative path)
-        let deployment = Deployments::find_by_id(self.deployment_id)
-            .one(self.db.as_ref())
-            .await
-            .map_err(|e| WorkflowError::Other(format!("Failed to find deployment: {}", e)))?
-            .ok_or_else(|| {
-                WorkflowError::Other(format!("Deployment {} not found", self.deployment_id))
-            })?;
-
-        let mut active_deployment: deployments::ActiveModel = deployment.into();
-        active_deployment.screenshot_location = Set(Some(filename.clone()));
-        active_deployment.updated_at = Set(chrono::Utc::now());
-
-        active_deployment
-            .update(self.db.as_ref())
-            .await
-            .map_err(|e| {
-                WorkflowError::Other(format!(
-                    "Failed to update deployment screenshot_location: {}",
-                    e
-                ))
-            })?;
-
         self.log(format!(
-            "Updated deployment screenshot_location: {}",
-            filename
+            "Using screenshot service: {}",
+            self.screenshot_service.provider_name()
+        ))
+        .await?;
+
+        // An on-demand capture of this deployment may be running; wait for it
+        // rather than race it to record the deployment's screenshot.
+        let _slot = match self.capture_guard.try_claim(self.deployment_id) {
+            Ok(slot) => slot,
+            Err(started_at) => {
+                self.log(format!(
+                    "Waiting for the screenshot of deployment {} already being captured (started {})...",
+                    self.deployment_id,
+                    started_at.to_rfc3339()
+                ))
+                .await?;
+                self.capture_guard
+                    .claim_within(self.deployment_id, RUNNING_CAPTURE_WAIT)
+                    .await
+                    .map_err(|started_at| {
+                        WorkflowError::JobExecutionFailed(format!(
+                            "Another screenshot of deployment {} has been running since {} and did not finish within {}s",
+                            self.deployment_id,
+                            started_at.to_rfc3339(),
+                            RUNNING_CAPTURE_WAIT.as_secs()
+                        ))
+                    })?
+            }
+        };
+
+        let captured = capture_deployment_screenshot(
+            self.deployment_id,
+            self.screenshot_service.as_ref(),
+            self.config_service.as_ref(),
+            self.db.as_ref(),
+        )
+        .await
+        .map_err(|e| WorkflowError::JobExecutionFailed(e.to_string()))?;
+
+        self.log(format!("Deployment URL: {}", captured.url))
+            .await?;
+        self.log(format!(
+            "Screenshot captured: {}",
+            captured.screenshot_location
         ))
         .await?;
 
@@ -239,10 +387,14 @@ impl WorkflowTask for TakeScreenshotJob {
         context.set_output(
             &self.job_id,
             "captured_at",
-            screenshot_output.captured_at.timestamp(),
+            captured.captured_at.timestamp(),
         )?;
         context.set_output(&self.job_id, "deployment_id", self.deployment_id)?;
-        context.set_output(&self.job_id, "screenshot_location", filename)?;
+        context.set_output(
+            &self.job_id,
+            "screenshot_location",
+            captured.screenshot_location,
+        )?;
 
         Ok(JobResult::success(context))
     }
@@ -287,6 +439,7 @@ pub struct TakeScreenshotJobBuilder {
     job_id: Option<String>,
     deployment_id: Option<i32>,
     screenshot_service: Option<Arc<dyn ScreenshotServiceTrait>>,
+    capture_guard: Option<Arc<DeploymentCaptureGuard>>,
     config_service: Option<Arc<ConfigService>>,
     db: Option<Arc<DbConnection>>,
     log_id: Option<String>,
@@ -299,6 +452,7 @@ impl TakeScreenshotJobBuilder {
             job_id: None,
             deployment_id: None,
             screenshot_service: None,
+            capture_guard: None,
             config_service: None,
             db: None,
             log_id: None,
@@ -321,6 +475,11 @@ impl TakeScreenshotJobBuilder {
         screenshot_service: Arc<dyn ScreenshotServiceTrait>,
     ) -> Self {
         self.screenshot_service = Some(screenshot_service);
+        self
+    }
+
+    pub fn capture_guard(mut self, capture_guard: Arc<DeploymentCaptureGuard>) -> Self {
+        self.capture_guard = Some(capture_guard);
         self
     }
 
@@ -352,6 +511,9 @@ impl TakeScreenshotJobBuilder {
         let screenshot_service = self.screenshot_service.ok_or_else(|| {
             WorkflowError::JobValidationFailed("screenshot_service is required".to_string())
         })?;
+        let capture_guard = self.capture_guard.ok_or_else(|| {
+            WorkflowError::JobValidationFailed("capture_guard is required".to_string())
+        })?;
         let config_service = self.config_service.ok_or_else(|| {
             WorkflowError::JobValidationFailed("config_service is required".to_string())
         })?;
@@ -363,6 +525,7 @@ impl TakeScreenshotJobBuilder {
             job_id,
             deployment_id,
             screenshot_service,
+            capture_guard,
             config_service,
             db,
         );
@@ -487,6 +650,7 @@ mod tests {
             "take_screenshot".to_string(),
             1,
             Arc::new(UnavailableScreenshotService),
+            Arc::new(DeploymentCaptureGuard::default()),
             test_config_service(db.clone()),
             db,
         );
@@ -507,5 +671,80 @@ mod tests {
             "error should carry the underlying reason, got: {}",
             message
         );
+    }
+
+    #[test]
+    fn a_deployment_has_one_capture_slot_until_it_is_released() {
+        let guard = DeploymentCaptureGuard::default();
+
+        let slot = guard.try_claim(7).expect("free slot");
+        let started_at = guard
+            .try_claim(7)
+            .expect_err("a second capture of the same deployment must wait");
+        assert!(started_at <= chrono::Utc::now());
+        // Other deployments are unaffected.
+        assert!(guard.try_claim(8).is_ok());
+
+        drop(slot);
+        assert!(guard.try_claim(7).is_ok(), "dropping the slot frees it");
+    }
+
+    #[tokio::test]
+    async fn the_pipeline_waits_for_a_running_capture_to_finish() {
+        let guard = Arc::new(DeploymentCaptureGuard::default());
+        let running = guard.try_claim(7).unwrap();
+
+        let waiter = {
+            let guard = guard.clone();
+            tokio::spawn(async move { guard.claim_within(7, Duration::from_secs(5)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!waiter.is_finished(), "must wait while the capture runs");
+
+        drop(running);
+        let claimed = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("claims once the running capture ends")
+            .unwrap();
+        assert!(claimed.is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_pipeline_gives_up_on_a_capture_that_never_ends() {
+        let guard = DeploymentCaptureGuard::default();
+        let _running = guard.try_claim(7).unwrap();
+
+        let result = guard.claim_within(7, Duration::from_millis(300)).await;
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn captures_in_the_same_instant_get_different_files() {
+        let now = chrono::Utc::now();
+
+        let first = screenshot_location(7, now);
+        let second = screenshot_location(7, now);
+
+        assert_ne!(first, second);
+        assert!(
+            first.starts_with("screenshots/deployment-7-") && first.ends_with(".png"),
+            "{first}"
+        );
+    }
+
+    #[test]
+    fn builder_requires_the_shared_capture_guard() {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+
+        let err = TakeScreenshotJobBuilder::new()
+            .deployment_id(7)
+            .screenshot_service(Arc::new(UnavailableScreenshotService))
+            .config_service(test_config_service(db.clone()))
+            .db(db)
+            .build()
+            .expect_err("a job without the shared guard could race on-demand captures");
+
+        assert!(err.to_string().contains("capture_guard"), "{err}");
     }
 }
