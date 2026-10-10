@@ -745,35 +745,100 @@ pub enum RouteGenerationError {
 
     #[error("route_generation (id = 1) returned negative generation {value}")]
     Negative { value: i64 },
+
+    #[error(
+        "Claiming the route generation after in-memory generation {previous} from \
+         route_generation (id = 1) did not finish within {timeout_ms} ms"
+    )]
+    Timeout { previous: u64, timeout_ms: u128 },
 }
 
-/// Atomically claim the generation after `previous` from the durable counter.
-///
-/// `GREATEST(current, previous) + 1` in a single `UPDATE ... RETURNING`: the
-/// row lock serializes concurrent claims, so each caller gets a distinct
-/// value, and the result is above both the stored and the in-memory value.
+/// How long a reload may wait to claim its generation before numbering it
+/// locally. Every reload waits for the claim before waking route waiters
+/// (readiness checks, worker long-polls), so a stalled database must not hold
+/// them asleep for longer than this.
+pub(crate) const ROUTE_GENERATION_CLAIM_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(2);
+
+/// Extra time the client allows past the server-side statement timeout, for
+/// a connection that stalls outside a statement (acquire, `BEGIN`, `COMMIT`).
+const ROUTE_GENERATION_CLAIM_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Atomically claim the generation after `previous` from the durable counter,
+/// bounded by [`ROUTE_GENERATION_CLAIM_TIMEOUT`].
 pub(crate) async fn claim_route_generation(
     db: &DatabaseConnection,
     previous: u64,
 ) -> Result<u64, RouteGenerationError> {
+    claim_route_generation_within(db, previous, ROUTE_GENERATION_CLAIM_TIMEOUT).await
+}
+
+/// Atomically claim the generation after `previous`, giving up after
+/// `timeout`.
+///
+/// `GREATEST(current, previous) + 1` in a single `UPDATE ... RETURNING`: the
+/// row lock serializes concurrent claims, so each caller gets a distinct
+/// value, and the result is above both the stored and the in-memory value.
+///
+/// The statement runs in its own transaction under `SET LOCAL
+/// statement_timeout`, so a claim that gives up is cancelled and rolled back
+/// by Postgres rather than committing after the caller already numbered the
+/// reload locally. That keeps the row from moving ahead of the generation
+/// workers were given. The client-side bound only adds a short grace for a
+/// connection that stalls outside the statement.
+pub(crate) async fn claim_route_generation_within(
+    db: &DatabaseConnection,
+    previous: u64,
+    timeout: std::time::Duration,
+) -> Result<u64, RouteGenerationError> {
+    let timeout_ms = timeout.as_millis();
+    match tokio::time::timeout(
+        timeout + ROUTE_GENERATION_CLAIM_GRACE,
+        claim_in_transaction(db, previous, timeout_ms),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(RouteGenerationError::Timeout {
+            previous,
+            timeout_ms,
+        }),
+    }
+}
+
+async fn claim_in_transaction(
+    db: &DatabaseConnection,
+    previous: u64,
+    timeout_ms: u128,
+) -> Result<u64, RouteGenerationError> {
+    use sea_orm::{ConnectionTrait, TransactionTrait};
+    let claim_error = |source| RouteGenerationError::Claim { previous, source };
     // Leave room for the `+ 1` below; 9.2e18 reloads is unreachable anyway.
     let previous_i64 = i64::try_from(previous)
         .unwrap_or(i64::MAX - 1)
         .min(i64::MAX - 1);
-    let statement = sea_orm::Statement::from_sql_and_values(
+    let txn = db.begin().await.map_err(claim_error)?;
+    // An integer literal, not user input; `SET` cannot take a bind parameter.
+    txn.execute(sea_orm::Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
-        "UPDATE route_generation SET current = GREATEST(current, $1) + 1, updated_at = now() \
-         WHERE id = 1 RETURNING current",
-        [previous_i64.into()],
-    );
-    let row = sea_orm::ConnectionTrait::query_one(db, statement)
+        format!("SET LOCAL statement_timeout = {}", timeout_ms.max(1)),
+    ))
+    .await
+    .map_err(claim_error)?;
+    let row = txn
+        .query_one(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "UPDATE route_generation SET current = GREATEST(current, $1) + 1, \
+             updated_at = now() WHERE id = 1 RETURNING current",
+            [previous_i64.into()],
+        ))
         .await
-        .map_err(|source| RouteGenerationError::Claim { previous, source })?
+        .map_err(claim_error)?
         .ok_or(RouteGenerationError::MissingRow { previous })?;
-    let value = row
-        .try_get::<i64>("", "current")
-        .map_err(|source| RouteGenerationError::Claim { previous, source })?;
-    u64::try_from(value).map_err(|_| RouteGenerationError::Negative { value })
+    let value = row.try_get::<i64>("", "current").map_err(claim_error)?;
+    let claimed = u64::try_from(value).map_err(|_| RouteGenerationError::Negative { value })?;
+    txn.commit().await.map_err(claim_error)?;
+    Ok(claimed)
 }
 
 /// Raise `counter` to a generation claimed from the database and return the
@@ -968,8 +1033,9 @@ impl CachedPeerTable {
     /// restored database below this process's numbering, or a process that
     /// restarted below the database's, both continue from the higher one.
     ///
-    /// When the claim fails (the database is briefly unreachable) the reload
-    /// still has to wake waiters, so the in-memory counter advances on its own
+    /// When the claim fails (the database is briefly unreachable, or stalls
+    /// past `ROUTE_GENERATION_CLAIM_TIMEOUT`) the reload still has to wake
+    /// waiters, so the in-memory counter advances on its own
     /// and the row is left alone; the next successful claim starts above it.
     /// An agent that ACKs such a generation has the newest routes, and the
     /// completion gate's target (the row) is at or below its ACK.
@@ -4331,7 +4397,8 @@ mod route_generation_tests {
     // no worker would ever be given.
 
     use super::{
-        adopt_claimed_generation, claim_route_generation, CachedPeerTable, RouteGenerationRole,
+        adopt_claimed_generation, claim_route_generation, claim_route_generation_within,
+        CachedPeerTable, RouteGenerationError, RouteGenerationRole, ROUTE_GENERATION_CLAIM_TIMEOUT,
     };
     use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
     use std::collections::HashSet;
@@ -4595,5 +4662,68 @@ mod route_generation_tests {
         table.load_routes().await.expect("load with the row back");
         assert_eq!(table.current_generation(), 4);
         assert_eq!(persisted(&db).await, Some(4));
+    }
+
+    /// A stalled database cannot hold a reload's waiters asleep: the claim
+    /// gives up within its bound, Postgres cancels it so it never commits
+    /// behind the reload's back, and the reload numbers itself locally.
+    #[tokio::test]
+    async fn a_stalled_claim_gives_up_without_committing_and_the_reload_still_advances() {
+        use sea_orm::TransactionTrait;
+        let Some(database) = database_or_skip().await else {
+            return;
+        };
+        let db = database.db.clone();
+
+        let table = CachedPeerTable::new(db.clone());
+        table.load_routes().await.expect("load");
+        assert_eq!(table.current_generation(), 1);
+
+        // Another session holds the row, so every claim waits on its lock.
+        let blocker = db.begin().await.expect("blocking transaction");
+        blocker
+            .execute(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT current FROM route_generation WHERE id = 1 FOR UPDATE".to_string(),
+            ))
+            .await
+            .expect("lock the row");
+
+        let started = std::time::Instant::now();
+        let error =
+            claim_route_generation_within(db.as_ref(), 1, std::time::Duration::from_millis(200))
+                .await
+                .expect_err("a claim behind a held lock gives up");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the claim must give up near its bound, took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(
+                error,
+                RouteGenerationError::Claim { previous: 1, .. }
+                    | RouteGenerationError::Timeout { previous: 1, .. }
+            ),
+            "{error:?}"
+        );
+
+        let started = std::time::Instant::now();
+        table.load_routes().await.expect("load during the stall");
+        assert!(
+            started.elapsed() < ROUTE_GENERATION_CLAIM_TIMEOUT + std::time::Duration::from_secs(3),
+            "the reload must not wait on the database beyond the claim bound, took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(table.current_generation(), 2, "numbered locally");
+
+        blocker.rollback().await.expect("release the row");
+        // Neither cancelled claim committed once the lock was released.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(persisted(&db).await, Some(1));
+
+        table.load_routes().await.expect("load after the stall");
+        assert_eq!(table.current_generation(), 3);
+        assert_eq!(persisted(&db).await, Some(3));
     }
 }

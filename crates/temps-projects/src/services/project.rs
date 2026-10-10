@@ -677,7 +677,11 @@ impl SourceDirectoryTarget<'_> {
     /// unrelated edit (a preset change re-sending the same directory) is never
     /// refused because the repository changed underneath the project.
     fn differs_from(&self, project: &projects::Model) -> bool {
+        // The public flag and URL decide whether (and against which
+        // provider) a connectionless project can be checked at all.
         self.connection_id != project.git_provider_connection_id
+            || self.is_public_repo != project.is_public_repo
+            || self.git_url != project.git_url.as_deref()
             || self.repo_owner != project.repo_owner
             || self.repo_name != project.repo_name
             || self.branch != project.main_branch
@@ -12571,6 +12575,16 @@ mod tests {
             },
             SourceDirectoryTarget {
                 connection_id: Some(4),
+                ..same
+            },
+            // A connectionless project moved to a public URL (or between
+            // providers) is checked against the new repository.
+            SourceDirectoryTarget {
+                is_public_repo: true,
+                ..same
+            },
+            SourceDirectoryTarget {
+                git_url: Some("https://github.com/example/monorepo"),
                 ..same
             },
         ] {
