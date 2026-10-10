@@ -9,12 +9,15 @@ interface ErrorAlertProps {
   title?: string
   description: string
   retry?: () => void
+  /** True while the retry is in flight: the button says so and ignores clicks. */
+  retrying?: boolean
 }
 
 export function ErrorAlert({
   title = 'Error',
   description,
   retry,
+  retrying = false,
 }: ErrorAlertProps) {
   return (
     <Alert variant="destructive">
@@ -23,8 +26,15 @@ export function ErrorAlert({
       <div className="flex items-center justify-between gap-4">
         <AlertDescription>{description}</AlertDescription>
         {retry && (
-          <Button variant="destructive" size="sm" onClick={retry}>
-            Try Again
+          <Button
+            variant="destructive"
+            size="sm"
+            aria-disabled={retrying}
+            onClick={() => {
+              if (!retrying) retry()
+            }}
+          >
+            {retrying ? 'Retrying…' : 'Try Again'}
           </Button>
         )}
       </div>
