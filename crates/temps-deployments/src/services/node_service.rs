@@ -1819,6 +1819,11 @@ impl NodeService {
     pub async fn remove(&self, node_id: i32) -> Result<NodeRemoval, NodeError> {
         let txn = self.db.begin().await?;
 
+        // First, before any row lock: environment settings saves take the
+        // same lock to validate and write `target_nodes`, so a save can never
+        // commit this node's ID after the placements below were rewritten.
+        temps_entities::deployment_config::lock_node_placements(&txn).await?;
+
         // Drop the node's DNS records first, under the DNS registry's
         // generation lock. A route reload republishes `service_endpoints`
         // rows carrying this `node_id`. If the node row were locked first,
@@ -1866,10 +1871,9 @@ impl NodeService {
             });
         }
 
-        // Read and rewritten under the node row lock, in this transaction: a
-        // settings save that adds this node concurrently either committed
-        // first and is rewritten here, or validates against a node that no
-        // longer exists once this commits.
+        // Read and rewritten under the placement lock taken above: a settings
+        // save that names this node either committed first and is rewritten
+        // here, or waits and then validates against a node that is gone.
         let placements_updated = Self::remove_from_placements(&txn, node_id, &locked.name).await?;
 
         // `deployment_containers.node_id` is `ON DELETE SET NULL`, and NULL
@@ -2859,8 +2863,14 @@ mod tests {
 
     /// Queue the results of `remove`'s first step: the DNS generation lock,
     /// then deleting the node's DNS records (none here, so no bump follows).
+    /// The statements every removal runs first: the node placement lock,
+    /// then the DNS registry's generation read and endpoint delete.
     fn with_no_dns_records(db: MockDatabase) -> MockDatabase {
-        db.append_query_results(vec![vec![std::collections::BTreeMap::from([(
+        db.append_exec_results(vec![sea_orm::MockExecResult {
+            last_insert_id: 0,
+            rows_affected: 1,
+        }])
+        .append_query_results(vec![vec![std::collections::BTreeMap::from([(
             "current".to_string(),
             sea_orm::Value::BigInt(Some(5)),
         )])]])

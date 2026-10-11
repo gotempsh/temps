@@ -895,8 +895,13 @@ impl EnvironmentService {
     /// A stored unknown ID silently stops targeting anything: a removed node's
     /// ID is never reused, and the same machine rejoining gets a new one, so
     /// the scheduler would quietly place replicas on fewer nodes than asked.
-    async fn ensure_target_nodes_exist(
-        &self,
+    ///
+    /// Must run inside the transaction that writes the config, after
+    /// [`temps_entities::deployment_config::lock_node_placements`]: node
+    /// removal takes the same lock, so no node can disappear between this
+    /// check and the commit.
+    async fn ensure_target_nodes_exist<C: ConnectionTrait>(
+        conn: &C,
         environment_id: i32,
         requested: &[i32],
     ) -> Result<(), EnvironmentError> {
@@ -913,7 +918,7 @@ impl EnvironmentService {
             .column(temps_entities::nodes::Column::Id)
             .filter(temps_entities::nodes::Column::Id.is_in(candidates))
             .into_tuple()
-            .all(self.db.as_ref())
+            .all(conn)
             .await
             .map_err(|e| EnvironmentError::DatabaseError {
                 reason: format!(
@@ -933,7 +938,7 @@ impl EnvironmentService {
             .order_by_asc(temps_entities::nodes::Column::Id)
             .limit(50)
             .into_tuple()
-            .all(self.db.as_ref())
+            .all(conn)
             .await
             .map_err(|e| EnvironmentError::DatabaseError {
                 reason: format!(
@@ -965,8 +970,24 @@ impl EnvironmentService {
         settings: crate::handlers::UpdateEnvironmentSettingsRequest,
         ceiling_enforcement: temps_core::CeilingEnforcement,
     ) -> Result<environments::Model, EnvironmentError> {
-        // First get the environment to verify it exists and belongs to the project
-        let environment = self.get_environment(project_id_param, env_id).await?;
+        // One transaction under the node placement lock, which node removal
+        // also takes: the environment is read, its target nodes validated and
+        // its config written while no node can be removed. A save can then
+        // neither commit a removed node's ID nor write back a copy of the
+        // config read before a removal rewrote it. Rolled back on any error.
+        let txn = self.db.begin().await?;
+        temps_entities::deployment_config::lock_node_placements(&txn).await?;
+        let environment = environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(project_id_param))
+            .filter(environments::Column::Id.eq(env_id))
+            .filter(environments::Column::DeletedAt.is_null())
+            .one(&txn)
+            .await?
+            .ok_or_else(|| {
+                EnvironmentError::NotFound(format!(
+                    "Environment {env_id} not found in project {project_id_param}"
+                ))
+            })?;
 
         // Update the environment with new settings
         let mut active_model: environments::ActiveModel = environment.clone().into();
@@ -1042,8 +1063,7 @@ impl EnvironmentService {
             deployment_config.security = Some(security);
         }
         if let Some(target_nodes) = settings.target_nodes {
-            self.ensure_target_nodes_exist(env_id, &target_nodes)
-                .await?;
+            Self::ensure_target_nodes_exist(&txn, env_id, &target_nodes).await?;
             deployment_config.target_nodes = normalize_target_nodes(target_nodes);
         }
         if let Some(target_labels) = settings.target_labels {
@@ -1136,7 +1156,10 @@ impl EnvironmentService {
         active_model.updated_at = Set(chrono::Utc::now());
 
         let updated_environment = active_model
-            .update(self.db.as_ref())
+            .update(&txn)
+            .await
+            .map_err(|e| EnvironmentError::DatabaseConnectionError(e.to_string()))?;
+        txn.commit()
             .await
             .map_err(|e| EnvironmentError::DatabaseConnectionError(e.to_string()))?;
 
@@ -2232,6 +2255,11 @@ mod tests {
         let env = env_for_ceiling_test();
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
+                // The node placement lock the save takes first.
+                .append_exec_results(vec![MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
                 .append_query_results(vec![vec![env]])
                 .into_connection(),
         );
@@ -2808,5 +2836,170 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(result.unwrap().sleeping);
+    }
+
+    fn settings_with_target_nodes(
+        target_nodes: Vec<i32>,
+    ) -> crate::handlers::UpdateEnvironmentSettingsRequest {
+        crate::handlers::UpdateEnvironmentSettingsRequest {
+            branch: None,
+            cpu_request: None,
+            cpu_limit: None,
+            memory_request: None,
+            memory_limit: None,
+            replicas: None,
+            exposed_port: None,
+            automatic_deploy: None,
+            performance_metrics_enabled: None,
+            session_recording_enabled: None,
+            security: None,
+            target_nodes: Some(target_nodes),
+            target_labels: None,
+            anti_affinity: None,
+            cross_architecture_builds: None,
+            build_location: None,
+            protected: None,
+            attack_mode: None,
+            force_https: None,
+            on_demand: None,
+            idle_timeout_seconds: None,
+            wake_timeout_seconds: None,
+            request_timeout_seconds: None,
+            sse_idle_timeout_seconds: None,
+            websocket_idle_timeout_seconds: None,
+            max_concurrent_connections: None,
+            password: None,
+        }
+    }
+
+    /// A settings save racing a node removal: the removal holds the node
+    /// placement lock and deletes the node; the save must wait for it and
+    /// then reject the ID, instead of validating before the removal and
+    /// committing a deleted node's ID after it.
+    #[tokio::test]
+    async fn a_save_racing_a_node_removal_waits_and_then_rejects_the_removed_node() {
+        use sea_orm::TransactionTrait;
+        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+        use temps_entities::{preset::Preset, upstream_config::UpstreamList};
+
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                eprintln!("Docker unavailable, skipping placement race test: {error:#}");
+                return;
+            }
+            Err(error) => panic!("placement race test database setup failed: {error:#}"),
+        };
+        let db = test_db.connection_arc();
+        let node_id: i32 = db
+            .query_one(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "INSERT INTO nodes (name, token_hash, address, private_address, role, status, \
+                 labels, capacity, created_at, updated_at) VALUES ('worker-race', 'hash', \
+                 'https://10.100.0.9:3100', '10.100.0.9', 'worker', 'active', '{}', '{}', now(), \
+                 now()) RETURNING id"
+                    .to_string(),
+            ))
+            .await
+            .expect("insert node")
+            .expect("returned row")
+            .try_get("", "id")
+            .expect("node id");
+        let project = projects::ActiveModel {
+            name: Set("Placement race".to_string()),
+            slug: Set("placement-race".to_string()),
+            repo_owner: Set("owner".to_string()),
+            repo_name: Set("repo".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::NextJs),
+            directory: Set("/".to_string()),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            is_deleted: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert project");
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            slug: Set("production".to_string()),
+            host: Set("race.example.test".to_string()),
+            subdomain: Set("race.example.test".to_string()),
+            upstreams: Set(UpstreamList::default()),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert environment");
+
+        // The "removal": takes the placement lock, then deletes the node.
+        let removal = db.begin().await.expect("begin removal");
+        temps_entities::deployment_config::lock_node_placements(&removal)
+            .await
+            .expect("removal takes the lock");
+
+        let server_config = temps_config::ServerConfig::new(
+            "127.0.0.1:3000".to_string(),
+            "postgres://localhost/test".to_string(),
+            None,
+            None,
+        )
+        .unwrap();
+        let config_service = Arc::new(temps_config::ConfigService::new(
+            Arc::new(server_config),
+            db.clone(),
+        ));
+        let service = EnvironmentService::new(db.clone(), config_service);
+        let (project_id, environment_id) = (project.id, environment.id);
+        let save = tokio::spawn(async move {
+            service
+                .update_environment_settings(
+                    project_id,
+                    environment_id,
+                    settings_with_target_nodes(vec![0, node_id]),
+                    temps_core::CeilingEnforcement::Bypass,
+                )
+                .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !save.is_finished(),
+            "the save must wait while a removal holds the placement lock"
+        );
+
+        removal
+            .execute(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "DELETE FROM nodes WHERE id = $1",
+                [node_id.into()],
+            ))
+            .await
+            .expect("delete node");
+        removal.commit().await.expect("commit removal");
+
+        let result = save.await.expect("save task");
+        match result {
+            Err(EnvironmentError::UnknownTargetNodes { unknown, .. }) => {
+                assert_eq!(unknown, vec![node_id]);
+            }
+            other => panic!("expected UnknownTargetNodes, got {:?}", other.map(|e| e.id)),
+        }
+        let stored = environments::Entity::find_by_id(environment_id)
+            .one(db.as_ref())
+            .await
+            .expect("read environment")
+            .expect("environment exists");
+        assert_eq!(
+            stored
+                .deployment_config
+                .and_then(|config| config.target_nodes),
+            None,
+            "the removed node's ID must not be stored"
+        );
     }
 }

@@ -14,6 +14,33 @@ use utoipa::ToSchema;
 /// Smallest non-zero CPU limit Docker accepts: 0.01 cores, in microcores.
 pub const MIN_CPU_LIMIT_MICROCORES: i32 = 10_000;
 
+/// `pg_advisory_xact_lock` key that serializes every write of an
+/// environment's or project's `target_nodes` with node removal.
+///
+/// A settings save validates its node IDs and then writes the whole
+/// `deployment_config`; node removal rewrites every placement that names the
+/// node and deletes it. Without one lock around both, a save could validate
+/// against a node that is removed before it commits, or write back a copy of
+/// the config read before the removal, and either way put a deleted ID back.
+pub const NODE_PLACEMENT_LOCK_KEY: i64 = 0x5445_4D50_504C_4143;
+
+/// Take [`NODE_PLACEMENT_LOCK_KEY`] for the rest of the current transaction.
+///
+/// Call it first in the transaction, before any row lock, so every holder
+/// acquires its locks in the same order. Outside a transaction it is released
+/// immediately and protects nothing.
+pub async fn lock_node_placements<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+) -> Result<(), sea_orm::DbErr> {
+    conn.execute(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT pg_advisory_xact_lock($1)",
+        [NODE_PLACEMENT_LOCK_KEY.into()],
+    ))
+    .await
+    .map(|_| ())
+}
+
 /// Security configuration for projects and environments
 ///
 /// This configuration can be set at three levels:
