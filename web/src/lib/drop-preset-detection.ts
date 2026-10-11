@@ -20,20 +20,21 @@ export interface PreparedDropInspection {
 
 /** Combine the console's and the server's left-out reports. */
 export function mergeLeftOut(
-  local: DropLeftOutPath[],
+  local: { leftOut: DropLeftOutPath[]; leftOutFileCount: number },
   inspection: Pick<
     DropInspectionResponse,
     'skippedEntries' | 'skippedFileCount'
   >
 ): { leftOut: DropLeftOutPath[]; leftOutFileCount: number } {
   const server = inspection.skippedEntries ?? []
-  const leftOut = [...local, ...server].sort((a, b) =>
+  const leftOut = [...local.leftOut, ...server].sort((a, b) =>
     a.path.localeCompare(b.path)
   )
-  const localFiles = local.reduce((sum, entry) => sum + entry.files, 0)
   return {
     leftOut,
-    leftOutFileCount: localFiles + (inspection.skippedFileCount ?? 0),
+    // Totals, not sums of the listed paths: either list may be truncated.
+    leftOutFileCount:
+      local.leftOutFileCount + (inspection.skippedFileCount ?? 0),
   }
 }
 
@@ -104,6 +105,6 @@ export async function prepareAndInspectDrop(
   return {
     archive: prepared.file,
     inspection,
-    ...mergeLeftOut(prepared.leftOut, inspection),
+    ...mergeLeftOut(prepared, inspection),
   }
 }

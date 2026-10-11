@@ -11,8 +11,10 @@ export interface PreparedDrop {
   fileCount: number
   rootPage: string | null
   /** What a dropped folder left out of the upload (empty for a ZIP, whose
-   * left-out entries the server reports). */
+   * left-out entries the server reports). At most 50 paths. */
   leftOut: DropLeftOutPath[]
+  /** Files left out in total, including any beyond the listed paths. */
+  leftOutFileCount: number
 }
 
 /**
@@ -41,6 +43,17 @@ type DropPathDisposition =
 
 /** Distinct left-out paths listed, matching the server's bound. */
 const MAX_LEFT_OUT_PATHS = 50
+
+/**
+ * Folders left out wherever they appear. A `Map`, not an object literal, so
+ * an ordinary folder named `constructor` or `toString` never matches an
+ * inherited property.
+ */
+const DIRECTORY_REASONS = new Map<string, DropLeftOutReason>([
+  ['.git', 'version_control'],
+  ['node_modules', 'dependencies'],
+  ['__MACOSX', 'os_metadata'],
+])
 
 /** Last dot-separated suffixes that make a `.env.*` file a template. */
 const ENV_TEMPLATE_SUFFIXES = new Set(['example', 'sample', 'template', 'dist'])
@@ -92,13 +105,8 @@ export function classifyDropPath(path: string): DropPathDisposition {
   const last = parts.length - 1
   const through = (index: number) =>
     parts.slice(0, index + 1).join('/') + (index < last ? '/' : '')
-  const directoryReasons: Record<string, DropLeftOutReason> = {
-    '.git': 'version_control',
-    node_modules: 'dependencies',
-    __MACOSX: 'os_metadata',
-  }
   for (const [index, part] of parts.entries()) {
-    const reason = directoryReasons[part]
+    const reason = DIRECTORY_REASONS.get(part)
     if (reason) return { kind: 'skip', reason, reportedPath: through(index) }
   }
   for (const [index, part] of parts.entries()) {
@@ -126,10 +134,17 @@ export function classifyDropPath(path: string): DropPathDisposition {
   return { kind: 'keep' }
 }
 
-/** Kept files, with a shared top folder removed, and what was left out. */
+/**
+ * Kept files, with a shared top folder removed, and what was left out.
+ *
+ * Paths are classified before the selected folder's name is removed, so
+ * choosing `node_modules` or `.git` itself still leaves it out. `leftOut`
+ * lists at most 50 paths; `leftOutFileCount` counts every file left out.
+ */
 export function partitionDropFiles(files: DropFile[]): {
   kept: DropFile[]
   leftOut: DropLeftOutPath[]
+  leftOutFileCount: number
 } {
   const cleaned = files
     .map(({ file, path }) => ({ file, path: cleanPath(path || file.name) }))
@@ -141,26 +156,30 @@ export function partitionDropFiles(files: DropFile[]): {
   const hasSharedFolder =
     splitPaths.length > 0 &&
     splitPaths.every((parts) => parts.length > 1 && parts[0] === firstPart)
-  const relative = hasSharedFolder
-    ? cleaned.map(({ file, path }) => ({
-        file,
-        path: path.slice(firstPart.length + 1),
-      }))
-    : cleaned
+  const sharedPrefix = hasSharedFolder ? `${firstPart}/` : ''
+  // Relative to the selected folder, unless the excluded path is that
+  // folder itself (`node_modules/` when node_modules was selected).
+  const relativeTo = (path: string) =>
+    sharedPrefix && path.startsWith(sharedPrefix) && path !== sharedPrefix
+      ? path.slice(sharedPrefix.length)
+      : path
 
   const kept: DropFile[] = []
   const leftOut = new Map<string, DropLeftOutPath>()
-  for (const entry of relative) {
+  let leftOutFileCount = 0
+  for (const entry of cleaned) {
     const disposition = classifyDropPath(entry.path)
     if (disposition.kind === 'keep') {
-      kept.push(entry)
+      kept.push({ file: entry.file, path: relativeTo(entry.path) })
       continue
     }
-    const listed = leftOut.get(disposition.reportedPath)
+    leftOutFileCount += 1
+    const reportedPath = relativeTo(disposition.reportedPath)
+    const listed = leftOut.get(reportedPath)
     if (listed) listed.files += 1
     else if (leftOut.size < MAX_LEFT_OUT_PATHS) {
-      leftOut.set(disposition.reportedPath, {
-        path: disposition.reportedPath,
+      leftOut.set(reportedPath, {
+        path: reportedPath,
         reason: disposition.reason,
         files: 1,
       })
@@ -169,6 +188,7 @@ export function partitionDropFiles(files: DropFile[]): {
   return {
     kept,
     leftOut: [...leftOut.values()].sort((a, b) => a.path.localeCompare(b.path)),
+    leftOutFileCount,
   }
 }
 
@@ -325,11 +345,29 @@ export async function prepareDrop(
     if (rawFiles[0].file.size > 500 * 1024 * 1024) {
       throw new Error('Drop exceeds the 500 MB upload limit')
     }
-    return { file: rawFiles[0].file, fileCount: 1, rootPage: null, leftOut: [] }
+    return {
+      file: rawFiles[0].file,
+      fileCount: 1,
+      rootPage: null,
+      leftOut: [],
+      leftOutFileCount: 0,
+    }
   }
 
-  const { kept: files, leftOut } = partitionDropFiles(rawFiles)
-  if (files.length === 0) throw new Error('The selected folder is empty')
+  const {
+    kept: files,
+    leftOut,
+    leftOutFileCount,
+  } = partitionDropFiles(rawFiles)
+  if (files.length === 0) {
+    throw new Error(
+      leftOutFileCount > 0
+        ? `Nothing in the selected folder can be uploaded: everything in it is left out (${leftOut
+            .map(({ path }) => path)
+            .join(', ')}). Select the project folder instead.`
+        : 'The selected folder is empty'
+    )
+  }
 
   const totalBytes = files.reduce((sum, { file }) => sum + file.size, 0)
   if (totalBytes > MAX_BROWSER_PACKAGE_BYTES) {
@@ -359,5 +397,6 @@ export async function prepareDrop(
     fileCount: files.length,
     rootPage,
     leftOut,
+    leftOutFileCount,
   }
 }

@@ -5,6 +5,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   DROP_NO_PROJECT_PROBLEM_TYPE,
   dropDetectionGap,
+  mergeLeftOut,
   prepareAndInspectDrop,
   presetConfigForDropCandidate,
 } from './drop-preset-detection'
@@ -133,5 +134,28 @@ describe('prepareAndInspectDrop', () => {
       )
     ).rejects.toMatchObject({ name: 'AbortError' })
     expect(inspectCalled).toBe(false)
+  })
+})
+
+describe('mergeLeftOut', () => {
+  test('the left-out total comes from both totals, not the listed paths', () => {
+    const merged = mergeLeftOut(
+      {
+        leftOut: [{ path: '.env', reason: 'environment_file', files: 1 }],
+        leftOutFileCount: 51,
+      },
+      {
+        skippedEntries: [
+          { path: 'node_modules/', reason: 'dependencies', files: 3 },
+        ],
+        skippedFileCount: 120,
+      }
+    )
+
+    expect(merged.leftOutFileCount).toBe(171)
+    expect(merged.leftOut.map(({ path }) => path)).toEqual([
+      '.env',
+      'node_modules/',
+    ])
   })
 })

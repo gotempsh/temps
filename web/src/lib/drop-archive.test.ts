@@ -97,6 +97,55 @@ describe('drop archive preparation', () => {
     ])
   })
 
+  test('keeps folders whose names are inherited object properties', () => {
+    const files = normalizeDropFiles([
+      dropped('app/src/constructor/index.ts'),
+      dropped('app/src/toString/index.ts'),
+      dropped('app/src/__proto__/index.ts'),
+      dropped('app/src/hasOwnProperty/index.ts'),
+    ])
+
+    expect(files.map(({ path }) => path)).toEqual([
+      'src/constructor/index.ts',
+      'src/toString/index.ts',
+      'src/__proto__/index.ts',
+      'src/hasOwnProperty/index.ts',
+    ])
+  })
+
+  test('leaves out an excluded folder even when it is the one selected', () => {
+    for (const [folder, reason] of [
+      ['node_modules', 'dependencies'],
+      ['.git', 'version_control'],
+    ] as const) {
+      const { kept, leftOut, leftOutFileCount } = partitionDropFiles([
+        dropped(`${folder}/a/index.js`),
+        dropped(`${folder}/b/index.js`),
+      ])
+
+      expect(kept).toEqual([])
+      expect(leftOutFileCount).toBe(2)
+      expect(leftOut).toEqual([{ path: `${folder}/`, reason, files: 2 }])
+    }
+  })
+
+  test('counts every file left out, beyond the listed paths', () => {
+    const files = [dropped('app/index.js')]
+    for (let index = 0; index < 51; index += 1) {
+      files.push(dropped(`app/pkg-${index}/.env`, 'TOKEN=secret'))
+    }
+    const { leftOut, leftOutFileCount } = partitionDropFiles(files)
+
+    expect(leftOut).toHaveLength(50)
+    expect(leftOutFileCount).toBe(51)
+  })
+
+  test('explains a folder whose every file is left out', async () => {
+    await expect(
+      prepareDrop([dropped('node_modules/a/index.js')])
+    ).rejects.toThrow('everything in it is left out (node_modules/)')
+  })
+
   test('classifies paths with the same rule as the server', () => {
     expect(classifyDropPath('apps/api/.env.production.example')).toEqual({
       kind: 'keep',
