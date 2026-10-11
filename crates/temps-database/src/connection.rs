@@ -195,9 +195,34 @@ where
     Fut: std::future::Future<Output = Result<T, StartupAttemptFailure>>,
 {
     let started = tokio::time::Instant::now();
+    let give_up = |attempts: u32, reason: &str| {
+        ServiceError::Database(format!(
+            "Database at {target} is still unreachable after waiting {}s \
+             ({attempts} attempt(s)); last error: {reason}. Check that PostgreSQL \
+             is running and reachable from this host, or allow a longer wait with \
+             --database-startup-wait / TEMPS_DB_STARTUP_WAIT (seconds)",
+            started.elapsed().as_secs()
+        ))
+    };
     let mut failed_attempts: u32 = 0;
     loop {
-        let reason = match attempt().await {
+        // Each attempt gets only the time left, so a slow probe (a TCP check
+        // to a black-holed host, a login that hangs) cannot carry startup
+        // past the limit. A zero wait makes one attempt with its own
+        // timeouts, as before.
+        let outcome = if max_wait.is_zero() {
+            attempt().await
+        } else {
+            let remaining = max_wait.saturating_sub(started.elapsed());
+            match tokio::time::timeout(remaining, attempt()).await {
+                Ok(outcome) => outcome,
+                Err(_) => Err(StartupAttemptFailure::Transient(format!(
+                    "the attempt did not finish within the {}s left of the startup wait",
+                    remaining.as_secs()
+                ))),
+            }
+        };
+        let reason = match outcome {
             Ok(value) => {
                 if failed_attempts > 0 {
                     tracing::info!(
@@ -222,15 +247,14 @@ where
         let elapsed = started.elapsed();
         let remaining = max_wait.saturating_sub(elapsed);
         if remaining.is_zero() {
-            return Err(ServiceError::Database(format!(
-                "Database at {target} is still unreachable after waiting {}s \
-                 ({failed_attempts} attempt(s)); last error: {reason}. Check that PostgreSQL \
-                 is running and reachable from this host, or allow a longer wait with \
-                 --database-startup-wait / TEMPS_DB_STARTUP_WAIT (seconds)",
-                elapsed.as_secs()
-            )));
+            return Err(give_up(failed_attempts, &reason));
         }
-        let delay = startup_retry_delay(failed_attempts).min(remaining);
+        let delay = startup_retry_delay(failed_attempts);
+        if delay >= remaining {
+            // The next attempt would start with no time left to run in.
+            tokio::time::sleep(remaining).await;
+            return Err(give_up(failed_attempts, &reason));
+        }
         tracing::warn!(
             target_database = %target,
             attempt = failed_attempts,
@@ -1455,19 +1479,53 @@ mod tests {
         .await
         .unwrap_err()
         .to_string();
-        // Attempts at 0, 1, 3, 7 and 10 s: the last delay is cut to the time
-        // left, so the wait never overshoots the limit.
-        assert_eq!(attempts.load(Ordering::SeqCst), 5);
+        // Attempts at 0, 1, 3 and 7 s; the next one (8 s later) would start
+        // past the limit, so it waits out the rest and gives up at 10 s.
+        assert_eq!(attempts.load(Ordering::SeqCst), 4);
         assert_eq!(started.elapsed().as_secs(), 10);
         for expected in [
             "db:5432",
             "after waiting 10s",
-            "5 attempt(s)",
+            "4 attempt(s)",
             "No route to host",
             "TEMPS_DB_STARTUP_WAIT",
         ] {
             assert!(error.contains(expected), "{expected:?} missing: {error}");
         }
+    }
+
+    /// A probe that hangs (a black-holed host) must not carry startup past
+    /// the limit: the attempt is cut off when the wait runs out.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_attempt_cannot_outlast_the_startup_wait() {
+        let attempts = AtomicU32::new(0);
+        let started = tokio::time::Instant::now();
+        let error = retry_database_startup("db:5432", Duration::from_secs(5), || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok::<(), StartupAttemptFailure>(())
+            }
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(started.elapsed().as_secs(), 5);
+        assert!(error.contains("did not finish within the 5s"), "{error}");
+        assert!(error.contains("after waiting 5s"), "{error}");
+    }
+
+    /// With no wait configured the single attempt keeps its own timeouts and
+    /// is not cut short.
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_wait_does_not_cut_the_single_attempt_short() {
+        let result = retry_database_startup("db:5432", Duration::ZERO, || async {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            Ok::<u8, StartupAttemptFailure>(7)
+        })
+        .await;
+        assert_eq!(result.unwrap(), 7);
     }
 
     #[tokio::test(start_paused = true)]
