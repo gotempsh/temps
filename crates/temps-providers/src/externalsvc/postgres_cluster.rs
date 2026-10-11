@@ -520,13 +520,18 @@ const REAL_PG_BASEBACKUP_SUFFIX: &str = ".temps-real";
 ///
 /// The real binary is moved aside once and a two-line wrapper put in its
 /// place, so it is idempotent across container restarts (the container
-/// filesystem survives them). Runs as root, before `pg_autoctl create`.
+/// filesystem survives them). The moved-aside binary decides whether a
+/// directory is handled, not `pg_basebackup` itself, so a stop between the
+/// move and the wrapper's install is repaired on the next start instead of
+/// leaving the standby without the command it clones with. Runs as root,
+/// before `pg_autoctl create`.
 fn fast_checkpoint_basebackup_snippet(bindir_glob: &str) -> String {
     format!(
-        r#"for BB in {bindir_glob}/pg_basebackup; do
-  [ -f "$BB" ] || continue
+        r#"for BIN in {bindir_glob}; do
+  BB="$BIN/pg_basebackup"
   REAL="$BB{suffix}"
   if [ ! -e "$REAL" ]; then
+    [ -f "$BB" ] || continue
     mv "$BB" "$REAL" || {{ echo "temps: could not move $BB aside; standby clones keep the spread checkpoint" >&2; continue; }}
   fi
   printf '#!/bin/sh\n# Installed by Temps: request a fast checkpoint for every base backup.\nexec "%s" --checkpoint=fast "$@"\n' "$REAL" > "$BB.temps-wrapper"
@@ -1974,6 +1979,73 @@ exit 0
             std::fs::read_to_string(&recorded).unwrap().trim(),
             "--checkpoint=fast -w -d host=primary port=6121 --wal-method=stream"
         );
+    }
+
+    /// A stop between moving the real binary aside and installing the
+    /// wrapper leaves only `pg_basebackup.temps-real`; the next start must
+    /// put the wrapper back rather than skip the directory.
+    #[cfg(unix)]
+    #[test]
+    fn fast_checkpoint_wrapper_is_repaired_after_an_interrupted_install() {
+        let root = tempfile::tempdir().unwrap();
+        let bindir = root.path().join("18").join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let recorded = root.path().join("args");
+        let real = bindir.join(format!("pg_basebackup{REAL_PG_BASEBACKUP_SUFFIX}"));
+        std::fs::write(
+            &real,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\n",
+                recorded.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&real, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let pg_basebackup = bindir.join("pg_basebackup");
+        assert!(
+            !pg_basebackup.exists(),
+            "the interrupted state has no command"
+        );
+
+        let glob = format!("{}/*/bin", root.path().display());
+        let status = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "set -e\n{}",
+                fast_checkpoint_basebackup_snippet(&glob)
+            ))
+            .status()
+            .expect("run the snippet");
+        assert!(status.success());
+
+        let status = std::process::Command::new(&pg_basebackup)
+            .args(["-w", "-D", "/tmp/x"])
+            .status()
+            .expect("run the repaired wrapper");
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(&recorded).unwrap().trim(),
+            "--checkpoint=fast -w -D /tmp/x"
+        );
+    }
+
+    /// No PostgreSQL bin directory (another image layout): nothing to wrap,
+    /// and the entrypoint must carry on.
+    #[cfg(unix)]
+    #[test]
+    fn fast_checkpoint_snippet_is_a_no_op_without_postgres_binaries() {
+        let root = tempfile::tempdir().unwrap();
+        let glob = format!("{}/*/bin", root.path().display());
+        let status = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "set -e\n{}",
+                fast_checkpoint_basebackup_snippet(&glob)
+            ))
+            .status()
+            .expect("run the snippet");
+        assert!(status.success());
     }
 
     #[test]
