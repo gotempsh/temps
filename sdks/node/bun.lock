@@ -59,7 +59,7 @@
     },
     "packages/analytics-browser": {
       "name": "@temps-sdk/analytics-browser",
-      "version": "0.0.5",
+      "version": "0.0.6",
       "dependencies": {
         "@temps-sdk/analytics-core": "workspace:*",
       },
