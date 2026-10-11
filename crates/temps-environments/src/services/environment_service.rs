@@ -970,6 +970,40 @@ impl EnvironmentService {
         settings: crate::handlers::UpdateEnvironmentSettingsRequest,
         ceiling_enforcement: temps_core::CeilingEnforcement,
     ) -> Result<environments::Model, EnvironmentError> {
+        // Everything that does not need the environment row happens before
+        // the transaction below, so it never holds the placement lock (and
+        // its pooled connection) while waiting on other work: the instance
+        // settings read can need a second connection from the same pool, and
+        // concurrent saves queued on the lock would otherwise hold every
+        // connection it could use. Hashing is CPU-bound and gains nothing
+        // from the lock either.
+        let tenant_ceilings = if ceiling_enforcement == temps_core::CeilingEnforcement::Enforce {
+            let app_settings = self.config_service.get_settings().await.map_err(|e| {
+                EnvironmentError::Other(format!(
+                    "Failed to read instance settings to check resource ceilings for environment {env_id}: {e}"
+                ))
+            })?;
+            Some(app_settings.tenant_resource_ceilings)
+        } else {
+            None
+        };
+        let password_hash = match settings.password.as_deref() {
+            Some(password) if !password.is_empty() => {
+                use argon2::{Argon2, PasswordHasher};
+                let hash = Argon2::default()
+                    .hash_password(password.as_bytes())
+                    .map_err(|e| {
+                        EnvironmentError::InvalidInput(format!(
+                            "Failed to hash password for environment {}: {}",
+                            env_id, e
+                        ))
+                    })?
+                    .to_string();
+                Some(hash)
+            }
+            _ => None,
+        };
+
         // One transaction under the node placement lock, which node removal
         // also takes: the environment is read, its target nodes validated and
         // its config written while no node can be removed. A save can then
@@ -1036,30 +1070,16 @@ impl EnvironmentService {
             deployment_config.security = Some(security);
         }
         // Handle password protection: hash plaintext password with argon2
-        if let Some(ref password) = settings.password {
+        // (hashed above, before the transaction)
+        if settings.password.is_some() {
             let mut security = deployment_config.security.clone().unwrap_or_default();
-            if password.is_empty() {
-                // Empty string removes password protection
-                security.password_protection = None;
-            } else {
-                use argon2::{Argon2, PasswordHasher};
-                let argon2 = Argon2::default();
-                let hash = argon2
-                    .hash_password(password.as_bytes())
-                    .map_err(|e| {
-                        EnvironmentError::InvalidInput(format!(
-                            "Failed to hash password for environment {}: {}",
-                            env_id, e
-                        ))
-                    })?
-                    .to_string();
-                security.password_protection = Some(
-                    temps_entities::deployment_config::PasswordProtectionConfig {
-                        enabled: true,
-                        password_hash: hash,
-                    },
-                );
-            }
+            security.password_protection = password_hash.map(|password_hash| {
+                // A non-empty password sets protection; an empty one removes it.
+                temps_entities::deployment_config::PasswordProtectionConfig {
+                    enabled: true,
+                    password_hash,
+                }
+            });
             deployment_config.security = Some(security);
         }
         if let Some(target_nodes) = settings.target_nodes {
@@ -1122,14 +1142,9 @@ impl EnvironmentService {
         // already bounded — except for configs written before the operator set
         // the ceiling, which no write path revisits (see the PR discussion on
         // retroactive enforcement).
-        if ceiling_enforcement == temps_core::CeilingEnforcement::Enforce {
-            let app_settings = self.config_service.get_settings().await.map_err(|e| {
-                EnvironmentError::Other(format!(
-                    "Failed to read instance settings to check resource ceilings for environment {env_id}: {e}"
-                ))
-            })?;
-            if let Err(violations) = deployment_config
-                .check_against_tenant_ceilings(&app_settings.tenant_resource_ceilings)
+        if let Some(tenant_ceilings) = &tenant_ceilings {
+            if let Err(violations) =
+                deployment_config.check_against_tenant_ceilings(tenant_ceilings)
             {
                 return Err(EnvironmentError::InvalidInput(violations.join("; ")));
             }
@@ -3001,5 +3016,97 @@ mod tests {
             None,
             "the removed node's ID must not be stored"
         );
+    }
+
+    /// The save holds a pooled connection for its transaction. Reading the
+    /// instance settings inside it would need a second connection, so on a
+    /// busy pool (here: a pool of one) the save could never finish. They are
+    /// read before the transaction starts.
+    #[tokio::test]
+    async fn a_ceiling_checked_save_needs_only_one_pooled_connection() {
+        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+        use temps_entities::{preset::Preset, upstream_config::UpstreamList};
+
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                eprintln!("Docker unavailable, skipping single-connection save test: {error:#}");
+                return;
+            }
+            Err(error) => panic!("single-connection save test database setup failed: {error:#}"),
+        };
+        let setup = test_db.connection_arc();
+        let project = projects::ActiveModel {
+            name: Set("Single connection".to_string()),
+            slug: Set("single-connection".to_string()),
+            repo_owner: Set("owner".to_string()),
+            repo_name: Set("repo".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::NextJs),
+            directory: Set("/".to_string()),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            is_deleted: Set(false),
+            ..Default::default()
+        }
+        .insert(setup.as_ref())
+        .await
+        .expect("insert project");
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            slug: Set("production".to_string()),
+            host: Set("single.example.test".to_string()),
+            subdomain: Set("single.example.test".to_string()),
+            upstreams: Set(UpstreamList::default()),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(setup.as_ref())
+        .await
+        .expect("insert environment");
+
+        let mut options = temps_database::connect_options(test_db.database_url.clone());
+        options
+            .max_connections(1)
+            .min_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(5));
+        let single = Arc::new(
+            sea_orm::Database::connect(options)
+                .await
+                .expect("connect a one-connection pool"),
+        );
+        let server_config = temps_config::ServerConfig::new(
+            "127.0.0.1:3000".to_string(),
+            "postgres://localhost/test".to_string(),
+            None,
+            None,
+        )
+        .unwrap();
+        // Same pool, cold cache: the settings read needs a connection.
+        let config_service = Arc::new(temps_config::ConfigService::new(
+            Arc::new(server_config),
+            single.clone(),
+        ));
+        let service = EnvironmentService::new(single, config_service);
+
+        let mut request = settings_with_target_nodes(vec![0]);
+        request.replicas = Some(2);
+        let saved = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            service.update_environment_settings(
+                project.id,
+                environment.id,
+                request,
+                temps_core::CeilingEnforcement::Enforce,
+            ),
+        )
+        .await
+        .expect("the save must not wait for a second pooled connection")
+        .expect("the save succeeds");
+        let config = saved.deployment_config.expect("config stored");
+        assert_eq!(config.replicas, 2);
+        assert_eq!(config.target_nodes, Some(vec![0]));
     }
 }
