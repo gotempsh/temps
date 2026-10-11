@@ -4,6 +4,7 @@
 import { linkedResourceCopy } from '@/lib/service-link-copy'
 import {
   deleteServiceMutation,
+  getClusterHealthQueryKey,
   getProjectsOptions,
   listS3SourcesOptions,
   getServiceOptions,
@@ -531,7 +532,7 @@ export function ServiceDetail() {
       setMemberToRemove(null)
       refetch()
       queryClient.invalidateQueries({
-        queryKey: ['cluster-health', parseInt(id!)],
+        queryKey: getClusterHealthQueryKey({ path: { id: parseInt(id!) } }),
       })
     },
     onError: (error: Error) => {
@@ -575,7 +576,7 @@ export function ServiceDetail() {
       const ping = () => {
         refetch()
         queryClient.invalidateQueries({
-          queryKey: ['cluster-health', parseInt(id!)],
+          queryKey: getClusterHealthQueryKey({ path: { id: parseInt(id!) } }),
         })
       }
       ping()
