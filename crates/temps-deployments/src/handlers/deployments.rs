@@ -589,8 +589,8 @@ impl From<crate::services::services::DeploymentError> for Problem {
         ("id" = i32, Path, description = "Project ID")
     ),
     responses(
-        (status = 200, description = "Last deployment details", body = DeploymentResponse),
-        (status = 404, description = "Project not found or no deployments"),
+        (status = 200, description = "Last deployment details, or `null` when the project has not been deployed yet", body = Option<DeploymentResponse>),
+        (status = 404, description = "Project not found"),
         (status = 500, description = "Internal server error")
     ),
     path = "/projects/{id}/last-deployment"
@@ -605,9 +605,13 @@ pub async fn get_last_deployment(
     project_access_guard!(auth, id, state.project_access_checker);
 
     debug!("Getting last deployment for project with id: {}", id);
-    let deployment = state.deployment_service.get_last_deployment(id).await?;
+    // "No deployment yet" is an explicit empty state (`null`), not a 404: it is
+    // normal for a new project and every project switcher asks for it.
+    let Some(deployment) = state.deployment_service.get_last_deployment(id).await? else {
+        return Ok(Json(Option::<DeploymentResponse>::None).into_response());
+    };
     let response = deployment_response_with_service_urls(&state, id, deployment).await?;
-    Ok(Json(response).into_response())
+    Ok(Json(Some(response)).into_response())
 }
 
 #[derive(Debug, serde::Deserialize, utoipa::IntoParams)]

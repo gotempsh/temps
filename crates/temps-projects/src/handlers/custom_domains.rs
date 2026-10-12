@@ -247,10 +247,9 @@ pub async fn list_custom_domains_for_project(
     path = "/custom-domains/by-host/{hostname}",
     operation_id = "get_visible_custom_domain_by_hostname",
     responses(
-        (status = 200, description = "Custom domain assignment retrieved", body = CustomDomainResponse),
+        (status = 200, description = "Custom domain assignment, or `null` when the hostname is not assigned to a project", body = Option<CustomDomainResponse>),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Project access denied"),
-        (status = 404, description = "Domain is not assigned to a project")
+        (status = 403, description = "Project access denied")
     ),
     params(("hostname" = String, Path, description = "Domain hostname")),
     tag = "Custom Domains",
@@ -268,14 +267,13 @@ pub async fn get_custom_domain_by_hostname(
     let custom_domain = state
         .custom_domain_service
         .get_visible_custom_domain_by_hostname(&hostname, &hidden_project_ids)
-        .await?
-        .ok_or_else(|| {
-            problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Domain is not assigned")
-                .with_detail(format!(
-                    "Domain {hostname} is not currently assigned to a project environment"
-                ))
-        })?;
+        .await?;
+
+    // A hostname that is not attached to a project is a normal state the domain
+    // page asks about for every certificate, not a missing resource.
+    let Some(custom_domain) = custom_domain else {
+        return Ok((StatusCode::OK, hostname_assignment_response(None)));
+    };
 
     let domain_with_info = state
         .custom_domain_service
@@ -283,10 +281,18 @@ pub async fn get_custom_domain_by_hostname(
         .await?;
     Ok((
         StatusCode::OK,
-        Json(CustomDomainResponse::from(CustomDomainWithInfo::from(
-            domain_with_info,
+        hostname_assignment_response(Some(CustomDomainResponse::from(
+            CustomDomainWithInfo::from(domain_with_info),
         ))),
     ))
+}
+
+/// Body of a hostname assignment lookup: the assignment, or `null` when the
+/// hostname is not attached to any project environment.
+fn hostname_assignment_response(
+    assignment: Option<CustomDomainResponse>,
+) -> Json<Option<CustomDomainResponse>> {
+    Json(assignment)
 }
 
 /// Move a domain between projects without deleting its route or certificate.
@@ -1002,5 +1008,31 @@ mod tests {
 
         assert!(deny_token < scoped_lookup);
         assert!(hidden_projects < scoped_lookup);
+    }
+
+    /// An unassigned hostname is answered with an explicit empty state (JSON
+    /// `null`), not a 404 the console logs as an error for every certificate.
+    #[test]
+    fn unassigned_hostname_serializes_as_an_explicit_null() {
+        let Json(body) = hostname_assignment_response(None);
+        assert_eq!(
+            serde_json::to_value(&body).expect("response serializes"),
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn hostname_lookup_no_longer_declares_a_404_for_unassigned_domains() {
+        let source = include_str!("custom_domains.rs");
+        let start = source
+            .find("pub async fn get_custom_domain_by_hostname")
+            .expect("hostname handler must exist");
+        let remainder = &source[start + 1..];
+        let end = remainder.find("pub async fn").unwrap_or(remainder.len());
+        let handler = &source[start..start + 1 + end];
+        assert!(
+            !handler.contains("Domain is not assigned"),
+            "an unassigned hostname must not be turned into a NOT_FOUND problem"
+        );
     }
 }

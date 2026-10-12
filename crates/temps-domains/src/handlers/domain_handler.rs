@@ -2274,9 +2274,9 @@ async fn create_or_recreate_order(
     get,
     path = "/domains/{domain_id}/order",
     responses(
-        (status = 200, description = "Order retrieved successfully", body = AcmeOrderResponse),
+        (status = 200, description = "The current order, or `null` when the domain has none", body = Option<AcmeOrderResponse>),
         (status = 401, description = "Unauthorized"),
-        (status = 404, description = "Order not found"),
+        (status = 404, description = "Domain not found"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -2299,13 +2299,24 @@ async fn get_domain_order(
     let order = app_state
         .repository
         .find_acme_order_by_domain(domain_id)
-        .await?
-        .ok_or_else(|| {
-            ErrorBuilder::new(StatusCode::NOT_FOUND)
-                .title("Order not found")
-                .detail(format!("No ACME order found for domain ID {}", domain_id))
-                .build()
-        })?;
+        .await?;
+    let Some(order) = order else {
+        // A domain with no order is a normal state — an active certificate has
+        // its order removed once issued, and the domain page asks regardless.
+        // Only a domain that does not exist is a 404.
+        let domain_exists = app_state
+            .domain_service
+            .get_domain_by_id(domain_id)
+            .await?
+            .is_some();
+        if !domain_exists {
+            return Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
+                .title("Domain not found")
+                .detail(format!("Domain with ID {} not found", domain_id))
+                .build());
+        }
+        return Ok((StatusCode::OK, Json(Option::<AcmeOrderResponse>::None)));
+    };
 
     // Convert order to response
     let mut response = AcmeOrderResponse::from(order.clone());
@@ -2325,7 +2336,7 @@ async fn get_domain_order(
     }
     reconcile_order_with_live_challenge(&mut response);
 
-    Ok((StatusCode::OK, Json(response)))
+    Ok((StatusCode::OK, Json(Some(response))))
 }
 
 /// Order statuses an ACME order can still progress out of.

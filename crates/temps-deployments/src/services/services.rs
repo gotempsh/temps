@@ -1819,18 +1819,35 @@ impl DeploymentService {
         Ok(deployment)
     }
 
+    /// The project's most recent deployment, or `None` when it has never been
+    /// deployed.
+    ///
+    /// A project with no deployments yet is a normal state (a fresh project, or
+    /// every list in the console asking about each project it shows), not a
+    /// missing resource. Only a project that does not exist is `NotFound`.
     pub async fn get_last_deployment(
         &self,
         project_id: i32,
-    ) -> Result<Deployment, DeploymentError> {
-        let deployment_with_pipeline = deployments::Entity::find()
+    ) -> Result<Option<Deployment>, DeploymentError> {
+        let Some(deployment_with_pipeline) = deployments::Entity::find()
             .filter(deployments::Column::ProjectId.eq(project_id))
             .order_by_desc(deployments::Column::CreatedAt)
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| {
-                DeploymentError::NotFound(format!("project {} not found", project_id))
-            })?;
+        else {
+            let project_exists = projects::Entity::find_by_id(project_id)
+                .one(self.db.as_ref())
+                .await?
+                .is_some();
+            return if project_exists {
+                Ok(None)
+            } else {
+                Err(DeploymentError::NotFound(format!(
+                    "project {} not found",
+                    project_id
+                )))
+            };
+        };
 
         let deployment = deployment_with_pipeline;
 
@@ -1850,9 +1867,10 @@ impl DeploymentService {
             .get(&deployment.environment_id)
             .cloned();
 
-        Ok(self
-            .map_db_deployment_to_deployment(deployment, is_current, environment)
-            .await)
+        Ok(Some(
+            self.map_db_deployment_to_deployment(deployment, is_current, environment)
+                .await,
+        ))
     }
 
     pub async fn get_deployment(
