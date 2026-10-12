@@ -162,8 +162,10 @@ impl ProxyLogBatchHandle {
 ///    cache when available.
 ///
 /// Both channels are consumed by a single `tokio::select!` loop so there is only
-/// one writer task. Persistence is fail-open: errors are logged and the batch is
-/// dropped; live traffic is never blocked and this task never panics.
+/// one writer task. Persistence is fail-open: a batch that still fails after the
+/// storage backend's bounded retry of transient lock conflicts (deadlock /
+/// serialization failure) is logged and dropped; live traffic is never blocked
+/// and this task never panics.
 pub struct ProxyLogBatchWriter {
     /// Database connection for raw visitor/session upserts and geo-IP enrichment.
     #[allow(dead_code)]
@@ -508,7 +510,8 @@ impl ProxyLogBatchWriter {
         // Persist via the configured storage backend. FAIL OPEN: on backend
         // error we log and drop the batch — we never block live traffic and
         // never panic (this task is off the Pingora hot path, but the backend
-        // could be down, e.g. ClickHouse unreachable).
+        // could be down, e.g. ClickHouse unreachable). Transient lock
+        // conflicts are retried inside the backend before we get here.
         if let Err(e) = self.storage.write_batch(std::mem::take(batch)).await {
             error!(
                 "Failed to persist {} proxy log entries (dropping batch): {:?}",

@@ -9,16 +9,19 @@
 //! `proxy_logs` hypertable. No behaviour changes — this is purely the original
 //! code relocated behind the trait.
 
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use sea_orm::{
-    ConnectionTrait, DatabaseBackend, DatabaseConnection, QueryResult, Statement, TransactionTrait,
-    Value,
+    ConnectionTrait, DatabaseBackend, DatabaseConnection, DbErr, QueryResult, RuntimeErr,
+    Statement, TransactionTrait, Value,
 };
+use temps_core::retry::RetryConfig;
 use temps_core::UtcDateTime;
 use temps_entities::proxy_logs;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::ProxyLogStorage;
 use crate::handler::proxy_logs::ProxyLogsQuery;
@@ -75,6 +78,105 @@ const INSERT_COLUMNS: [&str; 35] = [
     "response_headers",
     "created_date",
 ];
+
+/// PostgreSQL SQLSTATE for `deadlock_detected`. The server picks one of the
+/// transactions as the victim and rolls the whole statement back.
+const SQLSTATE_DEADLOCK_DETECTED: &str = "40P01";
+
+/// PostgreSQL SQLSTATE for `serialization_failure`. Same contract as a
+/// deadlock: the statement did not apply, re-running it is safe.
+const SQLSTATE_SERIALIZATION_FAILURE: &str = "40001";
+
+/// Attempts (first try included) for one batch INSERT that keeps losing a
+/// lock race. Bounded so a persistent fault degrades to the existing
+/// shed-and-log behaviour rather than stalling the writer task.
+const WRITE_MAX_ATTEMPTS: u32 = 4;
+
+/// Backoff between attempts: 50 ms, 100 ms, 200 ms (capped at 400 ms). The
+/// whole retry budget is under 0.4 s of sleeping, far below what the 8192-entry
+/// ingest channel absorbs at the sustained write rate.
+const WRITE_RETRY_BASE_DELAY: Duration = Duration::from_millis(50);
+const WRITE_RETRY_MAX_DELAY: Duration = Duration::from_millis(400);
+
+/// Whether a failed write is a lock-ordering casualty that is safe to re-run.
+///
+/// Only the two "the server rolled this statement back and you may run it
+/// again" SQLSTATEs qualify. Anything else (connection loss, constraint
+/// violation, bad data) fails the same way on every attempt, so retrying it
+/// would only delay the shed-and-log path.
+fn is_retryable_write_error(error: &DbErr) -> bool {
+    let sqlx_error = match error {
+        DbErr::Exec(RuntimeErr::SqlxError(e)) | DbErr::Query(RuntimeErr::SqlxError(e)) => e,
+        _ => return false,
+    };
+    match sqlx_error {
+        sea_orm::sqlx::Error::Database(database_error) => matches!(
+            database_error.code().as_deref(),
+            Some(SQLSTATE_DEADLOCK_DETECTED) | Some(SQLSTATE_SERIALIZATION_FAILURE)
+        ),
+        _ => false,
+    }
+}
+
+/// Run `operation`, re-running it with exponential backoff while it fails with
+/// a retryable lock-ordering error (see [`is_retryable_write_error`]).
+///
+/// Hand-rolled instead of `RetryConfig::retry` because that helper retries
+/// every error, and most failures here are not worth a second attempt.
+async fn retry_transient_write<F, Fut>(
+    policy: &RetryConfig,
+    entry_count: usize,
+    mut operation: F,
+) -> Result<(), DbErr>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<(), DbErr>>,
+{
+    let mut attempt = 0;
+    loop {
+        match operation().await {
+            Ok(()) => {
+                if attempt > 0 {
+                    debug!(
+                        entries = entry_count,
+                        attempts = attempt + 1,
+                        "Proxy log batch persisted after retrying a transient database conflict"
+                    );
+                }
+                return Ok(());
+            }
+            Err(error) => {
+                attempt += 1;
+                if attempt >= policy.max_attempts || !is_retryable_write_error(&error) {
+                    return Err(error);
+                }
+                let delay = policy.compute_delay(attempt - 1);
+                warn!(
+                    entries = entry_count,
+                    attempt,
+                    max_attempts = policy.max_attempts,
+                    retry_in_ms = delay.as_millis() as u64,
+                    "Proxy log batch hit a transient database conflict, retrying: {}",
+                    error
+                );
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+}
+
+/// Order a batch so that foreign-key parent rows are always locked in the same
+/// sequence.
+///
+/// A multi-row INSERT takes a `FOR KEY SHARE` lock on the referenced
+/// `projects`/`environments`/`deployments` row of every inserted row, in row
+/// order, when the statement finishes. Two batches (or a batch and another
+/// writer) that list the same parents in different orders can each wait on
+/// the other. A stable sort on the parent ids removes the ordering difference
+/// between concurrent batches; ties keep arrival order.
+fn order_for_stable_fk_locking(entries: &mut [CreateProxyLogRequest]) {
+    entries.sort_by_key(|entry| (entry.project_id, entry.environment_id, entry.deployment_id));
+}
 
 /// TimescaleDB-backed proxy log storage.
 ///
@@ -184,9 +286,13 @@ impl TimescaleDbProxyLogStore {
 impl ProxyLogStorage for TimescaleDbProxyLogStore {
     async fn write_batch(
         &self,
-        entries: Vec<CreateProxyLogRequest>,
+        mut entries: Vec<CreateProxyLogRequest>,
     ) -> Result<(), ProxyLogServiceError> {
-        self.batch_insert(&entries).await?;
+        order_for_stable_fk_locking(&mut entries);
+        let policy = RetryConfig::new(WRITE_MAX_ATTEMPTS)
+            .with_base_delay(WRITE_RETRY_BASE_DELAY)
+            .with_max_delay(WRITE_RETRY_MAX_DELAY);
+        retry_transient_write(&policy, entries.len(), || self.batch_insert(&entries)).await?;
         Ok(())
     }
 
@@ -764,6 +870,206 @@ mod tests {
     #[test]
     fn test_store_constructs() {
         let _store = make_store();
+    }
+
+    // ── Deadlock retry (batch writes) ────────────────────────────────────────
+
+    /// A PostgreSQL error carrying a chosen SQLSTATE, so the retry classifier
+    /// is exercised against the same `sqlx::Error::Database` shape the driver
+    /// produces for a real `40P01`.
+    #[derive(Debug)]
+    struct FakePgError {
+        code: &'static str,
+    }
+
+    impl std::fmt::Display for FakePgError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "fake postgres error (SQLSTATE {})", self.code)
+        }
+    }
+
+    impl std::error::Error for FakePgError {}
+
+    impl sea_orm::sqlx::error::DatabaseError for FakePgError {
+        fn message(&self) -> &str {
+            "fake postgres error"
+        }
+
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(std::borrow::Cow::Borrowed(self.code))
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+
+        fn kind(&self) -> sea_orm::sqlx::error::ErrorKind {
+            sea_orm::sqlx::error::ErrorKind::Other
+        }
+    }
+
+    fn pg_error(code: &'static str) -> DbErr {
+        DbErr::Exec(RuntimeErr::SqlxError(sea_orm::sqlx::Error::Database(
+            Box::new(FakePgError { code }),
+        )))
+    }
+
+    fn fast_policy(max_attempts: u32) -> RetryConfig {
+        RetryConfig::new(max_attempts)
+            .with_base_delay(Duration::from_millis(1))
+            .with_max_delay(Duration::from_millis(2))
+    }
+
+    fn entry_for(
+        project: Option<i32>,
+        env: Option<i32>,
+        dep: Option<i32>,
+    ) -> CreateProxyLogRequest {
+        CreateProxyLogRequest {
+            method: "GET".into(),
+            path: "/".into(),
+            query_string: None,
+            host: "example.test".into(),
+            status_code: 200,
+            response_time_ms: Some(1),
+            request_source: "proxy".into(),
+            is_system_request: false,
+            routing_status: "routed".into(),
+            project_id: project,
+            environment_id: env,
+            deployment_id: dep,
+            session_id: None,
+            visitor_id: None,
+            visitor_uuid: None,
+            session_uuid: None,
+            container_id: None,
+            upstream_host: None,
+            error_message: None,
+            client_ip: None,
+            user_agent: None,
+            referrer: None,
+            request_id: "req".into(),
+            ip_geolocation_id: None,
+            browser: None,
+            browser_version: None,
+            operating_system: None,
+            device_type: None,
+            is_bot: None,
+            bot_name: None,
+            request_size_bytes: None,
+            response_size_bytes: None,
+            cache_status: None,
+            request_headers: None,
+            response_headers: None,
+            trace_id: None,
+            error_group_id: None,
+        }
+    }
+
+    #[test]
+    fn deadlock_and_serialization_failures_are_retryable() {
+        assert!(is_retryable_write_error(&pg_error("40P01")));
+        assert!(is_retryable_write_error(&pg_error("40001")));
+    }
+
+    #[test]
+    fn other_database_errors_are_not_retryable() {
+        // unique_violation, foreign_key_violation, undefined_table, admin_shutdown
+        for code in ["23505", "23503", "42P01", "57P01"] {
+            assert!(
+                !is_retryable_write_error(&pg_error(code)),
+                "SQLSTATE {code} must not be retried"
+            );
+        }
+        assert!(!is_retryable_write_error(&DbErr::Custom("boom".into())));
+        assert!(!is_retryable_write_error(&DbErr::Conn(
+            RuntimeErr::Internal("connection closed".into())
+        )));
+    }
+
+    #[tokio::test]
+    async fn deadlocked_batch_is_retried_until_it_persists() {
+        // The reported failure: the first attempts lose a deadlock, a later one
+        // succeeds. Before the fix the batch was dropped on the first error.
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let result = retry_transient_write(&fast_policy(4), 3, || {
+            let attempt = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                if attempt < 2 {
+                    Err(pg_error("40P01"))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "batch must persist once the conflict clears"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn persistent_deadlock_gives_up_after_the_attempt_budget() {
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let result = retry_transient_write(&fast_policy(4), 3, || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Err(pg_error("40P01")) }
+        })
+        .await;
+
+        assert!(result.is_err(), "the final error must reach the caller");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn non_transient_error_is_not_retried() {
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let result = retry_transient_write(&fast_policy(4), 3, || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Err(pg_error("23503")) }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a constraint violation fails identically every time"
+        );
+    }
+
+    #[test]
+    fn batches_are_ordered_by_fk_parent_ids_keeping_arrival_order_for_ties() {
+        let mut batch = vec![
+            entry_for(Some(2), Some(9), Some(1)),
+            entry_for(None, None, None),
+            entry_for(Some(1), Some(7), Some(5)),
+            entry_for(Some(1), Some(3), Some(8)),
+            entry_for(Some(1), Some(3), Some(2)),
+        ];
+        batch[0].request_id = "late-env-9".into();
+        batch[2].request_id = "env-7".into();
+        batch[3].request_id = "env-3-dep-8".into();
+        batch[4].request_id = "env-3-dep-2".into();
+
+        order_for_stable_fk_locking(&mut batch);
+
+        let ids: Vec<&str> = batch.iter().map(|e| e.request_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["req", "env-3-dep-2", "env-3-dep-8", "env-7", "late-env-9"]
+        );
     }
 
     #[test]

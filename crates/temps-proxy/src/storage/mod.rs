@@ -31,6 +31,8 @@
 //! hot path only ever does a non-blocking `try_send` into an mpsc channel.
 //! `write_batch` must fail open: on backend error it returns an `Err` which the
 //! caller logs and drops (the batch is lost, live traffic is never blocked).
+//! A backend may first retry errors it knows to be transient (the TimescaleDB
+//! store re-runs a batch that lost a deadlock), within a small fixed budget.
 
 pub mod clickhouse;
 pub mod clickhouse_migrations;
