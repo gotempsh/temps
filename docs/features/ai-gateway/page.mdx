@@ -88,7 +88,7 @@ Point any OpenAI SDK at your Temps instance. The only changes are `base_url` and
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="https://your-temps-instance.com/ai/v1",
+    base_url="https://your-temps-instance.com/api/ai/v1",
     api_key="your-temps-api-key",
 )
 
@@ -106,7 +106,7 @@ print(response.choices[0].message.content)
 import OpenAI from "openai";
 
 const client = new OpenAI({
-  baseURL: "https://your-temps-instance.com/ai/v1",
+  baseURL: "https://your-temps-instance.com/api/ai/v1",
   apiKey: "your-temps-api-key",
 });
 
@@ -121,7 +121,7 @@ console.log(response.choices[0].message.content);
 ```
 
 ```bash {{ title: 'cURL' }}
-curl https://your-temps-instance.com/ai/v1/chat/completions \
+curl https://your-temps-instance.com/api/ai/v1/chat/completions \
   -H "Authorization: Bearer your-temps-api-key" \
   -H "Content-Type: application/json" \
   -d '{
@@ -263,7 +263,7 @@ console.log(response.choices[0].message.content);
 # Base64 encode an image (macOS)
 IMAGE_B64=$(base64 -i screenshot.png)
 
-curl https://your-temps-instance.com/ai/v1/chat/completions \
+curl https://your-temps-instance.com/api/ai/v1/chat/completions \
   -H "Authorization: Bearer your-temps-api-key" \
   -H "Content-Type: application/json" \
   -d "{
