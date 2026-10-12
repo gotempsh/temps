@@ -2654,6 +2654,24 @@ async fn reset_user_password(
         .into_response())
 }
 
+/// MFA enrolment changes the account's own security factors, so it is an
+/// interactive action: only a live browser session may perform it. An API key,
+/// CLI token or deployment token — whatever its role or permission set — is
+/// refused, so a narrowly scoped or read-only credential cannot enrol an
+/// authenticator on its owner's account (an SSO-only account has no password
+/// to re-verify), and the factor would then outlive the key's revocation.
+fn require_interactive_session(auth: &AuthContext) -> Result<(), Problem> {
+    if !auth.is_session() {
+        return Err(problemdetails::new(StatusCode::FORBIDDEN)
+            .with_title("Browser Session Required")
+            .with_detail(
+                "Managing multi-factor authentication requires an interactive browser \
+                 session; API keys, CLI tokens and deployment tokens cannot do it.",
+            ));
+    }
+    Ok(())
+}
+
 #[utoipa::path(
     tag = "Users",
     post,
@@ -2663,7 +2681,7 @@ async fn reset_user_password(
         (status = 200, description = "MFA setup data", body = MfaSetupResponse),
         (status = 400, description = "Current password is required but was not provided"),
         (status = 401, description = "Unauthorized or current password is incorrect"),
-        (status = 403, description = "Deployment tokens cannot enrol MFA"),
+        (status = 403, description = "Only an interactive browser session can manage MFA"),
         (status = 409, description = "MFA is already enabled; verify and disable it before re-enrollment"),
         (status = 500, description = "Internal server error")
     ),
@@ -2677,14 +2695,10 @@ async fn setup_mfa(
     Json(req): Json<SetupMfaRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     // Self-service: this enrols MFA on the caller's own account, so it is gated
-    // on being a real user (proven by the current password below), not on
-    // `users:write`, which is the permission to manage *other* accounts. A
-    // `User`-role account does not hold it and used to be refused its own MFA.
-    auth.require_user().map_err(|msg| {
-        problemdetails::new(StatusCode::FORBIDDEN)
-            .with_title("User Required")
-            .with_detail(msg)
-    })?;
+    // on an interactive browser session, not on `users:write` (the permission
+    // to manage *other* accounts, which a `User`-role account does not hold and
+    // was refused its own MFA for).
+    require_interactive_session(&auth)?;
 
     let setup_data = app_state
         .user_service
@@ -2828,6 +2842,7 @@ async fn verify_and_enable_mfa(
 ) -> Result<impl IntoResponse, Problem> {
     // Self-service on the caller's own account, proven by the TOTP code from
     // setup — see `setup_mfa` for why this is not a `users:write` operation.
+    require_interactive_session(&auth)?;
 
     // Require a user for this endpoint (deployment tokens not allowed)
     let user = auth.require_user().map_err(|msg| {
@@ -2883,6 +2898,7 @@ async fn disable_mfa(
     // Self-service on the caller's own account, proven by a valid TOTP or
     // recovery code — see `setup_mfa` for why this is not a `users:write`
     // operation.
+    require_interactive_session(&auth)?;
 
     // Require a user for this endpoint (deployment tokens not allowed)
     let user = auth.require_user().map_err(|msg| {
@@ -3192,6 +3208,36 @@ mod tests {
             "a User-role session must be able to start MFA enrolment: {:?}",
             result.err().map(|problem| problem.status_code)
         );
+    }
+
+    /// A scoped or read-only API key of the account owner must not enrol MFA
+    /// on the owner's account: `require_user` alone would let it through.
+    #[tokio::test]
+    async fn api_keys_cannot_enrol_mfa_even_with_a_user_attached() {
+        for key in [
+            api_key_auth(Some(Role::Reader), None),
+            api_key_auth(None, Some(vec![Permission::ProjectsRead])),
+            api_key_auth(Some(Role::Admin), None),
+        ] {
+            let state = auth_state_with_audit(
+                MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+                Arc::new(NoopAuditLogger),
+            );
+
+            let result = setup_mfa(
+                State(state),
+                RequireAuth(key),
+                Json(SetupMfaRequest {
+                    current_password: None,
+                }),
+            )
+            .await;
+
+            assert_problem_status(
+                expect_problem(result, "an API key is not an interactive session"),
+                StatusCode::FORBIDDEN,
+            );
+        }
     }
 
     #[tokio::test]
