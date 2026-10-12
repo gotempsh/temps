@@ -55,8 +55,6 @@ interface CreatedLink {
   url: string
   port: number
   expiresAt: number
-  /** When the link was minted (ms); the lifetime label is relative to it. */
-  createdAt: number
 }
 
 interface SandboxPreviewLinksCardProps {
@@ -116,7 +114,6 @@ export function SandboxPreviewLinksCard({
             url: response.url,
             port: variables.body.port,
             expiresAt: response.expires_at,
-            createdAt: Date.now(),
           },
           ...current,
         ].slice(0, MAX_LINKS_SHOWN)
@@ -272,8 +269,7 @@ export function SandboxPreviewLinksCard({
                 <div className="min-w-0 flex-1">
                   <p className="truncate font-mono text-xs">{link.url}</p>
                   <p className="text-xs text-muted-foreground">
-                    Port {link.port} ·{' '}
-                    {previewLinkExpiry(link.expiresAt, link.createdAt)}
+                    Port {link.port} · {previewLinkExpiry(link.expiresAt)}
                   </p>
                 </div>
                 <CopyButton

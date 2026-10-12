@@ -78,16 +78,29 @@ export function previewLinkBlockedReason(options: {
   return null
 }
 
-/** `expires_at` from the API is Unix seconds. */
-export function previewLinkExpiry(expiresAt: number, now: number): string {
-  const remaining = expiresAt * 1000 - now
-  if (remaining <= 0) return 'expired'
-  const minutes = Math.round(remaining / 60_000)
-  if (minutes < 1) return 'expires in under a minute'
-  if (minutes < 60) return `expires in ${minutes} min`
-  const hours = Math.floor(minutes / 60)
-  const rest = minutes % 60
-  return rest === 0
-    ? `expires in ${hours} h`
-    : `expires in ${hours} h ${rest} min`
+/**
+ * When a link stops working, as a wall-clock time. `expires_at` from the API
+ * is Unix seconds. An absolute time never goes stale on screen the way a
+ * "in 1 h" label computed once would.
+ */
+export function previewLinkExpiry(
+  expiresAt: number,
+  options: { locale?: string; timeZone?: string } = {}
+): string {
+  // Date and time are formatted separately and joined here: a combined
+  // `toLocaleString` uses a locale-data-version-dependent connector
+  // ("Jan 1, 12:30 PM" in one ICU release, "Jan 1 at 12:30 PM" in another).
+  const at = new Date(expiresAt * 1000)
+  const day = at.toLocaleDateString(options.locale, {
+    month: 'short',
+    day: 'numeric',
+    timeZone: options.timeZone,
+  })
+  const time = at.toLocaleTimeString(options.locale, {
+    hour: 'numeric',
+    minute: '2-digit',
+    timeZone: options.timeZone,
+  })
+  const formatted = `${day}, ${time}`
+  return `expires ${formatted}`
 }

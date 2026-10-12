@@ -63,6 +63,7 @@ import {
   listApplicationsOptions,
   getWorkspaceActivityOptions,
   listSandboxesOptions,
+  listSandboxesQueryKey,
   pauseSandboxMutation,
   restartSandboxMutation,
   resumeSandboxMutation,
@@ -290,7 +291,7 @@ export default function Sandboxes({
   }, [items, now, filter])
 
   const invalidate = () =>
-    queryClient.invalidateQueries({ queryKey: ['sandboxes'] })
+    queryClient.invalidateQueries({ queryKey: listSandboxesQueryKey() })
 
   const deleteMutation = useMutation({
     ...stopSandboxMutation(),
@@ -887,7 +888,7 @@ function SandboxRow({
   const [customPort, setCustomPort] = useState('')
 
   const invalidate = () =>
-    queryClient.invalidateQueries({ queryKey: ['sandboxes'] })
+    queryClient.invalidateQueries({ queryKey: listSandboxesQueryKey() })
 
   const pauseMutation = useMutation({
     ...pauseSandboxMutation(),

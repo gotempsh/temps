@@ -73,15 +73,23 @@ describe('previewLinkBlockedReason', () => {
 })
 
 describe('previewLinkExpiry', () => {
-  const now = Date.parse('2026-01-01T00:00:00Z')
-  const at = (offsetMs: number) => (now + offsetMs) / 1000
-  test('formats the remaining lifetime', () => {
-    expect(previewLinkExpiry(at(-1000), now)).toBe('expired')
-    expect(previewLinkExpiry(at(20_000), now)).toBe('expires in under a minute')
-    expect(previewLinkExpiry(at(15 * 60_000), now)).toBe('expires in 15 min')
-    expect(previewLinkExpiry(at(60 * 60_000), now)).toBe('expires in 1 h')
-    expect(previewLinkExpiry(at(90 * 60_000), now)).toBe(
-      'expires in 1 h 30 min'
+  // 2026-01-01T12:30:00Z
+  const expiresAt = Date.UTC(2026, 0, 1, 12, 30) / 1000
+
+  test('is an absolute wall-clock time that does not change as time passes', () => {
+    const options = { locale: 'en-US', timeZone: 'UTC' }
+    expect(previewLinkExpiry(expiresAt, options)).toBe(
+      'expires Jan 1, 12:30 PM'
     )
+    // Same input, same output: there is no "now" to go stale against.
+    expect(previewLinkExpiry(expiresAt, options)).toBe(
+      previewLinkExpiry(expiresAt, options)
+    )
+  })
+
+  test('is rendered in the requested time zone', () => {
+    expect(
+      previewLinkExpiry(expiresAt, { locale: 'en-US', timeZone: 'Asia/Tokyo' })
+    ).toBe('expires Jan 1, 9:30 PM')
   })
 })

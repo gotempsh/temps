@@ -64,8 +64,11 @@ import {
   execMutation,
   extendTimeoutMutation,
   getSandboxOptions,
+  getSandboxQueryKey,
   listEventsOptions,
+  listEventsQueryKey,
   listJobsOptions,
+  listSandboxesQueryKey,
   pauseSandboxMutation,
   resizeSandboxMutation,
   restartSandboxMutation,
@@ -295,9 +298,13 @@ export default function SandboxDetail() {
   const events: SandboxEvent[] = eventsResp?.events ?? []
 
   const invalidate = () => {
-    queryClient.invalidateQueries({ queryKey: ['sandbox', sandboxId] })
-    queryClient.invalidateQueries({ queryKey: ['sandboxes'] })
-    queryClient.invalidateQueries({ queryKey: ['sandbox-events', sandboxId] })
+    queryClient.invalidateQueries({
+      queryKey: getSandboxQueryKey({ path: { id: sandboxId } }),
+    })
+    queryClient.invalidateQueries({ queryKey: listSandboxesQueryKey() })
+    queryClient.invalidateQueries({
+      queryKey: listEventsQueryKey({ path: { id: sandboxId } }),
+    })
   }
 
   const resizeMutation = useMutation({

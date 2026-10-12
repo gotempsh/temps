@@ -304,3 +304,62 @@ test('a file created since the first open is loaded when the path is opened agai
   expect(reads).toBe(1)
   api.restore()
 })
+
+test('text typed while a save is in flight is kept and still marked unsaved', async () => {
+  let release: () => void = () => {}
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const written: string[] = []
+  const api = mockApi({
+    'GET /v1/sandboxes/sbx_1/fs/stat': () =>
+      jsonResponse({
+        path: PATH,
+        exists: true,
+        is_file: true,
+        is_dir: false,
+        size: 5,
+      }),
+    'GET /v1/sandboxes/sbx_1/fs/read': () =>
+      jsonResponse({ path: PATH, size: 5, contents_b64: encodeText('start') }),
+    'POST /v1/sandboxes/sbx_1/fs/write': async (request) => {
+      const body = (await request.json()) as { contents_b64: string }
+      written.push(body.contents_b64)
+      await gate
+      return new Response(null, { status: 204 })
+    },
+  })
+  const view = renderCard()
+
+  fireEvent.change(view.getByLabelText('File path'), {
+    target: { value: PATH },
+  })
+  fireEvent.click(view.getByRole('button', { name: 'Open file' }))
+  const editor = (await view.findByLabelText(
+    `Contents of ${PATH}`
+  )) as HTMLTextAreaElement
+
+  fireEvent.change(editor, { target: { value: 'first' } })
+  fireEvent.click(view.getByRole('button', { name: 'Save' }))
+  await waitFor(() => expect(written).toHaveLength(1))
+
+  // The request is still pending; the operator keeps typing.
+  fireEvent.change(editor, { target: { value: 'first, and more' } })
+  const saveButton = view.getByRole('button', {
+    name: 'Save',
+  }) as HTMLButtonElement
+  expect(saveButton.disabled).toBe(true)
+  release()
+
+  // Pending ends once the write resolved; then let the cache settle.
+  await waitFor(() => expect(saveButton.disabled).toBe(false))
+  await new Promise((resolve) => setTimeout(resolve, 100))
+
+  const after = view.getByLabelText(
+    `Contents of ${PATH}`
+  ) as HTMLTextAreaElement
+  expect(after.value).toBe('first, and more')
+  expect(view.getByText('unsaved changes')).toBeTruthy()
+  expect(written).toEqual([encodeText('first')])
+  api.restore()
+})

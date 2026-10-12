@@ -6,6 +6,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
 import { MemoryRouter, Route, Routes } from 'react-router'
 import { installBrowserWindow } from '@/test/dom'
+import { listSandboxesQueryKey } from '@/api/client/@tanstack/react-query.gen'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import { CreateSandboxSheet } from './CreateSandboxSheet'
 
@@ -176,5 +177,25 @@ test("reopening the sheet does not show the previous attempt's error", async () 
   await waitFor(() =>
     expect(view.queryByText(/Node worker-9 is offline/)).toBeNull()
   )
+  api.restore()
+})
+
+test('creating invalidates every cached page of the sandbox list', async () => {
+  const api = mockApi({
+    'GET /v1/sandboxes/placement': () => jsonResponse(PLACEMENT),
+    'POST /v1/sandboxes': () => jsonResponse(CREATED, 201),
+  })
+  const client = newClient()
+  const pageOne = listSandboxesQueryKey({ query: { page: 1, page_size: 20 } })
+  const pageTwo = listSandboxesQueryKey({ query: { page: 2, page_size: 20 } })
+  client.setQueryData(pageOne, { sandboxes: [] })
+  client.setQueryData(pageTwo, { sandboxes: [] })
+  const view = render(sheetTree(client, true, true))
+
+  fireEvent.click(await view.findByRole('button', { name: 'Create sandbox' }))
+  await view.findByText('detail page')
+
+  expect(client.getQueryState(pageOne)?.isInvalidated).toBe(true)
+  expect(client.getQueryState(pageTwo)?.isInvalidated).toBe(true)
   api.restore()
 })

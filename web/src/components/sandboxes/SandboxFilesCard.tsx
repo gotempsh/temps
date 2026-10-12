@@ -74,6 +74,10 @@ export function SandboxFilesCard({
   lifecycle,
 }: SandboxFilesCardProps) {
   const [openPath, setOpenPath] = useState<string | null>(null)
+  // Bumped when the operator re-opens the open path, after the fresh stat and
+  // contents have arrived, so the editor restarts from what is in the
+  // sandbox. Background updates (a save, a cache refresh) never restart it.
+  const [generation, setGeneration] = useState(0)
   const blocked = filesUnavailableReason({ status, lifecycle })
 
   const form = useForm<PathFormValues>({
@@ -121,7 +125,8 @@ export function SandboxFilesCard({
     }
     const wasReadable = readable
     const fresh = await statQuery.refetch()
-    if (wasReadable && isEditableFile(fresh.data)) void readQuery.refetch()
+    if (wasReadable && isEditableFile(fresh.data)) await readQuery.refetch()
+    setGeneration((current) => current + 1)
   }
 
   return (
@@ -192,7 +197,7 @@ export function SandboxFilesCard({
             readLoading={readable && readQuery.isPending}
             readError={readQuery.isError ? readQuery.error : null}
             contentsB64={readQuery.data?.contents_b64}
-            loadedAt={readQuery.dataUpdatedAt}
+            generation={generation}
           />
         )}
       </CardContent>
@@ -211,7 +216,7 @@ interface FileSectionProps {
   readLoading: boolean
   readError: unknown
   contentsB64: string | undefined
-  loadedAt: number
+  generation: number
 }
 
 function FileSection({
@@ -223,7 +228,7 @@ function FileSection({
   readLoading,
   readError,
   contentsB64,
-  loadedAt,
+  generation,
 }: FileSectionProps) {
   if (statLoading || readLoading) {
     return <Skeleton className="h-40 w-full" />
@@ -295,7 +300,7 @@ function FileSection({
 
   return (
     <FileEditor
-      key={`${path}:${loadedAt}:${stat.exists}`}
+      key={`${path}:${generation}`}
       sandboxId={sandboxId}
       path={path}
       exists={stat.exists}
@@ -317,19 +322,28 @@ function FileEditor({
 }) {
   const queryClient = useQueryClient()
   const [draft, setDraft] = useState(initial)
-  const dirty = draft !== initial
+  // What the sandbox holds as far as this editor knows. A save moves it to
+  // the text that was *sent*, so anything typed while the request was in
+  // flight stays in the editor, still marked unsaved.
+  const [saved, setSaved] = useState(initial)
+  const dirty = draft !== saved
 
   const save = useMutation({
     ...writeFileMutation(),
     meta: { errorTitle: 'Failed to save file' },
-    onSuccess: () => {
+    onSuccess: (_data, variables) => {
       toast.success(`Saved ${path}`)
-      void queryClient.invalidateQueries({
-        queryKey: readFileQueryKey({
-          path: { id: sandboxId },
-          query: { path },
-        }),
-      })
+      // Seed the read cache with what was written instead of invalidating
+      // it: a refetch would restart the editor under the user's cursor, and a
+      // new file's read must not show a loading state that unmounts it.
+      queryClient.setQueryData(
+        readFileQueryKey({ path: { id: sandboxId }, query: { path } }),
+        {
+          path,
+          size: atob(variables.body.contents_b64).length,
+          contents_b64: variables.body.contents_b64,
+        }
+      )
       void queryClient.invalidateQueries({
         predicate: (query) =>
           (query.queryKey[0] as { _id?: string } | undefined)?._id ===
@@ -349,12 +363,16 @@ function FileEditor({
         <Button
           size="sm"
           disabled={!dirty || save.isPending}
-          onClick={() =>
-            save.mutate({
-              path: { id: sandboxId },
-              body: { path, contents_b64: encodeText(draft) },
-            })
-          }
+          onClick={() => {
+            const sent = draft
+            save.mutate(
+              {
+                path: { id: sandboxId },
+                body: { path, contents_b64: encodeText(sent) },
+              },
+              { onSuccess: () => setSaved(sent) }
+            )
+          }}
         >
           {save.isPending ? (
             <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />

@@ -11,6 +11,7 @@ import { toast } from 'sonner'
 import {
   createSandboxMutation,
   getSandboxPlacementOptions,
+  listSandboxesQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
@@ -99,7 +100,7 @@ export function CreateSandboxSheet({
     ...createSandboxMutation(),
     meta: { errorTitle: 'Failed to create sandbox' },
     onSuccess: (response) => {
-      void queryClient.invalidateQueries({ queryKey: ['sandboxes'] })
+      void queryClient.invalidateQueries({ queryKey: listSandboxesQueryKey() })
       toast.success(`Sandbox ${response.sandbox.name} created`)
       onOpenChange(false)
       navigate(`/sandboxes/${response.sandbox.id}`)
