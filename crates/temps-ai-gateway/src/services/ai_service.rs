@@ -727,6 +727,7 @@ impl AiService for GatewayAiService {
         let token_stream = async_stream::stream! {
             let mut byte_stream = byte_stream;
             let mut buffer = String::new();
+            let mut terminal_seen = false;
             while let Some(item) = byte_stream.next().await {
                 match item {
                     Ok(bytes) => {
@@ -742,6 +743,9 @@ impl AiService for GatewayAiService {
                                 return;
                             }
                             if let Ok(chunk) = serde_json::from_str::<ChatCompletionChunk>(data) {
+                                if chunk_is_terminal(&chunk) {
+                                    terminal_seen = true;
+                                }
                                 if let Some(content) = chunk
                                     .choices
                                     .first()
@@ -762,6 +766,12 @@ impl AiService for GatewayAiService {
                         return;
                     }
                 }
+            }
+            if !terminal_seen {
+                yield Err(AiError::Provider {
+                    purpose: purpose.clone(),
+                    reason: STREAM_WITHOUT_TERMINAL_REASON.to_string(),
+                });
             }
         };
         Ok(Box::pin(token_stream))
@@ -877,6 +887,7 @@ impl AiService for GatewayAiService {
         let token_stream = async_stream::stream! {
             let mut byte_stream = byte_stream;
             let mut buf = String::new();
+            let mut terminal_seen = false;
             while let Some(item) = byte_stream.next().await {
                 match item {
                     Ok(bytes) => {
@@ -890,6 +901,9 @@ impl AiService for GatewayAiService {
                                 return;
                             }
                             if let Ok(chunk) = serde_json::from_str::<ChatCompletionChunk>(data) {
+                                if chunk_is_terminal(&chunk) {
+                                    terminal_seen = true;
+                                }
                                 if let Some(content) = chunk
                                     .choices
                                     .first()
@@ -910,6 +924,12 @@ impl AiService for GatewayAiService {
                         return;
                     }
                 }
+            }
+            if !terminal_seen {
+                yield Err(AiError::Provider {
+                    purpose: purpose.clone(),
+                    reason: STREAM_WITHOUT_TERMINAL_REASON.to_string(),
+                });
             }
         };
         Ok(Box::pin(token_stream))
@@ -961,84 +981,134 @@ impl AiService for GatewayAiService {
                 reason: e.to_string(),
             })?;
 
-        // Parse the OpenAI-format SSE byte stream into interleaved text + tool-call
-        // deltas. Tool calls arrive incrementally: the first delta for a given
-        // `index` carries `id` + `function.name`, and later deltas append
-        // `function.arguments` fragments. We accumulate per-index and emit a
-        // fully-assembled `ToolCall` once the stream finishes (`finish_reason:
-        // tool_calls`, or `[DONE]`/end). `data:` lines can split across byte
-        // chunks, so buffer to line boundaries.
-        let delta_stream = async_stream::stream! {
-            let mut byte_stream = byte_stream;
-            let mut buf = String::new();
-            // (id, name, arguments-so-far) accumulated per tool-call `index`.
-            let mut pending: Vec<(String, String, String)> = Vec::new();
+        // Parse the OpenAI-format SSE byte stream into interleaved text +
+        // tool-call deltas; see [`turn_delta_stream`].
+        let delta_stream = turn_delta_stream(byte_stream, purpose);
+        Ok(Box::pin(delta_stream))
+    }
+}
 
-            while let Some(item) = byte_stream.next().await {
-                match item {
-                    Ok(bytes) => {
-                        buf.push_str(&String::from_utf8_lossy(&bytes));
-                        while let Some(nl) = buf.find('\n') {
-                            let line: String = buf.drain(..=nl).collect();
-                            let line = line.trim();
-                            let Some(data) = line.strip_prefix("data:") else { continue };
-                            let data = data.trim();
-                            if data == "[DONE]" {
-                                // Flush any accumulated tool calls and finish.
-                                for tc in assemble_tool_calls(&mut pending) {
-                                    yield Ok(ChatStreamDelta::ToolCall(tc));
-                                }
-                                return;
+/// Why a provider stream that closed without a terminal chunk is an error.
+const STREAM_WITHOUT_TERMINAL_REASON: &str = "the provider's response stream ended without a terminal chunk (`data: [DONE]` or a `finish_reason`), so the reply is incomplete";
+
+/// `true` when a chunk carries the provider's end-of-reply marker.
+fn chunk_is_terminal(chunk: &ChatCompletionChunk) -> bool {
+    chunk
+        .choices
+        .iter()
+        .any(|choice| choice.finish_reason.is_some())
+}
+
+/// Parse a gateway OpenAI-format SSE byte stream into interleaved text +
+/// tool-call deltas.
+///
+/// Tool calls arrive incrementally: the first delta for a given `index` carries
+/// `id` + `function.name`, and later deltas append `function.arguments`
+/// fragments. They are accumulated per index and emitted fully assembled once
+/// the reply finishes (`finish_reason: tool_calls`, or `[DONE]`). `data:` lines
+/// can split across byte chunks, so input is buffered to line boundaries.
+///
+/// A reply is only complete once the provider says so — `data: [DONE]` or a
+/// chunk with a `finish_reason`. A connection that drops after the first chunk
+/// closes the byte stream just as a finished reply does, and treating that as
+/// the end of the reply saved the truncated text as the final answer of a
+/// completed turn. The stream therefore yields an [`AiError::Provider`] when the
+/// bytes end without a terminal marker, and never assembles tool calls from a
+/// reply that was cut off (their arguments would be partial JSON).
+fn turn_delta_stream<S, E>(
+    byte_stream: S,
+    purpose: String,
+) -> impl futures_util::Stream<Item = Result<ChatStreamDelta, AiError>> + Send
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, E>> + Send,
+    E: std::fmt::Display + Send,
+{
+    async_stream::stream! {
+        let mut byte_stream = std::pin::pin!(byte_stream);
+        let mut buf = String::new();
+        // (id, name, arguments-so-far) accumulated per tool-call `index`.
+        let mut pending: Vec<(String, String, String)> = Vec::new();
+        let mut terminal_seen = false;
+
+        while let Some(item) = byte_stream.next().await {
+            match item {
+                Ok(bytes) => {
+                    buf.push_str(&String::from_utf8_lossy(&bytes));
+                    while let Some(nl) = buf.find('\n') {
+                        let line: String = buf.drain(..=nl).collect();
+                        let line = line.trim();
+                        let Some(data) = line.strip_prefix("data:") else { continue };
+                        let data = data.trim();
+                        if data == "[DONE]" {
+                            // Flush any accumulated tool calls and finish.
+                            for tc in assemble_tool_calls(&mut pending) {
+                                yield Ok(ChatStreamDelta::ToolCall(tc));
                             }
-                            let chunk = match serde_json::from_str::<ChatCompletionChunk>(data) {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "chat_stream_turn: unparsed SSE data ({e}): {}",
-                                        data.chars().take(300).collect::<String>()
-                                    );
-                                    continue;
-                                }
-                            };
-                            let Some(choice) = chunk.choices.first() else { continue };
-                            // Text delta -> stream immediately.
-                            if let Some(content) = choice.delta.content.as_ref() {
-                                if !content.is_empty() {
-                                    yield Ok(ChatStreamDelta::Text(content.clone()));
-                                }
+                            return;
+                        }
+                        let chunk = match serde_json::from_str::<ChatCompletionChunk>(data) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "chat_stream_turn: unparsed SSE data ({e}): {}",
+                                    data.chars().take(300).collect::<String>()
+                                );
+                                continue;
                             }
-                            // Tool-call deltas -> accumulate by index.
-                            if let Some(tcs) = choice.delta.tool_calls.as_ref() {
-                                accumulate_tool_call_deltas(&mut pending, tcs);
+                        };
+                        if chunk_is_terminal(&chunk) {
+                            terminal_seen = true;
+                        }
+                        let Some(choice) = chunk.choices.first() else { continue };
+                        // Text delta -> stream immediately.
+                        if let Some(content) = choice.delta.content.as_ref() {
+                            if !content.is_empty() {
+                                yield Ok(ChatStreamDelta::Text(content.clone()));
                             }
-                            // Some providers signal completion via finish_reason
-                            // without a trailing [DONE]; flush there too.
-                            if choice
-                                .finish_reason
-                                .as_deref()
-                                .is_some_and(|r| r == "tool_calls")
-                            {
-                                for tc in assemble_tool_calls(&mut pending) {
-                                    yield Ok(ChatStreamDelta::ToolCall(tc));
-                                }
+                        }
+                        // Tool-call deltas -> accumulate by index.
+                        if let Some(tcs) = choice.delta.tool_calls.as_ref() {
+                            accumulate_tool_call_deltas(&mut pending, tcs);
+                        }
+                        // Some providers signal completion via finish_reason
+                        // without a trailing [DONE]; flush there too.
+                        if choice
+                            .finish_reason
+                            .as_deref()
+                            .is_some_and(|r| r == "tool_calls")
+                        {
+                            for tc in assemble_tool_calls(&mut pending) {
+                                yield Ok(ChatStreamDelta::ToolCall(tc));
                             }
                         }
                     }
-                    Err(e) => {
-                        yield Err(AiError::Provider {
-                            purpose: purpose.clone(),
-                            reason: e.to_string(),
-                        });
-                        return;
-                    }
+                }
+                Err(e) => {
+                    yield Err(AiError::Provider {
+                        purpose: purpose.clone(),
+                        reason: e.to_string(),
+                    });
+                    return;
                 }
             }
-            // Stream ended without an explicit terminator — flush any remainder.
-            for tc in assemble_tool_calls(&mut pending) {
-                yield Ok(ChatStreamDelta::ToolCall(tc));
-            }
-        };
-        Ok(Box::pin(delta_stream))
+        }
+
+        if !terminal_seen {
+            tracing::warn!(
+                purpose = %purpose,
+                pending_tool_calls = pending.len(),
+                "chat_stream_turn: provider stream ended without a terminal chunk"
+            );
+            yield Err(AiError::Provider {
+                purpose: purpose.clone(),
+                reason: STREAM_WITHOUT_TERMINAL_REASON.to_string(),
+            });
+            return;
+        }
+        // `finish_reason` arrived without a trailing [DONE] — flush any remainder.
+        for tc in assemble_tool_calls(&mut pending) {
+            yield Ok(ChatStreamDelta::ToolCall(tc));
+        }
     }
 }
 
@@ -1139,6 +1209,173 @@ mod tests {
             }],
             usage: None,
         }
+    }
+
+    // ── Streamed turns: terminal-chunk handling ─────────────────────
+
+    fn sse_chunk(delta: serde_json::Value, finish_reason: Option<&str>) -> bytes::Bytes {
+        let chunk = serde_json::json!({
+            "id": "chunk-1",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": finish_reason,
+            }],
+        });
+        bytes::Bytes::from(format!("data: {chunk}\n\n"))
+    }
+
+    /// Run `turn_delta_stream` over the given byte results and collect every
+    /// item it yields.
+    async fn collect_turn(
+        input: Vec<Result<bytes::Bytes, std::io::Error>>,
+    ) -> Vec<Result<ChatStreamDelta, AiError>> {
+        let stream = turn_delta_stream(futures_util::stream::iter(input), "chat.test".to_string());
+        std::pin::pin!(stream).collect::<Vec<_>>().await
+    }
+
+    fn texts(items: &[Result<ChatStreamDelta, AiError>]) -> Vec<String> {
+        items
+            .iter()
+            .filter_map(|item| match item {
+                Ok(ChatStreamDelta::Text(text)) => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Reported defect: an upstream that sends one chunk and drops the
+    /// connection ended the stream "cleanly", so the partial text became the
+    /// final answer of a completed turn. It must surface as a provider error.
+    #[tokio::test]
+    async fn stream_cut_off_after_one_chunk_is_a_provider_error() {
+        let items = collect_turn(vec![Ok(sse_chunk(
+            serde_json::json!({"content": "The answer is"}),
+            None,
+        ))])
+        .await;
+
+        assert_eq!(texts(&items), vec!["The answer is".to_string()]);
+        match items.last() {
+            Some(Err(AiError::Provider { purpose, reason })) => {
+                assert_eq!(purpose, "chat.test");
+                assert!(reason.contains("terminal chunk"), "{reason}");
+            }
+            other => panic!("expected a trailing provider error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_with_no_chunks_at_all_is_a_provider_error() {
+        let items = collect_turn(vec![]).await;
+        assert!(matches!(items.as_slice(), [Err(AiError::Provider { .. })]));
+    }
+
+    #[tokio::test]
+    async fn done_marker_completes_the_reply() {
+        let items = collect_turn(vec![
+            Ok(sse_chunk(serde_json::json!({"content": "Hello"}), None)),
+            Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n")),
+        ])
+        .await;
+
+        assert_eq!(texts(&items), vec!["Hello".to_string()]);
+        assert!(items.iter().all(Result::is_ok), "{items:?}");
+    }
+
+    #[tokio::test]
+    async fn finish_reason_without_done_completes_the_reply() {
+        // Several providers close the connection after `finish_reason` and
+        // never send `[DONE]`; that is a complete reply, not a truncated one.
+        let items = collect_turn(vec![
+            Ok(sse_chunk(serde_json::json!({"content": "Hello"}), None)),
+            Ok(sse_chunk(serde_json::json!({}), Some("stop"))),
+        ])
+        .await;
+
+        assert_eq!(texts(&items), vec!["Hello".to_string()]);
+        assert!(items.iter().all(Result::is_ok), "{items:?}");
+    }
+
+    #[tokio::test]
+    async fn tool_call_cut_off_mid_arguments_is_never_assembled() {
+        let items = collect_turn(vec![Ok(sse_chunk(
+            serde_json::json!({"tool_calls": [{
+                "index": 0,
+                "id": "call_1",
+                "function": {"name": "temps", "arguments": "{\"command\": \"pro"}
+            }]}),
+            None,
+        ))])
+        .await;
+
+        assert!(
+            !items
+                .iter()
+                .any(|item| matches!(item, Ok(ChatStreamDelta::ToolCall(_)))),
+            "partial tool-call JSON must not be dispatched: {items:?}"
+        );
+        assert!(matches!(items.last(), Some(Err(AiError::Provider { .. }))));
+    }
+
+    #[tokio::test]
+    async fn completed_tool_call_is_assembled_on_finish_reason() {
+        let items = collect_turn(vec![
+            Ok(sse_chunk(
+                serde_json::json!({"tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "function": {"name": "temps", "arguments": "{\"command\":"}
+                }]}),
+                None,
+            )),
+            Ok(sse_chunk(
+                serde_json::json!({"tool_calls": [{
+                    "index": 0,
+                    "function": {"arguments": " \"projects --help\"}"}
+                }]}),
+                None,
+            )),
+            Ok(sse_chunk(serde_json::json!({}), Some("tool_calls"))),
+        ])
+        .await;
+
+        let calls: Vec<&ToolCall> = items
+            .iter()
+            .filter_map(|item| match item {
+                Ok(ChatStreamDelta::ToolCall(call)) => Some(call),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 1, "{items:?}");
+        assert_eq!(calls[0].name, "temps");
+        assert_eq!(calls[0].arguments, "{\"command\": \"projects --help\"}");
+        assert!(items.iter().all(Result::is_ok), "{items:?}");
+    }
+
+    #[tokio::test]
+    async fn transport_error_mid_stream_is_reported_with_its_reason() {
+        let items = collect_turn(vec![
+            Ok(sse_chunk(serde_json::json!({"content": "Partial"}), None)),
+            Err(std::io::Error::other("connection reset by peer")),
+        ])
+        .await;
+
+        assert_eq!(texts(&items), vec!["Partial".to_string()]);
+        match items.last() {
+            Some(Err(AiError::Provider { reason, .. })) => {
+                assert!(reason.contains("connection reset"), "{reason}")
+            }
+            other => panic!("expected the transport error, got {other:?}"),
+        }
+        assert_eq!(
+            items.iter().filter(|item| item.is_err()).count(),
+            1,
+            "an upstream error must not be followed by a second, synthetic one"
+        );
     }
 
     #[tokio::test]
