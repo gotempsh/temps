@@ -2389,7 +2389,6 @@ mod tests {
         let _ = service.is_in_cooldown(&request).await;
         drop(service);
         let log = Arc::try_unwrap(db)
-            .ok()
             .expect("the service was dropped, so the mock connection has one owner")
             .into_transaction_log();
         format!("{log:?}")
