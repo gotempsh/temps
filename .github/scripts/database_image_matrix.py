@@ -22,8 +22,13 @@ Releases run it with --missing-only (publish what is absent, move nothing
 else) and then --check, which fails the release unless every required tag is
 anonymously pullable -- the way a fresh install will pull it.
 
-Writes `matrix=<json>` and `count=<n>` to $GITHUB_OUTPUT when set, otherwise
-prints the plan as JSON.
+A tag that is already published is never rebuilt by a release: a missing
+alias of a published image is re-pointed at that image's digest (`retags`)
+instead, and a GHCR lookup that fails -- rather than answering "absent" --
+aborts the plan, since "could not look" must never read as "missing".
+
+Writes `matrix=<json>`, `count=<n>`, `retags=<json>` and `retag_count=<n>` to
+$GITHUB_OUTPUT when set, otherwise prints the plan as JSON.
 """
 
 import argparse
@@ -32,6 +37,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -94,6 +100,10 @@ CATALOG = [
 ]
 
 HTTP_TIMEOUT_SECS = 30
+# GHCR lookups that fail transiently (rate limit, outage, network) are retried
+# this many times, LOOKUP_RETRY_DELAY_SECS * attempt apart, before giving up.
+LOOKUP_ATTEMPTS = 3
+LOOKUP_RETRY_DELAY_SECS = 2
 
 
 def _get(url, headers=None):
@@ -139,8 +149,36 @@ def pinned_minors(tags, majors, keep):
     }
 
 
+class RegistryLookupError(RuntimeError):
+    """GHCR could not say whether a tag exists (rate limit, outage, network)."""
+
+
+def _ghcr(request, what):
+    """Send a GHCR request and return the response body, or None when GHCR
+    answers that `what` is absent or not visible to these credentials
+    (401/403/404). Any other failure is retried and then raised."""
+    failure = ""
+    for attempt in range(1, LOOKUP_ATTEMPTS + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECS) as response:
+                return response.read()
+        except urllib.error.HTTPError as error:
+            if error.code in (401, 403, 404):
+                return None
+            failure = f"HTTP {error.code}"
+        except OSError as error:
+            failure = str(error)
+        if attempt < LOOKUP_ATTEMPTS:
+            time.sleep(LOOKUP_RETRY_DELAY_SECS * attempt)
+    raise RegistryLookupError(
+        f"GHCR lookup of {what} failed after {LOOKUP_ATTEMPTS} attempts: {failure}"
+    )
+
+
 class GhcrRegistry:
-    """Existence checks against GHCR; any failure reads as "missing" (rebuild)."""
+    """Existence checks against GHCR. `has_tag` is false only when GHCR says
+    the tag is absent (or not visible to these credentials); a lookup that
+    cannot be completed raises RegistryLookupError instead."""
 
     def __init__(self, owner, username=None, password=None):
         self.owner = owner
@@ -159,16 +197,19 @@ class GhcrRegistry:
                     f"{self.username}:{self.password}".encode()
                 ).decode()
                 headers["Authorization"] = f"Basic {basic}"
-            try:
-                body, _ = _get(url, headers)
-                self._tokens[image] = json.loads(body).get("token")
-            except (urllib.error.URLError, ValueError) as error:
-                print(
-                    f"warning: GHCR token for {self.owner}/{image} unavailable "
-                    f"({error}); treating all its tags as missing",
-                    file=sys.stderr,
-                )
-                self._tokens[image] = None
+            what = f"the pull token for {self.owner}/{image}"
+            # GHCR refuses a token (403) for a package that does not exist yet
+            # or is private to these credentials: none of its tags are pullable.
+            body = _ghcr(urllib.request.Request(url, headers=headers), what)
+            token = None
+            if body is not None:
+                try:
+                    token = json.loads(body)["token"]
+                except (ValueError, KeyError, TypeError) as error:
+                    raise RegistryLookupError(
+                        f"GHCR lookup of {what} returned an unusable response: {error!r}"
+                    ) from error
+            self._tokens[image] = token
         return self._tokens[image]
 
     def has_tag(self, image, tag):
@@ -190,24 +231,7 @@ class GhcrRegistry:
                 ),
             },
         )
-        try:
-            with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECS):
-                return True
-        except urllib.error.HTTPError as error:
-            if error.code != 404:
-                print(
-                    f"warning: GHCR lookup of {self.owner}/{image}:{tag} returned "
-                    f"HTTP {error.code}; treating it as missing",
-                    file=sys.stderr,
-                )
-            return False
-        except urllib.error.URLError as error:
-            print(
-                f"warning: GHCR lookup of {self.owner}/{image}:{tag} failed "
-                f"({error}); treating it as missing",
-                file=sys.stderr,
-            )
-            return False
+        return _ghcr(request, f"{self.owner}/{image}:{tag}") is not None
 
 
 def _entry(spec, owner, version, tag, expect_postgres, aliases=()):
@@ -259,22 +283,37 @@ def _published(registry, entry):
 
 
 def plan(owner, minors_by_upstream, registry, forced, catalog=CATALOG, missing_only=False):
-    """Build the matrix.
+    """Decide what to publish. Returns `(builds, retags)`.
 
     `forced` is a set of image names (or {"*"}) to rebuild in full regardless
     of what GHCR already holds. `missing_only` (release runs) builds nothing
     that is already published, so a release never moves a tag under a
-    running database."""
-    include = []
+    running database.
+
+    `retags` covers an image that is published under some of its tags but not
+    all (a new alias): each missing tag is pointed at the existing image
+    rather than rebuilt, which would replace the tags already there."""
+    builds, retags = [], []
     for entry, refresh in candidates(owner, minors_by_upstream, catalog):
-        if missing_only:
-            build = not _published(registry, entry)
-        else:
-            force = "*" in forced or entry["image"] in forced
-            build = force or refresh or not _published(registry, entry)
-        if build:
-            include.append(entry)
-    return include
+        rebuild = "*" in forced or entry["image"] in forced or refresh
+        if rebuild and not missing_only:
+            builds.append(entry)
+            continue
+        present = [tag for tag in entry["tags"] if registry.has_tag(entry["image"], tag)]
+        if not present:
+            builds.append(entry)
+            continue
+        source = f"{entry['repository']}:{present[0]}"
+        for tag in entry["tags"]:
+            if tag not in present:
+                retags.append(
+                    {
+                        "image": entry["image"],
+                        "source": source,
+                        "target": f"{entry['repository']}:{tag}",
+                    }
+                )
+    return builds, retags
 
 
 def unpublished(owner, minors_by_upstream, registry, catalog=CATALOG):
@@ -330,6 +369,18 @@ def main(argv=None):
     upstreams = {spec["pinned_upstream"] for spec in catalog if spec.get("pinned_upstream")}
     minors_by_upstream = {upstream: upstream_tags(upstream) for upstream in upstreams}
 
+    try:
+        return _run(args, catalog, forced, minors_by_upstream)
+    except RegistryLookupError as error:
+        print(
+            f"error: {error}. Not treating the tag as missing: that would rebuild over "
+            "an image that may already be published. Re-run once GHCR is reachable.",
+            file=sys.stderr,
+        )
+        return 1
+
+
+def _run(args, catalog, forced, minors_by_upstream):
     if args.check:
         # Anonymous on purpose: a fresh Temps install pulls without GHCR
         # credentials, so a private package is as broken as a missing one.
@@ -355,7 +406,7 @@ def main(argv=None):
     registry = GhcrRegistry(
         args.owner, os.environ.get("GHCR_USERNAME"), os.environ.get("GHCR_TOKEN")
     )
-    include = plan(
+    include, retags = plan(
         args.owner, minors_by_upstream, registry, forced, catalog, args.missing_only
     )
 
@@ -364,10 +415,14 @@ def main(argv=None):
         with open(output, "a", encoding="utf-8") as handle:
             handle.write(f"matrix={json.dumps({'include': include})}\n")
             handle.write(f"count={len(include)}\n")
+            handle.write(f"retags={json.dumps(retags)}\n")
+            handle.write(f"retag_count={len(retags)}\n")
     else:
-        print(json.dumps(include, indent=2))
+        print(json.dumps({"builds": include, "retags": retags}, indent=2))
     for entry in include:
-        print(f"plan: {entry['refs'].replace(chr(10), ' ')}", file=sys.stderr)
+        print(f"plan: build {entry['refs'].replace(chr(10), ' ')}", file=sys.stderr)
+    for retag in retags:
+        print(f"plan: retag {retag['target']} -> {retag['source']}", file=sys.stderr)
     return 0
 
 

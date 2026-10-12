@@ -86,6 +86,8 @@ jobs:
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
       count: ${{ steps.plan.outputs.count }}
+      retags: ${{ steps.plan.outputs.retags }}
+      retag_count: ${{ steps.plan.outputs.retag_count }}
       publish: ${{ steps.mode.outputs.publish }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -154,8 +156,12 @@ jobs:
           elif [[ "$EVENT" == "pull_request" ]]; then
             # PRs only verify the images they touch; nothing is pushed.
             if [[ -z "$IMAGES" ]]; then
-              echo "matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
-              echo "count=0" >> "$GITHUB_OUTPUT"
+              {
+                echo "matrix={\"include\":[]}"
+                echo "count=0"
+                echo "retags=[]"
+                echo "retag_count=0"
+              } >> "$GITHUB_OUTPUT"
               exit 0
             fi
             args+=(--only "$IMAGES" --force-all)
@@ -266,9 +272,44 @@ jobs:
           cosign sign --yes "$IMAGE_REPOSITORY@$IMAGE_DIGEST"
           echo "- \`$IMAGE_REPOSITORY:$IMAGE_TAG\` → \`$IMAGE_DIGEST\`" >> "$GITHUB_STEP_SUMMARY"
 
+  retag:
+    # An image published under some of its tags but not all (a newly added
+    # alias) gets the missing tags pointed at the existing digest. Rebuilding
+    # it instead would replace the tags that are already published.
+    name: Publish missing aliases
+    needs: plan
+    if: needs.plan.outputs.retag_count != '0' && needs.plan.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Point missing tags at the published image
+        env:
+          RETAGS: ${{ needs.plan.outputs.retags }}
+        run: |
+          set -euo pipefail
+          jq -r '.[] | [.source, .target] | @tsv' <<<"$RETAGS" \
+            | while IFS=$'\t' read -r source target; do
+                # Copies the manifest list as-is: same digest, so the existing
+                # signature and attestations cover the new tag too.
+                docker buildx imagetools create --tag "$target" "$source"
+                echo "- \`$target\` → same image as \`$source\`" >> "$GITHUB_STEP_SUMMARY"
+              done
+
   verify-published:
     name: Required tags are publicly pullable
-    needs: [plan, build]
+    needs: [plan, build, retag]
     # Runs after a skipped build (nothing missing) too, but not after a
     # failed plan, and never on pull requests, which publish nothing.
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.publish == 'true' }}

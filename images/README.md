@@ -43,6 +43,12 @@ running database), then blocks the release unless every required tag can be
 pulled anonymously from GHCR, the way a fresh install pulls it. Keeping these
 images up to date is the weekly schedule's job, not the release's.
 
+Two cases follow from "never moves a tag". An image that is published under
+some of its tags but not all (a newly added alias) gets the missing tags
+pointed at the existing digest instead of being rebuilt. And if GHCR cannot be
+asked whether a tag exists (rate limit, outage), the run fails rather than
+treating the tag as missing.
+
 To support a new major, add it to `CATALOG` in the planner script.
 
 The MariaDB image is published by `.github/workflows/mariadb-walg-image.yml`.

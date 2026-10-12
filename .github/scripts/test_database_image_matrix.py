@@ -1,12 +1,18 @@
 # SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
+import io
 import re
 import unittest
+import urllib.error
+from unittest import mock
 
+import database_image_matrix
 from database_image_matrix import (
     CATALOG,
     PINNED_MINORS_PER_MAJOR,
+    GhcrRegistry,
+    RegistryLookupError,
     main,
     pinned_minors,
     plan,
@@ -36,7 +42,8 @@ def tags(include, image):
     return [entry["tag"] for entry in include if entry["image"] == image]
 
 
-def run(registry, forced=frozenset(), missing_only=False):
+def run_plan(registry, forced=frozenset(), missing_only=False):
+    """The full plan: (builds, retags)."""
     return plan(
         "gotempsh",
         {"library/postgres": UPSTREAM_TAGS},
@@ -44,6 +51,10 @@ def run(registry, forced=frozenset(), missing_only=False):
         set(forced),
         missing_only=missing_only,
     )
+
+
+def run(registry, forced=frozenset(), missing_only=False):
+    return run_plan(registry, forced, missing_only)[0]
 
 
 def every_tag():
@@ -165,12 +176,50 @@ class AliasTests(unittest.TestCase):
             ["ghcr.io/gotempsh/postgres-ha:18-bookworm", "ghcr.io/gotempsh/postgres-ha:18-bookworm-walg"],
         )
 
-    def test_missing_alias_alone_triggers_a_build_and_fails_the_check(self):
+    def test_missing_alias_is_retagged_not_rebuilt_and_fails_the_check(self):
+        # Rebuilding to add the alias would also replace 18-bookworm, which is
+        # already published and may be running.
         published = every_tag() - {("postgres-ha", "18-bookworm-walg")}
-        include = run(FakeRegistry(published), missing_only=True)
-        self.assertEqual([(e["image"], e["tag"]) for e in include], [("postgres-ha", "18-bookworm")])
+        builds, retags = run_plan(FakeRegistry(published), missing_only=True)
+        self.assertEqual(builds, [])
+        self.assertEqual(
+            retags,
+            [
+                {
+                    "image": "postgres-ha",
+                    "source": "ghcr.io/gotempsh/postgres-ha:18-bookworm",
+                    "target": "ghcr.io/gotempsh/postgres-ha:18-bookworm-walg",
+                }
+            ],
+        )
         missing = unpublished("gotempsh", {"library/postgres": UPSTREAM_TAGS}, FakeRegistry(published))
         self.assertEqual([e["tag"] for e in missing], ["18-bookworm"])
+
+    def test_missing_primary_tag_is_retagged_from_its_published_alias(self):
+        published = every_tag() - {("postgres-ha", "17-bookworm")}
+        builds, retags = run_plan(FakeRegistry(published), missing_only=True)
+        self.assertEqual(builds, [])
+        self.assertEqual(
+            [(r["source"], r["target"]) for r in retags],
+            [
+                (
+                    "ghcr.io/gotempsh/postgres-ha:17-bookworm-walg",
+                    "ghcr.io/gotempsh/postgres-ha:17-bookworm",
+                )
+            ],
+        )
+
+    def test_image_with_no_published_tag_is_built_with_every_alias(self):
+        published = every_tag() - {("postgres-ha", "16-bookworm"), ("postgres-ha", "16-bookworm-walg")}
+        builds, retags = run_plan(FakeRegistry(published), missing_only=True)
+        self.assertEqual([e["tags"] for e in builds], [["16-bookworm", "16-bookworm-walg"]])
+        self.assertEqual(retags, [])
+
+    def test_regular_run_rebuilds_floating_tags_and_retags_nothing(self):
+        published = every_tag() - {("postgres-ha", "18-bookworm-walg")}
+        builds, retags = run_plan(FakeRegistry(published))
+        self.assertIn("18-bookworm", tags(builds, "postgres-ha"))
+        self.assertEqual(retags, [])
 
     def test_pinned_minors_have_no_aliases(self):
         for entry in run(FakeRegistry()):
@@ -190,7 +239,19 @@ class ReleaseModeTests(unittest.TestCase):
         )
 
     def test_missing_only_with_everything_published_builds_nothing(self):
-        self.assertEqual(run(FakeRegistry(every_tag()), missing_only=True), [])
+        self.assertEqual(run_plan(FakeRegistry(every_tag()), missing_only=True), ([], []))
+
+    def test_missing_only_ignores_forced_images(self):
+        builds, retags = run_plan(FakeRegistry(every_tag()), {"*"}, missing_only=True)
+        self.assertEqual((builds, retags), ([], []))
+
+    def test_failed_lookup_aborts_the_plan_instead_of_rebuilding(self):
+        class Unreachable(FakeRegistry):
+            def has_tag(self, image, tag):
+                raise RegistryLookupError(f"GHCR lookup of gotempsh/{image}:{tag} failed")
+
+        with self.assertRaises(RegistryLookupError):
+            run_plan(Unreachable(), missing_only=True)
 
     def test_unpublished_lists_exactly_the_gaps(self):
         published = every_tag() - {("postgres-ha", "18.3-bookworm")}
@@ -213,6 +274,77 @@ class ReleaseModeTests(unittest.TestCase):
         ):
             with self.subTest(argv=argv), self.assertRaises(SystemExit):
                 main(argv)
+
+
+def http_error(code):
+    return urllib.error.HTTPError("https://ghcr.io/", code, "error", {}, io.BytesIO(b""))
+
+
+class Response:
+    def __init__(self, body=b""):
+        self.body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def read(self):
+        return self.body
+
+
+TOKEN = Response(b'{"token": "t"}')
+
+
+class GhcrRegistryTests(unittest.TestCase):
+    """`has_tag` against scripted GHCR responses: a token request, then HEADs."""
+
+    def lookup(self, *responses):
+        with mock.patch.object(
+            database_image_matrix.urllib.request, "urlopen", side_effect=list(responses)
+        ) as urlopen, mock.patch.object(database_image_matrix.time, "sleep") as sleep:
+            self.urlopen, self.sleep = urlopen, sleep
+            return GhcrRegistry("gotempsh").has_tag("postgres-walg", "18-bookworm")
+
+    def test_published_tag_is_present(self):
+        self.assertTrue(self.lookup(TOKEN, Response()))
+
+    def test_absent_tag_is_missing(self):
+        self.assertFalse(self.lookup(TOKEN, http_error(404)))
+
+    def test_refused_token_means_package_is_absent_or_private(self):
+        self.assertFalse(self.lookup(http_error(403)))
+        self.assertEqual(self.urlopen.call_count, 1)
+
+    def test_rate_limit_and_outage_are_not_missing(self):
+        for failure in (http_error(429), http_error(503), urllib.error.URLError("reset"), TimeoutError()):
+            with self.subTest(failure=failure), self.assertRaises(RegistryLookupError) as raised:
+                self.lookup(TOKEN, failure, failure, failure)
+            self.assertIn("gotempsh/postgres-walg:18-bookworm", str(raised.exception))
+
+    def test_token_outage_is_not_missing(self):
+        with self.assertRaises(RegistryLookupError):
+            self.lookup(http_error(502), http_error(502), http_error(502))
+
+    def test_unusable_token_response_is_not_missing(self):
+        with self.assertRaises(RegistryLookupError):
+            self.lookup(Response(b"<html>"))
+
+    def test_transient_failure_is_retried(self):
+        self.assertTrue(self.lookup(TOKEN, http_error(503), Response()))
+        self.assertEqual(self.sleep.call_count, 1)
+
+    def test_main_fails_instead_of_planning_when_ghcr_is_unreachable(self):
+        with mock.patch.object(
+            database_image_matrix.urllib.request, "urlopen", side_effect=http_error(503)
+        ), mock.patch.object(database_image_matrix.time, "sleep"), mock.patch.object(
+            database_image_matrix, "upstream_tags", return_value=UPSTREAM_TAGS
+        ), mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            for mode in ("--missing-only", "--check"):
+                with self.subTest(mode=mode):
+                    self.assertEqual(main(["--owner", "gotempsh", "--only", "redis-walg", mode]), 1)
+        self.assertIn("Not treating the tag as missing", stderr.getvalue())
 
 
 if __name__ == "__main__":
