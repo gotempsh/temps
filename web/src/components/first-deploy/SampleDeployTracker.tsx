@@ -145,9 +145,16 @@ export function SampleDeployTracker({
   if (!deployment) {
     // A deployment started a moment ago may not be visible on the first
     // read; keep waiting through the bounded polls before calling it absent.
+    // Empty answers (`null`) count like errors did: the same bound that stops
+    // the polling ends the waiting state, or the skeleton would never leave.
+    const lastDeploymentState = queryClient.getQueryState(
+      getLastDeploymentQueryKey({ path: { id: project.id } })
+    )
+    const emptyPolls =
+      deploymentQuery.errorUpdateCount +
+      (lastDeploymentState?.dataUpdateCount ?? 0)
     const stillWaiting =
-      !startError &&
-      deploymentQuery.errorUpdateCount < MAX_POLLS_WITHOUT_DEPLOYMENT
+      !startError && emptyPolls < MAX_POLLS_WITHOUT_DEPLOYMENT
     if (deploymentQuery.isPending || stillWaiting) {
       return <TrackerSkeleton />
     }

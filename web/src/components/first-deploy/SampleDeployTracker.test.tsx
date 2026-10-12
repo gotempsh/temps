@@ -63,7 +63,45 @@ function render(lastDeployment: DeploymentResponse): string {
   return markup
 }
 
+/** Render with `updates` empty (`null`) answers cached for the last deployment. */
+function renderWithoutDeployment(updates: number): string {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  client.setQueryData(
+    getProjectBySlugQueryKey({ path: { slug: project.slug } }),
+    project
+  )
+  for (let i = 0; i < updates; i++) {
+    client.setQueryData(
+      getLastDeploymentQueryKey({ path: { id: project.id } }),
+      null
+    )
+  }
+  const markup = renderToStaticMarkup(
+    <QueryClientProvider client={client}>
+      <MemoryRouter>
+        <SampleDeployTracker projectSlug={project.slug} />
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+  client.clear()
+  return markup
+}
+
 describe('SampleDeployTracker', () => {
+  test('keeps waiting through the first empty answers, then offers the deploy', () => {
+    // The API answers `null` (not 404) for a project with no deployment yet.
+    const waiting = renderWithoutDeployment(1)
+    expect(waiting).not.toContain('No deployment has started yet')
+
+    // Once the bounded polls are spent the skeleton must give way: the
+    // empty answers are successes, so only counting errors would wait forever.
+    const settled = renderWithoutDeployment(5)
+    expect(settled).toContain('No deployment has started yet')
+    expect(settled).toContain('Not deployed')
+  })
+
   test('shows a stopped deployment with a retry instead of indefinite progress', () => {
     const markup = render(deployment({ status: 'stopped' }))
     expect(markup).toContain('Stopped')
