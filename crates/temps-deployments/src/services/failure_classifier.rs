@@ -811,10 +811,13 @@ fn buildkit_missing_path(lower: &str) -> Option<String> {
     // The failure text is often a Debug-quoted string, which escapes the quotes
     // around the path (`\"/node_modules\": not found`).
     let text = lower.replace("\\\"", "\"");
-    let phrase_at = ["failed to calculate checksum", "failed to compute cache key"]
-        .iter()
-        .filter_map(|phrase| text.find(phrase))
-        .min()?;
+    let phrase_at = [
+        "failed to calculate checksum",
+        "failed to compute cache key",
+    ]
+    .iter()
+    .filter_map(|phrase| text.find(phrase))
+    .min()?;
     let after_phrase = &text[phrase_at..];
     let not_found_at = after_phrase.find("\": not found")?;
     let before = &after_phrase[..not_found_at];
@@ -1719,11 +1722,7 @@ mod tests {
             "build_image",
             "Failed to build image: Dockerfile:9\n--------------------\n   9 | >>> COPY node_modules /app/node_modules\n--------------------\nERROR: failed to solve: failed to compute cache key: failed to calculate checksum of ref abc: \"/node_modules\": not found",
         );
-        assert_class(
-            &excerpt_mentions_app,
-            S::Build,
-            C::BuildContextPathMissing,
-        );
+        assert_class(&excerpt_mentions_app, S::Build, C::BuildContextPathMissing);
 
         let guidance = guidance_for(C::BuildContextPathMissing);
         assert!(
