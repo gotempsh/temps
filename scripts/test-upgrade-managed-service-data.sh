@@ -305,9 +305,13 @@ grep -q "Nothing was changed" <<<"$ERROR" || fail "failure does not say nothing 
 [ "$(docker inspect "$SHAPE_C" --format '{{.Id}}')" = "$SHAPE_CONTAINER_ID" ] ||
   fail "the #1415-shaped container was replaced"
 assert_data "$SHAPE_C" "$SHAPE_SYSID" "after the refused backup"
-if curl -fsS --aws-sigv4 "aws:amz:us-east-1:s3" --user "$S3_KEY:$S3_SECRET" \
-  "http://127.0.0.1:${S3_PORT}/${BUCKET}?list-type=2&prefix=run/external_services/postgres/${SHAPE}/" |
-  grep -q basebackups; then
+# Fetch the listing on its own so a failed request fails the test instead
+# of reading as "nothing was pushed".
+LISTING=$(curl -fsS --aws-sigv4 "aws:amz:us-east-1:s3" --user "$S3_KEY:$S3_SECRET" \
+  "http://127.0.0.1:${S3_PORT}/${BUCKET}?list-type=2&prefix=run/external_services/postgres/${SHAPE}/") ||
+  fail "could not list the S3 bucket to check that nothing was pushed"
+grep -q "<ListBucketResult" <<<"$LISTING" || fail "the S3 listing is not a bucket listing: $LISTING"
+if grep -q basebackups <<<"$LISTING"; then
   fail "a base backup was pushed for the refused service"
 fi
 

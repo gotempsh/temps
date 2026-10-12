@@ -8,6 +8,7 @@ import {
   formatRetainedUntil,
   maskSecret,
   parseCleanupScheduleId,
+  resolveRestartConsent,
   validateCreateScheduleAutomation,
   type RetentionCleanupReport,
 } from './index.js'
@@ -161,5 +162,73 @@ describe('formatRetainedUntil', () => {
 
   test('falls back to "until deleted" for an unparsable timestamp', () => {
     expect(formatRetainedUntil('not-a-date')).toBe('until deleted')
+  })
+})
+
+describe('resolveRestartConsent (#1415)', () => {
+  const restarts = { restarts_database: true, reason: 'WAL archiving is off' }
+  const deps = (over: Partial<Parameters<typeof resolveRestartConsent>[0]> = {}) => {
+    const calls = { preflight: 0, prompt: 0 }
+    return {
+      calls,
+      deps: {
+        confirmFlag: false,
+        isTTY: true,
+        loadPreflight: async () => {
+          calls.preflight++
+          return restarts
+        },
+        prompt: async () => {
+          calls.prompt++
+          return true
+        },
+        ...over,
+      },
+    }
+  }
+
+  test('--confirm-restart proceeds without a preflight or a prompt', async () => {
+    const { deps: d, calls } = deps({ confirmFlag: true })
+    expect(await resolveRestartConsent(d)).toEqual({ kind: 'proceed', confirmRestart: true, warnings: [] })
+    expect(calls).toEqual({ preflight: 0, prompt: 0 })
+  })
+
+  test('a backup that does not restart proceeds without confirmation', async () => {
+    const { deps: d, calls } = deps({ loadPreflight: async () => ({ restarts_database: false }) })
+    expect(await resolveRestartConsent(d)).toEqual({ kind: 'proceed', confirmRestart: false, warnings: [] })
+    expect(calls.prompt).toBe(0)
+  })
+
+  test('a non-interactive run stops with exit 1 and never prompts', async () => {
+    const { deps: d, calls } = deps({ isTTY: false })
+    const consent = await resolveRestartConsent(d)
+    expect(consent).toMatchObject({ kind: 'abort', exitCode: 1, warnings: ['WAL archiving is off'] })
+    expect(calls.prompt).toBe(0)
+  })
+
+  test('an interactive yes sends confirm_restart', async () => {
+    const { deps: d, calls } = deps()
+    expect(await resolveRestartConsent(d)).toEqual({
+      kind: 'proceed',
+      confirmRestart: true,
+      warnings: ['WAL archiving is off'],
+    })
+    expect(calls.prompt).toBe(1)
+  })
+
+  test('an interactive no starts nothing and exits 0', async () => {
+    const { deps: d } = deps({ prompt: async () => false })
+    expect(await resolveRestartConsent(d)).toMatchObject({ kind: 'abort', exitCode: 0 })
+  })
+
+  test('an unreadable preflight sends the request unconfirmed (the server still refuses a restart)', async () => {
+    const { deps: d, calls } = deps({ loadPreflight: async () => undefined })
+    expect(await resolveRestartConsent(d)).toEqual({ kind: 'proceed', confirmRestart: false, warnings: [] })
+    expect(calls.prompt).toBe(0)
+  })
+
+  test('a missing reason still warns', async () => {
+    const { deps: d } = deps({ isTTY: false, loadPreflight: async () => ({ restarts_database: true, reason: null }) })
+    expect((await resolveRestartConsent(d)).warnings).toEqual(['This backup restarts the database.'])
   })
 })

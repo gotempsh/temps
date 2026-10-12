@@ -459,23 +459,39 @@ impl RedisService {
                 "Container {} already exists with different image (current: {}, requested: {}), recreating it",
                 container_name, existing_image, config.docker_image
             );
-            super::recreate_guard::recreate_preserving_data(
-                super::recreate_guard::RecreateRequest {
-                    docker,
-                    engine: super::recreate_guard::ManagedEngine::Redis,
-                    service_name: &self.name,
-                    container_name: &container_name,
-                    replacement: self.replacement_storage(),
-                    operation: "changing its image",
-                },
-                || self.create_fresh_container(docker, config, password, resource_limits),
-            )
-            .await?;
+            self.recreate_container_guarded(docker, config, password, resource_limits)
+                .await?;
             return Ok(());
         }
 
         self.create_fresh_container(docker, config, password, resource_limits)
             .await
+    }
+
+    /// Replace this service's container with one built from `config`,
+    /// through the shared guard (same data volume or refuse; original kept
+    /// until the new one shows the same keyspaces; restored otherwise).
+    async fn recreate_container_guarded(
+        &self,
+        docker: &Docker,
+        config: &RedisConfig,
+        password: &str,
+        resource_limits: &ServiceResourceLimits,
+    ) -> Result<()> {
+        let container_name = self.get_container_name();
+        super::recreate_guard::recreate_preserving_data(
+            super::recreate_guard::RecreateRequest {
+                docker,
+                engine: super::recreate_guard::ManagedEngine::Redis,
+                service_name: &self.name,
+                container_name: &container_name,
+                replacement: self.replacement_storage(),
+                operation: "changing its image",
+            },
+            || self.create_fresh_container(docker, config, password, resource_limits),
+        )
+        .await?;
+        Ok(())
     }
 
     /// The storage a container created by this service mounts, for
@@ -3284,12 +3300,39 @@ impl ExternalService for RedisService {
         // guard, which stops the original itself once it has checked the new
         // container will see its data, and fingerprints it while it runs.
 
-        // Create container with new image (keeping the same volume for data persistence)
-        info!("Starting Redis container with new image");
+        // Compare with the build the tag resolves to now, not only the
+        // reference string: asking again for a re-published tag must
+        // replace the container with its new digest.
         let limits = upgrade_limits;
         let password = new_redis_config.password.clone();
-        self.create_container(&self.docker, &mut new_redis_config, &password, &limits)
-            .await?;
+        match super::recreate_guard::runs_current_image(
+            &self.docker,
+            &self.get_container_name(),
+            &new_redis_config.docker_image,
+        )
+        .await
+        {
+            Some(true) => info!(
+                "Redis container {} already runs the current {} build",
+                self.get_container_name(),
+                new_redis_config.docker_image
+            ),
+            Some(false) => {
+                info!("Replacing Redis container with the new image");
+                self.recreate_container_guarded(
+                    &self.docker,
+                    &new_redis_config,
+                    &password,
+                    &limits,
+                )
+                .await?;
+            }
+            None => {
+                info!("Starting Redis container with new image");
+                self.create_container(&self.docker, &mut new_redis_config, &password, &limits)
+                    .await?;
+            }
+        }
         *self.config.write().await = Some(new_redis_config);
 
         info!("Redis upgrade completed successfully");

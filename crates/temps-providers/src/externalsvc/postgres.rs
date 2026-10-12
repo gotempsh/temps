@@ -8914,6 +8914,78 @@ mod tests {
             scope.cleanup().await;
         }
 
+        /// A normal start of a managed service whose volume says archiving is
+        /// configured (walg.env present, e.g. a first backup interrupted
+        /// before its recreate) but whose container still runs with
+        /// archive_mode=off. The manager starts it through `force_recreate`
+        /// with a provider it just built, so the drift is repaired, through
+        /// the guard, on the same cluster.
+        #[tokio::test]
+        async fn start_repairs_archive_drift_on_managed_storage() {
+            let Some(docker) = docker_or_skip("start_repairs_archive_drift").await else {
+                return;
+            };
+            let scope = RunScope::new(&docker, "drift2");
+            let service = scope.name("svc");
+            let container = postgres_container_name(&service);
+            scope.track_volume(postgres_volume_names(&service)[0].clone());
+            let port = find_available_port_async(&docker, 25432)
+                .await
+                .expect("free port");
+            let cfg = config(port, WALG_18);
+            let params = serde_json::to_value(&cfg).unwrap();
+            PostgresService::new(service.clone(), Arc::new(docker.clone()))
+                .init(ServiceConfig {
+                    name: service.clone(),
+                    service_type: ServiceType::Postgres,
+                    version: None,
+                    parameters: params.clone(),
+                })
+                .await
+                .expect("init");
+            seed(&docker, &container).await;
+            let identity = system_id_of(&docker, &container).await;
+            sh_eventually(
+                &docker,
+                &container,
+                "echo 'WALG_S3_PREFIX=s3://recreate-guard-test/walg' > /var/lib/postgresql/walg.env",
+            )
+            .await;
+            assert_eq!(psql(&docker, &container, "SHOW archive_mode").await, "off");
+
+            // As start_service does it: a fresh provider, then force_recreate.
+            PostgresService::new(service.clone(), Arc::new(docker.clone()))
+                .force_recreate(ServiceConfig {
+                    name: service.clone(),
+                    service_type: ServiceType::Postgres,
+                    version: None,
+                    parameters: params,
+                })
+                .await
+                .expect("start with drift repair");
+            assert_eq!(psql(&docker, &container, "SHOW archive_mode").await, "on");
+            assert_eq!(system_id_of(&docker, &container).await, identity);
+            assert_eq!(
+                psql(&docker, &container, "SELECT count(*) FROM accounts").await,
+                "7"
+            );
+            assert!(set_aside_containers(&docker, &container).await.is_empty());
+            scope.cleanup().await;
+        }
+
+        async fn system_id_of(docker: &Docker, container: &str) -> Option<String> {
+            super::super::super::recreate_guard::fingerprint(
+                docker,
+                ManagedEngine::Postgres,
+                container,
+                "/var/lib/postgresql/18/docker",
+                false,
+                false,
+            )
+            .await
+            .identity
+        }
+
         /// The exact #1415 flow on a service Temps created: archive_mode off,
         /// then "Run backup"'s archiving step. It restarts PostgreSQL in a new
         /// container, and the data, roles and cluster identity are the same.

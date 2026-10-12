@@ -213,18 +213,29 @@ impl BackupEngine for PostgresWalgEngine {
             .get("allow_restart")
             .and_then(Value::as_bool)
             .unwrap_or(true);
-        if !allow_restart
-            && postgres_service
+        // Only a probe that answered "restart needed" is final. A probe that
+        // could not reach PostgreSQL (restarting, at its connection limit)
+        // is a transient outage and retries like any other.
+        let restart_needed = if allow_restart {
+            false
+        } else {
+            postgres_service
                 .backup_requires_restart(service_config.clone())
                 .await
-                .unwrap_or(true)
-        {
+                .map_err(|error| BackupError::Failed {
+                    reason: format!(
+                        "Could not check whether backing up service {} ('{}') would restart \
+                         PostgreSQL: {}",
+                        service.id, service.name, error
+                    ),
+                })?
+        };
+        if restart_needed {
             return Err(BackupError::PermanentFailure {
                 reason: format!(
                     "Backup of service {} ('{}') would restart PostgreSQL to turn WAL archiving \
                      on, and that was not confirmed when the backup was requested (archiving was \
-                     on then, or could not be checked). Nothing was changed. Run the backup again \
-                     and confirm the restart",
+                     on then). Nothing was changed. Run the backup again and confirm the restart",
                     service.id, service.name
                 ),
             });

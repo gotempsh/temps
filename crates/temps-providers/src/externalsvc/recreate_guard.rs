@@ -1101,18 +1101,46 @@ pub async fn created_image(docker: &Docker, container_name: &str) -> Option<Stri
         .and_then(|c| c.config.and_then(|c| c.image))
 }
 
+/// Whether `container_name` already runs exactly the image `image_ref`
+/// resolves to now: created from that reference *and* on the same image ID.
+/// `None` when there is no such container (or either cannot be inspected).
+///
+/// An explicit upgrade uses this, not [`created_image`]: a tag re-pulled to
+/// a new digest keeps the same reference string, but an operator who asks
+/// for that tag again wants the new build. Start-up deliberately compares
+/// only the reference, so a moved tag never restarts a service by itself.
+pub async fn runs_current_image(
+    docker: &Docker,
+    container_name: &str,
+    image_ref: &str,
+) -> Option<bool> {
+    let container = docker
+        .inspect_container(container_name, None::<InspectContainerOptions>)
+        .await
+        .ok()?;
+    let image = docker.inspect_image(image_ref).await.ok()?;
+    let same_reference =
+        container.config.as_ref().and_then(|c| c.image.as_deref()) == Some(image_ref);
+    let same_build = container.image.is_some() && container.image == image.id;
+    Some(same_reference && same_build)
+}
+
 /// Remove originals that an interrupted recreate of `container_name` kept
-/// aside (named `<container>-pre-recreate-<time>`). Only for deleting the
-/// service and its data: anywhere else they may be the only copy that runs.
-/// Best effort; failures are logged.
+/// aside. Only for deleting the service and its data: anywhere else they may
+/// be the only copy that runs. Best effort; failures are logged.
+///
+/// A container is only taken for one when it is exactly what
+/// [`set_aside`] leaves behind: named [`set_aside_name`] for this container
+/// (the suffix is a fixed-width timestamp, so another service whose name
+/// merely starts the same way never matches), stopped, and with restarts
+/// disabled.
 pub async fn remove_set_aside_originals(docker: &Docker, container_name: &str) {
-    let prefix = format!("{container_name}-pre-recreate-");
     let containers = match docker
         .list_containers(Some(ListContainersOptions {
             all: true,
             filters: Some(std::collections::HashMap::from([(
                 "name".to_string(),
-                vec![prefix.clone()],
+                vec![format!("{container_name}-pre-recreate-")],
             )])),
             ..Default::default()
         }))
@@ -1125,21 +1153,50 @@ pub async fn remove_set_aside_originals(docker: &Docker, container_name: &str) {
         }
     };
     for c in containers {
-        // The name filter matches substrings; act only on an exact prefix.
         let Some(name) = c
             .names
             .unwrap_or_default()
             .into_iter()
             .map(|n| n.trim_start_matches('/').to_string())
-            .find(|n| n.starts_with(&prefix))
+            .find(|n| is_set_aside_name(container_name, n))
         else {
             continue;
         };
+        let inspect = match docker
+            .inspect_container(&name, None::<InspectContainerOptions>)
+            .await
+        {
+            Ok(i) => i,
+            Err(e) => {
+                warn!(container = %name, error = %e, "Could not inspect a set-aside candidate; leaving it");
+                continue;
+            }
+        };
+        let running = inspect
+            .state
+            .as_ref()
+            .and_then(|s| s.running)
+            .unwrap_or(true);
+        let restart_disabled = inspect
+            .host_config
+            .as_ref()
+            .and_then(|h| h.restart_policy.as_ref())
+            .and_then(|p| p.name)
+            .is_some_and(|n| matches!(n, RestartPolicyNameEnum::NO | RestartPolicyNameEnum::EMPTY));
+        if running || !restart_disabled {
+            warn!(
+                container = %name,
+                running,
+                restart_disabled,
+                "Not removing a container named like a set-aside original: it is not in the stopped, restart-disabled state the recreate guard leaves"
+            );
+            continue;
+        }
         match docker
             .remove_container(
                 &name,
                 Some(RemoveContainerOptions {
-                    force: true,
+                    force: false,
                     v: false,
                     ..Default::default()
                 }),
@@ -1150,6 +1207,15 @@ pub async fn remove_set_aside_originals(docker: &Docker, container_name: &str) {
             Err(e) => warn!(container = %name, error = %e, "Could not remove set-aside original"),
         }
     }
+}
+
+/// Whether `name` is exactly what [`set_aside_name`] produces for
+/// `container_name`: `<container>-pre-recreate-` followed by the 23-digit
+/// timestamp and nothing else.
+pub fn is_set_aside_name(container_name: &str, name: &str) -> bool {
+    name.strip_prefix(container_name)
+        .and_then(|rest| rest.strip_prefix("-pre-recreate-"))
+        .is_some_and(|stamp| stamp.len() == 23 && stamp.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Unique even for two recreates of one container within the same second
@@ -2001,6 +2067,27 @@ mod tests {
     }
 
     #[test]
+    fn only_exact_set_aside_names_count_as_set_aside_originals() {
+        let made = set_aside_name("postgres-app");
+        assert!(is_set_aside_name("postgres-app", &made), "{made}");
+        // Another service whose name merely starts the same way.
+        assert!(!is_set_aside_name(
+            "postgres-app",
+            "postgres-app-pre-recreate-reporting"
+        ));
+        assert!(!is_set_aside_name(
+            "postgres-app",
+            "postgres-app-pre-recreate-20261012114525200595000-x"
+        ));
+        assert!(!is_set_aside_name(
+            "postgres-app",
+            "postgres-app-pre-recreate-2026"
+        ));
+        assert!(!is_set_aside_name("postgres-ap", &made));
+        assert!(!is_set_aside_name("postgres-app", "postgres-app"));
+    }
+
+    #[test]
     fn anonymous_volume_names_are_recognised() {
         assert!(is_anonymous_volume_name(ANON));
         assert!(!is_anonymous_volume_name("postgres-app_data"));
@@ -2256,6 +2343,42 @@ pub(crate) mod test_support {
         pub prefix: String,
         volumes: std::sync::Mutex<Vec<String>>,
         binds: std::sync::Mutex<Vec<String>>,
+        cleaned: std::sync::atomic::AtomicBool,
+    }
+
+    /// A test that panics before its `cleanup().await` still removes what it
+    /// created: on a dedicated thread with its own runtime, since `Drop`
+    /// cannot await and may run inside the test's runtime.
+    impl Drop for RunScope {
+        fn drop(&mut self) {
+            if self.cleaned.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            let scope = RunScope {
+                docker: self.docker.clone(),
+                prefix: self.prefix.clone(),
+                volumes: std::sync::Mutex::new(
+                    self.volumes.lock().map(|v| v.clone()).unwrap_or_default(),
+                ),
+                binds: std::sync::Mutex::new(
+                    self.binds.lock().map(|v| v.clone()).unwrap_or_default(),
+                ),
+                cleaned: std::sync::atomic::AtomicBool::new(false),
+            };
+            let cleanup = std::thread::spawn(move || {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt.block_on(scope.cleanup()),
+                    // Never retry from this copy's own Drop.
+                    Err(_) => scope
+                        .cleaned
+                        .store(true, std::sync::atomic::Ordering::SeqCst),
+                }
+            });
+            let _ = cleanup.join();
+        }
     }
 
     impl RunScope {
@@ -2273,6 +2396,7 @@ pub(crate) mod test_support {
                 ),
                 volumes: std::sync::Mutex::new(Vec::new()),
                 binds: std::sync::Mutex::new(Vec::new()),
+                cleaned: std::sync::atomic::AtomicBool::new(false),
             }
         }
 
@@ -2300,6 +2424,10 @@ pub(crate) mod test_support {
         /// Remove every container whose name starts with this scope's prefix
         /// (including set-aside originals) and every tracked volume.
         pub async fn cleanup(&self) {
+            // Once only: also marks the scope done for `Drop`.
+            if self.cleaned.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
             let containers = self
                 .docker
                 .list_containers(Some(ListContainersOptions {
@@ -2829,6 +2957,149 @@ mod docker_tests {
         assert_eq!(after, identity);
         assert!(set_aside_containers(&docker, &name).await.is_empty());
         scope.cleanup().await;
+    }
+
+    /// Deleting service `app` removes only its own set-aside original: a
+    /// running service whose name merely starts with `app-pre-recreate-`,
+    /// and a running container with a set-aside name, are left alone.
+    #[tokio::test]
+    async fn delete_cleanup_takes_only_real_set_aside_originals() {
+        let Some(docker) =
+            docker_or_skip("delete_cleanup_takes_only_real_set_aside_originals").await
+        else {
+            return;
+        };
+        let scope = RunScope::new(&docker, "sweep");
+        let base = scope.name("pg");
+        let sleeper = |name: String| {
+            let docker = docker.clone();
+            async move {
+                run_container(
+                    &docker,
+                    &name,
+                    "alpine:3.22",
+                    &[],
+                    Some(vec!["sleep".into(), "600".into()]),
+                    vec![],
+                    None,
+                )
+                .await
+            }
+        };
+        // A real set-aside original: stopped, restart disabled.
+        let real = set_aside_name(&base);
+        sleeper(real.clone()).await;
+        docker
+            .update_container(
+                &real,
+                ContainerUpdateBody {
+                    restart_policy: Some(no_restart()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        docker
+            .stop_container(
+                &real,
+                Some(StopContainerOptions {
+                    t: Some(1),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        // Another service, named so it shares the prefix.
+        let other_service = format!("{base}-pre-recreate-reporting");
+        sleeper(other_service.clone()).await;
+        // A set-aside name that is running (not left by the guard).
+        let running = format!("{base}-pre-recreate-{}", "1".repeat(23));
+        sleeper(running.clone()).await;
+
+        remove_set_aside_originals(&docker, &base).await;
+
+        assert!(
+            container_id(&docker, &real).await.is_none(),
+            "the stopped original is removed"
+        );
+        assert!(
+            is_running(&docker, &other_service).await,
+            "another service is untouched"
+        );
+        assert!(
+            is_running(&docker, &running).await,
+            "a running container is untouched"
+        );
+        scope.cleanup().await;
+    }
+
+    /// An explicit upgrade to the same tag sees a re-published build.
+    #[tokio::test]
+    async fn runs_current_image_follows_the_tag_not_only_its_name() {
+        let Some(docker) =
+            docker_or_skip("runs_current_image_follows_the_tag_not_only_its_name").await
+        else {
+            return;
+        };
+        let scope = RunScope::new(&docker, "imgid");
+        let name = scope.name("svc");
+        let tag = format!("{}:v1", scope.name("img"));
+        let (repo, version) = tag.split_once(':').unwrap();
+        ensure_image(&docker, "alpine:3.22").await;
+        ensure_image(&docker, "redis:7-alpine").await;
+        let retag = |source: &'static str| {
+            let docker = docker.clone();
+            let (repo, version) = (repo.to_string(), version.to_string());
+            async move {
+                docker
+                    .tag_image(
+                        source,
+                        Some(bollard::query_parameters::TagImageOptions {
+                            repo: Some(repo),
+                            tag: Some(version),
+                        }),
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+        retag("alpine:3.22").await;
+        run_container(
+            &docker,
+            &name,
+            &tag,
+            &[],
+            Some(vec!["sleep".into(), "600".into()]),
+            vec![],
+            None,
+        )
+        .await;
+        assert_eq!(runs_current_image(&docker, &name, &tag).await, Some(true));
+        assert_eq!(
+            created_image(&docker, &name).await.as_deref(),
+            Some(tag.as_str())
+        );
+
+        // The tag moves to another build; the reference string does not.
+        retag("redis:7-alpine").await;
+        assert_eq!(
+            created_image(&docker, &name).await.as_deref(),
+            Some(tag.as_str())
+        );
+        assert_eq!(runs_current_image(&docker, &name, &tag).await, Some(false));
+        assert_eq!(
+            runs_current_image(&docker, &scope.name("missing"), &tag).await,
+            None
+        );
+
+        scope.cleanup().await;
+        let _ = docker
+            .remove_image(
+                &tag,
+                None::<bollard::query_parameters::RemoveImageOptions>,
+                None,
+            )
+            .await;
     }
 
     /// The happy path: same volume, same PGDATA. The original is removed only

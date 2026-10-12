@@ -160,7 +160,10 @@ export function TriggerBackupDialog({
     meta: {
       errorTitle: 'Failed to trigger backup',
     },
-    onError: () => {
+    // onSettled, not onError: a local onError would replace the app-wide
+    // default that shows the error toast, leaving a failed run unexplained.
+    onSettled: (_data, error) => {
+      if (!error) return
       // A 409 means the server found a restart the dialog did not know
       // about; re-check so the acknowledgement appears.
       void queryClient.invalidateQueries({

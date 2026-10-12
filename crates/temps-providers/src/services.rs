@@ -11821,7 +11821,33 @@ echo "[restore] Pre-seed complete"
                 }
             }
 
-            match service_instance.start().await {
+            // A managed PostgreSQL service is started with its stored
+            // configuration loaded (`force_recreate` = load it, then
+            // `start()`), so start-time drift repair (archive_mode,
+            // shared_preload_libraries) has a specification to rebuild from.
+            // Without it, start() can only start the existing container as
+            // it is. The repair itself goes through the recreate guard.
+            let managed_postgres = matches!(service_type_enum, ServiceType::Postgres)
+                && !parameters.contains_key("container_name");
+            let start_result = if managed_postgres {
+                let service_config = ServiceConfig {
+                    name: service.name.clone(),
+                    service_type: service_type_enum,
+                    version: service.version.clone(),
+                    parameters: serde_json::to_value(&parameters).map_err(|e| {
+                        ExternalServiceError::InternalError {
+                            reason: format!(
+                                "Failed to serialize parameters of service {}: {}",
+                                service_id, e
+                            ),
+                        }
+                    })?,
+                };
+                service_instance.force_recreate(service_config).await
+            } else {
+                service_instance.start().await
+            };
+            match start_result {
                 Ok(()) => {}
                 Err(e) => {
                     info!(

@@ -950,29 +950,26 @@ async function runServiceBackup(options: RunServiceBackupOptions): Promise<void>
 
   // The first WAL-G backup of a PostgreSQL service with archiving off
   // restarts it; the server refuses that unless it is acknowledged.
-  let confirmRestart = options.confirmRestart === true
-  if (!confirmRestart) {
-    const { data: preflight } = await externalServiceBackupPreflight({
-      client,
-      path: { id },
-    })
-    if (preflight?.restarts_database) {
-      warning(preflight.reason || 'This backup restarts the database.')
-      if (!process.stdin.isTTY) {
-        warning('Nothing was started. Re-run with --confirm-restart to proceed.')
-        process.exitCode = 1
-        return
-      }
-      confirmRestart = await promptConfirm({
+  const consent = await resolveRestartConsent({
+    confirmFlag: options.confirmRestart === true,
+    isTTY: process.stdin.isTTY === true,
+    loadPreflight: async () =>
+      (await externalServiceBackupPreflight({ client, path: { id } })).data,
+    prompt: () =>
+      promptConfirm({
         message: 'Restart the database and run the backup?',
         default: false,
-      })
-      if (!confirmRestart) {
-        info('Backup not started')
-        return
-      }
-    }
+      }),
+  })
+  for (const message of consent.warnings) {
+    warning(message)
   }
+  if (consent.kind === 'abort') {
+    info(consent.message)
+    if (consent.exitCode !== 0) process.exitCode = consent.exitCode
+    return
+  }
+  const confirmRestart = consent.confirmRestart
 
   const backup = await withSpinner('Triggering external service backup...', async () => {
     const { data, error } = await runExternalServiceBackup({
@@ -1214,6 +1211,47 @@ async function cleanupBackups(options: CleanupBackupsOptions): Promise<void> {
 }
 
 // Helpers
+
+/** What `run-service` should do about a backup that may restart the database. */
+export type RestartConsent =
+  | { kind: 'proceed'; confirmRestart: boolean; warnings: string[] }
+  | { kind: 'abort'; message: string; exitCode: 0 | 1; warnings: string[] }
+
+/**
+ * Decide whether `run-service` may start a backup that restarts the
+ * database (#1415): `--confirm-restart` proceeds without asking; otherwise
+ * the run preflight decides, an interactive terminal is asked, and a
+ * non-interactive one stops with a non-zero exit instead of sending the
+ * request. When the preflight cannot be read the request is sent without
+ * confirmation; the server still refuses an unacknowledged restart (409).
+ */
+export async function resolveRestartConsent(deps: {
+  confirmFlag: boolean
+  isTTY: boolean
+  loadPreflight: () => Promise<{ restarts_database: boolean; reason?: string | null } | undefined>
+  prompt: () => Promise<boolean>
+}): Promise<RestartConsent> {
+  if (deps.confirmFlag) {
+    return { kind: 'proceed', confirmRestart: true, warnings: [] }
+  }
+  const preflight = await deps.loadPreflight()
+  if (!preflight?.restarts_database) {
+    return { kind: 'proceed', confirmRestart: false, warnings: [] }
+  }
+  const warnings = [preflight.reason || 'This backup restarts the database.']
+  if (!deps.isTTY) {
+    return {
+      kind: 'abort',
+      message: 'Nothing was started. Re-run with --confirm-restart to proceed.',
+      exitCode: 1,
+      warnings,
+    }
+  }
+  if (await deps.prompt()) {
+    return { kind: 'proceed', confirmRestart: true, warnings }
+  }
+  return { kind: 'abort', message: 'Backup not started', exitCode: 0, warnings }
+}
 
 export function parseCleanupScheduleId(value?: string): number | undefined {
   if (!value) return undefined
