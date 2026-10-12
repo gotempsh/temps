@@ -690,6 +690,17 @@ pub enum ExternalServiceError {
     #[error("Parameter validation failed for service {service_id}: {reason}")]
     ParameterValidationFailed { service_id: i32, reason: String },
 
+    /// A change was refused because carrying it out would leave the service
+    /// running without the data it has: its container would be replaced by
+    /// one on other storage, or a rename would start it on a new, empty
+    /// volume (#1415). Nothing was changed.
+    #[error("Refusing to change service {service_id} ('{name}'): {reason}")]
+    DataSafetyRefusal {
+        service_id: i32,
+        name: String,
+        reason: String,
+    },
+
     #[error("Failed to start service {id}: {reason}")]
     StartFailed { id: i32, reason: String },
 
@@ -2293,6 +2304,11 @@ pub struct ResourceLimitsUpdateResponse {
     pub limits: crate::externalsvc::ServiceResourceLimits,
     /// Per-container result of trying to apply the limits live.
     pub applied: Vec<ResourceLimitApplyResult>,
+    /// Set when a new `/dev/shm` size was saved but could not be applied,
+    /// because that needs a new container and replacing it was refused or
+    /// failed (the reason says which, and that no data was changed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shm_not_applied: Option<String>,
 }
 
 /// TTL for the `<service>.temps.local` A record of a standalone managed
@@ -3313,6 +3329,165 @@ impl ExternalServiceManager {
         })
     }
 
+    /// Refuse a change that recreates `service`'s local container with
+    /// `parameters` when the new container would not see the data the
+    /// current one uses. Read-only; a no-op when there is no container yet,
+    /// or the service is remote or a cluster (whose paths guard themselves).
+    async fn ensure_recreate_keeps_data(
+        &self,
+        service: &external_services::Model,
+        parameters: &HashMap<String, serde_json::Value>,
+        operation: &str,
+    ) -> Result<(), ExternalServiceError> {
+        if service.node_id.is_some() || service.topology == "cluster" {
+            return Ok(());
+        }
+        let service_type = ServiceType::from_str(&service.service_type).map_err(|_| {
+            ExternalServiceError::InvalidServiceType {
+                id: service.id,
+                service_type: service.service_type.clone(),
+            }
+        })?;
+        let instance = self.create_service_instance_for_parameters(
+            service.name.clone(),
+            service_type,
+            parameters,
+        )?;
+        let config = ServiceConfig {
+            name: service.name.clone(),
+            service_type,
+            version: service.version.clone(),
+            parameters: serde_json::to_value(parameters).map_err(|e| {
+                ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Failed to serialize parameters of service {}: {}",
+                        service.id, e
+                    ),
+                }
+            })?,
+        };
+        // Imported services are never recreated, so there is nothing to check.
+        let Some((engine, replacement)) = instance.recreate_plan(&config) else {
+            return Ok(());
+        };
+        let docker = self.require_docker()?;
+        crate::externalsvc::recreate_guard::preflight(
+            docker.as_ref(),
+            engine,
+            &service.name,
+            &instance.get_docker_container_name(),
+            &replacement,
+            operation,
+        )
+        .await
+        .map_err(|e| {
+            if e.is_refusal() {
+                ExternalServiceError::DataSafetyRefusal {
+                    service_id: service.id,
+                    name: service.name.clone(),
+                    reason: e.to_string(),
+                }
+            } else {
+                ExternalServiceError::DockerError {
+                    id: service.id,
+                    reason: e.to_string(),
+                }
+            }
+        })?;
+        Ok(())
+    }
+
+    /// Refuse to rename a local service that already has Docker resources
+    /// under its current name: its data volume cannot follow the rename, so
+    /// the renamed service would come up empty (#1415 class).
+    async fn ensure_rename_keeps_data(
+        &self,
+        service: &external_services::Model,
+        new_name: &str,
+    ) -> Result<(), ExternalServiceError> {
+        if service.node_id.is_some() {
+            // Its resources are on a worker this process cannot inspect, and
+            // they are named after the service just the same.
+            return Err(ExternalServiceError::DataSafetyRefusal {
+                service_id: service.id,
+                name: service.name.clone(),
+                reason: format!(
+                    "renaming it to '{new_name}' would start it on new, empty storage on its \
+                     worker node: its container and volume are named after the current name. \
+                     Nothing was changed. Keep the current name, or back the service up and \
+                     restore it into a new service with the name you want"
+                ),
+            });
+        }
+        let parameters = self.get_service_parameters(service.id).await?;
+        let service_type = ServiceType::from_str(&service.service_type).map_err(|_| {
+            ExternalServiceError::InvalidServiceType {
+                id: service.id,
+                service_type: service.service_type.clone(),
+            }
+        })?;
+        let instance = self.create_service_instance_for_parameters(
+            service.name.clone(),
+            service_type,
+            &parameters,
+        )?;
+        let refuse = |resource: String| ExternalServiceError::DataSafetyRefusal {
+            service_id: service.id,
+            name: service.name.clone(),
+            reason: format!(
+                "renaming it to '{new_name}' would start it on new, empty storage: its data is in \
+                 Docker resource '{resource}', which is named after the current service name and \
+                 cannot be renamed. Nothing was changed. Keep the current name, or back the \
+                 service up and restore it into a new service with the name you want"
+            ),
+        };
+        let Some(names) = instance.docker_resource_names() else {
+            return Err(refuse(instance.get_docker_container_name()));
+        };
+        let docker = self.require_docker()?;
+        for volume in names.volumes {
+            match docker.inspect_volume(&volume).await {
+                Ok(_) => return Err(refuse(volume)),
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => {}
+                Err(e) => {
+                    return Err(ExternalServiceError::DockerError {
+                        id: service.id,
+                        reason: format!(
+                            "Failed to check volume '{}' before renaming service {}: {}",
+                            volume, service.id, e
+                        ),
+                    })
+                }
+            }
+        }
+        for container in names.containers {
+            match docker
+                .inspect_container(
+                    &container,
+                    None::<bollard::query_parameters::InspectContainerOptions>,
+                )
+                .await
+            {
+                Ok(_) => return Err(refuse(container)),
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => {}
+                Err(e) => {
+                    return Err(ExternalServiceError::DockerError {
+                        id: service.id,
+                        reason: format!(
+                            "Failed to check container '{}' before renaming service {}: {}",
+                            container, service.id, e
+                        ),
+                    })
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn ensure_new_local_service_resources_unused(
         &self,
         service: &external_services::Model,
@@ -4281,12 +4456,20 @@ impl ExternalServiceManager {
 
         // Get existing parameters and merge updates
         let mut existing_params = self.get_service_parameters(service_id).await?;
+        let previous_image = existing_params.get("docker_image").cloned();
         strategy
             .merge_updates(&mut existing_params, update_params)
             .map_err(|reason| ExternalServiceError::ParameterValidationFailed {
                 service_id,
                 reason,
             })?;
+        // A new image means a new container. Refuse before saving anything
+        // or stopping the service when that container would not see the
+        // current one's data (#1415).
+        if existing_params.get("docker_image") != previous_image.as_ref() {
+            self.ensure_recreate_keeps_data(&service, &existing_params, "changing its image")
+                .await?;
+        }
 
         // Serialize and encrypt the merged parameters
         let config_json = serde_json::to_string(&existing_params).map_err(|e| {
@@ -4320,6 +4503,10 @@ impl ExternalServiceManager {
                 // Reserving a database name does not grant ownership of an
                 // existing Docker resource. Refuse a rename destination before
                 // stopping the original service or persisting its new identity.
+                // Every resource is named after the service, and Docker cannot
+                // rename a volume: a rename would start the service on a new,
+                // empty volume and leave its data behind under the old name.
+                self.ensure_rename_keeps_data(&service, &new_name).await?;
                 let mut renamed_service = service.clone();
                 renamed_service.name = new_name.clone();
                 self.ensure_new_local_service_resources_unused(&renamed_service)
@@ -4654,6 +4841,16 @@ impl ExternalServiceManager {
                     service_type_enum,
                     &parameters,
                 )?;
+                // An original kept aside by an interrupted recreate still
+                // mounts the data volume and would make removing it fail.
+                // Deleting the service deletes that data anyway.
+                if let Ok(docker) = self.require_docker() {
+                    crate::externalsvc::recreate_guard::remove_set_aside_originals(
+                        docker.as_ref(),
+                        &service_instance.get_docker_container_name(),
+                    )
+                    .await;
+                }
                 service_instance.remove().await.map_err(|e| {
                     ExternalServiceError::DeletionFailed {
                         id: service_id,
@@ -4830,6 +5027,69 @@ impl ExternalServiceManager {
     }
 
     // Helper methods
+    /// Why a WAL-G backup of `service_id` would restart PostgreSQL right
+    /// now, or `None` when it would not. A restart is needed when a managed,
+    /// local, standalone service has `archive_mode` off: turning it on
+    /// recreates the container. When the setting cannot be read the answer
+    /// is "it may", so the caller asks for confirmation rather than assume.
+    /// Bounded: one SQL round trip to the service.
+    pub async fn backup_restart_reason(
+        &self,
+        service_id: i32,
+    ) -> Result<Option<String>, ExternalServiceError> {
+        let service = self.get_service(service_id).await?;
+        let is_postgres = matches!(
+            ServiceType::from_str(&service.service_type),
+            Ok(ServiceType::Postgres)
+        );
+        if !is_postgres || service.topology == "cluster" || service.node_id.is_some() {
+            return Ok(None);
+        }
+        let parameters = self.get_service_parameters(service_id).await?;
+        let docker = self.require_docker()?;
+        let postgres =
+            crate::externalsvc::postgres::PostgresService::new(service.name.clone(), docker);
+        let config = ServiceConfig {
+            name: service.name.clone(),
+            service_type: ServiceType::Postgres,
+            version: service.version.clone(),
+            parameters: serde_json::to_value(&parameters).map_err(|e| {
+                ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Failed to serialize parameters of service {}: {}",
+                        service_id, e
+                    ),
+                }
+            })?,
+        };
+        Ok(
+            match postgres.backup_requires_restart(config.clone()).await {
+                Ok(false) => None,
+                Ok(true) => match postgres.backup_restart_refusal(config).await {
+                    Ok(Some(refusal)) => Some(format!(
+                    "WAL archiving is off for PostgreSQL service '{}', and turning it on needs a \
+                     new container that Temps cannot create safely, so this backup will fail \
+                     without changing anything: {}",
+                    service.name, refusal
+                )),
+                    Ok(None) | Err(_) => Some(format!(
+                "WAL archiving is off for PostgreSQL service '{}'. The first WAL-G backup turns \
+                 it on, which restarts PostgreSQL in a new container (usually under a minute). \
+                 Temps keeps the current container until the new one is verified to hold the same \
+                 data, and puts it back otherwise",
+                    service.name
+                )),
+                },
+                Err(e) => Some(format!(
+                    "Temps could not read whether WAL archiving is on for PostgreSQL service '{}' \
+                 ({}). If it is off, this backup restarts PostgreSQL in a new container to turn it \
+                 on",
+                    service.name, e
+                )),
+            },
+        )
+    }
+
     /// Read a single `external_services` row by id. Public so handlers can
     /// branch on per-service fields (e.g. `topology`) without redoing the
     /// existence check.
@@ -7914,9 +8174,16 @@ echo "[restore] Pre-seed complete"
 
         // Initialize the service
         let inferred_params = service_instance.init(config).await.map_err(|e| {
-            ExternalServiceError::InitializationFailed {
-                id: service_id,
-                reason: e.to_string(),
+            match e.downcast_ref::<crate::externalsvc::recreate_guard::RecreateGuardError>() {
+                Some(guard) if guard.is_refusal() => ExternalServiceError::DataSafetyRefusal {
+                    service_id,
+                    name: service.name.clone(),
+                    reason: guard.to_string(),
+                },
+                _ => ExternalServiceError::InitializationFailed {
+                    id: service_id,
+                    reason: e.to_string(),
+                },
             }
         })?;
 
@@ -14755,52 +15022,69 @@ echo "[restore] Pre-seed complete"
         // a hard requirement (the caller already ruled out remote/cluster).
         let docker = self.docker.require()?;
 
-        // Stop, then DELETE the container (volume preserved). Stop is
-        // best-effort — the container may already be stopped or gone.
-        let _ = docker
-            .stop_container(
-                &container_name,
-                None::<bollard::query_parameters::StopContainerOptions>,
-            )
-            .await;
-        match docker
-            .remove_container(
-                &container_name,
-                Some(bollard::query_parameters::RemoveContainerOptions {
-                    v: false, // keep the data volume — only the container is recreated
-                    force: true,
-                    ..Default::default()
-                }),
-            )
-            .await
-        {
-            Ok(()) => {
-                info!(
-                    service_id = service.id,
-                    container = %container_name,
-                    "Removed container to apply new /dev/shm size (data volume preserved)"
-                );
+        // Through the shared guard (#1415): refuse unless the new container
+        // mounts the data the current one uses, keep the current one until
+        // the new one is verified to hold the same data, restore it otherwise.
+        let service_config = ServiceConfig {
+            name: service.name.clone(),
+            service_type: ServiceType::from_str(&service.service_type).map_err(|_| {
+                ExternalServiceError::InvalidServiceType {
+                    id: service.id,
+                    service_type: service.service_type.clone(),
+                }
+            })?,
+            version: service.version.clone(),
+            parameters: serde_json::to_value(&parameters).map_err(|e| {
+                ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Failed to serialize parameters of service {}: {}",
+                        service.id, e
+                    ),
+                }
+            })?,
+        };
+        let (engine, replacement) = instance.recreate_plan(&service_config).ok_or_else(|| {
+            ExternalServiceError::DataSafetyRefusal {
+                service_id: service.id,
+                name: service.name.clone(),
+                reason: format!(
+                    "its {} container '{}' cannot be recreated safely by Temps (imported, or an engine without a known storage layout), so the new /dev/shm size was saved but not applied. Recreate the container by hand with the same mounts",
+                    service.service_type, container_name
+                ),
             }
-            Err(e) => {
-                // "no such container" is benign — nothing to recreate-from,
-                // initialize_service will just create it fresh. Surface other
-                // errors so the caller can warn.
-                let msg = e.to_string();
-                if !msg.contains("No such container") && !msg.contains("no such container") {
-                    return Err(ExternalServiceError::InternalError {
-                        reason: format!(
-                            "Failed to remove container '{}' for shm recreate: {}",
-                            container_name, msg
-                        ),
-                    });
+        })?;
+        let report = crate::externalsvc::recreate_guard::recreate_preserving_data(
+            crate::externalsvc::recreate_guard::RecreateRequest {
+                docker: docker.as_ref(),
+                engine,
+                service_name: &service.name,
+                container_name: &container_name,
+                replacement,
+                operation: "applying a new /dev/shm size",
+            },
+            || self.initialize_service(service.id),
+        )
+        .await
+        .map_err(|e| {
+            if e.is_refusal() {
+                ExternalServiceError::DataSafetyRefusal {
+                    service_id: service.id,
+                    name: service.name.clone(),
+                    reason: e.to_string(),
+                }
+            } else {
+                ExternalServiceError::InternalError {
+                    reason: e.to_string(),
                 }
             }
-        }
-
-        // Recreate from the now-persisted config (incl. the new resources
-        // block). With the old container gone, `create_container` takes the
-        // create branch and applies the new shm.
-        self.initialize_service(service.id).await
+        })?;
+        info!(
+            service_id = service.id,
+            container = %container_name,
+            replaced = report.replaced,
+            "Recreated container to apply new /dev/shm size; data verified"
+        );
+        Ok(())
     }
 
     pub async fn update_service_resource_limits(
@@ -14896,8 +15180,10 @@ echo "[restore] Pre-seed complete"
         // Best-effort: the limits are already persisted, so a recreate failure
         // must not roll them back. We log and fall through to report the
         // per-member outcome — the operator can recreate manually.
+        let mut shm_not_applied = None;
         if shm_changed {
             if let Err(e) = self.recreate_service_container_for_shm(&service).await {
+                shm_not_applied = Some(e.to_string());
                 tracing::warn!(
                     service_id,
                     error = %e,
@@ -14920,6 +15206,7 @@ echo "[restore] Pre-seed complete"
         Ok(ResourceLimitsUpdateResponse {
             limits: new_limits,
             applied,
+            shm_not_applied,
         })
     }
 }

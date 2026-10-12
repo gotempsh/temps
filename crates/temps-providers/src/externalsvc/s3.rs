@@ -679,7 +679,14 @@ echo '[restore] complete'"#;
                     *config = attempt_config;
                     return Ok(());
                 }
-                Err(e) if attempt < MAX_ATTEMPTS && is_port_conflict_error(&e.to_string()) => {
+                // A failed guarded recreate has already put the original
+                // back under this name; never remove it as "the failed attempt".
+                Err(e)
+                    if attempt < MAX_ATTEMPTS
+                        && e.downcast_ref::<super::recreate_guard::RecreateGuardError>()
+                            .is_none()
+                        && is_port_conflict_error(&e.to_string()) =>
+                {
                     warn!(
                         "Port {} for MinIO container was already allocated (attempt {}/{}), retrying with a fresh port: {}",
                         attempt_config.port, attempt, MAX_ATTEMPTS, e
@@ -746,12 +753,13 @@ echo '[restore] complete'"#;
             }))
             .await?;
 
-        if !containers.is_empty() {
-            // Check if we need to recreate with a new image
-            let existing_image = containers
-                .first()
-                .and_then(|c| c.image.as_deref())
-                .unwrap_or("");
+        if let Some(existing) = containers.first() {
+            // The reference the container was created from; the list API
+            // reports an image ID once the tag has moved to a newer digest.
+            let existing_image = super::recreate_guard::created_image(docker, &container_name)
+                .await
+                .or_else(|| existing.image.clone())
+                .unwrap_or_default();
 
             if existing_image == config.docker_image {
                 info!(
@@ -762,26 +770,49 @@ echo '[restore] complete'"#;
             }
 
             info!(
-                "Container {} already exists with different image (current: {}, requested: {}), removing it to recreate",
+                "Container {} already exists with different image (current: {}, requested: {}), recreating it",
                 container_name, existing_image, config.docker_image
             );
-
-            // Stop the container first
-            let _ = docker
-                .stop_container(&container_name, None::<StopContainerOptions>)
-                .await;
-
-            // Remove the container
-            docker
-                .remove_container(
-                    &container_name,
-                    Some(bollard::query_parameters::RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    }),
-                )
-                .await?;
+            let engine = match kind {
+                S3ServerKind::Minio => super::recreate_guard::ManagedEngine::Minio,
+                S3ServerKind::Rustfs => super::recreate_guard::ManagedEngine::Rustfs,
+            };
+            super::recreate_guard::recreate_preserving_data(
+                super::recreate_guard::RecreateRequest {
+                    docker,
+                    engine,
+                    service_name: &self.name,
+                    container_name: &container_name,
+                    replacement: super::recreate_guard::ReplacementStorage {
+                        data_dir: "/data".to_string(),
+                        mounts: vec![super::recreate_guard::PlannedMount {
+                            volume: volume_name.clone(),
+                            target: "/data".to_string(),
+                        }],
+                    },
+                    operation: "changing its image",
+                },
+                || self.create_fresh_container(docker, config, resource_limits, kind),
+            )
+            .await?;
+            return Ok(());
         }
+
+        self.create_fresh_container(docker, config, resource_limits, kind)
+            .await
+    }
+
+    /// Create, start and wait for a new container. The caller has made sure
+    /// no container with this name exists.
+    async fn create_fresh_container(
+        &self,
+        docker: &Docker,
+        config: &S3Config,
+        resource_limits: &ServiceResourceLimits,
+        kind: S3ServerKind,
+    ) -> Result<()> {
+        let container_name = self.get_container_name();
+        let volume_name = format!("minio_{}_data", self.name);
 
         let service_label_key = format!("{}service_type", temps_core::DOCKER_LABEL_PREFIX);
         let name_label_key = format!("{}service_name", temps_core::DOCKER_LABEL_PREFIX);
@@ -1287,6 +1318,26 @@ pub(crate) fn minio_volume_names(name: &str) -> [String; 1] {
 
 #[async_trait]
 impl ExternalService for S3Service {
+    fn recreate_plan(
+        &self,
+        _service_config: &ServiceConfig,
+    ) -> Option<(
+        super::recreate_guard::ManagedEngine,
+        super::recreate_guard::ReplacementStorage,
+    )> {
+        // Both server kinds keep buckets as directories under /data.
+        Some((
+            super::recreate_guard::ManagedEngine::Minio,
+            super::recreate_guard::ReplacementStorage {
+                data_dir: "/data".to_string(),
+                mounts: vec![super::recreate_guard::PlannedMount {
+                    volume: format!("minio_{}_data", self.name),
+                    target: "/data".to_string(),
+                }],
+            },
+        ))
+    }
+
     fn docker_resource_names(&self) -> Option<super::DockerResourceNames> {
         Some(super::DockerResourceNames {
             containers: vec![minio_container_name(&self.name)],
@@ -3017,6 +3068,9 @@ impl ExternalService for S3Service {
         info!("Starting S3/MinIO upgrade");
 
         let _old_s3_config = self.get_s3_config(old_config)?;
+        // The service's own limits: a provider built for this call has
+        // none loaded, and the new container must keep them.
+        let upgrade_limits = ServiceResourceLimits::from_parameters(&new_config.parameters);
         let mut new_s3_config = self.get_s3_config(new_config)?;
 
         // Verify the new image can be pulled BEFORE stopping the old container
@@ -3028,13 +3082,13 @@ impl ExternalService for S3Service {
             .await?;
         info!("New Docker image verified and is available");
 
-        // Stop the old container
-        info!("Stopping old S3/MinIO container");
-        self.stop().await?;
+        // No stop here: replacing the container goes through the recreate
+        // guard, which stops the original itself once it has checked the new
+        // container will see its data, and fingerprints it while it runs.
 
         // Create container with new image (keeping the same volume for data persistence)
         info!("Starting S3/MinIO container with new image");
-        let limits = self.resource_limits.read().await.clone();
+        let limits = upgrade_limits;
         self.create_container(&self.docker, &mut new_s3_config, &limits)
             .await?;
         *self.config.write().await = Some(new_s3_config);

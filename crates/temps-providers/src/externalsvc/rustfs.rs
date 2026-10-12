@@ -599,17 +599,7 @@ impl RustfsService {
         resource_limits: &ServiceResourceLimits,
         require_new: bool,
     ) -> Result<()> {
-        // Pull the image first
-        info!("Pulling RustFS image {}", config.docker_image);
-
-        crate::utils::pull_image_with_retry(docker, &config.docker_image, None)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
-
         let container_name = self.get_container_name();
-        // Add volume names for data and logs
-        let data_volume_name = format!("rustfs_{}_data", self.name);
-        let logs_volume_name = format!("rustfs_{}_logs", self.name);
 
         // Check if container already exists
         let containers = docker
@@ -637,11 +627,15 @@ impl RustfsService {
                     container_name
                 )
             })?;
-            let existing_image = container.image.as_deref().unwrap_or("");
+            // The reference the container was created from; the list API
+            // reports an image ID once the tag has moved to a newer digest.
+            let existing_image = super::recreate_guard::created_image(docker, &container_name)
+                .await
+                .or_else(|| container.image.clone())
+                .unwrap_or_default();
             let is_running =
                 container.state == Some(bollard::models::ContainerSummaryStateEnum::RUNNING);
 
-            // Check if container is running with same image - if so, we're good
             if existing_image == config.docker_image && is_running {
                 info!(
                     "Container {} already exists and is running with same image",
@@ -650,28 +644,125 @@ impl RustfsService {
                 return Ok(());
             }
 
-            // Container exists but is not running or has different image - remove and recreate
+            // A stopped container is replaced so it picks up the current
+            // specification (credentials, ingest keys), as before; now through
+            // the guard, so the replacement must mount the same data.
             info!(
                 "Container {} exists (running: {}, image: {}) but needs to be recreated (requested image: {})",
                 container_name, is_running, existing_image, config.docker_image
             );
-
-            // Stop the container first (ignore errors if already stopped)
-            let _ = docker
-                .stop_container(&container_name, None::<StopContainerOptions>)
-                .await;
-
-            // Remove the container
-            docker
-                .remove_container(
-                    &container_name,
-                    Some(bollard::query_parameters::RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    }),
-                )
-                .await?;
+            let same_image = existing_image == config.docker_image;
+            let operation = if same_image {
+                "applying its current configuration"
+            } else {
+                "changing its image"
+            };
+            match self
+                .recreate_container_guarded(docker, config, resource_limits, operation)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e)
+                    if same_image
+                        && e.downcast_ref::<super::recreate_guard::RecreateGuardError>()
+                            .is_some_and(|g| g.is_refusal()) =>
+                {
+                    // Refreshing the specification is optional; the data is
+                    // not. Start the stopped container as it is.
+                    warn!(
+                        service = %self.name,
+                        container = %container_name,
+                        error = %e,
+                        "Not recreating the RustFS container; starting it unchanged"
+                    );
+                    docker
+                        .start_container(
+                            &container_name,
+                            None::<bollard::query_parameters::StartContainerOptions>,
+                        )
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "Failed to start existing RustFS container '{}': {}",
+                                container_name,
+                                e
+                            )
+                        })?;
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            }
         }
+
+        info!("Pulling RustFS image {}", config.docker_image);
+        crate::utils::pull_image_with_retry(docker, &config.docker_image, None)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        self.create_fresh_container(docker, config, resource_limits, require_new)
+            .await
+    }
+
+    /// The storage a container created by this service mounts, for
+    /// [`recreate_guard`](super::recreate_guard).
+    fn replacement_storage(&self) -> super::recreate_guard::ReplacementStorage {
+        super::recreate_guard::ReplacementStorage {
+            data_dir: "/data".to_string(),
+            mounts: vec![
+                super::recreate_guard::PlannedMount {
+                    volume: format!("rustfs_{}_data", self.name),
+                    target: "/data".to_string(),
+                },
+                super::recreate_guard::PlannedMount {
+                    volume: format!("rustfs_{}_logs", self.name),
+                    target: "/logs".to_string(),
+                },
+            ],
+        }
+    }
+
+    /// Replace this service's existing container with one built from
+    /// `config` through the shared guard (same data volume or refuse; old
+    /// container kept until the new one lists the same buckets).
+    async fn recreate_container_guarded(
+        &self,
+        docker: &Docker,
+        config: &RustfsConfig,
+        resource_limits: &ServiceResourceLimits,
+        operation: &str,
+    ) -> Result<()> {
+        let container_name = self.get_container_name();
+        // Pull while the original still serves.
+        info!("Pulling RustFS image {}", config.docker_image);
+        crate::utils::pull_image_with_retry(docker, &config.docker_image, None)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        super::recreate_guard::recreate_preserving_data(
+            super::recreate_guard::RecreateRequest {
+                docker,
+                engine: super::recreate_guard::ManagedEngine::Rustfs,
+                service_name: &self.name,
+                container_name: &container_name,
+                replacement: self.replacement_storage(),
+                operation,
+            },
+            || self.create_fresh_container(docker, config, resource_limits, false),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Create and start a new container. The caller has made sure no
+    /// container with this name exists.
+    async fn create_fresh_container(
+        &self,
+        docker: &Docker,
+        config: &RustfsConfig,
+        resource_limits: &ServiceResourceLimits,
+        require_new: bool,
+    ) -> Result<()> {
+        let container_name = self.get_container_name();
+        let data_volume_name = format!("rustfs_{}_data", self.name);
+        let logs_volume_name = format!("rustfs_{}_logs", self.name);
 
         if require_new {
             for volume_name in [&data_volume_name, &logs_volume_name] {
@@ -1436,6 +1527,19 @@ pub(crate) fn rustfs_volume_names(name: &str) -> [String; 2] {
 
 #[async_trait]
 impl ExternalService for RustfsService {
+    fn recreate_plan(
+        &self,
+        _service_config: &ServiceConfig,
+    ) -> Option<(
+        super::recreate_guard::ManagedEngine,
+        super::recreate_guard::ReplacementStorage,
+    )> {
+        Some((
+            super::recreate_guard::ManagedEngine::Rustfs,
+            self.replacement_storage(),
+        ))
+    }
+
     fn docker_resource_names(&self) -> Option<super::DockerResourceNames> {
         Some(super::DockerResourceNames {
             containers: vec![rustfs_container_name(&self.name)],
@@ -1470,26 +1574,13 @@ impl ExternalService for RustfsService {
         let config = RustfsConfig::from(input_config);
         let resource_limits = self.resource_limits.read().await.clone();
 
-        let container_name = self.get_container_name();
-
-        let _ = self
-            .docker
-            .stop_container(&container_name, None::<StopContainerOptions>)
-            .await;
-
-        let _ = self
-            .docker
-            .remove_container(
-                &container_name,
-                Some(bollard::query_parameters::RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
-            )
-            .await;
-
-        self.create_container(&self.docker, &config, &resource_limits, false)
-            .await
+        self.recreate_container_guarded(
+            &self.docker,
+            &config,
+            &resource_limits,
+            "applying its metrics ingest key",
+        )
+        .await
     }
 
     /// Upgrade the RustFS container to a new Docker image.
@@ -1500,34 +1591,23 @@ impl ExternalService for RustfsService {
     /// metrics ingest key carried in the new config is re-applied so OTLP push
     /// keeps working after the upgrade.
     async fn upgrade(&self, _old_config: ServiceConfig, new_config: ServiceConfig) -> Result<()> {
+        // The service's own limits: a provider built for this call has
+        // none loaded, and the new container must keep them.
+        let upgrade_limits = ServiceResourceLimits::from_parameters(&new_config.parameters);
         let new_cfg = self.get_rustfs_config(new_config)?;
         info!(
             "Starting RustFS upgrade to image {} for service {}",
             new_cfg.docker_image, self.name
         );
 
-        let resource_limits = self.resource_limits.read().await.clone();
-        let container_name = self.get_container_name();
-
-        // Stop + remove the old container. Volumes survive (not removed here).
-        let _ = self
-            .docker
-            .stop_container(&container_name, None::<StopContainerOptions>)
-            .await;
-        let _ = self
-            .docker
-            .remove_container(
-                &container_name,
-                Some(bollard::query_parameters::RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
-            )
-            .await;
-
-        // create_container pulls the new image and mounts the existing volume.
-        self.create_container(&self.docker, &new_cfg, &resource_limits, false)
-            .await?;
+        let resource_limits = upgrade_limits;
+        self.recreate_container_guarded(
+            &self.docker,
+            &new_cfg,
+            &resource_limits,
+            "changing its image",
+        )
+        .await?;
 
         info!(
             "RustFS upgrade completed successfully for service {}",
