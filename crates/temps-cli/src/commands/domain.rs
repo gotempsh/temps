@@ -1505,7 +1505,23 @@ async fn execute_order_show(cmd: OrderShowCommand) -> anyhow::Result<()> {
         return Err(handle_api_error(response).await);
     }
 
-    let order_resp: AcmeOrderResponse = parse_api_response(response, "GET", &url).await?;
+    // A domain with no order (an active certificate has none) answers 200 with
+    // `null`; that is a state to report, not a decode failure.
+    let order_resp: Option<AcmeOrderResponse> = parse_api_response(response, "GET", &url).await?;
+    let Some(order_resp) = order_resp else {
+        if cmd.json {
+            println!("null");
+        } else {
+            println!();
+            println!(
+                "{} Domain {} has no ACME order.",
+                "ℹ".bright_blue(),
+                cmd.domain_id
+            );
+            println!();
+        }
+        return Ok(());
+    };
 
     if cmd.json {
         println!(
