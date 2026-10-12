@@ -720,7 +720,7 @@ impl LetsEncryptProvider {
                         )
                     };
                     error!("{}", error_msg);
-                    return Err(ProviderError::ChallengeFailed(error_msg));
+                    return Err(ProviderError::OrderInvalid(error_msg));
                 }
                 _ => {
                     if attempt < MAX_ATTEMPTS {
@@ -747,6 +747,31 @@ impl LetsEncryptProvider {
             "Order validation timed out after {} attempts",
             MAX_ATTEMPTS
         )))
+    }
+
+    /// Per-challenge ACME error details (type + detail) of one authorization,
+    /// joined into a single human-readable string; empty when the CA attached
+    /// none.
+    fn authorization_error_detail(
+        identifier: &str,
+        authorization: &instant_acme::AuthorizationState,
+    ) -> String {
+        authorization
+            .challenges
+            .iter()
+            .filter_map(|challenge| {
+                challenge.error.as_ref().map(|err| {
+                    format!(
+                        "[{} {:?}] {}: {}",
+                        identifier,
+                        challenge.r#type,
+                        err.r#type.as_deref().unwrap_or("(no type)"),
+                        err.detail.as_deref().unwrap_or("(no detail)")
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
     }
 
     /// Walk the order's authorizations and collect any per-challenge ACME error
@@ -929,6 +954,26 @@ impl CertificateProvider for LetsEncryptProvider {
                 // Skip authorizations that are already valid (cached validations).
                 if handle.status == AuthorizationStatus::Valid {
                     continue;
+                }
+
+                // Only a pending authorization can still be answered. One the
+                // CA already invalidated (the previous attempt's TXT record
+                // or token was not there) stays invalid, and asking to set its
+                // challenge ready fails with an opaque "Cannot update
+                // challenge with status invalid". Say what happened instead,
+                // and let the caller start a new order.
+                if handle.status != AuthorizationStatus::Pending {
+                    let identifier = handle.identifier().to_string();
+                    let status = handle.status;
+                    let detail = Self::authorization_error_detail(&identifier, &handle);
+                    let message = if detail.is_empty() {
+                        format!(
+                            "Authorization for {identifier} is {status:?}; the certificate authority will not accept another attempt on this order"
+                        )
+                    } else {
+                        format!("Authorization for {identifier} is {status:?}: {detail}")
+                    };
+                    return Err(ProviderError::OrderInvalid(message));
                 }
 
                 let mut challenge =

@@ -68,6 +68,9 @@ fn sorted_domains_query(
         .order_by_asc(domains::Column::Id)
 }
 
+/// `acme_orders.status` once the certificate authority has rejected the order.
+const ORDER_STATUS_INVALID: &str = "invalid";
+
 #[derive(Error, Debug)]
 pub enum DomainServiceError {
     #[error("Database error: {0}")]
@@ -78,6 +81,21 @@ pub enum DomainServiceError {
     InvalidDomain(String),
     #[error("Challenge error: {0}")]
     Challenge(String),
+    /// The domain's previous ACME order was rejected by the certificate
+    /// authority and is final, so it was replaced with a fresh order. For
+    /// DNS-01 the new order has new TXT values that must be published before
+    /// verification can succeed.
+    #[error(
+        "The previous ACME order for {domain} was rejected ({previous_error}) and cannot be \
+         retried. A new {challenge_type} order was created: {instructions}"
+    )]
+    ChallengeRestarted {
+        domain: String,
+        challenge_type: String,
+        previous_error: String,
+        instructions: String,
+        txt_records: Vec<crate::tls::models::DnsTxtRecord>,
+    },
     #[error("TLS error: {0}")]
     Tls(#[from] TlsError),
     #[error("Provider error: {0}")]
@@ -515,9 +533,14 @@ impl DomainService {
 
                 self.repository.save_acme_order(order).await?;
 
-                // Update domain status based on challenge type
+                // Update domain status based on challenge type. A new order
+                // supersedes the failure that made it necessary: the rejected
+                // attempt stays in the renewal-attempt history, but the
+                // domain no longer reports its error as if it were current.
                 let mut domain_active: domains::ActiveModel = domain.into();
                 domain_active.status = Set("challenge_requested".to_string());
+                domain_active.last_error = Set(None);
+                domain_active.last_error_type = Set(None);
 
                 match challenge_data.challenge_type {
                     ChallengeType::Http01 => {
@@ -711,17 +734,82 @@ impl DomainService {
         }
 
         // Find the domain
-        let domain = self.find_domain(target).await?;
+        let mut domain = self.find_domain(target).await?;
         let domain_name_owned = domain.domain.clone();
         let domain_name = domain_name_owned.as_str();
         let domain_id = domain.id;
 
         // Find the ACME order for this domain
-        let order = self.repository.find_acme_order_by_domain(domain.id).await?
+        let mut order = self.repository.find_acme_order_by_domain(domain.id).await?
             .ok_or_else(|| DomainServiceError::Challenge(
                 format!("No ACME order found for domain: {}. Please create an order first using POST /domains/{}/order",
                     domain_name, domain.id)
             ))?;
+
+        // A previous attempt that the CA rejected left its order `invalid`.
+        // That order is final — submitting its challenge again fails with
+        // "Cannot update challenge with status invalid" and the same error
+        // stays on the domain forever — so "retry" means a new order.
+        if order.status == ORDER_STATUS_INVALID {
+            let previous_error = order
+                .error
+                .clone()
+                .or_else(|| domain.last_error.clone())
+                .unwrap_or_else(|| "the challenge was not satisfied".to_string());
+            info!(
+                "ACME order for domain {} is invalid ({}); starting a new order",
+                domain_name, previous_error
+            );
+            // By id: the row this retry started from, even if the hostname is
+            // deleted and recreated while the new order is being requested.
+            let renewed = self
+                .request_challenge_with(DomainLookup::Id(domain_id), user_email, report_telemetry)
+                .await?;
+            if renewed.status == "completed" {
+                // The CA still held a valid authorization, so the certificate
+                // was issued while creating the order.
+                return domains::Entity::find_by_id(domain_id)
+                    .one(self.db.as_ref())
+                    .await?
+                    .ok_or_else(|| DomainServiceError::NotFound(domain_name.to_string()));
+            }
+            if renewed.challenge_type == "dns-01" {
+                // New token, new TXT value: the record published for the
+                // rejected order cannot satisfy this one. Hand the new values
+                // back and let the operator publish them.
+                let record_names: Vec<String> = renewed
+                    .txt_records
+                    .iter()
+                    .map(|record| record.name.clone())
+                    .collect();
+                return Err(DomainServiceError::ChallengeRestarted {
+                    domain: domain_name.to_string(),
+                    challenge_type: renewed.challenge_type,
+                    previous_error,
+                    instructions: format!(
+                        "publish the new TXT record value(s) for {} and verify again",
+                        record_names.join(", ")
+                    ),
+                    txt_records: renewed.txt_records,
+                });
+            }
+            // HTTP-01 needs nothing from the operator: Temps serves the new
+            // token itself, so carry on and verify the fresh order now.
+            domain = domains::Entity::find_by_id(domain_id)
+                .one(self.db.as_ref())
+                .await?
+                .ok_or_else(|| DomainServiceError::NotFound(domain_name.to_string()))?;
+            order = self
+                .repository
+                .find_acme_order_by_domain(domain_id)
+                .await?
+                .ok_or_else(|| {
+                    DomainServiceError::Challenge(format!(
+                        "No ACME order found for domain: {} after starting a new order",
+                        domain_name
+                    ))
+                })?;
+        }
         let retain_order_for_dns_cleanup = has_pending_dns_cleanup(order.authorizations.as_ref());
 
         // Check if order is in a valid state
@@ -903,6 +991,27 @@ impl DomainService {
                          valid; keeping it served as '{}'. Operator action needed before expiry.",
                         domain_name, fallback_status
                     );
+                }
+
+                // The CA rejecting the order is final for that order. Record it on
+                // the order itself so every reader — the order endpoint and the
+                // retry path above — sees `invalid` plus the reason, instead of a
+                // `pending` order that can never succeed.
+                if matches!(e, crate::tls::ProviderError::OrderInvalid(_)) {
+                    if let Err(update_err) = self
+                        .repository
+                        .update_acme_order_status(
+                            &order.order_url,
+                            ORDER_STATUS_INVALID,
+                            Some(e.to_string()),
+                        )
+                        .await
+                    {
+                        error!(
+                            "Failed to mark ACME order {} invalid for domain {}: {}",
+                            order.order_url, domain_name, update_err
+                        );
+                    }
                 }
 
                 // Persist the error so the failure is visible, and actually write it —
@@ -2098,6 +2207,278 @@ mod tests {
         // Return the TestDatabase guard so the caller keeps it alive for the whole
         // test; its Drop reaps the dedicated schema afterwards.
         Some((service, db, test_db))
+    }
+
+    // ── Retrying a challenge the CA rejected ─────────────────────────
+
+    /// Provider that issues a fresh order (new token, new TXT value) on every
+    /// `provision` and answers `complete_challenge` from a script. It records
+    /// which order URL each completion was attempted against, so a test can
+    /// prove an invalidated order is never submitted again.
+    struct ScriptedAcmeProvider {
+        orders_created: std::sync::atomic::AtomicUsize,
+        script: std::sync::Mutex<std::collections::VecDeque<Result<(), String>>>,
+        completed_order_urls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl ScriptedAcmeProvider {
+        fn new(script: Vec<Result<(), String>>) -> Self {
+            Self {
+                orders_created: std::sync::atomic::AtomicUsize::new(0),
+                script: std::sync::Mutex::new(script.into()),
+                completed_order_urls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn completed(&self) -> Vec<String> {
+            self.completed_order_urls
+                .lock()
+                .expect("not poisoned")
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CertificateProvider for Arc<ScriptedAcmeProvider> {
+        async fn provision(
+            &self,
+            domain: &str,
+            challenge: ChallengeType,
+            _email: &str,
+        ) -> Result<ProvisioningResult, crate::tls::ProviderError> {
+            let n = self
+                .orders_created
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            let records = match challenge {
+                ChallengeType::Dns01 => vec![crate::tls::models::DnsTxtRecord {
+                    name: format!("_acme-challenge.{domain}"),
+                    value: format!("txt-value-for-order-{n}"),
+                    validation_url: format!("https://acme.test/chall/{n}"),
+                }],
+                ChallengeType::Http01 => vec![],
+            };
+            Ok(ProvisioningResult::Challenge(
+                crate::tls::models::ChallengeData {
+                    challenge_type: challenge,
+                    domain: domain.to_string(),
+                    token: format!("token-{n}"),
+                    key_authorization: format!("token-{n}.thumbprint"),
+                    validation_url: Some(format!("https://acme.test/chall/{n}")),
+                    dns_txt_records: records,
+                    order_url: Some(format!("https://acme.test/order/{n}")),
+                },
+            ))
+        }
+
+        async fn complete_challenge(
+            &self,
+            domain: &str,
+            challenge_data: &crate::tls::models::ChallengeData,
+            _email: &str,
+        ) -> Result<crate::tls::models::Certificate, crate::tls::ProviderError> {
+            self.completed_order_urls
+                .lock()
+                .expect("not poisoned")
+                .push(challenge_data.order_url.clone().unwrap_or_default());
+            let next = self
+                .script
+                .lock()
+                .expect("not poisoned")
+                .pop_front()
+                .unwrap_or(Ok(()));
+            match next {
+                Ok(()) => Ok(mock_certificate(domain)),
+                Err(reason) => Err(crate::tls::ProviderError::OrderInvalid(reason)),
+            }
+        }
+
+        fn supported_challenges(&self) -> Vec<ChallengeType> {
+            vec![ChallengeType::Http01, ChallengeType::Dns01]
+        }
+
+        async fn validate_prerequisites(
+            &self,
+            _domain: &str,
+            _email: &str,
+        ) -> Result<crate::tls::models::ValidationResult, crate::tls::ProviderError> {
+            Ok(crate::tls::models::ValidationResult {
+                is_valid: true,
+                errors: vec![],
+                warnings: vec![],
+            })
+        }
+
+        async fn cancel_order(&self, _domain: &str) -> Result<(), crate::tls::ProviderError> {
+            Ok(())
+        }
+    }
+
+    async fn scripted_service(
+        script: Vec<Result<(), String>>,
+    ) -> Option<(
+        DomainService,
+        Arc<ScriptedAcmeProvider>,
+        temps_database::test_utils::TestDatabase,
+    )> {
+        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping ACME retry test: {e}");
+                return None;
+            }
+        };
+        let encryption_service = Arc::new(
+            EncryptionService::new(
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .unwrap(),
+        );
+        let repository = Arc::new(crate::tls::repository::DefaultCertificateRepository::new(
+            test_db.db.clone(),
+            encryption_service.clone(),
+        ));
+        let provider = Arc::new(ScriptedAcmeProvider::new(script));
+        let service = DomainService::new(
+            test_db.db.clone(),
+            Arc::new(provider.clone()),
+            repository,
+            encryption_service,
+        );
+        Some((service, provider, test_db))
+    }
+
+    const REJECTED: &str = "Authorization for example is Invalid: [example Dns01] \
+        urn:ietf:params:acme:error:unauthorized: no TXT record found";
+
+    /// A DNS-01 verification that the CA rejects must leave the order
+    /// `invalid` (with the error) and the domain `failed`. Retrying must then
+    /// create a NEW order — never resubmit the invalidated one — and hand back
+    /// the new TXT value to publish.
+    #[tokio::test]
+    async fn dns01_retry_after_rejection_creates_a_new_order_with_new_records() {
+        let Some((service, provider, test_db)) =
+            scripted_service(vec![Err(REJECTED.to_string())]).await
+        else {
+            return;
+        };
+        let domain = service
+            .create_domain("retry.example.test", "dns-01")
+            .await
+            .unwrap();
+        let first = service
+            .request_challenge(&domain.domain, "ops@example.test")
+            .await
+            .unwrap();
+
+        // 1st verification: the CA rejects the challenge.
+        let rejected = service
+            .complete_challenge(&domain.domain, "ops@example.test")
+            .await;
+        assert!(rejected.is_err());
+
+        let after_failure = domains::Entity::find_by_id(domain.id)
+            .one(test_db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_failure.status, "failed");
+        assert!(after_failure
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("no TXT record found"));
+        let failed_order = service
+            .get_challenge_status(&domain.domain)
+            .await
+            .unwrap()
+            .expect("the rejected order is retained for inspection");
+        assert_eq!(failed_order.status, "invalid");
+
+        // Retry: a new order with new TXT records, not the old one resubmitted.
+        let retry = service
+            .complete_challenge(&domain.domain, "ops@example.test")
+            .await
+            .expect_err("the operator must publish the new TXT value first");
+        let DomainServiceError::ChallengeRestarted {
+            txt_records,
+            previous_error,
+            ..
+        } = retry
+        else {
+            panic!("expected ChallengeRestarted, got {retry:?}");
+        };
+        assert_eq!(txt_records.len(), 1);
+        assert_ne!(
+            txt_records[0].value, first.txt_records[0].value,
+            "a new order has a new TXT value"
+        );
+        assert!(previous_error.contains("no TXT record found"));
+
+        assert_eq!(
+            provider.completed(),
+            vec!["https://acme.test/order/1".to_string()],
+            "the invalidated order must not be submitted again"
+        );
+        let renewed = domains::Entity::find_by_id(domain.id)
+            .one(test_db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(renewed.status, "challenge_requested");
+        assert!(renewed.last_error.is_none(), "stale error must be cleared");
+        let new_order = service
+            .get_challenge_status(&domain.domain)
+            .await
+            .unwrap()
+            .expect("a fresh order exists");
+        assert_eq!(new_order.status, "pending");
+        assert_eq!(new_order.txt_records[0].value, txt_records[0].value);
+    }
+
+    /// HTTP-01 needs nothing from the operator, so a retry after a rejection
+    /// starts a new order and verifies it in the same call.
+    #[tokio::test]
+    async fn http01_retry_after_rejection_creates_and_verifies_a_new_order() {
+        let Some((service, provider, test_db)) =
+            scripted_service(vec![Err(REJECTED.to_string()), Ok(())]).await
+        else {
+            return;
+        };
+        let domain = service
+            .create_domain("retry-http.example.test", "http-01")
+            .await
+            .unwrap();
+        service
+            .request_challenge(&domain.domain, "ops@example.test")
+            .await
+            .unwrap();
+        assert!(service
+            .complete_challenge(&domain.domain, "ops@example.test")
+            .await
+            .is_err());
+
+        let issued = service
+            .complete_challenge(&domain.domain, "ops@example.test")
+            .await
+            .expect("the retry should verify a fresh order");
+
+        assert_eq!(issued.status, "active");
+        assert!(issued.last_error.is_none());
+        assert_eq!(
+            provider.completed(),
+            vec![
+                "https://acme.test/order/1".to_string(),
+                "https://acme.test/order/2".to_string()
+            ],
+            "the second attempt is against the NEW order"
+        );
+        let stored = domains::Entity::find_by_id(domain.id)
+            .one(test_db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, "active");
     }
 
     #[tokio::test]
