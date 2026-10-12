@@ -580,17 +580,31 @@ impl PublicStatusPageService {
         Ok(())
     }
 
-    async fn public_base_url(&self) -> String {
-        match self.config_service.get_public_ingress_url().await {
-            Ok(url) => url.trim_end_matches('/').to_string(),
+    /// Base URL the page's public links are built on, and whether it came from
+    /// the operator's configuration.
+    ///
+    /// `public_ingress_url` / `external_url` when set. When neither is, the
+    /// effective ingress URL is the built-in `http://localho.st` default, which
+    /// has no port and does not reach this server — links built on it 404.
+    /// The console origin is always reachable from wherever the console is, so
+    /// use it, and say it is a fallback so the UI can point at the setting.
+    async fn public_base(&self) -> PublicBase {
+        let configured = match self.config_service.get_settings().await {
+            Ok(settings) => settings.configured_public_ingress_url(),
             Err(e) => {
                 warn!(
                     error = %e,
-                    "could not read the public ingress URL; status page URLs are shown relative"
+                    "could not read the public URL settings; status page URLs fall back to the console origin"
                 );
-                String::new()
+                None
             }
-        }
+        };
+        let console_address = self
+            .config_service
+            .get_server_config()
+            .console_address
+            .clone();
+        public_base_from(configured, &console_address)
     }
 
     async fn to_response(
@@ -639,12 +653,20 @@ impl PublicStatusPageService {
                 });
         }
 
-        let base = self.public_base_url().await;
+        let base = self.public_base().await;
+        let base_url = base.url;
+        let url_configured = base.configured;
         Ok(models
             .into_iter()
             .map(|model| StatusPageResponse {
-                public_url: format!("{base}/api/status/{}", model.slug),
-                public_json_url: format!("{base}/api/status/{}/summary.json", model.slug),
+                public_url: format!("{base_url}/api/status/{}", model.slug),
+                public_json_url: format!("{base_url}/api/status/{}/summary.json", model.slug),
+                public_url_configured: url_configured,
+                public_url_setup_path: if url_configured {
+                    None
+                } else {
+                    Some(PUBLIC_URL_SETTINGS_PATH.to_string())
+                },
                 monitors: by_page.remove(&model.id).unwrap_or_default(),
                 id: model.id,
                 project_id: model.project_id,
@@ -658,6 +680,51 @@ impl PublicStatusPageService {
             })
             .collect())
     }
+}
+
+/// Console path where the public URL is configured.
+const PUBLIC_URL_SETTINGS_PATH: &str = "/settings";
+
+/// The base public links are built on (see [`PublicStatusPageService::public_base`]).
+#[derive(Debug, PartialEq, Eq)]
+struct PublicBase {
+    url: String,
+    /// `false` when no public/external URL is configured and `url` is the
+    /// console origin fallback.
+    configured: bool,
+}
+
+/// Choose the base URL: the configured one, else the console origin.
+fn public_base_from(configured: Option<String>, console_address: &str) -> PublicBase {
+    match configured {
+        Some(url) => PublicBase {
+            url: url.trim_end_matches('/').to_string(),
+            configured: true,
+        },
+        None => PublicBase {
+            url: console_origin(console_address),
+            configured: false,
+        },
+    }
+}
+
+/// `http://host:port` for a listener address, with wildcard binds mapped to
+/// `localhost` (a browser cannot connect to `0.0.0.0`).
+fn console_origin(console_address: &str) -> String {
+    let address = console_address.trim();
+    let address = address
+        .strip_prefix("http://")
+        .or_else(|| address.strip_prefix("https://"))
+        .unwrap_or(address)
+        .trim_end_matches('/');
+    let address = if let Some(port) = address.strip_prefix("0.0.0.0:") {
+        format!("localhost:{port}")
+    } else if let Some(port) = address.strip_prefix("[::]:") {
+        format!("localhost:{port}")
+    } else {
+        address.to_string()
+    };
+    format!("http://{address}")
 }
 
 #[async_trait::async_trait]
@@ -686,6 +753,41 @@ impl temps_core::ProjectDeletionHook for PublicStatusPageService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// With no public/external URL configured the links used to be built on
+    /// the port-less `http://localho.st` default, which 404s. They now use the
+    /// console origin and report that the URL is not configured.
+    #[test]
+    fn unconfigured_public_url_falls_back_to_the_console_origin() {
+        let base = public_base_from(None, "127.0.0.1:8000");
+        assert_eq!(
+            base,
+            PublicBase {
+                url: "http://127.0.0.1:8000".to_string(),
+                configured: false
+            }
+        );
+    }
+
+    #[test]
+    fn configured_public_url_is_used_as_is_without_a_trailing_slash() {
+        let base = public_base_from(
+            Some("https://status.example.test/".to_string()),
+            "127.0.0.1:8000",
+        );
+        assert_eq!(base.url, "https://status.example.test");
+        assert!(base.configured);
+    }
+
+    #[test]
+    fn wildcard_console_binds_are_not_handed_out_as_urls() {
+        assert_eq!(console_origin("0.0.0.0:8000"), "http://localhost:8000");
+        assert_eq!(console_origin("[::]:8000"), "http://localhost:8000");
+        assert_eq!(
+            console_origin("http://10.0.0.5:8000/"),
+            "http://10.0.0.5:8000"
+        );
+    }
 
     #[test]
     fn generated_slugs_are_128_bit_hex_and_distinct() {

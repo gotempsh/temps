@@ -89,6 +89,13 @@ pub struct StatusPageResponse {
     pub public_url: String,
     /// Machine-readable form of the public page.
     pub public_json_url: String,
+    /// `false` when no public or external URL is configured: `public_url` is
+    /// then the console origin, which only works from where the console is
+    /// reachable. Configure a public URL so customers can open the page.
+    pub public_url_configured: bool,
+    /// Console path where the public URL is configured; set only while
+    /// `public_url_configured` is `false`.
+    pub public_url_setup_path: Option<String>,
     pub monitors: Vec<StatusPageMonitorResponse>,
     #[schema(value_type = Option<String>, format = "date-time")]
     pub published_at: Option<UtcDateTime>,
