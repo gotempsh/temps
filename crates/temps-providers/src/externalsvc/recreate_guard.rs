@@ -1087,19 +1087,47 @@ impl Drop for PendingRollback {
     }
 }
 
-/// Wait until container `id` is no longer running, at most
-/// [`ABANDONED_STOP_GRACE`]: the length of a stop request, after which
-/// Docker has killed the container.
+/// Whether one inspect of the original shows that the stop an abandoned
+/// recreate asked for has landed: it reports `running: false`, or the
+/// container is gone. A failed or unclear inspect says nothing: the stop
+/// may still be in flight, and restarting under it would leave the original
+/// stopped when it lands.
+fn abandoned_stop_has_landed(
+    inspected: &Result<ContainerInspectResponse, bollard::errors::Error>,
+) -> bool {
+    match inspected {
+        Ok(container) => {
+            matches!(
+                container.state.as_ref().and_then(|s| s.running),
+                Some(false)
+            )
+        }
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => true,
+        Err(_) => false,
+    }
+}
+
+/// Wait until the stop of container `id` that an abandoned recreate asked
+/// for has landed, at most [`ABANDONED_STOP_GRACE`]: the length of a stop
+/// request, after which Docker has killed the container. An inspect that
+/// fails is retried until then rather than taken as "stopped".
 async fn wait_until_stopped(docker: &Docker, id: &str) {
     let deadline = std::time::Instant::now() + ABANDONED_STOP_GRACE;
     while std::time::Instant::now() < deadline {
-        match docker
+        let inspected = docker
             .inspect_container(id, None::<InspectContainerOptions>)
-            .await
-        {
-            Ok(c) if c.state.as_ref().and_then(|s| s.running).unwrap_or(false) => {}
-            // Stopped, or gone: nothing is in flight any more.
-            _ => return,
+            .await;
+        if abandoned_stop_has_landed(&inspected) {
+            return;
+        }
+        if let Err(e) = &inspected {
+            warn!(
+                container_id = id,
+                error = %e,
+                "Could not inspect the original while waiting for an abandoned stop; retrying"
+            );
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
@@ -2457,6 +2485,40 @@ mod tests {
             &["/var/lib/postgresql/tablespaces/ts1".to_string()],
         )
         .is_err());
+    }
+
+    #[test]
+    fn an_abandoned_stop_has_landed_only_when_the_inspect_says_so() {
+        let inspect = |running: Option<bool>| -> Result<ContainerInspectResponse, _> {
+            Ok(ContainerInspectResponse {
+                state: Some(bollard::models::ContainerState {
+                    running,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+        };
+        assert!(abandoned_stop_has_landed(&inspect(Some(false))));
+        assert!(!abandoned_stop_has_landed(&inspect(Some(true))));
+        // No state to read: not evidence of anything.
+        assert!(!abandoned_stop_has_landed(&inspect(None)));
+        assert!(!abandoned_stop_has_landed(&Ok(
+            ContainerInspectResponse::default()
+        )));
+        // Gone for good: nothing is in flight.
+        assert!(abandoned_stop_has_landed(&Err(
+            bollard::errors::Error::DockerResponseServerError {
+                status_code: 404,
+                message: "no such container".into(),
+            }
+        )));
+        // A daemon hiccup must not end the wait.
+        assert!(!abandoned_stop_has_landed(&Err(
+            bollard::errors::Error::DockerResponseServerError {
+                status_code: 500,
+                message: "daemon busy".into(),
+            }
+        )));
     }
 
     #[test]
