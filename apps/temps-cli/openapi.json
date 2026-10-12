@@ -22616,6 +22616,37 @@
         ],
         "type": "object"
       },
+      "ExternalServiceBackupPreflightResponse": {
+        "description": "What running a backup of this service now would do, so a client can warn\nbefore starting it.",
+        "properties": {
+          "engine": {
+            "description": "Engine that would run the backup (e.g. \"postgres_walg\").",
+            "example": "postgres_walg",
+            "type": "string"
+          },
+          "reason": {
+            "description": "Why, when `restarts_database` is true.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "restarts_database": {
+            "description": "The backup restarts the database (PostgreSQL with WAL archiving off).\nSend `confirm_restart: true` to run it.",
+            "type": "boolean"
+          },
+          "service_id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "service_id",
+          "engine",
+          "restarts_database"
+        ],
+        "type": "object"
+      },
       "ExternalServiceBackupResponse": {
         "description": "Response type for external service backup",
         "properties": {
@@ -22664,6 +22695,13 @@
             "type": "integer"
           },
           "metadata": {},
+          "restarts_database": {
+            "description": "Set on the response to a manual run: this backup restarts the\ndatabase to turn WAL archiving on before backing it up.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "s3_location": {
             "type": "string"
           },
@@ -44502,6 +44540,13 @@
           "limits": {
             "$ref": "#/components/schemas/ServiceResourceLimits",
             "description": "The limits that were persisted to the encrypted config."
+          },
+          "shm_not_applied": {
+            "description": "Set when a new `/dev/shm` size was saved but could not be applied,\nbecause that needs a new container and replacing it was refused or\nfailed (the reason says which, and that no data was changed).",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -45632,6 +45677,13 @@
             "example": "full",
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "confirm_restart": {
+            "description": "Acknowledge that this backup restarts the database. Required (`true`)\nwhen `GET /backups/external-services/{id}/run-preflight` reports\n`restarts_database`; otherwise the request is refused with a 409 and\nnothing is started.",
+            "type": [
+              "boolean",
               "null"
             ]
           },
@@ -72291,6 +72343,16 @@
             },
             "description": "External service or S3 source not found"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The backup would restart the database and `confirm_restart` was not true (error_code RESTART_CONFIRMATION_REQUIRED); nothing was started"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -72308,6 +72370,84 @@
           }
         ],
         "summary": "Run a backup for an external service manually.",
+        "tags": [
+          "Backups"
+        ]
+      }
+    },
+    "/backups/external-services/{id}/run-preflight": {
+      "get": {
+        "operationId": "external_service_backup_preflight",
+        "parameters": [
+          {
+            "description": "External service ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExternalServiceBackupPreflightResponse"
+                }
+              }
+            },
+            "description": "What a backup run would do"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "External service not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Report what running a backup of this external service now would do —\nin particular whether it restarts the database — without starting it.",
         "tags": [
           "Backups"
         ]
