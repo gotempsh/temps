@@ -84,6 +84,24 @@ export function isEchoOfOwnEdit(
   return value === emitted
 }
 
+/**
+ * What the box should show once the parent has answered this field's own
+ * edit, or `null` to leave it alone.
+ *
+ * This has to be decided after the edit even when the parent's value did not
+ * change: a field whose parent clamps to 50 holds 50 already, so typing "500"
+ * produces no prop change and a change-driven sync never runs, leaving "500"
+ * on screen while the app uses 50.
+ */
+export function textAfterOwnEdit(
+  text: string,
+  emitted: number | undefined,
+  value: number | null | undefined
+): string | null {
+  if (isEchoOfOwnEdit(emitted, value)) return null
+  return shouldResyncNumericText(text, value) ? formatNumericText(value) : null
+}
+
 export interface NumericRules {
   min?: number
   max?: number

@@ -8,6 +8,7 @@ import {
   formatNumericText,
   parseNumericText,
   isEchoOfOwnEdit,
+  textAfterOwnEdit,
   shouldResyncNumericText,
   validateNumeric,
 } from './numeric-input'
@@ -159,5 +160,27 @@ describe('isEchoOfOwnEdit', () => {
   test('a different number is the parent overriding the edit', () => {
     expect(isEchoOfOwnEdit(100, 50)).toBe(false)
     expect(isEchoOfOwnEdit(-5, undefined)).toBe(false)
+  })
+})
+
+describe('textAfterOwnEdit', () => {
+  test('shows the clamped value even though the parent value did not change', () => {
+    // contextLines is 50; the user types "500"; the parent keeps 50.
+    expect(textAfterOwnEdit('500', 500, 50)).toBe('50')
+  })
+
+  test('shows an emptied field when the parent turned the edit into "no value"', () => {
+    expect(textAfterOwnEdit('-5', -5, undefined)).toBe('')
+  })
+
+  test('leaves text alone when the parent accepted the edit', () => {
+    expect(textAfterOwnEdit('42', 42, 42)).toBeNull()
+    expect(textAfterOwnEdit('042', 42, 42)).toBeNull()
+    expect(textAfterOwnEdit('4', 4, 4)).toBeNull()
+  })
+
+  test('leaves an emptied field empty whatever the form falls back to', () => {
+    expect(textAfterOwnEdit('', undefined, 60)).toBeNull()
+    expect(textAfterOwnEdit('', undefined, undefined)).toBeNull()
   })
 })

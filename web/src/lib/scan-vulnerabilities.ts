@@ -49,7 +49,22 @@ export function findScanVulnerability(
 export const SCAN_VULNERABILITIES_PAGE_SIZE = 100
 
 /** Upper bound on pages walked, so a malformed `total` cannot loop forever. */
-const MAX_VULNERABILITY_PAGES = 200
+export const MAX_VULNERABILITY_PAGES = 200
+
+/**
+ * The walk gave up before reaching the end of the scan's findings. This is
+ * not "the finding does not exist": the answer is unknown.
+ */
+export class VulnerabilitySearchIncompleteError extends Error {
+  readonly pagesSearched: number
+  constructor(vulnId: string, pagesSearched: number) {
+    super(
+      `Vulnerability ${vulnId} was not found in the first ${pagesSearched} pages of this scan's findings, and the list is longer. Try again, or open it from the scan's list.`
+    )
+    this.name = 'VulnerabilitySearchIncompleteError'
+    this.pagesSearched = pagesSearched
+  }
+}
 
 function envelopeTotal(response: unknown): number | undefined {
   if (response && typeof response === 'object' && 'total' in response) {
@@ -64,31 +79,47 @@ function envelopeTotal(response: unknown): number | undefined {
  * ends. A scan can have far more findings than one page holds, so searching
  * only the first page reports a real finding as "not found".
  *
- * `fetchPage` takes a 1-based page number and returns the raw envelope. A
- * non-numeric `vulnId` resolves to `undefined` without fetching anything.
+ * Resolves `undefined` only when the end of the list was reached without the
+ * finding (or the id is not a number, which fetches nothing). If the walk is
+ * stopped by `maxPages` it rejects with `VulnerabilitySearchIncompleteError`
+ * instead of claiming the finding is absent.
+ *
+ * The end is decided from the findings actually received, not from the
+ * requested page size: a server that returns shorter pages than asked for
+ * must not end the walk early. `signal` stops the walk before the next page
+ * is requested.
  */
 export async function findVulnerabilityInPages({
   vulnId,
   fetchPage,
+  signal,
   pageSize = SCAN_VULNERABILITIES_PAGE_SIZE,
+  maxPages = MAX_VULNERABILITY_PAGES,
 }: {
   vulnId: string | undefined
-  fetchPage: (page: number) => Promise<unknown>
+  /** `page` is 1-based; `signal` is the walk's cancellation signal. */
+  fetchPage: (page: number, signal?: AbortSignal) => Promise<unknown>
+  signal?: AbortSignal
   pageSize?: number
+  maxPages?: number
 }): Promise<VulnerabilityResponse | undefined> {
   if (!vulnId || !/^\d+$/.test(vulnId)) return undefined
-  for (let page = 1; page <= MAX_VULNERABILITY_PAGES; page++) {
-    const response = await fetchPage(page)
+  let received = 0
+  for (let page = 1; page <= maxPages; page++) {
+    signal?.throwIfAborted()
+    const response = await fetchPage(page, signal)
     const rows = scanVulnerabilities(response)
     const found = findScanVulnerability(rows, vulnId)
     if (found) return found
+    received += rows.length
     const total = envelopeTotal(response)
+    // Without a total, a page shorter than requested is the only end signal.
     const reachedEnd =
-      rows.length < pageSize ||
-      (total !== undefined && page * pageSize >= total)
+      rows.length === 0 ||
+      (total !== undefined ? received >= total : rows.length < pageSize)
     if (reachedEnd) return undefined
   }
-  return undefined
+  throw new VulnerabilitySearchIncompleteError(vulnId, maxPages)
 }
 
 /**

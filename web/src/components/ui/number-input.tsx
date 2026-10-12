@@ -8,6 +8,7 @@ import {
   committedNumber,
   formatNumericText,
   isEchoOfOwnEdit,
+  textAfterOwnEdit,
   shouldResyncNumericText,
   validateNumeric,
   type NumericRules,
@@ -74,8 +75,18 @@ const NumberInput = React.forwardRef<HTMLInputElement, NumberInputProps>(
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [value])
 
+    // After every render this field's own edit caused: show what the parent
+    // decided, including when it decided to keep its value (a clamp that
+    // lands where it already was), which no change in `value` reports.
+    // It cannot loop: the edit is cleared first, so the render `setText`
+    // causes finds nothing to reconcile.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     React.useEffect(() => {
+      const edit = ownEdit.current
       ownEdit.current = null
+      if (edit === null) return
+      const shown = textAfterOwnEdit(text, edit.emitted, value)
+      if (shown !== null) setText(shown)
     })
 
     const message = validateNumeric(value, {

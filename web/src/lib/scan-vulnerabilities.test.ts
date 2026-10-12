@@ -4,6 +4,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   findScanVulnerability,
   findVulnerabilityInPages,
+  VulnerabilitySearchIncompleteError,
   scanVulnerabilities,
   vulnerabilityDetailState,
 } from './scan-vulnerabilities'
@@ -189,5 +190,74 @@ describe('findVulnerabilityInPages', () => {
     await expect(
       findVulnerabilityInPages({ vulnId: '150', fetchPage: failing })
     ).rejects.toThrow('boom')
+  })
+
+  test('a server that returns shorter pages than asked for does not end the walk', async () => {
+    // Asked for 100 per page, served 40: only `total` says there is more.
+    const calls: number[] = []
+    const found = await findVulnerabilityInPages({
+      vulnId: '200',
+      fetchPage: async (page) => {
+        calls.push(page)
+        return {
+          data: all.slice((page - 1) * 40, page * 40),
+          total: all.length,
+          page,
+          page_size: 40,
+        }
+      },
+    })
+    expect(found?.id).toBe(200)
+    expect(calls).toEqual([1, 2, 3, 4, 5])
+  })
+
+  test('without a total, a page shorter than requested ends the walk', async () => {
+    const calls: number[] = []
+    const found = await findVulnerabilityInPages({
+      vulnId: '999',
+      pageSize: 100,
+      fetchPage: async (page) => {
+        calls.push(page)
+        return { data: all.slice((page - 1) * 100, page * 100) }
+      },
+    })
+    expect(found).toBeUndefined()
+    expect(calls).toEqual([1, 2, 3])
+  })
+
+  test('giving up at the page limit is an incomplete search, not "not found"', async () => {
+    const big = async (page: number) => ({
+      data: Array.from({ length: 100 }, (_, i) => makeRow(page * 1000 + i)),
+      total: 1_000_000,
+      page,
+      page_size: 100,
+    })
+    const search = findVulnerabilityInPages({
+      vulnId: '5',
+      fetchPage: big,
+      maxPages: 3,
+    })
+    await expect(search).rejects.toBeInstanceOf(
+      VulnerabilitySearchIncompleteError
+    )
+    await expect(search).rejects.toThrow('first 3 pages')
+  })
+
+  test('stops before requesting another page once cancelled', async () => {
+    const controller = new AbortController()
+    const calls: number[] = []
+    const search = findVulnerabilityInPages({
+      vulnId: '9999',
+      signal: controller.signal,
+      fetchPage: async (page, signal) => {
+        calls.push(page)
+        // The user leaves the page while the second request is in flight.
+        if (page === 2) controller.abort()
+        expect(signal).toBe(controller.signal)
+        return { data: all.slice((page - 1) * 100, page * 100), total: 250 }
+      },
+    })
+    await expect(search).rejects.toThrow()
+    expect(calls).toEqual([1, 2])
   })
 })
