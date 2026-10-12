@@ -5724,6 +5724,10 @@ impl ConversationService {
                 }
                 if let Ok(mut stream) = salvage {
                     let mut salvage_text = String::new();
+                    // The closing call is itself a provider stream. Text that
+                    // arrived before it broke off is another fragment, not the
+                    // recovered answer.
+                    let mut salvage_stream_failed = false;
                     let mut authorization_check = tokio::time::interval(Duration::from_secs(1));
                     authorization_check
                         .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -5802,14 +5806,30 @@ impl ConversationService {
                                     Ok(ChatStreamEvent::ContextUsage(usage)),
                                 );
                             }
-                            _ => {}
+                            Err(error) => {
+                                tracing::warn!(
+                                    conversation_id = conv_id,
+                                    %error,
+                                    "salvage stream failed"
+                                );
+                                remember_provider_error(
+                                    &mut last_provider_error,
+                                    error.to_string(),
+                                );
+                                salvage_stream_failed = true;
+                                break;
+                            }
+                            Ok(_) => {}
                         }
                     }
                     if !salvage_text.is_empty() {
                         parts.push(serde_json::json!({ "type": "text", "text": salvage_text }));
-                        // The tool-free closing call produced an answer, so a
-                        // reply that broke off earlier was recovered.
-                        provider_stream_failed = false;
+                        // A closing call that produced an answer and finished
+                        // recovers a reply that broke off earlier. One that
+                        // broke off itself does not.
+                        if !salvage_stream_failed {
+                            provider_stream_failed = false;
+                        }
                     }
                 }
             }
@@ -9544,6 +9564,54 @@ mod tests {
         }
     }
 
+    /// A native tool call breaks the first stream; the closing (salvage) call
+    /// then sends some text and breaks off as well.
+    struct NativeToolThenBrokenSalvageAi {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl AiService for NativeToolThenBrokenSalvageAi {
+        async fn is_available(&self) -> bool {
+            true
+        }
+
+        async fn complete(&self, _request: AiRequest) -> Result<AiResponse, AiError> {
+            Err(AiError::NotAvailable)
+        }
+
+        async fn chat_stream(&self, _request: ChatTurnRequest) -> Result<TokenStream, AiError> {
+            Err(AiError::NotAvailable)
+        }
+
+        async fn chat_stream_turn(
+            &self,
+            _request: ChatTurnRequest,
+        ) -> Result<ChatTurnStream, AiError> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let stream = async_stream::stream! {
+                if call == 0 {
+                    yield Ok(ChatStreamDelta::ToolCall(ToolCall {
+                        id: "native-1".to_string(),
+                        name: "Bash".to_string(),
+                        arguments: r#"{"command":"pwd"}"#.to_string(),
+                    }));
+                    yield Err(AiError::Provider {
+                        purpose: "chat.application.tools".to_string(),
+                        reason: "first stream dropped".to_string(),
+                    });
+                } else {
+                    yield Ok(ChatStreamDelta::Text("The directory is".to_string()));
+                    yield Err(AiError::Provider {
+                        purpose: "chat.application.tools.final".to_string(),
+                        reason: "salvage stream dropped".to_string(),
+                    });
+                }
+            };
+            Ok(Box::pin(stream))
+        }
+    }
+
     struct NativeToolThenErrorAi {
         calls: std::sync::atomic::AtomicUsize,
     }
@@ -9942,6 +10010,61 @@ mod tests {
         let message = errors[0].to_string();
         assert!(message.contains("cut off"), "{message}");
         assert!(message.contains("terminal chunk"), "{message}");
+    }
+
+    /// The closing call can break off after sending some text too. That text
+    /// is a second fragment: the turn must stay failed, not be marked complete
+    /// because "some answer arrived".
+    #[tokio::test]
+    async fn salvage_stream_that_breaks_off_does_not_recover_the_turn() {
+        let ai: Arc<dyn AiService> = Arc::new(NativeToolThenBrokenSalvageAi {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let (svc, tools, auth) = service_with_current_tool_auth(ai);
+        let mut conversation = test_conversation();
+        conversation.context_type = "application".to_string();
+        conversation.ai_provider = "claude_cli".to_string();
+        conversation.ai_permission_mode = "default".to_string();
+        let mut stream = svc
+            .try_tool_loop_in_workspace(
+                &conversation,
+                vec![],
+                None,
+                tools,
+                &auth,
+                &test_request_metadata(),
+                None,
+                Vec::new(),
+                Some(temps_ai::HarnessWorkspace {
+                    sandbox_label: "app_test".to_string(),
+                    host_work_dir: std::path::PathBuf::from("/tmp/app_test"),
+                }),
+                temps_ai::SensitiveEnvironment::default(),
+                Vec::new(),
+                None,
+                false,
+                None,
+            )
+            .await;
+
+        let mut tokens = String::new();
+        let mut errors = Vec::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(ChatStreamEvent::Token(text)) => tokens.push_str(&text),
+                Ok(_) => {}
+                Err(error) => errors.push(error),
+            }
+        }
+
+        assert!(tokens.contains("The directory is"), "{tokens}");
+        assert_eq!(
+            errors.len(),
+            1,
+            "the broken salvage must fail the turn: {errors:?}"
+        );
+        let message = errors[0].to_string();
+        assert!(message.contains("cut off"), "{message}");
     }
 
     #[tokio::test]
