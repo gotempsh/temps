@@ -180,9 +180,6 @@ export function NotificationRouteForm() {
     }))
   }
 
-  // `mutate`, not `mutateAsync`: the mutation's onError toast reports a failed
-  // save, and a rejecting promise returned from a submit handler would be an
-  // unhandled rejection.
   const save = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (!draft.name.trim()) {

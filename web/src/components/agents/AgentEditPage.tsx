@@ -7,7 +7,6 @@ import { AiHarnessLogo } from '@/components/ui/ai-harness-logo'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { NumberInput } from '@/components/ui/number-input'
-import { firstNumericError } from '@/lib/numeric-input'
 import { Label } from '@/components/ui/label'
 import {
   Select,
@@ -139,8 +138,6 @@ function AgentEditForm({
   const [aiProvider, setAiProvider] = useState(agent.ai_provider ?? '')
   const [aiModel, setAiModel] = useState<string>(agent.ai_model ?? '')
   const [prompt, setPrompt] = useState(agent.prompt ?? '')
-  // Limits are `undefined` while their field is empty; submit rejects that
-  // instead of silently substituting a default.
   const [maxTurns, setMaxTurns] = useState<number | undefined>(
     agent.max_turns ?? 25
   )
@@ -240,34 +237,6 @@ function AgentEditForm({
 
   const handleSubmit = () => {
     if (!agent) return
-    const limitError = firstNumericError([
-      { label: 'Max turns', value: maxTurns, rules: { min: 0, integer: true } },
-      {
-        label: 'Timeout (sec)',
-        value: timeoutSeconds,
-        rules: { min: 0, integer: true },
-      },
-      {
-        label: 'Daily budget (cents)',
-        value: dailyBudgetCents,
-        rules: { min: 0, integer: true },
-      },
-      {
-        label: 'Cooldown (min)',
-        value: cooldownMinutes,
-        rules: { min: 0, integer: true },
-      },
-    ])
-    if (
-      limitError ||
-      maxTurns === undefined ||
-      timeoutSeconds === undefined ||
-      dailyBudgetCents === undefined ||
-      cooldownMinutes === undefined
-    ) {
-      toast.error(limitError ?? 'Enter a number for every limit')
-      return
-    }
     // Only include trigger blocks the user actually enabled. Writing every
     // trigger unconditionally caused workflows to persist triggers they
     // never asked for.
@@ -281,6 +250,22 @@ function AgentEditForm({
     if (triggerManual) triggerConfig.manual = true
     if (triggerCron.trim())
       triggerConfig.schedule = { cron: triggerCron.trim() }
+
+    // The limit boxes may be empty while editing; an empty or invalid one is
+    // an error on submit rather than silently becoming a default.
+    const isValidLimit = (value: number | undefined): value is number =>
+      value !== undefined && Number.isInteger(value) && value >= 0
+    if (
+      !isValidLimit(maxTurns) ||
+      !isValidLimit(timeoutSeconds) ||
+      !isValidLimit(dailyBudgetCents) ||
+      !isValidLimit(cooldownMinutes)
+    ) {
+      toast.error(
+        'Max turns, timeout, daily budget and cooldown must each be a whole number of 0 or more'
+      )
+      return
+    }
 
     const body: UpsertAgentRequest = {
       slug: agent.slug,
@@ -765,7 +750,7 @@ function AgentEditForm({
               id="max-turns"
               name="max-turns"
               min={0}
-              integer
+              step={1}
               className="tabular-nums"
               value={maxTurns}
               onValueChange={setMaxTurns}
@@ -777,7 +762,7 @@ function AgentEditForm({
               id="timeout"
               name="timeout"
               min={0}
-              integer
+              step={1}
               className="tabular-nums"
               value={timeoutSeconds}
               onValueChange={setTimeoutSeconds}
@@ -789,7 +774,7 @@ function AgentEditForm({
               id="budget"
               name="budget"
               min={0}
-              integer
+              step={1}
               className="tabular-nums"
               value={dailyBudgetCents}
               onValueChange={setDailyBudgetCents}
@@ -801,7 +786,7 @@ function AgentEditForm({
               id="cooldown"
               name="cooldown"
               min={0}
-              integer
+              step={1}
               className="tabular-nums"
               value={cooldownMinutes}
               onValueChange={setCooldownMinutes}

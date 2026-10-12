@@ -17,8 +17,6 @@ import { isAdvisoryDnsRecord } from '@/lib/email-dns-records'
 import { isSmtpProvider, smtpVerifyToast } from '@/lib/email-smtp-domains'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
-import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
-import { useConfirmDelete } from '@/components/ui/confirm-delete'
 import { CreateActionButton } from '@/components/ui/create-action-button'
 import { CopyButton } from '@/components/ui/copy-button'
 import {
@@ -570,11 +568,7 @@ export function EmailDomainsManagement() {
   })
 
   const handleVerify = (id: number) => verifyMutation.mutate(id)
-  // The row menu only asks for confirmation; the request is sent from the
-  // dialog's confirm button.
-  const confirmDelete = useConfirmDelete<EmailDomain>((domain, callbacks) =>
-    deleteMutation.mutate(domain.id, callbacks)
-  )
+  const handleDelete = (id: number) => deleteMutation.mutate(id)
   const handleOpen = (id: number) => navigate(`/email/domains/${id}`)
 
   // Provider lookup by id — avoids N+1 fetches per row.
@@ -794,7 +788,7 @@ export function EmailDomainsManagement() {
                           <DropdownMenuSeparator />
                           <DropdownMenuItem
                             className="text-destructive"
-                            onClick={() => confirmDelete.request(domain)}
+                            onClick={() => handleDelete(domain.id)}
                           >
                             Delete
                           </DropdownMenuItem>
@@ -810,17 +804,6 @@ export function EmailDomainsManagement() {
           </div>
         </>
       )}
-
-      <ConfirmDeleteDialog
-        open={confirmDelete.open}
-        onOpenChange={(open) => {
-          if (!open) confirmDelete.cancel()
-        }}
-        resourceType="email domain"
-        resourceName={confirmDelete.target?.domain}
-        isPending={deleteMutation.isPending}
-        onConfirm={confirmDelete.confirm}
-      />
     </div>
   )
 }

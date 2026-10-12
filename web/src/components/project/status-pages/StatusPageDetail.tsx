@@ -64,6 +64,7 @@ import { useFieldArray, useForm } from 'react-hook-form'
 import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 import { StatusPageStateBadge } from './ProjectStatusPages'
+import { StatusPageDomains } from './StatusPageDomains'
 import { StatusPageIncidents } from './StatusPageIncidents'
 import {
   formDefaults,
@@ -339,6 +340,11 @@ export function StatusPageDetail({ project }: { project: ProjectResponse }) {
   const refresh = async () => {
     await queryClient.invalidateQueries(operationQueries('getStatusPage'))
     await queryClient.invalidateQueries(operationQueries('listStatusPages'))
+    // Unpublishing releases every custom domain's certificate, so their
+    // state changes too; a stale "Serving" row would hide Verify.
+    await queryClient.invalidateQueries(
+      operationQueries('listStatusPageDomains')
+    )
   }
   const publish = useMutation({
     ...publishStatusPageMutation(),
@@ -471,6 +477,8 @@ export function StatusPageDetail({ project }: { project: ProjectResponse }) {
       </div>
 
       <PublicLinkSection page={page} />
+
+      <StatusPageDomains page={page} />
 
       <StatusPageForm
         page={page}

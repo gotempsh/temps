@@ -18,7 +18,6 @@ import {
 } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { NumberInput } from '@/components/ui/number-input'
-import { validateNumeric } from '@/lib/numeric-input'
 import {
   Select,
   SelectContent,
@@ -31,6 +30,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowRight, Loader2, Plus, Trash2 } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { toast } from 'sonner'
+import { rolePriorityError } from '@/lib/oidc-role-priority'
 
 function nextDefaultPriority(existing: OidcRoleMappingResponse[]): number {
   if (existing.length === 0) return 100
@@ -59,8 +59,7 @@ export function OidcRoleMappingsCard({
 
   const [draftGroup, setDraftGroup] = useState('')
   const [draftRole, setDraftRole] = useState<'admin' | 'user'>('user')
-  // `undefined` while the field is empty: the rule then takes the suggested
-  // priority, shown as the placeholder.
+  // Empty while editing; an empty priority means "use the suggested one".
   const [draftPriority, setDraftPriority] = useState<number | undefined>(100)
 
   const suggestedPriority = useMemo(
@@ -107,12 +106,9 @@ export function OidcRoleMappingsCard({
   const handleAdd = () => {
     const idpGroup = draftGroup.trim()
     if (!idpGroup) return
-    const priorityError = validateNumeric(draftPriority, {
-      integer: true,
-      required: false,
-    })
+    const priorityError = rolePriorityError(draftPriority)
     if (priorityError) {
-      toast.error(`Priority: ${priorityError}`)
+      toast.error(priorityError)
       return
     }
     createMapping.mutate({
@@ -200,7 +196,7 @@ export function OidcRoleMappingsCard({
                 </label>
                 <NumberInput
                   className="w-24"
-                  integer
+                  step={1}
                   placeholder={String(suggestedPriority)}
                   value={draftPriority}
                   onValueChange={setDraftPriority}

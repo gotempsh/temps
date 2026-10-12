@@ -32,7 +32,7 @@ import {
   Workflow,
 } from 'lucide-react'
 import { useMemo, useState } from 'react'
-import { useBatchedSearchParams, useUrlTextInput } from '@temps-sdk/ds'
+import { useComposedSearchParams, useUrlBoundText } from '@temps-sdk/ds'
 import { cn } from '@/lib/utils'
 import { format } from 'date-fns'
 
@@ -81,7 +81,7 @@ function sameKindSet(
  */
 export default function Observe({ project }: ObserveProps) {
   usePageTitle(`Observe · ${project.name}`)
-  const [searchParams, setSearchParams] = useBatchedSearchParams()
+  const [searchParams, updateSearchParams] = useComposedSearchParams()
   const [selectedEvent, setSelectedEvent] = useState<ObservabilityEvent | null>(
     null
   )
@@ -122,44 +122,36 @@ export default function Observe({ project }: ObserveProps) {
     }
   }, [searchParams])
 
-  const withObserveFilters = (
-    current: URLSearchParams,
-    next: ObserveFilters
-  ) => {
-    const params = new URLSearchParams(current)
-    if (sameKindSet(next.kinds, DEFAULT_KINDS)) {
-      params.delete('kinds')
-    } else {
-      params.set('kinds', next.kinds.join(','))
-    }
-    if (next.timeRange === '24h') {
-      params.delete('time_range')
-    } else {
-      params.set('time_range', next.timeRange)
-    }
-    if (next.search) {
-      params.set('search', next.search)
-    } else {
-      params.delete('search')
-    }
-    if (next.environmentId != null) {
-      params.set('environment_id', String(next.environmentId))
-    } else {
-      params.delete('environment_id')
-    }
-    // Bots hidden is the default — only persist when the user has flipped
-    // it off so the URL doesn't carry redundant state.
-    if (next.hideBots) {
-      params.delete('hide_bots')
-    } else {
-      params.set('hide_bots', 'false')
-    }
-    return params
-  }
-
   const updateFilters = (next: ObserveFilters) => {
-    setSearchParams((current) => withObserveFilters(current, next), {
-      replace: true,
+    updateSearchParams((params) => {
+      if (sameKindSet(next.kinds, DEFAULT_KINDS)) {
+        params.delete('kinds')
+      } else {
+        params.set('kinds', next.kinds.join(','))
+      }
+      if (next.timeRange === '24h') {
+        params.delete('time_range')
+      } else {
+        params.set('time_range', next.timeRange)
+      }
+      if (next.search) {
+        params.set('search', next.search)
+      } else {
+        params.delete('search')
+      }
+      if (next.environmentId != null) {
+        params.set('environment_id', String(next.environmentId))
+      } else {
+        params.delete('environment_id')
+      }
+      // Bots hidden is the default — only persist when the user has flipped
+      // it off so the URL doesn't carry redundant state.
+      if (next.hideBots) {
+        params.delete('hide_bots')
+      } else {
+        params.set('hide_bots', 'false')
+      }
+      return params
     })
   }
 
@@ -291,12 +283,10 @@ function CockpitHeader({
   events: ObservabilityEvent[]
 }) {
   const buckets = useMemo(() => bucketByKind(events, 24), [events])
-  // Typed text stays local until it reaches the URL, so the box never snaps
-  // back while the location update is still in flight.
-  const search = useUrlTextInput({
-    value: filters.search,
-    onCommit: (text) => onChange({ ...filters, search: text }),
-  })
+  const [searchText, setSearchText] = useUrlBoundText(
+    filters.search,
+    (search) => onChange({ ...filters, search })
+  )
 
   const toggle = (kind: EventKind) => {
     const next = filters.kinds.includes(kind)
@@ -365,8 +355,8 @@ function CockpitHeader({
           <Input
             type="search"
             placeholder="grep path / class / event…"
-            value={search.value}
-            onChange={(e) => search.setValue(e.target.value)}
+            value={searchText}
+            onChange={(e) => setSearchText(e.target.value)}
             className="pl-9 font-mono"
           />
         </div>

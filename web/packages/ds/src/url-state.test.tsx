@@ -1,139 +1,246 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { describe, expect, test } from 'bun:test'
-import { renderToStaticMarkup } from 'react-dom/server'
-import { MemoryRouter } from 'react-router'
-import { createSearchParamsBatch, useUrlState } from './url-state'
+import { afterEach, expect, test } from 'bun:test'
+import { MemoryRouter, useLocation, useNavigate } from 'react-router'
+import { useUrlBoundText, useUrlState } from './url-state'
 
-/**
- * Models what React Router does: `setSearchParams(fn)` calls `fn` with the
- * params of the render the callback belongs to, and the new location only
- * becomes visible to callers after the next render.
- */
-function fakeRouter(initial: string) {
-  let location = new URLSearchParams(initial)
-  let rendered = new URLSearchParams(initial)
-  return {
-    get location() {
-      return location.toString()
-    },
-    render() {
-      rendered = new URLSearchParams(location)
-      return rendered
-    },
-    get rendered() {
-      return rendered
-    },
-    navigate(next: URLSearchParams) {
-      location = new URLSearchParams(next)
-    },
-    renderTimeUpdate(fn: (current: URLSearchParams) => URLSearchParams) {
-      location = fn(new URLSearchParams(rendered))
-    },
-  }
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  waitFor,
+} from '@testing-library/react'
+import { installBrowserWindow } from '../../../src/test/dom'
+
+installBrowserWindow()
+afterEach(cleanup)
+
+function SearchBox() {
+  const { get, patch } = useUrlState<'q' | 'page' | 'tab'>()
+  const [text, setText] = useUrlBoundText(get('q') ?? '', (value) =>
+    // The same two-step update the list pages used to make: search, then page.
+    {
+      patch({ q: value || undefined })
+      patch({ page: undefined })
+    }
+  )
+  const location = useLocation()
+  return (
+    <div>
+      <input
+        aria-label="search"
+        value={text}
+        onChange={(event) => setText(event.target.value)}
+      />
+      <output data-testid="search">{location.search}</output>
+    </div>
+  )
 }
 
-const withKeys =
-  (values: Record<string, string | undefined>) =>
-  (current: URLSearchParams) => {
-    const next = new URLSearchParams(current)
-    for (const [key, value] of Object.entries(values)) {
-      if (value === undefined) next.delete(key)
-      else next.set(key, value)
-    }
-    return next
+test('typing a multi-character term into a URL-bound search keeps the full value', async () => {
+  const view = render(
+    <MemoryRouter initialEntries={['/list?tab=backups&page=3']}>
+      <SearchBox />
+    </MemoryRouter>
+  )
+  const input = view.getByLabelText('search') as HTMLInputElement
+  let typed = ''
+  for (const char of 'qa-ui-qj14a') {
+    typed += char
+    fireEvent.change(input, { target: { value: typed } })
   }
-
-describe('search params batching', () => {
-  test('two updates in one tick both land', () => {
-    const router = fakeRouter('page=3&tab=a')
-    const batch = createSearchParamsBatch()
-    router.navigate(batch.apply(router.rendered, withKeys({ q: 'qa' })))
-    router.navigate(batch.apply(router.rendered, withKeys({ page: undefined })))
-    const result = new URLSearchParams(router.location)
-    expect(result.get('q')).toBe('qa')
-    expect(result.has('page')).toBe(false)
-    expect(result.get('tab')).toBe('a')
-  })
-
-  test('a plain value update is also chained, not just functional ones', () => {
-    const router = fakeRouter('a=1')
-    const batch = createSearchParamsBatch()
-    router.navigate(batch.apply(router.rendered, withKeys({ b: '2' })))
-    router.navigate(batch.apply(router.rendered, new URLSearchParams('c=3')))
-    expect(router.location).toBe('c=3')
-    router.navigate(batch.apply(router.rendered, withKeys({ d: '4' })))
-    expect(router.location).toBe('c=3&d=4')
-  })
-
-  test('keeps chaining while the router renders an intermediate step', () => {
-    const router = fakeRouter('')
-    const batch = createSearchParamsBatch()
-    router.navigate(batch.apply(router.rendered, withKeys({ a: '1' })))
-    router.navigate(batch.apply(router.rendered, withKeys({ b: '2' })))
-    // Router renders the first step only.
-    const intermediate = new URLSearchParams('a=1')
-    batch.observe(intermediate)
-    router.navigate(batch.apply(intermediate, withKeys({ c: '3' })))
-    expect(router.location).toBe('a=1&b=2&c=3')
-  })
-
-  test('starts from the rendered location once the chain has landed', () => {
-    const router = fakeRouter('')
-    const batch = createSearchParamsBatch()
-    router.navigate(batch.apply(router.rendered, withKeys({ a: '1' })))
-    batch.observe(router.render())
-    // Someone else (back button) changed the URL after that.
-    const external = new URLSearchParams('z=9')
-    batch.observe(external)
-    expect(batch.apply(external, withKeys({ b: '2' })).toString()).toBe(
-      'z=9&b=2'
+  expect(input.value).toBe('qa-ui-qj14a')
+  // The search and the page reset both landed, and untouched params survived.
+  await waitFor(() => {
+    const params = new URLSearchParams(
+      view.getByTestId('search').textContent ?? ''
     )
+    expect(params.get('q')).toBe('qa-ui-qj14a')
+    expect(params.has('page')).toBe(false)
+    expect(params.get('tab')).toBe('backups')
   })
-
-  test('an external navigation ends the chain', () => {
-    const batch = createSearchParamsBatch()
-    batch.apply(new URLSearchParams('a=1'), withKeys({ q: 'x' }))
-    const external = new URLSearchParams('other=1')
-    batch.observe(external)
-    expect(batch.apply(external, withKeys({ page: '2' })).toString()).toBe(
-      'other=1&page=2'
-    )
-  })
-
-  test('a chain that never landed expires', () => {
-    let now = 1_000
-    const batch = createSearchParamsBatch({ maxAgeMs: 500, now: () => now })
-    const rendered = new URLSearchParams('a=1')
-    batch.apply(rendered, withKeys({ q: 'x' }))
-    now += 501
-    expect(batch.apply(rendered, withKeys({ page: '2' })).toString()).toBe(
-      'a=1&page=2'
-    )
-  })
-
-  test('does not mutate the params it is given', () => {
-    const batch = createSearchParamsBatch()
-    const rendered = new URLSearchParams('a=1')
-    batch.apply(rendered, withKeys({ q: 'x' }))
-    expect(rendered.toString()).toBe('a=1')
-  })
+  expect(input.value).toBe('qa-ui-qj14a')
+  view.unmount()
 })
 
-describe('useUrlState', () => {
-  test('reads typed state from the location', () => {
-    let seen: Record<string, string | undefined> = {}
-    function Probe() {
-      const { state, get } = useUrlState<'q' | 'page'>()
-      seen = { q: get('q') ?? undefined, page: state.page }
-      return null
-    }
-    renderToStaticMarkup(
-      <MemoryRouter initialEntries={['/backups?q=nightly&page=2']}>
-        <Probe />
-      </MemoryRouter>
+test('patch applies every key of one call in a single update', async () => {
+  function Patcher() {
+    const { patch } = useUrlState<'q' | 'page'>()
+    const location = useLocation()
+    return (
+      <div>
+        <button onClick={() => patch({ q: 'abc', page: 2 })}>go</button>
+        <output data-testid="search">{location.search}</output>
+      </div>
     )
-    expect(seen).toEqual({ q: 'nightly', page: '2' })
+  }
+  const view = render(
+    <MemoryRouter initialEntries={['/list']}>
+      <Patcher />
+    </MemoryRouter>
+  )
+  await act(async () => {
+    fireEvent.click(view.getByText('go'))
   })
+  const params = new URLSearchParams(
+    view.getByTestId('search').textContent ?? ''
+  )
+  expect(params.get('q')).toBe('abc')
+  expect(params.get('page')).toBe('2')
+  view.unmount()
+})
+
+test('an external URL change replaces the text in the box', async () => {
+  function Linked() {
+    const { get, patch } = useUrlState<'q'>()
+    const [text] = useUrlBoundText(get('q') ?? '', (value) =>
+      patch({ q: value })
+    )
+    return (
+      <div>
+        <input aria-label="search" value={text} readOnly />
+        <button onClick={() => patch({ q: 'from-link' })}>apply</button>
+      </div>
+    )
+  }
+  const view = render(
+    <MemoryRouter initialEntries={['/list']}>
+      <Linked />
+    </MemoryRouter>
+  )
+  await act(async () => {
+    fireEvent.click(view.getByText('apply'))
+  })
+  expect((view.getByLabelText('search') as HTMLInputElement).value).toBe(
+    'from-link'
+  )
+  view.unmount()
+})
+
+const settle = (ms: number) =>
+  act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, ms))
+  })
+
+function Navigable({ settleMs }: { settleMs: number }) {
+  const { get, patch } = useUrlState<'q' | 'page'>()
+  const navigate = useNavigate()
+  const [text, setText] = useUrlBoundText(
+    get('q') ?? '',
+    (value) => patch({ q: value || undefined }),
+    { settleMs }
+  )
+  const location = useLocation()
+  return (
+    <div>
+      <input
+        aria-label="search"
+        value={text}
+        onChange={(event) => setText(event.target.value)}
+      />
+      <button onClick={() => navigate(-1)}>back</button>
+      <button
+        onClick={() => {
+          setText('abc')
+          patch({ q: undefined })
+        }}
+      >
+        type-then-clear
+      </button>
+      <button onClick={() => patch({ page: 2 })}>page</button>
+      <output data-testid="search">{location.search}</output>
+    </div>
+  )
+}
+
+test('Back that cancels in-flight typing makes the box show the URL again', async () => {
+  const view = render(
+    <MemoryRouter initialEntries={['/list?q=a', '/list']} initialIndex={1}>
+      <Navigable settleMs={30} />
+    </MemoryRouter>
+  )
+  const input = view.getByLabelText('search') as HTMLInputElement
+  await act(async () => {
+    fireEvent.change(input, { target: { value: 'a' } })
+    fireEvent.change(input, { target: { value: 'ab' } })
+    fireEvent.click(view.getByText('back'))
+  })
+  await settle(120)
+  expect(view.getByTestId('search').textContent).toBe('?q=a')
+  expect(input.value).toBe('a')
+  view.unmount()
+})
+
+test('an external clear back to the original query makes the box show the URL', async () => {
+  const view = render(
+    <MemoryRouter initialEntries={['/list']}>
+      <Navigable settleMs={30} />
+    </MemoryRouter>
+  )
+  const input = view.getByLabelText('search') as HTMLInputElement
+  await act(async () => {
+    fireEvent.click(view.getByText('type-then-clear'))
+  })
+  await settle(120)
+  expect(view.getByTestId('search').textContent).toBe('')
+  expect(input.value).toBe('')
+  view.unmount()
+})
+
+test('typing is not reverted while the URL is still catching up', async () => {
+  const view = render(
+    <MemoryRouter initialEntries={['/list']}>
+      <Navigable settleMs={500} />
+    </MemoryRouter>
+  )
+  const input = view.getByLabelText('search') as HTMLInputElement
+  await act(async () => {
+    fireEvent.change(input, { target: { value: 'slow' } })
+  })
+  await settle(60)
+  expect(input.value).toBe('slow')
+  expect(view.getByTestId('search').textContent).toBe('?q=slow')
+  view.unmount()
+})
+
+test('a navigation that lands on the query already shown discards a cancelled patch', async () => {
+  function Racer() {
+    const { patch } = useUrlState<'q' | 'page'>()
+    const navigate = useNavigate()
+    const location = useLocation()
+    return (
+      <div>
+        <button
+          onClick={() => {
+            patch({ q: 'abcd' })
+            navigate('/list?q=abc', { replace: true })
+          }}
+        >
+          race
+        </button>
+        <button onClick={() => patch({ page: 2 })}>page</button>
+        <output data-testid="search">{location.search}</output>
+      </div>
+    )
+  }
+  const view = render(
+    <MemoryRouter initialEntries={['/list?q=abc']}>
+      <Racer />
+    </MemoryRouter>
+  )
+  await act(async () => {
+    fireEvent.click(view.getByText('race'))
+  })
+  expect(view.getByTestId('search').textContent).toBe('?q=abc')
+  await act(async () => {
+    fireEvent.click(view.getByText('page'))
+  })
+  const params = new URLSearchParams(
+    view.getByTestId('search').textContent ?? ''
+  )
+  expect(params.get('q')).toBe('abc')
+  expect(params.get('page')).toBe('2')
+  view.unmount()
 })

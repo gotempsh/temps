@@ -15,7 +15,6 @@ import {
   getRepositoryPresetLiveOptions,
   getRepositoryComposeServicesLiveOptions,
   getPublicComposeServicesOptions,
-  getComposeSecurityOptions,
   listConnectionsOptions,
   listGitProvidersOptions,
   reinstallGitlabWebhookMutation,
@@ -24,10 +23,7 @@ import {
   updateProjectSettingsMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { ComposeSecuritySettings } from './ComposeSecuritySettings'
-import {
-  isComposePresetName,
-  shouldLoadComposeSecurity,
-} from '@/lib/compose-security-query'
+import { useComposeSecurityPolicy } from '@/hooks/useComposeSecurityPolicy'
 import { RepositorySelector } from '@/components/repositories/RepositorySelector'
 import { BranchSelector } from '@/components/deployments/BranchSelector'
 import { Badge } from '@/components/ui/badge'
@@ -506,7 +502,8 @@ function GitSettingsInline({
 
   const presetName = (project.preset || '').toString()
   const isDockerfilePreset = presetName === 'dockerfile'
-  const isComposePreset = isComposePresetName(presetName)
+  const isComposePreset =
+    presetName === 'docker-compose' || presetName === 'dockercompose'
 
   // Compose override editor and redacted effective-deployment preview.
   const [overrideDraft, setOverrideDraft] = useState('')
@@ -527,12 +524,10 @@ function GitSettingsInline({
   )
   const excludedComposeServices: string[] =
     composeConfig.excludedServices || composeConfig.excluded_services || []
-  // The endpoint answers 400 for every non-Compose project, so the read is
-  // gated on the preset instead of being fired and discarded.
-  const composeSecurityQuery = useQuery({
-    ...getComposeSecurityOptions({ path: { id: project.id } }),
-    enabled: shouldLoadComposeSecurity(project),
-  })
+  const composeSecurityQuery = useComposeSecurityPolicy(
+    project.id,
+    isComposePreset
+  )
   const [focusedComposeCheck, setFocusedComposeCheck] = useState<string | null>(
     null
   )

@@ -11,7 +11,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { useUrlTextInput } from '@temps-sdk/ds'
 import { cn } from '@/lib/utils'
 import { AlertOctagon, CircleDollarSign, Network, Workflow } from 'lucide-react'
 import { ALL_KINDS, type EventKind } from './types'
@@ -36,12 +35,6 @@ export function ObserveFilterBar({
   onChange: (next: ObserveFilters) => void
   environmentOptions?: Array<{ id: number; name: string }>
 }) {
-  // Typed text stays local until it reaches the URL, so the box never snaps
-  // back while the location update is still in flight.
-  const search = useUrlTextInput({
-    value: filters.search,
-    onCommit: (text) => onChange({ ...filters, search: text }),
-  })
   const toggleKind = (kind: EventKind) => {
     const next = filters.kinds.includes(kind)
       ? filters.kinds.filter((k) => k !== kind)
@@ -121,8 +114,8 @@ export function ObserveFilterBar({
       <Input
         type="search"
         placeholder="Search path / class / event…"
-        value={search.value}
-        onChange={(e) => search.setValue(e.target.value)}
+        value={filters.search}
+        onChange={(e) => onChange({ ...filters, search: e.target.value })}
         className="w-full sm:w-[260px]"
       />
     </div>

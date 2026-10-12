@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { RedirectWithQuery } from '@/components/routing/RedirectWithQuery'
 import {
   getLastDeploymentOptions,
   getEnvironmentVariablesOptions,
@@ -87,13 +88,13 @@ import Metrics from './Metrics'
 import { ProjectTour } from '@/components/project/ProjectTour'
 import { ProjectAgentActivity } from './AiGateway'
 import { AutofixRedirect } from '@/components/autofixer/AutofixRedirect'
-import { RedirectWithSearch } from '@/components/layout/RedirectWithSearch'
 import { AgentDetailPage } from '@/components/agents/AgentDetailPage'
 import { AgentEditPage } from '@/components/agents/AgentEditPage'
 import { AutopilotRunDetail } from '@/components/agents/AutopilotRunDetail'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useState } from 'react'
 import {
+  Navigate,
   Route,
   Routes,
   useNavigate,
@@ -411,10 +412,7 @@ export function ProjectDetail() {
             <div className="relative border-b">
               <div className="max-w-screen overflow-hidden">
                 <div className="relative flex items-center">
-                  <div
-                    tabIndex={0}
-                    className="flex-1 overflow-x-auto no-scrollbar"
-                  >
+                  <div className="flex-1 overflow-x-auto no-scrollbar">
                     <div className="min-w-full">
                       <Skeleton className="h-10 w-full" />
                     </div>
@@ -467,7 +465,7 @@ export function ProjectDetail() {
         <div className="min-w-0 flex-1 overflow-y-auto p-4">
           <ProjectSectionLayout project={project}>
             <Routes>
-              <Route index element={<RedirectWithSearch to="project" />} />
+              <Route index element={<RedirectWithQuery to="project" />} />
               {['project', 'integrations', 'setup'].map((path) => (
                 <Route
                   key={path}
@@ -662,10 +660,10 @@ export function ProjectDetail() {
           <ProjectTour />
           <ProjectSectionLayout project={project}>
             <Routes>
-              <Route index element={<RedirectWithSearch to="project" />} />
+              <Route index element={<RedirectWithQuery to="project" />} />
               <Route
                 path="hosting"
-                element={<RedirectWithSearch to="../settings/delivery" />}
+                element={<RedirectWithQuery to="../settings/delivery" />}
               />
               <Route
                 path="integrations"
@@ -682,7 +680,7 @@ export function ProjectDetail() {
               />
               <Route
                 path="tools"
-                element={<RedirectWithSearch to="../settings/general" />}
+                element={<RedirectWithQuery to="../settings/general" />}
               />
               <Route
                 path="setup"
@@ -750,8 +748,9 @@ export function ProjectDetail() {
               <Route
                 path="git/change-repository"
                 element={
-                  <RedirectWithSearch
+                  <Navigate
                     to={`/projects/${project.slug}/connect-repository`}
+                    replace
                   />
                 }
               />
@@ -784,8 +783,9 @@ export function ProjectDetail() {
               <Route
                 path="databases"
                 element={
-                  <RedirectWithSearch
+                  <Navigate
                     to={legacyDatabasesRedirectPath(project.slug)}
+                    replace
                   />
                 }
               />
@@ -852,7 +852,7 @@ export function ProjectDetail() {
                   any lingering /dashboards links. */}
               <Route
                 path="dashboards/*"
-                element={<RedirectWithSearch to="../metrics/dashboards" />}
+                element={<RedirectWithQuery to="../metrics/dashboards" />}
               />
               <Route
                 path="ai-gateway"

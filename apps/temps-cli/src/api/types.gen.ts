@@ -388,6 +388,18 @@ export type AddProviderModelRequest = {
     model_id: string;
 };
 
+export type AddStatusPageDomainRequest = {
+    /**
+     * Hostname to serve the page on, e.g. `status.example.com`. Unicode names
+     * are converted to punycode; wildcards and IP addresses are refused.
+     */
+    hostname: string;
+    /**
+     * Defaults to `http-01`.
+     */
+    verification_method?: VerificationMethod;
+};
+
 export type AdminGateResponse = {
     /**
      * `Host` header values allowed. Empty = any host.
@@ -8446,6 +8458,28 @@ export type DnsRecordContent = {
     value: {
         target: string;
     };
+};
+
+/**
+ * A DNS record the operator must create.
+ */
+export type DnsRecordInstruction = {
+    /**
+     * Fully qualified record name.
+     */
+    name: string;
+    /**
+     * Why the record is needed.
+     */
+    purpose: string;
+    /**
+     * `CNAME`, `A` or `TXT`.
+     */
+    record_type: string;
+    /**
+     * Record value.
+     */
+    value: string;
 };
 
 export type DnsRecordResponse = {
@@ -24275,6 +24309,30 @@ export type StatusCodesQuery = {
     start_date: string;
 };
 
+export type StatusPageDomainResponse = {
+    certificate_expires_at?: string | null;
+    created_at: string;
+    dns_records: Array<DnsRecordInstruction>;
+    hostname: string;
+    id: number;
+    /**
+     * Reason the last verification failed, if it did.
+     */
+    last_error?: string | null;
+    /**
+     * True when visitors can open the page on this hostname right now: the
+     * hostname is verified and the page is published.
+     */
+    serving: boolean;
+    status: StatusPageDomainStatus;
+    verification_method: VerificationMethod;
+};
+
+/**
+ * Lifecycle of a custom hostname.
+ */
+export type StatusPageDomainStatus = 'pending' | 'active' | 'failed' | 'unverified' | 'renewal_pending' | 'renewal_failed';
+
 export type StatusPageListResponse = {
     items: Array<StatusPageResponse>;
     page: number;
@@ -27576,6 +27634,11 @@ export type VariableHistoryList = {
     page_size: number;
     total: number;
 };
+
+/**
+ * How ownership of a hostname is proven.
+ */
+export type VerificationMethod = 'http-01' | 'dns-01';
 
 export type VerificationResult = {
     checked_at: string;
@@ -67003,6 +67066,246 @@ export type UpdateStatusPageResponses = {
 };
 
 export type UpdateStatusPageResponse = UpdateStatusPageResponses[keyof UpdateStatusPageResponses];
+
+export type ListStatusPageDomainsData = {
+    body?: never;
+    path: {
+        /**
+         * Status page ID
+         */
+        status_page_id: number;
+    };
+    query?: never;
+    url: '/status-pages/{status_page_id}/domains';
+};
+
+export type ListStatusPageDomainsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Status page not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListStatusPageDomainsResponses = {
+    /**
+     * Custom domains with their DNS records and state
+     */
+    200: Array<StatusPageDomainResponse>;
+};
+
+export type ListStatusPageDomainsResponse = ListStatusPageDomainsResponses[keyof ListStatusPageDomainsResponses];
+
+export type AddStatusPageDomainData = {
+    body: AddStatusPageDomainRequest;
+    path: {
+        /**
+         * Status page ID
+         */
+        status_page_id: number;
+    };
+    query?: never;
+    url: '/status-pages/{status_page_id}/domains';
+};
+
+export type AddStatusPageDomainErrors = {
+    /**
+     * Invalid hostname
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Status page not found
+     */
+    404: unknown;
+    /**
+     * Hostname already in use, or domain limit reached
+     */
+    409: unknown;
+    /**
+     * Certificate order could not be started
+     */
+    502: unknown;
+    /**
+     * Hostname availability could not be checked
+     */
+    503: unknown;
+};
+
+export type AddStatusPageDomainResponses = {
+    /**
+     * Domain attached; create the DNS records, then verify
+     */
+    201: StatusPageDomainResponse;
+};
+
+export type AddStatusPageDomainResponse = AddStatusPageDomainResponses[keyof AddStatusPageDomainResponses];
+
+export type RemoveStatusPageDomainData = {
+    body?: never;
+    path: {
+        /**
+         * Status page ID
+         */
+        status_page_id: number;
+        /**
+         * Custom domain ID
+         */
+        domain_id: number;
+    };
+    query?: never;
+    url: '/status-pages/{status_page_id}/domains/{domain_id}';
+};
+
+export type RemoveStatusPageDomainErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Status page or domain not found
+     */
+    404: unknown;
+};
+
+export type RemoveStatusPageDomainResponses = {
+    /**
+     * Domain removed; its certificate is deleted
+     */
+    204: void;
+};
+
+export type RemoveStatusPageDomainResponse = RemoveStatusPageDomainResponses[keyof RemoveStatusPageDomainResponses];
+
+export type RenewStatusPageDomainData = {
+    body?: never;
+    path: {
+        /**
+         * Status page ID
+         */
+        status_page_id: number;
+        /**
+         * Custom domain ID
+         */
+        domain_id: number;
+    };
+    query?: never;
+    url: '/status-pages/{status_page_id}/domains/{domain_id}/renew';
+};
+
+export type RenewStatusPageDomainErrors = {
+    /**
+     * The new order could not be validated
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Status page or domain not found
+     */
+    404: unknown;
+    /**
+     * The page is unpublished, the domain has no certificate yet, or another verify or renew of this hostname is in progress
+     */
+    409: unknown;
+    /**
+     * Too many domain operations for this project
+     */
+    429: unknown;
+};
+
+export type RenewStatusPageDomainResponses = {
+    /**
+     * Renewal started (DNS-01) or completed (HTTP-01)
+     */
+    200: StatusPageDomainResponse;
+};
+
+export type RenewStatusPageDomainResponse = RenewStatusPageDomainResponses[keyof RenewStatusPageDomainResponses];
+
+export type VerifyStatusPageDomainData = {
+    body?: never;
+    path: {
+        /**
+         * Status page ID
+         */
+        status_page_id: number;
+        /**
+         * Custom domain ID
+         */
+        domain_id: number;
+    };
+    query?: never;
+    url: '/status-pages/{status_page_id}/domains/{domain_id}/verify';
+};
+
+export type VerifyStatusPageDomainErrors = {
+    /**
+     * Ownership could not be verified yet
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Status page or domain not found
+     */
+    404: unknown;
+    /**
+     * The page is unpublished, or another verify or renew of this hostname is in progress
+     */
+    409: unknown;
+    /**
+     * Too many domain operations for this project
+     */
+    429: unknown;
+    /**
+     * Certificate order could not be started
+     */
+    502: unknown;
+};
+
+export type VerifyStatusPageDomainResponses = {
+    /**
+     * Verification result; `status` is `active` once the certificate is issued
+     */
+    200: StatusPageDomainResponse;
+};
+
+export type VerifyStatusPageDomainResponse = VerifyStatusPageDomainResponses[keyof VerifyStatusPageDomainResponses];
 
 export type PublishStatusPageData = {
     body?: never;

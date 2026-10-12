@@ -4,123 +4,66 @@
 import * as React from 'react'
 
 import { Input } from '@/components/ui/input'
-import {
-  committedNumber,
-  formatNumericText,
-  isEchoOfOwnEdit,
-  textAfterOwnEdit,
-  shouldResyncNumericText,
-  validateNumeric,
-  type NumericRules,
-} from '@/lib/numeric-input'
+import { parseNumberInput } from '@/lib/parse-number-input'
 
 type NumberInputProps = Omit<
-  React.ComponentProps<typeof Input>,
+  React.ComponentProps<'input'>,
   'type' | 'value' | 'defaultValue' | 'onChange'
-> &
-  Pick<NumericRules, 'integer'> & {
-    /** The committed value; `undefined`/`null` means the field is empty. */
-    value: number | null | undefined
-    /**
-     * Called with each valid number as it is typed, and with `undefined`
-     * when the field is emptied. It is never called with a default: the
-     * caller decides what an empty field means (usually a submit error).
-     */
-    onValueChange: (value: number | undefined) => void
-    /** Mark an empty field invalid once it has been left. Default: false. */
-    required?: boolean
-  }
+> & {
+  /** `undefined`, `null` and `NaN` show an empty box. */
+  value: number | null | undefined
+  /** Called with the parsed number, or `undefined` while the box is empty. */
+  onValueChange: (value: number | undefined) => void
+}
 
 /**
- * A number field that holds its text while it is edited. Emptying it and
- * typing `42` gives 42, not a default with 42 appended. The field only flags
- * a range problem once it has been left; enforce min/max on submit with
- * `validateNumeric` / `firstNumericError` from `@/lib/numeric-input`.
+ * A number field that can be emptied while it is being edited.
+ *
+ * Settings forms used to coerce an empty box straight back to a default
+ * (`parseInt(v) || 60`, `Number(v)` -> 0), so backspacing the "60" showed "0"
+ * and typing 42 produced "042". Here the box shows exactly what was typed and
+ * reports `undefined` when it is empty; the form decides what an empty value
+ * means (a required-field error on submit, or "use the default").
+ *
+ * With react-hook-form pass `onValueChange={(v) => field.onChange(v ?? NaN)}`:
+ * RHF replaces an `undefined` value with the field's default, which would put
+ * the old number straight back; NaN stays put and fails a `z.number()` check
+ * with its message on submit.
+ *
+ * `min`/`max`/`step` are passed to the browser for the spinner and keyboard
+ * stepping; enforcing them is the form's validation, which now only sees real
+ * numbers or `undefined`.
  */
 const NumberInput = React.forwardRef<HTMLInputElement, NumberInputProps>(
-  (
-    {
-      value,
-      onValueChange,
-      min,
-      max,
-      integer,
-      required = false,
-      onBlur,
-      'aria-invalid': ariaInvalid,
-      ...props
-    },
-    ref
-  ) => {
-    const [text, setText] = React.useState(() => formatNumericText(value))
-    const [touched, setTouched] = React.useState(false)
-    // What our own onChange just emitted, cleared after the render it causes.
-    // A value that arrives in that render is the parent reacting to this
-    // edit: react-hook-form, for one, answers `undefined` with the field's
-    // `defaultValues` entry, which would put the default straight back into a
-    // field the user just emptied. A *different number* is the parent
-    // overriding the edit (clamping it), which the field does follow.
-    const ownEdit = React.useRef<{ emitted: number | undefined } | null>(null)
+  ({ value, onValueChange, ...props }, ref) => {
+    // NaN is how a react-hook-form field says "empty" (RHF swaps `undefined`
+    // for the field's default value), so it reads as empty here too.
+    const external =
+      typeof value === 'number' && !Number.isNaN(value) ? value : undefined
+    const [draft, setDraft] = React.useState(
+      external === undefined ? '' : String(external)
+    )
+    const [seen, setSeen] = React.useState(external)
 
-    // Follow the value when it changes from outside (a form reset, data that
-    // finished loading) without disturbing what is being typed: text that
-    // already means the incoming value is left alone.
-    React.useEffect(() => {
-      const edit = ownEdit.current
-      const isEcho = edit !== null && isEchoOfOwnEdit(edit.emitted, value)
-      if (shouldResyncNumericText(text, value, isEcho)) {
-        setText(formatNumericText(value))
+    // Adopt a value that changed from outside (loaded data, form reset), but
+    // not the echo of what was just typed -- that would rewrite "1." to "1".
+    if (external !== seen) {
+      setSeen(external)
+      if (parseNumberInput(draft) !== external) {
+        setDraft(external === undefined ? '' : String(external))
       }
-      // `text` is intentionally not a dependency: only external changes sync.
-      // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [value])
+    }
 
-    // After every render this field's own edit caused: show what the parent
-    // decided, including when it decided to keep its value (a clamp that
-    // lands where it already was), which no change in `value` reports.
-    // It cannot loop: the edit is cleared first, so the render `setText`
-    // causes finds nothing to reconcile.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    React.useEffect(() => {
-      const edit = ownEdit.current
-      ownEdit.current = null
-      if (edit === null) return
-      const shown = textAfterOwnEdit(text, edit.emitted, value)
-      if (shown !== null) setText(shown)
-    })
-
-    const message = validateNumeric(value, {
-      min: typeof min === 'number' ? min : undefined,
-      max: typeof max === 'number' ? max : undefined,
-      integer,
-      required,
-    })
-    const showMessage = touched && message !== null
-
-    // A single element on purpose: FormControl's Slot hands its id and
-    // aria props to its one child.
     return (
       <Input
         {...props}
         ref={ref}
         type="number"
-        min={min}
-        max={max}
-        value={text}
-        aria-invalid={ariaInvalid ?? (showMessage ? true : undefined)}
+        inputMode={props.inputMode ?? 'decimal'}
+        value={draft}
         onChange={(event) => {
-          const next = event.target.value
-          setText(next)
-          const committed = committedNumber(next)
-          // Text that is not a number commits nothing.
-          if (committed !== null) {
-            ownEdit.current = { emitted: committed }
-            onValueChange(committed)
-          }
-        }}
-        onBlur={(event) => {
-          setTouched(true)
-          onBlur?.(event)
+          setDraft(event.target.value)
+          onValueChange(parseNumberInput(event.target.value))
         }}
       />
     )

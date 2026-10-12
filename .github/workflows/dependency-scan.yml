@@ -112,6 +112,25 @@ jobs:
       # - RUSTSEC-2024-0388 (derivative): transitive via pingora-core and
       #   pingora-load-balancing -> derivative (temps-proxy, temps-edge).
       #   Proc-macro only; the pinned Pingora 0.9 dependency includes it.
+      # - RUSTSEC-2024-0449 (unsafe-libyaml): workspace crates parse YAML
+      #   with `yaml_serde` (maintained serde_yaml fork on `libyaml-rs`), so
+      #   compose files, temps.yaml, Kamal and kubeconfig input never reach
+      #   unsafe-libyaml. The only remaining path is pingora-core 0.9 ->
+      #   serde_yaml, a non-optional dependency (also on Pingora main as of
+      #   2026-10-12) used solely by ServerConf's YAML conf-file loader.
+      #   Temps never gives Pingora a conf file: temps-proxy builds ServerConf
+      #   in code with `Opt { conf: None }` and temps-edge passes
+      #   `Opt::default()`, so the parser is linked but never fed input.
+      # - RUSTSEC-2025-0141 (bincode 2.0.1): no workspace crate uses bincode.
+      #   Its only dependents are microsandbox-filesystem, msb_krun_devices
+      #   and msb_krun_vmm, all under temps-agents' exact-pinned microsandbox
+      #   SDK (ADR-050), which is not linked on musl (the container image) or
+      #   Intel macOS. They encode/decode VM and filesystem state blobs the
+      #   microsandbox runtime writes itself. The latest releases checked on
+      #   2026-10-12 (microsandbox 0.7.8, msb_krun 0.1.41) still require
+      #   `bincode ^2.0.1` non-optionally, so no upgrade drops it. No
+      #   vulnerability is reported against bincode 2.0.1. A temps-core
+      #   Cargo.lock guard test fails if anything else starts depending on it.
       #
       # The three below are vulnerability/unsoundness advisories (not "unmaintained"
       # notices), blocked on upstream fixes with no non-forking workaround.
@@ -189,7 +208,7 @@ jobs:
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          ignore: RUSTSEC-2025-0134,RUSTSEC-2023-0071,RUSTSEC-2026-0235,RUSTSEC-2024-0436,RUSTSEC-2026-0173,RUSTSEC-2024-0388,RUSTSEC-2026-0253
+          ignore: RUSTSEC-2025-0134,RUSTSEC-2023-0071,RUSTSEC-2026-0235,RUSTSEC-2024-0436,RUSTSEC-2026-0173,RUSTSEC-2024-0388,RUSTSEC-2026-0253,RUSTSEC-2024-0449,RUSTSEC-2025-0141
 
   web-audit:
     name: Web Dependency Audit (bun audit)

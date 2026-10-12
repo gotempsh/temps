@@ -5851,6 +5851,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "libyaml-rs"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e126dda6f34391ab7b444f9922055facc83c07a910da3eb16f1e4d9c45dc777"
+
+[[package]]
 name = "libz-ng-sys"
 version = "1.1.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12187,7 +12193,6 @@ dependencies = [
  "sea-orm 1.1.20",
  "serde",
  "serde_json",
- "serde_yaml",
  "sha2 0.11.0",
  "tar",
  "tempfile",
@@ -12208,6 +12213,7 @@ dependencies = [
  "tracing",
  "utoipa",
  "walkdir",
+ "yaml_serde",
 ]
 
 [[package]]
@@ -12635,7 +12641,6 @@ dependencies = [
  "serde",
  "serde_derive",
  "serde_json",
- "serde_yaml",
  "sha2 0.11.0",
  "sqlx 0.8.6",
  "tar",
@@ -12663,6 +12668,7 @@ dependencies = [
  "utoipa",
  "uuid",
  "webpki-root-certs",
+ "yaml_serde",
 ]
 
 [[package]]
@@ -12772,7 +12778,6 @@ dependencies = [
  "sea-orm 1.1.20",
  "serde",
  "serde_json",
- "serde_yaml",
  "sha2 0.11.0",
  "sqlx 0.8.6",
  "sysinfo",
@@ -12857,6 +12862,7 @@ dependencies = [
  "uuid",
  "x25519-dalek",
  "x509-parser",
+ "yaml_serde",
 ]
 
 [[package]]
@@ -13010,7 +13016,6 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
- "serde_yaml",
  "sha2 0.11.0",
  "tempfile",
  "temps-memory",
@@ -13024,6 +13029,7 @@ dependencies = [
  "utoipa-swagger-ui",
  "uuid",
  "x25519-dalek",
+ "yaml_serde",
 ]
 
 [[package]]
@@ -13037,7 +13043,6 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
- "serde_yaml",
  "sha1 0.11.0",
  "sha2 0.11.0",
  "thiserror 2.0.21",
@@ -13045,6 +13050,7 @@ dependencies = [
  "toml",
  "utoipa",
  "x509-parser",
+ "yaml_serde",
 ]
 
 [[package]]
@@ -13093,7 +13099,6 @@ dependencies = [
  "sea-orm 1.1.20",
  "serde",
  "serde_json",
- "serde_yaml",
  "serial_test",
  "sysinfo",
  "tar",
@@ -13115,6 +13120,7 @@ dependencies = [
  "urlencoding",
  "utoipa",
  "uuid",
+ "yaml_serde",
 ]
 
 [[package]]
@@ -13156,7 +13162,6 @@ dependencies = [
  "serde",
  "serde_derive",
  "serde_json",
- "serde_yaml",
  "serial_test",
  "sha2 0.11.0",
  "sysinfo",
@@ -13198,6 +13203,7 @@ dependencies = [
  "utoipa",
  "uuid",
  "x509-parser",
+ "yaml_serde",
  "zeroize",
  "zip",
 ]
@@ -13924,7 +13930,6 @@ dependencies = [
  "sea-orm 1.1.20",
  "serde",
  "serde_json",
- "serde_yaml",
  "temps-core",
  "temps-entities",
  "temps-import-types",
@@ -13934,6 +13939,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "yaml_serde",
 ]
 
 [[package]]
@@ -13947,7 +13953,6 @@ dependencies = [
  "sea-orm 1.1.20",
  "serde",
  "serde_json",
- "serde_yaml",
  "temps-core",
  "temps-entities",
  "temps-import-types",
@@ -13957,6 +13962,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "yaml_serde",
 ]
 
 [[package]]
@@ -14473,7 +14479,6 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
- "serde_yaml",
  "tempfile",
  "temps-core",
  "temps-entities",
@@ -14484,6 +14489,7 @@ dependencies = [
  "tracing",
  "url",
  "utoipa",
+ "yaml_serde",
 ]
 
 [[package]]
@@ -14980,9 +14986,11 @@ dependencies = [
  "temps-config",
  "temps-core",
  "temps-database",
+ "temps-domains",
  "temps-entities",
  "temps-migrations",
  "temps-projects",
+ "temps-routes",
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
@@ -17328,6 +17336,19 @@ dependencies = [
  "arraydeque",
  "encoding_rs",
  "hashlink 0.11.1",
+]
+
+[[package]]
+name = "yaml_serde"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33b729a08a9a6be689bbad3e2bf8015926db54b6622cc89c3a5f7dc174b9e918"
+dependencies = [
+ "indexmap 2.14.0",
+ "itoa",
+ "libyaml-rs",
+ "ryu",
+ "serde",
 ]
 
 [[package]]

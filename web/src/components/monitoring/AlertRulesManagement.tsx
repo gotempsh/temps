@@ -28,8 +28,7 @@ import {
 } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { Badge } from '@/components/ui/badge'
-import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
-import { useConfirmDelete } from '@/components/ui/confirm-delete'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
@@ -157,19 +156,19 @@ export function AlertRulesManagement({
     },
   })
 
-  // Deleting is two steps: the row only asks for confirmation, and the
-  // request is sent from the dialog's confirm button. `mutate` (not
-  // `mutateAsync`) so a failed request surfaces through the mutation's error
-  // toast instead of an unhandled promise rejection.
-  const confirmDelete = useConfirmDelete<AlertRuleResponse>(
-    (rule, callbacks) => {
-      if (!projectId) return
-      deleteMutation.mutate(
-        { path: { project_id: projectId, rule_id: rule.id } },
-        callbacks
-      )
-    }
+  const [ruleToDelete, setRuleToDelete] = useState<AlertRuleResponse | null>(
+    null
   )
+
+  // `mutate`, not `mutateAsync`: a failed delete is reported by the mutation's
+  // error handler and must not also surface as an unhandled rejection.
+  const handleConfirmDelete = () => {
+    if (!projectId || !ruleToDelete) return
+    deleteMutation.mutate({
+      path: { project_id: projectId, rule_id: ruleToDelete.id },
+    })
+    setRuleToDelete(null)
+  }
 
   const handleToggleEnabled = (rule: AlertRuleResponse) => {
     if (!projectId) return
@@ -312,7 +311,7 @@ export function AlertRulesManagement({
                       <DropdownMenuSeparator />
                       <DropdownMenuItem
                         className="text-destructive"
-                        onClick={() => confirmDelete.request(rule)}
+                        onClick={() => setRuleToDelete(rule)}
                       >
                         Delete
                       </DropdownMenuItem>
@@ -341,16 +340,12 @@ export function AlertRulesManagement({
           ))}
         </div>
       )}
-
-      <ConfirmDeleteDialog
-        open={confirmDelete.open}
-        onOpenChange={(open) => {
-          if (!open) confirmDelete.cancel()
-        }}
-        resourceType="alert rule"
-        resourceName={confirmDelete.target?.name}
-        isPending={deleteMutation.isPending}
-        onConfirm={confirmDelete.confirm}
+      <ConfirmDialog
+        open={ruleToDelete !== null}
+        onOpenChange={(open) => !open && setRuleToDelete(null)}
+        title={`Delete ${ruleToDelete?.name ?? 'alert rule'}?`}
+        description="This permanently deletes the alert rule. It will stop sending notifications immediately. This cannot be undone."
+        onConfirm={handleConfirmDelete}
       />
     </div>
   )

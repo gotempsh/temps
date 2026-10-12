@@ -1369,12 +1369,12 @@ impl BackupCommand {
     }
 
     fn extract_server_config_secret(server_config: &str, field: &str) -> anyhow::Result<String> {
-        let value = serde_yaml::from_str::<serde_yaml::Value>(server_config).map_err(|error| {
+        let value = yaml_serde::from_str::<yaml_serde::Value>(server_config).map_err(|error| {
             anyhow::anyhow!("Failed to parse recovery server configuration: {}", error)
         })?;
         value
             .get(field)
-            .and_then(serde_yaml::Value::as_str)
+            .and_then(yaml_serde::Value::as_str)
             .map(str::trim)
             .filter(|secret| !secret.is_empty())
             .map(str::to_owned)

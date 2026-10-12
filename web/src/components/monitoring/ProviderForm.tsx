@@ -16,7 +16,6 @@ import {
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 import { NumberInput } from '@/components/ui/number-input'
-import { numberFieldProps } from '@/lib/numeric-input'
 import {
   Select,
   SelectContent,
@@ -34,7 +33,7 @@ import { ProviderFormData } from './schemas'
 
 interface ProviderFormProps {
   form: UseFormReturn<ProviderFormData>
-  onSubmit: (data: ProviderFormData) => void | Promise<void>
+  onSubmit: (data: ProviderFormData) => Promise<void>
   isEdit?: boolean
   isLoading?: boolean
   formId?: string
@@ -250,15 +249,16 @@ export function ProviderForm({
                     <FormItem>
                       <FormLabel>SMTP Port</FormLabel>
                       <FormControl>
-                        <Input
-                          {...field}
-                          type="number"
+                        <NumberInput
+                          name={field.name}
+                          ref={field.ref}
+                          onBlur={field.onBlur}
                           placeholder={getSuggestedPort()}
-                          onChange={(e) =>
-                            field.onChange(
-                              e.target.value ? parseInt(e.target.value) : ''
-                            )
+                          inputMode="numeric"
+                          onValueChange={(value) =>
+                            field.onChange(value ?? Number.NaN)
                           }
+                          value={field.value}
                         />
                       </FormControl>
                       <FormDescription>
@@ -599,11 +599,16 @@ export function ProviderForm({
                     <FormLabel>Timeout (seconds)</FormLabel>
                     <FormControl>
                       <NumberInput
-                        {...numberFieldProps(field)}
+                        name={field.name}
+                        ref={field.ref}
+                        onBlur={field.onBlur}
                         placeholder="30"
                         min={1}
                         max={300}
-                        integer
+                        onValueChange={(value) =>
+                          field.onChange(value ?? Number.NaN)
+                        }
+                        value={field.value}
                       />
                     </FormControl>
                     <FormMessage />

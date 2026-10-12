@@ -734,7 +734,7 @@ impl AgentExecutor {
 
         // Per-run overrides from the ephemeral YAML take precedence over globals.
         let (yaml_cpu, yaml_mem): (Option<f64>, Option<u64>) = ephemeral_yaml
-            .and_then(|y| serde_yaml::from_str::<temps_core::WorkflowYamlConfig>(y).ok())
+            .and_then(|y| yaml_serde::from_str::<temps_core::WorkflowYamlConfig>(y).ok())
             .map(|y| (y.cpu_limit, y.memory_limit_mb))
             .unwrap_or((None, None));
         let cpu_limit = yaml_cpu.unwrap_or(global_sandbox.cpu_limit);
@@ -1956,7 +1956,7 @@ impl AgentExecutor {
         platform_default_provider: &str,
     ) -> Result<project_agents::Model, AgentError> {
         let yaml: temps_core::WorkflowYamlConfig =
-            serde_yaml::from_str(ephemeral_yaml).map_err(|e| AgentError::Validation {
+            yaml_serde::from_str(ephemeral_yaml).map_err(|e| AgentError::Validation {
                 message: format!("Invalid ephemeral_yaml: {}", e),
             })?;
 

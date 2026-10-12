@@ -14,8 +14,6 @@ import {
 } from '@/api/client'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
-import { useConfirmDelete } from '@/components/ui/confirm-delete'
 import { CreateActionButton } from '@/components/ui/create-action-button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
@@ -43,6 +41,7 @@ import {
   FormLabel,
   FormMessage,
 } from '@/components/ui/form'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Input } from '@/components/ui/input'
 import {
   Select,
@@ -253,11 +252,11 @@ function ProviderCard({
   onEditClick,
 }: {
   provider: EmailProvider
-  /** Asks for confirmation; deleting happens from the confirm dialog. */
-  onDelete: (provider: EmailProvider) => void
+  onDelete: (id: number) => void
   onTestClick: (id: number) => void
   onEditClick: (provider: EmailProvider) => void
 }) {
+  const [confirmingDelete, setConfirmingDelete] = useState(false)
   const navigate = useNavigate()
 
   return (
@@ -306,12 +305,21 @@ function ProviderCard({
               <DropdownMenuSeparator />
               <DropdownMenuItem
                 className="text-destructive"
-                onClick={() => onDelete(provider)}
+                onClick={() => setConfirmingDelete(true)}
               >
                 Delete
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
+          {/* Inside the stopPropagation wrapper so clicks in the dialog (a
+              React portal child of this card) don't navigate to the detail. */}
+          <ConfirmDialog
+            open={confirmingDelete}
+            onOpenChange={setConfirmingDelete}
+            title={`Delete ${provider.name}?`}
+            description="This permanently deletes the email provider. Domains and sending that rely on it will stop working. This cannot be undone."
+            onConfirm={() => onDelete(provider.id)}
+          />
         </div>
       </CardHeader>
       <CardContent>
@@ -946,11 +954,9 @@ export function EmailProvidersManagement() {
     },
   })
 
-  // The card menu only asks for confirmation; the request is sent from the
-  // dialog's confirm button.
-  const confirmDelete = useConfirmDelete<EmailProvider>((provider, callbacks) =>
-    deleteMutation.mutate(provider.id, callbacks)
-  )
+  const handleDelete = (id: number) => {
+    deleteMutation.mutate(id)
+  }
 
   const handleTestClick = (id: number) => {
     setTestingProviderId(id)
@@ -1005,7 +1011,7 @@ export function EmailProvidersManagement() {
             <ProviderCard
               key={provider.id}
               provider={provider}
-              onDelete={confirmDelete.request}
+              onDelete={handleDelete}
               onTestClick={handleTestClick}
               onEditClick={handleEditClick}
             />
@@ -1029,17 +1035,6 @@ export function EmailProvidersManagement() {
         onSuccess={() => {
           queryClient.invalidateQueries({ queryKey: ['email-providers'] })
         }}
-      />
-
-      <ConfirmDeleteDialog
-        open={confirmDelete.open}
-        onOpenChange={(open) => {
-          if (!open) confirmDelete.cancel()
-        }}
-        resourceType="email provider"
-        resourceName={confirmDelete.target?.name}
-        isPending={deleteMutation.isPending}
-        onConfirm={confirmDelete.confirm}
       />
     </div>
   )

@@ -1,48 +1,64 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { describe, expect, test } from 'bun:test'
-import { renderToStaticMarkup } from 'react-dom/server'
-
+import { afterEach, expect, test } from 'bun:test'
+import { useState } from 'react'
+import { cleanup, fireEvent, render } from '@testing-library/react'
+import { installBrowserWindow } from '@/test/dom'
+import { parseNumberInput } from '@/lib/parse-number-input'
 import { NumberInput } from './number-input'
 
-function render(value: number | null | undefined, extra = {}) {
-  return renderToStaticMarkup(
-    <NumberInput value={value} onValueChange={() => {}} {...extra} />
+installBrowserWindow()
+afterEach(cleanup)
+
+function Harness({ initial }: { initial: number | undefined }) {
+  const [value, setValue] = useState<number | undefined>(initial)
+  return (
+    <div>
+      <NumberInput aria-label="limit" value={value} onValueChange={setValue} />
+      <output data-testid="state">{String(value)}</output>
+    </div>
   )
 }
 
-describe('NumberInput', () => {
-  test('renders a native number input showing the committed value', () => {
-    const html = render(42, { min: 1, max: 100 })
-    expect(html).toContain('type="number"')
-    expect(html).toContain('value="42"')
-    expect(html).toContain('min="1"')
-    expect(html).toContain('max="100"')
-  })
+test('emptying the field leaves it empty, so typing 42 gives 42', () => {
+  const view = render(<Harness initial={60} />)
+  const input = view.getByLabelText('limit') as HTMLInputElement
+  expect(input.value).toBe('60')
 
-  test('an absent value renders an empty field, not 0 or a default', () => {
-    expect(render(undefined)).toContain('value=""')
-    expect(render(null)).toContain('value=""')
-  })
+  fireEvent.change(input, { target: { value: '' } })
+  expect(input.value).toBe('')
+  expect(view.getByTestId('state').textContent).toBe('undefined')
 
-  test('zero renders as 0', () => {
-    expect(render(0)).toContain('value="0"')
-  })
+  fireEvent.change(input, { target: { value: '4' } })
+  fireEvent.change(input, { target: { value: '42' } })
+  expect(input.value).toBe('42')
+  expect(view.getByTestId('state').textContent).toBe('42')
+})
 
-  test('is a single input element so FormControl can wrap it', () => {
-    expect(render(5).match(/<input /g)?.length).toBe(1)
-    expect(render(5).startsWith('<input')).toBe(true)
-  })
+test('a value changed from outside replaces the text', () => {
+  function External() {
+    const [value, setValue] = useState<number | undefined>(5)
+    return (
+      <div>
+        <NumberInput
+          aria-label="limit"
+          value={value}
+          onValueChange={setValue}
+        />
+        <button onClick={() => setValue(99)}>load</button>
+      </div>
+    )
+  }
+  const view = render(<External />)
+  fireEvent.click(view.getByText('load'))
+  expect((view.getByLabelText('limit') as HTMLInputElement).value).toBe('99')
+})
 
-  test('forwards ordinary input props', () => {
-    const html = render(3, {
-      id: 'cooldown',
-      placeholder: '60',
-      disabled: true,
-    })
-    expect(html).toContain('id="cooldown"')
-    expect(html).toContain('placeholder="60"')
-    expect(html).toContain('disabled=""')
-  })
+test('only finite numbers are reported', () => {
+  expect(parseNumberInput('')).toBeUndefined()
+  expect(parseNumberInput('  ')).toBeUndefined()
+  expect(parseNumberInput('abc')).toBeUndefined()
+  expect(parseNumberInput('0')).toBe(0)
+  expect(parseNumberInput('-3.5')).toBe(-3.5)
 })

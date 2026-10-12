@@ -1064,6 +1064,22 @@
         ],
         "type": "object"
       },
+      "AddStatusPageDomainRequest": {
+        "properties": {
+          "hostname": {
+            "description": "Hostname to serve the page on, e.g. `status.example.com`. Unicode names\nare converted to punycode; wildcards and IP addresses are refused.",
+            "type": "string"
+          },
+          "verification_method": {
+            "$ref": "#/components/schemas/VerificationMethod",
+            "description": "Defaults to `http-01`."
+          }
+        },
+        "required": [
+          "hostname"
+        ],
+        "type": "object"
+      },
       "AdminGateResponse": {
         "properties": {
           "allowed_hosts": {
@@ -17870,6 +17886,34 @@
             "type": "object"
           }
         ]
+      },
+      "DnsRecordInstruction": {
+        "description": "A DNS record the operator must create.",
+        "properties": {
+          "name": {
+            "description": "Fully qualified record name.",
+            "type": "string"
+          },
+          "purpose": {
+            "description": "Why the record is needed.",
+            "type": "string"
+          },
+          "record_type": {
+            "description": "`CNAME`, `A` or `TXT`.",
+            "type": "string"
+          },
+          "value": {
+            "description": "Record value.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "record_type",
+          "name",
+          "value",
+          "purpose"
+        ],
+        "type": "object"
       },
       "DnsRecordResponse": {
         "properties": {
@@ -52188,6 +52232,73 @@
         ],
         "type": "object"
       },
+      "StatusPageDomainResponse": {
+        "properties": {
+          "certificate_expires_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "dns_records": {
+            "items": {
+              "$ref": "#/components/schemas/DnsRecordInstruction"
+            },
+            "type": "array"
+          },
+          "hostname": {
+            "type": "string"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "last_error": {
+            "description": "Reason the last verification failed, if it did.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "serving": {
+            "description": "True when visitors can open the page on this hostname right now: the\nhostname is verified and the page is published.",
+            "type": "boolean"
+          },
+          "status": {
+            "$ref": "#/components/schemas/StatusPageDomainStatus"
+          },
+          "verification_method": {
+            "$ref": "#/components/schemas/VerificationMethod"
+          }
+        },
+        "required": [
+          "id",
+          "hostname",
+          "verification_method",
+          "status",
+          "serving",
+          "dns_records",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "StatusPageDomainStatus": {
+        "description": "Lifecycle of a custom hostname.",
+        "enum": [
+          "pending",
+          "active",
+          "failed",
+          "unverified",
+          "renewal_pending",
+          "renewal_failed"
+        ],
+        "type": "string"
+      },
       "StatusPageListResponse": {
         "properties": {
           "items": {
@@ -59241,6 +59352,14 @@
           "page_size"
         ],
         "type": "object"
+      },
+      "VerificationMethod": {
+        "description": "How ownership of a hostname is proven.",
+        "enum": [
+          "http-01",
+          "dns-01"
+        ],
+        "type": "string"
       },
       "VerificationResult": {
         "properties": {
@@ -124651,6 +124770,318 @@
           }
         ],
         "summary": "Update a status page's title, description or monitor selection",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/status-pages/{status_page_id}/domains": {
+      "get": {
+        "operationId": "list_status_page_domains",
+        "parameters": [
+          {
+            "description": "Status page ID",
+            "in": "path",
+            "name": "status_page_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/StatusPageDomainResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Custom domains with their DNS records and state"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Status page not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List a status page's custom domains",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      },
+      "post": {
+        "description": "The hostname is checked against every hostname this instance already\nserves. It is served only after ownership is verified through ACME.",
+        "operationId": "add_status_page_domain",
+        "parameters": [
+          {
+            "description": "Status page ID",
+            "in": "path",
+            "name": "status_page_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddStatusPageDomainRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusPageDomainResponse"
+                }
+              }
+            },
+            "description": "Domain attached; create the DNS records, then verify"
+          },
+          "400": {
+            "description": "Invalid hostname"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Status page not found"
+          },
+          "409": {
+            "description": "Hostname already in use, or domain limit reached"
+          },
+          "502": {
+            "description": "Certificate order could not be started"
+          },
+          "503": {
+            "description": "Hostname availability could not be checked"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Attach a custom domain to a status page",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/status-pages/{status_page_id}/domains/{domain_id}": {
+      "delete": {
+        "operationId": "remove_status_page_domain",
+        "parameters": [
+          {
+            "description": "Status page ID",
+            "in": "path",
+            "name": "status_page_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Custom domain ID",
+            "in": "path",
+            "name": "domain_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Domain removed; its certificate is deleted"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Status page or domain not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Remove a custom domain from a status page; it answers 404 immediately",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/status-pages/{status_page_id}/domains/{domain_id}/renew": {
+      "post": {
+        "description": "Starts a new ACME order while the current certificate keeps being served.\nHTTP-01 completes immediately. DNS-01 returns `renewal_pending` with the\nnew `_acme-challenge` TXT record: publish it, then call verify.",
+        "operationId": "renew_status_page_domain",
+        "parameters": [
+          {
+            "description": "Status page ID",
+            "in": "path",
+            "name": "status_page_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Custom domain ID",
+            "in": "path",
+            "name": "domain_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusPageDomainResponse"
+                }
+              }
+            },
+            "description": "Renewal started (DNS-01) or completed (HTTP-01)"
+          },
+          "400": {
+            "description": "The new order could not be validated"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Status page or domain not found"
+          },
+          "409": {
+            "description": "The page is unpublished, the domain has no certificate yet, or another verify or renew of this hostname is in progress"
+          },
+          "429": {
+            "description": "Too many domain operations for this project"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Renew the certificate of a status page's custom domain",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/status-pages/{status_page_id}/domains/{domain_id}/verify": {
+      "post": {
+        "operationId": "verify_status_page_domain",
+        "parameters": [
+          {
+            "description": "Status page ID",
+            "in": "path",
+            "name": "status_page_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Custom domain ID",
+            "in": "path",
+            "name": "domain_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusPageDomainResponse"
+                }
+              }
+            },
+            "description": "Verification result; `status` is `active` once the certificate is issued"
+          },
+          "400": {
+            "description": "Ownership could not be verified yet"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Status page or domain not found"
+          },
+          "409": {
+            "description": "The page is unpublished, or another verify or renew of this hostname is in progress"
+          },
+          "429": {
+            "description": "Too many domain operations for this project"
+          },
+          "502": {
+            "description": "Certificate order could not be started"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Verify ownership of a status page's custom domain and issue its certificate",
         "tags": [
           "Status Page"
         ],

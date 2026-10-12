@@ -72,8 +72,8 @@ import {
   fmtDate,
   fmtDateTime,
   fmtRelativeTime,
+  useUrlBoundText,
   useUrlState,
-  useUrlTextInput,
   type DetailFact,
 } from '@temps-sdk/ds'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
@@ -98,7 +98,7 @@ import {
   Search,
   XCircle,
 } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 
@@ -304,13 +304,17 @@ export function S3SourceDetail() {
   >()
   const backupSearch = getBackupsUrlState('q') ?? ''
   const backupPage = Number(getBackupsUrlState('page') ?? '1') || 1
-  // The box keeps its own text and writes `q` + the page reset to the URL in
-  // one update, so fast typing never loses characters.
-  const backupSearchInput = useUrlTextInput({
-    value: backupSearch,
-    onCommit: (value) =>
+  // Search text and the page reset it implies are one URL update; the box
+  // keeps what was typed locally so a router transition can't drop keystrokes.
+  const commitBackupSearch = useCallback(
+    (value: string) =>
       patchBackupsUrlState({ q: value || undefined, page: undefined }),
-  })
+    [patchBackupsUrlState]
+  )
+  const [backupSearchText, setBackupSearchText] = useUrlBoundText(
+    backupSearch,
+    commitBackupSearch
+  )
   const setBackupPage = (value: number | ((current: number) => number)) => {
     const next = typeof value === 'function' ? value(backupPage) : value
     patchBackupsUrlState({ page: next > 1 ? next : undefined })
@@ -699,8 +703,8 @@ export function S3SourceDetail() {
                   <Input
                     type="search"
                     placeholder="Search by service, engine, state, or UUID…"
-                    value={backupSearchInput.value}
-                    onChange={(e) => backupSearchInput.setValue(e.target.value)}
+                    value={backupSearchText}
+                    onChange={(e) => setBackupSearchText(e.target.value)}
                     className="pl-9"
                   />
                 </div>

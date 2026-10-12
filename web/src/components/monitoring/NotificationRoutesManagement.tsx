@@ -8,19 +8,15 @@ import {
   listNotificationProvidersOptions,
   listNotificationRoutesOptions,
 } from '@/api/client/@tanstack/react-query.gen'
-import type {
-  NotificationProviderResponse,
-  NotificationRoute,
-} from '@/api/client/types.gen'
+import type { NotificationProviderResponse } from '@/api/client/types.gen'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
-import { useConfirmDelete } from '@/components/ui/confirm-delete'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { EmptyState } from '@/components/ui/empty-state'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { BellRing, Pencil, Plus, Trash2 } from 'lucide-react'
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
 import { useNavigate } from 'react-router'
 import { withReturnTo } from '@/lib/safe-return-to'
 import { toast } from 'sonner'
@@ -70,12 +66,15 @@ export function NotificationRoutesManagement({
     },
   })
 
-  // The trash button only asks for confirmation; the request is sent from the
-  // dialog's confirm button.
-  const confirmDelete = useConfirmDelete<NotificationRoute>(
-    (route, callbacks) =>
-      deleteMutation.mutate({ path: { id: route.id } }, callbacks)
-  )
+  const [routeToDelete, setRouteToDelete] = useState<{
+    id: number
+    name: string
+  } | null>(null)
+  const handleConfirmDelete = () => {
+    if (!routeToDelete) return
+    deleteMutation.mutate({ path: { id: routeToDelete.id } })
+    setRouteToDelete(null)
+  }
 
   const routes = routePage?.items || []
   const isLoading = routesLoading || providersLoading
@@ -165,7 +164,9 @@ export function NotificationRoutesManagement({
                     size="icon"
                     aria-label={`Delete ${route.name}`}
                     disabled={deleteMutation.isPending}
-                    onClick={() => confirmDelete.request(route)}
+                    onClick={() =>
+                      setRouteToDelete({ id: route.id, name: route.name })
+                    }
                   >
                     <Trash2 className="h-4 w-4" />
                   </Button>
@@ -198,16 +199,12 @@ export function NotificationRoutesManagement({
           ))}
         </div>
       )}
-
-      <ConfirmDeleteDialog
-        open={confirmDelete.open}
-        onOpenChange={(open) => {
-          if (!open) confirmDelete.cancel()
-        }}
-        resourceType="notification route"
-        resourceName={confirmDelete.target?.name}
-        isPending={deleteMutation.isPending}
-        onConfirm={confirmDelete.confirm}
+      <ConfirmDialog
+        open={routeToDelete !== null}
+        onOpenChange={(open) => !open && setRouteToDelete(null)}
+        title={`Delete ${routeToDelete?.name ?? 'notification route'}?`}
+        description="This permanently deletes the notification route. Alerts matching it will no longer be delivered through it. This cannot be undone."
+        onConfirm={handleConfirmDelete}
       />
     </div>
   )

@@ -15,8 +15,6 @@ import {
 import { revealNotificationProviderConfig } from '@/api/client/sdk.gen'
 import { NotificationProviderResponse } from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
-import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
-import { useConfirmDelete } from '@/components/ui/confirm-delete'
 import { CreateActionButton } from '@/components/ui/create-action-button'
 import { fmtDateTime, fmtRelativeTime } from '@temps-sdk/ds'
 import {
@@ -33,6 +31,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { EmptyState } from '@/components/ui/empty-state'
 import { Switch } from '@/components/ui/switch'
 import { zodResolver } from '@hookform/resolvers/zod'
@@ -195,77 +194,80 @@ export function ProvidersManagement({
     },
   })
 
-  // `mutate`, not `mutateAsync`: the mutation's own error toast reports a
-  // failed save, and a rejected promise here would escape react-hook-form's
-  // submit handler as an unhandled rejection.
-  const onEditSubmit = (data: ProviderFormData) => {
+  const onEditSubmit = async (data: ProviderFormData) => {
     if (!editingProvider) return
 
-    if (data.provider_type === 'slack') {
-      updateSlackMutation.mutate({
-        path: { id: editingProvider.id },
-        body: {
-          name: data.name,
-          enabled: editingProvider.enabled,
-          config: {
-            webhook_url: data.config.webhook_url!,
-            channel: data.config.channel ?? null,
+    try {
+      if (data.provider_type === 'slack') {
+        await updateSlackMutation.mutateAsync({
+          path: { id: editingProvider.id },
+          body: {
+            name: data.name,
+            enabled: editingProvider.enabled,
+            config: {
+              webhook_url: data.config.webhook_url!,
+              channel: data.config.channel ?? null,
+            },
           },
-        },
-      })
-    } else if (data.provider_type === 'webhook') {
-      updateWebhookMutation.mutate({
-        path: { id: editingProvider.id },
-        body: {
-          name: data.name,
-          enabled: editingProvider.enabled,
-          config: {
-            url: data.config.url!,
-            method: data.config.method || 'POST',
-            headers: (data.config.headers || {}) as Record<string, string>,
-            timeout_secs: data.config.timeout_secs || 30,
+        })
+      } else if (data.provider_type === 'webhook') {
+        await updateWebhookMutation.mutateAsync({
+          path: { id: editingProvider.id },
+          body: {
+            name: data.name,
+            enabled: editingProvider.enabled,
+            config: {
+              url: data.config.url!,
+              method: data.config.method || 'POST',
+              headers: (data.config.headers || {}) as Record<string, string>,
+              timeout_secs: data.config.timeout_secs || 30,
+            },
           },
-        },
-      })
-    } else if (data.provider_type === 'cloudflare') {
-      updateCloudflareMutation.mutate({
-        path: { id: editingProvider.id },
-        body: {
-          name: data.name,
-          enabled: editingProvider.enabled,
-          config: {
-            account_id: data.config.account_id!,
-            api_token: data.config.api_token!,
-            from_address: data.config.from_address!,
-            from_name: data.config.from_name || undefined,
-            to_addresses: data.config.to_addresses!,
+        })
+      } else if (data.provider_type === 'cloudflare') {
+        await updateCloudflareMutation.mutateAsync({
+          path: { id: editingProvider.id },
+          body: {
+            name: data.name,
+            enabled: editingProvider.enabled,
+            config: {
+              account_id: data.config.account_id!,
+              api_token: data.config.api_token!,
+              from_address: data.config.from_address!,
+              from_name: data.config.from_name || undefined,
+              to_addresses: data.config.to_addresses!,
+            },
           },
-        },
-      })
-    } else {
-      updateEmailMutation.mutate({
-        path: { id: editingProvider.id },
-        body: {
-          name: data.name,
-          enabled: editingProvider.enabled,
-          config: {
-            smtp_host: data.config.smtp_host!,
-            smtp_port: data.config.smtp_port!,
-            username: data.config.use_credentials
-              ? data.config.smtp_username || ''
-              : '',
-            password: data.config.use_credentials
-              ? data.config.password || ''
-              : '',
-            from_address: data.config.from_address!,
-            to_addresses: data.config.to_addresses!,
-            from_name: data.config.from_name || undefined,
-            tls_mode: data.config.tls_mode || undefined,
-            starttls_required: data.config.starttls_required,
-            accept_invalid_certs: data.config.accept_invalid_certs,
+        })
+      } else {
+        await updateEmailMutation.mutateAsync({
+          path: { id: editingProvider.id },
+          body: {
+            name: data.name,
+            enabled: editingProvider.enabled,
+            config: {
+              smtp_host: data.config.smtp_host!,
+              smtp_port: data.config.smtp_port!,
+              username: data.config.use_credentials
+                ? data.config.smtp_username || ''
+                : '',
+              password: data.config.use_credentials
+                ? data.config.password || ''
+                : '',
+              from_address: data.config.from_address!,
+              to_addresses: data.config.to_addresses!,
+              from_name: data.config.from_name || undefined,
+              tls_mode: data.config.tls_mode || undefined,
+              starttls_required: data.config.starttls_required,
+              accept_invalid_certs: data.config.accept_invalid_certs,
+            },
           },
-        },
-      })
+        })
+      }
+    } catch {
+      // The mutation's error handler already shows the failure toast; the
+      // rejection must not escape react-hook-form's submit handler as an
+      // unhandled promise rejection.
     }
   }
 
@@ -284,12 +286,16 @@ export function ProvidersManagement({
     return data.value
   }
 
-  // The row's Delete item only asks for confirmation; the request is sent
-  // from the dialog's confirm button.
-  const confirmDelete = useConfirmDelete<ExtendedNotificationProvider>(
-    (provider, callbacks) =>
-      deleteMutation.mutate({ path: { id: provider.id } }, callbacks)
-  )
+  const [providerToDelete, setProviderToDelete] =
+    useState<ExtendedNotificationProvider | null>(null)
+
+  // `mutate`, not `mutateAsync`: a failed delete is reported by the mutation's
+  // error handler and must not also surface as an unhandled rejection.
+  const handleConfirmDelete = () => {
+    if (!providerToDelete) return
+    deleteMutation.mutate({ path: { id: providerToDelete.id } })
+    setProviderToDelete(null)
+  }
 
   const handleTest = async (provider: ExtendedNotificationProvider) => {
     const toastId = toast.loading('Sending test notification...')
@@ -481,7 +487,7 @@ export function ProvidersManagement({
                       <DropdownMenuSeparator />
                       <DropdownMenuItem
                         className="text-destructive"
-                        onClick={() => confirmDelete.request(typedProvider)}
+                        onClick={() => setProviderToDelete(typedProvider)}
                       >
                         Delete
                       </DropdownMenuItem>
@@ -515,15 +521,12 @@ export function ProvidersManagement({
         </DialogContent>
       </Dialog>
 
-      <ConfirmDeleteDialog
-        open={confirmDelete.open}
-        onOpenChange={(open) => {
-          if (!open) confirmDelete.cancel()
-        }}
-        resourceType="notification provider"
-        resourceName={confirmDelete.target?.name}
-        isPending={deleteMutation.isPending}
-        onConfirm={confirmDelete.confirm}
+      <ConfirmDialog
+        open={providerToDelete !== null}
+        onOpenChange={(open) => !open && setProviderToDelete(null)}
+        title={`Delete ${providerToDelete?.name ?? 'provider'}?`}
+        description="This permanently deletes the notification provider. Notification routes that use it will stop delivering to it. This cannot be undone."
+        onConfirm={handleConfirmDelete}
       />
     </div>
   )

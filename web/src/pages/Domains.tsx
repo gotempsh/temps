@@ -6,19 +6,19 @@ import { PageContainer } from '@/components/layout/PageContainer'
 import { useQuery } from '@tanstack/react-query'
 import { listDomainsOptions } from '@/api/client/@tanstack/react-query.gen'
 import type { DomainSort } from '@/components/domains/domain-sort'
-import { useBatchedSearchParams, useUrlTextInput } from '@temps-sdk/ds'
 import { DomainsManagement } from '@/components/domains/DomainsManagement'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useDebounce } from '@/hooks/useDebounce'
 import { useEffect } from 'react'
+import { useComposedSearchParams } from '@temps-sdk/ds'
 
 const PAGE_SIZE = 20
 
 export function Domains() {
   const { setBreadcrumbs } = useBreadcrumbs()
-  const [params, setParams] = useBatchedSearchParams()
+  const [params, updateParams] = useComposedSearchParams()
   const searchQuery = params.get('search') ?? ''
   const sort: DomainSort =
     params.get('sort') === 'domain' || params.get('sort') === 'status'
@@ -39,28 +39,18 @@ export function Domains() {
   const { data, isLoading, isError, refetch } = useQuery(
     listDomainsOptions({ query })
   )
-  const updateParams = (values: Record<string, string>) =>
-    setParams(
-      (previous) => {
-        const next = new URLSearchParams(previous)
-        for (const [key, value] of Object.entries(values)) {
-          if (value) next.set(key, value)
-          else next.delete(key)
-        }
-        return next
-      },
-      { replace: true }
-    )
-  // The box keeps its own text, so fast typing is never reverted by the
-  // router's late location update. The query below is debounced separately,
-  // so each keystroke is written to the URL straight away (`debounceMs: 0`).
-  const searchInput = useUrlTextInput({
-    value: searchQuery,
-    debounceMs: 0,
-    onCommit: (value) => updateParams({ search: value, page: '1' }),
-  })
+  const patchParams = (values: Record<string, string>) =>
+    updateParams((next) => {
+      for (const [key, value] of Object.entries(values)) {
+        if (value) next.set(key, value)
+        else next.delete(key)
+      }
+      return next
+    })
+  const handleSearchChange = (value: string) =>
+    patchParams({ search: value, page: '1' })
   const handleSortChange = (value: DomainSort) =>
-    updateParams({
+    patchParams({
       sort: value,
       direction: sort === value && direction === 'asc' ? 'desc' : 'asc',
       page: '1',
@@ -80,16 +70,12 @@ export function Domains() {
 
   useEffect(() => {
     if (data && page > totalPages) {
-      setParams(
-        (previous) => {
-          const next = new URLSearchParams(previous)
-          next.set('page', String(totalPages))
-          return next
-        },
-        { replace: true }
-      )
+      updateParams((next) => {
+        next.set('page', String(totalPages))
+        return next
+      })
     }
-  }, [data, page, totalPages, setParams])
+  }, [data, page, totalPages, updateParams])
 
   return (
     <PageContainer innerClassName="space-y-6">
@@ -106,9 +92,9 @@ export function Domains() {
           page={page}
           pageSize={PAGE_SIZE}
           totalPages={totalPages}
-          onPageChange={(page) => updateParams({ page: String(page) })}
-          searchQuery={searchInput.value}
-          onSearchChange={searchInput.setValue}
+          onPageChange={(page) => patchParams({ page: String(page) })}
+          searchQuery={searchQuery}
+          onSearchChange={handleSearchChange}
           isSearching={searchQuery !== debouncedSearch}
         />
       </div>

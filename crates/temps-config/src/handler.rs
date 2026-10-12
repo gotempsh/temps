@@ -3495,6 +3495,20 @@ async fn update_settings(
                 }),
             ))
         }
+        Err(crate::ConfigServiceError::PublicIngressHostnameInUse { hostname }) => {
+            // A status page claimed the hostname after this request checked
+            // it. Same response as the up-front check (owner not disclosed
+            // beyond the kind of resource).
+            Err(ErrorBuilder::new(StatusCode::CONFLICT)
+                .title("Public Ingress Hostname In Use")
+                .detail(format!(
+                    "'{hostname}' is already used by a status page custom domain. The public \
+                     ingress hostname is reserved for Temps itself. Choose another hostname, or \
+                     remove it from the status page first."
+                ))
+                .value("field", "public_ingress_url")
+                .build())
+        }
         Err(e) => {
             tracing::error!("Failed to update settings: {}", e);
             Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
@@ -3986,6 +4000,10 @@ mod tests {
             .append_query_results(vec![Vec::<project_custom_domains::Model>::new()])
             .append_query_results(vec![Vec::<environment_domains::Model>::new()])
             .append_query_results(vec![Vec::<custom_routes::Model>::new()])
+            // A hostname attached to a status page (#1412).
+            .append_query_results(vec![
+                Vec::<temps_entities::status_page_domains::Model>::new(),
+            ])
     }
 
     #[tokio::test]

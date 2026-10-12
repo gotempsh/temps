@@ -46,7 +46,6 @@ import {
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 import { NumberInput } from '@/components/ui/number-input'
-import { numberFieldProps } from '@/lib/numeric-input'
 import { ReadFailure } from '@/components/ui/read-failure'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation } from '@tanstack/react-query'
@@ -344,11 +343,17 @@ export function RoutesManagement({
                     <FormLabel>Port</FormLabel>
                     <FormControl>
                       <NumberInput
-                        {...numberFieldProps(field)}
                         placeholder="8080"
                         min={1}
                         max={65535}
-                        integer
+                        step={1}
+                        name={field.name}
+                        ref={field.ref}
+                        onBlur={field.onBlur}
+                        value={field.value}
+                        onValueChange={(value) =>
+                          field.onChange(value ?? Number.NaN)
+                        }
                       />
                     </FormControl>
                     <FormMessage />

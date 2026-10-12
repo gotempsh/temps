@@ -18,7 +18,6 @@ import {
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 import { NumberInput } from '@/components/ui/number-input'
-import { numberFieldProps } from '@/lib/numeric-input'
 import {
   Select,
   SelectContent,
@@ -147,8 +146,14 @@ function ProjectAlerts({
                             <FormLabel>Error Threshold (per minute)</FormLabel>
                             <FormControl>
                               <NumberInput
-                                {...numberFieldProps(field)}
-                                integer
+                                inputMode="numeric"
+                                name={field.name}
+                                ref={field.ref}
+                                onBlur={field.onBlur}
+                                value={field.value}
+                                onValueChange={(value) =>
+                                  field.onChange(value ?? Number.NaN)
+                                }
                               />
                             </FormControl>
                             <FormMessage />
@@ -164,8 +169,14 @@ function ProjectAlerts({
                             <FormLabel>Time Window (minutes)</FormLabel>
                             <FormControl>
                               <NumberInput
-                                {...numberFieldProps(field)}
-                                integer
+                                inputMode="numeric"
+                                name={field.name}
+                                ref={field.ref}
+                                onBlur={field.onBlur}
+                                value={field.value}
+                                onValueChange={(value) =>
+                                  field.onChange(value ?? Number.NaN)
+                                }
                               />
                             </FormControl>
                             <FormMessage />
@@ -242,8 +253,14 @@ function DomainAlerts({
                             <FormLabel>Days Before Expiration</FormLabel>
                             <FormControl>
                               <NumberInput
-                                {...numberFieldProps(field)}
-                                integer
+                                inputMode="numeric"
+                                name={field.name}
+                                ref={field.ref}
+                                onBlur={field.onBlur}
+                                value={field.value}
+                                onValueChange={(value) =>
+                                  field.onChange(value ?? Number.NaN)
+                                }
                               />
                             </FormControl>
                             <FormMessage />

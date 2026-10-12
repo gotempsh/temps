@@ -351,13 +351,13 @@ fn default_version() -> String {
 
 impl TemplatesConfig {
     /// Parse configuration from YAML string
-    pub fn from_yaml(yaml: &str) -> Result<Self, serde_yaml::Error> {
-        serde_yaml::from_str(yaml)
+    pub fn from_yaml(yaml: &str) -> Result<Self, yaml_serde::Error> {
+        yaml_serde::from_str(yaml)
     }
 
     /// Serialize configuration to YAML string
-    pub fn to_yaml(&self) -> Result<String, serde_yaml::Error> {
-        serde_yaml::to_string(self)
+    pub fn to_yaml(&self) -> Result<String, yaml_serde::Error> {
+        yaml_serde::to_string(self)
     }
 
     /// Load configuration from a file path
@@ -540,7 +540,7 @@ fn parse_bundled_templates(
     let mut templates = Vec::with_capacity(files.len());
     let mut slug_sources = BTreeMap::new();
     for (path, yaml) in files {
-        let template: ProjectTemplate = serde_yaml::from_str(yaml).map_err(|error| {
+        let template: ProjectTemplate = yaml_serde::from_str(yaml).map_err(|error| {
             TemplateConfigError::ParseError(format!(
                 "Failed to parse bundled template '{path}': {error}"
             ))

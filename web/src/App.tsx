@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { RedirectWithQuery } from '@/components/routing/RedirectWithQuery'
 import { CommandPalette } from '@/components/command/CommandPalette'
 import {
   CompactErrorFallback,
@@ -26,7 +27,6 @@ import { getCurrentUserOptions } from '@/api/client/@tanstack/react-query.gen'
 import { Loader2 } from 'lucide-react'
 import { lazy, Suspense, useEffect } from 'react'
 import { BrowserRouter, Route, Routes } from 'react-router'
-import { RedirectWithSearch } from '@/components/layout/RedirectWithSearch'
 import { toast, Toaster } from 'sonner'
 import { gitProviderSetupPath, problemSetupPath } from '@/lib/api-problem'
 import {
@@ -631,11 +631,11 @@ const FullAppRoutes = () => {
                     ))}
                     <Route
                       path="/"
-                      element={<RedirectWithSearch to="/projects" />}
+                      element={<RedirectWithQuery to="/projects" />}
                     />
                     <Route
                       path="/dashboard"
-                      element={<RedirectWithSearch to="/projects" />}
+                      element={<RedirectWithQuery to="/projects" />}
                     />
                     <Route path="/account" element={<Account />} />
                     <Route path="/setup" element={<Setup />} />
@@ -646,7 +646,7 @@ const FullAppRoutes = () => {
                     <Route
                       path="/drop"
                       element={
-                        <RedirectWithSearch to="/projects/new?source=drop" />
+                        <RedirectWithQuery to="/projects/new?source=drop" />
                       }
                     />
                     <Route path="/revenue" element={<Revenue />} />
@@ -667,16 +667,16 @@ const FullAppRoutes = () => {
                     <Route path="/monitoring" element={<Monitoring />}>
                       <Route
                         index
-                        element={<RedirectWithSearch to="alerts" />}
+                        element={<RedirectWithQuery to="alerts" />}
                       />
                       <Route
                         path="resources"
-                        element={<RedirectWithSearch to="/proxy" />}
+                        element={<RedirectWithQuery to="/proxy" />}
                       />
                       <Route
                         path="providers/add"
                         element={
-                          <RedirectWithSearch to="/settings/notifications/new" />
+                          <RedirectWithQuery to="/settings/notifications/new" />
                         }
                       />
                       <Route
@@ -687,7 +687,7 @@ const FullAppRoutes = () => {
                     </Route>
                     <Route
                       path="/alarms"
-                      element={<RedirectWithSearch to="/monitoring/alarms" />}
+                      element={<RedirectWithQuery to="/monitoring/alarms" />}
                     />
                     {/* Observe section */}
                     <Route path="/analytics" element={<GlobalAnalytics />} />
@@ -999,43 +999,43 @@ const FullAppRoutes = () => {
                     {/* Backward-compat: old /settings/<resource> links → new top-level */}
                     <Route
                       path="/settings/domains/*"
-                      element={<RedirectWithSearch to="/domains" />}
+                      element={<RedirectWithQuery to="/domains" />}
                     />
                     <Route
                       path="/settings/email/*"
-                      element={<RedirectWithSearch to="/email" />}
+                      element={<RedirectWithQuery to="/email" />}
                     />
                     <Route
                       path="/settings/ai-gateway/*"
-                      element={<RedirectWithSearch to="/ai-gateway" />}
+                      element={<RedirectWithQuery to="/ai-gateway" />}
                     />
                     <Route
                       path="/settings/ai-providers"
-                      element={<RedirectWithSearch to="/ai-gateway" />}
+                      element={<RedirectWithQuery to="/ai-gateway" />}
                     />
                     <Route
                       path="/settings/agent-sandbox/*"
-                      element={<RedirectWithSearch to="/agent-sandbox" />}
+                      element={<RedirectWithQuery to="/agent-sandbox" />}
                     />
                     <Route
                       path="/settings/skills/*"
-                      element={<RedirectWithSearch to="/skills" />}
+                      element={<RedirectWithQuery to="/skills" />}
                     />
                     <Route
                       path="/settings/mcp-servers/*"
-                      element={<RedirectWithSearch to="/mcp-servers" />}
+                      element={<RedirectWithQuery to="/mcp-servers" />}
                     />
                     <Route
                       path="/settings/git-providers/*"
-                      element={<RedirectWithSearch to="/git-providers" />}
+                      element={<RedirectWithQuery to="/git-providers" />}
                     />
                     <Route
                       path="/settings/dns-providers/*"
-                      element={<RedirectWithSearch to="/dns-providers" />}
+                      element={<RedirectWithQuery to="/dns-providers" />}
                     />
                     <Route
                       path="/settings/backups/*"
-                      element={<RedirectWithSearch to="/backups" />}
+                      element={<RedirectWithQuery to="/backups" />}
                     />
                     {/* Projects */}
                     <Route path="/projects/new" element={<NewProject />} />

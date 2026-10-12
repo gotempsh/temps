@@ -382,7 +382,12 @@ impl PublicStatusPageService {
             let mut active: status_pages::ActiveModel = model.into();
             active.is_published = Set(false);
             active.published_at = Set(None);
-            Ok(active.update(&txn).await?)
+            let model = active.update(&txn).await?;
+            // An unpublished page's custom hostnames keep answering 404, and
+            // their certificates are released so they are neither served nor
+            // renewed. Republishing requires verifying them again.
+            super::domains::release_page_certificates(&txn, status_page_id).await?;
+            Ok(model)
         }
         .await;
         let model = Self::finish(txn, result).await?;
@@ -659,6 +664,18 @@ impl PublicStatusPageService {
 impl temps_core::ProjectDeletionHook for PublicStatusPageService {
     async fn project_deletion_started(&self, project_id: i32) {
         self.remove_project_pages(project_id).await;
+        match super::domains::release_project_certificates(self.db.as_ref(), project_id).await {
+            Ok(released) if released > 0 => info!(
+                project_id,
+                released, "released status page certificates of a project being deleted"
+            ),
+            Ok(_) => {}
+            Err(e) => error!(
+                project_id,
+                error = %e,
+                "failed to release status page certificates of a project being deleted; they are deleted with the project"
+            ),
+        }
         info!(
             project_id,
             "stopped serving status pages of a project being deleted"

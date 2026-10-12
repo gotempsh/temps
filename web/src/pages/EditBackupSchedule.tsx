@@ -27,8 +27,6 @@ import {
 import type { UpdateBackupScheduleRequest } from '@/api/client/types.gen'
 import { ScheduleServicesSelector } from '@/components/backups/ScheduleServicesSelector'
 import { Button } from '@/components/ui/button'
-import { EmptyState } from '@/components/ui/empty-state'
-import { ReadFailure } from '@/components/ui/read-failure'
 import {
   Card,
   CardContent,
@@ -38,18 +36,17 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
-import { NumberInput } from '@/components/ui/number-input'
-import { validateNumeric } from '@/lib/numeric-input'
 import { Label } from '@/components/ui/label'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
+import { ReadFailure } from '@/components/ui/read-failure'
 import { Skeleton } from '@/components/ui/skeleton'
+import { isVerifiedNotFound } from '@/lib/read-failure'
 import { Switch } from '@/components/ui/switch'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { isVerifiedNotFound } from '@/lib/read-failure'
 import { scheduleOptions } from '@/lib/schedule-options'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ArrowLeft, CalendarX } from 'lucide-react'
+import { ArrowLeft } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link, Navigate, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
@@ -84,8 +81,7 @@ export function EditBackupSchedule() {
   // (`setSeeded`), so the initial values here are placeholders until then.
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
-  // `undefined` while the field is empty; submit rejects it.
-  const [retentionPeriod, setRetentionPeriod] = useState<number | undefined>(7)
+  const [retentionPeriod, setRetentionPeriod] = useState(7)
   const [maxRuntimeHours, setMaxRuntimeHours] = useState<number | ''>('')
   const [enabled, setEnabled] = useState(true)
   const [selectedPreset, setSelectedPreset] = useState<string>(
@@ -171,15 +167,19 @@ export function EditBackupSchedule() {
   }
 
   // Guard: the loaded schedule must belong to the source in the URL to prevent
-  // silently re-binding a schedule to a different source's detail page.
-  if (schedule && schedule.s3_source_id !== sourceId) {
+  // silently re-binding a schedule to a different source's detail page. An id
+  // the server verifiably does not know is the same "not found" outcome.
+  const scheduleMissing = isScheduleError && isVerifiedNotFound(scheduleError)
+  if (scheduleMissing || (schedule && schedule.s3_source_id !== sourceId)) {
     return (
       <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
         <Card>
           <CardHeader>
             <CardTitle>Schedule not found</CardTitle>
             <CardDescription>
-              Schedule {scheduleIdNum} does not belong to S3 source {sourceId}.
+              {scheduleMissing
+                ? `Schedule ${scheduleIdNum} does not exist.`
+                : `Schedule ${scheduleIdNum} does not belong to S3 source ${sourceId}.`}
             </CardDescription>
           </CardHeader>
           <CardFooter>
@@ -195,47 +195,6 @@ export function EditBackupSchedule() {
     )
   }
 
-  // The schedule read settled with an error: show it instead of leaving the
-  // form skeleton up forever. Only a verified 404 means the schedule is gone.
-  if (isScheduleError && !schedule) {
-    return (
-      <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
-        <div className="flex items-center gap-2">
-          <Button variant="ghost" size="sm" asChild>
-            <Link to={`/backups/s3-sources/${id}`}>
-              <ArrowLeft className="mr-2 h-4 w-4" />
-              Back to S3 source
-            </Link>
-          </Button>
-        </div>
-        {isVerifiedNotFound(scheduleError) ? (
-          <div className="rounded-lg border bg-card text-card-foreground">
-            <EmptyState
-              size="compact"
-              icon={CalendarX}
-              title="Schedule not found"
-              description={`Backup schedule ${scheduleIdNum} does not exist, or it was removed.`}
-              action={
-                <Button variant="outline" asChild>
-                  <Link to="/backups">Back to backups</Link>
-                </Button>
-              }
-            />
-          </div>
-        ) : (
-          <ReadFailure
-            resource="Backup schedule"
-            error={scheduleError}
-            onRetry={() => {
-              void refetchSchedule()
-            }}
-            retrying={isFetchingSchedule}
-          />
-        )}
-      </div>
-    )
-  }
-
   function handleSubmit() {
     if (!schedule) return
 
@@ -247,15 +206,6 @@ export function EditBackupSchedule() {
     }
     if (!cron) {
       toast.error('Please select or enter a schedule expression')
-      return
-    }
-
-    const retentionError = validateNumeric(retentionPeriod, {
-      min: 1,
-      integer: true,
-    })
-    if (retentionError || retentionPeriod === undefined) {
-      toast.error(`Retention period: ${retentionError ?? 'Enter a number'}`)
       return
     }
 
@@ -327,7 +277,7 @@ export function EditBackupSchedule() {
         </CardHeader>
 
         <CardContent className="space-y-6">
-          {isLoadingSchedule || !seeded ? (
+          {isLoadingSchedule || (!seeded && !isScheduleError) ? (
             // Skeleton placeholders that match the real form layout so the
             // page does not collapse then expand when data arrives.
             <div className="space-y-6">
@@ -358,6 +308,14 @@ export function EditBackupSchedule() {
                 <Skeleton className="h-10 w-full" />
               </div>
             </div>
+          ) : isScheduleError ? (
+            <ReadFailure
+              resource="Backup schedule"
+              error={scheduleError}
+              onRetry={() => void refetchSchedule()}
+              retrying={isFetchingSchedule}
+              embedded
+            />
           ) : (
             <>
               <div className="grid gap-2">
@@ -502,12 +460,14 @@ export function EditBackupSchedule() {
 
               <div className="grid gap-2">
                 <Label htmlFor="edit-retention">Retention Period (days)</Label>
-                <NumberInput
+                <Input
                   id="edit-retention"
+                  type="number"
                   min={1}
-                  integer
                   value={retentionPeriod}
-                  onValueChange={setRetentionPeriod}
+                  onChange={(e) =>
+                    setRetentionPeriod(parseInt(e.target.value, 10))
+                  }
                 />
               </div>
 

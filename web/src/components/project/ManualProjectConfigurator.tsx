@@ -37,7 +37,6 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
-import { NumberInput } from '@/components/ui/number-input'
 import { ServiceLogo } from '@/components/ui/service-logo'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
@@ -545,16 +544,19 @@ export function ManualProjectConfigurator({
                 : 'Application Port'}
             </FormLabel>
             <FormControl>
-              <NumberInput
-                min={1}
-                max={65535}
-                integer
+              <Input
+                type="number"
+                min="1"
+                max="65535"
                 placeholder="3000"
                 name={field.name}
                 ref={field.ref}
                 onBlur={field.onBlur}
-                value={field.value}
-                onValueChange={field.onChange}
+                value={field.value ?? 3000}
+                onChange={(e) => {
+                  const v = e.target.valueAsNumber
+                  field.onChange(Number.isNaN(v) ? undefined : v)
+                }}
               />
             </FormControl>
             <p className="text-xs text-muted-foreground">

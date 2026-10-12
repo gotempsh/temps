@@ -9,7 +9,11 @@ import {
   getEnvironmentOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { VulnerabilityResponse } from '@/api/client'
-import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from '@/components/ui/popover'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -30,7 +34,6 @@ import {
   PageState,
   Status,
   useUrlState,
-  useUrlTextInput,
   type DetailFact,
   type StatusTone,
 } from '@temps-sdk/ds'
@@ -356,11 +359,7 @@ function ScanDetailContent() {
   const activeTab = get('tab') ?? 'source-code'
   const [showTypeFilters, setShowTypeFilters] = useState(false)
 
-  // Keep the typed text locally; the URL follows without dropping keystrokes.
-  const searchInput = useUrlTextInput({
-    value: searchQuery,
-    onCommit: (value) => patch({ q: value || undefined }),
-  })
+  const setSearchQuery = (value: string) => patch({ q: value || undefined })
   const setSelectedTypes = (types: Set<string>) =>
     patch({ types: types.size > 0 ? Array.from(types).join(',') : undefined })
 
@@ -564,7 +563,11 @@ function ScanDetailContent() {
                   Copy AI Prompt
                 </Button>
               </PopoverTrigger>
-              <PopoverContent align="end" className="w-64 space-y-2" aria-label="Copy vulnerability fix prompt">
+              <PopoverContent
+                align="end"
+                className="w-64 space-y-2"
+                aria-label="Copy vulnerability fix prompt"
+              >
                 <p className="text-sm font-medium">Copy fix prompt</p>
                 <CopyAction
                   value={generateVulnerabilityPrompt(vulnerabilities)}
@@ -575,9 +578,13 @@ function ScanDetailContent() {
                 </CopyAction>
                 {vulnerabilityTypes.length > 1 && (
                   <>
-                    <p className="pt-2 text-xs text-muted-foreground">By type</p>
+                    <p className="pt-2 text-xs text-muted-foreground">
+                      By type
+                    </p>
                     {vulnerabilityTypes.map((type) => {
-                      const typeVulns = vulnerabilities.filter((v) => v.type === type)
+                      const typeVulns = vulnerabilities.filter(
+                        (v) => v.type === type
+                      )
                       return (
                         <CopyAction
                           key={type}
@@ -640,8 +647,8 @@ function ScanDetailContent() {
                     <Input
                       type="text"
                       placeholder="Search by CVE ID, title, package, severity..."
-                      value={searchInput.value}
-                      onChange={(e) => searchInput.setValue(e.target.value)}
+                      value={searchQuery}
+                      onChange={(e) => setSearchQuery(e.target.value)}
                       className="pl-9"
                     />
                   </div>
@@ -832,7 +839,7 @@ function ScanDetailContent() {
                     </p>
                     <Button
                       variant="outline"
-                      onClick={() => searchInput.setValue('')}
+                      onClick={() => setSearchQuery('')}
                     >
                       Clear search
                     </Button>

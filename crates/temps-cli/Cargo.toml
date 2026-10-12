@@ -103,7 +103,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 anyhow = { workspace = true }
-serde_yaml = { workspace = true }
+yaml_serde = { workspace = true }
 dirs = { version = "7.0" }
 gethostname = "1.1"
 rand = { workspace = true }

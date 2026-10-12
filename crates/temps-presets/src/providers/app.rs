@@ -254,7 +254,7 @@ impl App {
         T: DeserializeOwned,
     {
         let contents = self.read_file(name)?;
-        let yaml_file = serde_yaml::from_str(&contents)
+        let yaml_file = yaml_serde::from_str(&contents)
             .with_context(|| format!("Error reading {} as YAML", name))?;
         Ok(yaml_file)
     }

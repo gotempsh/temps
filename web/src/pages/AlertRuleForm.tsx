@@ -26,7 +26,6 @@ import {
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 import { NumberInput } from '@/components/ui/number-input'
-import { numberFieldProps } from '@/lib/numeric-input'
 import {
   Select,
   SelectContent,
@@ -112,7 +111,7 @@ const alertRuleSchema = z.object({
     })
     .optional(),
   cooldown_minutes: z
-    .number({ message: 'Enter a cooldown in minutes' })
+    .number({ message: 'Cooldown must be a number' })
     .min(0, 'Cooldown cannot be negative'),
   notification_priority: z.string(),
   environment_filter: z.number().nullable().optional(),
@@ -247,9 +246,6 @@ export function AlertRuleForm({ projectId, projectName }: AlertRuleFormProps) {
 
   const isMutating = createMutation.isPending || updateMutation.isPending
 
-  // `mutate`, not `mutateAsync`: the mutation's onError toast reports a failed
-  // save, and awaiting a rejecting promise inside react-hook-form's submit
-  // handler would escape as an unhandled rejection.
   const onSubmit = (data: AlertRuleFormData) => {
     const triggerConfig = needsConfig(data.trigger_type)
       ? data.trigger_config
@@ -522,9 +518,15 @@ export function AlertRuleForm({ projectId, projectName }: AlertRuleFormProps) {
                     <FormLabel>Cooldown (minutes)</FormLabel>
                     <FormControl>
                       <NumberInput
-                        {...numberFieldProps(field)}
                         min={0}
-                        integer
+                        step={1}
+                        name={field.name}
+                        ref={field.ref}
+                        onBlur={field.onBlur}
+                        value={field.value}
+                        onValueChange={(value) =>
+                          field.onChange(value ?? Number.NaN)
+                        }
                       />
                     </FormControl>
                     <FormDescription>

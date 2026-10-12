@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useEffect, type ReactNode } from 'react'
+import { useCallback, useEffect, type ReactNode } from 'react'
 import { Link } from 'react-router'
 import { ProjectSelect } from '@/components/project/ProjectSelect'
 import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
@@ -18,7 +18,6 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { ResponsivePagination } from '@/components/ui/responsive-pagination'
-import { useUrlTextInput } from '@temps-sdk/ds'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
@@ -27,6 +26,7 @@ import {
 } from '@/lib/global-observability'
 import { RefreshCw, Search, X } from 'lucide-react'
 import type { GlobalView } from '@/hooks/useGlobalView'
+import { useUrlBoundText } from '@temps-sdk/ds'
 
 export function FilterSelect({
   label,
@@ -105,15 +105,14 @@ export function GlobalPage({
   children: ReactNode
 }) {
   usePageTitle(title)
+  const { patch: patchView } = view
+  const commitSearch = useCallback(
+    (value: string) => patchView({ q: value || undefined }),
+    [patchView]
+  )
+  const [searchText, setSearchText] = useUrlBoundText(view.search, commitSearch)
   const { setBreadcrumbs } = useBreadcrumbs()
   useEffect(() => setBreadcrumbs([{ label: title }]), [title, setBreadcrumbs])
-  // Search text stays in local state while it is typed and reaches the URL
-  // (and so the query) once, after a short pause. Reading it straight from the
-  // URL drops characters because the router applies location updates late.
-  const search = useUrlTextInput({
-    value: view.search,
-    onCommit: (q) => view.patch({ q: q || undefined }),
-  })
   return (
     <PageContainer innerClassName="space-y-6">
       <PageHeader
@@ -147,23 +146,22 @@ export function GlobalPage({
           />
           <Input
             className="h-9 ps-8 pe-8 text-sm"
-            value={search.value}
-            onChange={(event) => search.setValue(event.target.value)}
+            value={searchText}
+            onChange={(event) => setSearchText(event.target.value)}
             onKeyDown={(event) => {
-              if (event.key === 'Escape') search.setValue('')
-              if (event.key === 'Enter') search.flush()
+              if (event.key === 'Escape') setSearchText('')
             }}
             aria-label={searchLabel}
             placeholder={searchLabel}
           />
-          {search.value && (
+          {searchText && (
             <Button
               type="button"
               variant="ghost"
               size="icon"
               className="absolute end-1 top-1/2 size-7 -translate-y-1/2"
               aria-label="Clear search"
-              onClick={() => search.setValue('')}
+              onClick={() => setSearchText('')}
             >
               <X className="size-3.5" />
             </Button>

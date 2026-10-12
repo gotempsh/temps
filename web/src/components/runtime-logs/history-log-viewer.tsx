@@ -15,7 +15,6 @@ import { Alert, AlertDescription } from '@/components/ui/alert'
 import { LogLevelBadge } from '@temps-sdk/ds'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { NumberInput } from '@/components/ui/number-input'
 import {
   Select,
   SelectContent,
@@ -1082,18 +1081,17 @@ export default function HistoryLogViewer({
               <TooltipTrigger asChild>
                 <div className="flex items-center gap-1.5 shrink-0">
                   <AlignVerticalSpaceAround className="h-3.5 w-3.5 text-muted-foreground" />
-                  {/* Empty means 0 (context off): the field is left empty while
-                      editing instead of snapping back to "0". */}
-                  <NumberInput
+                  <Input
+                    type="number"
                     min={CONTEXT_MIN}
                     max={CONTEXT_MAX}
                     step={1}
-                    integer
-                    placeholder="0"
-                    value={contextLines > 0 ? contextLines : undefined}
-                    onValueChange={(next) => {
+                    value={contextLines}
+                    onChange={(e) => {
+                      const n = Number.parseInt(e.target.value, 10)
+                      const next = Number.isFinite(n) ? n : 0
                       setContextLines(
-                        Math.min(Math.max(next ?? 0, CONTEXT_MIN), CONTEXT_MAX)
+                        Math.min(Math.max(next, CONTEXT_MIN), CONTEXT_MAX)
                       )
                     }}
                     aria-label="Surrounding context lines"

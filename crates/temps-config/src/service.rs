@@ -205,6 +205,11 @@ pub enum ConfigServiceError {
     #[error("Settings section '{section}' is malformed")]
     MalformedSettingsSection { section: &'static str },
 
+    /// The submitted public ingress hostname was claimed by a status page
+    /// while the settings save was in flight (#1412).
+    #[error("Public ingress hostname '{hostname}' is attached to a status page")]
+    PublicIngressHostnameInUse { hostname: String },
+
     #[error("Cluster CA is not initialized")]
     ClusterCaNotInitialized,
 
@@ -1215,7 +1220,20 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         &self,
         host: &str,
     ) -> Result<Option<&'static str>, ConfigServiceError> {
-        use temps_entities::{custom_routes, environment_domains, project_custom_domains};
+        Self::hostname_claimed_by_on(self.db.as_ref(), host).await
+    }
+
+    /// [`Self::hostname_claimed_by`] on a caller-supplied connection, so a
+    /// caller holding a transaction (and the hostname-claim lock in it) runs
+    /// the check on that same connection instead of taking a second one from
+    /// the pool while the first is held.
+    pub async fn hostname_claimed_by_on<C: ConnectionTrait>(
+        conn: &C,
+        host: &str,
+    ) -> Result<Option<&'static str>, ConfigServiceError> {
+        use temps_entities::{
+            custom_routes, environment_domains, project_custom_domains, status_page_domains,
+        };
 
         let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
         if host.is_empty() {
@@ -1230,7 +1248,7 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
 
         if project_custom_domains::Entity::find()
             .filter(project_custom_domains::Column::Domain.is_in(candidates.clone()))
-            .one(self.db.as_ref())
+            .one(conn)
             .await?
             .is_some()
         {
@@ -1238,7 +1256,7 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         }
         if environment_domains::Entity::find()
             .filter(environment_domains::Column::Domain.is_in(candidates.clone()))
-            .one(self.db.as_ref())
+            .one(conn)
             .await?
             .is_some()
         {
@@ -1246,11 +1264,16 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         }
         if custom_routes::Entity::find()
             .filter(custom_routes::Column::Domain.is_in(candidates))
-            .one(self.db.as_ref())
+            .one(conn)
             .await?
             .is_some()
         {
             return Ok(Some("a custom route"));
+        }
+        // A hostname attached to a status page (#1412). Tombstones (removed
+        // hostnames) do not count: any application may claim those.
+        if status_page_domains::attached_hostname_conflict(conn, &host).await? {
+            return Ok(Some("a status page custom domain"));
         }
         Ok(None)
     }
@@ -1550,6 +1573,42 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         // snapshot.
         settings.preview_gateway = locked_settings.preview_gateway.clone();
         preserve_provider_credential_proof(&mut settings, &locked_settings);
+
+        // The handler checked that a new public ingress hostname was free, but
+        // before this transaction. Status page hostnames (#1412) are claimed
+        // under a per-hostname advisory lock; take the same lock and repeat
+        // that check here, so a status page cannot claim the name between the
+        // handler's check and this commit (nor the other way round: an attach
+        // waiting on the lock reads the committed settings afterwards).
+        if self.is_postgres() {
+            if let Some(host) = settings.public_ingress_hostname().filter(|host| {
+                locked_settings.public_ingress_hostname().as_deref() != Some(host.as_str())
+            }) {
+                let claimed = async {
+                    temps_entities::status_page_domains::lock_hostname_claim(&txn, &host).await?;
+                    temps_entities::status_page_domains::attached_hostname_conflict(&txn, &host)
+                        .await
+                }
+                .await;
+                match claimed {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        if let Err(rollback) = txn.rollback().await {
+                            warn!(%rollback, "Failed to roll back refused settings update");
+                        }
+                        return Err(ConfigServiceError::PublicIngressHostnameInUse {
+                            hostname: host,
+                        });
+                    }
+                    Err(error) => {
+                        if let Err(rollback) = txn.rollback().await {
+                            warn!(%rollback, "Failed to roll back settings update");
+                        }
+                        return Err(error.into());
+                    }
+                }
+            }
+        }
         // The geo section's freshness metadata belongs to the refresh job, and
         // its license key belongs to whichever request last submitted one.
         // Both are rebased here, under the lock, so a settings save built from
@@ -5748,6 +5807,10 @@ mod tests {
             .append_query_results(vec![Vec::<project_custom_domains::Model>::new()])
             .append_query_results(vec![Vec::<environment_domains::Model>::new()])
             .append_query_results(vec![Vec::<custom_routes::Model>::new()])
+            // A hostname attached to a status page (#1412).
+            .append_query_results(vec![
+                Vec::<temps_entities::status_page_domains::Model>::new(),
+            ])
             .into_connection();
         let svc = ConfigService::new(test_config(), Arc::new(db));
         assert_eq!(

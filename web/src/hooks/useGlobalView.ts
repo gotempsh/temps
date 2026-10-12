@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useEffect, useMemo, useState } from 'react'
-import { useBatchedSearchParams } from '@temps-sdk/ds'
+import { useComposedSearchParams } from '@temps-sdk/ds'
 import {
   patchObservationFilters,
   positiveInteger,
@@ -16,9 +16,7 @@ import {
 } from '@/lib/date-time-range'
 
 export function useGlobalView() {
-  // Batched so a filter change and the canonicalisation below, or a search
-  // term and a page reset, can never overwrite each other.
-  const [params, setParams] = useBatchedSearchParams()
+  const [params, updateParams] = useComposedSearchParams()
   const [now, setNow] = useState(Date.now)
   const window = useMemo(
     () => readObservationWindow(params, now),
@@ -32,15 +30,11 @@ export function useGlobalView() {
       (window.range !== 'custom' && (params.has('from') || params.has('to'))) ||
       params.get('range') !== window.range
     ) {
-      setParams((current) => normalizeObservationWindow(current, now), {
-        replace: true,
-      })
+      updateParams((current) => normalizeObservationWindow(current, now))
     }
-  }, [params, setParams, now, window.from, window.to, window.range])
+  }, [params, updateParams, now, window.from, window.to, window.range])
   const patch = (values: Record<string, string | undefined>) =>
-    setParams((current) => patchObservationFilters(current, values), {
-      replace: true,
-    })
+    updateParams((current) => patchObservationFilters(current, values))
   const setTimeRange = (value: DateTimeRangeValue) => {
     if (value.preset !== 'custom') setNow(Date.parse(value.to))
     patch({
@@ -61,25 +55,30 @@ export function useGlobalView() {
     setRange,
     setTimeRange,
     setPage: (page: number) =>
-      setParams((current) => {
-        const next = new URLSearchParams(current)
-        next.set('page', String(page))
-        return next
-      }),
+      updateParams(
+        (next) => {
+          next.set('page', String(page))
+          return next
+        },
+        { replace: false }
+      ),
     setCursor: (cursor?: string) =>
-      setParams((current) => {
-        // A cursor belongs to one exact window. Freeze a relative preset
-        // before attaching it so a later reload cannot reuse a stale cursor.
-        const next = normalizeObservationWindow(current, now)
-        if (cursor && window.range !== 'custom') {
-          next.set('from', window.from)
-          next.set('to', window.to)
-          next.set('range', 'custom')
-        }
-        if (cursor) next.set('cursor', cursor)
-        else next.delete('cursor')
-        return next
-      }),
+      updateParams(
+        (current) => {
+          // A cursor belongs to one exact window. Freeze a relative preset
+          // before attaching it so a later reload cannot reuse a stale cursor.
+          const next = normalizeObservationWindow(current, now)
+          if (cursor && window.range !== 'custom') {
+            next.set('from', window.from)
+            next.set('to', window.to)
+            next.set('range', 'custom')
+          }
+          if (cursor) next.set('cursor', cursor)
+          else next.delete('cursor')
+          return next
+        },
+        { replace: false }
+      ),
   }
 }
 export type GlobalView = ReturnType<typeof useGlobalView>
