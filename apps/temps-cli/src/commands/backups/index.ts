@@ -21,6 +21,7 @@ import {
   listSourceBackups,
   runBackupForSource,
   runExternalServiceBackup,
+  externalServiceBackupPreflight,
 } from '../../api/sdk.gen.js'
 import type { BackupScheduleResponse, BackupResponse, S3SourceResponse, SourceBackupEntry } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
@@ -133,6 +134,8 @@ interface RunServiceBackupOptions {
   id: string
   s3SourceId: string
   type?: string
+  /** Acknowledge in advance that the backup may restart the database. */
+  confirmRestart?: boolean
 }
 
 type ScheduleAutomationInput = {
@@ -332,6 +335,10 @@ export function registerBackupsCommands(program: Command): void {
     .requiredOption('--id <id>', 'External service ID')
     .requiredOption('--s3-source-id <id>', 'S3 source ID to store the backup')
     .option('-t, --type <type>', 'Backup type (e.g., full, incremental)')
+    .option(
+      '--confirm-restart',
+      'Allow the backup to restart the database (PostgreSQL with WAL archiving off restarts once to turn it on)',
+    )
     .action(runServiceBackup)
 }
 
@@ -941,6 +948,32 @@ async function runServiceBackup(options: RunServiceBackupOptions): Promise<void>
     return
   }
 
+  // The first WAL-G backup of a PostgreSQL service with archiving off
+  // restarts it; the server refuses that unless it is acknowledged.
+  let confirmRestart = options.confirmRestart === true
+  if (!confirmRestart) {
+    const { data: preflight } = await externalServiceBackupPreflight({
+      client,
+      path: { id },
+    })
+    if (preflight?.restarts_database) {
+      warning(preflight.reason || 'This backup restarts the database.')
+      if (!process.stdin.isTTY) {
+        warning('Nothing was started. Re-run with --confirm-restart to proceed.')
+        process.exitCode = 1
+        return
+      }
+      confirmRestart = await promptConfirm({
+        message: 'Restart the database and run the backup?',
+        default: false,
+      })
+      if (!confirmRestart) {
+        info('Backup not started')
+        return
+      }
+    }
+  }
+
   const backup = await withSpinner('Triggering external service backup...', async () => {
     const { data, error } = await runExternalServiceBackup({
       client,
@@ -948,6 +981,7 @@ async function runServiceBackup(options: RunServiceBackupOptions): Promise<void>
       body: {
         s3_source_id: s3SourceId,
         backup_type: options.type || null,
+        confirm_restart: confirmRestart ? true : null,
       },
     })
     if (error) {
@@ -957,6 +991,9 @@ async function runServiceBackup(options: RunServiceBackupOptions): Promise<void>
   })
 
   success(`Backup started for external service #${options.id}`)
+  if (backup.restarts_database) {
+    warning('The database restarts first to turn on WAL archiving')
+  }
   info(`Backup ID: ${backup.backup_id}`)
   info(`State: ${backup.state}`)
   info(`S3 Location: ${backup.s3_location}`)

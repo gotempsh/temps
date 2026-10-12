@@ -218,7 +218,17 @@ export function EditResourceLimitsDialog({
       // is a no-op and only a container recreate picks up the change.
       const recreate = members.filter((m) => m.outcome === 'requires_recreate')
 
-      if (failed.length > 0) {
+      if (response.shm_not_applied) {
+        // A new /dev/shm size needs a new container, and replacing it was
+        // refused or rolled back to keep the service's data safe.
+        toast.warning(
+          'Limits saved, but the shared memory size was not applied',
+          {
+            description: response.shm_not_applied,
+            duration: 15000,
+          }
+        )
+      } else if (failed.length > 0) {
         toast.warning('Limits saved, but some containers rejected the update', {
           description: failed
             .map((f) => `${f.container_name}: ${f.error ?? 'failed'}`)
