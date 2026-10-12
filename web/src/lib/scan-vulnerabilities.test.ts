@@ -168,7 +168,86 @@ describe('findVulnerabilityInPages', () => {
     await expect(search).rejects.toBeInstanceOf(
       VulnerabilitySearchIncompleteError
     )
-    await expect(search).rejects.toThrow('first 3 pages')
+    await expect(search).rejects.toMatchObject({
+      reason: 'too-large',
+      // Searching again would read the same pages and fail the same way.
+      retryable: false,
+      pagesSearched: 3,
+    })
+    await expect(search).rejects.toThrow('first 300 findings')
+    await expect(search).rejects.toThrow('which has 1000000')
+    // The message must not send the user to the scan's list: it shows only
+    // the first page of findings, which cannot contain this one.
+    await expect(search).rejects.not.toThrow(/scan's list/)
+  })
+
+  test('a finding served on no page is an unstable-order search, not "not found"', async () => {
+    // 250 findings, but the server dealt a tied row to neither side of the
+    // page-2/page-3 boundary: id 200 is skipped and id 199 is served twice.
+    const pages = [
+      all.slice(0, 100),
+      all.slice(100, 199),
+      [all[198], ...all.slice(200, 250)],
+    ]
+    const search = findVulnerabilityInPages({
+      vulnId: '200',
+      fetchPage: async (page) => ({
+        data: pages[page - 1] ?? [],
+        total: 250,
+        page,
+        page_size: 100,
+      }),
+    })
+    await expect(search).rejects.toBeInstanceOf(
+      VulnerabilitySearchIncompleteError
+    )
+    await expect(search).rejects.toMatchObject({
+      reason: 'unstable-order',
+      retryable: true,
+    })
+  })
+
+  test('fewer distinct findings than the total is unstable even without a repeat', async () => {
+    const search = findVulnerabilityInPages({
+      vulnId: '9999',
+      fetchPage: async (page) => ({
+        // The server says 150 but only ever serves 100 distinct rows.
+        data: page === 1 ? all.slice(0, 100) : [],
+        total: 150,
+        page,
+        page_size: 100,
+      }),
+    })
+    await expect(search).rejects.toMatchObject({ reason: 'unstable-order' })
+  })
+
+  test('a consistent walk with no repeats still resolves undefined for an absent id', async () => {
+    const found = await findVulnerabilityInPages({
+      vulnId: '9999',
+      fetchPage: async (page) => ({
+        data: all.slice((page - 1) * 100, page * 100),
+        total: 250,
+        page,
+        page_size: 100,
+      }),
+    })
+    expect(found).toBeUndefined()
+  })
+
+  test('a repeat does not hide a finding that is on a later page', async () => {
+    const pages = [
+      all.slice(0, 100),
+      [all[99], ...all.slice(100, 199)],
+      all.slice(199),
+    ]
+    const found = await findVulnerabilityInPages({
+      vulnId: '230',
+      fetchPage: async (page) => ({
+        data: pages[page - 1] ?? [],
+        total: 250,
+      }),
+    })
+    expect(found?.id).toBe(230)
   })
 
   test('stops before requesting another page once cancelled', async () => {

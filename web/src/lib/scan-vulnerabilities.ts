@@ -51,17 +51,54 @@ export const SCAN_VULNERABILITIES_PAGE_SIZE = 100
 export const MAX_VULNERABILITY_PAGES = 200
 
 /**
- * The walk gave up before reaching the end of the scan's findings. This is
- * not "the finding does not exist": the answer is unknown.
+ * Why a search ended without an answer:
+ *
+ * - `too-large`: the walk read `maxPages` pages and the list goes on. The
+ *   scan holds more findings than this page will read, so searching again
+ *   gives the same answer.
+ * - `unstable-order`: the list ended without the finding, but the pages did
+ *   not add up (a finding was served twice or the unique count fell short of
+ *   the reported total). The server orders findings without a unique
+ *   tiebreaker, so rows that tie can be dealt differently to each page
+ *   request and one can fall between two pages. The finding may exist, and a
+ *   fresh walk can land differently.
+ */
+export type VulnerabilitySearchIncompleteReason = 'too-large' | 'unstable-order'
+
+/**
+ * The walk ended without proving the finding is absent. This is not "the
+ * finding does not exist": the answer is unknown.
  */
 export class VulnerabilitySearchIncompleteError extends Error {
+  readonly reason: VulnerabilitySearchIncompleteReason
   readonly pagesSearched: number
-  constructor(vulnId: string, pagesSearched: number) {
+  /** Whether a second walk can plausibly answer differently. */
+  readonly retryable: boolean
+  constructor({
+    reason,
+    vulnId,
+    pagesSearched,
+    pageSize,
+    total,
+  }: {
+    reason: VulnerabilitySearchIncompleteReason
+    vulnId: string
+    pagesSearched: number
+    pageSize: number
+    total?: number
+  }) {
+    const searched = pagesSearched * pageSize
     super(
-      `Vulnerability ${vulnId} was not found in the first ${pagesSearched} pages of this scan's findings, and the list is longer. Try again, or open it from the scan's list.`
+      reason === 'too-large'
+        ? `Vulnerability ${vulnId} is not among the first ${searched} findings of this scan${
+            total !== undefined ? `, which has ${total}` : ''
+          }. The console cannot search further than that, so this finding may still exist.`
+        : `Vulnerability ${vulnId} was not found, but the server returned this scan's findings in a different order between pages, so some may have been skipped. Search again to check.`
     )
     this.name = 'VulnerabilitySearchIncompleteError'
+    this.reason = reason
     this.pagesSearched = pagesSearched
+    this.retryable = reason === 'unstable-order'
   }
 }
 
@@ -79,9 +116,11 @@ function envelopeTotal(response: unknown): number | undefined {
  * only the first page reports a real finding as "not found".
  *
  * Resolves `undefined` only when the end of the list was reached without the
- * finding (or the id is not a number, which fetches nothing). If the walk is
- * stopped by `maxPages` it rejects with `VulnerabilitySearchIncompleteError`
- * instead of claiming the finding is absent.
+ * finding, every row the server counted was seen exactly once (or the id is
+ * not a number, which fetches nothing). If the walk is stopped by `maxPages`,
+ * or the pages do not add up, it rejects with
+ * `VulnerabilitySearchIncompleteError` instead of claiming the finding is
+ * absent.
  *
  * The end is decided from the findings actually received, not from the
  * requested page size: a server that returns shorter pages than asked for
@@ -104,6 +143,9 @@ export async function findVulnerabilityInPages({
 }): Promise<VulnerabilityResponse | undefined> {
   if (!vulnId || !/^\d+$/.test(vulnId)) return undefined
   let received = 0
+  let total: number | undefined
+  // At most `maxPages * pageSize` ids, so memory is bounded by the page cap.
+  const seen = new Set<number>()
   for (let page = 1; page <= maxPages; page++) {
     signal?.throwIfAborted()
     const response = await fetchPage(page, signal)
@@ -111,12 +153,35 @@ export async function findVulnerabilityInPages({
     const found = findScanVulnerability(rows, vulnId)
     if (found) return found
     received += rows.length
-    const total = envelopeTotal(response)
+    for (const row of rows) seen.add(row.id)
+    total = envelopeTotal(response)
     // Without a total, a page shorter than requested is the only end signal.
     const reachedEnd =
       rows.length === 0 ||
       (total !== undefined ? received >= total : rows.length < pageSize)
-    if (reachedEnd) return undefined
+    if (reachedEnd) {
+      // A complete walk reads every finding once. A repeat, or fewer distinct
+      // findings than the server counted, means a tied row fell between two
+      // pages, so "not found" would not be proven.
+      const pagesDidNotAddUp =
+        seen.size < received || (total !== undefined && seen.size < total)
+      if (pagesDidNotAddUp) {
+        throw new VulnerabilitySearchIncompleteError({
+          reason: 'unstable-order',
+          vulnId,
+          pagesSearched: page,
+          pageSize,
+          total,
+        })
+      }
+      return undefined
+    }
   }
-  throw new VulnerabilitySearchIncompleteError(vulnId, maxPages)
+  throw new VulnerabilitySearchIncompleteError({
+    reason: 'too-large',
+    vulnId,
+    pagesSearched: maxPages,
+    pageSize,
+    total,
+  })
 }
