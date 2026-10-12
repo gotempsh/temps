@@ -529,6 +529,32 @@ pub async fn blob_status(
     }
 }
 
+/// Problem for a failed `create_service` while enabling Blob.
+///
+/// The Blob store's Docker resources have fixed names (`rustfs-temps-blob` and
+/// its volumes), so two Temps instances sharing one Docker host collide on
+/// them. The manager refuses to adopt a resource it did not create, which is
+/// correct — but it is a conflict the operator can resolve, not an internal
+/// failure, and the 500 it was reported as gave no hint of the cause.
+fn blob_create_failure_problem(error: &temps_providers::ExternalServiceError) -> Problem {
+    match error {
+        temps_providers::ExternalServiceError::ServiceResourceConflict { resource, .. } => {
+            temps_core::problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Blob Resource Already Exists")
+                .with_detail(format!(
+                    "Docker resource '{resource}' already exists on this host and is not owned \
+                     by this Temps instance. The Blob store uses fixed, host-wide resource names, \
+                     so this usually means another Temps instance sharing this Docker host has \
+                     already enabled Blob. Remove the resource if it is a leftover, or enable \
+                     Blob on a Docker host this instance does not share."
+                ))
+        }
+        other => temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Failed to Enable Blob Service")
+            .with_detail(format!("Could not create S3/Blob service: {other}")),
+    }
+}
+
 /// Enable Blob service
 #[utoipa::path(
     tag = "Blob Management",
@@ -538,6 +564,7 @@ pub async fn blob_status(
     responses(
         (status = 200, description = "Blob service enabled", body = EnableBlobResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 409, description = "A Docker resource this service needs already exists on the host and is not owned by this instance"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -660,9 +687,7 @@ pub async fn blob_enable(
             .await
             .map_err(|e| {
                 error!("Failed to create Blob service: {}", e);
-                temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("Failed to Enable Blob Service")
-                    .with_detail(format!("Could not create S3/Blob service: {}", e))
+                blob_create_failure_problem(&e)
             })?;
 
         // `create_service` builds its own service instance to start the
@@ -986,6 +1011,40 @@ mod tests {
         let result = sanitize_download_filename("/");
         // The fallback is "download"
         assert_eq!(result, "download");
+    }
+}
+
+#[cfg(test)]
+mod enable_conflict_tests {
+    use super::blob_create_failure_problem;
+    use axum::http::StatusCode;
+    use temps_providers::ExternalServiceError;
+
+    /// Enabling Blob on a Docker host that another Temps instance already
+    /// provisioned Blob on hit `ServiceResourceConflict` and answered 500.
+    #[test]
+    fn shared_docker_host_resource_conflict_is_a_409_naming_the_resource() {
+        let problem = blob_create_failure_problem(&ExternalServiceError::ServiceResourceConflict {
+            name: "temps-blob".to_string(),
+            resource: "rustfs-temps-blob".to_string(),
+        });
+
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|detail| detail.as_str())
+            .unwrap_or_default();
+        assert!(detail.contains("rustfs-temps-blob"), "{detail}");
+        assert!(detail.contains("another Temps instance"), "{detail}");
+    }
+
+    #[test]
+    fn other_create_failures_stay_internal_errors() {
+        let problem = blob_create_failure_problem(&ExternalServiceError::InternalError {
+            reason: "disk full".to_string(),
+        });
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
 

@@ -445,6 +445,32 @@ pub async fn kv_status(
     }
 }
 
+/// Problem for a failed `create_service` while enabling KV.
+///
+/// The KV store's Docker resources have fixed names (`redis-temps-kv` and its
+/// volume), so two Temps instances sharing one Docker host collide on them. The
+/// manager refuses to adopt a resource it did not create, which is correct —
+/// but it is a conflict the operator can resolve, not an internal failure, and
+/// the 500 it was reported as gave no hint of the cause.
+fn kv_create_failure_problem(error: &temps_providers::ExternalServiceError) -> Problem {
+    match error {
+        temps_providers::ExternalServiceError::ServiceResourceConflict { resource, .. } => {
+            temps_core::problemdetails::new(StatusCode::CONFLICT)
+                .with_title("KV Resource Already Exists")
+                .with_detail(format!(
+                    "Docker resource '{resource}' already exists on this host and is not owned \
+                     by this Temps instance. The KV store uses fixed, host-wide resource names, \
+                     so this usually means another Temps instance sharing this Docker host has \
+                     already enabled KV. Remove the resource if it is a leftover, or enable KV \
+                     on a Docker host this instance does not share."
+                ))
+        }
+        other => temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Failed to Enable KV Service")
+            .with_detail(format!("Could not create Redis service: {other}")),
+    }
+}
+
 /// Enable KV service
 #[utoipa::path(
     tag = "KV Management",
@@ -454,6 +480,7 @@ pub async fn kv_status(
     responses(
         (status = 200, description = "KV service enabled", body = EnableKvResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 409, description = "A Docker resource this service needs already exists on the host and is not owned by this instance"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -572,9 +599,7 @@ pub async fn kv_enable(
             .await
             .map_err(|e| {
                 error!("Failed to create KV service: {}", e);
-                temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("Failed to Enable KV Service")
-                    .with_detail(format!("Could not create Redis service: {}", e))
+                kv_create_failure_problem(&e)
             })?;
 
         // `create_service` builds its own service instance to start the
@@ -832,6 +857,40 @@ pub async fn kv_disable(
         success: true,
         message: "KV service disabled successfully".to_string(),
     }))
+}
+
+#[cfg(test)]
+mod enable_conflict_tests {
+    use super::kv_create_failure_problem;
+    use axum::http::StatusCode;
+    use temps_providers::ExternalServiceError;
+
+    /// Enabling KV on a Docker host that another Temps instance already
+    /// provisioned KV on hit `ServiceResourceConflict` and answered 500.
+    #[test]
+    fn shared_docker_host_resource_conflict_is_a_409_naming_the_resource() {
+        let problem = kv_create_failure_problem(&ExternalServiceError::ServiceResourceConflict {
+            name: "temps-kv".to_string(),
+            resource: "redis-temps-kv".to_string(),
+        });
+
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|detail| detail.as_str())
+            .unwrap_or_default();
+        assert!(detail.contains("redis-temps-kv"), "{detail}");
+        assert!(detail.contains("another Temps instance"), "{detail}");
+    }
+
+    #[test]
+    fn other_create_failures_stay_internal_errors() {
+        let problem = kv_create_failure_problem(&ExternalServiceError::InternalError {
+            reason: "disk full".to_string(),
+        });
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+    }
 }
 
 #[cfg(test)]
