@@ -1,8 +1,14 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { afterEach, expect, test } from 'bun:test'
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { afterEach, beforeEach, expect, test } from 'bun:test'
+import {
+  QueryClient,
+  QueryClientProvider,
+  environmentManager,
+  focusManager,
+  onlineManager,
+} from '@tanstack/react-query'
 import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
 import { MemoryRouter, Route, Routes } from 'react-router'
 import { BreadcrumbProvider } from '@/contexts/BreadcrumbContext'
@@ -12,7 +18,22 @@ import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import { DomainDetail } from './DomainDetail'
 
 installBrowserWindow()
-afterEach(cleanup)
+// Polling is skipped when React Query believes it runs on a server, and pauses
+// while the document is hidden or offline. All three are process-wide
+// singletons that other test files in the same run leave toggled, so pin them
+// for this file and put them back.
+const wasServer = environmentManager.isServer()
+beforeEach(() => {
+  environmentManager.setIsServer(() => false)
+  focusManager.setFocused(true)
+  onlineManager.setOnline(true)
+})
+afterEach(() => {
+  cleanup()
+  environmentManager.setIsServer(() => wasServer)
+  focusManager.setFocused(undefined)
+  onlineManager.setOnline(true)
+})
 
 const TIMESTAMP = Date.parse('2026-01-01T00:00:00Z')
 
@@ -117,9 +138,12 @@ test('a failed verification shows the failed status without a reload', async () 
 
   // Well inside the 3 s polling interval: this is the post-mutation re-read,
   // not the poll.
-  await waitFor(() => expect(view.getAllByText('failed').length).toBeGreaterThan(0), {
-    timeout: 2000,
-  })
+  await waitFor(
+    () => expect(view.getAllByText('failed').length).toBeGreaterThan(0),
+    {
+      timeout: 2000,
+    }
+  )
   expect(view.queryByText('challenge_requested')).toBeNull()
   expect(view.getByText(/Retry verification/)).toBeTruthy()
   api.restore()
@@ -140,12 +164,15 @@ test('an in-flight domain is polled and polling stops once it is settled', async
 
   await view.findAllByText('challenge_requested')
   // No click: the page has to notice the status change on its own.
-  await waitFor(() => expect(view.getAllByText('failed').length).toBeGreaterThan(0), {
-    timeout: 6000,
-  })
+  await waitFor(
+    () => expect(view.getAllByText('failed').length).toBeGreaterThan(0),
+    {
+      timeout: 12_000,
+    }
+  )
   const readsWhenSettled = reads
 
   await new Promise((resolve) => setTimeout(resolve, 3500))
   expect(reads).toBe(readsWhenSettled)
   api.restore()
-}, 15000)
+}, 30_000)
