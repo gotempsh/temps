@@ -15660,6 +15660,7 @@
           "route_activation",
           "registry_unavailable",
           "image_pull_failed",
+          "build_context_path_missing",
           "unknown"
         ],
         "type": "string"
@@ -52490,6 +52491,17 @@
             "description": "Public HTML page. Serves 404 while the page is unpublished.",
             "type": "string"
           },
+          "public_url_configured": {
+            "description": "`false` when no public or external URL is configured: `public_url` is\nthen the console origin, which only works from where the console is\nreachable. Configure a public URL so customers can open the page.",
+            "type": "boolean"
+          },
+          "public_url_setup_path": {
+            "description": "Console path where the public URL is configured; set only while\n`public_url_configured` is `false`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "published_at": {
             "format": "date-time",
             "type": [
@@ -52517,6 +52529,7 @@
           "is_published",
           "public_url",
           "public_json_url",
+          "public_url_configured",
           "monitors",
           "created_at",
           "updated_at"
@@ -75214,6 +75227,9 @@
           "401": {
             "description": "Unauthorized"
           },
+          "409": {
+            "description": "A Docker resource this service needs already exists on the host and is not owned by this instance"
+          },
           "500": {
             "description": "Internal server error"
           }
@@ -78142,17 +78158,24 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/AcmeOrderResponse"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/AcmeOrderResponse"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Order retrieved successfully"
+            "description": "The current order, or `null` when the domain has none"
           },
           "401": {
             "description": "Unauthorized"
           },
           "404": {
-            "description": "Order not found"
+            "description": "Domain not found"
           },
           "500": {
             "description": "Internal server error"
@@ -78255,7 +78278,7 @@
             "description": "Domain or order not found"
           },
           "409": {
-            "description": "Certificate issued but DNS cleanup requires operator action"
+            "description": "The previous order was rejected by the CA and a new order was created (new TXT records in `txt_records` must be published, then verify again), or the certificate was issued but DNS cleanup requires operator action"
           },
           "500": {
             "description": "Internal server error"
@@ -84482,6 +84505,9 @@
             },
             "description": "List of containers"
           },
+          "400": {
+            "description": "The path is not a container of this data source's hierarchy"
+          },
           "401": {
             "description": "Unauthorized"
           },
@@ -89773,6 +89799,9 @@
           },
           "401": {
             "description": "Unauthorized"
+          },
+          "409": {
+            "description": "A Docker resource this service needs already exists on the host and is not owned by this instance"
           },
           "500": {
             "description": "Internal server error"
@@ -100970,20 +100999,24 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/CustomDomainResponse"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/CustomDomainResponse"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Custom domain assignment retrieved"
+            "description": "Custom domain assignment, or `null` when the hostname is not assigned to a project"
           },
           "401": {
             "description": "Unauthorized"
           },
           "403": {
             "description": "Project access denied"
-          },
-          "404": {
-            "description": "Domain is not assigned to a project"
           }
         },
         "security": [
@@ -101459,14 +101492,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/DeploymentResponse"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/DeploymentResponse"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Last deployment details"
+            "description": "Last deployment details, or `null` when the project has not been deployed yet"
           },
           "404": {
-            "description": "Project not found or no deployments"
+            "description": "Project not found"
           },
           "500": {
             "description": "Internal server error"
@@ -127187,6 +127227,9 @@
           },
           "401": {
             "description": "Unauthorized or current password is incorrect"
+          },
+          "403": {
+            "description": "Deployment tokens cannot enrol MFA"
           },
           "409": {
             "description": "MFA is already enabled; verify and disable it before re-enrollment"

@@ -7541,7 +7541,7 @@ export type DeploymentEnvironmentResponse = {
  * Allowlisted failure codes. Wire values are `snake_case` and stable; add new
  * variants rather than renaming existing ones.
  */
-export type DeploymentFailureCode = 'out_of_memory' | 'disk_exhausted' | 'timeout' | 'health_check_failed' | 'repository_authentication' | 'repository_not_found' | 'repository_clone' | 'dns_resolution' | 'network_connection' | 'dependency_lockfile_out_of_sync' | 'dependency_resolution' | 'dependency_download' | 'runtime_version_unsupported' | 'missing_build_script' | 'compile_error' | 'dockerfile_invalid' | 'base_image_pull' | 'image_missing' | 'static_output_missing' | 'port_unavailable' | 'permission_denied' | 'invalid_configuration' | 'container_start' | 'build_error' | 'platform_internal' | 'cancelled' | 'build_timeout' | 'source_timeout' | 'image_pull_timeout' | 'health_check_timeout' | 'app_not_listening' | 'container_exited' | 'image_not_found' | 'registry_authentication' | 'registry_rate_limited' | 'image_platform_mismatch' | 'compose_file_invalid' | 'compose_variable_missing' | 'compose_policy_rejected' | 'compose_build_failed' | 'compose_up_failed' | 'compose_unavailable' | 'volume_mount' | 'route_activation' | 'registry_unavailable' | 'image_pull_failed' | 'unknown';
+export type DeploymentFailureCode = 'out_of_memory' | 'disk_exhausted' | 'timeout' | 'health_check_failed' | 'repository_authentication' | 'repository_not_found' | 'repository_clone' | 'dns_resolution' | 'network_connection' | 'dependency_lockfile_out_of_sync' | 'dependency_resolution' | 'dependency_download' | 'runtime_version_unsupported' | 'missing_build_script' | 'compile_error' | 'dockerfile_invalid' | 'base_image_pull' | 'image_missing' | 'static_output_missing' | 'port_unavailable' | 'permission_denied' | 'invalid_configuration' | 'container_start' | 'build_error' | 'platform_internal' | 'cancelled' | 'build_timeout' | 'source_timeout' | 'image_pull_timeout' | 'health_check_timeout' | 'app_not_listening' | 'container_exited' | 'image_not_found' | 'registry_authentication' | 'registry_rate_limited' | 'image_platform_mismatch' | 'compose_file_invalid' | 'compose_variable_missing' | 'compose_policy_rejected' | 'compose_build_failed' | 'compose_up_failed' | 'compose_unavailable' | 'volume_mount' | 'route_activation' | 'registry_unavailable' | 'image_pull_failed' | 'build_context_path_missing' | 'unknown';
 
 /**
  * API view of a failed deployment's classification.
@@ -24425,6 +24425,17 @@ export type StatusPageResponse = {
      * Public HTML page. Serves 404 while the page is unpublished.
      */
     public_url: string;
+    /**
+     * `false` when no public or external URL is configured: `public_url` is
+     * then the console origin, which only works from where the console is
+     * reachable. Configure a public URL so customers can open the page.
+     */
+    public_url_configured: boolean;
+    /**
+     * Console path where the public URL is configured; set only while
+     * `public_url_configured` is `false`.
+     */
+    public_url_setup_path?: string | null;
     published_at?: string | null;
     /**
      * Unguessable token in the public URL.
@@ -36005,6 +36016,10 @@ export type BlobEnableErrors = {
      */
     401: unknown;
     /**
+     * A Docker resource this service needs already exists on the host and is not owned by this instance
+     */
+    409: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -37840,7 +37855,7 @@ export type GetDomainOrderErrors = {
      */
     401: unknown;
     /**
-     * Order not found
+     * Domain not found
      */
     404: unknown;
     /**
@@ -37851,9 +37866,9 @@ export type GetDomainOrderErrors = {
 
 export type GetDomainOrderResponses = {
     /**
-     * Order retrieved successfully
+     * The current order, or `null` when the domain has none
      */
-    200: AcmeOrderResponse;
+    200: AcmeOrderResponse | null;
 };
 
 export type GetDomainOrderResponse = GetDomainOrderResponses[keyof GetDomainOrderResponses];
@@ -37924,7 +37939,7 @@ export type FinalizeOrderErrors = {
      */
     404: unknown;
     /**
-     * Certificate issued but DNS cleanup requires operator action
+     * The previous order was rejected by the CA and a new order was created (new TXT records in `txt_records` must be published, then verify again), or the certificate was issued but DNS cleanup requires operator action
      */
     409: unknown;
     /**
@@ -42262,6 +42277,10 @@ export type ListContainersAtPathData = {
 
 export type ListContainersAtPathErrors = {
     /**
+     * The path is not a container of this data source's hierarchy
+     */
+    400: unknown;
+    /**
      * Unauthorized
      */
     401: unknown;
@@ -45875,6 +45894,10 @@ export type KvEnableErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * A Docker resource this service needs already exists on the host and is not owned by this instance
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -52038,17 +52061,13 @@ export type GetVisibleCustomDomainByHostnameErrors = {
      * Project access denied
      */
     403: unknown;
-    /**
-     * Domain is not assigned to a project
-     */
-    404: unknown;
 };
 
 export type GetVisibleCustomDomainByHostnameResponses = {
     /**
-     * Custom domain assignment retrieved
+     * Custom domain assignment, or `null` when the hostname is not assigned to a project
      */
-    200: CustomDomainResponse;
+    200: CustomDomainResponse | null;
 };
 
 export type GetVisibleCustomDomainByHostnameResponse = GetVisibleCustomDomainByHostnameResponses[keyof GetVisibleCustomDomainByHostnameResponses];
@@ -52396,7 +52415,7 @@ export type GetLastDeploymentData = {
 
 export type GetLastDeploymentErrors = {
     /**
-     * Project not found or no deployments
+     * Project not found
      */
     404: unknown;
     /**
@@ -52407,9 +52426,9 @@ export type GetLastDeploymentErrors = {
 
 export type GetLastDeploymentResponses = {
     /**
-     * Last deployment details
+     * Last deployment details, or `null` when the project has not been deployed yet
      */
-    200: DeploymentResponse;
+    200: DeploymentResponse | null;
 };
 
 export type GetLastDeploymentResponse = GetLastDeploymentResponses[keyof GetLastDeploymentResponses];
@@ -68671,6 +68690,10 @@ export type SetupMfaErrors = {
      * Unauthorized or current password is incorrect
      */
     401: unknown;
+    /**
+     * Deployment tokens cannot enrol MFA
+     */
+    403: unknown;
     /**
      * MFA is already enabled; verify and disable it before re-enrollment
      */
