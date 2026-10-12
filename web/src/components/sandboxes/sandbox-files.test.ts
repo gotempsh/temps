@@ -1,0 +1,81 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+import { describe, expect, test } from 'bun:test'
+import {
+  decodeFile,
+  defaultFilePath,
+  encodeText,
+  filesUnavailableReason,
+  validateSandboxPath,
+} from './sandbox-files'
+
+describe('validateSandboxPath', () => {
+  test('accepts an absolute file path', () => {
+    expect(validateSandboxPath('/home/user/app/index.ts')).toBeNull()
+  })
+
+  test('explains each way a path is unusable', () => {
+    expect(validateSandboxPath('  ')).toContain('Enter')
+    expect(validateSandboxPath('app/index.ts')).toContain('absolute')
+    expect(validateSandboxPath('/home/user/')).toContain('directory')
+    expect(validateSandboxPath('/a\0b')).toContain('invalid')
+    expect(validateSandboxPath(`/${'a'.repeat(5000)}`)).toContain('too long')
+  })
+})
+
+describe('defaultFilePath', () => {
+  test('starts the path in the work dir', () => {
+    expect(defaultFilePath('/home/user/work')).toBe('/home/user/work/')
+    expect(defaultFilePath('/home/user/work/')).toBe('/home/user/work/')
+  })
+
+  test('falls back to the root for a missing or relative work dir', () => {
+    expect(defaultFilePath(undefined)).toBe('/')
+    expect(defaultFilePath('workspace')).toBe('/')
+  })
+})
+
+describe('encodeText / decodeFile', () => {
+  test('round-trips ASCII and non-Latin-1 text', () => {
+    for (const text of ['hello\n', 'héllo — 日本語 🚀', '']) {
+      expect(decodeFile(encodeText(text))).toEqual({ ok: true, text })
+    }
+  })
+
+  test('round-trips text larger than one encoding chunk', () => {
+    const text = 'x'.repeat(100_000)
+    expect(decodeFile(encodeText(text))).toEqual({ ok: true, text })
+  })
+
+  test('refuses binary content and invalid base64', () => {
+    expect(decodeFile(btoa(String.fromCharCode(0x89, 0x50, 0, 0x47)))).toEqual({
+      ok: false,
+      reason: 'binary',
+    })
+    expect(decodeFile(btoa(String.fromCharCode(0xff, 0xfe, 0xfd)))).toEqual({
+      ok: false,
+      reason: 'binary',
+    })
+    expect(decodeFile('***not base64***')).toEqual({
+      ok: false,
+      reason: 'invalid',
+    })
+  })
+})
+
+describe('filesUnavailableReason', () => {
+  test('is null while running and for a sleeping workspace', () => {
+    expect(filesUnavailableReason({ status: 'running' })).toBeNull()
+    expect(
+      filesUnavailableReason({ status: 'stopped', lifecycle: 'workspace' })
+    ).toBeNull()
+  })
+
+  test('explains stopped and destroyed sandboxes', () => {
+    expect(filesUnavailableReason({ status: 'stopped' })).toContain('Resume')
+    expect(filesUnavailableReason({ status: 'destroyed' })).toContain(
+      'destroyed'
+    )
+  })
+})

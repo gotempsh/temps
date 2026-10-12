@@ -25,6 +25,7 @@ import {
   Database,
   HardDrive,
   Cpu,
+  Plus,
 } from 'lucide-react'
 import { toast } from 'sonner'
 
@@ -86,6 +87,7 @@ import {
 } from '@/components/sandboxes/helpers'
 import { useAuth } from '@/contexts/AuthContext-shared'
 import { CreateSandboxDocs } from '@/components/sandboxes/CreateSandboxDocs'
+import { CreateSandboxSheet } from '@/components/sandboxes/CreateSandboxSheet'
 import { SandboxNodeBadge } from '@/components/sandboxes/SandboxNode'
 
 function statusVariant(
@@ -182,6 +184,7 @@ export default function Sandboxes({
   const [page, setPage] = useState(1)
   const [filter, setFilter] = useState<StatusFilter>('active')
   const [stopTarget, setStopTarget] = useState<SandboxView | null>(null)
+  const [createOpen, setCreateOpen] = useState(false)
   const queryClient = useQueryClient()
 
   const listQuery = listSandboxesOptions({
@@ -344,6 +347,12 @@ export default function Sandboxes({
                 })}
               </div>
             )}
+            {!workspacesOnly && (
+              <Button size="sm" onClick={() => setCreateOpen(true)}>
+                <Plus className="mr-1.5 h-4 w-4" />
+                <span className="max-sm:sr-only">New sandbox</span>
+              </Button>
+            )}
             <Button
               variant="outline"
               size="sm"
@@ -443,15 +452,30 @@ export default function Sandboxes({
               </CardContent>
             </Card>
           ) : items.length === 0 ? (
-            // Empty state — there's no "Create Sandbox" button in the UI yet, so
-            // surface the three real ways to create one (CLI / REST / SDK) right
-            // here instead of making the user hunt for docs.
-            <CreateSandboxDocs variant="full" />
+            // Empty state: the primary action first, then the three other ways
+            // to create one (CLI / REST / SDK) so nobody has to hunt for docs.
+            <div className="space-y-4">
+              <Card>
+                <CardContent className="space-y-3 py-10 text-center">
+                  <Box className="mx-auto h-8 w-8 text-muted-foreground" />
+                  <p className="text-sm font-medium">No sandboxes yet</p>
+                  <p className="mx-auto max-w-md text-xs text-muted-foreground">
+                    A sandbox is an isolated environment you can run commands
+                    in, open a terminal on, edit files in and share a preview
+                    of. Create one here or from the CLI, API or SDK.
+                  </p>
+                  <Button size="sm" onClick={() => setCreateOpen(true)}>
+                    <Plus className="mr-1.5 h-4 w-4" />
+                    New sandbox
+                  </Button>
+                </CardContent>
+              </Card>
+              <CreateSandboxDocs variant="full" />
+            </div>
           ) : (
             <div className="space-y-3">
-              {/* Collapsible docs banner. Creation still only happens from outside
-              the UI, so keep the instructions one click away even when the
-              user already has sandboxes. */}
+              {/* Collapsible docs banner: the CLI, API and SDK equivalents of
+              "New sandbox", one click away even when sandboxes already exist. */}
               <CreateSandboxDocs variant="compact" />
               {visible.length === 0 ? (
                 <Card>
@@ -547,6 +571,11 @@ export default function Sandboxes({
           </AlertDialog>
         </>
       )}
+      <CreateSandboxSheet
+        open={createOpen}
+        onOpenChange={setCreateOpen}
+        available={platformFeatures.data?.sandboxes ?? true}
+      />
     </PageContainer>
   )
 }

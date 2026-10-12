@@ -84,6 +84,13 @@ import {
 } from '@/components/sandboxes/helpers'
 import { useAuth } from '@/contexts/AuthContext-shared'
 import { SandboxPreviewPasswordCard } from '@/components/sandboxes/SandboxPreviewPasswordCard'
+import { SandboxFilesCard } from '@/components/sandboxes/SandboxFilesCard'
+import {
+  PREVIEW_ACCESS_ANCHOR,
+  SandboxPreviewLinksCard,
+} from '@/components/sandboxes/SandboxPreviewLinksCard'
+import { SandboxTerminalCard } from '@/components/sandboxes/SandboxTerminalCard'
+import { terminalUnavailableReason } from '@/components/sandboxes/sandbox-terminal'
 import { SandboxNodeValue } from '@/components/sandboxes/SandboxNode'
 import { ReadFailure } from '@/components/ui/read-failure'
 import { isVerifiedNotFound } from '@/lib/read-failure'
@@ -482,13 +489,18 @@ export default function SandboxDetail() {
   // verdict, derived from the record's own status field. Workspaces read
   // "sleeping" rather than "stopped" since they wake on next access instead
   // of requiring an explicit resume.
-  const SANDBOX_STATUS_VERDICT: Record<string, { tone: StatusTone; label: string }> = {
+  const SANDBOX_STATUS_VERDICT: Record<
+    string,
+    { tone: StatusTone; label: string }
+  > = {
     running: { tone: 'ok', label: 'Running' },
     stopped: { tone: 'warn', label: workspace ? 'Sleeping' : 'Stopped' },
     destroyed: { tone: 'error', label: 'Destroyed' },
   }
-  const verdict =
-    SANDBOX_STATUS_VERDICT[sandbox.status] ?? { tone: 'idle' as StatusTone, label: sandbox.status }
+  const verdict = SANDBOX_STATUS_VERDICT[sandbox.status] ?? {
+    tone: 'idle' as StatusTone,
+    label: sandbox.status,
+  }
 
   const facts: DetailFact[] = [
     {
@@ -581,9 +593,9 @@ export default function SandboxDetail() {
           {sandbox.preview_url_template}
         </code>
         <p className="text-xs text-muted-foreground mt-2">
-          Substitute <code className="font-mono">{'{port}'}</code> for any
-          port bound inside the sandbox. Use &ldquo;Open preview&rdquo;
-          above to launch common dev-server ports directly.
+          Substitute <code className="font-mono">{'{port}'}</code> for any port
+          bound inside the sandbox. Use &ldquo;Open preview&rdquo; above to
+          launch common dev-server ports directly.
         </p>
       </CardContent>
     </Card>
@@ -598,471 +610,515 @@ export default function SandboxDetail() {
         <p className="text-xs text-muted-foreground">
           Preview URLs are not available yet for sandboxes on worker nodes. This
           sandbox runs on {sandbox.node_name}; create one with{' '}
-          <code className="font-mono">--node control-plane</code> to preview
-          its ports.
+          <code className="font-mono">--node control-plane</code> to preview its
+          ports.
         </p>
       </CardContent>
     </Card>
   ) : null
 
-  const aside = diskCard || previewUrlCard ? (
-    <>
-      {diskCard}
-      {previewUrlCard}
-    </>
-  ) : undefined
+  const aside =
+    diskCard || previewUrlCard ? (
+      <>
+        {diskCard}
+        {previewUrlCard}
+      </>
+    ) : undefined
 
   return (
     <>
       <Detail
-      title={sandbox.name}
-      description={
-        <span className="inline-flex flex-wrap items-center gap-1.5 font-mono text-xs">
-          {sandbox.id}
-          <CopyAction value={sandbox.id} label="Copy sandbox ID" />
-        </span>
-      }
-      verdict={<Status tone={verdict.tone} label={verdict.label} />}
-      facts={facts}
-      actions={
-        <>
-          {backAction}
-          {hasPreview && (
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button size="sm" className="gap-1">
-                  <ExternalLink className="h-4 w-4" />
-                  Open preview
-                  <ChevronDown className="h-3 w-3 opacity-70" />
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="w-56">
-                {DEFAULT_PORTS.map((p) => (
-                  <DropdownMenuItem
-                    key={p.port}
-                    onClick={() => openPort(p.port)}
-                    className="justify-between"
-                  >
-                    <span className="font-mono text-xs">:{p.port}</span>
-                    <span className="text-muted-foreground text-xs">
-                      {p.label}
-                    </span>
-                  </DropdownMenuItem>
-                ))}
-                <DropdownMenuSeparator />
-                <div className="p-2 space-y-1.5">
-                  <Label
-                    htmlFor="dd-custom-port"
-                    className="text-xs text-muted-foreground"
-                  >
-                    Custom port
-                  </Label>
-                  <form
-                    className="flex items-center gap-1.5"
-                    onSubmit={(e) => {
-                      e.preventDefault()
-                      if (customPortValid) openPort(Number(customPort))
-                    }}
-                  >
-                    <Input
-                      id="dd-custom-port"
-                      type="number"
-                      min={1}
-                      max={65535}
-                      placeholder="4321"
-                      value={customPort}
-                      onChange={(e) => setCustomPort(e.target.value)}
-                      className="h-8 text-xs"
-                    />
-                    <Button
-                      type="submit"
-                      size="sm"
-                      variant="outline"
-                      className="h-8"
-                      disabled={!customPortValid}
+        title={sandbox.name}
+        description={
+          <span className="inline-flex flex-wrap items-center gap-1.5 font-mono text-xs">
+            {sandbox.id}
+            <CopyAction value={sandbox.id} label="Copy sandbox ID" />
+          </span>
+        }
+        verdict={<Status tone={verdict.tone} label={verdict.label} />}
+        facts={facts}
+        actions={
+          <>
+            {backAction}
+            {hasPreview && (
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button size="sm" className="gap-1">
+                    <ExternalLink className="h-4 w-4" />
+                    Open preview
+                    <ChevronDown className="h-3 w-3 opacity-70" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="w-56">
+                  {DEFAULT_PORTS.map((p) => (
+                    <DropdownMenuItem
+                      key={p.port}
+                      onClick={() => openPort(p.port)}
+                      className="justify-between"
                     >
-                      Go
-                    </Button>
-                  </form>
-                </div>
-              </DropdownMenuContent>
-            </DropdownMenu>
-          )}
-
-          {running && (
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() =>
-                pauseMutationHook.mutate({ path: { id: sandboxId } })
-              }
-              busy={pauseMutationHook.isPending}
-              busyLabel="Stopping…"
-            >
-              <Square className="mr-1 h-4 w-4" />
-              Stop
-            </Button>
-          )}
-          {stopped && (
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() =>
-                resumeMutationHook.mutate({ path: { id: sandboxId } })
-              }
-              busy={resumeMutationHook.isPending}
-              busyLabel="Resuming…"
-            >
-              <Play className="mr-1 h-4 w-4" />
-              Resume
-            </Button>
-          )}
-          {running && (
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() =>
-                restartMutationHook.mutate({ path: { id: sandboxId } })
-              }
-              disabled={restartMutationHook.isPending}
-              title="Restart"
-            >
-              <RotateCw className="h-4 w-4" />
-            </Button>
-          )}
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => refetch()}
-            disabled={isFetching}
-            title="Refresh"
-          >
-            <RefreshCw
-              className={`h-4 w-4 ${isFetching ? 'animate-spin' : ''}`}
-            />
-          </Button>
-          {!destroyed && (
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setDeleteOpen(true)}
-              className="text-destructive hover:text-destructive"
-              title="Delete"
-            >
-              <Trash2 className="h-4 w-4" />
-            </Button>
-          )}
-        </>
-      }
-      aside={aside}
-      main={
-        <>
-      {isError && (
-        <ReadFailure
-          resource="Sandbox"
-          error={error}
-          cached
-          onRetry={() => refetch()}
-          retrying={isFetching}
-        />
-      )}
-      {/* Live status strip — countdown with inline extend actions */}
-      {!destroyed && (
-        <Card className={expired ? 'border-destructive/40' : undefined}>
-          <CardContent className="py-4">
-            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-              <div className="flex items-center gap-4 flex-wrap">
-                <div className="flex items-center gap-2">
-                  <Timer
-                    className={`h-4 w-4 ${
-                      expired ? 'text-destructive' : 'text-muted-foreground'
-                    }`}
-                  />
-                  <div className="leading-tight">
-                    <div
-                      className={`font-mono text-sm tabular-nums ${
-                        expired ? 'text-destructive' : ''
-                      }`}
+                      <span className="font-mono text-xs">:{p.port}</span>
+                      <span className="text-muted-foreground text-xs">
+                        {p.label}
+                      </span>
+                    </DropdownMenuItem>
+                  ))}
+                  <DropdownMenuSeparator />
+                  <div className="p-2 space-y-1.5">
+                    <Label
+                      htmlFor="dd-custom-port"
+                      className="text-xs text-muted-foreground"
                     >
-                      {workspace && stopped
-                        ? 'sleeping — wakes on next use'
-                        : idleDeadlineReached
-                          ? 'suspending idle compute…'
-                          : expired
-                            ? 'expired'
-                            : `${timeLeft} ${workspace ? 'to suspend' : 'left'}`}
-                    </div>
-                    <div className="text-xs text-muted-foreground">
-                      {workspace ? 'idle suspension' : 'expires'}{' '}
-                      {fmtDateTime(sandbox.expires_at)}
-                    </div>
+                      Custom port
+                    </Label>
+                    <form
+                      className="flex items-center gap-1.5"
+                      onSubmit={(e) => {
+                        e.preventDefault()
+                        if (customPortValid) openPort(Number(customPort))
+                      }}
+                    >
+                      <Input
+                        id="dd-custom-port"
+                        type="number"
+                        min={1}
+                        max={65535}
+                        placeholder="4321"
+                        value={customPort}
+                        onChange={(e) => setCustomPort(e.target.value)}
+                        className="h-8 text-xs"
+                      />
+                      <Button
+                        type="submit"
+                        size="sm"
+                        variant="outline"
+                        className="h-8"
+                        disabled={!customPortValid}
+                      >
+                        Go
+                      </Button>
+                    </form>
                   </div>
-                </div>
-                <div className="h-8 w-px bg-border hidden sm:block" />
-                <div className="leading-tight">
-                  <div className="text-sm tabular-nums">
-                    {fmtRelativeTime(sandbox.created_at, now)}
-                  </div>
-                  <div className="text-xs text-muted-foreground">created</div>
-                </div>
-              </div>
-              <div className="flex flex-wrap items-center gap-1.5">
-                <span className="text-xs text-muted-foreground mr-1">
-                  Extend:
-                </span>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() =>
-                    extendMutationHook.mutate({
-                      path: { id: sandboxId },
-                      body: { extra_secs: 900 },
-                    })
-                  }
-                  disabled={extendMutationHook.isPending}
-                >
-                  +15m
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() =>
-                    extendMutationHook.mutate({
-                      path: { id: sandboxId },
-                      body: { extra_secs: 3600 },
-                    })
-                  }
-                  disabled={extendMutationHook.isPending}
-                >
-                  +1h
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() =>
-                    extendMutationHook.mutate({
-                      path: { id: sandboxId },
-                      body: { extra_secs: 14400 },
-                    })
-                  }
-                  disabled={extendMutationHook.isPending}
-                >
-                  +4h
-                </Button>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-      )}
-
-      {/* Command workbench — primary action, always visible */}
-      <Card>
-        <CardHeader className="pb-3">
-          <div className="flex items-center justify-between gap-2">
-            <CardTitle className="text-sm font-medium flex items-center gap-2">
-              <Terminal className="h-4 w-4" />
-              Command
-            </CardTitle>
-            {!running && (
-              <Badge variant="warning">sandbox {sandbox.status}</Badge>
+                </DropdownMenuContent>
+              </DropdownMenu>
             )}
-          </div>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          {/* Preset chips — zero-friction common probes */}
-          <div className="flex flex-wrap gap-1.5">
-            {PRESET_CMDS.map((p) => (
+
+            {running && (
               <Button
-                key={p.cmd}
                 variant="outline"
                 size="sm"
-                className="h-7 text-xs font-mono"
-                disabled={!running || execMutationHook.isPending}
-                onClick={() => {
-                  setCmdInput(p.cmd)
-                  runExec({ cmd: p.cmd, shell: p.shell })
-                }}
-                title={p.hint}
-              >
-                {p.label}
-              </Button>
-            ))}
-          </div>
-
-          <div className="flex flex-col gap-2 sm:flex-row">
-            <div className="min-w-0 flex-1 flex items-center gap-2 rounded-md border bg-muted/30 px-2">
-              <span className="font-mono text-xs text-muted-foreground select-none shrink-0">
-                $
-              </span>
-              <Input
-                ref={cmdInputRef}
-                value={cmdInput}
-                placeholder='ls -la  (use "quotes" to group)'
-                onChange={(e) => setCmdInput(e.target.value)}
-                onKeyDown={(e) => {
-                  if (
-                    e.key === 'Enter' &&
-                    !execMutationHook.isPending &&
-                    cmdInput.trim().length > 0 &&
-                    running
-                  ) {
-                    runExec()
-                  }
-                }}
-                className="min-w-0 border-0 bg-transparent shadow-none focus-visible:ring-0 px-0 font-mono h-9 text-base sm:text-sm"
-              />
-            </div>
-            <div className="flex gap-2">
-              <Input
-                value={cwdInput}
-                placeholder={sandbox.work_dir}
-                onChange={(e) => setCwdInput(e.target.value)}
-                className="font-mono h-9 w-full sm:w-56 text-base sm:text-xs"
-                title="Working directory (optional)"
-              />
-              <Button
-                onClick={() => runExec()}
-                disabled={
-                  execMutationHook.isPending ||
-                  cmdInput.trim().length === 0 ||
-                  !running
+                onClick={() =>
+                  pauseMutationHook.mutate({ path: { id: sandboxId } })
                 }
-                className="gap-1 shrink-0"
+                busy={pauseMutationHook.isPending}
+                busyLabel="Stopping…"
               >
-                {execMutationHook.isPending ? (
-                  <>
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                    Running…
-                  </>
-                ) : (
-                  <>Run</>
-                )}
+                <Square className="mr-1 h-4 w-4" />
+                Stop
               </Button>
-            </div>
-          </div>
+            )}
+            {stopped && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() =>
+                  resumeMutationHook.mutate({ path: { id: sandboxId } })
+                }
+                busy={resumeMutationHook.isPending}
+                busyLabel="Resuming…"
+              >
+                <Play className="mr-1 h-4 w-4" />
+                Resume
+              </Button>
+            )}
+            {running && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() =>
+                  restartMutationHook.mutate({ path: { id: sandboxId } })
+                }
+                disabled={restartMutationHook.isPending}
+                title="Restart"
+              >
+                <RotateCw className="h-4 w-4" />
+              </Button>
+            )}
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => refetch()}
+              disabled={isFetching}
+              title="Refresh"
+            >
+              <RefreshCw
+                className={`h-4 w-4 ${isFetching ? 'animate-spin' : ''}`}
+              />
+            </Button>
+            {!destroyed && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setDeleteOpen(true)}
+                className="text-destructive hover:text-destructive"
+                title="Delete"
+              >
+                <Trash2 className="h-4 w-4" />
+              </Button>
+            )}
+          </>
+        }
+        aside={aside}
+        main={
+          <>
+            {isError && (
+              <ReadFailure
+                resource="Sandbox"
+                error={error}
+                cached
+                onRetry={() => refetch()}
+                retrying={isFetching}
+              />
+            )}
+            {/* Live status strip — countdown with inline extend actions */}
+            {!destroyed && (
+              <Card className={expired ? 'border-destructive/40' : undefined}>
+                <CardContent className="py-4">
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                    <div className="flex items-center gap-4 flex-wrap">
+                      <div className="flex items-center gap-2">
+                        <Timer
+                          className={`h-4 w-4 ${
+                            expired
+                              ? 'text-destructive'
+                              : 'text-muted-foreground'
+                          }`}
+                        />
+                        <div className="leading-tight">
+                          <div
+                            className={`font-mono text-sm tabular-nums ${
+                              expired ? 'text-destructive' : ''
+                            }`}
+                          >
+                            {workspace && stopped
+                              ? 'sleeping — wakes on next use'
+                              : idleDeadlineReached
+                                ? 'suspending idle compute…'
+                                : expired
+                                  ? 'expired'
+                                  : `${timeLeft} ${workspace ? 'to suspend' : 'left'}`}
+                          </div>
+                          <div className="text-xs text-muted-foreground">
+                            {workspace ? 'idle suspension' : 'expires'}{' '}
+                            {fmtDateTime(sandbox.expires_at)}
+                          </div>
+                        </div>
+                      </div>
+                      <div className="h-8 w-px bg-border hidden sm:block" />
+                      <div className="leading-tight">
+                        <div className="text-sm tabular-nums">
+                          {fmtRelativeTime(sandbox.created_at, now)}
+                        </div>
+                        <div className="text-xs text-muted-foreground">
+                          created
+                        </div>
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <span className="text-xs text-muted-foreground mr-1">
+                        Extend:
+                      </span>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() =>
+                          extendMutationHook.mutate({
+                            path: { id: sandboxId },
+                            body: { extra_secs: 900 },
+                          })
+                        }
+                        disabled={extendMutationHook.isPending}
+                      >
+                        +15m
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() =>
+                          extendMutationHook.mutate({
+                            path: { id: sandboxId },
+                            body: { extra_secs: 3600 },
+                          })
+                        }
+                        disabled={extendMutationHook.isPending}
+                      >
+                        +1h
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() =>
+                          extendMutationHook.mutate({
+                            path: { id: sandboxId },
+                            body: { extra_secs: 14400 },
+                          })
+                        }
+                        disabled={extendMutationHook.isPending}
+                      >
+                        +4h
+                      </Button>
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+            )}
 
-          {execResult && (
-            <div className="rounded-md border bg-background">
-              <div className="flex items-center justify-between px-3 py-2 border-b bg-muted/40">
-                <div className="flex items-center gap-2 text-xs min-w-0">
-                  <Badge
-                    variant={
-                      execResult.exit_code === 0 ? 'success' : 'destructive'
-                    }
-                  >
-                    exit {execResult.exit_code}
-                  </Badge>
-                  {execDuration !== null && (
-                    <span className="text-muted-foreground">
-                      {execDuration}ms
-                    </span>
-                  )}
-                  {execStartedCmd && (
-                    <code className="font-mono text-muted-foreground truncate">
-                      $ {execStartedCmd}
-                    </code>
+            {/* Interactive terminal. Always visible; it explains why it cannot
+          connect rather than disappearing. */}
+            <SandboxTerminalCard
+              sandboxId={sandbox.id}
+              unavailableReason={terminalUnavailableReason(sandbox)}
+            />
+
+            {/* Command workbench — primary action, always visible */}
+            <Card>
+              <CardHeader className="pb-3">
+                <div className="flex items-center justify-between gap-2">
+                  <CardTitle className="text-sm font-medium flex items-center gap-2">
+                    <Terminal className="h-4 w-4" />
+                    Command
+                  </CardTitle>
+                  {!running && (
+                    <Badge variant="warning">sandbox {sandbox.status}</Badge>
                   )}
                 </div>
-                <CopyAction
-                  value={
-                    execResult.stdout +
-                    (execResult.stderr
-                      ? `\n---stderr---\n${execResult.stderr}`
-                      : '')
-                  }
-                  minimal
-                  className="h-7 w-7 shrink-0"
-                />
-              </div>
-              <div className="p-3 space-y-3">
-                <OutputBlock label="stdout" text={execResult.stdout} />
-                <OutputBlock label="stderr" text={execResult.stderr} error />
-              </div>
-            </div>
-          )}
-        </CardContent>
-      </Card>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                {/* Preset chips — zero-friction common probes */}
+                <div className="flex flex-wrap gap-1.5">
+                  {PRESET_CMDS.map((p) => (
+                    <Button
+                      key={p.cmd}
+                      variant="outline"
+                      size="sm"
+                      className="h-7 text-xs font-mono"
+                      disabled={!running || execMutationHook.isPending}
+                      onClick={() => {
+                        setCmdInput(p.cmd)
+                        runExec({ cmd: p.cmd, shell: p.shell })
+                      }}
+                      title={p.hint}
+                    >
+                      {p.label}
+                    </Button>
+                  ))}
+                </div>
 
-      {/* Detached jobs. Self-hides when the sandbox has none so it
+                <div className="flex flex-col gap-2 sm:flex-row">
+                  <div className="min-w-0 flex-1 flex items-center gap-2 rounded-md border bg-muted/30 px-2">
+                    <span className="font-mono text-xs text-muted-foreground select-none shrink-0">
+                      $
+                    </span>
+                    <Input
+                      ref={cmdInputRef}
+                      value={cmdInput}
+                      placeholder='ls -la  (use "quotes" to group)'
+                      onChange={(e) => setCmdInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (
+                          e.key === 'Enter' &&
+                          !execMutationHook.isPending &&
+                          cmdInput.trim().length > 0 &&
+                          running
+                        ) {
+                          runExec()
+                        }
+                      }}
+                      className="min-w-0 border-0 bg-transparent shadow-none focus-visible:ring-0 px-0 font-mono h-9 text-base sm:text-sm"
+                    />
+                  </div>
+                  <div className="flex gap-2">
+                    <Input
+                      value={cwdInput}
+                      placeholder={sandbox.work_dir}
+                      onChange={(e) => setCwdInput(e.target.value)}
+                      className="font-mono h-9 w-full sm:w-56 text-base sm:text-xs"
+                      title="Working directory (optional)"
+                    />
+                    <Button
+                      onClick={() => runExec()}
+                      disabled={
+                        execMutationHook.isPending ||
+                        cmdInput.trim().length === 0 ||
+                        !running
+                      }
+                      className="gap-1 shrink-0"
+                    >
+                      {execMutationHook.isPending ? (
+                        <>
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                          Running…
+                        </>
+                      ) : (
+                        <>Run</>
+                      )}
+                    </Button>
+                  </div>
+                </div>
+
+                {execResult && (
+                  <div className="rounded-md border bg-background">
+                    <div className="flex items-center justify-between px-3 py-2 border-b bg-muted/40">
+                      <div className="flex items-center gap-2 text-xs min-w-0">
+                        <Badge
+                          variant={
+                            execResult.exit_code === 0
+                              ? 'success'
+                              : 'destructive'
+                          }
+                        >
+                          exit {execResult.exit_code}
+                        </Badge>
+                        {execDuration !== null && (
+                          <span className="text-muted-foreground">
+                            {execDuration}ms
+                          </span>
+                        )}
+                        {execStartedCmd && (
+                          <code className="font-mono text-muted-foreground truncate">
+                            $ {execStartedCmd}
+                          </code>
+                        )}
+                      </div>
+                      <CopyAction
+                        value={
+                          execResult.stdout +
+                          (execResult.stderr
+                            ? `\n---stderr---\n${execResult.stderr}`
+                            : '')
+                        }
+                        minimal
+                        className="h-7 w-7 shrink-0"
+                      />
+                    </div>
+                    <div className="p-3 space-y-3">
+                      <OutputBlock label="stdout" text={execResult.stdout} />
+                      <OutputBlock
+                        label="stderr"
+                        text={execResult.stderr}
+                        error
+                      />
+                    </div>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+
+            {/* Detached jobs. Self-hides when the sandbox has none so it
           doesn't waste space on the common case. Shows cmd, status, age,
           and exit code at a glance; the full stdout/stderr lives behind
           `GET /jobs/{id}` which we wire to a drilldown later. */}
-      {jobs.length > 0 && (
-        <Card>
-          <CardHeader className="pb-3 flex flex-row items-center justify-between">
-            <CardTitle className="text-sm font-medium">
-              Background jobs{' '}
-              <span className="text-muted-foreground font-normal">
-                · {jobs.length}
-              </span>
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="p-0">
-            <ul className="divide-y">
-              {jobs.map((j) => (
-                <JobRow key={j.id} sandboxId={sandboxId} job={j} now={now} />
-              ))}
-            </ul>
-          </CardContent>
-        </Card>
-      )}
-
-      {/* Operations timeline — lifecycle events only, never shell activity. */}
-      {events.length > 0 && (
-        <Card>
-          <CardHeader className="pb-3">
-            <CardTitle className="text-sm font-medium">Timeline</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <ol className="space-y-3">
-              {events.map((e, i) => {
-                const { icon: Icon, label, detail } = eventPresentation(e)
-                return (
-                  <li
-                    key={`${e.at}-${e.event_type}-${i}`}
-                    className="flex items-start gap-3"
-                  >
-                    <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full border bg-muted/40">
-                      <Icon className="h-3.5 w-3.5 text-muted-foreground" />
+            {jobs.length > 0 && (
+              <Card>
+                <CardHeader className="pb-3 flex flex-row items-center justify-between">
+                  <CardTitle className="text-sm font-medium">
+                    Background jobs{' '}
+                    <span className="text-muted-foreground font-normal">
+                      · {jobs.length}
                     </span>
-                    <div className="min-w-0 flex-1">
-                      <div className="flex flex-wrap items-baseline gap-x-2">
-                        <span className="text-sm font-medium">{label}</span>
-                        {detail && (
-                          <span className="font-mono text-xs text-muted-foreground">
-                            {detail}
-                          </span>
-                        )}
-                      </div>
-                      <div
-                        className="text-xs text-muted-foreground"
-                        title={fmtDateTime(e.at)}
-                      >
-                        {fmtRelativeTime(e.at, now)}
-                      </div>
-                    </div>
-                  </li>
-                )
-              })}
-            </ol>
-          </CardContent>
-        </Card>
-      )}
+                  </CardTitle>
+                </CardHeader>
+                <CardContent className="p-0">
+                  <ul className="divide-y">
+                    {jobs.map((j) => (
+                      <JobRow
+                        key={j.id}
+                        sandboxId={sandboxId}
+                        job={j}
+                        now={now}
+                      />
+                    ))}
+                  </ul>
+                </CardContent>
+              </Card>
+            )}
 
-      {/* Preview access gate — only meaningful when preview URLs are
+            {/* Operations timeline — lifecycle events only, never shell activity. */}
+            {events.length > 0 && (
+              <Card>
+                <CardHeader className="pb-3">
+                  <CardTitle className="text-sm font-medium">
+                    Timeline
+                  </CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <ol className="space-y-3">
+                    {events.map((e, i) => {
+                      const { icon: Icon, label, detail } = eventPresentation(e)
+                      return (
+                        <li
+                          key={`${e.at}-${e.event_type}-${i}`}
+                          className="flex items-start gap-3"
+                        >
+                          <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full border bg-muted/40">
+                            <Icon className="h-3.5 w-3.5 text-muted-foreground" />
+                          </span>
+                          <div className="min-w-0 flex-1">
+                            <div className="flex flex-wrap items-baseline gap-x-2">
+                              <span className="text-sm font-medium">
+                                {label}
+                              </span>
+                              {detail && (
+                                <span className="font-mono text-xs text-muted-foreground">
+                                  {detail}
+                                </span>
+                              )}
+                            </div>
+                            <div
+                              className="text-xs text-muted-foreground"
+                              title={fmtDateTime(e.at)}
+                            >
+                              {fmtRelativeTime(e.at, now)}
+                            </div>
+                          </div>
+                        </li>
+                      )
+                    })}
+                  </ol>
+                </CardContent>
+              </Card>
+            )}
+
+            {/* Preview access gate — only meaningful when preview URLs are
           configured on this install. Destroyed sandboxes freeze the
           controls since mutating a dead row is never useful. */}
-      {Boolean(sandbox.preview_url_template) && (
-        <SandboxPreviewPasswordCard
-          sandboxId={sandbox.id}
-          hint={sandbox.preview_password_hint ?? undefined}
-          disabled={destroyed}
-        />
-      )}
-        </>
-      }
-    />
-  {/* Resize dialog */}
+            <SandboxPreviewLinksCard
+              sandboxId={sandbox.id}
+              hasPassword={Boolean(sandbox.preview_password_hint)}
+              running={running}
+              destroyed={destroyed}
+              configured={Boolean(sandbox.preview_url_template)}
+              onWorkerNode={sandbox.node_id != null}
+            />
+            {Boolean(sandbox.preview_url_template) && (
+              <div id={PREVIEW_ACCESS_ANCHOR} className="scroll-mt-4">
+                <SandboxPreviewPasswordCard
+                  sandboxId={sandbox.id}
+                  hint={sandbox.preview_password_hint ?? undefined}
+                  disabled={destroyed}
+                />
+              </div>
+            )}
+
+            <SandboxFilesCard
+              sandboxId={sandbox.id}
+              workDir={sandbox.work_dir}
+              status={sandbox.status}
+              lifecycle={sandbox.lifecycle}
+            />
+          </>
+        }
+      />
+      {/* Resize dialog */}
       <AlertDialog open={resizeOpen} onOpenChange={setResizeOpen}>
         <AlertDialogContent>
           <AlertDialogHeader>
@@ -1328,7 +1384,8 @@ function JobLogsPanel({
         </div>
         {error && <span className="text-destructive">{error}</span>}
       </div>
-      <pre tabIndex={0}
+      <pre
+        tabIndex={0}
         ref={scrollRef}
         className="max-h-80 overflow-auto rounded-md border bg-background p-2 font-mono text-xs leading-relaxed"
       >
@@ -1343,7 +1400,10 @@ function JobLogsPanel({
           <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
             stderr
           </div>
-          <pre tabIndex={0} className="max-h-40 overflow-auto rounded-md border bg-background p-2 font-mono text-xs leading-relaxed text-destructive/90">
+          <pre
+            tabIndex={0}
+            className="max-h-40 overflow-auto rounded-md border bg-background p-2 font-mono text-xs leading-relaxed text-destructive/90"
+          >
             {stderrText}
           </pre>
         </div>
@@ -1376,7 +1436,8 @@ function OutputBlock({
       <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
         {label}
       </div>
-      <pre tabIndex={0}
+      <pre
+        tabIndex={0}
         className={`text-xs font-mono whitespace-pre-wrap break-all rounded border p-3 max-h-72 overflow-auto ${
           error ? 'bg-destructive/5 border-destructive/30' : 'bg-muted/40'
         }`}
