@@ -453,22 +453,25 @@ pub async fn kv_status(
 /// but it is a conflict the operator can resolve, not an internal failure, and
 /// the 500 it was reported as gave no hint of the cause.
 fn kv_create_failure_problem(error: &temps_providers::ExternalServiceError) -> Problem {
-    match error {
-        temps_providers::ExternalServiceError::ServiceResourceConflict { resource, .. } => {
-            temps_core::problemdetails::new(StatusCode::CONFLICT)
-                .with_title("KV Resource Already Exists")
-                .with_detail(format!(
-                    "Docker resource '{resource}' already exists on this host and is not owned \
-                     by this Temps instance. The KV store uses fixed, host-wide resource names, \
-                     so this usually means another Temps instance sharing this Docker host has \
-                     already enabled KV. Remove the resource if it is a leftover, or enable KV \
-                     on a Docker host this instance does not share."
-                ))
-        }
-        other => temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-            .with_title("Failed to Enable KV Service")
-            .with_detail(format!("Could not create Redis service: {other}")),
+    if let temps_providers::ExternalServiceError::ServiceResourceConflict { resource, .. } = error {
+        return temps_core::problemdetails::new(StatusCode::CONFLICT)
+            .with_title("KV Resource Already Exists")
+            .with_detail(format!(
+                "Docker resource '{resource}' already exists on this host and is not owned \
+                 by this Temps instance. The KV store uses fixed, host-wide resource names, \
+                 so this usually means another Temps instance sharing this Docker host has \
+                 already enabled KV. Remove the resource if it is a leftover, or enable \
+                 KV on a Docker host this instance does not share."
+            ));
     }
+    // Every other variant goes through the providers crate's exhaustive
+    // classification (missing worker node, name conflicts, cluster placement),
+    // so a new `ExternalServiceError` variant is reviewed there, not swallowed
+    // by a catch-all here.
+    temps_providers::handlers::external_service_problem(
+        error,
+        format!("Could not create Redis service: {error}"),
+    )
 }
 
 /// Enable KV service

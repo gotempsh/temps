@@ -130,7 +130,7 @@ pub(crate) fn worker_node_required(
 /// `GET /external-services/types/{service_type}/parameters` answer a plain
 /// metadata question with "Failed to get parameter schema: This process has no
 /// local Docker daemon".
-pub(crate) fn external_service_problem(
+pub fn external_service_problem(
     error: &crate::services::ExternalServiceError,
     detail: String,
 ) -> Problem {
