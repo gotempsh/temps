@@ -187,6 +187,16 @@ fn forward(reply: UpstreamReply, credential_type: Option<CredentialType>) -> Res
     }
 }
 
+/// Name the provider that served a reply, like streamed replies do, so
+/// clients can tell a self-hosted reply from an OpenAI one by its headers.
+fn with_provider_header(mut response: Response, provider_id: &'static str) -> Response {
+    response.headers_mut().insert(
+        "x-temps-provider",
+        axum::http::HeaderValue::from_static(provider_id),
+    );
+    response
+}
+
 /// Batch result bytes are downloads, even if a custom provider labels them HTML/SVG.
 fn download_response(
     stream: crate::services::native_api_service::ByteStream,
@@ -485,7 +495,10 @@ async fn create_response(
                 credential_type = credential_type_str(credential_type),
                 "AI gateway Responses request completed"
             );
-            Ok(forward(reply, Some(credential_type)))
+            Ok(with_provider_header(
+                forward(reply, Some(credential_type)),
+                provider_id,
+            ))
         }
         ResponsesOutcome::Stream(stream) => {
             info!(
@@ -1148,6 +1161,27 @@ mod tests {
                 .await
                 .unwrap(),
             payload
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_responses_replies_name_the_serving_provider() {
+        let reply = UpstreamReply {
+            status: reqwest::StatusCode::OK,
+            content_type: Some("application/json".to_string()),
+            body: bytes::Bytes::from_static(br#"{"id":"resp_1"}"#),
+        };
+        let response = with_provider_header(
+            forward(reply, Some(CredentialType::System)),
+            crate::self_hosted::OPENAI_COMPATIBLE,
+        );
+        assert_eq!(
+            response.headers().get("x-temps-provider").unwrap(),
+            "openai_compatible"
+        );
+        assert_eq!(
+            response.headers().get("x-temps-credential-type").unwrap(),
+            "system"
         );
     }
 

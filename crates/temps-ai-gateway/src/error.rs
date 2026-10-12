@@ -69,14 +69,18 @@ pub enum AiGatewayError {
 
     #[error(
         "Model '{model}' is served by more than one configured provider ({candidates}); refusing \
-         to pick one. Send the X-Temps-Provider-Key-Id header with one of these key ids, or \
-         disable the model on all but one provider key."
+         to pick one. Send the X-Temps-Provider-Key-Id header with one of these key ids. \
+         Disabling the model on the other keys also works, except on a self-hosted key: a \
+         self-hosted key that lists a model keeps hosting it while it is disabled there, so \
+         requests for it must then pin a key."
     )]
     AmbiguousModel { model: String, candidates: String },
 
     #[error(
         "Model '{model}' is hosted by self-hosted provider key {key_id}, which cannot serve it \
-         right now ({reason}); it is never forwarded to another provider."
+         right now ({reason}); it is never forwarded to another provider automatically. Make it \
+         available on that key again, or send the X-Temps-Provider-Key-Id header to use another \
+         key explicitly."
     )]
     SelfHostedModelUnavailable {
         model: String,

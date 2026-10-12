@@ -501,6 +501,94 @@ async fn self_hosted_key_verification_uses_the_chosen_model_not_a_vendor_default
     assert_eq!(requests[0].model.as_deref(), Some(SELF_HOSTED_MODEL));
 }
 
+#[tokio::test]
+async fn ai_chat_follows_self_hosted_capability_declarations() {
+    use temps_ai::{
+        AiService, ChatMessage as AiChatMessage, ChatStreamDelta, ChatTool, ChatTurnRequest,
+        RefreshPolicy,
+    };
+    use temps_ai_gateway::services::GatewayAiService;
+
+    let Some(harness) = harness().await else {
+        return;
+    };
+    // One server that cannot stream, one that streams but has no tools.
+    let no_streaming_server = MockRecordingServer::start(&[SELF_HOSTED_MODEL], false).await;
+    let no_tools_server = MockRecordingServer::start(&[SELF_HOSTED_MODEL], false).await;
+    let no_streaming = add_key(
+        &harness,
+        OPENAI_COMPATIBLE,
+        "",
+        &no_streaming_server,
+        Some(SelfHostedCapabilities {
+            streaming: false,
+            tools: false,
+            embeddings: false,
+            responses_api: false,
+        }),
+    )
+    .await;
+    let no_tools = add_key(
+        &harness,
+        OPENAI_COMPATIBLE,
+        "",
+        &no_tools_server,
+        Some(SelfHostedCapabilities {
+            streaming: true,
+            tools: false,
+            embeddings: false,
+            responses_api: false,
+        }),
+    )
+    .await;
+    let ai = GatewayAiService::new(harness.gateway.clone(), harness._db.connection_arc());
+
+    // AI chat streams every turn: a key that cannot stream is not offered.
+    let no_streaming_route = format!("gateway_key:{}", no_streaming.id);
+    assert!(!ai.chat_capable_for(Some(&no_streaming_route)).await);
+    let no_tools_route = format!("gateway_key:{}", no_tools.id);
+    assert!(ai.chat_capable_for(Some(&no_tools_route)).await);
+
+    // The capability report reflects the declarations, not a vendor's.
+    let capabilities = ai
+        .capabilities_for(Some(&no_tools_route), RefreshPolicy::Cached)
+        .await
+        .expect("capabilities of the tools-off key");
+    assert!(capabilities.realtime.text_streaming);
+    assert!(!capabilities.realtime.tool_events);
+
+    // A turn offering tools still gets a reply: the tools are omitted
+    // instead of the request being refused for an undeclared capability.
+    let mut stream = ai
+        .chat_stream_turn(ChatTurnRequest {
+            purpose: "test.self_hosted_chat".to_string(),
+            provider: Some(no_tools_route),
+            model: Some(SELF_HOSTED_MODEL.to_string()),
+            messages: vec![AiChatMessage {
+                role: "user".to_string(),
+                content: "Say hello".to_string(),
+                ..Default::default()
+            }],
+            tools: vec![ChatTool {
+                name: "lookup".to_string(),
+                description: "Look something up".to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            }],
+            ..Default::default()
+        })
+        .await
+        .expect("chat turn on a tools-off key");
+    let mut text = String::new();
+    while let Some(delta) = stream.next().await {
+        if let ChatStreamDelta::Text(chunk) = delta.expect("stream delta") {
+            text.push_str(&chunk);
+        }
+    }
+    assert!(text.contains("from self-hosted"), "{text}");
+    assert_eq!(no_tools_server.inference_requests().len(), 1);
+    assert!(no_streaming_server.inference_requests().is_empty());
+}
+
 // ----------------------------------------------------------------------------
 // #1410: blocked destinations are reported clearly, before anything is sent
 // ----------------------------------------------------------------------------

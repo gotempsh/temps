@@ -22,6 +22,7 @@ use temps_ai::{
     RefreshPolicy, TokenStream, ToolCall,
 };
 
+use crate::self_hosted::{is_self_hosted, SelfHostedCapabilities};
 use crate::services::{gateway_provider_capabilities, ByokOverride, GatewayService};
 use crate::types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, MessageContent,
@@ -59,6 +60,29 @@ impl GatewayAiService {
             system_key_id: Some(key_id),
             ..Default::default()
         })
+    }
+
+    /// Capabilities declared on the self-hosted key that will serve `model`
+    /// for this route, using the same catalog-first routing as the request.
+    /// `None` when a vendor key (or nothing) serves it: vendor capabilities
+    /// are defined by their adapters.
+    async fn serving_declaration(
+        &self,
+        route: &ByokOverride,
+        model: &str,
+    ) -> Option<SelfHostedCapabilities> {
+        // A pinned key always serves its conversation; otherwise the catalog
+        // decides which key serves the model.
+        let key = match route.system_key_id {
+            Some(key_id) => temps_entities::ai_provider_keys::Entity::find_by_id(key_id)
+                .one(self.db.as_ref())
+                .await
+                .ok()
+                .flatten()?,
+            None => self.gateway.select_system_key(model, None).await.ok()?,
+        };
+        is_self_hosted(&key.provider)
+            .then(|| SelfHostedCapabilities::from_stored(key.capabilities.as_ref()))
     }
 
     /// Resolve the model to use: an explicit per-call `model`, else the first
@@ -429,7 +453,23 @@ impl AiService for GatewayAiService {
     }
 
     async fn chat_capable_for(&self, provider: Option<&str>) -> bool {
-        self.is_available_for(provider).await
+        if !self.is_available_for(provider).await {
+            return false;
+        }
+        // AI chat streams every turn. A self-hosted key that did not declare
+        // streaming would refuse it, so it is not offered for chat.
+        let Ok(route) = Self::route_override(provider, "chat.capable") else {
+            return false;
+        };
+        let Some(model) = self.resolve_model(None, None).await else {
+            return true;
+        };
+        if model == "temps-cloud" {
+            return true;
+        }
+        self.serving_declaration(&route, &model)
+            .await
+            .is_none_or(|declared| declared.streaming)
     }
 
     async fn capabilities_for(
@@ -493,13 +533,22 @@ impl AiService for GatewayAiService {
                 .filter(|id| !id.starts_with("text-embedding-"))
                 .collect();
         }
-        Ok(gateway_provider_capabilities(
+        let declared = is_self_hosted(&key.provider)
+            .then(|| SelfHostedCapabilities::from_stored(key.capabilities.as_ref()));
+        let mut capabilities = gateway_provider_capabilities(
             format!("gateway_key:{}", key.id),
             key.display_name,
             &key.provider,
             key.default_model,
             model_ids,
-        ))
+        );
+        // A self-hosted key reports what its administrator declared, not
+        // what a vendor would support.
+        if let Some(declared) = declared {
+            capabilities.realtime.text_streaming = declared.streaming;
+            capabilities.realtime.tool_events = declared.tools;
+        }
+        Ok(capabilities)
     }
 
     async fn complete(&self, request: AiRequest) -> Result<AiResponse, AiError> {
@@ -677,7 +726,13 @@ impl AiService for GatewayAiService {
         let messages: Vec<serde_json::Value> =
             messages_with_model_identity(&request.messages, &model);
         let mut body = serde_json::json!({ "model": model, "messages": messages });
-        if !request.tools.is_empty() {
+        // A self-hosted key that did not declare tool calling would refuse a
+        // request carrying tools; send the turn without them instead.
+        let tools_supported = self
+            .serving_declaration(&route, &model)
+            .await
+            .is_none_or(|declared| declared.tools);
+        if tools_supported && !request.tools.is_empty() {
             body["tools"] =
                 serde_json::Value::Array(request.tools.iter().map(tool_to_json).collect());
         }
@@ -828,7 +883,13 @@ impl AiService for GatewayAiService {
         let messages: Vec<serde_json::Value> =
             messages_with_model_identity(&request.messages, &model);
         let mut body = serde_json::json!({ "model": model, "messages": messages, "stream": true });
-        if !request.tools.is_empty() {
+        // A self-hosted key that did not declare tool calling would refuse a
+        // request carrying tools; stream the turn without them instead.
+        let tools_supported = self
+            .serving_declaration(&route, &model)
+            .await
+            .is_none_or(|declared| declared.tools);
+        if tools_supported && !request.tools.is_empty() {
             body["tools"] =
                 serde_json::Value::Array(request.tools.iter().map(tool_to_json).collect());
         }

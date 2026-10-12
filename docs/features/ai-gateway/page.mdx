@@ -151,7 +151,7 @@ The gateway routes each request by its exact model ID: it looks the ID up in the
   All providers use the same OpenAI-compatible API format. The gateway handles protocol translation automatically for Anthropic and Gemini.
 </Note>
 
-If two keys that reach different upstreams both serve the same model ID, the request is refused with `409 ambiguous_model` rather than sent to either. Pick one with the `X-Temps-Provider-Key-Id: <key id>` header, or disable the model on all but one key. Two keys of the same provider on the same endpoint are interchangeable and are not ambiguous.
+If two keys that reach different upstreams both serve the same model ID, the request is refused with `409 ambiguous_model` rather than sent to either. Pick one with the `X-Temps-Provider-Key-Id: <key id>` header. Disabling the model on the other keys also resolves it, except on a self-hosted key: a self-hosted key that lists a model keeps hosting it even while the model is disabled there (so it is never handed to a vendor by accident), and requests for that model must then pin a key with the header. Two keys of the same provider on the same endpoint are interchangeable and are not ambiguous.
 
 ---
 
@@ -164,7 +164,9 @@ Add a **Self-hosted (OpenAI-compatible)** provider to use a model server on your
 3. Click **Load models**. Temps lists every model the server reports at `/models`, with no name filter, and you pick the default model. Temps verifies the connection with that model before saving.
 4. Declare what the server supports: streaming, tool calling, embeddings and the Responses API. Requests that need an undeclared capability are refused before anything is sent.
 
-Every model the server lists is routed only to that server. A request for a model it hosts is never sent to OpenRouter or another vendor, even when the ID looks like `vendor/model`, and if the model is disabled there or the server stops listing it, the request fails instead of falling back.
+Every model the server lists is routed only to that server. A request for a model it hosts is never sent to OpenRouter or another vendor, even when the ID looks like `vendor/model`, and if the model is disabled there or the server stops listing it, the request fails with `model_unavailable` instead of falling back. To use another key for such a model on purpose, send the `X-Temps-Provider-Key-Id` header.
+
+AI chat follows the declared capabilities: a self-hosted key that does not declare streaming is not offered for chat, and chat turns on a key that does not declare tool calling are sent without tools.
 
 <Note>
   Plain `http://` is accepted only for trusted private addresses, so an API key or a prompt is never sent unencrypted over the internet. Use `https://` for any provider on a public address. Keys created before this rule that point at a public `http://` URL are refused at request time with that reason; change their base URL to `https://`.
