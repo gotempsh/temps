@@ -814,7 +814,114 @@ pub async fn preflight(
         return Ok(None);
     };
     let storage = check_storage(engine, service_name, operation, &snapshot, replacement)?;
+    if engine == ManagedEngine::Postgres {
+        let locations = pg_tablespace_locations(docker, container_name, &storage.data_dir)
+            .await
+            .map_err(|reason| RecreateGuardError::Inspect {
+                service: service_name.to_string(),
+                container: container_name.to_string(),
+                operation: operation.to_string(),
+                reason: format!("reading its tablespaces failed: {reason}"),
+            })?;
+        check_tablespaces(
+            service_name,
+            container_name,
+            operation,
+            &storage,
+            replacement,
+            &locations,
+        )?;
+    }
     Ok(Some((snapshot, storage)))
+}
+
+/// Tablespaces are absolute symlinks out of the data directory
+/// (`$PGDATA/pg_tblspc/<oid>`): a replacement only sees them when they are on
+/// the data volume and that volume is mounted at the same place. Pure.
+pub fn check_tablespaces(
+    service_name: &str,
+    container_name: &str,
+    operation: &str,
+    storage: &StorageMatch,
+    replacement: &ReplacementStorage,
+    locations: &[String],
+) -> Result<(), RecreateGuardError> {
+    let carried_at_same_place = replacement.mounts.iter().any(|m| {
+        m.volume == storage.volume && normalize_path(&m.target) == storage.mount_destination
+    });
+    for location in locations {
+        let inside_data_dir = path_within(location, &storage.data_dir).is_some();
+        let on_volume = path_within(location, &storage.mount_destination).is_some();
+        if !(inside_data_dir || (carried_at_same_place && on_volume)) {
+            return Err(RecreateGuardError::TablespaceNotCarriedOver {
+                engine: ManagedEngine::Postgres,
+                service: service_name.to_string(),
+                container: container_name.to_string(),
+                operation: operation.to_string(),
+                location: location.clone(),
+                volume: storage.volume.clone(),
+                mount: storage.mount_destination.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Where each tablespace of the cluster in `data_dir` lives, read from the
+/// `pg_tblspc` links through the archive API, so it works on a stopped
+/// container too. Relative links (in-place tablespaces) are inside the data
+/// directory and resolved against it.
+async fn pg_tablespace_locations(
+    docker: &Docker,
+    container: &str,
+    data_dir: &str,
+) -> Result<Vec<String>, String> {
+    let mut stream = docker.download_from_container(
+        container,
+        Some(DownloadFromContainerOptions {
+            path: format!("{data_dir}/pg_tblspc"),
+        }),
+    );
+    let mut archive = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(bytes) => {
+                if archive.len() + bytes.len() > SMALL_FILE_LIMIT {
+                    return Err("pg_tblspc is unexpectedly large".to_string());
+                }
+                archive.extend_from_slice(&bytes);
+            }
+            // No cluster yet: nothing to carry over.
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => return Ok(Vec::new()),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    tablespace_links(&archive, data_dir)
+}
+
+/// The link targets in a tar of `pg_tblspc`, as absolute normalised paths.
+pub fn tablespace_links(archive: &[u8], data_dir: &str) -> Result<Vec<String>, String> {
+    let mut tar = tar::Archive::new(archive);
+    let entries = tar.entries().map_err(|e| e.to_string())?;
+    let mut locations = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if !entry.header().entry_type().is_symlink() {
+            continue;
+        }
+        let Some(target) = entry.link_name().map_err(|e| e.to_string())? else {
+            continue;
+        };
+        let target = target.to_string_lossy().to_string();
+        locations.push(if target.starts_with('/') {
+            normalize_path(&target)
+        } else {
+            normalize_path(&format!("{data_dir}/pg_tblspc/{target}"))
+        });
+    }
+    Ok(locations)
 }
 
 /// Replace a managed container without ever losing its data; see the module
@@ -843,10 +950,9 @@ where
         .try_with(|held| held.borrow().contains(&name))
         .unwrap_or(false);
     if reentrant {
-        return recreate_locked(request, create).await;
+        return recreate_locked(request, create, None).await;
     }
-    let lock = container_lock(&name);
-    let _turn = lock.lock().await;
+    let turn = container_lock(&name).lock_owned().await;
     let mut held = HELD_RECREATES
         .try_with(|held| held.borrow().clone())
         .unwrap_or_default();
@@ -854,9 +960,64 @@ where
     HELD_RECREATES
         .scope(
             std::cell::RefCell::new(held),
-            recreate_locked(request, create),
+            recreate_locked(request, create, Some(turn)),
         )
         .await
+}
+
+/// Finishes a recreate that its caller abandoned. Armed once the original
+/// has been set aside: if the future driving the recreate is dropped before
+/// it verified the replacement or rolled back (a cancelled backup, a client
+/// that disconnected), dropping this puts the original back on a task of its
+/// own, still holding the container's turn so no other recreate starts on
+/// the half-finished state.
+struct PendingRollback {
+    docker: Docker,
+    old: ContainerSnapshot,
+    aside_name: String,
+    volume: String,
+    turn: Option<tokio::sync::OwnedMutexGuard<()>>,
+    armed: bool,
+}
+
+impl PendingRollback {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingRollback {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let docker = self.docker.clone();
+        let old = self.old.clone();
+        let aside_name = self.aside_name.clone();
+        let volume = self.volume.clone();
+        let turn = self.turn.take();
+        error!(
+            container = %old.name,
+            set_aside_as = %aside_name,
+            "Recreate abandoned before it finished; restoring the original container"
+        );
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    // Held until the original is back.
+                    let _turn = turn;
+                    let outcome = roll_back(&docker, &old, &aside_name, &volume).await;
+                    warn!(container = %old.name, %outcome, "Abandoned recreate rolled back");
+                });
+            }
+            Err(_) => error!(
+                container = %old.name,
+                set_aside_as = %aside_name,
+                "No runtime to restore the original on: it is kept stopped with restarts disabled \
+                 under its set-aside name; rename it back and start it"
+            ),
+        }
+    }
 }
 
 tokio::task_local! {
@@ -885,6 +1046,7 @@ fn container_lock(container_name: &str) -> std::sync::Arc<tokio::sync::Mutex<()>
 async fn recreate_locked<F, Fut, E>(
     request: RecreateRequest<'_>,
     create: F,
+    turn: Option<tokio::sync::OwnedMutexGuard<()>>,
 ) -> Result<RecreateReport, RecreateGuardError>
 where
     F: FnOnce() -> Fut,
@@ -955,29 +1117,6 @@ where
         "Captured data fingerprint before recreating"
     );
 
-    // Tablespaces are absolute symlinks out of the data directory: they must
-    // be on the same volume, mounted at the same place in the replacement.
-    if let Some(objects) = &before.objects {
-        let carried_at_same_place = replacement.mounts.iter().any(|m| {
-            m.volume == storage.volume && normalize_path(&m.target) == storage.mount_destination
-        });
-        for location in objects.iter().filter_map(|o| o.strip_prefix("tablespace:")) {
-            if !(carried_at_same_place
-                && path_within(location, &storage.mount_destination).is_some())
-            {
-                return Err(RecreateGuardError::TablespaceNotCarriedOver {
-                    engine,
-                    service: service_name.to_string(),
-                    container: container_name.to_string(),
-                    operation: operation.to_string(),
-                    location: location.to_string(),
-                    volume: storage.volume.clone(),
-                    mount: storage.mount_destination.clone(),
-                });
-            }
-        }
-    }
-
     let aside_name = set_aside_name(container_name);
     if let Err(reason) = set_aside(docker, &old, &aside_name).await {
         let restored = match restore_original(docker, &old, &aside_name, &storage.volume).await {
@@ -992,8 +1131,17 @@ where
             restored,
         });
     }
+    let mut pending = PendingRollback {
+        docker: docker.clone(),
+        old: old.clone(),
+        aside_name: aside_name.clone(),
+        volume: storage.volume.clone(),
+        turn,
+        armed: true,
+    };
 
     if let Err(e) = create().await {
+        pending.disarm();
         let rollback = roll_back(docker, &old, &aside_name, &storage.volume).await;
         return Err(RecreateGuardError::ReplacementFailed {
             engine,
@@ -1016,6 +1164,7 @@ where
             %reason,
             "Recreated container does not hold the original data; rolling back"
         );
+        pending.disarm();
         let rollback = roll_back(docker, &old, &aside_name, &storage.volume).await;
         return Err(RecreateGuardError::DataNotPreserved {
             engine,
@@ -1028,6 +1177,7 @@ where
     }
 
     // Verified: only now is the original removed, and never its volumes.
+    pending.disarm();
     if let Err(e) = docker
         .remove_container(
             &aside_name,
@@ -1134,7 +1284,7 @@ pub async fn runs_current_image(
 /// (the suffix is a fixed-width timestamp, so another service whose name
 /// merely starts the same way never matches), stopped, and with restarts
 /// disabled.
-pub async fn remove_set_aside_originals(docker: &Docker, container_name: &str) {
+pub async fn remove_set_aside_originals(docker: &Docker, container_name: &str, service_name: &str) {
     let containers = match docker
         .list_containers(Some(ListContainersOptions {
             all: true,
@@ -1183,6 +1333,30 @@ pub async fn remove_set_aside_originals(docker: &Docker, container_name: &str) {
             .and_then(|h| h.restart_policy.as_ref())
             .and_then(|p| p.name)
             .is_some_and(|n| matches!(n, RestartPolicyNameEnum::NO | RestartPolicyNameEnum::EMPTY));
+        // Temps labels every container it creates with its service's name
+        // (MongoDB under `temps.name`); an original set aside for this
+        // service carries this one.
+        let owner_labels = [
+            format!("{}service_name", temps_core::DOCKER_LABEL_PREFIX),
+            "temps.name".to_string(),
+        ];
+        let owned = inspect
+            .config
+            .as_ref()
+            .and_then(|c| c.labels.as_ref())
+            .is_some_and(|labels| {
+                owner_labels
+                    .iter()
+                    .any(|key| labels.get(key).is_some_and(|owner| owner == service_name))
+            });
+        if !owned {
+            warn!(
+                container = %name,
+                service = service_name,
+                "Not removing a container named like a set-aside original: it is not labelled as this service's"
+            );
+            continue;
+        }
         if running || !restart_disabled {
             warn!(
                 container = %name,
@@ -1315,6 +1489,33 @@ async fn restore_original(
             .await
             .map_err(|e| format!("renaming '{aside_name}' back to '{}' failed: {e}", old.name))?;
     }
+    // Never two servers on one data directory: while anything else runs on
+    // this volume, the original stays stopped *and* with restarts disabled,
+    // or a daemon restart would start it next to the other one.
+    let others: Vec<String> = docker
+        .list_containers(Some(ListContainersOptions {
+            all: false,
+            filters: Some(std::collections::HashMap::from([(
+                "volume".to_string(),
+                vec![volume.to_string()],
+            )])),
+            ..Default::default()
+        }))
+        .await
+        .map_err(|e| format!("checking who else uses volume '{volume}' failed: {e}"))?
+        .into_iter()
+        .filter(|c| c.id.as_deref() != Some(old.id.as_str()))
+        .flat_map(|c| c.names.unwrap_or_default())
+        .collect();
+    if !others.is_empty() {
+        return Err(format!(
+            "left the original stopped with restarts disabled because running container(s) {} \
+             also mount volume '{volume}'; stop them, then restore '{}' (restart policy and \
+             start)",
+            others.join(", "),
+            old.name
+        ));
+    }
     if let Some(policy) = old.restart_policy.clone() {
         docker
             .update_container(
@@ -1328,32 +1529,6 @@ async fn restore_original(
             .map_err(|e| format!("restoring the restart policy failed: {e}"))?;
     }
     if old.running {
-        // Never two servers on one data directory: if anything else is
-        // running on this volume (another process recreating it), leave the
-        // original stopped and say so.
-        let others: Vec<String> = docker
-            .list_containers(Some(ListContainersOptions {
-                all: false,
-                filters: Some(std::collections::HashMap::from([(
-                    "volume".to_string(),
-                    vec![volume.to_string()],
-                )])),
-                ..Default::default()
-            }))
-            .await
-            .map_err(|e| format!("checking who else uses volume '{volume}' failed: {e}"))?
-            .into_iter()
-            .filter(|c| c.id.as_deref() != Some(old.id.as_str()))
-            .flat_map(|c| c.names.unwrap_or_default())
-            .collect();
-        if !others.is_empty() {
-            return Err(format!(
-                "left the original stopped because running container(s) {} also mount volume \
-                 '{volume}'; stop them, then start '{}'",
-                others.join(", "),
-                old.name
-            ));
-        }
         match docker
             .start_container(&old.id, None::<StartContainerOptions>)
             .await
@@ -2085,6 +2260,85 @@ mod tests {
         ));
         assert!(!is_set_aside_name("postgres-ap", &made));
         assert!(!is_set_aside_name("postgres-app", "postgres-app"));
+    }
+
+    fn tblspc_tar(links: &[(&str, &str)]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut dir = tar::Header::new_gnu();
+        dir.set_entry_type(tar::EntryType::Directory);
+        dir.set_size(0);
+        builder
+            .append_data(&mut dir, "pg_tblspc/", std::io::empty())
+            .unwrap();
+        for (name, target) in links {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Symlink);
+            h.set_size(0);
+            builder
+                .append_link(&mut h, format!("pg_tblspc/{name}"), target)
+                .unwrap();
+        }
+        builder.into_inner().unwrap()
+    }
+
+    #[test]
+    fn tablespace_links_are_read_from_pg_tblspc() {
+        let archive = tblspc_tar(&[("16390", "/extra/ts"), ("16391", "../pg_tblspc_inplace/x")]);
+        let links = tablespace_links(&archive, "/var/lib/postgresql/18/docker").unwrap();
+        assert_eq!(
+            links,
+            vec![
+                "/extra/ts".to_string(),
+                "/var/lib/postgresql/18/docker/pg_tblspc/../pg_tblspc_inplace/x".to_string()
+            ]
+        );
+        assert!(tablespace_links(&tblspc_tar(&[]), "/d").unwrap().is_empty());
+    }
+
+    #[test]
+    fn tablespaces_must_live_on_the_carried_volume() {
+        let storage = StorageMatch {
+            data_dir: "/var/lib/postgresql/18/docker".into(),
+            volume: "postgres-app_data".into(),
+            mount_destination: "/var/lib/postgresql".into(),
+            path_in_volume: "18/docker".into(),
+        };
+        let check = |locations: &[&str]| {
+            check_tablespaces(
+                "app",
+                "postgres-app",
+                "a test",
+                &storage,
+                &pg18_replacement(),
+                &locations.iter().map(|l| l.to_string()).collect::<Vec<_>>(),
+            )
+        };
+        assert!(check(&[]).is_ok());
+        assert!(check(&["/var/lib/postgresql/tablespaces/ts1"]).is_ok());
+        let err = check(&["/extra/ts"]).unwrap_err();
+        assert!(
+            matches!(err, RecreateGuardError::TablespaceNotCarriedOver { .. }),
+            "{err}"
+        );
+        assert!(err.is_refusal());
+        // On the volume, but the replacement mounts it elsewhere: the
+        // absolute link would dangle.
+        let moved = ReplacementStorage {
+            data_dir: "/pg/18/docker".into(),
+            mounts: vec![PlannedMount {
+                volume: "postgres-app_data".into(),
+                target: "/pg".into(),
+            }],
+        };
+        assert!(check_tablespaces(
+            "app",
+            "postgres-app",
+            "a test",
+            &storage,
+            &moved,
+            &["/var/lib/postgresql/tablespaces/ts1".to_string()],
+        )
+        .is_err());
     }
 
     #[test]
@@ -2971,56 +3225,75 @@ mod docker_tests {
         };
         let scope = RunScope::new(&docker, "sweep");
         let base = scope.name("pg");
-        let sleeper = |name: String| {
+        let owner = "app";
+        let label = format!("{}service_name", temps_core::DOCKER_LABEL_PREFIX);
+        // Every container here sleeps; `labelled` decides whether it carries
+        // this service's Temps label, `parked` puts it in the state the guard
+        // leaves a set-aside original in (stopped, restarts disabled).
+        let make = |name: String, labelled: bool, parked: bool| {
             let docker = docker.clone();
+            let label = label.clone();
             async move {
-                run_container(
-                    &docker,
-                    &name,
-                    "alpine:3.22",
-                    &[],
-                    Some(vec!["sleep".into(), "600".into()]),
-                    vec![],
-                    None,
-                )
-                .await
+                ensure_image(&docker, "alpine:3.22").await;
+                let labels =
+                    labelled.then(|| std::collections::HashMap::from([(label, owner.to_string())]));
+                docker
+                    .create_container(
+                        Some(
+                            bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                                .name(&name)
+                                .build(),
+                        ),
+                        bollard::models::ContainerCreateBody {
+                            image: Some("alpine:3.22".to_string()),
+                            cmd: Some(vec!["sleep".into(), "600".into()]),
+                            labels,
+                            host_config: Some(bollard::models::HostConfig {
+                                restart_policy: Some(if parked {
+                                    no_restart()
+                                } else {
+                                    RestartPolicy {
+                                        name: Some(RestartPolicyNameEnum::ALWAYS),
+                                        maximum_retry_count: None,
+                                    }
+                                }),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                if !parked {
+                    docker
+                        .start_container(&name, None::<StartContainerOptions>)
+                        .await
+                        .unwrap();
+                }
             }
         };
-        // A real set-aside original: stopped, restart disabled.
+        // A real set-aside original of this service.
         let real = set_aside_name(&base);
-        sleeper(real.clone()).await;
-        docker
-            .update_container(
-                &real,
-                ContainerUpdateBody {
-                    restart_policy: Some(no_restart()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        docker
-            .stop_container(
-                &real,
-                Some(StopContainerOptions {
-                    t: Some(1),
-                    ..Default::default()
-                }),
-            )
-            .await
-            .unwrap();
+        make(real.clone(), true, true).await;
+        // The same name shape and state, but not labelled as this service's.
+        let impostor = format!("{base}-pre-recreate-{}", "2".repeat(23));
+        make(impostor.clone(), false, true).await;
         // Another service, named so it shares the prefix.
         let other_service = format!("{base}-pre-recreate-reporting");
-        sleeper(other_service.clone()).await;
+        make(other_service.clone(), true, false).await;
         // A set-aside name that is running (not left by the guard).
         let running = format!("{base}-pre-recreate-{}", "1".repeat(23));
-        sleeper(running.clone()).await;
+        make(running.clone(), true, false).await;
 
-        remove_set_aside_originals(&docker, &base).await;
+        remove_set_aside_originals(&docker, &base, owner).await;
 
         assert!(
             container_id(&docker, &real).await.is_none(),
             "the stopped original is removed"
+        );
+        assert!(
+            container_id(&docker, &impostor).await.is_some(),
+            "an unlabelled container is untouched"
         );
         assert!(
             is_running(&docker, &other_service).await,
@@ -3030,6 +3303,218 @@ mod docker_tests {
             is_running(&docker, &running).await,
             "a running container is untouched"
         );
+        scope.cleanup().await;
+    }
+
+    /// The data directory is on the volume, but a tablespace lives in the
+    /// container's own filesystem. Stopped, the container can only be read
+    /// through the archive API, and the guard must still refuse.
+    #[tokio::test]
+    async fn a_stopped_cluster_with_a_tablespace_off_the_volume_is_refused() {
+        let Some(docker) =
+            docker_or_skip("a_stopped_cluster_with_a_tablespace_off_the_volume_is_refused").await
+        else {
+            return;
+        };
+        let scope = RunScope::new(&docker, "tblspc");
+        let name = scope.name("pg");
+        let volume = scope.name("data");
+        scope.track_volume(&volume);
+        run_container(
+            &docker,
+            &name,
+            PG_IMAGE,
+            &pg_env(),
+            None,
+            vec![volume_mount(&volume, "/var/lib/postgresql")],
+            None,
+        )
+        .await;
+        seed(&docker, &name).await;
+        sh_eventually(
+            &docker,
+            &name,
+            "mkdir -p /extra/ts && chown postgres:postgres /extra/ts",
+        )
+        .await;
+        psql(
+            &docker,
+            &name,
+            "CREATE TABLESPACE extra LOCATION '/extra/ts'",
+        )
+        .await;
+        psql(
+            &docker,
+            &name,
+            "CREATE TABLE in_extra(x int) TABLESPACE extra; INSERT INTO in_extra VALUES (1)",
+        )
+        .await;
+        docker
+            .stop_container(
+                &name,
+                Some(StopContainerOptions {
+                    t: Some(30),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        let err = preflight(
+            &docker,
+            ManagedEngine::Postgres,
+            "app",
+            &name,
+            &ReplacementStorage {
+                data_dir: "/var/lib/postgresql/18/docker".into(),
+                mounts: vec![PlannedMount {
+                    volume: volume.clone(),
+                    target: "/var/lib/postgresql".into(),
+                }],
+            },
+            "a test",
+        )
+        .await
+        .expect_err("the tablespace would not be carried over");
+        assert!(
+            matches!(err, RecreateGuardError::TablespaceNotCarriedOver { ref location, .. } if location == "/extra/ts"),
+            "{err}"
+        );
+        scope.cleanup().await;
+    }
+
+    /// A recreate whose caller gives up half-way (a cancelled backup) still
+    /// ends with the original back, running, with its data.
+    #[tokio::test]
+    async fn an_abandoned_recreate_restores_the_original() {
+        let Some(docker) = docker_or_skip("an_abandoned_recreate_restores_the_original").await
+        else {
+            return;
+        };
+        let scope = RunScope::new(&docker, "cancel");
+        let name = scope.name("pg");
+        let volume = scope.name("data");
+        scope.track_volume(&volume);
+        let original_id = run_container(
+            &docker,
+            &name,
+            PG_IMAGE,
+            &pg_env(),
+            None,
+            vec![volume_mount(&volume, "/var/lib/postgresql")],
+            None,
+        )
+        .await;
+        seed(&docker, &name).await;
+
+        let abandoned = tokio::time::timeout(
+            Duration::from_secs(20),
+            recreate_preserving_data(
+                RecreateRequest {
+                    docker: &docker,
+                    engine: ManagedEngine::Postgres,
+                    service_name: "app",
+                    container_name: &name,
+                    replacement: ReplacementStorage {
+                        data_dir: "/var/lib/postgresql/18/docker".into(),
+                        mounts: vec![PlannedMount {
+                            volume: volume.clone(),
+                            target: "/var/lib/postgresql".into(),
+                        }],
+                    },
+                    operation: "a test",
+                },
+                // Never finishes: the caller gives up first.
+                || async {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    Ok::<(), String>(())
+                },
+            ),
+        )
+        .await;
+        assert!(abandoned.is_err(), "the recreate was abandoned");
+
+        // The rollback runs on its own task; give it time.
+        let mut back = false;
+        for _ in 0..60 {
+            if container_id(&docker, &name).await.as_deref() == Some(original_id.as_str())
+                && is_running(&docker, &name).await
+            {
+                back = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        assert!(back, "the original is back under its name and running");
+        assert_eq!(rows(&docker, &name).await, "7");
+        assert!(set_aside_containers(&docker, &name).await.is_empty());
+        let policy = docker
+            .inspect_container(&name, None::<InspectContainerOptions>)
+            .await
+            .unwrap()
+            .host_config
+            .and_then(|h| h.restart_policy)
+            .and_then(|p| p.name);
+        assert_eq!(policy, Some(RestartPolicyNameEnum::ALWAYS));
+        scope.cleanup().await;
+    }
+
+    /// Restoring an original while another container runs on its volume
+    /// leaves it stopped *with restarts disabled*, so a daemon restart can
+    /// never start two servers on one data directory.
+    #[tokio::test]
+    async fn restoring_beside_another_server_keeps_restarts_disabled() {
+        let Some(docker) =
+            docker_or_skip("restoring_beside_another_server_keeps_restarts_disabled").await
+        else {
+            return;
+        };
+        let scope = RunScope::new(&docker, "shared");
+        let name = scope.name("orig");
+        let volume = scope.name("data");
+        scope.track_volume(&volume);
+        let sleep = Some(vec!["sleep".to_string(), "600".to_string()]);
+        run_container(
+            &docker,
+            &name,
+            "alpine:3.22",
+            &[],
+            sleep.clone(),
+            vec![volume_mount(&volume, "/data")],
+            None,
+        )
+        .await;
+        let snapshot = inspect_snapshot(&docker, "app", &name, "a test")
+            .await
+            .unwrap()
+            .unwrap();
+        let aside = set_aside_name(&name);
+        set_aside(&docker, &snapshot, &aside).await.unwrap();
+        let other = scope.name("other");
+        run_container(
+            &docker,
+            &other,
+            "alpine:3.22",
+            &[],
+            sleep,
+            vec![volume_mount(&volume, "/data")],
+            None,
+        )
+        .await;
+
+        let err = restore_original(&docker, &snapshot, &aside, &volume)
+            .await
+            .unwrap_err();
+        assert!(err.contains(&other), "{err}");
+        assert!(!is_running(&docker, &name).await);
+        let policy = docker
+            .inspect_container(&name, None::<InspectContainerOptions>)
+            .await
+            .unwrap()
+            .host_config
+            .and_then(|h| h.restart_policy)
+            .and_then(|p| p.name);
+        assert_eq!(policy, Some(RestartPolicyNameEnum::NO));
         scope.cleanup().await;
     }
 

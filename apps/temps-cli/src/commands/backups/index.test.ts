@@ -168,19 +168,23 @@ describe('formatRetainedUntil', () => {
 describe('resolveRestartConsent (#1415)', () => {
   const restarts = { restarts_database: true, reason: 'WAL archiving is off' }
   const deps = (over: Partial<Parameters<typeof resolveRestartConsent>[0]> = {}) => {
-    const calls = { preflight: 0, prompt: 0 }
+    // Everything the operator would see or be asked, in order.
+    const events: string[] = []
     return {
-      calls,
+      events,
       deps: {
         confirmFlag: false,
         isTTY: true,
         loadPreflight: async () => {
-          calls.preflight++
+          events.push('preflight')
           return restarts
         },
         prompt: async () => {
-          calls.prompt++
+          events.push('prompt')
           return true
+        },
+        warn: (message: string) => {
+          events.push(`warn: ${message}`)
         },
         ...over,
       },
@@ -188,32 +192,27 @@ describe('resolveRestartConsent (#1415)', () => {
   }
 
   test('--confirm-restart proceeds without a preflight or a prompt', async () => {
-    const { deps: d, calls } = deps({ confirmFlag: true })
-    expect(await resolveRestartConsent(d)).toEqual({ kind: 'proceed', confirmRestart: true, warnings: [] })
-    expect(calls).toEqual({ preflight: 0, prompt: 0 })
+    const { deps: d, events } = deps({ confirmFlag: true })
+    expect(await resolveRestartConsent(d)).toEqual({ kind: 'proceed', confirmRestart: true })
+    expect(events).toEqual([])
   })
 
   test('a backup that does not restart proceeds without confirmation', async () => {
-    const { deps: d, calls } = deps({ loadPreflight: async () => ({ restarts_database: false }) })
-    expect(await resolveRestartConsent(d)).toEqual({ kind: 'proceed', confirmRestart: false, warnings: [] })
-    expect(calls.prompt).toBe(0)
+    const { deps: d, events } = deps({ loadPreflight: async () => ({ restarts_database: false }) })
+    expect(await resolveRestartConsent(d)).toEqual({ kind: 'proceed', confirmRestart: false })
+    expect(events).toEqual([])
   })
 
-  test('a non-interactive run stops with exit 1 and never prompts', async () => {
-    const { deps: d, calls } = deps({ isTTY: false })
-    const consent = await resolveRestartConsent(d)
-    expect(consent).toMatchObject({ kind: 'abort', exitCode: 1, warnings: ['WAL archiving is off'] })
-    expect(calls.prompt).toBe(0)
+  test('a non-interactive run explains, then stops with exit 1 and never prompts', async () => {
+    const { deps: d, events } = deps({ isTTY: false })
+    expect(await resolveRestartConsent(d)).toMatchObject({ kind: 'abort', exitCode: 1 })
+    expect(events).toEqual(['preflight', 'warn: WAL archiving is off'])
   })
 
-  test('an interactive yes sends confirm_restart', async () => {
-    const { deps: d, calls } = deps()
-    expect(await resolveRestartConsent(d)).toEqual({
-      kind: 'proceed',
-      confirmRestart: true,
-      warnings: ['WAL archiving is off'],
-    })
-    expect(calls.prompt).toBe(1)
+  test('the reason is shown before the question, and a yes sends confirm_restart', async () => {
+    const { deps: d, events } = deps()
+    expect(await resolveRestartConsent(d)).toEqual({ kind: 'proceed', confirmRestart: true })
+    expect(events).toEqual(['preflight', 'warn: WAL archiving is off', 'prompt'])
   })
 
   test('an interactive no starts nothing and exits 0', async () => {
@@ -222,13 +221,17 @@ describe('resolveRestartConsent (#1415)', () => {
   })
 
   test('an unreadable preflight sends the request unconfirmed (the server still refuses a restart)', async () => {
-    const { deps: d, calls } = deps({ loadPreflight: async () => undefined })
-    expect(await resolveRestartConsent(d)).toEqual({ kind: 'proceed', confirmRestart: false, warnings: [] })
-    expect(calls.prompt).toBe(0)
+    const { deps: d, events } = deps({ loadPreflight: async () => undefined })
+    expect(await resolveRestartConsent(d)).toEqual({ kind: 'proceed', confirmRestart: false })
+    expect(events).toEqual([])
   })
 
   test('a missing reason still warns', async () => {
-    const { deps: d } = deps({ isTTY: false, loadPreflight: async () => ({ restarts_database: true, reason: null }) })
-    expect((await resolveRestartConsent(d)).warnings).toEqual(['This backup restarts the database.'])
+    const { deps: d, events } = deps({
+      isTTY: false,
+      loadPreflight: async () => ({ restarts_database: true, reason: null }),
+    })
+    await resolveRestartConsent(d)
+    expect(events).toContain('warn: This backup restarts the database.')
   })
 })

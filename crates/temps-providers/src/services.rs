@@ -4848,6 +4848,7 @@ impl ExternalServiceManager {
                     crate::externalsvc::recreate_guard::remove_set_aside_originals(
                         docker.as_ref(),
                         &service_instance.get_docker_container_name(),
+                        &service_instance.get_name(),
                     )
                     .await;
                 }
@@ -11829,6 +11830,44 @@ echo "[restore] Pre-seed complete"
             // it is. The repair itself goes through the recreate guard.
             let managed_postgres = matches!(service_type_enum, ServiceType::Postgres)
                 && !parameters.contains_key("container_name");
+            // A managed container that no longer exists is created afresh
+            // by re-initialisation, which stores the host port it actually
+            // bound (a port retry happens when the old one is now taken).
+            // Starting it through the provider would keep that port only in
+            // memory and leave the service's connection details stale.
+            if managed_postgres {
+                let docker = self.require_docker()?;
+                let container = service_instance.get_docker_container_name();
+                match docker
+                    .inspect_container(
+                        &container,
+                        None::<bollard::query_parameters::InspectContainerOptions>,
+                    )
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(bollard::errors::Error::DockerResponseServerError {
+                        status_code: 404,
+                        ..
+                    }) => {
+                        info!(
+                            "Container {} of service {} ({}) is missing; re-initializing it",
+                            container, service_id, service.name
+                        );
+                        self.initialize_service(service_id).await?;
+                        return self.get_service_info(service_id).await;
+                    }
+                    Err(e) => {
+                        return Err(ExternalServiceError::DockerError {
+                            id: service_id,
+                            reason: format!(
+                                "Failed to inspect container '{}' before starting service {}: {}",
+                                container, service_id, e
+                            ),
+                        })
+                    }
+                }
+            }
             let start_result = if managed_postgres {
                 let service_config = ServiceConfig {
                     name: service.name.clone(),

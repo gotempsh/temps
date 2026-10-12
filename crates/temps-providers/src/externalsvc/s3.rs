@@ -3119,13 +3119,12 @@ impl ExternalService for S3Service {
                 new_s3_config.docker_image
             ),
             Some(false) => {
-                let kind = new_s3_config.server.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "S3 service '{}': server kind for image '{}' was not resolved before replacing its container",
-                        self.name,
-                        new_s3_config.docker_image
-                    )
-                })?;
+                // Services created before the `server` field have none
+                // stored: resolve it from the (already pulled) image, with
+                // the same legacy MinIO fallback container creation uses,
+                // and keep it on the config that is stored afterwards.
+                let kind = Self::resolve_server_kind(&self.docker, &new_s3_config).await?;
+                new_s3_config.server = Some(kind);
                 info!("Replacing S3/MinIO container with the new image");
                 self.recreate_container_guarded(&self.docker, &new_s3_config, &limits, kind)
                     .await?;

@@ -213,32 +213,12 @@ impl BackupEngine for PostgresWalgEngine {
             .get("allow_restart")
             .and_then(Value::as_bool)
             .unwrap_or(true);
-        // Only a probe that answered "restart needed" is final. A probe that
-        // could not reach PostgreSQL (restarting, at its connection limit)
-        // is a transient outage and retries like any other.
-        let restart_needed = if allow_restart {
-            false
-        } else {
-            postgres_service
+        if !allow_restart {
+            let probe = postgres_service
                 .backup_requires_restart(service_config.clone())
                 .await
-                .map_err(|error| BackupError::Failed {
-                    reason: format!(
-                        "Could not check whether backing up service {} ('{}') would restart \
-                         PostgreSQL: {}",
-                        service.id, service.name, error
-                    ),
-                })?
-        };
-        if restart_needed {
-            return Err(BackupError::PermanentFailure {
-                reason: format!(
-                    "Backup of service {} ('{}') would restart PostgreSQL to turn WAL archiving \
-                     on, and that was not confirmed when the backup was requested (archiving was \
-                     on then). Nothing was changed. Run the backup again and confirm the restart",
-                    service.id, service.name
-                ),
-            });
+                .map_err(|error| error.to_string());
+            unconfirmed_restart_gate(service.id, &service.name, probe)?;
         }
         let archiving = postgres_service
             .enable_continuous_archiving_reporting(service_config, &s3_credentials, &walg_prefix)
@@ -404,6 +384,35 @@ impl BackupEngine for PostgresWalgEngine {
 }
 
 // ── Local helpers ────────────────────────────────────────────────────────────
+
+/// What to do with a run whose caller did not confirm a restart, given the
+/// probe of whether one is needed now. Only a probe that answered "restart
+/// needed" is final (the run would restart PostgreSQL unconfirmed). A probe
+/// that could not reach PostgreSQL (restarting, at its connection limit) is
+/// a transient outage and retries like any other.
+fn unconfirmed_restart_gate(
+    service_id: i32,
+    service_name: &str,
+    probe: Result<bool, String>,
+) -> Result<(), BackupError> {
+    match probe {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(BackupError::PermanentFailure {
+            reason: format!(
+                "Backup of service {service_id} ('{service_name}') would restart PostgreSQL to \
+                 turn WAL archiving on, and that was not confirmed when the backup was requested \
+                 (archiving was on then). Nothing was changed. Run the backup again and confirm \
+                 the restart"
+            ),
+        }),
+        Err(error) => Err(BackupError::Failed {
+            reason: format!(
+                "Could not check whether backing up service {service_id} ('{service_name}') \
+                 would restart PostgreSQL: {error}"
+            ),
+        }),
+    }
+}
 struct PgParams {
     username: String,
     password: String,
@@ -662,5 +671,31 @@ mod tests {
         let (cmd, env) = build_lsn_exec_args(&pg);
         assert_eq!(cmd.len(), 4);
         assert_eq!(env.len(), 3);
+    }
+
+    #[test]
+    fn an_unreachable_restart_probe_is_retried_not_final() {
+        let err = unconfirmed_restart_gate(7, "app", Err("connection refused".into()))
+            .expect_err("unknown is not a pass");
+        assert!(
+            matches!(err, BackupError::Failed { ref reason } if reason.contains("connection refused")),
+            "{err:?}"
+        );
+        assert!(!err.is_permanent());
+    }
+
+    #[test]
+    fn a_needed_unconfirmed_restart_is_refused_for_good() {
+        let err = unconfirmed_restart_gate(7, "app", Ok(true)).expect_err("restart needed");
+        assert!(
+            matches!(err, BackupError::PermanentFailure { ref reason } if reason.contains("not confirmed")),
+            "{err:?}"
+        );
+        assert!(err.is_permanent());
+    }
+
+    #[test]
+    fn no_restart_needed_lets_the_backup_run() {
+        assert!(unconfirmed_restart_gate(7, "app", Ok(false)).is_ok());
     }
 }

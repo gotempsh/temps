@@ -953,6 +953,7 @@ async function runServiceBackup(options: RunServiceBackupOptions): Promise<void>
   const consent = await resolveRestartConsent({
     confirmFlag: options.confirmRestart === true,
     isTTY: process.stdin.isTTY === true,
+    warn: (message) => warning(message),
     loadPreflight: async () =>
       (await externalServiceBackupPreflight({ client, path: { id } })).data,
     prompt: () =>
@@ -961,9 +962,6 @@ async function runServiceBackup(options: RunServiceBackupOptions): Promise<void>
         default: false,
       }),
   })
-  for (const message of consent.warnings) {
-    warning(message)
-  }
   if (consent.kind === 'abort') {
     info(consent.message)
     if (consent.exitCode !== 0) process.exitCode = consent.exitCode
@@ -1214,8 +1212,8 @@ async function cleanupBackups(options: CleanupBackupsOptions): Promise<void> {
 
 /** What `run-service` should do about a backup that may restart the database. */
 export type RestartConsent =
-  | { kind: 'proceed'; confirmRestart: boolean; warnings: string[] }
-  | { kind: 'abort'; message: string; exitCode: 0 | 1; warnings: string[] }
+  | { kind: 'proceed'; confirmRestart: boolean }
+  | { kind: 'abort'; message: string; exitCode: 0 | 1 }
 
 /**
  * Decide whether `run-service` may start a backup that restarts the
@@ -1224,33 +1222,35 @@ export type RestartConsent =
  * non-interactive one stops with a non-zero exit instead of sending the
  * request. When the preflight cannot be read the request is sent without
  * confirmation; the server still refuses an unacknowledged restart (409).
+ * The preflight's reason is given to `warn` before anything is asked, so the
+ * operator answers knowing why (including that the backup will be refused).
  */
 export async function resolveRestartConsent(deps: {
   confirmFlag: boolean
   isTTY: boolean
   loadPreflight: () => Promise<{ restarts_database: boolean; reason?: string | null } | undefined>
   prompt: () => Promise<boolean>
+  warn: (message: string) => void
 }): Promise<RestartConsent> {
   if (deps.confirmFlag) {
-    return { kind: 'proceed', confirmRestart: true, warnings: [] }
+    return { kind: 'proceed', confirmRestart: true }
   }
   const preflight = await deps.loadPreflight()
   if (!preflight?.restarts_database) {
-    return { kind: 'proceed', confirmRestart: false, warnings: [] }
+    return { kind: 'proceed', confirmRestart: false }
   }
-  const warnings = [preflight.reason || 'This backup restarts the database.']
+  deps.warn(preflight.reason || 'This backup restarts the database.')
   if (!deps.isTTY) {
     return {
       kind: 'abort',
       message: 'Nothing was started. Re-run with --confirm-restart to proceed.',
       exitCode: 1,
-      warnings,
     }
   }
   if (await deps.prompt()) {
-    return { kind: 'proceed', confirmRestart: true, warnings }
+    return { kind: 'proceed', confirmRestart: true }
   }
-  return { kind: 'abort', message: 'Backup not started', exitCode: 0, warnings }
+  return { kind: 'abort', message: 'Backup not started', exitCode: 0 }
 }
 
 export function parseCleanupScheduleId(value?: string): number | undefined {
