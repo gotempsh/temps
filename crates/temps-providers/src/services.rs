@@ -11903,6 +11903,15 @@ echo "[restore] Pre-seed complete"
             match start_result {
                 Ok(()) => {}
                 Err(e) => {
+                    // The guard's verdict is final. Re-initialising would
+                    // stop whatever holds the container's name and recreate
+                    // it again -- over an original that is still set aside,
+                    // or a replacement that failed verification.
+                    if let Some(guard_failure) =
+                        Self::guard_failure_for_start(service_id, &service.name, &e)
+                    {
+                        return Err(guard_failure);
+                    }
                     info!(
                         "Direct start failed for service {} ({}), falling back to initialize: {}",
                         service_id, service.name, e
@@ -11962,6 +11971,33 @@ echo "[restore] Pre-seed complete"
         }
 
         self.get_service_info(service_id).await
+    }
+
+    /// The error to return from a failed start when the failure came from
+    /// the recreate guard, or `None` for any other failure (which may fall
+    /// back to re-initialising the service). A guard error is never retried
+    /// through `initialize_service`: it stops the container that holds the
+    /// name and recreates it again, which is exactly what the guard just
+    /// refused or failed to complete safely.
+    fn guard_failure_for_start(
+        service_id: i32,
+        name: &str,
+        error: &anyhow::Error,
+    ) -> Option<ExternalServiceError> {
+        let guard =
+            error.downcast_ref::<crate::externalsvc::recreate_guard::RecreateGuardError>()?;
+        Some(if guard.is_refusal() {
+            ExternalServiceError::DataSafetyRefusal {
+                service_id,
+                name: name.to_string(),
+                reason: guard.to_string(),
+            }
+        } else {
+            ExternalServiceError::StartFailed {
+                id: service_id,
+                reason: guard.to_string(),
+            }
+        })
     }
 
     /// Wipe `health_metadata.postgres_wal` then immediately run the WAL probe
@@ -15721,6 +15757,43 @@ impl temps_metrics::ClusterPrimaryConnector for ExternalServiceManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn guard_error(restored: bool) -> anyhow::Error {
+        crate::externalsvc::recreate_guard::RecreateGuardError::DataNotPreserved {
+            engine: crate::externalsvc::recreate_guard::ManagedEngine::Postgres,
+            service: "app".into(),
+            container: "postgres-app".into(),
+            operation: "a test".into(),
+            reason: "identity changed".into(),
+            rollback: "rollback note".into(),
+            original_in_place: restored,
+        }
+        .into()
+    }
+
+    #[test]
+    fn a_failed_start_after_a_guard_error_is_never_retried_by_reinitialising() {
+        // Whether or not the rollback completed, the guard's verdict is
+        // returned as the start failure instead of recreating again.
+        for restored in [true, false] {
+            let failure =
+                ExternalServiceManager::guard_failure_for_start(7, "app", &guard_error(restored));
+            assert!(
+                matches!(
+                    failure,
+                    Some(ExternalServiceError::StartFailed { id: 7, ref reason })
+                        if reason.contains("postgres-app")
+                ),
+                "restored={restored}: {failure:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_start_without_a_guard_error_may_fall_back_to_reinitialising() {
+        let other = anyhow::anyhow!("container is missing");
+        assert!(ExternalServiceManager::guard_failure_for_start(7, "app", &other).is_none());
+    }
 
     #[test]
     fn readiness_is_reported_only_for_the_phase_the_status_is_in() {

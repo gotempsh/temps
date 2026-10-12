@@ -1016,6 +1016,9 @@ struct PendingRollback {
     aside_name: String,
     volume: String,
     turn: Option<tokio::sync::OwnedMutexGuard<()>>,
+    /// Set by [`set_aside`] just before it asks Docker to stop the original.
+    /// That request keeps running in the daemon when this future is dropped.
+    stop_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
     armed: bool,
 }
 
@@ -1035,9 +1038,13 @@ impl Drop for PendingRollback {
         let aside_name = self.aside_name.clone();
         let volume = self.volume.clone();
         let turn = self.turn.take();
+        let stop_requested = self
+            .stop_requested
+            .load(std::sync::atomic::Ordering::SeqCst);
         error!(
             container = %old.name,
             set_aside_as = %aside_name,
+            stop_requested,
             "Recreate abandoned before it finished; restoring the original container"
         );
         match tokio::runtime::Handle::try_current() {
@@ -1045,19 +1052,23 @@ impl Drop for PendingRollback {
                 handle.spawn(async move {
                     // Held until the original is back.
                     let _turn = turn;
+                    // A stop the abandoned future asked for is still running
+                    // in the daemon and would stop the original right after
+                    // a restart. Restarts are disabled on it, so wait until
+                    // that stop has landed (or cannot still be in flight),
+                    // then restore once. Nothing is replayed later: an
+                    // operator's own stop after this is theirs to keep.
+                    if stop_requested && old.running {
+                        wait_until_stopped(&docker, &old.id).await;
+                    }
                     let outcome = roll_back(&docker, &old, &aside_name, &volume).await;
-                    warn!(
-                        container = %old.name,
-                        restored = outcome.restored,
-                        outcome = %outcome.message,
-                        "Abandoned recreate rolled back"
-                    );
-                    // A stop the abandoned future had asked for keeps running
-                    // in the daemon and can finish after this restart. Once
-                    // it can no longer be in flight, make sure again.
-                    tokio::time::sleep(ABANDONED_STOP_GRACE).await;
-                    let outcome = roll_back(&docker, &old, &aside_name, &volume).await;
-                    if !outcome.restored {
+                    if outcome.restored {
+                        warn!(
+                            container = %old.name,
+                            outcome = %outcome.message,
+                            "Abandoned recreate rolled back"
+                        );
+                    } else {
                         error!(
                             container = %old.name,
                             outcome = %outcome.message,
@@ -1073,6 +1084,24 @@ impl Drop for PendingRollback {
                  under its set-aside name; rename it back and start it"
             ),
         }
+    }
+}
+
+/// Wait until container `id` is no longer running, at most
+/// [`ABANDONED_STOP_GRACE`]: the length of a stop request, after which
+/// Docker has killed the container.
+async fn wait_until_stopped(docker: &Docker, id: &str) {
+    let deadline = std::time::Instant::now() + ABANDONED_STOP_GRACE;
+    while std::time::Instant::now() < deadline {
+        match docker
+            .inspect_container(id, None::<InspectContainerOptions>)
+            .await
+        {
+            Ok(c) if c.state.as_ref().and_then(|s| s.running).unwrap_or(false) => {}
+            // Stopped, or gone: nothing is in flight any more.
+            _ => return,
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 
@@ -1186,9 +1215,11 @@ where
         aside_name: aside_name.clone(),
         volume: storage.volume.clone(),
         turn,
+        stop_requested: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         armed: true,
     };
-    if let Err(reason) = set_aside(docker, &old, &aside_name).await {
+    let stop_requested = pending.stop_requested.clone();
+    if let Err(reason) = set_aside(docker, &old, &aside_name, &stop_requested).await {
         let restore = restore_original(docker, &old, &aside_name, &storage.volume).await;
         pending.disarm();
         let (restored, original_in_place) = match restore {
@@ -1484,6 +1515,7 @@ async fn set_aside(
     docker: &Docker,
     old: &ContainerSnapshot,
     aside_name: &str,
+    stop_requested: &std::sync::atomic::AtomicBool,
 ) -> Result<(), String> {
     docker
         .update_container(
@@ -1496,6 +1528,7 @@ async fn set_aside(
         .await
         .map_err(|e| format!("disabling the restart policy failed: {e}"))?;
     if old.running {
+        stop_requested.store(true, std::sync::atomic::Ordering::SeqCst);
         match docker
             .stop_container(
                 &old.id,
@@ -3650,6 +3683,100 @@ mod docker_tests {
         scope.cleanup().await;
     }
 
+    /// The recovery of an abandoned recreate happens once. A stop the
+    /// operator issues after the original is back is theirs to keep: nothing
+    /// replays the restore from the old snapshot afterwards.
+    #[tokio::test]
+    async fn a_stop_after_an_abandoned_recreate_is_not_undone() {
+        let Some(docker) = docker_or_skip("a_stop_after_an_abandoned_recreate_is_not_undone").await
+        else {
+            return;
+        };
+        let scope = RunScope::new(&docker, "laterstop");
+        let name = scope.name("svc");
+        let volume = scope.name("data");
+        scope.track_volume(&volume);
+        let original_id = run_container(
+            &docker,
+            &name,
+            "alpine:3.22",
+            &[],
+            Some(vec!["sleep".into(), "3600".into()]),
+            vec![volume_mount(&volume, "/data")],
+            None,
+        )
+        .await;
+
+        let abandoned = tokio::time::timeout(
+            Duration::from_secs(3),
+            recreate_preserving_data(
+                RecreateRequest {
+                    docker: &docker,
+                    engine: ManagedEngine::Redis,
+                    service_name: "app",
+                    container_name: &name,
+                    replacement: ReplacementStorage {
+                        data_dir: "/data".into(),
+                        mounts: vec![PlannedMount {
+                            volume: volume.clone(),
+                            target: "/data".into(),
+                        }],
+                    },
+                    operation: "a test",
+                },
+                || async { Ok::<(), String>(()) },
+            ),
+        )
+        .await;
+        assert!(abandoned.is_err(), "abandoned while the stop was in flight");
+
+        // Wait for the one recovery to finish. The original still answers to
+        // its own name while the abandoned stop is in flight, so "running"
+        // alone proves nothing: its restart policy was disabled by the set
+        // aside and only the recovery puts it back.
+        let deadline = std::time::Instant::now() + ABANDONED_STOP_GRACE + Duration::from_secs(30);
+        let mut back = false;
+        while std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let policy = docker
+                .inspect_container(&name, None::<InspectContainerOptions>)
+                .await
+                .ok()
+                .and_then(|c| {
+                    c.host_config
+                        .and_then(|h| h.restart_policy)
+                        .and_then(|p| p.name)
+                });
+            if container_id(&docker, &name).await.as_deref() == Some(original_id.as_str())
+                && is_running(&docker, &name).await
+                && policy == Some(RestartPolicyNameEnum::ALWAYS)
+            {
+                back = true;
+                break;
+            }
+        }
+        assert!(back, "the original was put back and is running");
+
+        // The operator stops the service. A recovery that replayed the old
+        // "running" snapshot would start it again within the grace period.
+        docker
+            .stop_container(
+                &name,
+                Some(StopContainerOptions {
+                    t: Some(1),
+                    signal: None,
+                }),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(ABANDONED_STOP_GRACE + Duration::from_secs(10)).await;
+        assert!(
+            !is_running(&docker, &name).await,
+            "the operator's stop was undone by a delayed recovery"
+        );
+        scope.cleanup().await;
+    }
+
     /// Restoring an original while another container runs on its volume
     /// leaves it stopped *with restarts disabled*, so a daemon restart can
     /// never start two servers on one data directory.
@@ -3680,7 +3807,14 @@ mod docker_tests {
             .unwrap()
             .unwrap();
         let aside = set_aside_name(&name);
-        set_aside(&docker, &snapshot, &aside).await.unwrap();
+        set_aside(
+            &docker,
+            &snapshot,
+            &aside,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
         let other = scope.name("other");
         run_container(
             &docker,
