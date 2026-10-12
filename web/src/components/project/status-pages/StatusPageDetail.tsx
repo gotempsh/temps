@@ -25,6 +25,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
+import { resolvePublicUrl } from './public-url'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -85,20 +86,21 @@ function DetailSkeleton() {
 }
 
 function PublicLinkSection({ page }: { page: StatusPageResponse }) {
+  const publicUrl = resolvePublicUrl(page.public_url, window.location.origin)
   return (
     <section className="space-y-2">
       <h3 className="text-lg font-semibold">Public link</h3>
       <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center">
         <code className="min-w-0 truncate rounded-md border bg-muted px-3 py-2 text-sm">
-          {page.public_url}
+          {publicUrl}
         </code>
         <div className="flex gap-2">
-          <CopyButton value={page.public_url} variant="outline" size="sm">
+          <CopyButton value={publicUrl} variant="outline" size="sm">
             Copy
           </CopyButton>
           {page.is_published && (
             <Button variant="outline" size="sm" asChild>
-              <a href={page.public_url} target="_blank" rel="noreferrer">
+              <a href={publicUrl} target="_blank" rel="noreferrer">
                 <ExternalLink className="size-4 sm:mr-2" />
                 <span className="hidden sm:inline">Open</span>
               </a>

@@ -48,6 +48,7 @@ import { useForm } from 'react-hook-form'
 import { Link, useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import * as z from 'zod'
+import { resolvePublicUrl } from './public-url'
 import { MAX_TITLE_CHARS, operationQueries } from './status-page-form'
 
 const createSchema = z.object({
@@ -263,7 +264,10 @@ export function ProjectStatusPages({ project }: { project: ProjectResponse }) {
                 <TableCell className="hidden md:table-cell">
                   {page.is_published ? (
                     <CopyButton
-                      value={page.public_url}
+                      value={resolvePublicUrl(
+                        page.public_url,
+                        window.location.origin
+                      )}
                       variant="ghost"
                       size="sm"
                       label="Copy public link"

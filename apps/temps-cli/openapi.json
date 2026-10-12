@@ -52525,15 +52525,15 @@
             "type": "integer"
           },
           "public_json_url": {
-            "description": "Machine-readable form of the public page.",
+            "description": "Machine-readable form of the public page; relative in the same case as\n`public_url`.",
             "type": "string"
           },
           "public_url": {
-            "description": "Public HTML page. Serves 404 while the page is unpublished.",
+            "description": "Public HTML page. Serves 404 while the page is unpublished. An absolute\nURL, or — while `public_url_configured` is `false` — a path relative to\nthe console origin (`/api/status/<slug>`).",
             "type": "string"
           },
           "public_url_configured": {
-            "description": "`false` when no public or external URL is configured: `public_url` is\nthen the console origin, which only works from where the console is\nreachable. Configure a public URL so customers can open the page.",
+            "description": "`false` when no public or external URL is configured: the links above\nare then relative to the console and only work where the console is\nreachable. Configure a public URL so customers can open the page.",
             "type": "boolean"
           },
           "public_url_setup_path": {

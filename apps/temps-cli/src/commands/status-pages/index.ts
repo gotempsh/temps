@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type { Command } from 'commander'
-import { requireAuth } from '../../config/store.js'
+import { config, requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import {
   listStatusPages,
@@ -104,13 +104,29 @@ function parseId(value: string, what: string): number | null {
   return id
 }
 
+/**
+ * Until a public or external URL is configured the API returns links relative
+ * to the console (`/api/status/<slug>`). Resolve them against the instance this
+ * CLI talks to, so they can be opened.
+ */
+function resolveLink(url: string): string {
+  if (!url.startsWith('/')) {
+    return url
+  }
+  try {
+    return new URL(url, config.get('apiUrl')).toString()
+  } catch {
+    return url
+  }
+}
+
 function printPage(page: StatusPageResponse): void {
   newline()
   header(`${icons.info} ${page.title}`)
   keyValue('ID', page.id)
   keyValue('State', page.is_published ? colors.success('published') : colors.muted('draft'))
-  keyValue('Public URL', page.public_url)
-  keyValue('JSON', page.public_json_url)
+  keyValue('Public URL', resolveLink(page.public_url))
+  keyValue('JSON', resolveLink(page.public_json_url))
   if (!page.public_url_configured) {
     warning(
       'No public URL is configured, so these links use the console address and only work '
@@ -410,7 +426,7 @@ export function registerStatusPagesCommands(program: Command): void {
         { header: 'Title', key: 'title', color: (v) => colors.bold(v) },
         { header: 'State', accessor: (p) => (p.is_published ? 'published' : 'draft') },
         { header: 'Monitors', accessor: (p) => String(p.monitors.length) },
-        { header: 'Public URL', accessor: (p) => (p.is_published ? p.public_url : '-') },
+        { header: 'Public URL', accessor: (p) => (p.is_published ? resolveLink(p.public_url) : '-') },
       ]
       printTable(result.items, columns, { style: 'minimal' })
       newline()

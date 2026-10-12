@@ -24445,16 +24445,19 @@ export type StatusPageResponse = {
     monitors: Array<StatusPageMonitorResponse>;
     project_id: number;
     /**
-     * Machine-readable form of the public page.
+     * Machine-readable form of the public page; relative in the same case as
+     * `public_url`.
      */
     public_json_url: string;
     /**
-     * Public HTML page. Serves 404 while the page is unpublished.
+     * Public HTML page. Serves 404 while the page is unpublished. An absolute
+     * URL, or — while `public_url_configured` is `false` — a path relative to
+     * the console origin (`/api/status/<slug>`).
      */
     public_url: string;
     /**
-     * `false` when no public or external URL is configured: `public_url` is
-     * then the console origin, which only works from where the console is
+     * `false` when no public or external URL is configured: the links above
+     * are then relative to the console and only work where the console is
      * reachable. Configure a public URL so customers can open the page.
      */
     public_url_configured: boolean;

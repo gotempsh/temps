@@ -586,25 +586,22 @@ impl PublicStatusPageService {
     /// `public_ingress_url` / `external_url` when set. When neither is, the
     /// effective ingress URL is the built-in `http://localho.st` default, which
     /// has no port and does not reach this server — links built on it 404.
-    /// The console origin is always reachable from wherever the console is, so
-    /// use it, and say it is a fallback so the UI can point at the setting.
+    /// The server cannot know the origin the operator reaches the console on
+    /// (its bind address is not that), so the links are *relative* paths and
+    /// `configured` is `false`: a client resolves them against the console it
+    /// is already talking to, and shows the operator the setting to configure.
     async fn public_base(&self) -> PublicBase {
         let configured = match self.config_service.get_settings().await {
             Ok(settings) => settings.configured_public_ingress_url(),
             Err(e) => {
                 warn!(
                     error = %e,
-                    "could not read the public URL settings; status page URLs fall back to the console origin"
+                    "could not read the public URL settings; status page links are returned relative"
                 );
                 None
             }
         };
-        let console_address = self
-            .config_service
-            .get_server_config()
-            .console_address
-            .clone();
-        public_base_from(configured, &console_address)
+        public_base_from(configured)
     }
 
     async fn to_response(
@@ -688,43 +685,25 @@ const PUBLIC_URL_SETTINGS_PATH: &str = "/settings";
 /// The base public links are built on (see [`PublicStatusPageService::public_base`]).
 #[derive(Debug, PartialEq, Eq)]
 struct PublicBase {
+    /// The configured origin, or empty when none is configured — links are
+    /// then paths relative to the console origin.
     url: String,
-    /// `false` when no public/external URL is configured and `url` is the
-    /// console origin fallback.
+    /// `false` when no public/external URL is configured and links are relative.
     configured: bool,
 }
 
-/// Choose the base URL: the configured one, else the console origin.
-fn public_base_from(configured: Option<String>, console_address: &str) -> PublicBase {
+/// Choose the base URL: the configured one, else none (relative links).
+fn public_base_from(configured: Option<String>) -> PublicBase {
     match configured {
         Some(url) => PublicBase {
             url: url.trim_end_matches('/').to_string(),
             configured: true,
         },
         None => PublicBase {
-            url: console_origin(console_address),
+            url: String::new(),
             configured: false,
         },
     }
-}
-
-/// `http://host:port` for a listener address, with wildcard binds mapped to
-/// `localhost` (a browser cannot connect to `0.0.0.0`).
-fn console_origin(console_address: &str) -> String {
-    let address = console_address.trim();
-    let address = address
-        .strip_prefix("http://")
-        .or_else(|| address.strip_prefix("https://"))
-        .unwrap_or(address)
-        .trim_end_matches('/');
-    let address = if let Some(port) = address.strip_prefix("0.0.0.0:") {
-        format!("localhost:{port}")
-    } else if let Some(port) = address.strip_prefix("[::]:") {
-        format!("localhost:{port}")
-    } else {
-        address.to_string()
-    };
-    format!("http://{address}")
 }
 
 #[async_trait::async_trait]
@@ -755,38 +734,32 @@ mod tests {
     use super::*;
 
     /// With no public/external URL configured the links used to be built on
-    /// the port-less `http://localho.st` default, which 404s. They now use the
-    /// console origin and report that the URL is not configured.
+    /// the port-less `http://localho.st` default, which 404s. They are now
+    /// relative to the console origin the client already uses, and the
+    /// response reports that the URL is not configured. (The server's bind
+    /// address is not the origin an operator reaches the console on, so it is
+    /// never put into a link.)
     #[test]
-    fn unconfigured_public_url_falls_back_to_the_console_origin() {
-        let base = public_base_from(None, "127.0.0.1:8000");
+    fn unconfigured_public_url_yields_relative_links() {
+        let base = public_base_from(None);
         assert_eq!(
             base,
             PublicBase {
-                url: "http://127.0.0.1:8000".to_string(),
+                url: String::new(),
                 configured: false
             }
+        );
+        assert_eq!(
+            format!("{}/api/status/{}", base.url, "abc123"),
+            "/api/status/abc123"
         );
     }
 
     #[test]
     fn configured_public_url_is_used_as_is_without_a_trailing_slash() {
-        let base = public_base_from(
-            Some("https://status.example.test/".to_string()),
-            "127.0.0.1:8000",
-        );
+        let base = public_base_from(Some("https://status.example.test/".to_string()));
         assert_eq!(base.url, "https://status.example.test");
         assert!(base.configured);
-    }
-
-    #[test]
-    fn wildcard_console_binds_are_not_handed_out_as_urls() {
-        assert_eq!(console_origin("0.0.0.0:8000"), "http://localhost:8000");
-        assert_eq!(console_origin("[::]:8000"), "http://localhost:8000");
-        assert_eq!(
-            console_origin("http://10.0.0.5:8000/"),
-            "http://10.0.0.5:8000"
-        );
     }
 
     #[test]
