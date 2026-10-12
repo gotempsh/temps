@@ -427,17 +427,35 @@ impl WebhookService {
                 }
             };
 
-        // Update delivery record with result
+        // Update delivery record with result. Only the attempt that owns the
+        // row's current attempt number may write its outcome: if a newer retry
+        // already incremented it, this (older, slower) attempt must not
+        // overwrite the newer outcome.
         let delivery_id = delivery_record.id;
-        let mut delivery_update: temps_entities::webhook_deliveries::ActiveModel =
-            delivery_record.into();
-        delivery_update.status_code = Set(status_code.map(|s| s as i32));
-        // SECURITY: response_body field removed - do not store response data
-        delivery_update.error_message = Set(error_message.clone());
-        delivery_update.success = Set(success);
-        delivery_update.delivered_at = Set(Some(Utc::now()));
+        // SECURITY: response_body is never written - do not store response data
+        let write = temps_entities::webhook_deliveries::Entity::update_many()
+            .col_expr(
+                temps_entities::webhook_deliveries::Column::StatusCode,
+                sea_orm::sea_query::Expr::value(status_code.map(i32::from)),
+            )
+            .col_expr(
+                temps_entities::webhook_deliveries::Column::ErrorMessage,
+                sea_orm::sea_query::Expr::value(error_message.clone()),
+            )
+            .col_expr(
+                temps_entities::webhook_deliveries::Column::Success,
+                sea_orm::sea_query::Expr::value(success),
+            )
+            .col_expr(
+                temps_entities::webhook_deliveries::Column::DeliveredAt,
+                sea_orm::sea_query::Expr::value(Some(Utc::now())),
+            )
+            .filter(temps_entities::webhook_deliveries::Column::Id.eq(delivery_id))
+            .filter(temps_entities::webhook_deliveries::Column::AttemptNumber.eq(attempt_number))
+            .exec(self.db.as_ref())
+            .await;
 
-        if let Err(e) = delivery_update.update(self.db.as_ref()).await {
+        if let Err(e) = write {
             error!(
                 "Failed to update webhook delivery {} (webhook {}): {}",
                 delivery_id, webhook.id, e
@@ -606,13 +624,31 @@ impl WebhookService {
 
         // A retry is another attempt at the SAME delivery: keep its record (and
         // therefore its `X-Webhook-Delivery` id) and count the attempt on it.
-        // Recording it before sending means the history is right even if the
-        // send outcome cannot be written back.
-        let next_attempt = delivery.attempt_number.saturating_add(1);
+        // The increment happens in the database and returns the new count, so
+        // two overlapping retries get distinct attempt numbers instead of both
+        // reading N and writing N + 1. Recording it before sending also keeps
+        // the history right even if the send outcome cannot be written back.
         let payload = delivery.payload.clone();
-        let mut delivery_update: temps_entities::webhook_deliveries::ActiveModel = delivery.into();
-        delivery_update.attempt_number = Set(next_attempt);
-        let delivery = delivery_update.update(self.db.as_ref()).await?;
+        let incremented = temps_entities::webhook_deliveries::Entity::update_many()
+            .col_expr(
+                temps_entities::webhook_deliveries::Column::AttemptNumber,
+                sea_orm::sea_query::Expr::col(
+                    temps_entities::webhook_deliveries::Column::AttemptNumber,
+                )
+                .add(1),
+            )
+            .filter(temps_entities::webhook_deliveries::Column::Id.eq(delivery_id))
+            .filter(temps_entities::webhook_deliveries::Column::WebhookId.eq(webhook_id))
+            .exec_with_returning(self.db.as_ref())
+            .await?;
+        let delivery = incremented
+            .into_iter()
+            .next()
+            .ok_or(WebhookError::DeliveryNotInScope {
+                project_id,
+                webhook_id,
+                delivery_id,
+            })?;
 
         Ok(self
             .send_delivery(&webhook, event.event_type.as_str(), payload, delivery)
@@ -674,7 +710,7 @@ impl WebhookService {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use sea_orm::{DatabaseBackend, DbErr, MockDatabase};
+    use sea_orm::{DatabaseBackend, DbErr, MockDatabase, MockExecResult};
 
     fn service_with_db(db: Arc<DatabaseConnection>) -> WebhookService {
         let encryption_service = Arc::new(
@@ -837,16 +873,18 @@ mod tests {
         failed.event_id = event.id.clone();
         let mut after_attempt_bump = failed.clone();
         after_attempt_bump.attempt_number = 2;
-        let mut after_send = after_attempt_bump.clone();
-        after_send.success = true;
-        after_send.status_code = Some(200);
 
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results(vec![vec![target]])
                 .append_query_results(vec![vec![failed]])
+                // `UPDATE … SET attempt_number = attempt_number + 1 RETURNING *`
                 .append_query_results(vec![vec![after_attempt_bump]])
-                .append_query_results(vec![vec![after_send]])
+                // the outcome write
+                .append_exec_results(vec![MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
                 .into_connection(),
         );
         let service = service_with_db(db.clone());
@@ -880,7 +918,19 @@ mod tests {
             .filter(|sql| sql.starts_with("UPDATE"))
             .collect();
         assert_eq!(updates.len(), 2, "attempt bump + outcome: {statements:?}");
-        assert!(updates[0].contains("\"attempt_number\""));
+        // The count is incremented by the database, not computed from a read,
+        // so overlapping retries cannot both write the same number.
+        assert!(
+            updates[0].contains("\"attempt_number\" = \"attempt_number\" + "),
+            "{}",
+            updates[0]
+        );
+        // The outcome is only written by the attempt that owns the current count.
+        assert!(
+            updates[1].contains("\"attempt_number\" ="),
+            "{}",
+            updates[1]
+        );
     }
 
     #[tokio::test]
