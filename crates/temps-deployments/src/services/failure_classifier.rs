@@ -804,6 +804,24 @@ fn elapsed_seconds(lower: &str) -> Option<u64> {
     number_after(lower, "waited ")
 }
 
+/// The quoted path of a BuildKit `failed to compute cache key` /
+/// `failed to calculate checksum` error: the `"<path>"` right before
+/// `: not found`. `None` when the text is not that error.
+fn buildkit_missing_path(lower: &str) -> Option<String> {
+    // The failure text is often a Debug-quoted string, which escapes the quotes
+    // around the path (`\"/node_modules\": not found`).
+    let text = lower.replace("\\\"", "\"");
+    let phrase_at = ["failed to calculate checksum", "failed to compute cache key"]
+        .iter()
+        .filter_map(|phrase| text.find(phrase))
+        .min()?;
+    let after_phrase = &text[phrase_at..];
+    let not_found_at = after_phrase.find("\": not found")?;
+    let before = &after_phrase[..not_found_at];
+    let opening_quote = before.rfind('"')?;
+    Some(before[opening_quote + 1..].to_string())
+}
+
 /// Preserve the pre-taxonomy `reason` wire value exactly for existing
 /// telemetry consumers. New stage/code matching may be more specific, but it
 /// must not silently change this compatibility dimension.
@@ -1318,39 +1336,28 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
     ) {
         return make(S::Build, C::CompileError);
     }
-    // BuildKit's COPY of a build-stage path that the build never produced,
-    // e.g. `COPY --from=builder /app/dist ...` after a build that wrote to
-    // `build/`: `failed to compute cache key: failed to calculate checksum of
-    // ref ...: "/app/dist": not found`. Generated images build under /app, so
-    // an absolute /app path is the build output, never a context file (those
-    // are context-relative). Checked before the generic Dockerfile and
-    // "image ... not found" rules, which the same text also matches.
-    if contains_any(
-        r,
-        &[
-            "failed to calculate checksum",
-            "failed to compute cache key",
-        ],
-    ) && r.contains("/app/")
-        && r.contains("not found")
-    {
-        return make(S::Build, C::StaticOutputMissing);
-    }
-    // The same BuildKit error for a path that is not under /app is a `COPY`
-    // of something the build context does not contain (`node_modules`, an
-    // ignored file, a misspelt name). It is the user's Dockerfile, not a
-    // missing image: the failed job is `build_image`, so the generic
-    // "image ... not found" rule below would otherwise claim it and send them
-    // to check disk space.
-    if contains_any(
-        r,
-        &[
-            "failed to calculate checksum",
-            "failed to compute cache key",
-        ],
-    ) && r.contains("not found")
-    {
-        return make(S::Build, C::BuildContextPathMissing);
+    // BuildKit's COPY of a path that does not exist:
+    // `failed to compute cache key: failed to calculate checksum of ref ...:
+    // "/app/dist": not found`. What the path *is* decides the cause, so key on
+    // the quoted missing path itself rather than on `/app/` appearing anywhere in
+    // the text (a Dockerfile excerpt with `COPY . /app/` would otherwise claim
+    // every such failure):
+    //
+    // - Generated images build under /app, so a missing absolute /app path is a
+    //   build output that was never produced (`COPY --from=builder /app/dist`
+    //   after a build that wrote to `build/`).
+    // - Anything else is a context-relative file the build context does not
+    //   contain (`node_modules`, an ignored file, a misspelt name) — the user's
+    //   Dockerfile, not a missing image.
+    //
+    // Checked before the generic Dockerfile and "image ... not found" rules,
+    // which the same text also matches (the failed job is `build_image`).
+    if let Some(missing_path) = buildkit_missing_path(r) {
+        return if missing_path.starts_with("/app/") {
+            make(S::Build, C::StaticOutputMissing)
+        } else {
+            make(S::Build, C::BuildContextPathMissing)
+        };
     }
     if r.contains("dockerfile")
         && contains_any(
@@ -1702,6 +1709,18 @@ mod tests {
         );
         assert_class(
             &with_dockerfile_excerpt,
+            S::Build,
+            C::BuildContextPathMissing,
+        );
+
+        // A `/app/` anywhere in the excerpt (WORKDIR, a COPY destination) must
+        // not turn a missing context file into "build output not found".
+        let excerpt_mentions_app = wrapped(
+            "build_image",
+            "Failed to build image: Dockerfile:9\n--------------------\n   9 | >>> COPY node_modules /app/node_modules\n--------------------\nERROR: failed to solve: failed to compute cache key: failed to calculate checksum of ref abc: \"/node_modules\": not found",
+        );
+        assert_class(
+            &excerpt_mentions_app,
             S::Build,
             C::BuildContextPathMissing,
         );
