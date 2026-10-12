@@ -15824,8 +15824,9 @@ mod tests {
         // RustFS answers /health before its storage layer can serve S3, so
         // the readiness gate holds the service `starting` until an
         // authenticated ListBuckets succeeds, then promotes it in the
-        // background.
-        assert_eq!(service.status, readiness::STARTING_STATUS);
+        // background. The watcher is spawned before create_service returns,
+        // so a fast probe can already have promoted it: either is valid here.
+        let created_status = service.status.clone();
 
         // Wait for the gate's verdict, bounded by its own 180s deadline plus
         // a margin for the final probe and write.
@@ -15845,13 +15846,16 @@ mod tests {
         // Cleanup before asserting, so a failed gate does not leak the container
         let _ = manager.delete_service(service.id).await;
 
+        assert!(
+            created_status == readiness::STARTING_STATUS || created_status == "running",
+            "create_service returned unexpected status {:?} for S3 service {}",
+            created_status,
+            service.id
+        );
         assert_eq!(
-            settled.status,
-            "running",
+            settled.status, "running",
             "S3 service {} did not become ready within {:?}: error_message={:?}",
-            service.id,
-            wait_limit,
-            settled.error_message
+            service.id, wait_limit, settled.error_message
         );
     }
 
