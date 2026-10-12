@@ -650,6 +650,29 @@ impl DomainService {
         }
     }
 
+    /// Store `receipt` (a DNS cleanup plan) on the domain's current order.
+    async fn carry_cleanup_receipt(
+        &self,
+        domain_id: i32,
+        receipt: serde_json::Value,
+    ) -> Result<(), DomainServiceError> {
+        let Some(mut order) = self.repository.find_acme_order_by_domain(domain_id).await? else {
+            return Ok(());
+        };
+        let authorizations = order
+            .authorizations
+            .get_or_insert_with(|| serde_json::json!({}));
+        let Some(object) = authorizations.as_object_mut() else {
+            return Err(DomainServiceError::Internal(format!(
+                "ACME order {} for domain {} has non-object authorizations; cannot carry its DNS cleanup receipt",
+                order.order_url, domain_id
+            )));
+        };
+        object.insert(crate::tls::models::DNS_CLEANUP_PLAN_KEY.to_string(), receipt);
+        self.repository.save_acme_order(order).await?;
+        Ok(())
+    }
+
     /// [`Self::request_challenge`] for the row with id `domain_id`.
     ///
     /// For callers that own a specific row: a hostname can be deleted and
@@ -760,11 +783,26 @@ impl DomainService {
                 "ACME order for domain {} is invalid ({}); starting a new order",
                 domain_name, previous_error
             );
+            // The rejected order may carry the receipt of the TXT records
+            // Temps published for it. Replacing the order must not lose it:
+            // keep it on the new order so the cleanup after a successful
+            // verification still removes those records.
+            let cleanup_receipt = order
+                .authorizations
+                .as_ref()
+                .and_then(|authorizations| {
+                    authorizations.get(crate::tls::models::DNS_CLEANUP_PLAN_KEY)
+                })
+                .cloned();
+
             // By id: the row this retry started from, even if the hostname is
             // deleted and recreated while the new order is being requested.
             let renewed = self
                 .request_challenge_with(DomainLookup::Id(domain_id), user_email, report_telemetry)
                 .await?;
+            if let Some(receipt) = cleanup_receipt {
+                self.carry_cleanup_receipt(domain_id, receipt).await?;
+            }
             if renewed.status == "completed" {
                 // The CA still held a valid authorization, so the certificate
                 // was issued while creating the order.
@@ -2395,6 +2433,34 @@ mod tests {
             .expect("the rejected order is retained for inspection");
         assert_eq!(failed_order.status, "invalid");
 
+        // The operator had published the first order's records through DNS
+        // automation, so the order carries a cleanup receipt.
+        let mut rejected_order = service
+            .repository
+            .find_acme_order_by_domain(domain.id)
+            .await
+            .unwrap()
+            .expect("the rejected order is retained");
+        let receipt = serde_json::json!({
+            "provider_id": 3,
+            "zone": "example.test",
+            "records": [{
+                "name": "_acme-challenge.retry.example.test",
+                "value": first.txt_records[0].value,
+                "record_id": "rec-1"
+            }]
+        });
+        rejected_order
+            .authorizations
+            .as_mut()
+            .and_then(|a| a.as_object_mut())
+            .expect("authorizations are an object")
+            .insert(
+                crate::tls::models::DNS_CLEANUP_PLAN_KEY.to_string(),
+                receipt.clone(),
+            );
+        service.repository.save_acme_order(rejected_order).await.unwrap();
+
         // Retry: a new order with new TXT records, not the old one resubmitted.
         let retry = service
             .complete_challenge(&domain.domain, "ops@example.test")
@@ -2434,6 +2500,24 @@ mod tests {
             .expect("a fresh order exists");
         assert_eq!(new_order.status, "pending");
         assert_eq!(new_order.txt_records[0].value, txt_records[0].value);
+
+        // The old order's DNS cleanup receipt moved to the new order instead of
+        // being deleted with the old row.
+        let current = service
+            .repository
+            .find_acme_order_by_domain(domain.id)
+            .await
+            .unwrap()
+            .expect("the new order exists");
+        assert_ne!(current.order_url, "https://acme.test/order/1");
+        assert_eq!(
+            current
+                .authorizations
+                .as_ref()
+                .and_then(|a| a.get(crate::tls::models::DNS_CLEANUP_PLAN_KEY)),
+            Some(&receipt),
+            "the cleanup receipt must survive the restart"
+        );
     }
 
     /// HTTP-01 needs nothing from the operator, so a retry after a rejection
