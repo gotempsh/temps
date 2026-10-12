@@ -2663,6 +2663,7 @@ async fn reset_user_password(
         (status = 200, description = "MFA setup data", body = MfaSetupResponse),
         (status = 400, description = "Current password is required but was not provided"),
         (status = 401, description = "Unauthorized or current password is incorrect"),
+        (status = 403, description = "Deployment tokens cannot enrol MFA"),
         (status = 409, description = "MFA is already enabled; verify and disable it before re-enrollment"),
         (status = 500, description = "Internal server error")
     ),
@@ -2675,7 +2676,15 @@ async fn setup_mfa(
     RequireAuth(auth): RequireAuth,
     Json(req): Json<SetupMfaRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, UsersWrite);
+    // Self-service: this enrols MFA on the caller's own account, so it is gated
+    // on being a real user (proven by the current password below), not on
+    // `users:write`, which is the permission to manage *other* accounts. A
+    // `User`-role account does not hold it and used to be refused its own MFA.
+    auth.require_user().map_err(|msg| {
+        problemdetails::new(StatusCode::FORBIDDEN)
+            .with_title("User Required")
+            .with_detail(msg)
+    })?;
 
     let setup_data = app_state
         .user_service
@@ -2817,7 +2826,8 @@ async fn verify_and_enable_mfa(
     Extension(metadata): Extension<RequestMetadata>,
     Json(req): Json<VerifyMfaRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, UsersWrite);
+    // Self-service on the caller's own account, proven by the TOTP code from
+    // setup — see `setup_mfa` for why this is not a `users:write` operation.
 
     // Require a user for this endpoint (deployment tokens not allowed)
     let user = auth.require_user().map_err(|msg| {
@@ -2870,7 +2880,9 @@ async fn disable_mfa(
     Extension(metadata): Extension<RequestMetadata>,
     Json(req): Json<DisableMfaRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, UsersWrite);
+    // Self-service on the caller's own account, proven by a valid TOTP or
+    // recovery code — see `setup_mfa` for why this is not a `users:write`
+    // operation.
 
     // Require a user for this endpoint (deployment tokens not allowed)
     let user = auth.require_user().map_err(|msg| {
@@ -2908,15 +2920,16 @@ mod tests {
     use super::{
         assign_role, authorize_admin_target, authorize_role_assignment, bounded_audit_identity,
         create_user, delete_user, login, normalized_login_email, parse_user_roles,
-        record_pending_login, remove_role, restore_user, update_user, verify_mfa_challenge,
-        AdminTargetDenied, AssignRoleRequest, CreateUserRequest, LoginRequest, RoleChangeDenied,
-        UpdateUserRequest,
+        record_pending_login, remove_role, restore_user, setup_mfa, update_user,
+        verify_mfa_challenge, AdminTargetDenied, AssignRoleRequest, CreateUserRequest,
+        LoginRequest, RoleChangeDenied, UpdateUserRequest,
     };
     use crate::auth_service::UserAuthError;
     use crate::context::AuthContext;
     use crate::permissions::{Permission, Role};
     use crate::state::AuthState;
     use crate::types::MfaVerificationRequest;
+    use crate::types::SetupMfaRequest;
     use crate::user_service::UserServiceError;
     use crate::RequireAuth;
     use async_trait::async_trait;
@@ -3144,6 +3157,65 @@ mod tests {
             Ok(_) => panic!("{message}"),
             Err(problem) => problem,
         }
+    }
+
+    /// A `User`-role account does not hold `users:write` (that permission is
+    /// for managing other accounts), yet `POST /users/me/mfa/setup` required
+    /// it, so the console's "Set up 2FA" answered 403 for ordinary users.
+    #[tokio::test]
+    async fn user_role_account_can_enrol_mfa_for_itself() {
+        let account = test_user(1);
+        assert!(
+            !Role::User.has_permission(&Permission::UsersWrite),
+            "the regression only exists while the User role lacks users:write"
+        );
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([
+                vec![account.clone()],
+                vec![account.clone()],
+                vec![account.clone()],
+            ])
+            .into_connection();
+        let state = auth_state_with_audit(db, Arc::new(NoopAuditLogger));
+
+        let result = setup_mfa(
+            State(state),
+            RequireAuth(session_auth(Role::User)),
+            Json(SetupMfaRequest {
+                current_password: None,
+            }),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a User-role session must be able to start MFA enrolment: {:?}",
+            result.err().map(|problem| problem.status_code)
+        );
+    }
+
+    #[tokio::test]
+    async fn deployment_tokens_cannot_enrol_mfa() {
+        let state = auth_state_with_audit(
+            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+            Arc::new(NoopAuditLogger),
+        );
+        let token =
+            AuthContext::new_deployment_token(1, None, None, 9, "deploy-token".to_string(), vec![]);
+
+        let result = setup_mfa(
+            State(state),
+            RequireAuth(token),
+            Json(SetupMfaRequest {
+                current_password: None,
+            }),
+        )
+        .await;
+
+        assert_problem_status(
+            expect_problem(result, "a deployment token is not a user"),
+            StatusCode::FORBIDDEN,
+        );
     }
 
     #[test]
