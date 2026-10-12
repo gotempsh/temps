@@ -42,6 +42,7 @@ import {
   defaultFilePath,
   encodeText,
   filesUnavailableReason,
+  isEditableFile,
   validateSandboxPath,
 } from './sandbox-files'
 
@@ -89,8 +90,7 @@ export function SandboxFilesCard({
     retry: false,
   })
   const stat = statQuery.data
-  const readable =
-    !!stat && stat.exists && stat.is_file && stat.size <= MAX_EDITABLE_BYTES
+  const readable = isEditableFile(stat)
   const readQuery = useQuery({
     ...readFileOptions({
       path: { id: sandboxId },
@@ -109,13 +109,19 @@ export function SandboxFilesCard({
   // Opening the same path again must show what is in the sandbox now: the
   // terminal beside this card can change the file, and saving a stale buffer
   // would silently overwrite that change.
-  const openFile = (path: string) => {
-    if (path === openPath) {
-      void statQuery.refetch()
-      void readQuery.refetch()
+  //
+  // `refetch()` ignores `enabled`, so the read is only forced when the file
+  // was already loadable AND still is; a missing, oversized or directory path
+  // never gets an `fs/read`. A file that has appeared since is picked up by
+  // the read query enabling itself once the fresh stat says it is readable.
+  const openFile = async (path: string) => {
+    if (path !== openPath) {
+      setOpenPath(path)
       return
     }
-    setOpenPath(path)
+    const wasReadable = readable
+    const fresh = await statQuery.refetch()
+    if (wasReadable && isEditableFile(fresh.data)) void readQuery.refetch()
   }
 
   return (

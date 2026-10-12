@@ -71,6 +71,9 @@ export const ORDER_SETTLED_STATUSES: readonly string[] = [
   'deactivated',
 ]
 
+/** How long a settled domain keeps re-reading an order that is still open. */
+export const ORDER_CATCH_UP_WINDOW_MS = 60_000
+
 /**
  * `refetchInterval` for the order read that sits beside a domain.
  *
@@ -78,19 +81,27 @@ export const ORDER_SETTLED_STATUSES: readonly string[] = [
  * seen as `failed` while the last order read still says `pending`. Following
  * the domain status alone would stop polling at that moment and leave the
  * stale order next to a fresh `failed` badge, so the order keeps polling
- * until it has settled itself (bounded by the same back-off as the domain).
+ * until it has settled itself, for at most `ORDER_CATCH_UP_WINDOW_MS` after
+ * the domain settled.
  */
 export function orderRefetchInterval(
   domainStatus: string | null | undefined,
   orderStatus: string | null | undefined,
-  readCount: number
+  readCount: number,
+  /** The order's latest read time minus the domain's, in ms. */
+  msSinceDomainSettled: number
 ): number | false {
   if (isIssuanceInFlight(domainStatus)) {
     return domainRefetchInterval(domainStatus, readCount)
   }
   const orderSettled =
     !orderStatus || ORDER_SETTLED_STATUSES.includes(orderStatus)
-  if (orderSettled || readCount >= DOMAIN_POLL_FAST_READS) return false
+  // Bounded by time since the *domain* settled, not by the order's own read
+  // count: an issuance that ran for minutes has long used up its reads, and
+  // the catch-up read is needed exactly then.
+  if (orderSettled || msSinceDomainSettled >= ORDER_CATCH_UP_WINDOW_MS) {
+    return false
+  }
   return DOMAIN_POLL_FAST_MS
 }
 

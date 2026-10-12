@@ -196,3 +196,111 @@ test('opening the same file again reloads it, so a stale buffer is never saved o
   expect(reads).toBe(2)
   api.restore()
 })
+
+test('opening a missing path again keeps the new-file editor and never reads it', async () => {
+  let reads = 0
+  const api = mockApi({
+    'GET /v1/sandboxes/sbx_1/fs/stat': () =>
+      jsonResponse({
+        path: PATH,
+        exists: false,
+        is_file: false,
+        is_dir: false,
+        size: 0,
+      }),
+    'GET /v1/sandboxes/sbx_1/fs/read': () => {
+      reads += 1
+      return jsonResponse({ title: 'Not Found' }, 404)
+    },
+  })
+  const view = renderCard()
+
+  fireEvent.change(view.getByLabelText('File path'), {
+    target: { value: PATH },
+  })
+  fireEvent.click(view.getByRole('button', { name: 'Open file' }))
+  const editor = (await view.findByLabelText(
+    `Contents of ${PATH}`
+  )) as HTMLTextAreaElement
+  fireEvent.change(editor, { target: { value: 'draft' } })
+
+  fireEvent.click(view.getByRole('button', { name: 'Open file' }))
+  await new Promise((resolve) => setTimeout(resolve, 100))
+
+  expect(reads).toBe(0)
+  expect(view.queryByText(/Could not read/)).toBeNull()
+  expect(view.getByLabelText(`Contents of ${PATH}`)).toBeTruthy()
+  api.restore()
+})
+
+test('opening an oversized file again does not fetch its contents', async () => {
+  let reads = 0
+  const api = mockApi({
+    'GET /v1/sandboxes/sbx_1/fs/stat': () =>
+      jsonResponse({
+        path: PATH,
+        exists: true,
+        is_file: true,
+        is_dir: false,
+        size: 10 * 1024 * 1024,
+      }),
+    'GET /v1/sandboxes/sbx_1/fs/read': () => {
+      reads += 1
+      return jsonResponse({ path: PATH, size: 0, contents_b64: '' })
+    },
+  })
+  const view = renderCard()
+
+  fireEvent.change(view.getByLabelText('File path'), {
+    target: { value: PATH },
+  })
+  fireEvent.click(view.getByRole('button', { name: 'Open file' }))
+  await view.findByText(/over the/)
+  fireEvent.click(view.getByRole('button', { name: 'Open file' }))
+  await new Promise((resolve) => setTimeout(resolve, 100))
+
+  expect(reads).toBe(0)
+  api.restore()
+})
+
+test('a file created since the first open is loaded when the path is opened again', async () => {
+  let exists = false
+  let reads = 0
+  const api = mockApi({
+    'GET /v1/sandboxes/sbx_1/fs/stat': () =>
+      jsonResponse({
+        path: PATH,
+        exists,
+        is_file: exists,
+        is_dir: false,
+        size: exists ? 5 : 0,
+      }),
+    'GET /v1/sandboxes/sbx_1/fs/read': () => {
+      reads += 1
+      return jsonResponse({
+        path: PATH,
+        size: 5,
+        contents_b64: encodeText('made!'),
+      })
+    },
+  })
+  const view = renderCard()
+
+  fireEvent.change(view.getByLabelText('File path'), {
+    target: { value: PATH },
+  })
+  fireEvent.click(view.getByRole('button', { name: 'Open file' }))
+  await view.findByText('new file')
+
+  exists = true
+  fireEvent.click(view.getByRole('button', { name: 'Open file' }))
+
+  await waitFor(() => {
+    const editor = view.getByLabelText(
+      `Contents of ${PATH}`
+    ) as HTMLTextAreaElement
+    expect(editor.value).toBe('made!')
+  })
+  expect(reads).toBe(1)
+  api.restore()
+})

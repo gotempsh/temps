@@ -261,7 +261,12 @@ export function DomainDetail() {
       orderRefetchInterval(
         domain?.status,
         query.state.data?.status,
-        query.state.dataUpdateCount
+        query.state.dataUpdateCount,
+        // The domain stops polling when it settles, so its last read is the
+        // moment it was seen settled; the order's own last read, relative to
+        // that, is how long the catch-up has been running.
+        query.state.dataUpdatedAt -
+          (queryClient.getQueryState(domainQueryKey)?.dataUpdatedAt ?? 0)
       ),
   })
 

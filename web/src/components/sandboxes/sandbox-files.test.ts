@@ -7,6 +7,8 @@ import {
   defaultFilePath,
   encodeText,
   filesUnavailableReason,
+  isEditableFile,
+  MAX_EDITABLE_BYTES,
   validateSandboxPath,
 } from './sandbox-files'
 
@@ -77,5 +79,21 @@ describe('filesUnavailableReason', () => {
     expect(filesUnavailableReason({ status: 'destroyed' })).toContain(
       'destroyed'
     )
+  })
+})
+
+describe('isEditableFile', () => {
+  const file = { exists: true, is_file: true, size: 10 }
+  test('accepts a small regular file', () => {
+    expect(isEditableFile(file)).toBe(true)
+    expect(isEditableFile({ ...file, size: MAX_EDITABLE_BYTES })).toBe(true)
+  })
+  test('refuses missing, non-regular, oversized and unknown paths', () => {
+    expect(isEditableFile({ ...file, exists: false })).toBe(false)
+    expect(isEditableFile({ ...file, is_file: false })).toBe(false)
+    expect(isEditableFile({ ...file, size: MAX_EDITABLE_BYTES + 1 })).toBe(
+      false
+    )
+    expect(isEditableFile(undefined)).toBe(false)
   })
 })

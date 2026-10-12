@@ -12,6 +12,18 @@
 export const MAX_EDITABLE_BYTES = 256 * 1024
 const MAX_PATH_LENGTH = 4096
 
+/**
+ * Whether a stat result is a regular file small enough to load into the
+ * editor. It gates `fs/read`: nothing else may ask for the contents.
+ */
+export function isEditableFile(
+  stat: { exists: boolean; is_file: boolean; size: number } | undefined
+): boolean {
+  return (
+    !!stat && stat.exists && stat.is_file && stat.size <= MAX_EDITABLE_BYTES
+  )
+}
+
 /** `null` when the path can be sent to the API, otherwise why it cannot. */
 export function validateSandboxPath(raw: string): string | null {
   const path = raw.trim()
