@@ -74,7 +74,11 @@ export function SampleDeployTracker({
           ? POLL_INTERVAL_MS
           : false
       }
-      return query.state.errorUpdateCount < MAX_POLLS_WITHOUT_DEPLOYMENT
+      // A project that has not been deployed yet answers `null` (it used to
+      // answer 404), so empty answers count as polls too — not only errors.
+      const emptyPolls =
+        query.state.errorUpdateCount + query.state.dataUpdateCount
+      return emptyPolls < MAX_POLLS_WITHOUT_DEPLOYMENT
         ? POLL_INTERVAL_MS
         : false
     },

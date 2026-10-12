@@ -13,6 +13,7 @@ import {
   getDomainOrderOptions,
   listDnsProvidersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
+import type { AcmeOrderResponse } from '@/api/client'
 import { DomainDetail } from './DomainDetail'
 
 const domainKey = getDomainByIdOptions({ path: { domain: 1 } }).queryKey
@@ -108,7 +109,7 @@ test('cached domain and order survive failed refreshes without offering a new or
     email: 'operator@example.test',
     created_at: domain.created_at,
     updated_at: domain.updated_at,
-  })
+  } as AcmeOrderResponse)
   fail(client, domainKey, new TypeError('Failed to fetch'))
   fail(client, orderKey, { title: 'Forbidden', status: 403 })
   const html = render(client)
@@ -169,7 +170,7 @@ for (const status of ['active', 'active_renewal_failed']) {
             email: 'operator@example.test',
             created_at: domain.created_at,
             updated_at: domain.updated_at,
-          })
+          } as AcmeOrderResponse)
         }
         fail(client, orderKey, orderError)
 
@@ -224,7 +225,7 @@ function dnsChallengeClient() {
     email: 'operator@example.test',
     created_at: domain.created_at,
     updated_at: domain.updated_at,
-  })
+  } as AcmeOrderResponse)
   return client
 }
 const providersKey = listDnsProvidersOptions().queryKey

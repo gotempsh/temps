@@ -609,7 +609,7 @@ export function ProjectDetail() {
             repository?.clone_url || project.git_url || undefined
           }
           repositoryProviderType={repositoryProviderType}
-          lastDeployment={lastDeployment}
+          lastDeployment={lastDeployment ?? undefined}
           lastDeploymentUrl={
             lastDeployment ? resolveStableUrl(lastDeployment) : null
           }
@@ -674,7 +674,7 @@ export function ProjectDetail() {
                 element={
                   <ProjectOverview
                     project={project}
-                    lastDeployment={lastDeployment}
+                    lastDeployment={lastDeployment ?? undefined}
                   />
                 }
               />
