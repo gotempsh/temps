@@ -334,6 +334,40 @@ fn filter_shape(filter: Option<&serde_json::Value>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Problem for a failed container browse request (`list_containers`,
+/// `get_container_info`).
+///
+/// A path the data source cannot answer for — an unknown container, a level
+/// the hierarchy does not have, an operation the engine lacks — is the
+/// caller's request being wrong, not the server failing. Reporting those as a
+/// 500 made every harmless probe look like an outage in the console and in the
+/// error log. Only genuine backend/connection failures stay a 500.
+fn container_browse_problem(error: &temps_query::DataError, operation: &str) -> Problem {
+    use temps_query::DataError;
+
+    let (status, title) = match error {
+        DataError::NotFound(_) => (StatusCode::NOT_FOUND, "Container Not Found"),
+        DataError::InvalidQuery(_) => (StatusCode::BAD_REQUEST, "Invalid Container Path"),
+        DataError::OperationNotSupported(_) => (StatusCode::BAD_REQUEST, "Operation Not Supported"),
+        DataError::ConnectionFailed(_)
+        | DataError::ConnectionLost(_)
+        | DataError::QueryFailed(_)
+        | DataError::QueryTimeout(_)
+        | DataError::SchemaError(_)
+        | DataError::InvalidConfiguration(_)
+        | DataError::SerializationError(_)
+        | DataError::ResultLimitExceeded { .. }
+        | DataError::BackendQueryFailed { .. }
+        | DataError::PermissionDenied(_)
+        | DataError::InvalidCredentials
+        | DataError::BackendError(_)
+        | DataError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Query Error"),
+    };
+    temps_core::problemdetails::new(status)
+        .with_title(title)
+        .with_detail(format!("Failed to {operation}: {error}"))
+}
+
 fn query_error_problem(error: temps_query::DataError, service_id: i32, limit: usize) -> Problem {
     let (status, title, kind, safe_detail) = match &error {
         temps_query::DataError::ResultLimitExceeded { .. } => (
@@ -1102,11 +1136,7 @@ pub async fn list_root_containers(
         .query_service
         .list_containers(service_id, &path)
         .await
-        .map_err(|e| {
-            temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Query Error")
-                .with_detail(format!("Failed to list containers: {}", e))
-        })?;
+        .map_err(|e| container_browse_problem(&e, "list containers"))?;
 
     let response: Vec<ContainerResponse> = containers.into_iter().map(Into::into).collect();
     Ok(Json(response))
@@ -1123,6 +1153,7 @@ pub async fn list_root_containers(
         (status = 200, description = "List of containers", body = Vec<ContainerResponse>),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
+        (status = 400, description = "The path is not a container of this data source's hierarchy"),
         (status = 404, description = "Service or container not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -1152,11 +1183,7 @@ pub async fn list_containers_at_path(
         .query_service
         .list_containers(service_id, &path)
         .await
-        .map_err(|e| {
-            temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Query Error")
-                .with_detail(format!("Failed to list containers: {}", e))
-        })?;
+        .map_err(|e| container_browse_problem(&e, "list containers"))?;
 
     let response: Vec<ContainerResponse> = containers.into_iter().map(Into::into).collect();
     Ok(Json(response))
@@ -1207,11 +1234,7 @@ pub async fn get_container_info(
         .query_service
         .get_container_info(service_id, &path)
         .await
-        .map_err(|e| {
-            temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Query Error")
-                .with_detail(format!("Failed to get container info: {}", e))
-        })?;
+        .map_err(|e| container_browse_problem(&e, "get container info"))?;
 
     Ok(Json(ContainerResponse::from(container)))
 }
@@ -1838,6 +1861,58 @@ mod tests {
         assert_eq!(shape, "sql_where");
         assert!(!shape.contains("alice@example.com"));
         assert!(!shape.contains("tok_live_secret"));
+    }
+
+    /// Browsing to a path the engine has no answer for is the caller's
+    /// request being wrong: it must be a 4xx, not a 500 that the console logs
+    /// as a server fault. Only a failing backend stays a 500.
+    #[test]
+    fn container_browse_errors_that_blame_the_request_are_client_errors() {
+        use temps_query::DataError;
+
+        let invalid = container_browse_problem(
+            &DataError::InvalidQuery(
+                "PostgreSQL hierarchy only supports 2 levels (database/schema). Path depth: 3"
+                    .to_string(),
+            ),
+            "list containers",
+        );
+        assert_eq!(invalid.status_code, StatusCode::BAD_REQUEST);
+        let detail = invalid.body.get("detail").and_then(|d| d.as_str());
+        assert!(
+            detail.is_some_and(|d| d.contains("Path depth: 3")),
+            "the detail must say what was wrong: {detail:?}"
+        );
+
+        let missing = container_browse_problem(
+            &DataError::NotFound("Database 'ghost' not found".to_string()),
+            "get container info",
+        );
+        assert_eq!(missing.status_code, StatusCode::NOT_FOUND);
+
+        let unsupported = container_browse_problem(
+            &DataError::OperationNotSupported("no containers below a bucket".to_string()),
+            "list containers",
+        );
+        assert_eq!(unsupported.status_code, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn container_browse_backend_failures_stay_internal_errors() {
+        use temps_query::DataError;
+
+        for error in [
+            DataError::ConnectionFailed("refused".to_string()),
+            DataError::QueryFailed("relation does not exist".to_string()),
+            DataError::QueryTimeout(5_000),
+        ] {
+            let problem = container_browse_problem(&error, "list containers");
+            assert_eq!(
+                problem.status_code,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{error}"
+            );
+        }
     }
 
     #[test]
