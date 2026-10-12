@@ -7099,6 +7099,33 @@ export type DeliveryRequirements = {
     warnings: Array<string>;
 };
 
+/**
+ * Outcome of a manual delivery retry. The retry is another attempt of the
+ * same delivery, so `delivery_id` is the id that was retried.
+ */
+export type DeliveryRetryResult = {
+    /**
+     * Attempts made on this delivery, including this one.
+     */
+    attempt_number: number;
+    /**
+     * The delivery that was retried (unchanged by the retry).
+     */
+    delivery_id: number;
+    /**
+     * Why the attempt failed, when it did.
+     */
+    error_message?: string | null;
+    /**
+     * HTTP status the receiver answered with, when it answered.
+     */
+    status_code?: number | null;
+    /**
+     * Whether the receiver answered 2xx on this attempt.
+     */
+    success: boolean;
+};
+
 export type DeliveryRoutingPlan = {
     custom_domain_id?: number | null;
     will_create_custom_domain: boolean;
@@ -64017,7 +64044,7 @@ export type RetryDeliveryResponses = {
     /**
      * Delivery retried
      */
-    200: WebhookDeliveryResponse;
+    200: DeliveryRetryResult;
 };
 
 export type RetryDeliveryResponse = RetryDeliveryResponses[keyof RetryDeliveryResponses];
@@ -69012,7 +69039,7 @@ export type SetupMfaErrors = {
      */
     401: unknown;
     /**
-     * Deployment tokens cannot enrol MFA
+     * Only an interactive browser session can manage MFA
      */
     403: unknown;
     /**

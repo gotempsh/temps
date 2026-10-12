@@ -86,7 +86,7 @@ impl AuditOperation for WebhookAudit {
             CreateWebhookRequestBody,
             UpdateWebhookRequestBody,
             WebhookDeliveryResponse,
-            RetryDeliveryResponse,
+            DeliveryRetryResult,
             EventTypeResponse,
         )
     ),
@@ -109,7 +109,7 @@ pub struct WebhooksApiDoc;
 /// Outcome of a manual delivery retry. The retry is another attempt of the
 /// same delivery, so `delivery_id` is the id that was retried.
 #[derive(Debug, Serialize, ToSchema)]
-pub struct RetryDeliveryResponse {
+pub struct DeliveryRetryResult {
     /// The delivery that was retried (unchanged by the retry).
     pub delivery_id: i32,
     /// Whether the receiver answered 2xx on this attempt.
@@ -732,7 +732,7 @@ async fn get_delivery(
     post,
     path = "/projects/{project_id}/webhooks/{webhook_id}/deliveries/{delivery_id}/retry",
     responses(
-        (status = 200, description = "Delivery retried", body = RetryDeliveryResponse),
+        (status = 200, description = "Delivery retried", body = DeliveryRetryResult),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Delivery not found"),
@@ -779,7 +779,7 @@ async fn retry_delivery(
                 error!("Failed to create audit log: {}", e);
             }
 
-            Ok(Json(RetryDeliveryResponse {
+            Ok(Json(DeliveryRetryResult {
                 delivery_id: result.delivery_id,
                 success: result.success,
                 status_code: result.status_code,

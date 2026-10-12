@@ -14975,6 +14975,47 @@
         ],
         "type": "object"
       },
+      "DeliveryRetryResult": {
+        "description": "Outcome of a manual delivery retry. The retry is another attempt of the\nsame delivery, so `delivery_id` is the id that was retried.",
+        "properties": {
+          "attempt_number": {
+            "description": "Attempts made on this delivery, including this one.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "delivery_id": {
+            "description": "The delivery that was retried (unchanged by the retry).",
+            "format": "int32",
+            "type": "integer"
+          },
+          "error_message": {
+            "description": "Why the attempt failed, when it did.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status_code": {
+            "description": "HTTP status the receiver answered with, when it answered.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "success": {
+            "description": "Whether the receiver answered 2xx on this attempt.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "delivery_id",
+          "success",
+          "attempt_number"
+        ],
+        "type": "object"
+      },
       "DeliveryRoutingPlan": {
         "properties": {
           "custom_domain_id": {
@@ -119080,7 +119121,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/WebhookDeliveryResponse"
+                  "$ref": "#/components/schemas/DeliveryRetryResult"
                 }
               }
             },
@@ -127229,7 +127270,7 @@
             "description": "Unauthorized or current password is incorrect"
           },
           "403": {
-            "description": "Deployment tokens cannot enrol MFA"
+            "description": "Only an interactive browser session can manage MFA"
           },
           "409": {
             "description": "MFA is already enabled; verify and disable it before re-enrollment"
