@@ -174,6 +174,10 @@ pub enum DeploymentFailureCode {
     RegistryUnavailable,
     /// Pulling the deploy image failed for a reason not covered above.
     ImagePullFailed,
+    // ── v4 ──────────────────────────────────────────────────────────────
+    /// A `COPY`/`ADD` instruction names a file or directory that is not in
+    /// the build context (or in the stage it copies from).
+    BuildContextPathMissing,
     Unknown,
 }
 
@@ -226,6 +230,7 @@ impl DeploymentFailureCode {
             Self::RouteActivation => "route_activation",
             Self::RegistryUnavailable => "registry_unavailable",
             Self::ImagePullFailed => "image_pull_failed",
+            Self::BuildContextPathMissing => "build_context_path_missing",
             Self::Unknown => "unknown",
         }
     }
@@ -278,6 +283,7 @@ impl DeploymentFailureCode {
         Self::RouteActivation,
         Self::RegistryUnavailable,
         Self::ImagePullFailed,
+        Self::BuildContextPathMissing,
         Self::Unknown,
     ];
 }
@@ -482,6 +488,11 @@ pub const fn guidance_for(code: DeploymentFailureCode) -> FailureGuidance {
             "Built image missing",
             "The image produced by the build was not found when deploying. Redeploy to rebuild it; if it keeps happening, check disk space and image retention settings.",
             Some(S::Deploy),
+        ),
+        C::BuildContextPathMissing => (
+            "File missing from the build context",
+            "A COPY or ADD instruction in the Dockerfile names a path that is not in the build context. Uploaded archives and git checkouts never include node_modules, .git, environment files or anything listed in .dockerignore, so a Dockerfile that copies them fails. Remove that instruction, or create the directory inside the build (for example by running the install step in the Dockerfile).",
+            Some(S::Build),
         ),
         C::StaticOutputMissing => (
             "Build output not found",
@@ -1325,6 +1336,22 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
     {
         return make(S::Build, C::StaticOutputMissing);
     }
+    // The same BuildKit error for a path that is not under /app is a `COPY`
+    // of something the build context does not contain (`node_modules`, an
+    // ignored file, a misspelt name). It is the user's Dockerfile, not a
+    // missing image: the failed job is `build_image`, so the generic
+    // "image ... not found" rule below would otherwise claim it and send them
+    // to check disk space.
+    if contains_any(
+        r,
+        &[
+            "failed to calculate checksum",
+            "failed to compute cache key",
+        ],
+    ) && r.contains("not found")
+    {
+        return make(S::Build, C::BuildContextPathMissing);
+    }
     if r.contains("dockerfile")
         && contains_any(
             r,
@@ -1655,6 +1682,42 @@ mod tests {
             classify_failure_reason(Some(&image)).code,
             C::StaticOutputMissing
         );
+    }
+
+    /// A `COPY` of a path the build context does not contain (uploads strip
+    /// `node_modules`) failed the `build_image` job. It was reported as
+    /// "Built image missing — check disk space" because the job name and
+    /// "not found" matched the generic missing-image rule.
+    #[test]
+    fn copy_of_a_path_missing_from_the_build_context_is_not_a_missing_image() {
+        let reason = wrapped(
+            "build_image",
+            "Failed to build image: Build failed: Docker stream error: failed to solve: failed to compute cache key: failed to calculate checksum of ref 3c1f::q8m2: \"/node_modules\": not found",
+        );
+        assert_class(&reason, S::Build, C::BuildContextPathMissing);
+
+        let with_dockerfile_excerpt = wrapped(
+            "build_image",
+            "Failed to build image: Dockerfile:6\n--------------------\n   6 | >>> COPY node_modules ./node_modules\n--------------------\nERROR: failed to solve: failed to compute cache key: failed to calculate checksum of ref abc: \"/node_modules\": not found",
+        );
+        assert_class(
+            &with_dockerfile_excerpt,
+            S::Build,
+            C::BuildContextPathMissing,
+        );
+
+        let guidance = guidance_for(C::BuildContextPathMissing);
+        assert!(
+            !guidance.remediation.contains("disk space"),
+            "a build-context error must not send the user to check disk space"
+        );
+
+        // A genuinely missing built image keeps its classification.
+        let image = wrapped(
+            "deploy_container",
+            "Failed to deploy container: image 'app:latest' not found",
+        );
+        assert_class(&image, S::Image, C::ImageMissing);
     }
 
     #[test]
