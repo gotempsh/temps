@@ -67,6 +67,8 @@ import {
 } from '@/lib/date'
 import {
   STATUS_ACTIVE_RENEWAL_FAILED,
+  domainRefetchInterval,
+  isIssuanceInFlight,
   isServingCert,
 } from '@/lib/domain-status'
 import {
@@ -98,7 +100,7 @@ import {
   Wand2,
   XCircle,
 } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 
@@ -131,6 +133,15 @@ export function DomainDetail() {
     ...getDomainByIdOptions({ path: { domain: Number(id) } }),
     enabled: !!id,
     retry: false,
+    // The backend moves a domain between statuses on its own (a failed
+    // validation flips it to `failed` while the page still shows
+    // `challenge_requested`). Poll while issuance is in flight; the interval
+    // is `false` for settled statuses, so polling stops by itself.
+    refetchInterval: (query) =>
+      domainRefetchInterval(
+        query.state.data?.status,
+        query.state.dataUpdateCount
+      ),
   })
   const domain = domainQuery.data
 
@@ -241,6 +252,13 @@ export function DomainDetail() {
     // cert. "active_renewal_failed" is still serving, so treat it like "active".
     enabled: orderRequired,
     retry: false,
+    // The order carries the per-authorization error, so it must follow the
+    // domain's polling or a failed attempt shows a stale order next to a fresh
+    // `failed` badge.
+    refetchInterval: domainRefetchInterval(
+      domain?.status,
+      domainQuery.dataUpdateCount
+    ),
   })
 
   const order = orderQuery.data
@@ -347,6 +365,27 @@ export function DomainDetail() {
 
   usePageTitle(domain ? `${domain.domain} - Domain Details` : 'Domain Details')
 
+  // Tell the operator when a certificate they were waiting on lands, even if
+  // they never saw the intermediate statuses.
+  const previousStatus = useRef<string | undefined>(undefined)
+  const currentStatus = domain?.status
+  useEffect(() => {
+    if (
+      currentStatus === 'active' &&
+      isIssuanceInFlight(previousStatus.current)
+    ) {
+      toast.success('TLS certificate is now active!')
+    }
+    previousStatus.current = currentStatus
+  }, [currentStatus])
+
+  // A failed mutation usually leaves the backend in a new state (a failed
+  // validation sets `failed` and `last_error`), so re-read instead of keeping
+  // the status the page was showing before the attempt.
+  const refreshAfterFailure = async () => {
+    await refreshAll()
+  }
+
   const createOrder = useMutation({
     ...createOrRecreateOrderMutation(),
     meta: { errorTitle: 'Failed to create ACME order' },
@@ -354,6 +393,7 @@ export function DomainDetail() {
       toast.success('ACME order created successfully')
       await refreshAll()
     },
+    onError: refreshAfterFailure,
   })
 
   const finalizeOrder = useMutation({
@@ -363,21 +403,13 @@ export function DomainDetail() {
       toast.success(
         'DNS challenge verified! TLS certificate provisioning in progress.'
       )
+      // The domain query keeps polling while issuance is in flight and the
+      // effect above announces the active certificate.
       await refreshAll()
-
-      const pollInterval = setInterval(async () => {
-        await refreshAll()
-        const latest = queryClient.getQueryData(domainQueryKey) as
-          { status?: string } | undefined
-        if (latest?.status === 'active') {
-          clearInterval(pollInterval)
-          toast.success('TLS certificate is now active!')
-          await refreshAll()
-        }
-      }, 3000)
-
-      setTimeout(() => clearInterval(pollInterval), 120000)
     },
+    // A failed validation is returned as an error, so `onSuccess` never runs:
+    // without this the page keeps showing `challenge_requested`.
+    onError: refreshAfterFailure,
   })
 
   const cancelOrder = useMutation({
@@ -406,6 +438,7 @@ export function DomainDetail() {
       }
       await refreshAll()
     },
+    onError: refreshAfterFailure,
   })
 
   const setupDns = useMutation({
@@ -424,6 +457,7 @@ export function DomainDetail() {
       })
       await refreshAll()
     },
+    onError: refreshAfterFailure,
   })
 
   const handleCreateOrder = () => {

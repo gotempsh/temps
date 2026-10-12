@@ -29,3 +29,46 @@ export const CERT_SERVING_STATUSES: readonly string[] = [
 export function isServingCert(status: string | null | undefined): boolean {
   return !!status && CERT_SERVING_STATUSES.includes(status)
 }
+
+/**
+ * Statuses a domain passes through on its way to a certificate: the order is
+ * being set up, waiting for the challenge to be published, or being validated
+ * and issued. Anything else (`active`, `active_renewal_failed`, `failed`,
+ * `expired`, ...) is settled until the operator acts again.
+ */
+export const ISSUANCE_IN_FLIGHT_STATUSES: readonly string[] = [
+  'pending',
+  'pending_dns',
+  'pending_http',
+  'challenge_requested',
+  'processing',
+  'on_demand_issuing',
+]
+
+/** True while issuance may still move the domain to a different status. */
+export function isIssuanceInFlight(status: string | null | undefined): boolean {
+  return !!status && ISSUANCE_IN_FLIGHT_STATUSES.includes(status)
+}
+
+/** How often to re-read a domain that is mid-issuance. */
+export const DOMAIN_POLL_FAST_MS = 3_000
+/** Back-off once a status has stayed in flight for a minute or so. */
+export const DOMAIN_POLL_SLOW_MS = 15_000
+/** Number of fast reads before backing off (~1 minute at the fast rate). */
+export const DOMAIN_POLL_FAST_READS = 20
+
+/**
+ * React Query `refetchInterval` for a domain read: poll while issuance is in
+ * flight, and stop (`false`) as soon as the status is settled so a failed
+ * attempt shows up without a reload and a finished one stops costing requests.
+ * `readCount` is how many successful reads the query has already made.
+ */
+export function domainRefetchInterval(
+  status: string | null | undefined,
+  readCount: number
+): number | false {
+  if (!isIssuanceInFlight(status)) return false
+  return readCount < DOMAIN_POLL_FAST_READS
+    ? DOMAIN_POLL_FAST_MS
+    : DOMAIN_POLL_SLOW_MS
+}
