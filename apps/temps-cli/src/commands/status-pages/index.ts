@@ -111,6 +111,12 @@ function printPage(page: StatusPageResponse): void {
   keyValue('State', page.is_published ? colors.success('published') : colors.muted('draft'))
   keyValue('Public URL', page.public_url)
   keyValue('JSON', page.public_json_url)
+  if (!page.public_url_configured) {
+    warning(
+      'No public URL is configured, so these links use the console address and only work '
+      + `where the console is reachable. Set the external URL in the console (${page.public_url_setup_path ?? '/settings'}).`,
+    )
+  }
   if (page.published_at) {
     keyValue('Published', formatDate(page.published_at))
   }

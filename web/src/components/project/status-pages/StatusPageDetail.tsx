@@ -113,6 +113,19 @@ function PublicLinkSection({ page }: { page: StatusPageResponse }) {
         A machine-readable version is at{' '}
         <code className="text-xs">…/summary.json</code>.
       </p>
+      {!page.public_url_configured && (
+        <p className="text-sm text-amber-700 dark:text-amber-400">
+          No public URL is configured, so this link uses the console address and
+          only works where the console is reachable.{' '}
+          <Link
+            to={page.public_url_setup_path ?? '/settings'}
+            className="font-medium underline underline-offset-4"
+          >
+            Set the external URL
+          </Link>{' '}
+          so customers can open the page.
+        </p>
+      )}
     </section>
   )
 }
