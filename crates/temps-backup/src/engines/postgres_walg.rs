@@ -34,7 +34,6 @@ use super::ring_buffer::RingBuffer;
 use super::v2_common;
 use super::walg_size::load_backup_size_bytes;
 use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
-use temps_providers::externalsvc::ExternalService;
 
 pub(crate) const ENGINE_KEY: &str = "postgres_walg";
 
@@ -200,15 +199,64 @@ impl BackupEngine for PostgresWalgEngine {
             version: None,
             parameters: serde_json::from_str(&config_json).unwrap_or(Value::Null),
         };
-        postgres_service
-            .enable_continuous_archiving(service_config, &s3_credentials, &walg_prefix)
-            .await
-            .map_err(|error| BackupError::Failed {
+        // When archive_mode is off this restarts PostgreSQL in a recreated
+        // container. The provider refuses unless the new container mounts
+        // the same data and only reports success once it has verified the
+        // same cluster (system identifier, databases, roles) came back, so a
+        // base backup is never pushed from a freshly initialised, empty
+        // cluster (#1415).
+        //
+        // A manual run records whether its caller confirmed a restart;
+        // scheduled runs (no caller to ask) do not set it and may restart.
+        let allow_restart = ctx
+            .params
+            .get("allow_restart")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        if !allow_restart
+            && postgres_service
+                .backup_requires_restart(service_config.clone())
+                .await
+                .unwrap_or(true)
+        {
+            return Err(BackupError::PermanentFailure {
                 reason: format!(
+                    "Backup of service {} ('{}') would restart PostgreSQL to turn WAL archiving \
+                     on, and that was not confirmed when the backup was requested (archiving was \
+                     on then, or could not be checked). Nothing was changed. Run the backup again \
+                     and confirm the restart",
+                    service.id, service.name
+                ),
+            });
+        }
+        let archiving = postgres_service
+            .enable_continuous_archiving_reporting(service_config, &s3_credentials, &walg_prefix)
+            .await
+            .map_err(|error| {
+                let reason = format!(
                     "Cannot create a recoverable WAL-G backup for service {} ('{}'): continuous archiving could not be enabled and verified: {}",
                     service.id, service.name, error
-                ),
+                );
+                // A refusal is decided by the container's storage layout;
+                // retrying cannot change it, only repeat the refusal.
+                let refused = error
+                    .downcast_ref::<temps_providers::externalsvc::recreate_guard::RecreateGuardError>()
+                    .is_some_and(|guard| guard.is_refusal());
+                if refused {
+                    BackupError::PermanentFailure { reason }
+                } else {
+                    BackupError::Failed { reason }
+                }
             })?;
+        if archiving.restarted {
+            warn!(
+                backup_id,
+                service_id,
+                service = %service.name,
+                "PostgresWalgEngine: PostgreSQL was restarted to enable WAL archiving \
+                 (archive_mode was off); its data was verified intact before the base backup"
+            );
+        }
 
         // WAL-G memory tuning — see v1 notes. Defaults can OOM small containers
         // because each in-flight tar buffer is held fully in RAM. These values
@@ -321,6 +369,7 @@ impl BackupEngine for PostgresWalgEngine {
             "lz4",
             Some(json!({
                 "backup_tool": "wal-g",
+                "database_restarted_to_enable_archiving": archiving.restarted,
                 "lsn": lsn,
                 "service": { "id": service_id, "name": service.name },
             })),

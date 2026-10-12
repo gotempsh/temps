@@ -200,6 +200,7 @@ impl From<BackupCapabilityError> for Problem {
         enable_backup_schedule,
         update_backup_schedule,
         run_external_service_backup,
+        external_service_backup_preflight,
         get_external_service_backup_capability,
         list_backup_alerts,
         list_schedule_services,
@@ -215,6 +216,7 @@ impl From<BackupCapabilityError> for Problem {
             UpdateBackupScheduleRequest,
             RunBackupRequest,
             RunExternalServiceBackupRequest,
+            ExternalServiceBackupPreflightResponse,
             S3SourceResponse,
             S3ConnectionTestResponse,
             BackupScheduleResponse,
@@ -451,6 +453,27 @@ pub struct RunExternalServiceBackupRequest {
     /// Type of backup to perform (e.g., "full", "incremental")
     #[schema(example = "full")]
     pub backup_type: Option<String>,
+    /// Acknowledge that this backup restarts the database. Required (`true`)
+    /// when `GET /backups/external-services/{id}/run-preflight` reports
+    /// `restarts_database`; otherwise the request is refused with a 409 and
+    /// nothing is started.
+    #[serde(default)]
+    pub confirm_restart: Option<bool>,
+}
+
+/// What running a backup of this service now would do, so a client can warn
+/// before starting it.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ExternalServiceBackupPreflightResponse {
+    pub service_id: i32,
+    /// Engine that would run the backup (e.g. "postgres_walg").
+    #[schema(example = "postgres_walg")]
+    pub engine: String,
+    /// The backup restarts the database (PostgreSQL with WAL archiving off).
+    /// Send `confirm_restart: true` to run it.
+    pub restarts_database: bool,
+    /// Why, when `restarts_database` is true.
+    pub reason: Option<String>,
 }
 
 /// Response type for external service backup
@@ -477,6 +500,10 @@ pub struct ExternalServiceBackupResponse {
     /// Immutable provenance retained when the source service is deleted.
     pub service_name_snapshot: Option<String>,
     pub service_type_snapshot: Option<String>,
+    /// Set on the response to a manual run: this backup restarts the
+    /// database to turn WAL archiving on before backing it up.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restarts_database: Option<bool>,
 }
 
 impl From<temps_entities::external_service_backups::Model> for ExternalServiceBackupResponse {
@@ -499,6 +526,7 @@ impl From<temps_entities::external_service_backups::Model> for ExternalServiceBa
             expires_at: backup.expires_at.map(|dt| dt.to_rfc3339()),
             service_name_snapshot: backup.service_name_snapshot,
             service_type_snapshot: backup.service_type_snapshot,
+            restarts_database: None,
         }
     }
 }
@@ -1436,6 +1464,10 @@ pub fn configure_routes() -> Router<Arc<BackupAppState>> {
         .route(
             "/backups/schedules/{id}/enable",
             patch(enable_backup_schedule),
+        )
+        .route(
+            "/backups/external-services/{id}/run-preflight",
+            get(external_service_backup_preflight),
         )
         .route(
             "/backups/external-services/{id}/run",
@@ -3185,12 +3217,42 @@ async fn run_external_service_backup(
             Problem::from(e)
         })?;
 
+    // A WAL-G backup of a PostgreSQL service with archiving off restarts it
+    // (#1415). Never do that without the caller having been told.
+    let restart_reason = app_state
+        .backup_service
+        .backup_restart_reason(service.id, engine_key)
+        .await
+        .map_err(Problem::from)?;
+    if let Some(reason) = &restart_reason {
+        if request.confirm_restart != Some(true) {
+            return Err(temps_core::error_builder::conflict()
+                .title("Backup Restarts the Database")
+                .detail(format!(
+                    "{reason}. Nothing was started. Run the backup again with \
+                     confirm_restart=true to proceed."
+                ))
+                .value("error_code", "RESTART_CONFIRMATION_REQUIRED")
+                .value("service_id", service.id)
+                .build());
+        }
+        tracing::warn!(
+            service_id = id,
+            service_name = %service.name,
+            "run_external_service_backup: confirmed backup will restart PostgreSQL to enable WAL archiving",
+        );
+    }
+
+    // Recorded on the job: the engine re-checks at run time, so a restart
+    // that only became necessary after this request (archiving turned off
+    // by a restore in between) is refused rather than done unconfirmed.
     let trigger = BackupTriggerParams {
         engine: engine_key.to_string(),
         params: serde_json::json!({
             "service_id": service.id,
             "s3_source_id": s3_source_id,
             "backup_type": backup_type,
+            "allow_restart": restart_reason.is_some(),
         }),
         max_runtime_secs: None,
     };
@@ -3239,11 +3301,71 @@ async fn run_external_service_backup(
         "run_external_service_backup: job enqueued",
     );
 
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(ExternalServiceBackupResponse::from(pending)),
+    let mut response = ExternalServiceBackupResponse::from(pending);
+    response.restarts_database = Some(restart_reason.is_some());
+    Ok((StatusCode::ACCEPTED, Json(response)).into_response())
+}
+
+/// Report what running a backup of this external service now would do —
+/// in particular whether it restarts the database — without starting it.
+#[utoipa::path(
+    tag = "Backups",
+    get,
+    path = "/backups/external-services/{id}/run-preflight",
+    responses(
+        (status = 200, description = "What a backup run would do", body = ExternalServiceBackupPreflightResponse),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 404, description = "External service not found", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails)
+    ),
+    params(("id" = i32, Path, description = "External service ID")),
+    security(
+        ("bearer_auth" = [])
     )
-        .into_response())
+)]
+async fn external_service_backup_preflight(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<BackupAppState>>,
+    Path(id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, BackupsCreate);
+    require_service_access(
+        &app_state,
+        &auth,
+        id,
+        Permission::BackupsCreate,
+        "external service",
+        "backup",
+    )
+    .await?;
+    let service = app_state
+        .backup_service
+        .get_external_service(id)
+        .await
+        .map_err(Problem::from)?;
+    let docker = bollard::Docker::connect_with_local_defaults().map_err(|e| {
+        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Docker Unavailable")
+            .with_detail(format!(
+                "Could not connect to Docker to determine the backup engine of service {}: {}",
+                id, e
+            ))
+    })?;
+    let engine_key = resolve_engine_key(&service, &docker)
+        .await
+        .map_err(Problem::from)?;
+    let reason = app_state
+        .backup_service
+        .backup_restart_reason(service.id, engine_key)
+        .await
+        .map_err(Problem::from)?;
+    Ok(Json(ExternalServiceBackupPreflightResponse {
+        service_id: service.id,
+        engine: engine_key.to_string(),
+        restarts_database: reason.is_some(),
+        reason,
+    }))
 }
 
 // ── Backup Alerts ──────────────────────────────────────────────────────────────
