@@ -851,7 +851,7 @@ function PropColumnsPicker({
       <PopoverTrigger asChild>
         <Button variant="outline" size="sm" className="gap-1.5">
           <Columns3 className="h-4 w-4" />
-          <span className="hidden sm:inline">Columns</span>
+          <span className="max-sm:sr-only">Columns</span>
           {columns.length > 0 && (
             <Badge variant="secondary" className="px-1.5 text-xs">
               {columns.length}

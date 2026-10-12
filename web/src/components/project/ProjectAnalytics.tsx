@@ -255,7 +255,7 @@ export function AnalyticsFilters({
             onEnvironmentChange(value ? parseInt(value) : undefined)
           }
         >
-          <SelectTrigger className="w-[200px]">
+          <SelectTrigger aria-label="Environment" className="w-[200px]">
             <SelectValue placeholder="All environments" />
           </SelectTrigger>
           <SelectContent>

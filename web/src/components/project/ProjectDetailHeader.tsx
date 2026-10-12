@@ -304,7 +304,7 @@ export function ProjectDetailHeader({
           )}
           <Button size="sm" onClick={onDeploy}>
             <Rocket className="size-4" />
-            <span className="hidden sm:inline">Deploy</span>
+            <span className="max-sm:sr-only">Deploy</span>
           </Button>
         </div>
       </div>

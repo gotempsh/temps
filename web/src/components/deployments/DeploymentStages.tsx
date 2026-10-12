@@ -615,7 +615,7 @@ export function DeploymentStages({
                     title="Debug this failure with AI"
                   >
                     <Sparkles className="h-4 w-4" />
-                    <span className="hidden sm:inline">Debug with AI</span>
+                    <span className="max-sm:sr-only">Debug with AI</span>
                   </Button>
                 )}
                 <ElapsedTime

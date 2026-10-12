@@ -364,9 +364,7 @@ export function DeploymentTokensSettings({
                             ) : (
                               <RefreshCw className="h-4 w-4" />
                             )}
-                            <span className="hidden sm:inline ml-1">
-                              Rotate
-                            </span>
+                            <span className="max-sm:sr-only ml-1">Rotate</span>
                           </Button>
                           <Button
                             size="sm"
@@ -383,9 +381,7 @@ export function DeploymentTokensSettings({
                             ) : (
                               <Trash2 className="h-4 w-4" />
                             )}
-                            <span className="hidden sm:inline ml-1">
-                              Delete
-                            </span>
+                            <span className="max-sm:sr-only ml-1">Delete</span>
                           </Button>
                         </div>
                       </TableCell>

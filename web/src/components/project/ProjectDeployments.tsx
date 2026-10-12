@@ -999,7 +999,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
               disabled={currentPage <= 1 || isFetching}
             >
               <ChevronLeft className="h-4 w-4" />
-              <span className="hidden sm:inline ml-1">Previous</span>
+              <span className="max-sm:sr-only ml-1">Previous</span>
             </Button>
             <Button
               variant="outline"
@@ -1008,7 +1008,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
               onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
               disabled={currentPage >= totalPages || isFetching}
             >
-              <span className="hidden sm:inline mr-1">Next</span>
+              <span className="max-sm:sr-only mr-1">Next</span>
               <ChevronRight className="h-4 w-4" />
             </Button>
           </div>

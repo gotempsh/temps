@@ -455,7 +455,7 @@ export function S3SourceDetail() {
               >
                 <Link to={`/backups/s3-sources/${sourceId}/schedules/new`}>
                   <Plus className="h-4 w-4 sm:mr-2" />
-                  <span className="hidden sm:inline">New Schedule</span>
+                  <span className="max-sm:sr-only">New Schedule</span>
                 </Link>
               </Button>
             </CardHeader>
@@ -688,9 +688,7 @@ export function S3SourceDetail() {
                 ) : (
                   <ScanSearch className="mr-2 h-4 w-4" />
                 )}
-                <span className="hidden sm:inline">
-                  Discover orphan backups
-                </span>
+                <span className="max-sm:sr-only">Discover orphan backups</span>
                 <span className="sm:hidden">Scan S3</span>
               </Button>
             </CardHeader>
@@ -892,7 +890,7 @@ export function S3SourceDetail() {
                       disabled={backupPage === 1}
                     >
                       <ChevronLeft className="h-4 w-4" />
-                      <span className="hidden sm:inline">Previous</span>
+                      <span className="max-sm:sr-only">Previous</span>
                     </Button>
                     <span className="hidden text-xs text-muted-foreground sm:inline">
                       Page {backupPage} of {backupTotalPages}
@@ -905,7 +903,7 @@ export function S3SourceDetail() {
                       }
                       disabled={backupPage === backupTotalPages}
                     >
-                      <span className="hidden sm:inline">Next</span>
+                      <span className="max-sm:sr-only">Next</span>
                       <ChevronRight className="h-4 w-4" />
                     </Button>
                   </div>

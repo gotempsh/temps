@@ -255,10 +255,11 @@ export function DomainDetail() {
     // The order carries the per-authorization error, so it must follow the
     // domain's polling or a failed attempt shows a stale order next to a fresh
     // `failed` badge.
-    refetchInterval: domainRefetchInterval(
-      domain?.status,
-      domainQuery.dataUpdateCount
-    ),
+    refetchInterval: () =>
+      domainRefetchInterval(
+        domain?.status,
+        queryClient.getQueryState(domainQueryKey)?.dataUpdateCount ?? 0
+      ),
   })
 
   const order = orderQuery.data
@@ -1513,14 +1514,14 @@ function DnsRecordsList({
               minimal
               className="h-7 rounded-md border border-gray-950/10 px-2 py-1 text-xs"
             >
-              <span className="hidden sm:inline">Name</span>
+              <span className="max-sm:sr-only">Name</span>
             </CopyButton>
             <CopyButton
               value={record.value}
               minimal
               className="h-7 rounded-md border border-gray-950/10 px-2 py-1 text-xs"
             >
-              <span className="hidden sm:inline">Value</span>
+              <span className="max-sm:sr-only">Value</span>
             </CopyButton>
           </div>
         </div>

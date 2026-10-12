@@ -329,13 +329,20 @@ function CockpitHeader({
                 'group flex flex-col gap-2 rounded-lg border p-3 text-left transition-colors',
                 active
                   ? 'border-border bg-card'
-                  : 'border-dashed border-border bg-background opacity-60 hover:opacity-100'
+                  : 'border-dashed border-border bg-background hover:bg-muted/40'
               )}
             >
               <div className="flex items-center justify-between gap-2">
                 <div className="flex min-w-0 items-center gap-2">
                   <Icon className={cn('size-4 shrink-0', meta.accent)} />
-                  <span className="truncate text-sm font-medium">
+                  <span
+                    className={cn(
+                      'truncate text-sm font-medium',
+                      // Dim by colour, not `opacity`: an opacity on the whole
+                      // button drops the label below WCAG 1.4.3 contrast.
+                      !active && 'text-muted-foreground'
+                    )}
+                  >
                     {meta.label}
                   </span>
                 </div>

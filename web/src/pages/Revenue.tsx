@@ -263,6 +263,7 @@ export function Revenue() {
               className="w-full sm:w-[260px]"
             />
             <SearchableSelect
+              label="Project"
               value={projectFilter}
               onValueChange={setProjectFilter}
               options={projectOptions}
@@ -273,6 +274,7 @@ export function Revenue() {
               disabled={projectsQuery.isLoading}
             />
             <SearchableSelect
+              label="Event type"
               value={typeFilter}
               onValueChange={setTypeFilter}
               options={typeOptions}

@@ -1198,7 +1198,7 @@ function NodeDetail({
               ) : (
                 <Pause className="h-4 w-4 mr-1" />
               )}
-              <span className="hidden sm:inline">Drain</span>
+              <span className="max-sm:sr-only">Drain</span>
             </Button>
           )}
           {canUndrain && (
@@ -1213,7 +1213,7 @@ function NodeDetail({
               ) : (
                 <Play className="h-4 w-4 mr-1" />
               )}
-              <span className="hidden sm:inline">Undrain</span>
+              <span className="max-sm:sr-only">Undrain</span>
             </Button>
           )}
           {canRemove && (
@@ -1228,7 +1228,7 @@ function NodeDetail({
               ) : (
                 <Trash2 className="h-4 w-4 mr-1" />
               )}
-              <span className="hidden sm:inline">Remove</span>
+              <span className="max-sm:sr-only">Remove</span>
             </Button>
           )}
         </div>

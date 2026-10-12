@@ -78,7 +78,7 @@ export function EnvironmentsTabsView({
             </div>
             <Button onClick={() => setIsCreateDialogOpen(true)}>
               <Plus className="h-4 w-4 sm:mr-2" />
-              <span className="hidden sm:inline">Add Environment</span>
+              <span className="max-sm:sr-only">Add Environment</span>
             </Button>
           </div>
         </div>

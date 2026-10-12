@@ -284,7 +284,7 @@ export default function TraceOperations({ project }: TraceOperationsProps) {
             onClick={() => navigate(`/projects/${project.slug}/traces`)}
           >
             <Workflow className="h-3.5 w-3.5" />
-            <span className="hidden sm:inline">All Traces</span>
+            <span className="max-sm:sr-only">All Traces</span>
           </Button>
           {totalCount > 0 && (
             <span className="text-sm text-muted-foreground">

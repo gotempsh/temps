@@ -46,7 +46,7 @@ export function ScheduleBackupsAction({
       <Button variant="outline" size="sm" className="gap-2" asChild>
         <Link to={createBackupDestinationHref(serviceId)}>
           <Plus className="h-4 w-4" />
-          <span className="hidden sm:inline">Set up backups</span>
+          <span className="max-sm:sr-only">Set up backups</span>
           <span className="sm:hidden">Set up</span>
         </Link>
       </Button>
@@ -57,7 +57,7 @@ export function ScheduleBackupsAction({
       <Button variant="outline" size="sm" className="gap-2" asChild>
         <Link to={scheduleServiceBackupsHref(sources[0].id, serviceId)}>
           <CalendarClock className="h-4 w-4" />
-          <span className="hidden sm:inline">Schedule backups</span>
+          <span className="max-sm:sr-only">Schedule backups</span>
           <span className="sm:hidden">Schedule</span>
         </Link>
       </Button>
@@ -68,7 +68,7 @@ export function ScheduleBackupsAction({
       <DropdownMenuTrigger asChild>
         <Button variant="outline" size="sm" className="gap-2">
           <CalendarClock className="h-4 w-4" />
-          <span className="hidden sm:inline">Schedule backups</span>
+          <span className="max-sm:sr-only">Schedule backups</span>
           <span className="sm:hidden">Schedule</span>
           <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
         </Button>

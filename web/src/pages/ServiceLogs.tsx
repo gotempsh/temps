@@ -339,14 +339,14 @@ export function ServiceLogs() {
               <Link to={`/storage/${id}/monitoring`}>
                 <Button variant="outline" size="sm" className="gap-2">
                   <Server className="h-4 w-4" />
-                  <span className="hidden sm:inline">Monitoring</span>
+                  <span className="max-sm:sr-only">Monitoring</span>
                 </Button>
               </Link>
             ) : null}
             <Link to={`/storage/${id}/browse`}>
               <Button variant="outline" size="sm" className="gap-2">
                 <Database className="h-4 w-4" />
-                <span className="hidden sm:inline">Browse Data</span>
+                <span className="max-sm:sr-only">Browse Data</span>
               </Button>
             </Link>
             <Button
@@ -362,7 +362,7 @@ export function ServiceLogs() {
               <RefreshCw
                 className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`}
               />
-              <span className="hidden sm:inline">Refresh</span>
+              <span className="max-sm:sr-only">Refresh</span>
             </Button>
           </div>
         </div>

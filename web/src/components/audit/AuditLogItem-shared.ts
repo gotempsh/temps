@@ -143,27 +143,27 @@ export const CATEGORY_META: Record<
   auth: {
     label: 'Auth',
     icon: LogIn,
-    tone: 'bg-blue-500/10 text-blue-600 dark:text-blue-400',
+    tone: 'bg-blue-500/10 text-blue-700 dark:text-blue-400',
   },
   user: {
     label: 'User',
     icon: UserCog,
-    tone: 'bg-purple-500/10 text-purple-600 dark:text-purple-400',
+    tone: 'bg-purple-500/10 text-purple-700 dark:text-purple-400',
   },
   mfa: {
     label: 'MFA',
     icon: Shield,
-    tone: 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400',
+    tone: 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-400',
   },
   project: {
     label: 'Project',
     icon: FolderKanban,
-    tone: 'bg-indigo-500/10 text-indigo-600 dark:text-indigo-400',
+    tone: 'bg-indigo-500/10 text-indigo-700 dark:text-indigo-400',
   },
   service: {
     label: 'Service',
     icon: Plug,
-    tone: 'bg-cyan-500/10 text-cyan-600 dark:text-cyan-400',
+    tone: 'bg-cyan-500/10 text-cyan-700 dark:text-cyan-400',
   },
   backup: {
     label: 'Backup',
@@ -173,52 +173,52 @@ export const CATEGORY_META: Record<
   pipeline: {
     label: 'Pipeline',
     icon: GitBranch,
-    tone: 'bg-sky-500/10 text-sky-600 dark:text-sky-400',
+    tone: 'bg-sky-500/10 text-sky-700 dark:text-sky-400',
   },
   skill: {
     label: 'Skill',
     icon: Wand2,
-    tone: 'bg-fuchsia-500/10 text-fuchsia-600 dark:text-fuchsia-400',
+    tone: 'bg-fuchsia-500/10 text-fuchsia-700 dark:text-fuchsia-400',
   },
   mcp: {
     label: 'MCP',
     icon: Workflow,
-    tone: 'bg-teal-500/10 text-teal-600 dark:text-teal-400',
+    tone: 'bg-teal-500/10 text-teal-700 dark:text-teal-400',
   },
   secret: {
     label: 'Secret',
     icon: KeyRound,
-    tone: 'bg-rose-500/10 text-rose-600 dark:text-rose-400',
+    tone: 'bg-rose-500/10 text-rose-700 dark:text-rose-400',
   },
   deployment: {
     label: 'Deploy',
     icon: Rocket,
-    tone: 'bg-violet-500/10 text-violet-600 dark:text-violet-400',
+    tone: 'bg-violet-500/10 text-violet-700 dark:text-violet-400',
   },
   container: {
     label: 'Container',
     icon: Server,
-    tone: 'bg-slate-500/10 text-slate-600 dark:text-slate-400',
+    tone: 'bg-slate-500/10 text-slate-700 dark:text-slate-400',
   },
   workspace: {
     label: 'Workspace',
     icon: Terminal,
-    tone: 'bg-zinc-500/10 text-zinc-600 dark:text-zinc-300',
+    tone: 'bg-zinc-500/10 text-zinc-700 dark:text-zinc-300',
   },
   agent: {
     label: 'Agent',
     icon: Wand2,
-    tone: 'bg-pink-500/10 text-pink-600 dark:text-pink-400',
+    tone: 'bg-pink-500/10 text-pink-700 dark:text-pink-400',
   },
   domain: {
     label: 'Domain',
     icon: Globe,
-    tone: 'bg-lime-500/10 text-lime-600 dark:text-lime-400',
+    tone: 'bg-lime-500/10 text-lime-700 dark:text-lime-400',
   },
   email: {
     label: 'Email',
     icon: Mail,
-    tone: 'bg-orange-500/10 text-orange-600 dark:text-orange-400',
+    tone: 'bg-orange-500/10 text-orange-700 dark:text-orange-400',
   },
   webhook: {
     label: 'Webhook',
@@ -228,22 +228,22 @@ export const CATEGORY_META: Record<
   notification: {
     label: 'Notification',
     icon: Bell,
-    tone: 'bg-red-500/10 text-red-600 dark:text-red-400',
+    tone: 'bg-red-500/10 text-red-700 dark:text-red-400',
   },
   storage: {
     label: 'Storage',
     icon: Database,
-    tone: 'bg-green-500/10 text-green-600 dark:text-green-400',
+    tone: 'bg-green-500/10 text-green-700 dark:text-green-400',
   },
   analytics: {
     label: 'Analytics',
     icon: ChartLine,
-    tone: 'bg-gray-500/10 text-gray-600 dark:text-gray-400',
+    tone: 'bg-gray-500/10 text-gray-700 dark:text-gray-400',
   },
   platform: {
     label: 'Platform',
     icon: Settings,
-    tone: 'bg-stone-500/10 text-stone-600 dark:text-stone-400',
+    tone: 'bg-stone-500/10 text-stone-700 dark:text-stone-400',
   },
   other: {
     label: 'Other',

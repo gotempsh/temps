@@ -353,7 +353,7 @@ export default function Sandboxes({
               <RefreshCw
                 className={`mr-1.5 h-4 w-4 ${refreshing ? 'animate-spin' : ''}`}
               />
-              <span className="hidden sm:inline">Refresh</span>
+              <span className="max-sm:sr-only">Refresh</span>
             </Button>
           </div>
         }

@@ -599,7 +599,7 @@ export function ScheduleDetail() {
               }
             >
               <Play className="h-4 w-4 sm:mr-2" />
-              <span className="hidden sm:inline">Run now</span>
+              <span className="max-sm:sr-only">Run now</span>
             </Button>
 
             <Button
@@ -614,7 +614,7 @@ export function ScheduleDetail() {
                 aria-label="Edit schedule"
               >
                 <Pencil className="h-4 w-4 sm:mr-2" />
-                <span className="hidden sm:inline">Edit</span>
+                <span className="max-sm:sr-only">Edit</span>
               </Link>
             </Button>
 
@@ -807,7 +807,7 @@ export function ScheduleDetail() {
                     className="shrink-0"
                   >
                     <Plus className="h-4 w-4 sm:mr-2" />
-                    <span className="hidden sm:inline">Attach service</span>
+                    <span className="max-sm:sr-only">Attach service</span>
                   </Button>
                 </CardHeader>
                 <CardContent className="p-5">

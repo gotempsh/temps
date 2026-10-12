@@ -411,7 +411,7 @@ export function EmailAnalytics() {
                       disabled={page === 1}
                     >
                       <ChevronLeft className="h-4 w-4" />
-                      <span className="hidden sm:inline">Previous</span>
+                      <span className="max-sm:sr-only">Previous</span>
                     </Button>
                     <Button
                       variant="outline"
@@ -419,7 +419,7 @@ export function EmailAnalytics() {
                       onClick={() => setPage((p) => p + 1)}
                       disabled={page >= totalPages}
                     >
-                      <span className="hidden sm:inline">Next</span>
+                      <span className="max-sm:sr-only">Next</span>
                       <ChevronRight className="h-4 w-4" />
                     </Button>
                   </div>
