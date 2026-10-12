@@ -981,6 +981,13 @@ pub(crate) fn extract_type_and_enum(schema: Option<&RefOr<Schema>>) -> (String, 
 }
 
 fn extract_schema_type_and_enum(schema: &Schema) -> (String, Vec<String>) {
+    // A `Vec<T>` field is its own schema kind (`Schema::Array`), not a
+    // `Schema::Object`. Falling through to the "string" default below told the
+    // model to pass `--environment_ids 15`, which the CLI then sent as a JSON
+    // string and the API rejected ("expected a sequence").
+    if matches!(schema, Schema::Array(_)) {
+        return ("array".to_string(), vec![]);
+    }
     let Schema::Object(obj) = schema else {
         return ("string".to_string(), vec![]);
     };
@@ -1986,6 +1993,82 @@ mod tests {
         assert_eq!(
             schema_type_to_string(&SchemaType::Array(vec![Type::Null])),
             "null"
+        );
+    }
+
+    /// A `Vec<T>` body field must be indexed as an `array`.
+    ///
+    /// `Schema::Array` is not a `Schema::Object`, so the type extractor used to
+    /// fall through to its "string" default and the help advertised
+    /// `--environment_ids <string>` — the CLI then sent `"15"` for a field the
+    /// API deserializes as a sequence, and every variable-create failed with
+    /// `invalid type: string "15", expected a sequence`.
+    #[test]
+    fn vec_body_fields_are_indexed_as_arrays() {
+        use utoipa::openapi::{
+            request_body::RequestBodyBuilder, schema::ComponentsBuilder, ContentBuilder,
+        };
+
+        #[derive(utoipa::ToSchema)]
+        #[allow(dead_code)]
+        struct CreateVariableBody {
+            key: String,
+            environment_ids: Vec<i32>,
+            include_in_preview: Option<Vec<String>>,
+        }
+
+        let components = ComponentsBuilder::new()
+            .schema(
+                "CreateVariableBody",
+                <CreateVariableBody as utoipa::PartialSchema>::schema(),
+            )
+            .build();
+        let create_variable = OperationBuilder::new()
+            .operation_id(Some("create_environment_variable"))
+            .tag("Projects")
+            .request_body(Some(
+                RequestBodyBuilder::new()
+                    .content(
+                        "application/json",
+                        ContentBuilder::new()
+                            .schema(Some(RefOr::Ref(
+                                utoipa::openapi::schema::Ref::from_schema_name(
+                                    "CreateVariableBody",
+                                ),
+                            )))
+                            .build(),
+                    )
+                    .build(),
+            ))
+            .build();
+        let mut item = PathItem::default();
+        item.post = Some(create_variable);
+        let api = OpenApiBuilder::new()
+            .info(utoipa::openapi::Info::new("Test API", "1.0.0"))
+            .paths(PathsBuilder::new().path("/variables", item).build())
+            .components(Some(components))
+            .build();
+
+        let index =
+            ReadOnlyApiIndex::from_openapi_write_allowlist(&api, &["create_environment_variable"]);
+        let op = index
+            .get("create_environment_variable")
+            .expect("write op indexed");
+        let ty_of = |name: &str| {
+            op.params
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| panic!("param {name} indexed"))
+                .ty
+                .clone()
+        };
+
+        assert_eq!(ty_of("key"), "string");
+        assert_eq!(ty_of("environment_ids"), "array");
+        assert_eq!(
+            ty_of("include_in_preview"),
+            "array",
+            "a nullable array is still an array"
         );
     }
 

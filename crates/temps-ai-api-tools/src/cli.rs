@@ -229,11 +229,23 @@ fn resolve_operation<'a>(op: &'a ApiOperation, tail: &[String]) -> CliAction<'a>
 // Help rendering
 // ---------------------------------------------------------------------------
 
+/// The write index holds only mutating operations; the read index always
+/// carries at least one `GET` (it may add vetted read-only POSTs on top).
+fn is_write_index(index: &ReadOnlyApiIndex) -> bool {
+    !index.operations().is_empty() && index.operations().iter().all(|op| op.method != "GET")
+}
+
 fn render_root_help(index: &ReadOnlyApiIndex, permit: &dyn Fn(&ApiOperation) -> bool) -> String {
     let secs = sections(index, permit);
-    let mut out = String::from(
-        "Temps read-only API — a CLI over the platform's GET endpoints.\n\
-         Usage: <section> <operation> [--flag value ...]\n\
+    let heading = if is_write_index(index) {
+        "Temps write API — a CLI over the platform's mutating endpoints (POST/PUT/PATCH/DELETE). \
+         Every call is shown to the user for approval before it runs.\n"
+    } else {
+        "Temps read-only API — a CLI over the platform's GET endpoints.\n"
+    };
+    let mut out = String::from(heading);
+    out.push_str(
+        "Usage: <section> <operation> [--flag value ...]\n\
          Run `<section> --help` to list a section's operations, or \
          `<section> <operation> --help` for an operation's flags. `project_id` is auto-filled \
          for the current project.\n\nSections:\n",
@@ -335,6 +347,9 @@ fn render_operation_help(op: &ApiOperation) -> String {
             // nothing, and guessing it wrong fails the whole call.
             if let Some(shape) = &p.object_shape {
                 out.push_str(&format!(" — {}", shape.describe()));
+            }
+            if p.ty == "array" {
+                out.push_str(" — JSON array, e.g. [1,2] (a single value or 1,2 also works)");
             }
             if let Some(d) = &p.description {
                 out.push_str(&format!(" — {d}"));
@@ -551,7 +566,8 @@ fn coerce(flag: &str, s: &str, expected_type: Option<&str>) -> Result<Value, Str
                 )),
             };
         }
-        Some("object") | Some("array") => return parse_structured_value(flag, s),
+        Some("array") => return parse_array_value(flag, s),
+        Some("object") => return parse_structured_value(flag, s),
         _ => {}
     }
 
@@ -592,6 +608,48 @@ fn coerce(flag: &str, s: &str, expected_type: Option<&str>) -> Result<Value, Str
             Ok(Value::String(s.to_string()))
         }
     }
+}
+
+/// Parse the value of an array-typed flag.
+///
+/// A JSON array (`[15]`, `["a","b"]`) is taken as written. The model also
+/// writes the natural CLI forms — a single value (`--environment_ids 15`) or a
+/// comma-separated list (`--environment_ids 15,16`) — and rejecting those for
+/// a flag documented as an array only costs a round trip through the approval
+/// gate, so they become a one-element / multi-element array. Items are typed
+/// by spelling (integer, boolean, else string) because the flag's item type is
+/// not carried in the operation index.
+fn parse_array_value(flag: &str, s: &str) -> Result<Value, String> {
+    let trimmed = s.trim();
+    if trimmed.starts_with('[') {
+        let value = parse_structured_value(flag, trimmed)?;
+        return if value.is_array() {
+            Ok(value)
+        } else {
+            Err(format!(
+                "Invalid value for `--{flag}`: expected a JSON array such as `[1,2]`."
+            ))
+        };
+    }
+    if trimmed.is_empty() {
+        return Err(format!(
+            "Invalid value for `--{flag}`: expected a JSON array such as `[1,2]`."
+        ));
+    }
+    let items = trimmed
+        .split(',')
+        .map(|item| {
+            let item = item.trim();
+            if let Ok(n) = item.parse::<i64>() {
+                Value::from(n)
+            } else if item == "true" || item == "false" {
+                Value::Bool(item == "true")
+            } else {
+                Value::String(item.trim_matches('"').to_string())
+            }
+        })
+        .collect();
+    Ok(Value::Array(items))
 }
 
 fn parse_structured_value(flag: &str, s: &str) -> Result<Value, String> {
@@ -805,6 +863,102 @@ mod tests {
         let parsed = parse_flags(&["--service_type".into(), r#""postgres""#.into()], None).unwrap();
 
         assert_eq!(parsed["service_type"], Value::String("postgres".into()));
+    }
+
+    fn array_flag_operation() -> ApiOperation {
+        ApiOperation {
+            operation_id: "create_environment_variable".to_string(),
+            path: "/projects/{project_id}/env-vars".to_string(),
+            method: "POST".to_string(),
+            summary: None,
+            description: None,
+            tags: vec!["Projects".to_string()],
+            params: vec![crate::index::ParamSpec {
+                name: "environment_ids".to_string(),
+                location: ParamLocation::Body,
+                required: true,
+                ty: "array".to_string(),
+                enum_values: vec![],
+                description: None,
+                object_shape: None,
+            }],
+        }
+    }
+
+    /// `temps_write projects create_environment_variable --environment_ids 15`
+    /// used to send the string `"15"`, which the API rejects as "expected a
+    /// sequence". Every spelling of "these ids" must arrive as a JSON array.
+    #[test]
+    fn array_flags_always_arrive_as_json_arrays() {
+        let operation = array_flag_operation();
+        let parse = |value: &str| {
+            parse_flags(
+                &["--environment_ids".into(), value.into()],
+                Some(&operation),
+            )
+            .map(|v| v["environment_ids"].clone())
+        };
+
+        assert_eq!(parse("[15]").unwrap(), serde_json::json!([15]));
+        assert_eq!(parse("[15, 16]").unwrap(), serde_json::json!([15, 16]));
+        assert_eq!(parse("15").unwrap(), serde_json::json!([15]));
+        assert_eq!(parse("15,16").unwrap(), serde_json::json!([15, 16]));
+        assert_eq!(parse("a, b").unwrap(), serde_json::json!(["a", "b"]));
+        assert_eq!(
+            parse(r#"["a","b"]"#).unwrap(),
+            serde_json::json!(["a", "b"])
+        );
+
+        let malformed = parse("[15").unwrap_err();
+        assert!(malformed.contains("--environment_ids"), "{malformed}");
+        assert!(parse("").is_err());
+    }
+
+    #[test]
+    fn array_flag_help_says_how_to_pass_a_list() {
+        let help = render_operation_help(&array_flag_operation());
+        assert!(
+            help.contains("--environment_ids <array> (required)"),
+            "{help}"
+        );
+        assert!(help.contains("JSON array"), "{help}");
+    }
+
+    #[test]
+    fn root_help_names_the_write_tool_for_a_write_index() {
+        let create = OperationBuilder::new()
+            .operation_id(Some("create_thing"))
+            .tag("Things")
+            .build();
+        let list = OperationBuilder::new()
+            .operation_id(Some("list_things"))
+            .tag("Things")
+            .build();
+        let mut write_item = PathItem::default();
+        write_item.post = Some(create);
+        let api = OpenApiBuilder::new()
+            .info(utoipa::openapi::Info::new("Test API", "1.0.0"))
+            .paths(
+                PathsBuilder::new()
+                    .path("/things", write_item)
+                    .path(
+                        "/things/list",
+                        PathItem::new(utoipa::openapi::path::HttpMethod::Get, list),
+                    )
+                    .build(),
+            )
+            .build();
+
+        let write_index = ReadOnlyApiIndex::from_openapi_write_allowlist(&api, &["create_thing"]);
+        let read_index = ReadOnlyApiIndex::from_openapi_allowlist(&api, &["list_things"]);
+
+        let write_help = render_root_help(&write_index, &|_| true);
+        assert!(write_help.starts_with("Temps write API"), "{write_help}");
+        assert!(!write_help.contains("read-only"), "{write_help}");
+        assert!(write_help.contains("things"), "{write_help}");
+
+        let read_help = render_root_help(&read_index, &|_| true);
+        assert!(read_help.starts_with("Temps read-only API"), "{read_help}");
     }
 
     #[test]
