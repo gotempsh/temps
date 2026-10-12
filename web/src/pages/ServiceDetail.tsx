@@ -1337,7 +1337,7 @@ export function ServiceDetail() {
                       onClick={() => setIsBackupDialogOpen(true)}
                     >
                       <HardDrive className="h-4 w-4" />
-                      <span className="max-sm:sr-only">Trigger backup</span>
+                      <span className="hidden sm:inline">Trigger backup</span>
                       <span className="sm:hidden">Backup</span>
                     </Button>
                     <ScheduleBackupsAction

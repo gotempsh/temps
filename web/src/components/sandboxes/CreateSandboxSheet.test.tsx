@@ -32,11 +32,8 @@ const CREATED = {
   sandbox: { id: 'sbx_new1', name: 'scratch' },
 }
 
-function renderSheet(available = true) {
-  const client = new QueryClient({
-    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
-  })
-  return render(
+function sheetTree(client: QueryClient, open: boolean, available: boolean) {
+  return (
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={['/sandboxes']}>
         <Routes>
@@ -44,7 +41,7 @@ function renderSheet(available = true) {
             path="/sandboxes"
             element={
               <CreateSandboxSheet
-                open
+                open={open}
                 onOpenChange={() => {}}
                 available={available}
               />
@@ -55,6 +52,16 @@ function renderSheet(available = true) {
       </MemoryRouter>
     </QueryClientProvider>
   )
+}
+
+function newClient() {
+  return new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  })
+}
+
+function renderSheet(available = true) {
+  return render(sheetTree(newClient(), true, available))
 }
 
 test('creating sends only the filled fields and opens the new sandbox', async () => {
@@ -145,5 +152,29 @@ test('loads node placement so a node can be chosen explicitly', async () => {
     expect(api.called('GET', '/v1/sandboxes/placement')).toBe(true)
   )
   expect(view.getByLabelText('Node')).toBeTruthy()
+  api.restore()
+})
+
+test("reopening the sheet does not show the previous attempt's error", async () => {
+  const api = mockApi({
+    'GET /v1/sandboxes/placement': () => jsonResponse(PLACEMENT),
+    'POST /v1/sandboxes': () =>
+      jsonResponse(
+        { title: 'Node unavailable', detail: 'Node worker-9 is offline.' },
+        422
+      ),
+  })
+  const client = newClient()
+  const view = render(sheetTree(client, true, true))
+
+  fireEvent.click(await view.findByRole('button', { name: 'Create sandbox' }))
+  await view.findByText(/Node worker-9 is offline/)
+
+  view.rerender(sheetTree(client, false, true))
+  view.rerender(sheetTree(client, true, true))
+
+  await waitFor(() =>
+    expect(view.queryByText(/Node worker-9 is offline/)).toBeNull()
+  )
   api.restore()
 })

@@ -186,7 +186,7 @@ export function AuthSettingsPage() {
           <Button asChild>
             <Link to="/settings/auth/new">
               <Plus className="mr-2 h-4 w-4" />
-              <span className="max-sm:sr-only">Add SSO Provider</span>
+              <span className="hidden sm:inline">Add SSO Provider</span>
               <span className="sm:hidden">Add</span>
             </Link>
           </Button>

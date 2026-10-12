@@ -98,11 +98,25 @@ export function SandboxFilesCard({
     }),
     enabled: openPath !== null && readable,
     retry: false,
-    // The editor owns the text once loaded; a background refetch must not
-    // replace what is being typed.
+    // The editor owns the text once loaded, so nothing refetches in the
+    // background; "Open file" reads it again on purpose (see `openFile`).
     refetchOnWindowFocus: false,
-    staleTime: Infinity,
+    refetchOnReconnect: false,
+    staleTime: 0,
+    gcTime: 0,
   })
+
+  // Opening the same path again must show what is in the sandbox now: the
+  // terminal beside this card can change the file, and saving a stale buffer
+  // would silently overwrite that change.
+  const openFile = (path: string) => {
+    if (path === openPath) {
+      void statQuery.refetch()
+      void readQuery.refetch()
+      return
+    }
+    setOpenPath(path)
+  }
 
   return (
     <Card>
@@ -113,8 +127,9 @@ export function SandboxFilesCard({
         </CardTitle>
         <CardDescription>
           Open a text file by its absolute path, edit it and save it back into
-          the sandbox. Browsing directories needs a listing endpoint that does
-          not exist yet.
+          the sandbox. Opening a file again reloads it and discards unsaved
+          edits. Browsing directories needs a listing endpoint that does not
+          exist yet.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -127,7 +142,7 @@ export function SandboxFilesCard({
         <Form {...form}>
           <form
             onSubmit={form.handleSubmit((values) =>
-              setOpenPath(values.path.trim())
+              openFile(values.path.trim())
             )}
             className="flex flex-col gap-2 sm:flex-row sm:items-end"
             noValidate

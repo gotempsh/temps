@@ -104,6 +104,50 @@ test('the scan recognises a button named only by a mobile-hidden span', () => {
   ).toHaveLength(0)
 })
 
+/**
+ * A button that already shows a short label below `sm` (`sm:hidden`) must hide
+ * its long label from the accessibility tree there too (`hidden sm:inline`).
+ * `max-sm:sr-only` would keep both, so the name reads "Set up backups Set up".
+ */
+function buttonsWithDuplicatedMobileLabel(src: string): string[] {
+  const found: string[] = []
+  for (const match of src.matchAll(OPEN)) {
+    const start = match.index ?? 0
+    const end = openingTagEnd(src, start + match[0].length)
+    if (end < 0) continue
+    const close = src.indexOf(`</${match[1]}>`, end)
+    if (close < 0) continue
+    const inner = src.slice(end, close)
+    if (/\bmax-sm:sr-only\b/.test(inner) && /\bsm:hidden\b/.test(inner)) {
+      found.push(`${src.slice(0, start).split('\n').length}`)
+    }
+  }
+  return found
+}
+
+test('a short mobile label is not doubled by a screen-reader-only long one', () => {
+  expect(
+    buttonsWithDuplicatedMobileLabel(
+      '<Button><span className="max-sm:sr-only">Set up backups</span><span className="sm:hidden">Set up</span></Button>'
+    )
+  ).toHaveLength(1)
+  expect(
+    buttonsWithDuplicatedMobileLabel(
+      '<Button><span className="hidden sm:inline">Set up backups</span><span className="sm:hidden">Set up</span></Button>'
+    )
+  ).toHaveLength(0)
+
+  const offenders: string[] = []
+  for (const file of sourceFiles(SRC)) {
+    for (const line of buttonsWithDuplicatedMobileLabel(
+      readFileSync(file, 'utf8')
+    )) {
+      offenders.push(`${path.relative(SRC, file)}:${line}`)
+    }
+  }
+  expect(offenders).toEqual([])
+})
+
 test('no console button loses its only label below the sm breakpoint', () => {
   const offenders: string[] = []
   for (const file of sourceFiles(SRC)) {

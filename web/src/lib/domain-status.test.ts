@@ -8,6 +8,7 @@ import {
   DOMAIN_POLL_SLOW_MS,
   domainRefetchInterval,
   isIssuanceInFlight,
+  orderRefetchInterval,
 } from './domain-status'
 
 test('every in-flight issuance status polls', () => {
@@ -41,10 +42,44 @@ test('settled statuses stop polling', () => {
 })
 
 test('polling backs off after the fast reads are used up', () => {
-  expect(domainRefetchInterval('challenge_requested', DOMAIN_POLL_FAST_READS - 1)).toBe(
+  expect(
+    domainRefetchInterval('challenge_requested', DOMAIN_POLL_FAST_READS - 1)
+  ).toBe(DOMAIN_POLL_FAST_MS)
+  expect(
+    domainRefetchInterval('challenge_requested', DOMAIN_POLL_FAST_READS)
+  ).toBe(DOMAIN_POLL_SLOW_MS)
+})
+
+test('the order follows the domain while issuance is in flight', () => {
+  expect(orderRefetchInterval('challenge_requested', 'pending', 0)).toBe(
     DOMAIN_POLL_FAST_MS
   )
-  expect(domainRefetchInterval('challenge_requested', DOMAIN_POLL_FAST_READS)).toBe(
-    DOMAIN_POLL_SLOW_MS
+  expect(
+    orderRefetchInterval(
+      'challenge_requested',
+      'pending',
+      DOMAIN_POLL_FAST_READS
+    )
+  ).toBe(DOMAIN_POLL_SLOW_MS)
+})
+
+test('a settled domain keeps polling an order that has not settled yet', () => {
+  // The domain poll saw `failed` before the order poll saw `invalid`.
+  expect(orderRefetchInterval('failed', 'pending', 3)).toBe(DOMAIN_POLL_FAST_MS)
+  expect(orderRefetchInterval('failed', 'processing', 3)).toBe(
+    DOMAIN_POLL_FAST_MS
   )
+})
+
+test('the order stops polling once both are settled or the order is unknown', () => {
+  expect(orderRefetchInterval('failed', 'invalid', 3)).toBe(false)
+  expect(orderRefetchInterval('active', 'valid', 3)).toBe(false)
+  expect(orderRefetchInterval('failed', 'cancelled', 3)).toBe(false)
+  expect(orderRefetchInterval('failed', undefined, 3)).toBe(false)
+})
+
+test('an order stuck non-terminal behind a settled domain is bounded', () => {
+  expect(
+    orderRefetchInterval('failed', 'pending', DOMAIN_POLL_FAST_READS)
+  ).toBe(false)
 })

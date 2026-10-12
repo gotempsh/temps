@@ -70,6 +70,7 @@ import {
   domainRefetchInterval,
   isIssuanceInFlight,
   isServingCert,
+  orderRefetchInterval,
 } from '@/lib/domain-status'
 import {
   useIsFetching,
@@ -252,13 +253,15 @@ export function DomainDetail() {
     // cert. "active_renewal_failed" is still serving, so treat it like "active".
     enabled: orderRequired,
     retry: false,
-    // The order carries the per-authorization error, so it must follow the
-    // domain's polling or a failed attempt shows a stale order next to a fresh
-    // `failed` badge.
-    refetchInterval: () =>
-      domainRefetchInterval(
+    // The order carries the per-authorization error. It follows the domain's
+    // polling and keeps going until the order itself has settled, so a domain
+    // seen as `failed` between two order reads never sits beside a stale
+    // `pending` order.
+    refetchInterval: (query) =>
+      orderRefetchInterval(
         domain?.status,
-        queryClient.getQueryState(domainQueryKey)?.dataUpdateCount ?? 0
+        query.state.data?.status,
+        query.state.dataUpdateCount
       ),
   })
 

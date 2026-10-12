@@ -95,18 +95,6 @@ export function CreateSandboxSheet({
     defaultValues: createSandboxFormDefaults,
   })
 
-  // Start from a clean form each time the sheet is opened.
-  useEffect(() => {
-    if (open) form.reset(createSandboxFormDefaults)
-  }, [open, form])
-
-  const placement = useQuery({
-    ...getSandboxPlacementOptions(),
-    enabled: open && available,
-    retry: false,
-  })
-  const nodes = (placement.data?.nodes ?? []).filter((node) => node.eligible)
-
   const create = useMutation({
     ...createSandboxMutation(),
     meta: { errorTitle: 'Failed to create sandbox' },
@@ -117,6 +105,22 @@ export function CreateSandboxSheet({
       navigate(`/sandboxes/${response.sandbox.id}`)
     },
   })
+  const { reset: resetCreate } = create
+
+  // Start from a clean form, and without the previous attempt's error, each
+  // time the sheet is opened (it stays mounted while closed).
+  useEffect(() => {
+    if (!open) return
+    form.reset(createSandboxFormDefaults)
+    resetCreate()
+  }, [open, form, resetCreate])
+
+  const placement = useQuery({
+    ...getSandboxPlacementOptions(),
+    enabled: open && available,
+    retry: false,
+  })
+  const nodes = (placement.data?.nodes ?? []).filter((node) => node.eligible)
 
   const submit = (values: CreateSandboxFormValues) =>
     create.mutate({ body: toCreateSandboxBody(values) })

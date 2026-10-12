@@ -58,6 +58,43 @@ export const DOMAIN_POLL_SLOW_MS = 15_000
 export const DOMAIN_POLL_FAST_READS = 20
 
 /**
+ * ACME order statuses after which the order cannot change on its own
+ * (RFC 8555: `valid`, `invalid`, plus the cancelled/revoked variants the
+ * console treats as terminal).
+ */
+export const ORDER_SETTLED_STATUSES: readonly string[] = [
+  'valid',
+  'invalid',
+  'cancelled',
+  'canceled',
+  'revoked',
+  'deactivated',
+]
+
+/**
+ * `refetchInterval` for the order read that sits beside a domain.
+ *
+ * The domain and the order poll on independent timers, so the domain can be
+ * seen as `failed` while the last order read still says `pending`. Following
+ * the domain status alone would stop polling at that moment and leave the
+ * stale order next to a fresh `failed` badge, so the order keeps polling
+ * until it has settled itself (bounded by the same back-off as the domain).
+ */
+export function orderRefetchInterval(
+  domainStatus: string | null | undefined,
+  orderStatus: string | null | undefined,
+  readCount: number
+): number | false {
+  if (isIssuanceInFlight(domainStatus)) {
+    return domainRefetchInterval(domainStatus, readCount)
+  }
+  const orderSettled =
+    !orderStatus || ORDER_SETTLED_STATUSES.includes(orderStatus)
+  if (orderSettled || readCount >= DOMAIN_POLL_FAST_READS) return false
+  return DOMAIN_POLL_FAST_MS
+}
+
+/**
  * React Query `refetchInterval` for a domain read: poll while issuance is in
  * flight, and stop (`false`) as soon as the status is settled so a failed
  * attempt shows up without a reload and a finished one stops costing requests.

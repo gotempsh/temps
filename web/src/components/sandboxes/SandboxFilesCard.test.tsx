@@ -3,7 +3,7 @@
 
 import { afterEach, expect, test } from 'bun:test'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, fireEvent, render } from '@testing-library/react'
+import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import { SandboxFilesCard } from './SandboxFilesCard'
@@ -148,5 +148,51 @@ test('a stopped ephemeral sandbox explains itself and blocks the form', () => {
     (view.getByRole('button', { name: 'Open file' }) as HTMLButtonElement)
       .disabled
   ).toBe(true)
+  api.restore()
+})
+
+test('opening the same file again reloads it, so a stale buffer is never saved over a newer file', async () => {
+  let current = 'from the terminal, version 1\n'
+  let reads = 0
+  const api = mockApi({
+    'GET /v1/sandboxes/sbx_1/fs/stat': () =>
+      jsonResponse({
+        path: PATH,
+        exists: true,
+        is_file: true,
+        is_dir: false,
+        size: current.length,
+      }),
+    'GET /v1/sandboxes/sbx_1/fs/read': () => {
+      reads += 1
+      return jsonResponse({
+        path: PATH,
+        size: current.length,
+        contents_b64: encodeText(current),
+      })
+    },
+  })
+  const view = renderCard()
+
+  fireEvent.change(view.getByLabelText('File path'), {
+    target: { value: PATH },
+  })
+  fireEvent.click(view.getByRole('button', { name: 'Open file' }))
+  const first = (await view.findByLabelText(
+    `Contents of ${PATH}`
+  )) as HTMLTextAreaElement
+  expect(first.value).toBe('from the terminal, version 1\n')
+
+  // Something else (the terminal card beside this one) changes the file.
+  current = 'from the terminal, version 2\n'
+  fireEvent.click(view.getByRole('button', { name: 'Open file' }))
+
+  await waitFor(() => {
+    const editor = view.getByLabelText(
+      `Contents of ${PATH}`
+    ) as HTMLTextAreaElement
+    expect(editor.value).toBe('from the terminal, version 2\n')
+  })
+  expect(reads).toBe(2)
   api.restore()
 })

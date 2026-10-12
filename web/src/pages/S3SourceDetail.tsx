@@ -688,7 +688,9 @@ export function S3SourceDetail() {
                 ) : (
                   <ScanSearch className="mr-2 h-4 w-4" />
                 )}
-                <span className="max-sm:sr-only">Discover orphan backups</span>
+                <span className="hidden sm:inline">
+                  Discover orphan backups
+                </span>
                 <span className="sm:hidden">Scan S3</span>
               </Button>
             </CardHeader>

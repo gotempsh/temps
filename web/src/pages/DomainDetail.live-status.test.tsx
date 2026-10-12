@@ -176,3 +176,40 @@ test('an in-flight domain is polled and polling stops once it is settled', async
   expect(reads).toBe(readsWhenSettled)
   api.restore()
 }, 30_000)
+
+test('the order is read again after the domain settles, so it never stays pending beside a failed badge', async () => {
+  // The domain poll sees `failed` first; the order only reports `invalid` on
+  // its next read. Following the domain status alone would stop polling the
+  // order at that point and leave it `pending`.
+  let domainReads = 0
+  let orderReadsAfterFailed = 0
+  const api = mockApi({
+    'GET /domains/1': () => {
+      domainReads += 1
+      return jsonResponse(
+        domainReads < 2 ? domain('challenge_requested') : domain('failed', 'x')
+      )
+    },
+    'GET /domains/1/order': () => {
+      if (domainReads < 2) return jsonResponse(order('pending'))
+      orderReadsAfterFailed += 1
+      return jsonResponse(
+        order(orderReadsAfterFailed < 2 ? 'pending' : 'invalid')
+      )
+    },
+  })
+  const view = renderPage()
+
+  await view.findAllByText('challenge_requested')
+  await waitFor(
+    () => expect(view.getAllByText('failed').length).toBeGreaterThan(0),
+    {
+      timeout: 12_000,
+    }
+  )
+  await waitFor(() => expect(view.queryByText('pending')).toBeNull(), {
+    timeout: 12_000,
+  })
+  expect(orderReadsAfterFailed).toBeGreaterThanOrEqual(2)
+  api.restore()
+}, 40_000)
