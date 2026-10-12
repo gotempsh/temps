@@ -315,33 +315,15 @@ impl WebhookService {
         }
     }
 
-    /// Deliver a webhook to its configured URL
+    /// Deliver a webhook to its configured URL as a brand-new delivery
+    /// (attempt 1). Re-sending an existing delivery goes through
+    /// [`Self::retry_delivery`], which reuses its record.
     async fn deliver_webhook(
         &self,
         webhook: &temps_entities::webhooks::Model,
         event: &WebhookEvent,
     ) -> WebhookDeliveryResult {
         let payload = serde_json::to_string(event).unwrap_or_default();
-        let timestamp = Utc::now().timestamp().to_string();
-
-        // Generate signature if secret is configured
-        let signature = if let Some(encrypted_secret) = &webhook.secret {
-            match self.encryption_service.decrypt(encrypted_secret) {
-                Ok(secret_bytes) => match String::from_utf8(secret_bytes) {
-                    Ok(secret) => Some(self.generate_signature(&secret, &timestamp, &payload)),
-                    Err(e) => {
-                        error!("Failed to convert secret to string: {}", e);
-                        None
-                    }
-                },
-                Err(e) => {
-                    error!("Failed to decrypt webhook secret: {}", e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
 
         // Create delivery record
         let delivery = temps_entities::webhook_deliveries::ActiveModel {
@@ -369,6 +351,45 @@ impl WebhookService {
             }
         };
 
+        self.send_delivery(webhook, event.event_type.as_str(), payload, delivery_record)
+            .await
+    }
+
+    /// Send `payload` for an existing delivery record and write the outcome
+    /// (status code, error, success, delivered_at) back to that same record.
+    ///
+    /// The record's `id` is what the receiver sees in `X-Webhook-Delivery`, and
+    /// its `attempt_number` is what the result reports, so a retry that reuses
+    /// the record is the same delivery, one attempt later.
+    async fn send_delivery(
+        &self,
+        webhook: &temps_entities::webhooks::Model,
+        event_type: &str,
+        payload: String,
+        delivery_record: temps_entities::webhook_deliveries::Model,
+    ) -> WebhookDeliveryResult {
+        let timestamp = Utc::now().timestamp().to_string();
+        let attempt_number = delivery_record.attempt_number;
+
+        // Generate signature if secret is configured
+        let signature = if let Some(encrypted_secret) = &webhook.secret {
+            match self.encryption_service.decrypt(encrypted_secret) {
+                Ok(secret_bytes) => match String::from_utf8(secret_bytes) {
+                    Ok(secret) => Some(self.generate_signature(&secret, &timestamp, &payload)),
+                    Err(e) => {
+                        error!("Failed to convert secret to string: {}", e);
+                        None
+                    }
+                },
+                Err(e) => {
+                    error!("Failed to decrypt webhook secret: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // Build a delivery client pinned to the validated IP (SSRF/rebinding
         // guard). A re-validation failure aborts the send and is recorded as a
         // failed delivery rather than silently connecting to an internal target.
@@ -380,7 +401,7 @@ impl WebhookService {
                     let mut request_builder = http_client
                         .post(&webhook.url)
                         .header("Content-Type", "application/json")
-                        .header("X-Webhook-Event", event.event_type.as_str())
+                        .header("X-Webhook-Event", event_type)
                         .header("X-Webhook-Delivery", &delivery_record.id.to_string())
                         .header("X-Webhook-Timestamp", &timestamp);
 
@@ -407,8 +428,9 @@ impl WebhookService {
             };
 
         // Update delivery record with result
+        let delivery_id = delivery_record.id;
         let mut delivery_update: temps_entities::webhook_deliveries::ActiveModel =
-            delivery_record.clone().into();
+            delivery_record.into();
         delivery_update.status_code = Set(status_code.map(|s| s as i32));
         // SECURITY: response_body field removed - do not store response data
         delivery_update.error_message = Set(error_message.clone());
@@ -416,28 +438,31 @@ impl WebhookService {
         delivery_update.delivered_at = Set(Some(Utc::now()));
 
         if let Err(e) = delivery_update.update(self.db.as_ref()).await {
-            error!("Failed to update delivery record: {}", e);
+            error!(
+                "Failed to update webhook delivery {} (webhook {}): {}",
+                delivery_id, webhook.id, e
+            );
         }
 
         if success {
             info!(
-                "Webhook {} delivered successfully to {}",
-                webhook.id, webhook.url
+                "Webhook {} delivered successfully to {} (delivery {}, attempt {})",
+                webhook.id, webhook.url, delivery_id, attempt_number
             );
         } else {
             warn!(
-                "Webhook {} delivery failed to {}: {:?}",
-                webhook.id, webhook.url, error_message
+                "Webhook {} delivery {} (attempt {}) failed to {}: {:?}",
+                webhook.id, delivery_id, attempt_number, webhook.url, error_message
             );
         }
 
         WebhookDeliveryResult {
             webhook_id: webhook.id,
-            delivery_id: delivery_record.id,
+            delivery_id,
             success,
             status_code,
             error_message,
-            attempt_number: 1,
+            attempt_number,
             delivered_at: Utc::now(),
         }
     }
@@ -574,18 +599,24 @@ impl WebhookService {
             .load_retry_scope(project_id, webhook_id, delivery_id)
             .await?;
 
-        // Parse the original event from the stored payload
+        // The stored payload is replayed byte-for-byte, so the receiver gets the
+        // same body (and event id) as the failed attempt. Parsing it validates
+        // it and yields the event type for the `X-Webhook-Event` header.
         let event: WebhookEvent = serde_json::from_str(&delivery.payload)?;
 
-        // Deliver again with incremented attempt number
-        let result = self.deliver_webhook(&webhook, &event).await;
-
-        // Update attempt number
+        // A retry is another attempt at the SAME delivery: keep its record (and
+        // therefore its `X-Webhook-Delivery` id) and count the attempt on it.
+        // Recording it before sending means the history is right even if the
+        // send outcome cannot be written back.
+        let next_attempt = delivery.attempt_number.saturating_add(1);
+        let payload = delivery.payload.clone();
         let mut delivery_update: temps_entities::webhook_deliveries::ActiveModel = delivery.into();
-        delivery_update.attempt_number = Set(result.attempt_number + 1);
-        let _ = delivery_update.update(self.db.as_ref()).await;
+        delivery_update.attempt_number = Set(next_attempt);
+        let delivery = delivery_update.update(self.db.as_ref()).await?;
 
-        Ok(result)
+        Ok(self
+            .send_delivery(&webhook, event.event_type.as_str(), payload, delivery)
+            .await)
     }
 
     /// Decrypt webhook secret for display (masked)
@@ -737,6 +768,119 @@ mod tests {
         assert!(log[1].statements()[0]
             .sql
             .contains(r#""webhook_deliveries"."webhook_id" = $2"#));
+    }
+
+    /// One-shot HTTP receiver on a loopback port. Replies `200` to every
+    /// request and reports the lower-cased `x-webhook-delivery` and
+    /// `x-webhook-event` header values it saw.
+    async fn spawn_receiver() -> (
+        String,
+        tokio::sync::mpsc::UnboundedReceiver<(Option<String>, Option<String>)>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/hook", listener.local_addr().unwrap());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buffer = vec![0u8; 8192];
+                let mut read = 0;
+                // Read until the end of the header block; the body is ignored.
+                while !buffer[..read].windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buffer[read..]).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => read += n,
+                    }
+                }
+                let head = String::from_utf8_lossy(&buffer[..read]).to_lowercase();
+                let header = |name: &str| {
+                    head.lines()
+                        .find_map(|line| line.strip_prefix(name))
+                        .map(|value| value.trim().to_string())
+                };
+                let _ = tx.send((header("x-webhook-delivery:"), header("x-webhook-event:")));
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+        (url, rx)
+    }
+
+    /// A manual retry is a second attempt at the SAME delivery: the failed
+    /// delivery's record is reused (no new row, same `X-Webhook-Delivery`),
+    /// its attempt number goes from 1 to 2, and the result reports attempt 2.
+    /// Before the fix the retry inserted a brand-new delivery (attempt 1, new
+    /// id) and rewrote the failed delivery's attempt count instead.
+    #[tokio::test]
+    async fn retry_reuses_the_failed_delivery_and_counts_the_attempt_on_it() {
+        let (url, mut received) = spawn_receiver().await;
+
+        let mut target = webhook(10, 1);
+        target.url = url;
+        let event = WebhookEvent::new(
+            WebhookEventType::DeploymentSucceeded,
+            Some(1),
+            crate::events::WebhookPayload::Project(crate::events::ProjectPayload {
+                project_id: 1,
+                project_name: "demo".to_string(),
+                slug: "demo".to_string(),
+                repo_url: None,
+            }),
+        );
+        let mut failed = delivery(20, 10);
+        failed.payload = serde_json::to_string(&event).unwrap();
+        failed.event_id = event.id.clone();
+        let mut after_attempt_bump = failed.clone();
+        after_attempt_bump.attempt_number = 2;
+        let mut after_send = after_attempt_bump.clone();
+        after_send.success = true;
+        after_send.status_code = Some(200);
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![target]])
+                .append_query_results(vec![vec![failed]])
+                .append_query_results(vec![vec![after_attempt_bump]])
+                .append_query_results(vec![vec![after_send]])
+                .into_connection(),
+        );
+        let service = service_with_db(db.clone());
+
+        let result = service.retry_delivery(1, 10, 20).await.unwrap();
+
+        assert!(result.success);
+        assert_eq!(result.status_code, Some(200));
+        assert_eq!(
+            result.delivery_id, 20,
+            "the retry must keep the delivery id"
+        );
+        assert_eq!(result.attempt_number, 2);
+
+        let (delivery_header, event_header) = received.recv().await.unwrap();
+        assert_eq!(delivery_header.as_deref(), Some("20"));
+        assert_eq!(event_header.as_deref(), Some("deployment.succeeded"));
+
+        drop(service);
+        let log = Arc::try_unwrap(db).unwrap().into_transaction_log();
+        let statements: Vec<String> = log
+            .iter()
+            .flat_map(|transaction| transaction.statements().iter().map(|s| s.sql.clone()))
+            .collect();
+        assert!(
+            statements.iter().all(|sql| !sql.starts_with("INSERT")),
+            "a retry must not record a new delivery: {statements:?}"
+        );
+        let updates: Vec<&String> = statements
+            .iter()
+            .filter(|sql| sql.starts_with("UPDATE"))
+            .collect();
+        assert_eq!(updates.len(), 2, "attempt bump + outcome: {statements:?}");
+        assert!(updates[0].contains("\"attempt_number\""));
     }
 
     #[tokio::test]

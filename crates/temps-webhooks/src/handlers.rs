@@ -763,6 +763,7 @@ async fn retry_delivery(
             }
 
             Ok(Json(serde_json::json!({
+                "delivery_id": result.delivery_id,
                 "success": result.success,
                 "status_code": result.status_code,
                 "error_message": result.error_message,
