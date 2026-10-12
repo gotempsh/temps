@@ -86,6 +86,7 @@ impl AuditOperation for WebhookAudit {
             CreateWebhookRequestBody,
             UpdateWebhookRequestBody,
             WebhookDeliveryResponse,
+            RetryDeliveryResponse,
             EventTypeResponse,
         )
     ),
@@ -104,6 +105,22 @@ pub struct WebhooksApiDoc;
 // ============================================================================
 // Request/Response Types
 // ============================================================================
+
+/// Outcome of a manual delivery retry. The retry is another attempt of the
+/// same delivery, so `delivery_id` is the id that was retried.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RetryDeliveryResponse {
+    /// The delivery that was retried (unchanged by the retry).
+    pub delivery_id: i32,
+    /// Whether the receiver answered 2xx on this attempt.
+    pub success: bool,
+    /// HTTP status the receiver answered with, when it answered.
+    pub status_code: Option<u16>,
+    /// Why the attempt failed, when it did.
+    pub error_message: Option<String>,
+    /// Attempts made on this delivery, including this one.
+    pub attempt_number: i32,
+}
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct WebhookResponse {
@@ -715,7 +732,7 @@ async fn get_delivery(
     post,
     path = "/projects/{project_id}/webhooks/{webhook_id}/deliveries/{delivery_id}/retry",
     responses(
-        (status = 200, description = "Delivery retried", body = WebhookDeliveryResponse),
+        (status = 200, description = "Delivery retried", body = RetryDeliveryResponse),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Delivery not found"),
@@ -762,13 +779,13 @@ async fn retry_delivery(
                 error!("Failed to create audit log: {}", e);
             }
 
-            Ok(Json(serde_json::json!({
-                "delivery_id": result.delivery_id,
-                "success": result.success,
-                "status_code": result.status_code,
-                "error_message": result.error_message,
-                "attempt_number": result.attempt_number,
-            })))
+            Ok(Json(RetryDeliveryResponse {
+                delivery_id: result.delivery_id,
+                success: result.success,
+                status_code: result.status_code,
+                error_message: result.error_message,
+                attempt_number: result.attempt_number,
+            }))
         }
         Err(e @ crate::service::WebhookError::DeliveryNotInScope { .. }) => {
             Err(retry_delivery_problem(e))
