@@ -196,7 +196,7 @@ fn example_docker_image() -> &'static str {
 use super::port_util::{find_available_port, find_available_port_async, is_port_conflict_error};
 
 pub struct RedisService {
-    name: String,
+    name: std::sync::RwLock<String>,
     config: Arc<RwLock<Option<RedisConfig>>>,
     /// Resource limits captured at init time, applied to recreate paths
     /// (start, upgrade) so the container keeps the same constraints.
@@ -207,11 +207,34 @@ pub struct RedisService {
 impl RedisService {
     pub fn new(name: String, docker: Arc<Docker>) -> Self {
         Self {
-            name,
+            name: std::sync::RwLock::new(name),
             config: Arc::new(RwLock::new(None)),
             resource_limits: Arc::new(RwLock::new(ServiceResourceLimits::default())),
             docker,
         }
+    }
+
+    /// The instance name this engine currently works under: the service name
+    /// its container (`{prefix}-{name}`) and volumes are derived from.
+    pub fn instance_name(&self) -> String {
+        self.name
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Point this engine at a different instance name.
+    ///
+    /// Only meaningful before the service is created: the managed KV and Blob
+    /// plugins build their engine once at startup, and the operator may pick
+    /// another container name (while the service does not exist) before
+    /// enabling it. Renaming an engine whose container exists would make it
+    /// lose track of that container.
+    pub fn set_instance_name(&self, name: String) {
+        *self
+            .name
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = name;
     }
 
     /// Create a fresh Redis connection
@@ -274,7 +297,7 @@ impl RedisService {
     /// callers reasoning about the container should ask rather than re-derive
     /// `redis-{name}` themselves. See `externalsvc::naming`.
     pub fn get_container_name(&self) -> String {
-        redis_container_name(&self.name)
+        redis_container_name(&self.instance_name())
     }
 
     /// The container this service actually runs in: the imported container's
@@ -474,11 +497,12 @@ impl RedisService {
         }
 
         let service_label_key = format!("{}service_type", temps_core::DOCKER_LABEL_PREFIX);
+        let instance_name = self.instance_name();
         let name_label_key = format!("{}service_name", temps_core::DOCKER_LABEL_PREFIX);
 
         let container_labels = HashMap::from([
             (service_label_key.as_str(), "redis"),
-            (name_label_key.as_str(), self.name.as_str()),
+            (name_label_key.as_str(), instance_name.as_str()),
         ]);
 
         let env_vars = [format!("REDIS_PASSWORD={}", password)];
@@ -496,7 +520,7 @@ impl RedisService {
             redis_cmd.push(password.to_string());
         }
 
-        let volume_name = format!("redis_data_{}", self.name);
+        let volume_name = format!("redis_data_{}", self.instance_name());
         let mut host_config = bollard::models::HostConfig {
             port_bindings: Some(crate::utils::local_port_binding("6379/tcp", &config.port)),
             mounts: Some(vec![bollard::models::Mount {
@@ -2031,7 +2055,7 @@ impl RedisService {
                 s3_location: Set("".to_string()),
                 metadata: Set(serde_json::json!({
                     "service_type": "redis",
-                    "service_name": self.name,
+                    "service_name": self.instance_name(),
                     "backup_tool": "bgsave",
                 })),
                 compression_type: Set("none".to_string()),
@@ -2231,8 +2255,8 @@ pub(crate) fn redis_volume_names(name: &str) -> [String; 1] {
 impl ExternalService for RedisService {
     fn docker_resource_names(&self) -> Option<super::DockerResourceNames> {
         Some(super::DockerResourceNames {
-            containers: vec![redis_container_name(&self.name)],
-            volumes: redis_volume_names(&self.name).to_vec(),
+            containers: vec![redis_container_name(&self.instance_name())],
+            volumes: redis_volume_names(&self.instance_name()).to_vec(),
         })
     }
 
@@ -2300,7 +2324,7 @@ impl ExternalService for RedisService {
         } else {
             info!(
                 "Redis service '{}' is imported from container '{}'; skipping container creation",
-                self.name,
+                self.instance_name(),
                 self.get_live_container_name(&redis_config)
             );
         }
@@ -2427,7 +2451,7 @@ impl ExternalService for RedisService {
     }
 
     fn get_name(&self) -> String {
-        self.name.clone()
+        self.instance_name()
     }
 
     fn get_connection_info(&self) -> Result<String> {
@@ -2634,9 +2658,12 @@ impl ExternalService for RedisService {
 
         // Then remove container and volume if Docker is available
         let container_name = self.get_container_name();
-        let [volume_name] = redis_volume_names(&self.name);
+        let [volume_name] = redis_volume_names(&self.instance_name());
 
-        info!("Removing Redis container and volume for {}", self.name);
+        info!(
+            "Removing Redis container and volume for {}",
+            self.instance_name()
+        );
 
         // Remove container if it exists
         let containers = self
@@ -2776,7 +2803,7 @@ impl ExternalService for RedisService {
 
         let metadata = serde_json::json!({
             "service_type": "redis",
-            "service_name": self.name,
+            "service_name": self.instance_name(),
             "backup_tool": "wal-g",
         });
 

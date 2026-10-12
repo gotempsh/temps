@@ -491,6 +491,11 @@ pub fn setup_proxy_server(
         retention_resolver.clone(),
     );
 
+    // One counter set shared by the batch writer (log write retries/drops) and
+    // the load balancer (request counters), so the metrics sampler persists
+    // both from a single snapshot.
+    let proxy_metrics = Arc::new(crate::metrics::ProxyMetrics::default());
+
     // Create batch writer for proxy logs and tracking events (bounded channels + background tasks)
     let (proxy_log_handle, tracking_handle, proxy_log_writer) =
         crate::service::proxy_log_batch_writer::ProxyLogBatchWriter::new(
@@ -498,6 +503,7 @@ pub fn setup_proxy_server(
             ip_service.clone(),
             proxy_log_storage,
         );
+    let proxy_log_writer = proxy_log_writer.with_metrics(proxy_metrics.clone());
 
     // Spawn the batch writer background task
     std::thread::spawn(move || {
@@ -594,6 +600,7 @@ pub fn setup_proxy_server(
         proxy_config.disable_https_redirect,
     )
     .with_trust_loopback_forwarded_ip(trust_loopback_forwarded_ip)
+    .with_proxy_metrics(proxy_metrics.clone())
     .with_request_policy_gate(request_policy_gate);
     if let Some(gate) = admin_gate {
         lb = lb.with_admin_gate(gate);
@@ -888,6 +895,11 @@ pub fn create_proxy_service(
         retention_resolver.clone(),
     );
 
+    // One counter set shared by the batch writer (log write retries/drops) and
+    // the load balancer (request counters), so the metrics sampler persists
+    // both from a single snapshot.
+    let proxy_metrics = Arc::new(crate::metrics::ProxyMetrics::default());
+
     // Create batch writer for proxy logs and tracking events (bounded channels + background tasks)
     let (proxy_log_handle, tracking_handle, proxy_log_writer) =
         crate::service::proxy_log_batch_writer::ProxyLogBatchWriter::new(
@@ -895,6 +907,7 @@ pub fn create_proxy_service(
             ip_service.clone(),
             proxy_log_storage,
         );
+    let proxy_log_writer = proxy_log_writer.with_metrics(proxy_metrics.clone());
 
     // Spawn the batch writer background task
     std::thread::spawn(move || {
@@ -943,7 +956,8 @@ pub fn create_proxy_service(
         cert_host_cache,
         proxy_config.disable_https_redirect,
     )
-    .with_trust_loopback_forwarded_ip(trust_loopback_forwarded_ip);
+    .with_trust_loopback_forwarded_ip(trust_loopback_forwarded_ip)
+    .with_proxy_metrics(proxy_metrics);
 
     Ok(lb)
 }

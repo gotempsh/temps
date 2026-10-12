@@ -18,6 +18,7 @@ use temps_core::AuditLogger;
 use temps_providers::externalsvc::{
     managed_instance_name, ExternalService, RedisService, ServiceType,
 };
+use temps_providers::managed_names::{ManagedServiceKind, ManagedServiceNames};
 use tracing::{debug, info, warn};
 use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
@@ -25,9 +26,6 @@ use utoipa::OpenApi as OpenApiTrait;
 use crate::handlers::{configure_routes, KvApiDoc, KvAppState};
 use crate::services::KvService;
 use temps_providers::ExternalServiceManager;
-
-/// Default name for the KV Redis service
-const KV_REDIS_SERVICE_NAME: &str = "temps-kv";
 
 /// KV Plugin for key-value storage operations
 ///
@@ -86,6 +84,32 @@ impl TempsPlugin for KvPlugin {
                 }
             };
 
+            // What this instance calls its KV service: the one that already
+            // exists, else the operator's `kv.container_name`, else a name
+            // derived from this instance (#1446). Two Temps instances on one
+            // Docker daemon would otherwise fight over `redis-temps-kv`.
+            //
+            // A failed lookup must not stop the server booting. Fall back to
+            // the name existing installs use: enabling the service re-resolves
+            // the name, so the fallback can at worst surface as a 409 there.
+            let managed_names = ManagedServiceNames::new(
+                context.require_service::<sea_orm::DatabaseConnection>(),
+                context.require_service::<temps_config::ConfigService>(),
+                context.require_service::<temps_core::EncryptionService>(),
+            );
+            let service_name = match managed_names.resolve(ManagedServiceKind::Kv).await {
+                Ok(resolved) => resolved.service_name,
+                Err(e) => {
+                    warn!(
+                        "Could not resolve the KV container name ({}); using '{}' until the \
+                         service is enabled",
+                        e,
+                        ManagedServiceKind::Kv.legacy_service_name()
+                    );
+                    ManagedServiceKind::Kv.legacy_service_name().to_string()
+                }
+            };
+
             // Create RedisService from temps-providers for container management
             // This gives us version tracking, upgrades, and backup support.
             //
@@ -96,7 +120,7 @@ impl TempsPlugin for KvPlugin {
             // today — deriving the name here anyway keeps that an accident
             // that can't turn into #495 if the type is ever corrected.
             let redis_service = Arc::new(RedisService::new(
-                managed_instance_name(KV_REDIS_SERVICE_NAME, ServiceType::Kv),
+                managed_instance_name(&service_name, ServiceType::Kv),
                 docker,
             ));
 
@@ -126,10 +150,13 @@ impl TempsPlugin for KvPlugin {
             // just surfaced sooner.
             let redis_service = context.require_service::<RedisService>();
             let external_service_manager = context.require_service::<ExternalServiceManager>();
+            // The name resolved when the engine was built, i.e. this
+            // instance's KV service if it exists.
+            let service_name = redis_service.instance_name();
 
             tokio::spawn(async move {
                 match external_service_manager
-                    .get_service_by_name(KV_REDIS_SERVICE_NAME)
+                    .get_service_by_name(&service_name)
                     .await
                 {
                     Ok(service_model) => {
@@ -137,14 +164,14 @@ impl TempsPlugin for KvPlugin {
                             info!(
                                 "KV service '{}' is stopped, skipping initialization. \
                                  Enable the service via the API to use it.",
-                                KV_REDIS_SERVICE_NAME
+                                service_name
                             );
                             return;
                         }
 
                         info!(
                             "Found KV service '{}' in database (id: {}, status: {}), loading configuration...",
-                            KV_REDIS_SERVICE_NAME, service_model.id, service_model.status
+                            service_name, service_model.id, service_model.status
                         );
 
                         // Same contract as the blob plugin: go through the
@@ -159,7 +186,7 @@ impl TempsPlugin for KvPlugin {
                             Ok(()) => {
                                 info!(
                                     "KV Redis service '{}' initialized successfully from database config",
-                                    KV_REDIS_SERVICE_NAME
+                                    service_name
                                 );
                                 if let Err(e) = redis_service.start().await {
                                     warn!(
@@ -181,7 +208,7 @@ impl TempsPlugin for KvPlugin {
                         debug!(
                             "KV service '{}' not found in database. \
                              It will be created when first accessed via the API.",
-                            KV_REDIS_SERVICE_NAME
+                            service_name
                         );
                     }
                 }
@@ -197,6 +224,11 @@ impl TempsPlugin for KvPlugin {
         let redis_service = context.require_service::<RedisService>();
         let external_service_manager = context.require_service::<ExternalServiceManager>();
         let audit_service = context.require_service::<dyn AuditLogger>();
+        let managed_names = Arc::new(ManagedServiceNames::new(
+            context.require_service::<sea_orm::DatabaseConnection>(),
+            context.require_service::<temps_config::ConfigService>(),
+            context.require_service::<temps_core::EncryptionService>(),
+        ));
         // Optional team-based access checker (present only when a plugin
         // registers one); confines data-plane access to reachable projects.
         let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
@@ -206,6 +238,7 @@ impl TempsPlugin for KvPlugin {
             kv_service,
             redis_service,
             external_service_manager,
+            managed_names,
             audit_service,
             project_access_checker,
         });

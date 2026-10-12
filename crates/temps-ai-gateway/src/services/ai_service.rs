@@ -961,85 +961,122 @@ impl AiService for GatewayAiService {
                 reason: e.to_string(),
             })?;
 
-        // Parse the OpenAI-format SSE byte stream into interleaved text + tool-call
-        // deltas. Tool calls arrive incrementally: the first delta for a given
-        // `index` carries `id` + `function.name`, and later deltas append
-        // `function.arguments` fragments. We accumulate per-index and emit a
-        // fully-assembled `ToolCall` once the stream finishes (`finish_reason:
-        // tool_calls`, or `[DONE]`/end). `data:` lines can split across byte
-        // chunks, so buffer to line boundaries.
-        let delta_stream = async_stream::stream! {
-            let mut byte_stream = byte_stream;
-            let mut buf = String::new();
-            // (id, name, arguments-so-far) accumulated per tool-call `index`.
-            let mut pending: Vec<(String, String, String)> = Vec::new();
+        Ok(chat_turn_delta_stream(byte_stream, purpose))
+    }
+}
 
-            while let Some(item) = byte_stream.next().await {
-                match item {
-                    Ok(bytes) => {
-                        buf.push_str(&String::from_utf8_lossy(&bytes));
-                        while let Some(nl) = buf.find('\n') {
-                            let line: String = buf.drain(..=nl).collect();
-                            let line = line.trim();
-                            let Some(data) = line.strip_prefix("data:") else { continue };
-                            let data = data.trim();
-                            if data == "[DONE]" {
-                                // Flush any accumulated tool calls and finish.
-                                for tc in assemble_tool_calls(&mut pending) {
-                                    yield Ok(ChatStreamDelta::ToolCall(tc));
-                                }
-                                return;
-                            }
-                            let chunk = match serde_json::from_str::<ChatCompletionChunk>(data) {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "chat_stream_turn: unparsed SSE data ({e}): {}",
-                                        data.chars().take(300).collect::<String>()
-                                    );
-                                    continue;
-                                }
-                            };
-                            let Some(choice) = chunk.choices.first() else { continue };
-                            // Text delta -> stream immediately.
-                            if let Some(content) = choice.delta.content.as_ref() {
-                                if !content.is_empty() {
-                                    yield Ok(ChatStreamDelta::Text(content.clone()));
-                                }
-                            }
-                            // Tool-call deltas -> accumulate by index.
-                            if let Some(tcs) = choice.delta.tool_calls.as_ref() {
-                                accumulate_tool_call_deltas(&mut pending, tcs);
-                            }
-                            // Some providers signal completion via finish_reason
-                            // without a trailing [DONE]; flush there too.
-                            if choice
-                                .finish_reason
-                                .as_deref()
-                                .is_some_and(|r| r == "tool_calls")
-                            {
-                                for tc in assemble_tool_calls(&mut pending) {
-                                    yield Ok(ChatStreamDelta::ToolCall(tc));
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        yield Err(AiError::Provider {
-                            purpose: purpose.clone(),
-                            reason: e.to_string(),
-                        });
-                        return;
+/// Parse the gateway's OpenAI-format SSE byte stream into interleaved text +
+/// tool-call deltas.
+///
+/// Tool calls arrive incrementally: the first delta for a given `index` carries
+/// `id` + `function.name`, and later deltas append `function.arguments`
+/// fragments. They are accumulated per index and emitted fully assembled once
+/// the provider says the reply is finished. `data:` lines can split across byte
+/// chunks, so input is buffered to line boundaries.
+///
+/// A reply is finished only when the provider says so: a `[DONE]` line or a
+/// chunk carrying a `finish_reason`. A stream that ends any other way -- the
+/// connection closes early, a transport error or the client timeout hits
+/// mid-reply -- yields [`AiError::StreamInterrupted`] after whatever text was
+/// already delivered. Treating that end of stream as success is how a truncated
+/// answer used to be persisted as a completed turn, and flushing the tool calls
+/// accumulated so far would execute calls whose arguments were cut off.
+fn chat_turn_delta_stream<S>(byte_stream: S, purpose: String) -> ChatTurnStream
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, crate::error::AiGatewayError>>
+        + Send
+        + 'static,
+{
+    Box::pin(async_stream::stream! {
+        let mut byte_stream = Box::pin(byte_stream);
+        let mut buf = String::new();
+        // (id, name, arguments-so-far) accumulated per tool-call `index`.
+        let mut pending: Vec<(String, String, String)> = Vec::new();
+        // Did the provider say the reply is finished (`finish_reason`)?
+        let mut finished = false;
+        let mut at_eof = false;
+
+        loop {
+            if at_eof {
+                break;
+            }
+            match byte_stream.next().await {
+                Some(Ok(bytes)) => buf.push_str(&String::from_utf8_lossy(&bytes)),
+                Some(Err(e)) => {
+                    yield Err(AiError::StreamInterrupted {
+                        purpose: purpose.clone(),
+                        reason: format!("the connection failed mid-reply: {e}"),
+                    });
+                    return;
+                }
+                None => {
+                    at_eof = true;
+                    // A final line without its newline is still a line.
+                    if !buf.trim().is_empty() {
+                        buf.push('\n');
                     }
                 }
             }
-            // Stream ended without an explicit terminator — flush any remainder.
-            for tc in assemble_tool_calls(&mut pending) {
-                yield Ok(ChatStreamDelta::ToolCall(tc));
+            while let Some(nl) = buf.find('\n') {
+                let line: String = buf.drain(..=nl).collect();
+                let line = line.trim();
+                let Some(data) = line.strip_prefix("data:") else { continue };
+                let data = data.trim();
+                if data == "[DONE]" {
+                    // Flush any accumulated tool calls and finish.
+                    for tc in assemble_tool_calls(&mut pending) {
+                        yield Ok(ChatStreamDelta::ToolCall(tc));
+                    }
+                    return;
+                }
+                let chunk = match serde_json::from_str::<ChatCompletionChunk>(data) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(
+                            "chat_stream_turn: unparsed SSE data ({e}): {}",
+                            data.chars().take(300).collect::<String>()
+                        );
+                        continue;
+                    }
+                };
+                let Some(choice) = chunk.choices.first() else { continue };
+                // Text delta -> stream immediately.
+                if let Some(content) = choice.delta.content.as_ref() {
+                    if !content.is_empty() {
+                        yield Ok(ChatStreamDelta::Text(content.clone()));
+                    }
+                }
+                // Tool-call deltas -> accumulate by index.
+                if let Some(tcs) = choice.delta.tool_calls.as_ref() {
+                    accumulate_tool_call_deltas(&mut pending, tcs);
+                }
+                // Some providers signal completion via finish_reason without a
+                // trailing [DONE]; that is a complete reply too.
+                if let Some(reason) = choice.finish_reason.as_deref() {
+                    finished = true;
+                    if reason == "tool_calls" {
+                        for tc in assemble_tool_calls(&mut pending) {
+                            yield Ok(ChatStreamDelta::ToolCall(tc));
+                        }
+                    }
+                }
             }
-        };
-        Ok(Box::pin(delta_stream))
-    }
+        }
+
+        if !finished {
+            yield Err(AiError::StreamInterrupted {
+                purpose: purpose.clone(),
+                reason: "the provider closed the stream before sending a final chunk \
+                         (no finish_reason and no [DONE])"
+                    .to_string(),
+            });
+            return;
+        }
+        // The provider finished but never sent [DONE]: flush any remainder.
+        for tc in assemble_tool_calls(&mut pending) {
+            yield Ok(ChatStreamDelta::ToolCall(tc));
+        }
+    })
 }
 
 #[cfg(test)]
@@ -1633,5 +1670,238 @@ mod tests {
             Some("temps-cloud".to_string()),
         );
         drop(temp); // keep tempdir alive past the assertion
+    }
+
+    // ── chat_turn_delta_stream: terminal-chunk contract ──────────────────────
+
+    fn sse_chunk(delta: serde_json::Value, finish_reason: Option<&str>) -> String {
+        format!(
+            "data: {}\n\n",
+            serde_json::json!({
+                "id": "c1",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": "test-model",
+                "choices": [{ "index": 0, "delta": delta, "finish_reason": finish_reason }],
+            })
+        )
+    }
+
+    fn bytes_ok(text: impl Into<String>) -> Result<bytes::Bytes, crate::error::AiGatewayError> {
+        Ok(bytes::Bytes::from(text.into()))
+    }
+
+    async fn collect_turn(
+        items: Vec<Result<bytes::Bytes, crate::error::AiGatewayError>>,
+    ) -> Vec<Result<ChatStreamDelta, AiError>> {
+        chat_turn_delta_stream(futures_util::stream::iter(items), "chat.test.tools".into())
+            .collect()
+            .await
+    }
+
+    fn texts(items: &[Result<ChatStreamDelta, AiError>]) -> Vec<String> {
+        items
+            .iter()
+            .filter_map(|item| match item {
+                Ok(ChatStreamDelta::Text(text)) => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn stream_with_finish_reason_and_done_completes_cleanly() {
+        let items = collect_turn(vec![
+            bytes_ok(sse_chunk(serde_json::json!({"content": "Hello, "}), None)),
+            bytes_ok(sse_chunk(
+                serde_json::json!({"content": "world"}),
+                Some("stop"),
+            )),
+            bytes_ok("data: [DONE]\n\n"),
+        ])
+        .await;
+
+        assert!(items.iter().all(Result::is_ok), "{items:?}");
+        assert_eq!(texts(&items), vec!["Hello, ", "world"]);
+    }
+
+    #[tokio::test]
+    async fn stream_with_done_only_completes_cleanly() {
+        let items = collect_turn(vec![
+            bytes_ok(sse_chunk(serde_json::json!({"content": "ok"}), None)),
+            bytes_ok("data: [DONE]\n\n"),
+        ])
+        .await;
+
+        assert!(items.iter().all(Result::is_ok), "{items:?}");
+        assert_eq!(texts(&items), vec!["ok"]);
+    }
+
+    #[tokio::test]
+    async fn stream_with_finish_reason_but_no_done_completes_cleanly() {
+        let items = collect_turn(vec![bytes_ok(sse_chunk(
+            serde_json::json!({"content": "done"}),
+            Some("stop"),
+        ))])
+        .await;
+
+        assert!(items.iter().all(Result::is_ok), "{items:?}");
+        assert_eq!(texts(&items), vec!["done"]);
+    }
+
+    #[tokio::test]
+    async fn done_without_trailing_newline_still_terminates_the_stream() {
+        let items = collect_turn(vec![
+            bytes_ok(sse_chunk(serde_json::json!({"content": "tail"}), None)),
+            bytes_ok("data: [DONE]"),
+        ])
+        .await;
+
+        assert!(items.iter().all(Result::is_ok), "{items:?}");
+    }
+
+    #[tokio::test]
+    async fn lines_split_across_byte_chunks_are_reassembled() {
+        let whole = sse_chunk(serde_json::json!({"content": "split"}), Some("stop"));
+        let (left, right) = whole.split_at(whole.len() / 2);
+        let items = collect_turn(vec![
+            bytes_ok(left.to_string()),
+            bytes_ok(right.to_string()),
+            bytes_ok("data: [DONE]\n\n"),
+        ])
+        .await;
+
+        assert!(items.iter().all(Result::is_ok), "{items:?}");
+        assert_eq!(texts(&items), vec!["split"]);
+    }
+
+    #[tokio::test]
+    async fn eof_without_a_terminal_chunk_is_an_interruption_after_the_partial_text() {
+        let items = collect_turn(vec![bytes_ok(sse_chunk(
+            serde_json::json!({"content": "Once upon a"}),
+            None,
+        ))])
+        .await;
+
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert_eq!(
+            texts(&items),
+            vec!["Once upon a"],
+            "partial text is delivered first"
+        );
+        match &items[1] {
+            Err(AiError::StreamInterrupted { purpose, reason }) => {
+                assert_eq!(purpose, "chat.test.tools");
+                assert!(
+                    reason.contains("no finish_reason and no [DONE]"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected StreamInterrupted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_stream_is_an_interruption() {
+        let items = collect_turn(vec![]).await;
+
+        assert!(
+            matches!(items.as_slice(), [Err(AiError::StreamInterrupted { .. })]),
+            "{items:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_error_mid_reply_is_an_interruption_naming_the_cause() {
+        let items = collect_turn(vec![
+            bytes_ok(sse_chunk(serde_json::json!({"content": "partial"}), None)),
+            Err(crate::error::AiGatewayError::StreamError {
+                model: "test-model".into(),
+                reason: "connection reset by peer".into(),
+            }),
+            // Anything after the error must never be read.
+            bytes_ok("data: [DONE]\n\n"),
+        ])
+        .await;
+
+        assert_eq!(texts(&items), vec!["partial"]);
+        match items.last() {
+            Some(Err(AiError::StreamInterrupted { reason, .. })) => {
+                assert!(reason.contains("connection reset by peer"), "{reason}");
+            }
+            other => panic!("expected StreamInterrupted, got {other:?}"),
+        }
+        assert_eq!(items.len(), 2, "{items:?}");
+    }
+
+    #[tokio::test]
+    async fn client_timeout_mid_reply_is_an_interruption() {
+        let items = collect_turn(vec![
+            bytes_ok(sse_chunk(serde_json::json!({"content": "slow"}), None)),
+            Err(crate::error::AiGatewayError::StreamError {
+                model: "test-model".into(),
+                reason: "operation timed out".into(),
+            }),
+        ])
+        .await;
+
+        assert_eq!(texts(&items), vec!["slow"]);
+        assert!(
+            matches!(
+                items.last(),
+                Some(Err(AiError::StreamInterrupted { reason, .. })) if reason.contains("timed out")
+            ),
+            "{items:?}"
+        );
+    }
+
+    fn tool_call_delta(arguments: &str) -> serde_json::Value {
+        serde_json::json!({"tool_calls": [{
+            "index": 0,
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "temps", "arguments": arguments},
+        }]})
+    }
+
+    #[tokio::test]
+    async fn complete_tool_call_is_emitted_when_the_provider_finishes() {
+        let items = collect_turn(vec![
+            bytes_ok(sse_chunk(tool_call_delta("{\"command\":\"--help\"}"), None)),
+            bytes_ok(sse_chunk(serde_json::json!({}), Some("tool_calls"))),
+            bytes_ok("data: [DONE]\n\n"),
+        ])
+        .await;
+
+        assert!(items.iter().all(Result::is_ok), "{items:?}");
+        assert!(
+            items.iter().any(|item| matches!(
+                item,
+                Ok(ChatStreamDelta::ToolCall(call)) if call.name == "temps"
+            )),
+            "{items:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn truncated_tool_call_is_never_emitted_for_execution() {
+        // The connection drops while the arguments are still streaming. The
+        // half-assembled call must not be handed to the executor.
+        let items = collect_turn(vec![bytes_ok(sse_chunk(
+            tool_call_delta("{\"command\":\"proj"),
+            None,
+        ))])
+        .await;
+
+        assert!(
+            !items
+                .iter()
+                .any(|item| matches!(item, Ok(ChatStreamDelta::ToolCall(_)))),
+            "{items:?}"
+        );
+        assert!(
+            matches!(items.last(), Some(Err(AiError::StreamInterrupted { .. }))),
+            "{items:?}"
+        );
     }
 }

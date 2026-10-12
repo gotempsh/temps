@@ -76,6 +76,54 @@ const INSERT_COLUMNS: [&str; 35] = [
     "created_date",
 ];
 
+/// Foreign-key parents a row of `proxy_logs` pins with `FOR KEY SHARE` while
+/// the INSERT runs, in the order they are compared: project, environment,
+/// deployment, then the per-visitor rows. `None` sorts first, consistently.
+type ParentKey = (
+    Option<i32>,
+    Option<i32>,
+    Option<i32>,
+    Option<i32>,
+    Option<i32>,
+    Option<i32>,
+);
+
+fn parent_key(entry: &CreateProxyLogRequest) -> ParentKey {
+    (
+        entry.project_id,
+        entry.environment_id,
+        entry.deployment_id,
+        entry.session_id,
+        entry.visitor_id,
+        entry.ip_geolocation_id,
+    )
+}
+
+/// Indices of `entries` in the order their rows must be inserted.
+///
+/// Each inserted row makes Postgres run one `SELECT 1 FROM <parent> WHERE id =
+/// $n FOR KEY SHARE` per foreign key (`projects`, `environments`,
+/// `deployments`, ...), in row order, and hold every lock until the statement
+/// ends. A batch in request-arrival order therefore pins parents in an
+/// arbitrary, per-batch order. Any transaction that takes a stronger lock on
+/// two of those rows in a different order (an environment or project edit,
+/// say) can then close a lock cycle with the batch: Postgres aborts the
+/// batch with `40P01 deadlock detected` and the whole batch was lost
+/// (issue #1425).
+///
+/// Sorting by parent id makes every batch -- from this process, another
+/// proxy node, or the next flush -- acquire parents in the same ascending
+/// order, which removes the batch-ordering half of the cycle. The sort is
+/// stable, so rows that share all parents keep their arrival order. The
+/// remaining half, an unrelated transaction taking its own locks in the
+/// opposite order, cannot be fixed from here and is covered by the bounded
+/// retry in `ProxyLogBatchWriter`.
+pub(crate) fn fk_lock_order(entries: &[CreateProxyLogRequest]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..entries.len()).collect();
+    order.sort_by_key(|&index| parent_key(&entries[index]));
+    order
+}
+
 /// TimescaleDB-backed proxy log storage.
 ///
 /// Holds the same primitives the prior code used (`db` + `ip_service`) and an
@@ -97,9 +145,22 @@ impl TimescaleDbProxyLogStore {
     }
 
     /// Multi-row batch INSERT, identical to the original
-    /// `ProxyLogBatchWriter::batch_insert`. Entries are expected to be already
-    /// enriched by the caller.
+    /// `ProxyLogBatchWriter::batch_insert` except that rows are inserted in
+    /// [`fk_lock_order`] rather than arrival order. Entries are expected to be
+    /// already enriched by the caller.
     async fn batch_insert(&self, entries: &[CreateProxyLogRequest]) -> Result<(), sea_orm::DbErr> {
+        self.insert_in_order(entries, fk_lock_order(entries)).await
+    }
+
+    /// Insert `entries` as one statement, rows in the order given by `order`
+    /// (indices into `entries`). One statement means one implicit transaction:
+    /// the batch lands whole or not at all, which is what makes re-running it
+    /// after a deadlock safe.
+    pub(crate) async fn insert_in_order(
+        &self,
+        entries: &[CreateProxyLogRequest],
+        order: Vec<usize>,
+    ) -> Result<(), sea_orm::DbErr> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -114,7 +175,7 @@ impl TimescaleDbProxyLogStore {
         let mut params: Vec<sea_orm::Value> = Vec::with_capacity(entries.len() * cols_per_row);
         let now = chrono::Utc::now();
 
-        for (i, entry) in entries.iter().enumerate() {
+        for (i, entry) in order.into_iter().map(|index| &entries[index]).enumerate() {
             if i > 0 {
                 sql.push_str(", ");
             }
@@ -184,9 +245,9 @@ impl TimescaleDbProxyLogStore {
 impl ProxyLogStorage for TimescaleDbProxyLogStore {
     async fn write_batch(
         &self,
-        entries: Vec<CreateProxyLogRequest>,
+        entries: &[CreateProxyLogRequest],
     ) -> Result<(), ProxyLogServiceError> {
-        self.batch_insert(&entries).await?;
+        self.batch_insert(entries).await?;
         Ok(())
     }
 
@@ -751,6 +812,115 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    fn entry_with_parents(
+        request_id: &str,
+        project_id: Option<i32>,
+        environment_id: Option<i32>,
+        deployment_id: Option<i32>,
+    ) -> CreateProxyLogRequest {
+        CreateProxyLogRequest {
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            query_string: None,
+            host: "app.example.test".to_string(),
+            status_code: 200,
+            response_time_ms: Some(1),
+            request_source: "proxy".to_string(),
+            is_system_request: false,
+            routing_status: "routed".to_string(),
+            project_id,
+            environment_id,
+            deployment_id,
+            session_id: None,
+            visitor_id: None,
+            visitor_uuid: None,
+            session_uuid: None,
+            container_id: None,
+            upstream_host: None,
+            error_message: None,
+            client_ip: None,
+            user_agent: None,
+            referrer: None,
+            request_id: request_id.to_string(),
+            ip_geolocation_id: None,
+            browser: None,
+            browser_version: None,
+            operating_system: None,
+            device_type: None,
+            is_bot: None,
+            bot_name: None,
+            request_size_bytes: None,
+            response_size_bytes: None,
+            cache_status: None,
+            request_headers: None,
+            response_headers: None,
+            trace_id: None,
+            error_group_id: None,
+        }
+    }
+
+    fn ordered_request_ids(entries: &[CreateProxyLogRequest]) -> Vec<&str> {
+        fk_lock_order(entries)
+            .into_iter()
+            .map(|index| entries[index].request_id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn fk_lock_order_sorts_by_project_then_environment_then_deployment() {
+        let entries = vec![
+            entry_with_parents("e2-d9", Some(1), Some(2), Some(9)),
+            entry_with_parents("p2", Some(2), Some(1), Some(1)),
+            entry_with_parents("e1-d5", Some(1), Some(1), Some(5)),
+            entry_with_parents("e2-d3", Some(1), Some(2), Some(3)),
+        ];
+        assert_eq!(
+            ordered_request_ids(&entries),
+            vec!["e1-d5", "e2-d3", "e2-d9", "p2"]
+        );
+    }
+
+    #[test]
+    fn fk_lock_order_is_independent_of_arrival_order() {
+        // Two batches holding the same rows in opposite arrival order must lock
+        // the parents in the same sequence; that is the whole point.
+        let forward = vec![
+            entry_with_parents("a", Some(1), Some(1), Some(1)),
+            entry_with_parents("b", Some(1), Some(2), Some(2)),
+            entry_with_parents("c", Some(2), Some(3), Some(3)),
+        ];
+        let reversed: Vec<CreateProxyLogRequest> = forward.iter().rev().cloned().collect();
+        assert_eq!(
+            ordered_request_ids(&forward),
+            ordered_request_ids(&reversed)
+        );
+    }
+
+    #[test]
+    fn fk_lock_order_puts_unrouted_rows_first_and_keeps_arrival_order_on_ties() {
+        let entries = vec![
+            entry_with_parents("routed", Some(4), Some(4), Some(4)),
+            entry_with_parents("unrouted-1", None, None, None),
+            entry_with_parents("project-only", Some(4), None, None),
+            entry_with_parents("unrouted-2", None, None, None),
+        ];
+        assert_eq!(
+            ordered_request_ids(&entries),
+            vec!["unrouted-1", "unrouted-2", "project-only", "routed"]
+        );
+    }
+
+    #[test]
+    fn fk_lock_order_covers_every_row_exactly_once() {
+        let entries: Vec<CreateProxyLogRequest> = (0..50)
+            .map(|i| entry_with_parents(&format!("r{i}"), Some(i % 3), Some(i % 7), Some(i % 5)))
+            .collect();
+        let mut order = fk_lock_order(&entries);
+        order.sort_unstable();
+        assert_eq!(order, (0..entries.len()).collect::<Vec<_>>());
+        assert!(fk_lock_order(&[]).is_empty());
+    }
+
     #[test]
     fn test_insert_columns_are_35() {
         // Regression guard: the prior batch_insert wrote exactly these 35
@@ -890,7 +1060,7 @@ mod tests {
             session_uuid: None,
         };
         store
-            .write_batch(vec![
+            .write_batch(&[
                 make_entry(
                     "traffic-fast",
                     "/api/users",

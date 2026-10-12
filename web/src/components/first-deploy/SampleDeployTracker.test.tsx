@@ -40,7 +40,10 @@ function deployment(
   } as DeploymentResponse
 }
 
-function render(lastDeployment: DeploymentResponse): string {
+function render(
+  lastDeployment: DeploymentResponse | null,
+  answers = 1
+): string {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
@@ -48,10 +51,14 @@ function render(lastDeployment: DeploymentResponse): string {
     getProjectBySlugQueryKey({ path: { slug: project.slug } }),
     project
   )
-  client.setQueryData(
-    getLastDeploymentQueryKey({ path: { id: project.id } }),
-    lastDeployment
-  )
+  // Each stored answer counts as one poll of the "wait for a first deployment"
+  // budget, like a refetch would.
+  for (let i = 0; i < answers; i++) {
+    client.setQueryData(
+      getLastDeploymentQueryKey({ path: { id: project.id } }),
+      { deployment: lastDeployment }
+    )
+  }
   const markup = renderToStaticMarkup(
     <QueryClientProvider client={client}>
       <MemoryRouter>
@@ -64,6 +71,18 @@ function render(lastDeployment: DeploymentResponse): string {
 }
 
 describe('SampleDeployTracker', () => {
+  test('keeps waiting while a just-started deployment is not visible yet', () => {
+    const markup = render(null)
+    expect(markup).not.toContain('No deployment has started yet')
+    expect(markup).not.toContain('Deploy the sample image')
+  })
+
+  test('explains an empty project once the bounded wait is over', () => {
+    const markup = render(null, 5)
+    expect(markup).toContain('No deployment has started yet')
+    expect(markup).toContain('Deploy the sample image')
+  })
+
   test('shows a stopped deployment with a retry instead of indefinite progress', () => {
     const markup = render(deployment({ status: 'stopped' }))
     expect(markup).toContain('Stopped')

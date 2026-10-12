@@ -258,7 +258,7 @@ async function stepGitDockerfile(
   // the deployment a new user waits on, so it is the one timed here.
   const deployment = await t.phase('initial deployment is queued', () =>
     pollUntil(
-      async () => (await getLastDeployment({ client: ctx.client, path: { id: project.id } })).data ?? null,
+      async () => (await getLastDeployment({ client: ctx.client, path: { id: project.id } })).data?.deployment ?? null,
       (d) => d !== null,
       { timeoutMs: 60_000, intervalMs: 1000, label: `initial deployment of git project ${project.id}` },
     ),

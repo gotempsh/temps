@@ -12,6 +12,7 @@ import { FeatureMaturityBadge } from '@/components/feature-maturity/FeatureMatur
 import { OperationsTray } from '@/components/operations/OperationsTray'
 import { ProjectAvatar } from '@/components/project/ProjectAvatar'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { selectLastDeployment } from '@/lib/empty-state-selectors'
 import { featureKeyForPath } from '@/lib/feature-maturity'
 import { useConsoleExtensions } from '@temps-sdk/console-kit'
 import { useQuery } from '@tanstack/react-query'
@@ -48,6 +49,7 @@ function ProjectRowIcon({
 }) {
   const { data: lastDeployment } = useQuery({
     ...getLastDeploymentOptions({ path: { id: projectId } }),
+    select: selectLastDeployment,
     enabled: !!projectId,
   })
   const screenshot = lastDeployment?.screenshot_location

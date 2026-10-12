@@ -1819,20 +1819,36 @@ impl DeploymentService {
         Ok(deployment)
     }
 
+    /// Most recent deployment of a project, or `None` when the project exists
+    /// but has never been deployed (a normal state, not an error).
+    ///
+    /// A project that does not exist (or was soft-deleted) is a
+    /// [`DeploymentError::NotFound`] naming the project, so callers can tell
+    /// "nothing deployed yet" apart from "wrong project id".
     pub async fn get_last_deployment(
         &self,
         project_id: i32,
-    ) -> Result<Deployment, DeploymentError> {
-        let deployment_with_pipeline = deployments::Entity::find()
+    ) -> Result<Option<Deployment>, DeploymentError> {
+        let Some(deployment) = deployments::Entity::find()
             .filter(deployments::Column::ProjectId.eq(project_id))
             .order_by_desc(deployments::Column::CreatedAt)
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| {
-                DeploymentError::NotFound(format!("project {} not found", project_id))
-            })?;
-
-        let deployment = deployment_with_pipeline;
+        else {
+            let project_exists = projects::Entity::find_by_id(project_id)
+                .filter(projects::Column::IsDeleted.eq(false))
+                .one(self.db.as_ref())
+                .await?
+                .is_some();
+            return if project_exists {
+                Ok(None)
+            } else {
+                Err(DeploymentError::NotFound(format!(
+                    "project {} not found",
+                    project_id
+                )))
+            };
+        };
 
         // Check if this deployment is current for any environment
         let is_current = environments::Entity::find()
@@ -1850,9 +1866,10 @@ impl DeploymentService {
             .get(&deployment.environment_id)
             .cloned();
 
-        Ok(self
-            .map_db_deployment_to_deployment(deployment, is_current, environment)
-            .await)
+        Ok(Some(
+            self.map_db_deployment_to_deployment(deployment, is_current, environment)
+                .await,
+        ))
     }
 
     pub async fn get_deployment(
@@ -9498,6 +9515,54 @@ mod tests {
             .unwrap();
         assert_eq!(updated_deployment2.state, "stopped");
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_last_deployment_distinguishes_empty_project_from_missing_project(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping get_last_deployment integration test");
+            return Ok(());
+        }
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let service = create_deployment_service_for_test(db.clone());
+
+        // Project with a deployment -> Some(latest).
+        let (project, _environment, deployment) = setup_test_data(&db).await?;
+        let last = service
+            .get_last_deployment(project.id)
+            .await?
+            .expect("project with a deployment must return it");
+        assert_eq!(last.id, deployment.id);
+
+        // Project that exists but was never deployed -> Ok(None).
+        let empty_project = projects::ActiveModel {
+            name: Set("Never Deployed".to_string()),
+            slug: Set("never-deployed".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            repo_name: Set("test-repo-empty".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::NextJs),
+            directory: Set("/".to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        assert!(service
+            .get_last_deployment(empty_project.id)
+            .await?
+            .is_none());
+
+        // Unknown project -> NotFound naming the project.
+        let missing_id = empty_project.id + 10_000;
+        let result = service.get_last_deployment(missing_id).await;
+        assert!(matches!(
+            result,
+            Err(DeploymentError::NotFound(message))
+                if message == format!("project {missing_id} not found")
+        ));
         Ok(())
     }
 

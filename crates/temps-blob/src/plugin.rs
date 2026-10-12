@@ -15,6 +15,7 @@ use temps_providers::externalsvc::{
     legacy_managed_instance_names, managed_instance_name, ExternalService, RustfsService,
     ServiceType,
 };
+use temps_providers::managed_names::{ManagedServiceKind, ManagedServiceNames};
 use temps_providers::ExternalServiceManager;
 use tracing::{debug, info, warn};
 use utoipa::openapi::OpenApi;
@@ -137,8 +138,31 @@ impl TempsPlugin for BlobPlugin {
             // target the same container. When they disagreed, enabling Blob
             // and restarting produced two RustFS containers and deleting the
             // service removed the wrong one (#495).
+            //
+            // Which name: the service that already exists, else the operator's
+            // `blob.container_name`, else a name derived from this instance
+            // (#1446), so two Temps instances on one Docker daemon do not
+            // fight over `rustfs-temps-blob`. A failed lookup must not stop
+            // the server booting: fall back to the name existing installs use;
+            // enabling the service re-resolves it.
+            let managed_names = ManagedServiceNames::new(
+                context.require_service::<sea_orm::DatabaseConnection>(),
+                context.require_service::<temps_config::ConfigService>(),
+                encryption_service.clone(),
+            );
+            let service_name = match managed_names.resolve(ManagedServiceKind::Blob).await {
+                Ok(resolved) => resolved.service_name,
+                Err(e) => {
+                    warn!(
+                        "Could not resolve the Blob container name ({}); using '{}' until the \
+                         service is enabled",
+                        e, BLOB_RUSTFS_SERVICE_NAME
+                    );
+                    BLOB_RUSTFS_SERVICE_NAME.to_string()
+                }
+            };
             let rustfs_service = Arc::new(RustfsService::new(
-                managed_instance_name(BLOB_RUSTFS_SERVICE_NAME, ServiceType::Blob),
+                managed_instance_name(&service_name, ServiceType::Blob),
                 docker,
                 encryption_service,
             ));
@@ -178,6 +202,9 @@ impl TempsPlugin for BlobPlugin {
             let rustfs_service = context.require_service::<RustfsService>();
             let external_service_manager = context.require_service::<ExternalServiceManager>();
             let encryption_service = context.require_service::<temps_core::EncryptionService>();
+            // The name resolved when the engine was built, i.e. this
+            // instance's Blob service if it exists.
+            let service_name = rustfs_service.instance_name();
 
             tokio::spawn(async move {
                 // Cloned is safe: we checked is_available() above.
@@ -186,7 +213,7 @@ impl TempsPlugin for BlobPlugin {
                 }
 
                 match external_service_manager
-                    .get_service_by_name(BLOB_RUSTFS_SERVICE_NAME)
+                    .get_service_by_name(&service_name)
                     .await
                 {
                     Ok(service_model) => {
@@ -194,14 +221,14 @@ impl TempsPlugin for BlobPlugin {
                             info!(
                                 "Blob service '{}' is stopped, skipping initialization. \
                                  Enable the service via the API to use it.",
-                                BLOB_RUSTFS_SERVICE_NAME
+                                service_name
                             );
                             return;
                         }
 
                         info!(
                             "Found Blob service '{}' in database (id: {}, status: {}), loading configuration...",
-                            BLOB_RUSTFS_SERVICE_NAME, service_model.id, service_model.status
+                            service_name, service_model.id, service_model.status
                         );
 
                         // Goes through the manager rather than calling
@@ -218,7 +245,7 @@ impl TempsPlugin for BlobPlugin {
                             Ok(()) => {
                                 info!(
                                     "Blob RustFS service '{}' initialized successfully from database config",
-                                    BLOB_RUSTFS_SERVICE_NAME
+                                    service_name
                                 );
                                 if let Err(e) = rustfs_service.start().await {
                                     warn!(
@@ -240,7 +267,7 @@ impl TempsPlugin for BlobPlugin {
                         debug!(
                             "Blob service '{}' not found in database. \
                              It will be created when first accessed via the API.",
-                            BLOB_RUSTFS_SERVICE_NAME
+                            service_name
                         );
                     }
                 }
@@ -263,6 +290,11 @@ impl TempsPlugin for BlobPlugin {
         let rustfs_service = context.require_service::<RustfsService>();
         let external_service_manager = context.require_service::<ExternalServiceManager>();
         let audit_service = context.require_service::<dyn AuditLogger>();
+        let managed_names = Arc::new(ManagedServiceNames::new(
+            context.require_service::<sea_orm::DatabaseConnection>(),
+            context.require_service::<temps_config::ConfigService>(),
+            context.require_service::<temps_core::EncryptionService>(),
+        ));
         // Optional team-based access checker (present only when a plugin
         // registers one); confines data-plane access to reachable projects.
         let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
@@ -272,6 +304,7 @@ impl TempsPlugin for BlobPlugin {
             blob_service,
             rustfs_service,
             external_service_manager,
+            managed_names,
             audit_service,
             project_access_checker,
         });

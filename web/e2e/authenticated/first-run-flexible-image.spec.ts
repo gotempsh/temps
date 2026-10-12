@@ -119,7 +119,10 @@ test.describe('first run: Flexible project from a Docker image', () => {
             const res = await page.request.get(
               `/api/projects/${project.id}/last-deployment`
             )
-            last = res.ok() ? ((await res.json()) as Deployment) : undefined
+            last = res.ok()
+              ? (((await res.json()) as { deployment: Deployment | null })
+                  .deployment ?? undefined)
+              : undefined
             return last?.status ?? 'none'
           },
           {
@@ -162,10 +165,13 @@ test.describe('first run: Flexible project from a Docker image', () => {
         const deployment = await page.request.get(
           `/api/projects/${project.id}/last-deployment`
         )
-        if (deployment.ok()) {
-          const { id } = (await deployment.json()) as Deployment
+        const latest = deployment.ok()
+          ? ((await deployment.json()) as { deployment: Deployment | null })
+              .deployment
+          : null
+        if (latest) {
           await page.request.delete(
-            `/api/projects/${project.id}/deployments/${id}/teardown`
+            `/api/projects/${project.id}/deployments/${latest.id}/teardown`
           )
         }
         await page.request.delete(`/api/projects/${project.id}`)

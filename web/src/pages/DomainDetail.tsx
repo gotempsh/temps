@@ -67,8 +67,15 @@ import {
 } from '@/lib/date'
 import {
   STATUS_ACTIVE_RENEWAL_FAILED,
+  type FailedRetryAction,
+  failedRetryAction,
   isServingCert,
+  isTerminalOrderStatus,
 } from '@/lib/domain-status'
+import {
+  selectCustomDomainLookup,
+  selectDomainOrder,
+} from '@/lib/empty-state-selectors'
 import {
   useIsFetching,
   useInfiniteQuery,
@@ -137,8 +144,10 @@ export function DomainDetail() {
   const assignmentOptions = getVisibleCustomDomainByHostnameOptions({
     path: { hostname: domain?.domain || '' },
   })
+  // `null` once loaded means the hostname is not attached to any project.
   const assignmentQuery = useQuery({
     ...assignmentOptions,
+    select: selectCustomDomainLookup,
     enabled: !!domain?.domain,
     retry: false,
   })
@@ -240,10 +249,12 @@ export function DomainDetail() {
     // Only fetch an in-progress ACME order when the domain isn't already serving a
     // cert. "active_renewal_failed" is still serving, so treat it like "active".
     enabled: orderRequired,
+    // `null` once loaded means the domain has no ACME order (not an error).
+    select: selectDomainOrder,
     retry: false,
   })
 
-  const order = orderQuery.data
+  const order = orderQuery.data ?? undefined
 
   const { data: httpDebugInfo } = useQuery({
     ...getHttpChallengeDebugOptions({
@@ -284,14 +295,8 @@ export function DomainDetail() {
   } = usePlatformCapabilities()
   // Disabled queries retain their errors. Once a certificate is serving, an
   // earlier pending-order failure must not block renewal or show an obsolete alert.
-  const orderReadFailed =
-    orderRequired &&
-    orderQuery.isError &&
-    (!isVerifiedNotFound(orderQuery.error) || !!order)
-  const orderKnown =
-    !orderRequired ||
-    orderQuery.isSuccess ||
-    isVerifiedNotFound(orderQuery.error)
+  const orderReadFailed = orderRequired && orderQuery.isError
+  const orderKnown = !orderRequired || orderQuery.isSuccess
   const canManageCertificates =
     platformCanManageCertificates &&
     domainQuery.isSuccess &&
@@ -359,6 +364,12 @@ export function DomainDetail() {
   const finalizeOrder = useMutation({
     ...finalizeOrderMutation(),
     meta: { errorTitle: 'Failed to verify DNS challenge' },
+    // A failed verification changes server state (the domain moves to `failed`
+    // with the error, and the CA may invalidate the order). Refetch right away
+    // so the page does not keep showing `challenge_requested` until a reload.
+    onError: async () => {
+      await refreshAll()
+    },
     onSuccess: async () => {
       toast.success(
         'DNS challenge verified! TLS certificate provisioning in progress.'
@@ -545,15 +556,7 @@ export function DomainDetail() {
   // When the order is in any of these, no further action is possible on it — the user
   // must create a new order. Treat the order as "absent" for UI gating purposes so we
   // don't strand the user with hidden actions.
-  const TERMINAL_ORDER_STATUSES = [
-    'cancelled',
-    'canceled',
-    'invalid',
-    'revoked',
-    'deactivated',
-  ]
-  const isOrderTerminal =
-    !!order && TERMINAL_ORDER_STATUSES.includes(order.status)
+  const isOrderTerminal = !!order && isTerminalOrderStatus(order.status)
   const activeOrder = order && !isOrderTerminal ? order : undefined
 
   const challengeData = activeOrder?.authorizations as ChallengeData | undefined
@@ -978,9 +981,11 @@ export function DomainDetail() {
               <FailedPanel
                 domain={domain}
                 dnsTxtRecords={dnsTxtRecords}
+                retryAction={failedRetryAction(order)}
                 onRetry={handleCompleteDns}
+                onNewOrder={handleCreateOrder}
                 onCancel={handleCancelOrder}
-                retrying={finalizeOrder.isPending}
+                retrying={finalizeOrder.isPending || createOrder.isPending}
                 canManage={canManageCertificates}
                 keyPrefix="current-failed"
                 withHeader
@@ -2174,7 +2179,9 @@ function DnsKvRow({
 function FailedPanel({
   domain,
   dnsTxtRecords,
+  retryAction,
   onRetry,
+  onNewOrder,
   onCancel,
   retrying,
   canManage,
@@ -2183,7 +2190,10 @@ function FailedPanel({
 }: {
   domain: Domain
   dnsTxtRecords: { name: string; value: string }[]
+  /** `new-order` when the CA invalidated the challenge and it cannot be resubmitted. */
+  retryAction: FailedRetryAction
   onRetry: () => void
+  onNewOrder: () => void
   onCancel: () => void
   retrying: boolean
   canManage: boolean
@@ -2208,12 +2218,27 @@ function FailedPanel({
             'Certificate provisioning failed. Verify your DNS records and try again.'}
         </AlertDescription>
       </Alert>
+      {retryAction === 'new-order' && (
+        <p className="text-sm text-muted-foreground">
+          The certificate authority rejected this challenge and it cannot be
+          verified again. Start a new order to get fresh DNS records (or HTTP
+          token) to publish before verifying.
+        </p>
+      )}
       <div className="flex flex-wrap gap-2">
-        <Button onClick={onRetry} disabled={retrying || !canManage}>
+        <Button
+          onClick={retryAction === 'new-order' ? onNewOrder : onRetry}
+          disabled={retrying || !canManage}
+        >
           {retrying ? (
             <>
               <Loader2 className="mr-2 size-4 animate-spin" />
               Retrying…
+            </>
+          ) : retryAction === 'new-order' ? (
+            <>
+              <Shield className="mr-2 size-4" />
+              Start new order
             </>
           ) : (
             <>

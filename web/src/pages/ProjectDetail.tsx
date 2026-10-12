@@ -64,6 +64,7 @@ import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { resolveStableUrl } from '@/lib/deployment-url'
+import { selectLastDeployment } from '@/lib/empty-state-selectors'
 import { legacyDatabasesRedirectPath } from '@/lib/project-detail-routes'
 import { projectLoadState } from '@/lib/project-load-state'
 import {
@@ -168,9 +169,12 @@ export function ProjectDetail() {
           id: project?.id || 0,
         },
       }),
+      select: selectLastDeployment,
       enabled: !!project?.id && project.source_type !== 'external',
       refetchInterval: (query) => {
-        const data = query.state.data
+        // `state.data` is the raw response; the deployment is `null` until the
+        // first deploy.
+        const data = query.state.data?.deployment
         // Poll more frequently for active deployments
         if (
           data &&

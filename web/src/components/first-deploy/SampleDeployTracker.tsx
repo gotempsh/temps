@@ -15,6 +15,7 @@ import { CopyButton } from '@/components/ui/copy-button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { deploymentFailureSummary } from '@/lib/deployment-failure-summary'
 import { displayUrl, resolvePrimaryUrl } from '@/lib/deployment-url'
+import { selectLastDeployment } from '@/lib/empty-state-selectors'
 import {
   FIRST_DEPLOY_PATH,
   SAMPLE_APP,
@@ -65,21 +66,33 @@ export function SampleDeployTracker({
 
   const deploymentQuery = useQuery({
     ...getLastDeploymentOptions({ path: { id: project?.id ?? 0 } }),
+    select: selectLastDeployment,
     enabled: project != null,
     retry: false,
     refetchInterval: (query) => {
-      const deployment = query.state.data
+      const deployment = query.state.data?.deployment
       if (deployment) {
         return firstDeployPhase(deployment.status) === 'in_progress'
           ? POLL_INTERVAL_MS
           : false
       }
-      return query.state.errorUpdateCount < MAX_POLLS_WITHOUT_DEPLOYMENT
+      // `deployment: null` means "nothing deployed yet"; each such answer counts
+      // as one poll of the bounded wait.
+      return query.state.dataUpdateCount < MAX_POLLS_WITHOUT_DEPLOYMENT
         ? POLL_INTERVAL_MS
         : false
     },
   })
-  const deployment = deploymentQuery.data
+  const deployment = deploymentQuery.data ?? undefined
+  // `useQuery` does not expose the success counter, so read it from the cache.
+  // `dataUpdatedAt` is read first so a new answer re-renders this component
+  // even when the (still-null) selected data is structurally unchanged.
+  const emptyAnswers =
+    deploymentQuery.dataUpdatedAt > 0
+      ? (queryClient.getQueryState(
+          getLastDeploymentQueryKey({ path: { id: project?.id ?? 0 } })
+        )?.dataUpdateCount ?? 0)
+      : 0
   const phase = deployment ? firstDeployPhase(deployment.status) : undefined
 
   // The setup checklist reads "has anything gone live" from the project list;
@@ -142,8 +155,7 @@ export function SampleDeployTracker({
     // A deployment started a moment ago may not be visible on the first
     // read; keep waiting through the bounded polls before calling it absent.
     const stillWaiting =
-      !startError &&
-      deploymentQuery.errorUpdateCount < MAX_POLLS_WITHOUT_DEPLOYMENT
+      !startError && emptyAnswers < MAX_POLLS_WITHOUT_DEPLOYMENT
     if (deploymentQuery.isPending || stillWaiting) {
       return <TrackerSkeleton />
     }

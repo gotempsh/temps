@@ -113,6 +113,16 @@ impl From<SandboxError> for Problem {
                     .with_title("Sandbox Creation Failed")
                     .with_detail(error.to_string())
             }
+            SandboxError::ImageUnavailable { ref image, .. } => {
+                let detail = format!(
+                    "{error}. Check that this host can reach the image registry and that the \
+                     tag is published; an administrator can pre-load it with `docker pull {image}`."
+                );
+                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .with_type("https://temps.sh/probs/sandbox-image-unavailable")
+                    .with_title("Sandbox Image Unavailable")
+                    .with_detail(detail)
+            }
             SandboxError::ExecFailed { .. } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Sandbox Exec Failed")
@@ -2916,11 +2926,34 @@ mod tests {
                 },
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
+            (
+                SandboxError::ImageUnavailable {
+                    sandbox_id: "sbx_1".into(),
+                    image: "registry.example.test/team/img:1.0.0".into(),
+                    reason: "manifest unknown".into(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
         ];
         for (error, status) in cases {
             let label = error.to_string();
             assert_eq!(Problem::from(error).status_code, status, "{label}");
         }
+    }
+
+    #[test]
+    fn image_unavailable_problem_names_the_image_cause_and_remediation() {
+        let problem = Problem::from(SandboxError::ImageUnavailable {
+            sandbox_id: "sbx_1".into(),
+            image: "registry.example.test/team/img:1.0.0".into(),
+            reason: "manifest unknown".into(),
+        });
+        assert_eq!(problem.status_code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(problem.body["title"], "Sandbox Image Unavailable");
+        let detail = problem.body["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains("registry.example.test/team/img:1.0.0"));
+        assert!(detail.contains("manifest unknown"));
+        assert!(detail.contains("docker pull"));
     }
 
     #[test]

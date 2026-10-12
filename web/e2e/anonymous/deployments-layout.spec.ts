@@ -98,7 +98,8 @@ for (const width of [1920, 1024, 768, 640, 390, 320]) {
           deployment_config: {},
           preset: 'dockerfile',
         }
-      else if (path.endsWith('/last-deployment')) json = deployments[0]
+      else if (path.endsWith('/last-deployment'))
+        json = { deployment: deployments[0] }
       else if (path === '/api/projects/2/deployments')
         json = {
           deployments:

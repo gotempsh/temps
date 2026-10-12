@@ -1515,18 +1515,39 @@ async fn serve_original_console(req: Request) -> Response {
     serve_static_from(&WEBSITE, req)
 }
 
+/// Detail text for a request path that must never fall through to the SPA,
+/// or `None` when the console may serve it.
+///
+/// The returned text is a fixed literal (no request data), so it is safe to
+/// embed in the JSON body verbatim.
+fn unmatched_api_detail(path: &str) -> Option<&'static str> {
+    if path.starts_with("/api/") {
+        Some("No API route matched")
+    } else if path == "/ai/v1" || path.starts_with("/ai/v1/") {
+        Some(
+            "No API route matched. The AI gateway is served under /api/ai/v1, \
+             for example /api/ai/v1/chat/completions",
+        )
+    } else {
+        None
+    }
+}
+
 fn serve_static_from(site: &'static Dir<'static>, req: Request) -> Response {
     let raw_path = req.uri().path();
 
     // Never serve the SPA for /api/ paths — those should 404 if unmatched
-    // by any API router (including external plugin proxies).
-    if raw_path.starts_with("/api/") {
+    // by any API router (including external plugin proxies). The same goes for
+    // `/ai/v1/*`: the AI gateway lives under `/api/ai/v1`, and answering a
+    // client that dropped the `/api` prefix with the console HTML (200) makes
+    // every OpenAI SDK fail with an unparseable body instead of a pointer to
+    // the right URL.
+    if let Some(detail) = unmatched_api_detail(raw_path) {
+        let body = format!(r#"{{"status":404,"title":"Not Found","detail":"{detail}"}}"#);
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
             .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                r#"{"status":404,"title":"Not Found","detail":"No API route matched"}"#,
-            ))
+            .body(Body::from(body))
             .unwrap();
     }
 
@@ -6790,5 +6811,58 @@ mod log_storage_config_tests {
             }
             other => panic!("expected the S3 backend, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod spa_fallback_tests {
+    use super::*;
+
+    #[test]
+    fn api_paths_never_fall_through_to_the_spa() {
+        assert_eq!(
+            unmatched_api_detail("/api/does-not-exist"),
+            Some("No API route matched")
+        );
+    }
+
+    #[test]
+    fn ai_gateway_path_without_api_prefix_points_to_the_real_base_url() {
+        for path in ["/ai/v1", "/ai/v1/models", "/ai/v1/chat/completions"] {
+            let detail = unmatched_api_detail(path)
+                .unwrap_or_else(|| panic!("{path} must not be answered with the console HTML"));
+            assert!(
+                detail.contains("/api/ai/v1"),
+                "detail for {path} must name the correct base URL, got: {detail}"
+            );
+        }
+    }
+
+    #[test]
+    fn console_routes_are_still_served_by_the_spa() {
+        for path in ["/", "/ai", "/ai-first", "/ai/v1x", "/projects/1/ai/v1"] {
+            assert_eq!(
+                unmatched_api_detail(path),
+                None,
+                "{path} is a console route and must keep the SPA fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_answers_ai_gateway_prefix_with_a_json_404() {
+        let request = axum::http::Request::builder()
+            .uri("/ai/v1/models")
+            .body(Body::empty())
+            .expect("request builds");
+        let response = serve_static_from(&WEBSITE, request);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .map(|v| v.as_bytes()),
+            Some(b"application/json".as_slice())
+        );
     }
 }

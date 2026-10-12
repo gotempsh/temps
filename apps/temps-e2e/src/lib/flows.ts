@@ -151,8 +151,8 @@ export async function createE2eGitProject(
 /**
  * Trigger a real build+deploy pipeline for a project (the same action a git
  * push to the tracked branch would cause) and return the id of the
- * deployment it created. `GET /projects/{id}/last-deployment` 404s until a
- * deployment row exists, so this polls through that instead of assuming the
+ * deployment it created. `GET /projects/{id}/last-deployment` answers
+ * `deployment: null` until a deployment row exists, so this polls through that instead of assuming the
  * trigger call itself returns one -- `TriggerPipelineResponse` doesn't carry
  * a deployment id.
  */
@@ -176,7 +176,7 @@ export async function triggerPipelineAndGetDeploymentId(
   const baseline = await pollUntil(
     async () => {
       const res = await getLastDeployment({ client, path: { id: opts.projectId } })
-      return res.data ?? null
+      return res.data?.deployment ?? null
     },
     (d) => d !== null,
     { timeoutMs: 15_000, intervalMs: 1000, label: 'the auto-queued initial deployment to land' },
@@ -194,7 +194,7 @@ export async function triggerPipelineAndGetDeploymentId(
   const deployment = await pollUntil(
     async () => {
       const res = await getLastDeployment({ client, path: { id: opts.projectId } })
-      return res.data ?? null
+      return res.data?.deployment ?? null
     },
     (d) => d !== null && d.id > baselineId,
     { timeoutMs: 30_000, intervalMs: 2000, label: 'a NEW deployment row (id > baseline) to appear after trigger-pipeline' },

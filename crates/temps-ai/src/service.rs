@@ -179,6 +179,13 @@ pub enum AiError {
     /// The provider/gateway returned an error.
     #[error("AI provider error for '{purpose}': {reason}")]
     Provider { purpose: String, reason: String },
+    /// The provider's reply stream ended before the provider said it was
+    /// finished: the connection dropped, a transport error or timeout hit
+    /// mid-reply, or the body closed without a terminal chunk (`finish_reason`
+    /// or `[DONE]`). Text received so far is incomplete and must not be
+    /// treated as a finished answer.
+    #[error("AI provider stream for '{purpose}' ended before the reply was complete: {reason}")]
+    StreamInterrupted { purpose: String, reason: String },
     /// Retained runtime diagnostic after exact turn-secret redaction at source.
     #[error("retained AI harness error for '{purpose}': {reason}")]
     RetainedHarnessDiagnostic { purpose: String, reason: String },

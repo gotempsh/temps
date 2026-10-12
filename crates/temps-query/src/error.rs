@@ -67,6 +67,22 @@ pub enum DataError {
         entity: String,
     },
 
+    /// A container path nests deeper than the backend's hierarchy allows.
+    ///
+    /// This is a client error (the caller asked for the child containers of a
+    /// leaf container, e.g. the sub-containers of a PostgreSQL schema), not a
+    /// backend failure, so HTTP layers must map it to a 4xx.
+    #[error(
+        "{backend} containers nest at most {max_depth} level(s) deep, but container path \
+         '{path}' is {depth} level(s) deep; it has no child containers, list its entities instead"
+    )]
+    ContainerPathTooDeep {
+        backend: &'static str,
+        path: String,
+        depth: usize,
+        max_depth: usize,
+    },
+
     /// Permission denied
     #[error("Permission denied: {0}")]
     PermissionDenied(String),
@@ -103,6 +119,53 @@ impl DataError {
     /// Create a permission denied error
     pub fn permission_denied(msg: impl Into<String>) -> Self {
         DataError::PermissionDenied(msg.into())
+    }
+
+    /// Create a "container path too deep" error for `path` in `backend`'s
+    /// hierarchy. `max_depth` is the number of container levels the backend
+    /// has (PostgreSQL: 2, database/schema), so a path of that depth is a
+    /// leaf container and has no child containers.
+    pub fn container_path_too_deep(
+        backend: &'static str,
+        path: &crate::types::ContainerPath,
+        max_depth: usize,
+    ) -> Self {
+        DataError::ContainerPathTooDeep {
+            backend,
+            path: path.segments.join("/"),
+            depth: path.depth(),
+            max_depth,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ContainerPath;
+
+    #[test]
+    fn container_path_too_deep_reports_path_depth_and_limit() {
+        let error = DataError::container_path_too_deep(
+            "PostgreSQL",
+            &ContainerPath::from_slice(&["appdb", "pg_catalog"]),
+            2,
+        );
+
+        assert!(matches!(
+            error,
+            DataError::ContainerPathTooDeep {
+                backend: "PostgreSQL",
+                depth: 2,
+                max_depth: 2,
+                ..
+            }
+        ));
+        let message = error.to_string();
+        assert!(message.contains("PostgreSQL"), "{message}");
+        assert!(message.contains("'appdb/pg_catalog'"), "{message}");
+        assert!(message.contains("2 level(s) deep"), "{message}");
+        assert!(message.contains("at most 2 level(s)"), "{message}");
     }
 }
 
