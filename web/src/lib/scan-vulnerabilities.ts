@@ -45,6 +45,52 @@ export function findScanVulnerability(
   return vulnerabilities.find((vulnerability) => vulnerability.id === id)
 }
 
+/** The server caps a page of findings here; asking for more silently returns this many. */
+export const SCAN_VULNERABILITIES_PAGE_SIZE = 100
+
+/** Upper bound on pages walked, so a malformed `total` cannot loop forever. */
+const MAX_VULNERABILITY_PAGES = 200
+
+function envelopeTotal(response: unknown): number | undefined {
+  if (response && typeof response === 'object' && 'total' in response) {
+    const { total } = response as { total: unknown }
+    if (typeof total === 'number' && Number.isFinite(total)) return total
+  }
+  return undefined
+}
+
+/**
+ * Find one finding by walking a scan's pages until it turns up or the list
+ * ends. A scan can have far more findings than one page holds, so searching
+ * only the first page reports a real finding as "not found".
+ *
+ * `fetchPage` takes a 1-based page number and returns the raw envelope. A
+ * non-numeric `vulnId` resolves to `undefined` without fetching anything.
+ */
+export async function findVulnerabilityInPages({
+  vulnId,
+  fetchPage,
+  pageSize = SCAN_VULNERABILITIES_PAGE_SIZE,
+}: {
+  vulnId: string | undefined
+  fetchPage: (page: number) => Promise<unknown>
+  pageSize?: number
+}): Promise<VulnerabilityResponse | undefined> {
+  if (!vulnId || !/^\d+$/.test(vulnId)) return undefined
+  for (let page = 1; page <= MAX_VULNERABILITY_PAGES; page++) {
+    const response = await fetchPage(page)
+    const rows = scanVulnerabilities(response)
+    const found = findScanVulnerability(rows, vulnId)
+    if (found) return found
+    const total = envelopeTotal(response)
+    const reachedEnd =
+      rows.length < pageSize ||
+      (total !== undefined && page * pageSize >= total)
+    if (reachedEnd) return undefined
+  }
+  return undefined
+}
+
 /**
  * What the vulnerability detail page renders.
  *

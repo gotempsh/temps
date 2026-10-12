@@ -7,6 +7,7 @@ import {
   firstNumericError,
   formatNumericText,
   parseNumericText,
+  isEchoOfOwnEdit,
   shouldResyncNumericText,
   validateNumeric,
 } from './numeric-input'
@@ -140,5 +141,23 @@ describe('shouldResyncNumericText', () => {
     expect(shouldResyncNumericText('', 60)).toBe(true)
     expect(shouldResyncNumericText('', 60, true)).toBe(false)
     expect(shouldResyncNumericText('4', 60, true)).toBe(false)
+  })
+})
+
+describe('isEchoOfOwnEdit', () => {
+  test('any answer to an emptied field is the form falling back, not a reset', () => {
+    expect(isEchoOfOwnEdit(undefined, 60)).toBe(true)
+    expect(isEchoOfOwnEdit(undefined, undefined)).toBe(true)
+  })
+
+  test('the same number coming back is an echo', () => {
+    expect(isEchoOfOwnEdit(42, 42)).toBe(true)
+  })
+
+  // A parent that clamps (50 max) answers a typed 100 with 50: the field has
+  // to show 50, or it displays a value the app is not using.
+  test('a different number is the parent overriding the edit', () => {
+    expect(isEchoOfOwnEdit(100, 50)).toBe(false)
+    expect(isEchoOfOwnEdit(-5, undefined)).toBe(false)
   })
 })

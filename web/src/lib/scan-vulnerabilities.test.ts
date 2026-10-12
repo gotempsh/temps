@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
-import { expect, test } from 'bun:test'
+import { describe, expect, test } from 'bun:test'
 import {
   findScanVulnerability,
+  findVulnerabilityInPages,
   scanVulnerabilities,
   vulnerabilityDetailState,
 } from './scan-vulnerabilities'
@@ -115,4 +116,78 @@ test('a failed scan-context read does not hide a found vulnerability', () => {
   expect(
     vulnerabilityDetailState({ ...settled, scanError: serverProblem })
   ).toBe('ready')
+})
+
+describe('findVulnerabilityInPages', () => {
+  const makeRow = (id: number) => ({
+    ...row,
+    id,
+    vulnerability_id: `CVE-${id}`,
+  })
+  // A scan with 250 findings served 100 at a time, like the server does.
+  const all = Array.from({ length: 250 }, (_, i) => makeRow(i + 1))
+  const pagesRequested: number[] = []
+  const fetchPage = async (page: number) => {
+    pagesRequested.push(page)
+    return {
+      data: all.slice((page - 1) * 100, page * 100),
+      total: all.length,
+      page,
+      page_size: 100,
+    }
+  }
+
+  test('finds a finding that is not on the first page', async () => {
+    pagesRequested.length = 0
+    const found = await findVulnerabilityInPages({ vulnId: '230', fetchPage })
+    expect(found?.id).toBe(230)
+    expect(pagesRequested).toEqual([1, 2, 3])
+  })
+
+  test('stops at the first page when the finding is there', async () => {
+    pagesRequested.length = 0
+    const found = await findVulnerabilityInPages({ vulnId: '7', fetchPage })
+    expect(found?.id).toBe(7)
+    expect(pagesRequested).toEqual([1])
+  })
+
+  test('reports an absent id only after the last page', async () => {
+    pagesRequested.length = 0
+    const found = await findVulnerabilityInPages({ vulnId: '9999', fetchPage })
+    expect(found).toBeUndefined()
+    expect(pagesRequested).toEqual([1, 2, 3])
+  })
+
+  test('does not fetch for a malformed id', async () => {
+    pagesRequested.length = 0
+    for (const id of [undefined, '', 'abc', '1.5', '-1']) {
+      expect(await findVulnerabilityInPages({ vulnId: id, fetchPage })).toBe(
+        undefined
+      )
+    }
+    expect(pagesRequested).toEqual([])
+  })
+
+  test('an empty scan ends on the first page', async () => {
+    const calls: number[] = []
+    const found = await findVulnerabilityInPages({
+      vulnId: '1',
+      fetchPage: async (page) => {
+        calls.push(page)
+        return { data: [], total: 0, page, page_size: 100 }
+      },
+    })
+    expect(found).toBeUndefined()
+    expect(calls).toEqual([1])
+  })
+
+  test('a failing page is an error, not "not found"', async () => {
+    const failing = async (page: number) => {
+      if (page === 2) throw new Error('boom')
+      return { data: all.slice(0, 100), total: 250, page, page_size: 100 }
+    }
+    await expect(
+      findVulnerabilityInPages({ vulnId: '150', fetchPage: failing })
+    ).rejects.toThrow('boom')
+  })
 })

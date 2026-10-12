@@ -7,6 +7,7 @@ import { Input } from '@/components/ui/input'
 import {
   committedNumber,
   formatNumericText,
+  isEchoOfOwnEdit,
   shouldResyncNumericText,
   validateNumeric,
   type NumericRules,
@@ -52,18 +53,21 @@ const NumberInput = React.forwardRef<HTMLInputElement, NumberInputProps>(
   ) => {
     const [text, setText] = React.useState(() => formatNumericText(value))
     const [touched, setTouched] = React.useState(false)
-    // Set by our own onChange and cleared after the render it causes. A value
-    // that arrives in that render is the parent reacting to this edit, not an
-    // outside change: react-hook-form, for one, answers `undefined` with the
-    // field's `defaultValues` entry, which would put the default straight
-    // back into a field the user just emptied.
-    const ownEdit = React.useRef(false)
+    // What our own onChange just emitted, cleared after the render it causes.
+    // A value that arrives in that render is the parent reacting to this
+    // edit: react-hook-form, for one, answers `undefined` with the field's
+    // `defaultValues` entry, which would put the default straight back into a
+    // field the user just emptied. A *different number* is the parent
+    // overriding the edit (clamping it), which the field does follow.
+    const ownEdit = React.useRef<{ emitted: number | undefined } | null>(null)
 
     // Follow the value when it changes from outside (a form reset, data that
     // finished loading) without disturbing what is being typed: text that
     // already means the incoming value is left alone.
     React.useEffect(() => {
-      if (shouldResyncNumericText(text, value, ownEdit.current)) {
+      const edit = ownEdit.current
+      const isEcho = edit !== null && isEchoOfOwnEdit(edit.emitted, value)
+      if (shouldResyncNumericText(text, value, isEcho)) {
         setText(formatNumericText(value))
       }
       // `text` is intentionally not a dependency: only external changes sync.
@@ -71,7 +75,7 @@ const NumberInput = React.forwardRef<HTMLInputElement, NumberInputProps>(
     }, [value])
 
     React.useEffect(() => {
-      ownEdit.current = false
+      ownEdit.current = null
     })
 
     const message = validateNumeric(value, {
@@ -95,11 +99,13 @@ const NumberInput = React.forwardRef<HTMLInputElement, NumberInputProps>(
         aria-invalid={ariaInvalid ?? (showMessage ? true : undefined)}
         onChange={(event) => {
           const next = event.target.value
-          ownEdit.current = true
           setText(next)
           const committed = committedNumber(next)
           // Text that is not a number commits nothing.
-          if (committed !== null) onValueChange(committed)
+          if (committed !== null) {
+            ownEdit.current = { emitted: committed }
+            onValueChange(committed)
+          }
         }}
         onBlur={(event) => {
           setTouched(true)

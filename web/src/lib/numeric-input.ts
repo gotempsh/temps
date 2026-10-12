@@ -64,6 +64,26 @@ export function shouldResyncNumericText(
   return typed === null || typed !== (value ?? undefined)
 }
 
+/**
+ * Whether `value`, arriving right after this field emitted `emitted`, is the
+ * parent merely echoing the edit rather than overriding it.
+ *
+ * - After emptying the field (`emitted === undefined`) any value is an echo:
+ *   react-hook-form answers `undefined` with the field's `defaultValues`
+ *   entry, and following that would put the default back into a field the
+ *   user just emptied.
+ * - After a number was emitted, the same number is an echo. A different
+ *   number means the parent clamped or rejected the edit, and the field
+ *   should show what the parent decided.
+ */
+export function isEchoOfOwnEdit(
+  emitted: number | undefined,
+  value: number | null | undefined
+): boolean {
+  if (emitted === undefined) return true
+  return value === emitted
+}
+
 export interface NumericRules {
   min?: number
   max?: number
