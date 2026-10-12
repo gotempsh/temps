@@ -24,7 +24,8 @@ import { getProjectsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { useQuery } from '@tanstack/react-query'
 import { subDays } from 'date-fns'
 import { ArrowRight, RefreshCw } from 'lucide-react'
-import { Link, useSearchParams } from 'react-router'
+import { Link } from 'react-router'
+import { useBatchedSearchParams, useUrlTextInput } from '@temps-sdk/ds'
 import { SourceLogo } from '@/components/imports/SourceLogo'
 import {
   TOP_MIGRATION_SOURCES,
@@ -40,9 +41,39 @@ import {
 
 const SEARCH_CATALOG_LIMIT = 50
 
+/**
+ * The search box keeps what is being typed locally and writes it (with the
+ * page reset, as one update) to the URL after a short pause. Reading the text
+ * straight from the URL drops characters: the router applies location
+ * updates late and a controlled input snaps back to the last value it was
+ * given.
+ */
+function ProjectSearchToolbar({
+  value,
+  onCommit,
+  summary,
+}: {
+  value: string
+  onCommit: (value: string) => void
+  summary: string
+}) {
+  const input = useUrlTextInput({ value, onCommit })
+  return (
+    <ListToolbar
+      searchLabel="Filter projects by name or slug"
+      placeholder="Filter projects…"
+      value={input.value}
+      onChange={input.setValue}
+      summary={summary}
+    />
+  )
+}
+
 export function Projects() {
   const { setBreadcrumbs } = useBreadcrumbs()
-  const [searchParams, setSearchParams] = useSearchParams()
+  // Batched: the search term, its page reset and the page canonicalisation
+  // below are chained instead of overwriting each other.
+  const [searchParams, setSearchParams] = useBatchedSearchParams()
   const { page, pageSize } = readProjectPagination(searchParams)
   const projectSearch = searchParams.get('q') ?? ''
   const setProjectSearch = (value: string) => {
@@ -198,11 +229,9 @@ export function Projects() {
       {(projectsData?.total ?? 0) > 0 && <OnboardingNextStepCard />}
 
       {((projectsData?.total ?? 0) > 0 || Boolean(projectSearch)) && (
-        <ListToolbar
-          searchLabel="Filter projects by name or slug"
-          placeholder="Filter projects…"
+        <ProjectSearchToolbar
           value={projectSearch}
-          onChange={setProjectSearch}
+          onCommit={setProjectSearch}
           summary={
             !projectsData
               ? isError
@@ -242,6 +271,7 @@ export function Projects() {
 
       {isLoading || isPageOutOfRange ? (
         <div
+          role="status"
           className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3"
           aria-label="Loading projects"
           aria-busy="true"

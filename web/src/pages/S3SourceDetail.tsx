@@ -73,6 +73,7 @@ import {
   fmtDateTime,
   fmtRelativeTime,
   useUrlState,
+  useUrlTextInput,
   type DetailFact,
 } from '@temps-sdk/ds'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
@@ -303,8 +304,13 @@ export function S3SourceDetail() {
   >()
   const backupSearch = getBackupsUrlState('q') ?? ''
   const backupPage = Number(getBackupsUrlState('page') ?? '1') || 1
-  const setBackupSearch = (value: string) =>
-    patchBackupsUrlState({ q: value || undefined })
+  // The box keeps its own text and writes `q` + the page reset to the URL in
+  // one update, so fast typing never loses characters.
+  const backupSearchInput = useUrlTextInput({
+    value: backupSearch,
+    onCommit: (value) =>
+      patchBackupsUrlState({ q: value || undefined, page: undefined }),
+  })
   const setBackupPage = (value: number | ((current: number) => number)) => {
     const next = typeof value === 'function' ? value(backupPage) : value
     patchBackupsUrlState({ page: next > 1 ? next : undefined })
@@ -533,7 +539,7 @@ export function S3SourceDetail() {
                                     className={cn(
                                       'truncate text-base sm:text-sm',
                                       !schedule.enabled
-                                        ? 'text-muted-foreground/60'
+                                        ? 'text-muted-foreground'
                                         : 'text-muted-foreground'
                                     )}
                                     title={schedule.description}
@@ -693,11 +699,8 @@ export function S3SourceDetail() {
                   <Input
                     type="search"
                     placeholder="Search by service, engine, state, or UUID…"
-                    value={backupSearch}
-                    onChange={(e) => {
-                      setBackupSearch(e.target.value)
-                      setBackupPage(1)
-                    }}
+                    value={backupSearchInput.value}
+                    onChange={(e) => backupSearchInput.setValue(e.target.value)}
                     className="pl-9"
                   />
                 </div>

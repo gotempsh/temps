@@ -106,7 +106,7 @@ describe('semantic artifact renderers', () => {
       })
     )
 
-    expect(html).toContain('text-red-600')
+    expect(html).toContain('text-red-700')
     expect(html).not.toContain('stroke-success')
   })
 })

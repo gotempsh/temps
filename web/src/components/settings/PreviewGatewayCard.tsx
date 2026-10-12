@@ -53,9 +53,9 @@ import {
 } from './preview-gateway-status'
 
 const STATUS_TONE_CLASS: Record<GatewayStatusTone, string> = {
-  ok: 'text-green-500',
-  warning: 'text-amber-500',
-  error: 'text-red-500',
+  ok: 'text-green-700 dark:text-green-500',
+  warning: 'text-amber-700 dark:text-amber-500',
+  error: 'text-red-700 dark:text-red-500',
   muted: 'text-muted-foreground',
 }
 
@@ -386,7 +386,7 @@ export function PreviewGatewayCard() {
                 )}
                 <span>{statusSummary.label}</span>
                 {status.drift && (
-                  <span className="ml-2 inline-flex items-center gap-1 rounded bg-amber-500/10 px-2 py-0.5 text-xs text-amber-500">
+                  <span className="ml-2 inline-flex items-center gap-1 rounded bg-amber-500/10 px-2 py-0.5 text-xs text-amber-700 dark:text-amber-500">
                     <AlertTriangle className="h-3 w-3" />
                     Image drift
                   </span>
@@ -408,7 +408,7 @@ export function PreviewGatewayCard() {
                 </p>
               )}
               {status.restart_count != null && status.restart_count > 0 && (
-                <p className="text-xs text-amber-500">
+                <p className="text-xs text-amber-700 dark:text-amber-500">
                   Docker has restarted this container {status.restart_count}{' '}
                   time(s)
                 </p>
@@ -620,7 +620,10 @@ export function PreviewGatewayCard() {
                 Fetch last 200 lines
               </Button>
               {logs && logs.length > 0 && (
-                <pre className="bg-muted rounded p-2 text-xs overflow-x-auto max-h-80 font-mono whitespace-pre-wrap">
+                <pre
+                  tabIndex={0}
+                  className="bg-muted rounded p-2 text-xs overflow-x-auto max-h-80 font-mono whitespace-pre-wrap"
+                >
                   {logs.join('\n')}
                 </pre>
               )}

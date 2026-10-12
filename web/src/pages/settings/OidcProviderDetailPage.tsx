@@ -65,6 +65,7 @@ import {
 import { useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
+import { ScrollRegion } from '@/components/ui/scroll-region'
 
 /**
  * ADR-045 §4: tooltip shown on the disabled delete control for the provider
@@ -508,7 +509,7 @@ function UsersForProviderCard({
             </p>
           </div>
         ) : (
-          <div className="overflow-x-auto">
+          <ScrollRegion regionLabel="Users who signed in through this provider, scrollable">
             <table className="w-full min-w-[640px] text-sm">
               <thead>
                 <tr className="text-left text-xs uppercase text-muted-foreground">
@@ -557,7 +558,7 @@ function UsersForProviderCard({
                 ))}
               </tbody>
             </table>
-          </div>
+          </ScrollRegion>
         )}
       </CardContent>
     </Card>

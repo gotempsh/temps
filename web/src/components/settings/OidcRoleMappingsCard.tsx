@@ -17,6 +17,8 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
+import { NumberInput } from '@/components/ui/number-input'
+import { validateNumeric } from '@/lib/numeric-input'
 import {
   Select,
   SelectContent,
@@ -57,7 +59,9 @@ export function OidcRoleMappingsCard({
 
   const [draftGroup, setDraftGroup] = useState('')
   const [draftRole, setDraftRole] = useState<'admin' | 'user'>('user')
-  const [draftPriority, setDraftPriority] = useState(100)
+  // `undefined` while the field is empty: the rule then takes the suggested
+  // priority, shown as the placeholder.
+  const [draftPriority, setDraftPriority] = useState<number | undefined>(100)
 
   const suggestedPriority = useMemo(
     () => nextDefaultPriority(mappings),
@@ -103,11 +107,19 @@ export function OidcRoleMappingsCard({
   const handleAdd = () => {
     const idpGroup = draftGroup.trim()
     if (!idpGroup) return
+    const priorityError = validateNumeric(draftPriority, {
+      integer: true,
+      required: false,
+    })
+    if (priorityError) {
+      toast.error(`Priority: ${priorityError}`)
+      return
+    }
     createMapping.mutate({
       path: { provider_id: providerId },
       body: {
         idp_group: idpGroup,
-        priority: draftPriority || suggestedPriority,
+        priority: draftPriority ?? suggestedPriority,
         role: draftRole,
       },
     })
@@ -186,15 +198,12 @@ export function OidcRoleMappingsCard({
                 <label className="text-xs text-muted-foreground">
                   Priority
                 </label>
-                <Input
-                  type="number"
+                <NumberInput
                   className="w-24"
+                  integer
+                  placeholder={String(suggestedPriority)}
                   value={draftPriority}
-                  onChange={(event) =>
-                    setDraftPriority(
-                      Number.parseInt(event.target.value || '100', 10)
-                    )
-                  }
+                  onValueChange={setDraftPriority}
                 />
               </div>
               <div className="space-y-1">

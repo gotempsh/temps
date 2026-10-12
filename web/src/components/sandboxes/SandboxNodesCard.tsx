@@ -341,7 +341,7 @@ export function ControlPlaneExcludedWarning() {
 
 function SandboxNodesSkeleton() {
   return (
-    <div
+    <div role="status"
       className="space-y-4"
       aria-busy="true"
       aria-label="Loading sandbox nodes"

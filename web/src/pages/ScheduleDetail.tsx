@@ -961,7 +961,7 @@ export function ScheduleDetail() {
                   <p className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
                     Backups to delete
                   </p>
-                  <ul className="max-h-48 divide-y overflow-y-auto rounded-md border bg-background font-mono text-xs">
+                  <ul tabIndex={0} className="max-h-48 divide-y overflow-y-auto rounded-md border bg-background font-mono text-xs">
                     {cleanupReport.candidate_backup_ids.map((backupId) => (
                       <li key={backupId} className="break-all px-3 py-2">
                         {backupId}

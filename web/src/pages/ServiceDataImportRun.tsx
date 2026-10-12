@@ -301,7 +301,10 @@ function RunBody({
         </CardHeader>
         <CardContent>
           {run.helper_output ? (
-            <pre className="max-h-[480px] overflow-auto whitespace-pre-wrap rounded-md bg-muted p-4 font-mono text-xs">
+            <pre
+              tabIndex={0}
+              className="max-h-[480px] overflow-auto whitespace-pre-wrap rounded-md bg-muted p-4 font-mono text-xs"
+            >
               {run.helper_output}
             </pre>
           ) : (

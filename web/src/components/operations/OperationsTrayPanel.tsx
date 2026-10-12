@@ -372,7 +372,7 @@ export function OperationsTraySkeleton({
 }) {
   const indexes = Array.from({ length: rows }, (_, index) => index)
   return (
-    <div aria-busy="true" aria-label={label}>
+    <div role="status" aria-busy="true" aria-label={label}>
       {indexes.map((index) => (
         <div
           key={index}

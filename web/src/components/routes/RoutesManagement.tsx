@@ -45,6 +45,8 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import { NumberInput } from '@/components/ui/number-input'
+import { numberFieldProps } from '@/lib/numeric-input'
 import { ReadFailure } from '@/components/ui/read-failure'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation } from '@tanstack/react-query'
@@ -77,7 +79,7 @@ const editRouteSchema = z.object({
   domain: z.string().min(1, 'Domain is required'),
   host: z.string().min(1, 'Host is required'),
   port: z
-    .number()
+    .number({ message: 'Port is required' })
     .min(1, 'Port is required')
     .max(65535, 'Port must be at most 65535'),
 })
@@ -341,15 +343,12 @@ export function RoutesManagement({
                   <FormItem>
                     <FormLabel>Port</FormLabel>
                     <FormControl>
-                      <Input
-                        type="number"
+                      <NumberInput
+                        {...numberFieldProps(field)}
                         placeholder="8080"
                         min={1}
                         max={65535}
-                        value={field.value}
-                        onChange={(e) =>
-                          field.onChange(Number(e.target.value) || 0)
-                        }
+                        integer
                       />
                     </FormControl>
                     <FormMessage />

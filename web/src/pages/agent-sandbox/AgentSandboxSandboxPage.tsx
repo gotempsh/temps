@@ -26,6 +26,8 @@ import {
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { NumberInput } from '@/components/ui/number-input'
+import { firstNumericError } from '@/lib/numeric-input'
 import { Label } from '@/components/ui/label'
 import { useSettings, useUpdateSettings } from '@/hooks/useSettings'
 import { SandboxNodesCard } from '@/components/sandboxes/SandboxNodesCard'
@@ -101,6 +103,45 @@ const DEFAULT_WORKSPACE_FILE_LIMITS = {
   max_download_size_mb: 32,
 }
 
+type WorkspaceFileLimitKey = keyof typeof DEFAULT_WORKSPACE_FILE_LIMITS
+
+/** Editable workspace limits with the bounds the server accepts. */
+const WORKSPACE_FILE_LIMIT_FIELDS: ReadonlyArray<{
+  key: WorkspaceFileLimitKey
+  label: string
+  min: number
+  max: number
+}> = [
+  { key: 'max_files_per_upload', label: 'Files per upload', min: 1, max: 100 },
+  { key: 'max_file_size_mb', label: 'File size (MB)', min: 1, max: 32 },
+  { key: 'max_upload_size_mb', label: 'Upload batch (MB)', min: 1, max: 32 },
+  {
+    key: 'max_workspace_size_mb',
+    label: 'Workspace size (MB)',
+    min: 1,
+    max: 2048,
+  },
+  {
+    key: 'max_workspace_entries',
+    label: 'Workspace entries',
+    min: 1,
+    max: 50000,
+  },
+  { key: 'max_text_preview_kb', label: 'Text preview (KB)', min: 1, max: 1024 },
+  {
+    key: 'max_image_preview_size_mb',
+    label: 'Image preview (MB)',
+    min: 1,
+    max: 16,
+  },
+  {
+    key: 'max_download_size_mb',
+    label: 'Download size (MB)',
+    min: 1,
+    max: 32,
+  },
+]
+
 function getResourcePresetLabel(cpu: number, memory: number): string {
   const match = RESOURCE_PRESETS.find(
     (p) => p.cpu === cpu && p.memory === memory
@@ -115,16 +156,18 @@ export function AgentSandboxSandboxPage() {
 
   const [runtime, setRuntime] = useState('node')
   const [customImage, setCustomImage] = useState('')
-  const [cpuLimit, setCpuLimit] = useState(4)
-  const [memoryLimitMb, setMemoryLimitMb] = useState(8192)
+  // `undefined` while a limit's field is empty; saving rejects that rather
+  // than substituting a default or a bound.
+  const [cpuLimit, setCpuLimit] = useState<number | undefined>(4)
+  const [memoryLimitMb, setMemoryLimitMb] = useState<number | undefined>(8192)
   const [resourcePreset, setResourcePreset] = useState('Standard')
   const [globalConfigRepo, setGlobalConfigRepo] = useState('')
   const [globalConfigRepoBranch, setGlobalConfigRepoBranch] = useState('main')
   const [defaultProvider, setDefaultProvider] = useState('claude_cli')
   const [sandboxBackend, setSandboxBackend] = useState('docker')
-  const [workspaceFileLimits, setWorkspaceFileLimits] = useState(
-    DEFAULT_WORKSPACE_FILE_LIMITS
-  )
+  const [workspaceFileLimits, setWorkspaceFileLimits] = useState<
+    Record<WorkspaceFileLimitKey, number | undefined>
+  >(DEFAULT_WORKSPACE_FILE_LIMITS)
   const [isDirty, setIsDirty] = useState(false)
 
   const [rebuilding, setRebuilding] = useState(false)
@@ -232,6 +275,42 @@ export function AgentSandboxSandboxPage() {
   }
 
   const handleSave = async () => {
+    const limitError = firstNumericError([
+      ...(resourcePreset === 'Custom'
+        ? [
+            {
+              label: 'CPU cores',
+              value: cpuLimit,
+              rules: { min: 0.5, max: 16 },
+            },
+            {
+              label: 'Memory (MB)',
+              value: memoryLimitMb,
+              rules: { min: 256, max: 32768, integer: true },
+            },
+          ]
+        : []),
+      ...WORKSPACE_FILE_LIMIT_FIELDS.map((field) => ({
+        label: field.label,
+        value: workspaceFileLimits[field.key],
+        rules: { min: field.min, max: field.max, integer: true },
+      })),
+    ])
+    const fileLimits = WORKSPACE_FILE_LIMIT_FIELDS.reduce<
+      Partial<Record<WorkspaceFileLimitKey, number>>
+    >((limits, field) => {
+      const value = workspaceFileLimits[field.key]
+      return value === undefined ? limits : { ...limits, [field.key]: value }
+    }, {})
+    if (
+      limitError ||
+      cpuLimit === undefined ||
+      memoryLimitMb === undefined ||
+      Object.keys(fileLimits).length !== WORKSPACE_FILE_LIMIT_FIELDS.length
+    ) {
+      toast.error(limitError ?? 'Enter a number for every limit')
+      return
+    }
     try {
       // Per-provider credentials live on /agent-sandbox/providers/:id —
       // this mutation only touches platform-wide sandbox knobs. We pass
@@ -260,7 +339,10 @@ export function AgentSandboxSandboxPage() {
           config_repo: globalConfigRepo,
           config_repo_branch: globalConfigRepoBranch,
         },
-        ai_workspace_file_limits: workspaceFileLimits,
+        ai_workspace_file_limits: {
+          ...DEFAULT_WORKSPACE_FILE_LIMITS,
+          ...fileLimits,
+        },
       })
       setIsDirty(false)
       toast.success('Workflow sandbox settings saved')
@@ -344,7 +426,7 @@ export function AgentSandboxSandboxPage() {
                     </div>
                   )}
                   {sandboxStatus.error && (
-                    <p className="text-xs text-red-400 mt-1">
+                    <p className="text-xs text-red-700 dark:text-red-400 mt-1">
                       {sandboxStatus.error}
                     </p>
                   )}
@@ -364,7 +446,10 @@ export function AgentSandboxSandboxPage() {
                         {rebuilding ? 'Rebuilding...' : 'Rebuild Image'}
                       </Button>
                       {buildLog.length > 0 && (
-                        <div className="max-h-60 overflow-y-auto rounded border bg-black/80 p-3 font-mono text-xs text-green-400 space-y-0.5">
+                        <div
+                          tabIndex={0}
+                          className="max-h-60 overflow-y-auto rounded border bg-black/80 p-3 font-mono text-xs text-green-400 space-y-0.5"
+                        >
                           {buildLog.map((line, i) => (
                             <div key={i}>{line}</div>
                           ))}
@@ -404,39 +489,22 @@ export function AgentSandboxSandboxPage() {
             </CardDescription>
           </CardHeader>
           <CardContent className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-            {[
-              ['max_files_per_upload', 'Files per upload', 1, 100],
-              ['max_file_size_mb', 'File size (MB)', 1, 32],
-              ['max_upload_size_mb', 'Upload batch (MB)', 1, 32],
-              ['max_workspace_size_mb', 'Workspace size (MB)', 1, 2048],
-              ['max_workspace_entries', 'Workspace entries', 1, 50000],
-              ['max_text_preview_kb', 'Text preview (KB)', 1, 1024],
-              ['max_image_preview_size_mb', 'Image preview (MB)', 1, 16],
-              ['max_download_size_mb', 'Download size (MB)', 1, 32],
-            ].map(([key, label, min, max]) => (
+            {WORKSPACE_FILE_LIMIT_FIELDS.map(({ key, label, min, max }) => (
               <div className="space-y-2" key={key}>
                 <Label htmlFor={`workspace-limit-${key}`}>{label}</Label>
-                <Input
+                <NumberInput
                   id={`workspace-limit-${key}`}
+                  integer
                   max={max}
                   min={min}
-                  onChange={(event) => {
-                    const value = Number.parseInt(event.target.value, 10)
+                  onValueChange={(value) => {
                     setWorkspaceFileLimits((current) => ({
                       ...current,
-                      [key]: Number.isFinite(value)
-                        ? Math.min(
-                            max as number,
-                            Math.max(min as number, value)
-                          )
-                        : min,
+                      [key]: value,
                     }))
                     setIsDirty(true)
                   }}
-                  type="number"
-                  value={
-                    workspaceFileLimits[key as keyof typeof workspaceFileLimits]
-                  }
+                  value={workspaceFileLimits[key]}
                 />
               </div>
             ))}
@@ -627,30 +695,29 @@ export function AgentSandboxSandboxPage() {
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2">
                 <div className="space-y-2">
                   <Label htmlFor="cpu-limit">CPU cores</Label>
-                  <Input
+                  <NumberInput
                     id="cpu-limit"
-                    type="number"
                     min={0.5}
                     max={16}
                     step={0.5}
                     value={cpuLimit}
-                    onChange={(e) => {
-                      setCpuLimit(parseFloat(e.target.value) || 2)
+                    onValueChange={(value) => {
+                      setCpuLimit(value)
                       setIsDirty(true)
                     }}
                   />
                 </div>
                 <div className="space-y-2">
                   <Label htmlFor="memory-limit">Memory (MB)</Label>
-                  <Input
+                  <NumberInput
                     id="memory-limit"
-                    type="number"
+                    integer
                     min={256}
                     max={32768}
                     step={256}
                     value={memoryLimitMb}
-                    onChange={(e) => {
-                      setMemoryLimitMb(parseInt(e.target.value) || 8192)
+                    onValueChange={(value) => {
+                      setMemoryLimitMb(value)
                       setIsDirty(true)
                     }}
                   />

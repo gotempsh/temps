@@ -25,9 +25,11 @@ import {
   cancelPgUpgrade,
   getPgUpgrade,
   getPgUpgradeLogs,
+  isPgUpgradeNotFound,
   isTerminal,
   PG_UPGRADE_PHASES,
   PHASE_LABELS,
+  pgUpgradePollInterval,
   phaseIndex,
   retryPgUpgrade,
   rollbackPgUpgrade,
@@ -147,20 +149,16 @@ export function MajorUpgradeDetail() {
     queryKey: ['pg-upgrades', serviceIdNum, upgradeIdNum],
     queryFn: () => getPgUpgrade(serviceIdNum, upgradeIdNum),
     enabled: Number.isFinite(serviceIdNum) && Number.isFinite(upgradeIdNum),
-    refetchInterval: (query) => {
-      const status = query.state.data?.status
-      return status && isTerminal(status) ? false : 2000
-    },
+    refetchInterval: (query) =>
+      pgUpgradePollInterval(query.state.data?.status, 2000),
   })
 
   const logsQuery = useQuery({
     queryKey: ['pg-upgrades', serviceIdNum, upgradeIdNum, 'logs'],
     queryFn: () => getPgUpgradeLogs(serviceIdNum, upgradeIdNum),
     enabled: Number.isFinite(serviceIdNum) && Number.isFinite(upgradeIdNum),
-    refetchInterval: () => {
-      const status = upgradeQuery.data?.status
-      return status && isTerminal(status) ? false : 3000
-    },
+    refetchInterval: () =>
+      pgUpgradePollInterval(upgradeQuery.data?.status, 3000),
   })
 
   const retryMutation = useMutation({
@@ -218,7 +216,7 @@ export function MajorUpgradeDetail() {
 
   const backAction = (
     <Button variant="ghost" size="icon" asChild>
-      <Link to={`/storage/${id}`}>
+      <Link to={`/storage/${id}`} aria-label="Back to storage service">
         <ArrowLeft className="h-4 w-4" />
       </Link>
     </Button>
@@ -240,17 +238,45 @@ export function MajorUpgradeDetail() {
     return <MajorUpgradeDetailSkeleton backAction={backAction} />
   }
 
+  if (upgradeQuery.isError && isPgUpgradeNotFound(upgradeQuery.error)) {
+    return (
+      <PageState
+        variant="empty"
+        size="compact"
+        icon={XCircle}
+        title="Upgrade not found"
+        description={`Upgrade #${upgradeId} does not exist for service ${id}, or it was removed.`}
+        action={
+          <Button variant="outline" asChild>
+            <Link to={`/storage/${id}`}>
+              <ArrowLeft className="mr-2 h-4 w-4" />
+              Back to service
+            </Link>
+          </Button>
+        }
+      />
+    )
+  }
+
   if (upgradeQuery.isError || !upgradeQuery.data) {
     return (
       <PageState
         variant="failed"
+        size="compact"
         icon={XCircle}
         title="Couldn't load upgrade"
         description={
-          (upgradeQuery.error as Error | undefined)?.message ??
-          'Upgrade not found.'
+          (upgradeQuery.error as Error | null)?.message ??
+          'The upgrade could not be loaded.'
         }
-        action={<Button onClick={() => void upgradeQuery.refetch()}>Retry</Button>}
+        action={
+          <div className="flex gap-2">
+            <Button onClick={() => void upgradeQuery.refetch()}>Retry</Button>
+            <Button variant="outline" asChild>
+              <Link to={`/storage/${id}`}>Back to service</Link>
+            </Button>
+          </div>
+        }
       />
     )
   }
@@ -375,7 +401,7 @@ export function MajorUpgradeDetail() {
                 </CardDescription>
               </CardHeader>
               <CardContent>
-                <pre className="text-xs bg-muted rounded-md p-3 max-h-[480px] overflow-auto whitespace-pre-wrap break-all">
+                <pre tabIndex={0} className="text-xs bg-muted rounded-md p-3 max-h-[480px] overflow-auto whitespace-pre-wrap break-all">
                   {logsQuery.data?.content?.trim() || '(no log output yet)'}
                 </pre>
               </CardContent>

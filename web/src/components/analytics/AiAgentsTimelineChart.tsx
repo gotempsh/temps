@@ -350,7 +350,7 @@ export function AiAgentsTimelineChart({
         {/* Custom legend below the chart — wraps + scrolls so a long agent
             taxonomy (~30 entries) stays readable instead of clipping. */}
         {!isLoading && !error && chartData.length > 0 && (
-          <div className="mt-3 max-h-20 overflow-y-auto">
+          <div tabIndex={0} className="mt-3 max-h-20 overflow-y-auto">
             <div className="flex flex-wrap gap-x-3 gap-y-1.5">
               {seriesKeys.map((key) => (
                 <div

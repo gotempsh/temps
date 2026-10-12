@@ -227,6 +227,7 @@ export function ProjectDetailHeader({
               // an operator needs. It degrades to an icon plus a short label
               // instead of disappearing.
               <Badge
+                role="img"
                 variant="outline"
                 className="inline-flex shrink-0 gap-1"
                 title={dockerSocket.detail}

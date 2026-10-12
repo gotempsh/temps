@@ -1328,7 +1328,7 @@ function JobLogsPanel({
         </div>
         {error && <span className="text-destructive">{error}</span>}
       </div>
-      <pre
+      <pre tabIndex={0}
         ref={scrollRef}
         className="max-h-80 overflow-auto rounded-md border bg-background p-2 font-mono text-xs leading-relaxed"
       >
@@ -1343,7 +1343,7 @@ function JobLogsPanel({
           <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
             stderr
           </div>
-          <pre className="max-h-40 overflow-auto rounded-md border bg-background p-2 font-mono text-xs leading-relaxed text-destructive/90">
+          <pre tabIndex={0} className="max-h-40 overflow-auto rounded-md border bg-background p-2 font-mono text-xs leading-relaxed text-destructive/90">
             {stderrText}
           </pre>
         </div>
@@ -1376,7 +1376,7 @@ function OutputBlock({
       <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
         {label}
       </div>
-      <pre
+      <pre tabIndex={0}
         className={`text-xs font-mono whitespace-pre-wrap break-all rounded border p-3 max-h-72 overflow-auto ${
           error ? 'bg-destructive/5 border-destructive/30' : 'bg-muted/40'
         }`}

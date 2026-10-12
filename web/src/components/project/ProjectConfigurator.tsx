@@ -53,6 +53,7 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import { NumberInput } from '@/components/ui/number-input'
 import { ServiceLogo } from '@/components/ui/service-logo'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
@@ -1674,19 +1675,18 @@ export function ProjectConfigurator({
             <FormItem>
               <FormLabel>Application Port</FormLabel>
               <FormControl>
-                <Input
-                  type="number"
-                  min="1"
-                  max="65535"
+                <NumberInput
+                  min={1}
+                  max={65535}
+                  integer
                   placeholder="3000"
                   name={field.name}
                   ref={field.ref}
                   onBlur={field.onBlur}
-                  value={field.value ?? 3000}
-                  onChange={(e) => {
+                  value={field.value}
+                  onValueChange={(next) => {
                     portWasManuallyEdited.current = true
-                    const v = e.target.valueAsNumber
-                    field.onChange(Number.isNaN(v) ? undefined : v)
+                    field.onChange(next)
                   }}
                 />
               </FormControl>
@@ -1778,6 +1778,7 @@ export function ProjectConfigurator({
       <div className="space-y-4">
         {areServicesPending && (
           <div
+            role="status"
             className="grid grid-cols-1 gap-3 md:grid-cols-2"
             aria-label="Loading databases"
           >
@@ -1962,6 +1963,7 @@ export function ProjectConfigurator({
                   <div key={v.key} className="flex items-start gap-2">
                     <Checkbox
                       className="mt-2.5"
+                      aria-label={`Import ${v.key}`}
                       checked={selectedEnvExampleKeys.has(v.key)}
                       onCheckedChange={(checked) => {
                         setSelectedEnvExampleKeys((prev) => {

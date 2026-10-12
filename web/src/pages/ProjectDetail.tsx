@@ -87,13 +87,13 @@ import Metrics from './Metrics'
 import { ProjectTour } from '@/components/project/ProjectTour'
 import { ProjectAgentActivity } from './AiGateway'
 import { AutofixRedirect } from '@/components/autofixer/AutofixRedirect'
+import { RedirectWithSearch } from '@/components/layout/RedirectWithSearch'
 import { AgentDetailPage } from '@/components/agents/AgentDetailPage'
 import { AgentEditPage } from '@/components/agents/AgentEditPage'
 import { AutopilotRunDetail } from '@/components/agents/AutopilotRunDetail'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useState } from 'react'
 import {
-  Navigate,
   Route,
   Routes,
   useNavigate,
@@ -411,7 +411,10 @@ export function ProjectDetail() {
             <div className="relative border-b">
               <div className="max-w-screen overflow-hidden">
                 <div className="relative flex items-center">
-                  <div className="flex-1 overflow-x-auto no-scrollbar">
+                  <div
+                    tabIndex={0}
+                    className="flex-1 overflow-x-auto no-scrollbar"
+                  >
                     <div className="min-w-full">
                       <Skeleton className="h-10 w-full" />
                     </div>
@@ -464,7 +467,7 @@ export function ProjectDetail() {
         <div className="min-w-0 flex-1 overflow-y-auto p-4">
           <ProjectSectionLayout project={project}>
             <Routes>
-              <Route index element={<Navigate to="project" replace />} />
+              <Route index element={<RedirectWithSearch to="project" />} />
               {['project', 'integrations', 'setup'].map((path) => (
                 <Route
                   key={path}
@@ -659,10 +662,10 @@ export function ProjectDetail() {
           <ProjectTour />
           <ProjectSectionLayout project={project}>
             <Routes>
-              <Route index element={<Navigate to="project" replace />} />
+              <Route index element={<RedirectWithSearch to="project" />} />
               <Route
                 path="hosting"
-                element={<Navigate to="../settings/delivery" replace />}
+                element={<RedirectWithSearch to="../settings/delivery" />}
               />
               <Route
                 path="integrations"
@@ -679,7 +682,7 @@ export function ProjectDetail() {
               />
               <Route
                 path="tools"
-                element={<Navigate to="../settings/general" replace />}
+                element={<RedirectWithSearch to="../settings/general" />}
               />
               <Route
                 path="setup"
@@ -747,9 +750,8 @@ export function ProjectDetail() {
               <Route
                 path="git/change-repository"
                 element={
-                  <Navigate
+                  <RedirectWithSearch
                     to={`/projects/${project.slug}/connect-repository`}
-                    replace
                   />
                 }
               />
@@ -782,9 +784,8 @@ export function ProjectDetail() {
               <Route
                 path="databases"
                 element={
-                  <Navigate
+                  <RedirectWithSearch
                     to={legacyDatabasesRedirectPath(project.slug)}
-                    replace
                   />
                 }
               />
@@ -851,7 +852,7 @@ export function ProjectDetail() {
                   any lingering /dashboards links. */}
               <Route
                 path="dashboards/*"
-                element={<Navigate to="../metrics/dashboards" replace />}
+                element={<RedirectWithSearch to="../metrics/dashboards" />}
               />
               <Route
                 path="ai-gateway"

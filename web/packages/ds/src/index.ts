@@ -46,7 +46,22 @@ export {
   type TimeChartBand,
   type TimeChartMarker,
 } from './time-chart'
-export { useUrlState, type UrlState, type UrlStateValue } from './url-state'
+export {
+  createSearchParamsBatch,
+  useBatchedSearchParams,
+  useUrlState,
+  type SearchParamsBatch,
+  type SearchParamsUpdate,
+  type UrlState,
+  type UrlStateValue,
+} from './url-state'
+export {
+  createUrlTextSync,
+  useUrlTextInput,
+  type UrlTextSync,
+  type UseUrlTextInputOptions,
+  type UseUrlTextInputResult,
+} from './url-text-input'
 export { notify } from './notify'
 export * from './fmt'
 

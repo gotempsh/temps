@@ -240,6 +240,7 @@ export default function ApiKeyCreate() {
               <Label>Your API Key</Label>
               <div className="flex gap-2">
                 <Input
+                  aria-label="Your API Key"
                   value={newKeySecret}
                   readOnly
                   className="font-mono text-sm"
@@ -548,6 +549,7 @@ export default function ApiKeyCreate() {
                             <div className="flex items-center justify-between p-4 hover:bg-muted/50 cursor-pointer">
                               <div className="flex items-center gap-3">
                                 <Checkbox
+                                  aria-label={`Select all ${category} permissions`}
                                   checked={allSelected}
                                   ref={(ref) => {
                                     if (ref) {

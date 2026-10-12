@@ -15,6 +15,8 @@ import {
 import { revealNotificationProviderConfig } from '@/api/client/sdk.gen'
 import { NotificationProviderResponse } from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
+import { useConfirmDelete } from '@/components/ui/confirm-delete'
 import { CreateActionButton } from '@/components/ui/create-action-button'
 import { fmtDateTime, fmtRelativeTime } from '@temps-sdk/ds'
 import {
@@ -193,11 +195,14 @@ export function ProvidersManagement({
     },
   })
 
-  const onEditSubmit = async (data: ProviderFormData) => {
+  // `mutate`, not `mutateAsync`: the mutation's own error toast reports a
+  // failed save, and a rejected promise here would escape react-hook-form's
+  // submit handler as an unhandled rejection.
+  const onEditSubmit = (data: ProviderFormData) => {
     if (!editingProvider) return
 
     if (data.provider_type === 'slack') {
-      await updateSlackMutation.mutateAsync({
+      updateSlackMutation.mutate({
         path: { id: editingProvider.id },
         body: {
           name: data.name,
@@ -209,7 +214,7 @@ export function ProvidersManagement({
         },
       })
     } else if (data.provider_type === 'webhook') {
-      await updateWebhookMutation.mutateAsync({
+      updateWebhookMutation.mutate({
         path: { id: editingProvider.id },
         body: {
           name: data.name,
@@ -223,7 +228,7 @@ export function ProvidersManagement({
         },
       })
     } else if (data.provider_type === 'cloudflare') {
-      await updateCloudflareMutation.mutateAsync({
+      updateCloudflareMutation.mutate({
         path: { id: editingProvider.id },
         body: {
           name: data.name,
@@ -238,7 +243,7 @@ export function ProvidersManagement({
         },
       })
     } else {
-      await updateEmailMutation.mutateAsync({
+      updateEmailMutation.mutate({
         path: { id: editingProvider.id },
         body: {
           name: data.name,
@@ -279,11 +284,12 @@ export function ProvidersManagement({
     return data.value
   }
 
-  const handleDelete = async (provider: ExtendedNotificationProvider) => {
-    await deleteMutation.mutateAsync({
-      path: { id: provider.id },
-    })
-  }
+  // The row's Delete item only asks for confirmation; the request is sent
+  // from the dialog's confirm button.
+  const confirmDelete = useConfirmDelete<ExtendedNotificationProvider>(
+    (provider, callbacks) =>
+      deleteMutation.mutate({ path: { id: provider.id } }, callbacks)
+  )
 
   const handleTest = async (provider: ExtendedNotificationProvider) => {
     const toastId = toast.loading('Sending test notification...')
@@ -314,10 +320,8 @@ export function ProvidersManagement({
     navigate(`/settings/notifications/${provider.id}`)
   }
 
-  const handleToggleEnabled = async (
-    provider: ExtendedNotificationProvider
-  ) => {
-    await toggleEnabledMutation.mutateAsync({
+  const handleToggleEnabled = (provider: ExtendedNotificationProvider) => {
+    toggleEnabledMutation.mutate({
       path: { id: provider.id },
       body: {
         name: provider.name,
@@ -477,7 +481,7 @@ export function ProvidersManagement({
                       <DropdownMenuSeparator />
                       <DropdownMenuItem
                         className="text-destructive"
-                        onClick={() => handleDelete(typedProvider)}
+                        onClick={() => confirmDelete.request(typedProvider)}
                       >
                         Delete
                       </DropdownMenuItem>
@@ -510,6 +514,17 @@ export function ProvidersManagement({
           </div>
         </DialogContent>
       </Dialog>
+
+      <ConfirmDeleteDialog
+        open={confirmDelete.open}
+        onOpenChange={(open) => {
+          if (!open) confirmDelete.cancel()
+        }}
+        resourceType="notification provider"
+        resourceName={confirmDelete.target?.name}
+        isPending={deleteMutation.isPending}
+        onConfirm={confirmDelete.confirm}
+      />
     </div>
   )
 }

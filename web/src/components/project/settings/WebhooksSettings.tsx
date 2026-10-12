@@ -179,7 +179,7 @@ export function WebhooksSettings({ project }: WebhooksSettingsProps) {
                         {webhook.enabled ? (
                           <Badge
                             variant="outline"
-                            className="border-green-500/50 text-green-600 bg-green-50 dark:bg-green-950 dark:text-green-400"
+                            className="border-green-500/50 text-green-700 bg-green-50 dark:bg-green-950 dark:text-green-400"
                           >
                             <CheckCircle2 className="h-3 w-3 mr-1" />
                             Enabled
@@ -225,7 +225,14 @@ export function WebhooksSettings({ project }: WebhooksSettingsProps) {
                         <EllipsisVertical className="h-4 w-4" />
                       </Button>
                     </DropdownMenuTrigger>
-                    <DropdownMenuContent align="end">
+                    {/* The menu is portaled, but React still bubbles its
+                        clicks to the row's onClick (navigate to the detail
+                        page), which unmounted the delete confirmation the
+                        item had just opened. */}
+                    <DropdownMenuContent
+                      align="end"
+                      onClick={(e) => e.stopPropagation()}
+                    >
                       <DropdownMenuItem
                         onClick={() =>
                           navigate(

@@ -206,7 +206,10 @@ export function DeploymentContainerLogs({
                             Download
                           </Button>
                         </div>
-                        <pre className="max-h-96 overflow-auto p-3 text-xs font-mono whitespace-pre-wrap break-all">
+                        <pre
+                          tabIndex={0}
+                          className="max-h-96 overflow-auto p-3 text-xs font-mono whitespace-pre-wrap break-all"
+                        >
                           {content?.content || '(empty)'}
                         </pre>
                       </div>

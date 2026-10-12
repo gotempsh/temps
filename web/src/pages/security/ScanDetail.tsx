@@ -30,6 +30,7 @@ import {
   PageState,
   Status,
   useUrlState,
+  useUrlTextInput,
   type DetailFact,
   type StatusTone,
 } from '@temps-sdk/ds'
@@ -308,7 +309,7 @@ function scanFacts(
             {scan.critical_count > 0 && (
               <Badge
                 variant="outline"
-                className="border-red-500/20 bg-red-500/10 text-red-500"
+                className="border-red-500/20 bg-red-500/10 text-red-700 dark:text-red-500"
               >
                 {scan.critical_count} Critical
               </Badge>
@@ -316,7 +317,7 @@ function scanFacts(
             {scan.high_count > 0 && (
               <Badge
                 variant="outline"
-                className="border-orange-500/20 bg-orange-500/10 text-orange-500"
+                className="border-orange-500/20 bg-orange-500/10 text-orange-700 dark:text-orange-500"
               >
                 {scan.high_count} High
               </Badge>
@@ -324,7 +325,7 @@ function scanFacts(
             {scan.medium_count > 0 && (
               <Badge
                 variant="outline"
-                className="border-yellow-500/20 bg-yellow-500/10 text-yellow-500"
+                className="border-yellow-500/20 bg-yellow-500/10 text-yellow-700 dark:text-yellow-500"
               >
                 {scan.medium_count} Medium
               </Badge>
@@ -332,7 +333,7 @@ function scanFacts(
             {scan.low_count > 0 && (
               <Badge
                 variant="outline"
-                className="border-blue-500/20 bg-blue-500/10 text-blue-500"
+                className="border-blue-500/20 bg-blue-500/10 text-blue-600 dark:text-blue-500"
               >
                 {scan.low_count} Low
               </Badge>
@@ -355,7 +356,11 @@ function ScanDetailContent() {
   const activeTab = get('tab') ?? 'source-code'
   const [showTypeFilters, setShowTypeFilters] = useState(false)
 
-  const setSearchQuery = (value: string) => patch({ q: value || undefined })
+  // Keep the typed text locally; the URL follows without dropping keystrokes.
+  const searchInput = useUrlTextInput({
+    value: searchQuery,
+    onCommit: (value) => patch({ q: value || undefined }),
+  })
   const setSelectedTypes = (types: Set<string>) =>
     patch({ types: types.size > 0 ? Array.from(types).join(',') : undefined })
 
@@ -635,8 +640,8 @@ function ScanDetailContent() {
                     <Input
                       type="text"
                       placeholder="Search by CVE ID, title, package, severity..."
-                      value={searchQuery}
-                      onChange={(e) => setSearchQuery(e.target.value)}
+                      value={searchInput.value}
+                      onChange={(e) => searchInput.setValue(e.target.value)}
                       className="pl-9"
                     />
                   </div>
@@ -827,7 +832,7 @@ function ScanDetailContent() {
                     </p>
                     <Button
                       variant="outline"
-                      onClick={() => setSearchQuery('')}
+                      onClick={() => searchInput.setValue('')}
                     >
                       Clear search
                     </Button>

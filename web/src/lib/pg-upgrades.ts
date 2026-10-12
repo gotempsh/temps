@@ -17,6 +17,8 @@
  * once these endpoints are included in the OpenAPI spec / generated client.
  */
 
+import { httpStatusOf } from './http-error-status'
+
 export interface PgUpgrade {
   id: number
   service_id: number
@@ -60,9 +62,30 @@ async function readJsonOrThrow<T>(response: Response): Promise<T> {
     } catch {
       // fall through with statusText
     }
-    throw new Error(detail)
+    // Carry the HTTP status on the thrown error, as the generated client's
+    // interceptor does: the app-wide retry policy then stops retrying a 404,
+    // and pages can tell "not found" from "could not load".
+    throw Object.assign(new Error(detail), { status: response.status })
   }
   return (await response.json()) as T
+}
+
+/** True when the server answered 404 for an upgrade (or its service). */
+export function isPgUpgradeNotFound(error: unknown): boolean {
+  return httpStatusOf(error) === 404
+}
+
+/**
+ * Poll interval for an upgrade read: only while a loaded upgrade is still
+ * running. A failed or not-yet-loaded read is never polled, otherwise every
+ * refetch of an errored query flips it back to pending and the page shows
+ * skeletons again instead of its error state.
+ */
+export function pgUpgradePollInterval(
+  status: string | undefined,
+  intervalMs: number
+): number | false {
+  return status && !isTerminal(status) ? intervalMs : false
 }
 
 export async function listPgUpgrades(serviceId: number): Promise<PgUpgrade[]> {

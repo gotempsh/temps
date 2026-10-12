@@ -6,7 +6,7 @@ import { PageContainer } from '@/components/layout/PageContainer'
 import { useQuery } from '@tanstack/react-query'
 import { listDomainsOptions } from '@/api/client/@tanstack/react-query.gen'
 import type { DomainSort } from '@/components/domains/domain-sort'
-import { useSearchParams } from 'react-router'
+import { useBatchedSearchParams, useUrlTextInput } from '@temps-sdk/ds'
 import { DomainsManagement } from '@/components/domains/DomainsManagement'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
@@ -18,7 +18,7 @@ const PAGE_SIZE = 20
 
 export function Domains() {
   const { setBreadcrumbs } = useBreadcrumbs()
-  const [params, setParams] = useSearchParams()
+  const [params, setParams] = useBatchedSearchParams()
   const searchQuery = params.get('search') ?? ''
   const sort: DomainSort =
     params.get('sort') === 'domain' || params.get('sort') === 'status'
@@ -51,8 +51,14 @@ export function Domains() {
       },
       { replace: true }
     )
-  const handleSearchChange = (value: string) =>
-    updateParams({ search: value, page: '1' })
+  // The box keeps its own text, so fast typing is never reverted by the
+  // router's late location update. The query below is debounced separately,
+  // so each keystroke is written to the URL straight away (`debounceMs: 0`).
+  const searchInput = useUrlTextInput({
+    value: searchQuery,
+    debounceMs: 0,
+    onCommit: (value) => updateParams({ search: value, page: '1' }),
+  })
   const handleSortChange = (value: DomainSort) =>
     updateParams({
       sort: value,
@@ -101,8 +107,8 @@ export function Domains() {
           pageSize={PAGE_SIZE}
           totalPages={totalPages}
           onPageChange={(page) => updateParams({ page: String(page) })}
-          searchQuery={searchQuery}
-          onSearchChange={handleSearchChange}
+          searchQuery={searchInput.value}
+          onSearchChange={searchInput.setValue}
           isSearching={searchQuery !== debouncedSearch}
         />
       </div>

@@ -24,6 +24,10 @@ import {
   updateProjectSettingsMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { ComposeSecuritySettings } from './ComposeSecuritySettings'
+import {
+  isComposePresetName,
+  shouldLoadComposeSecurity,
+} from '@/lib/compose-security-query'
 import { RepositorySelector } from '@/components/repositories/RepositorySelector'
 import { BranchSelector } from '@/components/deployments/BranchSelector'
 import { Badge } from '@/components/ui/badge'
@@ -502,8 +506,7 @@ function GitSettingsInline({
 
   const presetName = (project.preset || '').toString()
   const isDockerfilePreset = presetName === 'dockerfile'
-  const isComposePreset =
-    presetName === 'docker-compose' || presetName === 'dockercompose'
+  const isComposePreset = isComposePresetName(presetName)
 
   // Compose override editor and redacted effective-deployment preview.
   const [overrideDraft, setOverrideDraft] = useState('')
@@ -524,9 +527,12 @@ function GitSettingsInline({
   )
   const excludedComposeServices: string[] =
     composeConfig.excludedServices || composeConfig.excluded_services || []
-  const composeSecurityQuery = useQuery(
-    getComposeSecurityOptions({ path: { id: project.id } })
-  )
+  // The endpoint answers 400 for every non-Compose project, so the read is
+  // gated on the preset instead of being fired and discarded.
+  const composeSecurityQuery = useQuery({
+    ...getComposeSecurityOptions({ path: { id: project.id } }),
+    enabled: shouldLoadComposeSecurity(project),
+  })
   const [focusedComposeCheck, setFocusedComposeCheck] = useState<string | null>(
     null
   )
@@ -1663,6 +1669,7 @@ function GitSettingsInline({
           <CardContent className="p-0 divide-y">
             <div className="flex items-center gap-4 p-6">
               <Switch
+                aria-label="Automatic deployments"
                 checked={autoDeployOn}
                 onCheckedChange={handleAutoDeployToggle}
               />

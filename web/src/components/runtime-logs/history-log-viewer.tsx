@@ -15,6 +15,7 @@ import { Alert, AlertDescription } from '@/components/ui/alert'
 import { LogLevelBadge } from '@temps-sdk/ds'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { NumberInput } from '@/components/ui/number-input'
 import {
   Select,
   SelectContent,
@@ -294,7 +295,7 @@ function HistoryLogRow({
     // truncation — the context for each match is complete; these blocks simply
     // aren't next to each other in the log stream.
     return (
-      <div className="flex items-center gap-2 px-2 py-1 select-none text-[10px] text-muted-foreground/50">
+      <div className="flex items-center gap-2 px-2 py-1 select-none text-[10px] text-muted-foreground">
         <span className="h-px flex-1 bg-border" />
         <span className="shrink-0">gap in logs</span>
         <span className="h-px flex-1 bg-border" />
@@ -343,7 +344,7 @@ function HistoryLogRow({
           )}
           {columns.source && (
             <span
-              className="text-muted-foreground/80 min-w-0 max-w-full truncate tabular-nums sm:w-[150px] sm:shrink-0"
+              className="text-muted-foreground min-w-0 max-w-full truncate tabular-nums sm:w-[150px] sm:shrink-0"
               title={sourceLabel(containerId, nodeName)}
             >
               {sourceLabel(containerId, nodeName)}
@@ -1081,17 +1082,18 @@ export default function HistoryLogViewer({
               <TooltipTrigger asChild>
                 <div className="flex items-center gap-1.5 shrink-0">
                   <AlignVerticalSpaceAround className="h-3.5 w-3.5 text-muted-foreground" />
-                  <Input
-                    type="number"
+                  {/* Empty means 0 (context off): the field is left empty while
+                      editing instead of snapping back to "0". */}
+                  <NumberInput
                     min={CONTEXT_MIN}
                     max={CONTEXT_MAX}
                     step={1}
-                    value={contextLines}
-                    onChange={(e) => {
-                      const n = Number.parseInt(e.target.value, 10)
-                      const next = Number.isFinite(n) ? n : 0
+                    integer
+                    placeholder="0"
+                    value={contextLines > 0 ? contextLines : undefined}
+                    onValueChange={(next) => {
                       setContextLines(
-                        Math.min(Math.max(next, CONTEXT_MIN), CONTEXT_MAX)
+                        Math.min(Math.max(next ?? 0, CONTEXT_MIN), CONTEXT_MAX)
                       )
                     }}
                     aria-label="Surrounding context lines"
@@ -1207,13 +1209,10 @@ export default function HistoryLogViewer({
               Showing {showingCount.toLocaleString()}{' '}
               {showingCount === 1 ? 'match' : 'matches'}
               {canLoadOlder && (
-                <span className="text-muted-foreground/70">
-                  {' '}
-                  · more available
-                </span>
+                <span className="text-muted-foreground"> · more available</span>
               )}
               {contextLines > 0 && (
-                <span className="text-muted-foreground/70">
+                <span className="text-muted-foreground">
                   {' '}
                   · ±{contextLines} context lines
                 </span>

@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useEffect, useMemo, useState } from 'react'
-import { useSearchParams } from 'react-router'
 import { LogExplorer } from '@/components/observability/LogExplorer'
 import { LogHistogram } from '@/components/observability/LogHistogram'
 import { LogCollectionNotice } from '@/components/observability/LogCollectionNotice'
@@ -33,7 +32,7 @@ import {
   type GlobalLogFilters,
 } from '@/hooks/useGlobalLogs'
 import { RefreshCw, Play, Pause, Loader2 } from 'lucide-react'
-import { Callout, HelpPopover } from '@temps-sdk/ds'
+import { Callout, HelpPopover, useBatchedSearchParams } from '@temps-sdk/ds'
 
 const LEVELS: LogLevel[] = ['TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR']
 
@@ -56,9 +55,10 @@ export default function GlobalLogs() {
   const projectId = view.projectId
   const text = view.search
   // Attribute predicates (ADR-047 §5) are stored as repeated `attr` params,
-  // separately from `view.patch`'s single-value filters — `useSearchParams`
-  // shares the same router state `useGlobalView` reads, so both stay in sync.
-  const [searchParams, setSearchParams] = useSearchParams()
+  // separately from `view.patch`'s single-value filters — the batched setter
+  // chains onto the same pending update `useGlobalView` writes, so a filter
+  // and an attribute chosen in the same tick both land.
+  const [searchParams, setSearchParams] = useBatchedSearchParams()
   // Keyed on the serialized params (a stable primitive) rather than
   // `searchParams` itself, so this array keeps its identity across renders
   // that don't change the query — otherwise every render would hand

@@ -121,7 +121,7 @@ export function FacetCombobox({
               </span>
               {value ? (
                 <>
-                  <span className="text-muted-foreground/40">·</span>
+                  <span className="text-muted-foreground">·</span>
                   {selectedFlag && (
                     <span className="text-base leading-none">
                       {selectedFlag}
@@ -131,7 +131,7 @@ export function FacetCombobox({
                 </>
               ) : (
                 <>
-                  <span className="text-muted-foreground/40">·</span>
+                  <span className="text-muted-foreground">·</span>
                   <span className="truncate">{placeholder ?? 'Any'}</span>
                 </>
               )}

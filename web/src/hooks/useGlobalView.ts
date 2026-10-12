@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useEffect, useMemo, useState } from 'react'
-import { useSearchParams } from 'react-router'
+import { useBatchedSearchParams } from '@temps-sdk/ds'
 import {
   patchObservationFilters,
   positiveInteger,
@@ -16,7 +16,9 @@ import {
 } from '@/lib/date-time-range'
 
 export function useGlobalView() {
-  const [params, setParams] = useSearchParams()
+  // Batched so a filter change and the canonicalisation below, or a search
+  // term and a page reset, can never overwrite each other.
+  const [params, setParams] = useBatchedSearchParams()
   const [now, setNow] = useState(Date.now)
   const window = useMemo(
     () => readObservationWindow(params, now),

@@ -24,6 +24,8 @@ import {
 import { ScheduleServicesSelector } from '@/components/backups/ScheduleServicesSelector'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { NumberInput } from '@/components/ui/number-input'
+import { validateNumeric } from '@/lib/numeric-input'
 import { Label } from '@/components/ui/label'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { Switch } from '@/components/ui/switch'
@@ -154,6 +156,15 @@ export function CreateBackupSchedule() {
       return
     }
 
+    const retentionError = validateNumeric(form.retention_period, {
+      min: 1,
+      integer: true,
+    })
+    if (retentionError || form.retention_period === undefined) {
+      toast.error(`Retention period: ${retentionError ?? 'Enter a number'}`)
+      return
+    }
+
     let max_runtime_secs: number | undefined
     if (
       form.max_runtime_hours !== '' &&
@@ -179,7 +190,7 @@ export function CreateBackupSchedule() {
         description: form.description,
         backup_type: form.backup_type ?? 'scheduled',
         schedule_expression,
-        retention_period: form.retention_period ?? 7,
+        retention_period: form.retention_period,
         s3_source_id: sourceId!,
         enabled: form.enabled ?? true,
         tags: [],
@@ -318,16 +329,13 @@ export function CreateBackupSchedule() {
 
           <div className="grid gap-2">
             <Label htmlFor="retention">Retention Period (days)</Label>
-            <Input
+            <NumberInput
               id="retention"
-              type="number"
               min={1}
-              value={form.retention_period ?? 7}
-              onChange={(e) =>
-                setForm({
-                  ...form,
-                  retention_period: parseInt(e.target.value, 10),
-                })
+              integer
+              value={form.retention_period}
+              onValueChange={(retention_period) =>
+                setForm({ ...form, retention_period })
               }
             />
           </div>

@@ -366,7 +366,7 @@ export function ConnectionsCompactList({
                 unhealthy
                   ? 'font-medium text-destructive'
                   : healthy
-                    ? 'text-emerald-600 dark:text-emerald-400'
+                    ? 'text-emerald-700 dark:text-emerald-400'
                     : ''
               }
             >

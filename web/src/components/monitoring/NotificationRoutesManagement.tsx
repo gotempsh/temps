@@ -8,10 +8,15 @@ import {
   listNotificationProvidersOptions,
   listNotificationRoutesOptions,
 } from '@/api/client/@tanstack/react-query.gen'
-import type { NotificationProviderResponse } from '@/api/client/types.gen'
+import type {
+  NotificationProviderResponse,
+  NotificationRoute,
+} from '@/api/client/types.gen'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
+import { useConfirmDelete } from '@/components/ui/confirm-delete'
 import { EmptyState } from '@/components/ui/empty-state'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { BellRing, Pencil, Plus, Trash2 } from 'lucide-react'
@@ -64,6 +69,13 @@ export function NotificationRoutesManagement({
       refetchRoutes()
     },
   })
+
+  // The trash button only asks for confirmation; the request is sent from the
+  // dialog's confirm button.
+  const confirmDelete = useConfirmDelete<NotificationRoute>(
+    (route, callbacks) =>
+      deleteMutation.mutate({ path: { id: route.id } }, callbacks)
+  )
 
   const routes = routePage?.items || []
   const isLoading = routesLoading || providersLoading
@@ -153,9 +165,7 @@ export function NotificationRoutesManagement({
                     size="icon"
                     aria-label={`Delete ${route.name}`}
                     disabled={deleteMutation.isPending}
-                    onClick={() =>
-                      deleteMutation.mutate({ path: { id: route.id } })
-                    }
+                    onClick={() => confirmDelete.request(route)}
                   >
                     <Trash2 className="h-4 w-4" />
                   </Button>
@@ -188,6 +198,17 @@ export function NotificationRoutesManagement({
           ))}
         </div>
       )}
+
+      <ConfirmDeleteDialog
+        open={confirmDelete.open}
+        onOpenChange={(open) => {
+          if (!open) confirmDelete.cancel()
+        }}
+        resourceType="notification route"
+        resourceName={confirmDelete.target?.name}
+        isPending={deleteMutation.isPending}
+        onConfirm={confirmDelete.confirm}
+      />
     </div>
   )
 }

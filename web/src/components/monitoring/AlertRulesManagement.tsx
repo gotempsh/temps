@@ -28,6 +28,8 @@ import {
 } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { Badge } from '@/components/ui/badge'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
+import { useConfirmDelete } from '@/components/ui/confirm-delete'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
@@ -155,16 +157,23 @@ export function AlertRulesManagement({
     },
   })
 
-  const handleDelete = async (rule: AlertRuleResponse) => {
-    if (!projectId) return
-    await deleteMutation.mutateAsync({
-      path: { project_id: projectId, rule_id: rule.id },
-    })
-  }
+  // Deleting is two steps: the row only asks for confirmation, and the
+  // request is sent from the dialog's confirm button. `mutate` (not
+  // `mutateAsync`) so a failed request surfaces through the mutation's error
+  // toast instead of an unhandled promise rejection.
+  const confirmDelete = useConfirmDelete<AlertRuleResponse>(
+    (rule, callbacks) => {
+      if (!projectId) return
+      deleteMutation.mutate(
+        { path: { project_id: projectId, rule_id: rule.id } },
+        callbacks
+      )
+    }
+  )
 
-  const handleToggleEnabled = async (rule: AlertRuleResponse) => {
+  const handleToggleEnabled = (rule: AlertRuleResponse) => {
     if (!projectId) return
-    await updateMutation.mutateAsync({
+    updateMutation.mutate({
       path: { project_id: projectId, rule_id: rule.id },
       body: { enabled: !rule.enabled },
     })
@@ -303,7 +312,7 @@ export function AlertRulesManagement({
                       <DropdownMenuSeparator />
                       <DropdownMenuItem
                         className="text-destructive"
-                        onClick={() => handleDelete(rule)}
+                        onClick={() => confirmDelete.request(rule)}
                       >
                         Delete
                       </DropdownMenuItem>
@@ -332,6 +341,17 @@ export function AlertRulesManagement({
           ))}
         </div>
       )}
+
+      <ConfirmDeleteDialog
+        open={confirmDelete.open}
+        onOpenChange={(open) => {
+          if (!open) confirmDelete.cancel()
+        }}
+        resourceType="alert rule"
+        resourceName={confirmDelete.target?.name}
+        isPending={deleteMutation.isPending}
+        onConfirm={confirmDelete.confirm}
+      />
     </div>
   )
 }

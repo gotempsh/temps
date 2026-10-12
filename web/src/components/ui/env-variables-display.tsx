@@ -100,6 +100,7 @@ export function EnvVariablesDisplay({
       {/* Environment variables display */}
       <div className="relative">
         <pre
+          tabIndex={0}
           className={cn(
             'bg-muted/30 border rounded-md p-3 text-xs font-mono',
             'overflow-y-auto overflow-x-auto',

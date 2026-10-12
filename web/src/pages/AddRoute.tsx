@@ -19,6 +19,8 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import { NumberInput } from '@/components/ui/number-input'
+import { numberFieldProps } from '@/lib/numeric-input'
 import { Label } from '@/components/ui/label'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
@@ -50,7 +52,7 @@ const addRouteSchema = z
     subdomain: z.string().optional(),
     host: z.string().min(1, 'Host is required'),
     port: z
-      .number()
+      .number({ message: 'Port is required' })
       .min(1, 'Port must be at least 1')
       .max(65535, 'Port must be at most 65535'),
   })
@@ -520,15 +522,12 @@ export function AddRoute() {
                       <FormItem>
                         <FormLabel>Port</FormLabel>
                         <FormControl>
-                          <Input
-                            type="number"
+                          <NumberInput
+                            {...numberFieldProps(field)}
                             min={1}
                             max={65535}
+                            integer
                             placeholder="8080"
-                            value={field.value}
-                            onChange={(e) =>
-                              field.onChange(Number(e.target.value) || 0)
-                            }
                           />
                         </FormControl>
                         <FormDescription>

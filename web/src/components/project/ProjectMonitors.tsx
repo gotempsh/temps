@@ -61,6 +61,8 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
+import { NumberInput } from '@/components/ui/number-input'
+import { numberFieldProps } from '@/lib/numeric-input'
 import {
   Select,
   SelectContent,
@@ -218,12 +220,12 @@ function MonitorCard({
                   <div
                     className={`text-xs flex items-center gap-1 ${
                       currentMonitorStatus?.current_status === 'operational'
-                        ? 'text-green-500'
+                        ? 'text-green-700 dark:text-green-500'
                         : currentMonitorStatus?.current_status === 'degraded'
-                          ? 'text-yellow-500'
+                          ? 'text-yellow-700 dark:text-yellow-500'
                           : currentMonitorStatus?.current_status ===
                               'major_outage'
-                            ? 'text-red-500'
+                            ? 'text-red-700 dark:text-red-500'
                             : 'text-muted-foreground'
                     }`}
                   >
@@ -532,13 +534,10 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
                     <FormItem>
                       <FormLabel>Check Interval (seconds)</FormLabel>
                       <FormControl>
-                        <Input
-                          type="number"
-                          min="30"
-                          {...field}
-                          onChange={(e) =>
-                            field.onChange(parseInt(e.target.value) || 60)
-                          }
+                        <NumberInput
+                          {...numberFieldProps(field)}
+                          min={30}
+                          integer
                         />
                       </FormControl>
                       <FormMessage />

@@ -15,6 +15,7 @@ import { useNavigate, useSearchParams } from 'react-router'
 import { useAuth } from '@/contexts/AuthContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { consumeReturnTo } from '@/lib/return-to'
+import { submitLogin } from './login-submit'
 
 /**
  * Maps opaque SSO error codes (from `login_error_code_for` in
@@ -124,16 +125,12 @@ export const Login = () => {
     },
   })
 
-  const handleSubmit = async (data: { email: string; password: string }) => {
-    setIsLoading(true)
-    try {
-      await login.mutateAsync({
-        body: data,
-      })
-    } finally {
-      setIsLoading(false)
-    }
-  }
+  const handleSubmit = (data: { email: string; password: string }) =>
+    submitLogin({
+      credentials: data,
+      login: (credentials) => login.mutateAsync({ body: credentials }),
+      setLoading: setIsLoading,
+    })
 
   return (
     <div className="flex min-h-screen flex-col items-center justify-center bg-background p-4">

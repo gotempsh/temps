@@ -18,6 +18,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { ResponsivePagination } from '@/components/ui/responsive-pagination'
+import { useUrlTextInput } from '@temps-sdk/ds'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
@@ -106,6 +107,13 @@ export function GlobalPage({
   usePageTitle(title)
   const { setBreadcrumbs } = useBreadcrumbs()
   useEffect(() => setBreadcrumbs([{ label: title }]), [title, setBreadcrumbs])
+  // Search text stays in local state while it is typed and reaches the URL
+  // (and so the query) once, after a short pause. Reading it straight from the
+  // URL drops characters because the router applies location updates late.
+  const search = useUrlTextInput({
+    value: view.search,
+    onCommit: (q) => view.patch({ q: q || undefined }),
+  })
   return (
     <PageContainer innerClassName="space-y-6">
       <PageHeader
@@ -139,22 +147,23 @@ export function GlobalPage({
           />
           <Input
             className="h-9 ps-8 pe-8 text-sm"
-            value={view.search}
-            onChange={(event) => view.patch({ q: event.target.value })}
+            value={search.value}
+            onChange={(event) => search.setValue(event.target.value)}
             onKeyDown={(event) => {
-              if (event.key === 'Escape') view.patch({ q: undefined })
+              if (event.key === 'Escape') search.setValue('')
+              if (event.key === 'Enter') search.flush()
             }}
             aria-label={searchLabel}
             placeholder={searchLabel}
           />
-          {view.search && (
+          {search.value && (
             <Button
               type="button"
               variant="ghost"
               size="icon"
               className="absolute end-1 top-1/2 size-7 -translate-y-1/2"
               aria-label="Clear search"
-              onClick={() => view.patch({ q: undefined })}
+              onClick={() => search.setValue('')}
             >
               <X className="size-3.5" />
             </Button>

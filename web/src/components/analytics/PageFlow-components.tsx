@@ -44,7 +44,17 @@ import {
   Loader2,
   AlertCircle,
 } from 'lucide-react'
-import { type PageFlowProps, durationSortValue } from './PageFlow-shared'
+import {
+  type DropOffSortKey,
+  type EntryPageSortKey,
+  type ExitPageSortKey,
+  type PageFlowProps,
+  type TransitionSortKey,
+  dropOffSortValue,
+  entryPageSortValue,
+  exitPageSortValue,
+  transitionSortValue,
+} from './PageFlow-shared'
 
 function formatDuration(seconds: number | null | undefined): string {
   if (seconds == null || seconds <= 0) return '-'
@@ -75,8 +85,7 @@ function RateBar({ rate, color }: { rate: number; color: string }) {
 }
 
 function EntryPagesTable({ pages }: { pages: PageFlowEntry[] }) {
-  type SortKey = 'page' | 'entries' | 'views' | 'bounce' | 'time'
-  const [sort, setSort] = useState<TableSort<SortKey>>({
+  const [sort, setSort] = useState<TableSort<EntryPageSortKey>>({
     key: 'entries',
     direction: 'desc',
   })
@@ -84,14 +93,7 @@ function EntryPagesTable({ pages }: { pages: PageFlowEntry[] }) {
     () =>
       sortTableRows(
         pages,
-        (page) =>
-          ({
-            page: page.page_path,
-            entries: page.entry_count,
-            views: page.total_views,
-            bounce: page.bounce_rate,
-            time: durationSortValue(page.avg_time_on_page),
-          })[sort.key],
+        (page) => entryPageSortValue(page, sort.key),
         sort.direction
       ),
     [pages, sort]
@@ -182,8 +184,7 @@ function EntryPagesTable({ pages }: { pages: PageFlowEntry[] }) {
 }
 
 function ExitPagesTable({ pages }: { pages: PageFlowEntry[] }) {
-  type SortKey = 'page' | 'exits' | 'views' | 'rate' | 'time'
-  const [sort, setSort] = useState<TableSort<SortKey>>({
+  const [sort, setSort] = useState<TableSort<ExitPageSortKey>>({
     key: 'exits',
     direction: 'desc',
   })
@@ -191,14 +192,7 @@ function ExitPagesTable({ pages }: { pages: PageFlowEntry[] }) {
     () =>
       sortTableRows(
         pages,
-        (page) =>
-          ({
-            page: page.page_path,
-            exits: page.exit_count,
-            views: page.total_views,
-            rate: page.exit_rate,
-            time: durationSortValue(page.avg_time_on_page),
-          })[sort.key],
+        (page) => exitPageSortValue(page, sort.key),
         sort.direction
       ),
     [pages, sort]
@@ -287,8 +281,7 @@ function ExitPagesTable({ pages }: { pages: PageFlowEntry[] }) {
 }
 
 function DropOffTable({ points }: { points: DropOffPoint[] }) {
-  type SortKey = 'page' | 'exits' | 'views' | 'rate'
-  const [sort, setSort] = useState<TableSort<SortKey>>({
+  const [sort, setSort] = useState<TableSort<DropOffSortKey>>({
     key: 'rate',
     direction: 'desc',
   })
@@ -296,13 +289,7 @@ function DropOffTable({ points }: { points: DropOffPoint[] }) {
     () =>
       sortTableRows(
         points,
-        (point) =>
-          ({
-            page: point.page_path,
-            exits: point.exit_count,
-            views: point.total_views,
-            rate: point.exit_rate,
-          })[sort.key],
+        (point) => dropOffSortValue(point, sort.key),
         sort.direction
       ),
     [points, sort]
@@ -382,8 +369,7 @@ function DropOffTable({ points }: { points: DropOffPoint[] }) {
 }
 
 function TransitionsTable({ transitions }: { transitions: PageTransition[] }) {
-  type SortKey = 'from' | 'to' | 'count' | 'percentage'
-  const [sort, setSort] = useState<TableSort<SortKey>>({
+  const [sort, setSort] = useState<TableSort<TransitionSortKey>>({
     key: 'count',
     direction: 'desc',
   })
@@ -391,13 +377,7 @@ function TransitionsTable({ transitions }: { transitions: PageTransition[] }) {
     () =>
       sortTableRows(
         transitions,
-        (transition) =>
-          ({
-            from: transition.from_page,
-            to: transition.to_page,
-            count: transition.transition_count,
-            percentage: transition.percentage,
-          })[sort.key],
+        (transition) => transitionSortValue(transition, sort.key),
         sort.direction
       ),
     [sort, transitions]

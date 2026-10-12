@@ -15,6 +15,8 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import { NumberInput } from '@/components/ui/number-input'
+import { numberFieldProps } from '@/lib/numeric-input'
 import {
   Select,
   SelectContent,
@@ -32,7 +34,7 @@ import { ProviderFormData } from './schemas'
 
 interface ProviderFormProps {
   form: UseFormReturn<ProviderFormData>
-  onSubmit: (data: ProviderFormData) => Promise<void>
+  onSubmit: (data: ProviderFormData) => void | Promise<void>
   isEdit?: boolean
   isLoading?: boolean
   formId?: string
@@ -596,18 +598,12 @@ export function ProviderForm({
                   <FormItem>
                     <FormLabel>Timeout (seconds)</FormLabel>
                     <FormControl>
-                      <Input
-                        {...field}
-                        type="number"
+                      <NumberInput
+                        {...numberFieldProps(field)}
                         placeholder="30"
                         min={1}
                         max={300}
-                        onChange={(e) =>
-                          field.onChange(
-                            e.target.value ? parseInt(e.target.value) : 30
-                          )
-                        }
-                        value={field.value || 30}
+                        integer
                       />
                     </FormControl>
                     <FormMessage />
@@ -719,7 +715,10 @@ export function ProviderForm({
               <h4 className="text-sm font-medium mb-2">
                 Webhook Payload Format
               </h4>
-              <pre className="text-xs text-muted-foreground overflow-x-auto">
+              <pre
+                tabIndex={0}
+                className="text-xs text-muted-foreground overflow-x-auto"
+              >
                 <HighlightedCode
                   code={`{
   "id": "notification-uuid",

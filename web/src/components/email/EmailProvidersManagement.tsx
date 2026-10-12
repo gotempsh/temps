@@ -14,6 +14,8 @@ import {
 } from '@/api/client'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
+import { useConfirmDelete } from '@/components/ui/confirm-delete'
 import { CreateActionButton } from '@/components/ui/create-action-button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
@@ -251,21 +253,12 @@ function ProviderCard({
   onEditClick,
 }: {
   provider: EmailProvider
-  onDelete: (id: number) => void
+  /** Asks for confirmation; deleting happens from the confirm dialog. */
+  onDelete: (provider: EmailProvider) => void
   onTestClick: (id: number) => void
   onEditClick: (provider: EmailProvider) => void
 }) {
-  const [isDeleting, setIsDeleting] = useState(false)
   const navigate = useNavigate()
-
-  const handleDelete = () => {
-    setIsDeleting(true)
-    try {
-      onDelete(provider.id)
-    } finally {
-      setIsDeleting(false)
-    }
-  }
 
   return (
     <Card
@@ -313,10 +306,9 @@ function ProviderCard({
               <DropdownMenuSeparator />
               <DropdownMenuItem
                 className="text-destructive"
-                onClick={handleDelete}
-                disabled={isDeleting}
+                onClick={() => onDelete(provider)}
               >
-                {isDeleting ? 'Deleting...' : 'Delete'}
+                Delete
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
@@ -954,9 +946,11 @@ export function EmailProvidersManagement() {
     },
   })
 
-  const handleDelete = (id: number) => {
-    deleteMutation.mutate(id)
-  }
+  // The card menu only asks for confirmation; the request is sent from the
+  // dialog's confirm button.
+  const confirmDelete = useConfirmDelete<EmailProvider>((provider, callbacks) =>
+    deleteMutation.mutate(provider.id, callbacks)
+  )
 
   const handleTestClick = (id: number) => {
     setTestingProviderId(id)
@@ -1011,7 +1005,7 @@ export function EmailProvidersManagement() {
             <ProviderCard
               key={provider.id}
               provider={provider}
-              onDelete={handleDelete}
+              onDelete={confirmDelete.request}
               onTestClick={handleTestClick}
               onEditClick={handleEditClick}
             />
@@ -1035,6 +1029,17 @@ export function EmailProvidersManagement() {
         onSuccess={() => {
           queryClient.invalidateQueries({ queryKey: ['email-providers'] })
         }}
+      />
+
+      <ConfirmDeleteDialog
+        open={confirmDelete.open}
+        onOpenChange={(open) => {
+          if (!open) confirmDelete.cancel()
+        }}
+        resourceType="email provider"
+        resourceName={confirmDelete.target?.name}
+        isPending={deleteMutation.isPending}
+        onConfirm={confirmDelete.confirm}
       />
     </div>
   )

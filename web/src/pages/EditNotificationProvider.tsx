@@ -221,13 +221,16 @@ export function EditNotificationProvider() {
     },
   })
 
-  const handleSubmit = async (data: ProviderFormData) => {
+  // `mutate`, not `mutateAsync`: a failed save is reported by the mutation's
+  // error toast; awaiting a rejecting promise inside react-hook-form's submit
+  // handler would surface it as an unhandled rejection too.
+  const handleSubmit = (data: ProviderFormData) => {
     if (!provider) return
 
     const shouldSendCredentials = data.config.use_credentials
 
     if (data.provider_type === 'slack') {
-      await updateSlackMutation.mutateAsync({
+      updateSlackMutation.mutate({
         path: { id: provider.id },
         body: {
           name: data.name,
@@ -239,7 +242,7 @@ export function EditNotificationProvider() {
         },
       })
     } else if (data.provider_type === 'webhook') {
-      await updateWebhookMutation.mutateAsync({
+      updateWebhookMutation.mutate({
         path: { id: provider.id },
         body: {
           name: data.name,
@@ -253,7 +256,7 @@ export function EditNotificationProvider() {
         },
       })
     } else if (data.provider_type === 'cloudflare') {
-      await updateCloudflareMutation.mutateAsync({
+      updateCloudflareMutation.mutate({
         path: { id: provider.id },
         body: {
           name: data.name,
@@ -268,7 +271,7 @@ export function EditNotificationProvider() {
         },
       })
     } else {
-      await updateEmailMutation.mutateAsync({
+      updateEmailMutation.mutate({
         path: { id: provider.id },
         body: {
           name: data.name,
@@ -330,9 +333,9 @@ export function EditNotificationProvider() {
     }
   }
 
-  const handleDelete = async () => {
+  const handleDelete = () => {
     if (!provider) return
-    await deleteMutation.mutateAsync({ path: { id: provider.id } })
+    deleteMutation.mutate({ path: { id: provider.id } })
   }
 
   if (isLoading) {

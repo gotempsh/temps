@@ -161,7 +161,7 @@ export function KvService({ project }: KvServiceProps) {
                     <div className="p-4 rounded-lg border bg-muted/30">
                       <p className="text-sm text-muted-foreground">Status</p>
                       <p
-                        className={`font-medium flex items-center gap-1.5 mt-1 ${status?.healthy ? 'text-green-600' : 'text-red-600'}`}
+                        className={`font-medium flex items-center gap-1.5 mt-1 ${status?.healthy ? 'text-green-700 dark:text-green-600' : 'text-red-700 dark:text-red-600'}`}
                       >
                         {status?.healthy ? (
                           <CheckCircle2 className="h-4 w-4" />

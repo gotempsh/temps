@@ -847,7 +847,7 @@ function MiniStat({
     accent === 'green'
       ? 'text-success-strong'
       : accent === 'yellow'
-        ? 'text-yellow-600 dark:text-yellow-400'
+        ? 'text-yellow-700 dark:text-yellow-400'
         : accent === 'blue'
           ? 'text-blue-600 dark:text-blue-400'
           : ''
@@ -1283,7 +1283,10 @@ function NodeDetail({
             </AlertDialogDescription>
           </AlertDialogHeader>
           {pinnedPlacements && (
-            <ul className="max-h-48 space-y-1 overflow-y-auto rounded-md border p-2 text-sm">
+            <ul
+              tabIndex={0}
+              className="max-h-48 space-y-1 overflow-y-auto rounded-md border p-2 text-sm"
+            >
               {pinnedPlacements.map((placement) => (
                 <li
                   key={`${placement.project_id}-${placement.environment_id ?? 'default'}`}
@@ -1296,7 +1299,10 @@ function NodeDetail({
             </ul>
           )}
           {unremovedContainers && (
-            <ul className="max-h-48 space-y-1 overflow-y-auto rounded-md border p-2 font-mono text-xs break-all">
+            <ul
+              tabIndex={0}
+              className="max-h-48 space-y-1 overflow-y-auto rounded-md border p-2 font-mono text-xs break-all"
+            >
               {unremovedContainers.lines.map((container) => (
                 <li key={container}>{container}</li>
               ))}

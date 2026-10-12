@@ -610,7 +610,11 @@ export function ManagedApplicationWorkspaces({
       )}
 
       {loading && entries.length === 0 ? (
-        <div className="space-y-3" aria-label="Loading application workspaces">
+        <div
+          role="status"
+          className="space-y-3"
+          aria-label="Loading application workspaces"
+        >
           {Array.from({ length: 2 }).map((_, index) => (
             <Card key={index}>
               <CardContent className="space-y-3 py-4">

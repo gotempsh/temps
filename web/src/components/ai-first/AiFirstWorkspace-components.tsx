@@ -1716,6 +1716,7 @@ function PersistentAiFirstWorkspace() {
               <Terminal className="size-4 sm:mr-1.5" />
               <span className="hidden sm:inline">Harnesses</span>
               <span
+                role="img"
                 aria-label={
                   harnessesLoading
                     ? 'Harness readiness is being checked'
@@ -2473,6 +2474,7 @@ export function ThreadStatusIndicator({
 
   return (
     <span
+      role="img"
       className={cn(
         'inline-flex shrink-0 items-center gap-1 text-[9px] font-medium',
         presentation.text
