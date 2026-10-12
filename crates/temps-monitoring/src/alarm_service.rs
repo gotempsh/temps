@@ -3038,7 +3038,9 @@ mod tests {
             .ok()
             .expect("service dropped its connection clone")
             .into_transaction_log();
-        let sql = format!("{log:?}");
+        // `Debug` escapes the quotes inside the statement text; undo that so the
+        // assertions below read the SQL as it was sent.
+        let sql = format!("{log:?}").replace("\\\"", "\"");
         assert!(
             sql.contains("\"metadata\" ->> $"),
             "rule identity is read from metadata with bound keys: {sql}"
