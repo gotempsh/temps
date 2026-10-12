@@ -8,6 +8,7 @@
 //! deployment failures, etc.
 
 use chrono::{Duration, Utc};
+use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, DatabaseConnection,
     EntityTrait, Order, PaginatorTrait, QueryFilter, QueryOrder, Set, Statement,
@@ -276,6 +277,34 @@ fn project_id_filter(project_id: Option<i32>) -> sea_orm::sea_query::SimpleExpr 
         Some(id) => alarms::Column::ProjectId.eq(id),
         None => alarms::Column::ProjectId.is_null(),
     }
+}
+
+/// Extra cooldown/silence scope for alarms raised by a user-defined rule.
+///
+/// Every alarm a rule raises records the rule's id under `metadata.rule_id`
+/// (and, for per-series alerts, the series under `metadata.series_key`). Two
+/// rules in the same project share project, type and a NULL
+/// deployment/container/service, so without this the first rule to fire — or
+/// be silenced — mutes every other rule of that type in the project. Requests
+/// that carry no `rule_id` (container, outage, backup, … alarms) get `None`
+/// and keep the plain (project, type, deployment, container, service) scope.
+fn rule_scope_condition(metadata: Option<&serde_json::Value>) -> Option<Condition> {
+    let metadata = metadata?;
+    let rule_id = metadata
+        .get("rule_id")
+        .and_then(serde_json::Value::as_i64)?;
+
+    let mut scope = Condition::all().add(Expr::cust_with_values(
+        "(\"alarms\".\"metadata\" ->> 'rule_id') = $1",
+        [rule_id.to_string()],
+    ));
+    if let Some(series_key) = metadata.get("series_key").filter(|key| !key.is_null()) {
+        scope = scope.add(Expr::cust_with_values(
+            "(\"alarms\".\"metadata\" -> 'series_key') = ($1::text)::jsonb",
+            [series_key.to_string()],
+        ));
+    }
+    Some(scope)
 }
 
 /// Condition matching the optional list filters of [`AlarmFilters`]. Shared
@@ -1194,6 +1223,9 @@ impl AlarmService {
 
     /// Check if there's a recent alarm of the same type still within cooldown.
     ///
+    /// Alarms raised by a rule are additionally scoped to that rule (and, for
+    /// per-series alerts, that series) — see [`rule_scope_condition`].
+    ///
     /// When `deployment_id` or `container_id` is `None` (service-scoped alarms
     /// have no deployment; deployment-scoped alarms have no specific
     /// container), the filter explicitly requires `IS NULL` so alarms scoped
@@ -1232,6 +1264,12 @@ impl AlarmService {
                 // suppress deployment-scoped alarms and vice versa.
                 query = query.filter(alarms::Column::ContainerId.is_null());
             }
+        }
+
+        if let Some(rule_scope) = rule_scope_condition(request.metadata.as_ref()) {
+            // Cooldown and silence belong to the rule (and series) that raised
+            // the alarm, not to every rule that shares its project and type.
+            query = query.filter(rule_scope);
         }
 
         match request.service_id {
@@ -2307,6 +2345,184 @@ mod tests {
             "an active silence must suppress the new fire, same as an ordinary cooldown hit"
         );
         assert_eq!(notification_service.send_count(), 0);
+    }
+
+    // ── Rule-scoped cooldown / silence ────────────────────────────────
+
+    fn rule_fire_request(
+        project_id: i32,
+        rule_id: i32,
+        series_key: Option<serde_json::Value>,
+    ) -> FireAlarmRequest {
+        let mut metadata = serde_json::json!({ "rule_id": rule_id });
+        if let (Some(key), serde_json::Value::Object(map)) = (series_key, &mut metadata) {
+            map.insert("series_key".to_string(), key);
+        }
+        FireAlarmRequest {
+            project_id: Some(project_id),
+            environment_id: None,
+            deployment_id: None,
+            container_id: None,
+            service_id: None,
+            alarm_type: AlarmType::DeploymentMetricThreshold,
+            severity: AlarmSeverity::Warning,
+            title: format!("Rule {rule_id} breached"),
+            message: "metric above threshold".to_string(),
+            metadata: Some(metadata),
+        }
+    }
+
+    /// SQL of the cooldown query for `request`, captured from a mock database.
+    async fn cooldown_query_for(request: FireAlarmRequest) -> String {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[maplit::btreemap! {
+                    "num_items" => sea_orm::Value::BigInt(Some(1)),
+                }]])
+                .into_connection(),
+        );
+        let service = AlarmService::new(
+            db.clone(),
+            Arc::new(TrackingNotificationService::new()),
+            Arc::new(TrackingJobQueue::new()),
+        );
+        let _ = service.is_in_cooldown(&request).await;
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .ok()
+            .expect("the service was dropped, so the mock connection has one owner")
+            .into_transaction_log();
+        format!("{log:?}")
+    }
+
+    #[test]
+    fn rule_scope_is_absent_for_alarms_without_a_rule() {
+        assert!(rule_scope_condition(None).is_none());
+        assert!(rule_scope_condition(Some(&serde_json::json!({"restart_count": 3}))).is_none());
+        // A non-integer rule_id is not a rule scope.
+        assert!(rule_scope_condition(Some(&serde_json::json!({"rule_id": "7"}))).is_none());
+    }
+
+    /// Reported defect: the cooldown query matched on project + type only, so
+    /// one rule's (or one silenced alarm's) row suppressed every other rule.
+    #[tokio::test]
+    async fn cooldown_query_is_scoped_to_the_rule_that_fires() {
+        let rule_7 = cooldown_query_for(rule_fire_request(1, 7, None)).await;
+        let rule_8 = cooldown_query_for(rule_fire_request(1, 8, None)).await;
+
+        assert!(
+            rule_7.contains("'rule_id'"),
+            "cooldown must filter on metadata.rule_id: {rule_7}"
+        );
+        assert!(
+            rule_7.contains("\"7\""),
+            "rule 7 id must be bound: {rule_7}"
+        );
+        assert!(
+            rule_8.contains("\"8\""),
+            "rule 8 id must be bound: {rule_8}"
+        );
+        assert_ne!(rule_7, rule_8, "different rules must not share a bucket");
+    }
+
+    #[tokio::test]
+    async fn cooldown_query_is_not_rule_scoped_for_plain_alarms() {
+        let plain = cooldown_query_for(sample_fire_request()).await;
+        assert!(
+            !plain.contains("'rule_id'"),
+            "alarms with no rule keep the existing scope: {plain}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cooldown_query_for_a_series_is_scoped_to_that_series() {
+        let series = serde_json::json!([["host", "web-1"]]);
+        let sql = cooldown_query_for(rule_fire_request(1, 7, Some(series))).await;
+        assert!(
+            sql.contains("'series_key'"),
+            "per-series alarms must be scoped to their series: {sql}"
+        );
+    }
+
+    /// End to end against Postgres: silencing (and then resolving) one rule's
+    /// alarm must leave other rules in the project free to fire, while the
+    /// silenced rule itself stays muted.
+    #[tokio::test]
+    async fn silenced_alarm_of_one_rule_does_not_suppress_other_rules() {
+        let Some(f) = bulk_fixture().await else {
+            return;
+        };
+        let project = f.project_a;
+
+        let first = f
+            .service
+            .fire_alarm(rule_fire_request(project, 1, None))
+            .await
+            .expect("rule 1 fires")
+            .expect("rule 1 is not suppressed");
+        f.service
+            .silence_alarm(first, Some(project), Duration::hours(1))
+            .await
+            .expect("silence rule 1's alarm");
+        f.service
+            .resolve_alarm(first, Some(project))
+            .await
+            .expect("resolve rule 1's alarm");
+
+        let other_rule = f
+            .service
+            .fire_alarm(rule_fire_request(project, 2, None))
+            .await
+            .expect("rule 2 fires");
+        assert!(
+            other_rule.is_some(),
+            "a second rule must raise its own alarm"
+        );
+
+        let same_rule = f
+            .service
+            .fire_alarm(rule_fire_request(project, 1, None))
+            .await
+            .expect("rule 1 re-fires");
+        assert_eq!(
+            same_rule, None,
+            "the silenced rule itself stays muted until the silence expires"
+        );
+    }
+
+    #[tokio::test]
+    async fn silenced_series_does_not_suppress_sibling_series() {
+        let Some(f) = bulk_fixture().await else {
+            return;
+        };
+        let project = f.project_a;
+        let web_1 = serde_json::json!([["host", "web-1"]]);
+        let web_2 = serde_json::json!([["host", "web-2"]]);
+
+        let first = f
+            .service
+            .fire_alarm(rule_fire_request(project, 5, Some(web_1.clone())))
+            .await
+            .expect("series web-1 fires")
+            .expect("series web-1 is not suppressed");
+        f.service
+            .silence_alarm(first, Some(project), Duration::hours(1))
+            .await
+            .expect("silence web-1's alarm");
+
+        let sibling = f
+            .service
+            .fire_alarm(rule_fire_request(project, 5, Some(web_2)))
+            .await
+            .expect("series web-2 fires");
+        assert!(sibling.is_some(), "sibling series must still alarm");
+
+        let same_series = f
+            .service
+            .fire_alarm(rule_fire_request(project, 5, Some(web_1)))
+            .await
+            .expect("series web-1 re-fires");
+        assert_eq!(same_series, None, "the silenced series stays muted");
     }
 
     // ── AlarmService.get_alarm_summary tests ──────────────────────────
