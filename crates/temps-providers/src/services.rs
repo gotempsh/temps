@@ -4457,6 +4457,7 @@ impl ExternalServiceManager {
         // Get existing parameters and merge updates
         let mut existing_params = self.get_service_parameters(service_id).await?;
         let previous_image = existing_params.get("docker_image").cloned();
+        let previous_replica_set = existing_params.get("replica_set").cloned();
         strategy
             .merge_updates(&mut existing_params, update_params)
             .map_err(|reason| ExternalServiceError::ParameterValidationFailed {
@@ -4468,6 +4469,19 @@ impl ExternalServiceManager {
         // current one's data (#1415).
         if existing_params.get("docker_image") != previous_image.as_ref() {
             self.ensure_recreate_keeps_data(&service, &existing_params, "changing its image")
+                .await?;
+        }
+        // Enabling a MongoDB replica set also means a new container (the
+        // flag is on its command line): refuse before saving when the data
+        // would not come along, rather than report a setting that can't apply.
+        let replica_set_enabled = existing_params
+            .get("replica_set")
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| !v.is_empty());
+        if replica_set_enabled
+            && existing_params.get("replica_set") != previous_replica_set.as_ref()
+        {
+            self.ensure_recreate_keeps_data(&service, &existing_params, "enabling its replica set")
                 .await?;
         }
 

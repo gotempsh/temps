@@ -2626,14 +2626,31 @@ impl ExternalService for MongodbService {
                     || self.create_container_once(docker, &config, &limits),
                 )
                 .await;
+                let start_original = || async {
+                    docker
+                        .start_container(
+                            &container_name,
+                            None::<bollard::query_parameters::StartContainerOptions>,
+                        )
+                        .await
+                        .or_else(|e| match e {
+                            bollard::errors::Error::DockerResponseServerError {
+                                status_code: 304,
+                                ..
+                            } => Ok(()),
+                            e => Err(e),
+                        })
+                        .map_err(|e| anyhow::anyhow!("Failed to start MongoDB container: {}", e))
+                };
                 match recreated {
                     Ok(_) => {}
-                    Err(e) => {
-                        // Replica-set mode is optional; the data is not. The
-                        // guard refused before touching anything or put the
-                        // original back: start it unchanged, and don't hand
-                        // out replica-set connection strings for a
-                        // standalone server.
+                    // The layout cannot carry the data over. Nothing was
+                    // changed; the data matters more than replica-set mode,
+                    // so the standalone server starts as it is, and no
+                    // replica-set connection strings are handed out for it.
+                    // (Changing the setting is refused before it is saved,
+                    // so this is only reached for a setting saved earlier.)
+                    Err(e) if e.is_refusal() => {
                         warn!(
                             service = %self.name,
                             container = %container_name,
@@ -2641,23 +2658,23 @@ impl ExternalService for MongodbService {
                             "Not enabling the replica set; starting the existing standalone container unchanged"
                         );
                         config.replica_set = None;
-                        docker
-                            .start_container(
-                                &container_name,
-                                None::<bollard::query_parameters::StartContainerOptions>,
-                            )
-                            .await
-                            .or_else(|e| match e {
-                                bollard::errors::Error::DockerResponseServerError {
-                                    status_code: 304,
-                                    ..
-                                } => Ok(()),
-                                e => Err(e),
-                            })
-                            .map_err(|e| {
-                                anyhow::anyhow!("Failed to start MongoDB container: {}", e)
-                            })?;
+                        start_original().await?;
                     }
+                    // A replacement was attempted and rolled back, verified:
+                    // the standalone original is back. Keep it running, but
+                    // report that the replica set was not enabled.
+                    Err(e) if e.original_in_place() => {
+                        start_original().await?;
+                        return Err(anyhow::anyhow!(
+                            "The replica set of MongoDB service '{}' was not enabled; the \
+                             standalone server was restored and is running: {}",
+                            self.name,
+                            e
+                        ));
+                    }
+                    // The rollback did not complete: never start anything
+                    // that may share the data with another server.
+                    Err(e) => return Err(e.into()),
                 }
                 *self.config.write().await = Some(config);
             } else {

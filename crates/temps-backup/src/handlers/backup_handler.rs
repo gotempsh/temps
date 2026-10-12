@@ -3244,16 +3244,18 @@ async fn run_external_service_backup(
         );
     }
 
-    // Recorded on the job: the engine re-checks at run time, so a restart
-    // that only became necessary after this request (archiving turned off
-    // by a restore in between) is refused rather than done unconfirmed.
+    // Recorded on the job is the caller's consent, not this moment's
+    // probe: the engine enforces it when it decides to restart, so a restart
+    // that only became necessary after this request (archiving turned off by
+    // a restore in between) happens only if the caller agreed to one.
+    let allow_restart = request.confirm_restart == Some(true);
     let trigger = BackupTriggerParams {
         engine: engine_key.to_string(),
         params: serde_json::json!({
             "service_id": service.id,
             "s3_source_id": s3_source_id,
             "backup_type": backup_type,
-            "allow_restart": restart_reason.is_some(),
+            "allow_restart": allow_restart,
         }),
         max_runtime_secs: None,
     };

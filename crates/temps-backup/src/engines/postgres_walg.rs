@@ -221,7 +221,15 @@ impl BackupEngine for PostgresWalgEngine {
             unconfirmed_restart_gate(service.id, &service.name, probe)?;
         }
         let archiving = postgres_service
-            .enable_continuous_archiving_reporting(service_config, &s3_credentials, &walg_prefix)
+            .enable_continuous_archiving_reporting(
+                service_config,
+                &s3_credentials,
+                &walg_prefix,
+                // Enforced where the restart is decided, not only probed
+                // above: archiving can be turned off in between (an in-place
+                // restore finishing).
+                allow_restart,
+            )
             .await
             .map_err(|error| {
                 let reason = format!(
@@ -232,7 +240,10 @@ impl BackupEngine for PostgresWalgEngine {
                 // retrying cannot change it, only repeat the refusal.
                 let refused = error
                     .downcast_ref::<temps_providers::externalsvc::recreate_guard::RecreateGuardError>()
-                    .is_some_and(|guard| guard.is_refusal());
+                    .is_some_and(|guard| guard.is_refusal())
+                    || error
+                        .downcast_ref::<temps_providers::externalsvc::postgres::PostgresRestartNotConfirmed>()
+                        .is_some();
                 if refused {
                     BackupError::PermanentFailure { reason }
                 } else {

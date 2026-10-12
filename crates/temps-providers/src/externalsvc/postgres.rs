@@ -94,6 +94,19 @@ pub struct WalArchivingOutcome {
     pub restarted: bool,
 }
 
+/// Enabling WAL archiving would restart PostgreSQL, and the caller did not
+/// agree to a restart (a manual backup run without `confirm_restart`).
+/// Decided before anything is changed, or with the change undone.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "Enabling WAL archiving for PostgreSQL service '{service_name}' needs a restart (archive_mode \
+     is off), and a restart was not confirmed. Nothing was restarted. Run the backup again and \
+     confirm the restart"
+)]
+pub struct PostgresRestartNotConfirmed {
+    pub service_name: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("Failed to verify WAL archiving for PostgreSQL service '{service_name}': {reason}. Check this service's logs and retry this operation")]
 struct PostgresArchiveVerificationError {
@@ -1410,6 +1423,7 @@ impl PostgresService {
         container_name: &str,
         walg_env: &[String],
         postgres_config: &PostgresConfig,
+        allow_restart: bool,
     ) -> Result<WalArchivingOutcome> {
         use bollard::exec::{CreateExecOptions, StartExecOptions};
 
@@ -1432,6 +1446,12 @@ impl PostgresService {
         if postgres_config.container_name.is_none() {
             let (mode, _) = self.archive_settings(postgres_config, None).await?;
             if mode == "off" {
+                if !allow_restart {
+                    return Err(PostgresRestartNotConfirmed {
+                        service_name: self.name.clone(),
+                    }
+                    .into());
+                }
                 let replacement = self.replacement_storage(postgres_config)?;
                 super::recreate_guard::preflight(
                     &self.docker,
@@ -1540,6 +1560,18 @@ impl PostgresService {
             container_name
         );
 
+        // archive_mode can have been turned off since the check above (an
+        // in-place restore finishing meanwhile): the restart is decided here,
+        // so the caller's consent is enforced here too. Undo walg.env, or
+        // every later start would try the same recreate.
+        if !allow_restart {
+            self.remove_walg_env(container_name).await;
+            return Err(PostgresRestartNotConfirmed {
+                service_name: self.name.clone(),
+            }
+            .into());
+        }
+
         // Step 3: recreate so archive_mode=on lands in CMD args. A
         // command-line `-c archive_mode=off` outranks ALTER SYSTEM, so a
         // restart alone cannot turn it on for a container created with it.
@@ -1568,26 +1600,7 @@ impl PostgresService {
             // The original container is back (or was never touched). Take
             // walg.env away again, or every later start would see "archiving
             // configured" and try the same recreate.
-            if let Err(cleanup) = super::exec_util::run_exec(
-                &self.docker,
-                container_name,
-                vec![
-                    "rm".to_string(),
-                    "-f".to_string(),
-                    walg_env_path.to_string(),
-                ],
-                None,
-                Duration::from_secs(30),
-            )
-            .await
-            {
-                warn!(
-                    service = %self.name,
-                    container = container_name,
-                    error = %cleanup,
-                    "Could not remove walg.env after enabling WAL archiving failed"
-                );
-            }
+            self.remove_walg_env(container_name).await;
             return Err(e);
         }
 
@@ -1608,6 +1621,30 @@ impl PostgresService {
         );
 
         Ok(WalArchivingOutcome { restarted: true })
+    }
+
+    /// Remove `walg.env` from the service's volume, best effort.
+    async fn remove_walg_env(&self, container_name: &str) {
+        if let Err(cleanup) = super::exec_util::run_exec(
+            &self.docker,
+            container_name,
+            vec![
+                "rm".to_string(),
+                "-f".to_string(),
+                "/var/lib/postgresql/walg.env".to_string(),
+            ],
+            None,
+            Duration::from_secs(30),
+        )
+        .await
+        {
+            warn!(
+                service = %self.name,
+                container = container_name,
+                error = %cleanup,
+                "Could not remove walg.env after WAL archiving was not enabled"
+            );
+        }
     }
 
     /// Read settings from PostgreSQL itself, rather than inferring them
@@ -3119,7 +3156,7 @@ impl PostgresService {
             // verification as the v2 engine. Persist any refusal as a failed
             // child rather than completing an unrestorable base backup.
             let archiving = self
-                .write_wal_archiving_config(service_config, s3_credentials, &walg_s3_prefix)
+                .write_wal_archiving_config(service_config, s3_credentials, &walg_s3_prefix, true)
                 .await?;
             if archiving.restarted {
                 info!(
@@ -4359,11 +4396,16 @@ impl ExternalService for PostgresService {
                         }
                         Err(e)
                             if e.downcast_ref::<super::recreate_guard::RecreateGuardError>()
-                                .is_some() =>
+                                .is_some_and(|g| g.original_in_place()) =>
                         {
                             // Drift repair is optional; data is not. The
-                            // guard either refused before touching anything
-                            // or put the original back: start it unchanged.
+                            // guard refused before touching anything, or a
+                            // verified rollback put the original back exactly
+                            // as it was: start it unchanged. Any other
+                            // failure (a rollback that did not complete) is
+                            // returned: the original may still be set aside
+                            // or a replacement that failed verification may
+                            // hold its name, and that needs an operator.
                             warn!(
                                 service = %self.name,
                                 container = %container_name,
@@ -4465,7 +4507,7 @@ impl ExternalService for PostgresService {
         // Every backup reconciles the explicit, pinned write destination.
         // enable_wal_archiving verifies the actual command and recreates only
         // when PostgreSQL's archive_mode needs a postmaster restart.
-        self.write_wal_archiving_config(service_config, s3_credentials, walg_prefix)
+        self.write_wal_archiving_config(service_config, s3_credentials, walg_prefix, true)
             .await
             .map(|_| ())
     }
@@ -5289,20 +5331,24 @@ impl PostgresService {
         s3_credentials: &super::S3Credentials,
         walg_prefix: &str,
     ) -> Result<()> {
-        self.write_wal_archiving_config(service_config, s3_credentials, walg_prefix)
+        self.write_wal_archiving_config(service_config, s3_credentials, walg_prefix, true)
             .await
             .map(|_| ())
     }
 
     /// [`ExternalService::enable_continuous_archiving`], also reporting
-    /// whether PostgreSQL had to be restarted, so a backup can say so.
+    /// whether PostgreSQL had to be restarted, so a backup can say so. With
+    /// `allow_restart` false it never restarts PostgreSQL: when turning
+    /// archiving on would need one it returns [`PostgresRestartNotConfirmed`]
+    /// and changes nothing.
     pub async fn enable_continuous_archiving_reporting(
         &self,
         service_config: ServiceConfig,
         s3_credentials: &super::S3Credentials,
         walg_prefix: &str,
+        allow_restart: bool,
     ) -> Result<WalArchivingOutcome> {
-        self.write_wal_archiving_config(service_config, s3_credentials, walg_prefix)
+        self.write_wal_archiving_config(service_config, s3_credentials, walg_prefix, allow_restart)
             .await
     }
 
@@ -5353,6 +5399,7 @@ impl PostgresService {
         service_config: ServiceConfig,
         s3_credentials: &super::S3Credentials,
         walg_prefix: &str,
+        allow_restart: bool,
     ) -> Result<WalArchivingOutcome> {
         // Backup engines construct a fresh provider. Hydrate its limits from
         // the registered service before an off-policy managed recreation so
@@ -5388,7 +5435,7 @@ impl PostgresService {
             walg_env.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
         }
 
-        self.enable_wal_archiving(&container_name, &walg_env, &postgres_config)
+        self.enable_wal_archiving(&container_name, &walg_env, &postgres_config, allow_restart)
             .await
     }
 }
@@ -5688,6 +5735,7 @@ mod tests {
                 fixture.off.container_name.as_deref().unwrap(),
                 &["WALG_S3_PREFIX=s3://test-bucket/unused".to_string()],
                 &fixture.off,
+                true,
             )
             .await
             .expect_err("an imported off-policy container must never be recreated");
@@ -8801,7 +8849,7 @@ mod tests {
 
             let provider = PostgresService::new(service.clone(), Arc::new(docker.clone()));
             let err = provider
-                .enable_wal_archiving(&container, &walg_env(), &config(port, config_image))
+                .enable_wal_archiving(&container, &walg_env(), &config(port, config_image), true)
                 .await
                 .expect_err("archiving must be refused for this layout");
             assert_refusal(&err);
@@ -8986,6 +9034,47 @@ mod tests {
             .identity
         }
 
+        /// A manual backup run without confirming a restart never restarts
+        /// PostgreSQL: with archive_mode off, enabling archiving is refused
+        /// at the point the restart would be decided, and nothing changes.
+        #[tokio::test]
+        async fn archiving_without_restart_consent_changes_nothing() {
+            let Some(docker) = docker_or_skip("archiving_without_restart_consent").await else {
+                return;
+            };
+            let scope = RunScope::new(&docker, "noconsent");
+            let service = scope.name("svc");
+            let container = postgres_container_name(&service);
+            scope.track_volume(postgres_volume_names(&service)[0].clone());
+            let port = find_available_port_async(&docker, 25432)
+                .await
+                .expect("free port");
+            let provider = PostgresService::new(service.clone(), Arc::new(docker.clone()));
+            let cfg = config(port, WALG_18);
+            provider
+                .init(ServiceConfig {
+                    name: service.clone(),
+                    service_type: ServiceType::Postgres,
+                    version: None,
+                    parameters: serde_json::to_value(&cfg).unwrap(),
+                })
+                .await
+                .expect("init");
+            seed(&docker, &container).await;
+            let id = container_id(&docker, &container).await.unwrap();
+
+            let err = provider
+                .enable_wal_archiving(&container, &walg_env(), &cfg, false)
+                .await
+                .expect_err("a restart without consent");
+            assert!(
+                err.downcast_ref::<PostgresRestartNotConfirmed>().is_some(),
+                "{err:#}"
+            );
+            assert_untouched(&docker, &container, &id).await;
+            scope.cleanup().await;
+        }
+
         /// The exact #1415 flow on a service Temps created: archive_mode off,
         /// then "Run backup"'s archiving step. It restarts PostgreSQL in a new
         /// container, and the data, roles and cluster identity are the same.
@@ -9025,7 +9114,7 @@ mod tests {
             let old_id = container_id(&docker, &container).await.unwrap();
 
             let outcome = provider
-                .enable_wal_archiving(&container, &walg_env(), &cfg)
+                .enable_wal_archiving(&container, &walg_env(), &cfg, true)
                 .await
                 .expect("archiving on a managed service");
             assert!(outcome.restarted);
@@ -9058,7 +9147,7 @@ mod tests {
 
             // A second backup must not restart it again.
             let again = provider
-                .enable_wal_archiving(&container, &walg_env(), &cfg)
+                .enable_wal_archiving(&container, &walg_env(), &cfg, true)
                 .await
                 .expect("already archiving");
             assert!(!again.restarted);

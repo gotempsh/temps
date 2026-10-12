@@ -63,6 +63,10 @@ use tracing::{error, info, warn};
 /// the replacement's startup short.
 const STOP_TIMEOUT_SECS: i32 = 60;
 
+/// How long a stop requested by an abandoned recreate can still be running
+/// in the Docker daemon after its caller went away.
+const ABANDONED_STOP_GRACE: Duration = Duration::from_secs(STOP_TIMEOUT_SECS as u64 + 5);
+
 /// Attempts at reading the replacement's fingerprint once it reports healthy.
 /// A healthy container can still refuse its first connections for a moment.
 const FINGERPRINT_ATTEMPTS: u32 = 10;
@@ -526,6 +530,8 @@ pub enum RecreateGuardError {
         operation: String,
         reason: String,
         restored: String,
+        /// The original is back under its name, as it was (verified).
+        original_in_place: bool,
     },
 
     #[error(
@@ -539,6 +545,9 @@ pub enum RecreateGuardError {
         operation: String,
         reason: String,
         rollback: String,
+        /// The rollback completed: the original is back under its name, as
+        /// it was, with nothing else running on its volume (verified).
+        original_in_place: bool,
     },
 
     #[error(
@@ -552,6 +561,9 @@ pub enum RecreateGuardError {
         operation: String,
         reason: String,
         rollback: String,
+        /// The rollback completed: the original is back under its name, as
+        /// it was, with nothing else running on its volume (verified).
+        original_in_place: bool,
     },
 }
 
@@ -569,6 +581,33 @@ impl RecreateGuardError {
                 | RecreateGuardError::ReplacementWithoutDataMount { .. }
                 | RecreateGuardError::TablespaceNotCarriedOver { .. }
         )
+    }
+
+    /// Whether the original container is in place exactly as it was: the
+    /// guard refused before changing anything, or a rollback completed and
+    /// was verified. Only then may a caller fall back to using the original
+    /// (for example, starting it unchanged). Otherwise the state needs an
+    /// operator: the original may still be set aside, or a replacement that
+    /// failed verification may still hold its name.
+    pub fn original_in_place(&self) -> bool {
+        match self {
+            RecreateGuardError::DataInContainerLayer { .. }
+            | RecreateGuardError::StorageNotCarriedOver { .. }
+            | RecreateGuardError::DataPathChanged { .. }
+            | RecreateGuardError::NestedMountNotCarriedOver { .. }
+            | RecreateGuardError::ReplacementWithoutDataMount { .. }
+            | RecreateGuardError::TablespaceNotCarriedOver { .. }
+            | RecreateGuardError::Inspect { .. } => true,
+            RecreateGuardError::SetAside {
+                original_in_place, ..
+            }
+            | RecreateGuardError::ReplacementFailed {
+                original_in_place, ..
+            }
+            | RecreateGuardError::DataNotPreserved {
+                original_in_place, ..
+            } => *original_in_place,
+        }
     }
 }
 
@@ -1007,7 +1046,24 @@ impl Drop for PendingRollback {
                     // Held until the original is back.
                     let _turn = turn;
                     let outcome = roll_back(&docker, &old, &aside_name, &volume).await;
-                    warn!(container = %old.name, %outcome, "Abandoned recreate rolled back");
+                    warn!(
+                        container = %old.name,
+                        restored = outcome.restored,
+                        outcome = %outcome.message,
+                        "Abandoned recreate rolled back"
+                    );
+                    // A stop the abandoned future had asked for keeps running
+                    // in the daemon and can finish after this restart. Once
+                    // it can no longer be in flight, make sure again.
+                    tokio::time::sleep(ABANDONED_STOP_GRACE).await;
+                    let outcome = roll_back(&docker, &old, &aside_name, &volume).await;
+                    if !outcome.restored {
+                        error!(
+                            container = %old.name,
+                            outcome = %outcome.message,
+                            "Abandoned recreate could not be fully rolled back"
+                        );
+                    }
                 });
             }
             Err(_) => error!(
@@ -1082,6 +1138,8 @@ where
                 operation: operation.to_string(),
                 reason: e.to_string(),
                 rollback: "There was no previous container to restore".to_string(),
+                // Nothing to fall back to.
+                original_in_place: false,
             })?;
         return Ok(RecreateReport {
             replaced: false,
@@ -1118,19 +1176,10 @@ where
     );
 
     let aside_name = set_aside_name(container_name);
-    if let Err(reason) = set_aside(docker, &old, &aside_name).await {
-        let restored = match restore_original(docker, &old, &aside_name, &storage.volume).await {
-            Ok(()) => " and restored".to_string(),
-            Err(e) => format!("; restoring it also failed: {e}"),
-        };
-        return Err(RecreateGuardError::SetAside {
-            service: service_name.to_string(),
-            container: container_name.to_string(),
-            operation: operation.to_string(),
-            reason,
-            restored,
-        });
-    }
+    // Armed before the first change and kept armed until a rollback has
+    // finished: dropping this future at any await from here on (a cancelled
+    // backup, a client that went away) restores the original on its own
+    // task. A rollback is idempotent, so a second one is harmless.
     let mut pending = PendingRollback {
         docker: docker.clone(),
         old: old.clone(),
@@ -1139,17 +1188,34 @@ where
         turn,
         armed: true,
     };
+    if let Err(reason) = set_aside(docker, &old, &aside_name).await {
+        let restore = restore_original(docker, &old, &aside_name, &storage.volume).await;
+        pending.disarm();
+        let (restored, original_in_place) = match restore {
+            Ok(()) => (" and restored".to_string(), true),
+            Err(e) => (format!("; restoring it also failed: {e}"), false),
+        };
+        return Err(RecreateGuardError::SetAside {
+            service: service_name.to_string(),
+            container: container_name.to_string(),
+            operation: operation.to_string(),
+            reason,
+            restored,
+            original_in_place,
+        });
+    }
 
     if let Err(e) = create().await {
-        pending.disarm();
         let rollback = roll_back(docker, &old, &aside_name, &storage.volume).await;
+        pending.disarm();
         return Err(RecreateGuardError::ReplacementFailed {
             engine,
             service: service_name.to_string(),
             container: container_name.to_string(),
             operation: operation.to_string(),
             reason: e.to_string(),
-            rollback,
+            rollback: rollback.message,
+            original_in_place: rollback.restored,
         });
     }
 
@@ -1164,15 +1230,16 @@ where
             %reason,
             "Recreated container does not hold the original data; rolling back"
         );
-        pending.disarm();
         let rollback = roll_back(docker, &old, &aside_name, &storage.volume).await;
+        pending.disarm();
         return Err(RecreateGuardError::DataNotPreserved {
             engine,
             service: service_name.to_string(),
             container: container_name.to_string(),
             operation: operation.to_string(),
             reason,
-            rollback,
+            rollback: rollback.message,
+            original_in_place: rollback.restored,
         });
     }
 
@@ -1543,14 +1610,23 @@ async fn restore_original(
     Ok(())
 }
 
+/// How a rollback ended.
+struct Rollback {
+    /// The original is back under its name, as it was, with nothing else
+    /// running on its volume.
+    restored: bool,
+    /// A sentence for the error message.
+    message: String,
+}
+
 /// Remove the replacement (never the original, never with volumes) and
-/// restore the original. Returns a sentence for the error message.
+/// restore the original.
 async fn roll_back(
     docker: &Docker,
     old: &ContainerSnapshot,
     aside_name: &str,
     volume: &str,
-) -> String {
+) -> Rollback {
     let mut problems = Vec::new();
     match docker
         .inspect_container(&old.name, None::<InspectContainerOptions>)
@@ -1583,12 +1659,15 @@ async fn roll_back(
         }
     }
     if problems.is_empty() {
-        format!(
-            "The replacement was removed and the original container '{}' was restored{}; no \
-             data was deleted",
-            old.name,
-            if old.running { " and restarted" } else { "" }
-        )
+        Rollback {
+            restored: true,
+            message: format!(
+                "The replacement was removed and the original container '{}' was restored{}; no \
+                 data was deleted",
+                old.name,
+                if old.running { " and restarted" } else { "" }
+            ),
+        }
     } else {
         error!(
             container = %old.name,
@@ -1596,13 +1675,19 @@ async fn roll_back(
             problems = %problems.join("; "),
             "Rolling back a failed container recreate did not complete"
         );
-        format!(
-            "Rolling back did not complete ({}). No data was deleted: the original container is \
-             kept stopped as '{}' with its volumes; rename it back to '{}' and start it",
-            problems.join("; "),
-            aside_name,
-            old.name
-        )
+        Rollback {
+            restored: false,
+            message: format!(
+                "Rolling back did not complete ({}). No data was deleted: the original \
+                 container is kept stopped with restarts disabled (named '{}' or '{}') with its \
+                 volumes; once nothing else runs on volume '{}', restore its name, restart \
+                 policy and start it",
+                problems.join("; "),
+                aside_name,
+                old.name,
+                volume
+            ),
+        }
     }
 }
 
@@ -2339,6 +2424,33 @@ mod tests {
             &["/var/lib/postgresql/tablespaces/ts1".to_string()],
         )
         .is_err());
+    }
+
+    #[test]
+    fn only_refusals_and_verified_rollbacks_leave_the_original_usable() {
+        let refused = check(
+            &snapshot(
+                &["PGDATA=/pgdata"],
+                &[],
+                vec![volume("postgres-app_data", "/var/lib/postgresql")],
+            ),
+            &pg18_replacement(),
+        )
+        .unwrap_err();
+        assert!(refused.original_in_place());
+        let failed = |restored: bool| RecreateGuardError::DataNotPreserved {
+            engine: ManagedEngine::Postgres,
+            service: "app".into(),
+            container: "postgres-app".into(),
+            operation: "a test".into(),
+            reason: "identity changed".into(),
+            rollback: "…".into(),
+            original_in_place: restored,
+        };
+        assert!(failed(true).original_in_place());
+        // A rollback that did not complete: never fall back to "start it".
+        assert!(!failed(false).original_in_place());
+        assert!(!failed(false).is_refusal());
     }
 
     #[test]
@@ -3456,6 +3568,85 @@ mod docker_tests {
             .and_then(|h| h.restart_policy)
             .and_then(|p| p.name);
         assert_eq!(policy, Some(RestartPolicyNameEnum::ALWAYS));
+        scope.cleanup().await;
+    }
+
+    /// Cancelled while the original is still being stopped (before it was
+    /// renamed): the original ends up back under its name, running, with
+    /// its restart policy, even though the daemon finished that stop later.
+    #[tokio::test]
+    async fn a_recreate_abandoned_while_stopping_restores_the_original() {
+        let Some(docker) =
+            docker_or_skip("a_recreate_abandoned_while_stopping_restores_the_original").await
+        else {
+            return;
+        };
+        let scope = RunScope::new(&docker, "midstop");
+        let name = scope.name("svc");
+        let volume = scope.name("data");
+        scope.track_volume(&volume);
+        // `sleep` as PID 1 ignores SIGTERM: a stop takes the full timeout.
+        let original_id = run_container(
+            &docker,
+            &name,
+            "alpine:3.22",
+            &[],
+            Some(vec!["sleep".into(), "3600".into()]),
+            vec![volume_mount(&volume, "/data")],
+            None,
+        )
+        .await;
+
+        let abandoned = tokio::time::timeout(
+            Duration::from_secs(3),
+            recreate_preserving_data(
+                RecreateRequest {
+                    docker: &docker,
+                    engine: ManagedEngine::Redis,
+                    service_name: "app",
+                    container_name: &name,
+                    replacement: ReplacementStorage {
+                        data_dir: "/data".into(),
+                        mounts: vec![PlannedMount {
+                            volume: volume.clone(),
+                            target: "/data".into(),
+                        }],
+                    },
+                    operation: "a test",
+                },
+                || async { Ok::<(), String>(()) },
+            ),
+        )
+        .await;
+        assert!(abandoned.is_err(), "abandoned while the stop was in flight");
+
+        let deadline = std::time::Instant::now() + ABANDONED_STOP_GRACE + Duration::from_secs(30);
+        let mut back = false;
+        while std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let policy = docker
+                .inspect_container(&name, None::<InspectContainerOptions>)
+                .await
+                .ok()
+                .and_then(|c| {
+                    c.host_config
+                        .and_then(|h| h.restart_policy)
+                        .and_then(|p| p.name)
+                });
+            if container_id(&docker, &name).await.as_deref() == Some(original_id.as_str())
+                && is_running(&docker, &name).await
+                && policy == Some(RestartPolicyNameEnum::ALWAYS)
+                && std::time::Instant::now() > deadline - Duration::from_secs(25)
+            {
+                back = true;
+                break;
+            }
+        }
+        assert!(
+            back,
+            "the original is back, running, with its restart policy, after the late stop"
+        );
+        assert!(set_aside_containers(&docker, &name).await.is_empty());
         scope.cleanup().await;
     }
 
