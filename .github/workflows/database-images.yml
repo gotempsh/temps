@@ -65,8 +65,17 @@ on:
         type: boolean
         default: false
 
+# Every run that can publish shares ONE group, whatever its ref. A release
+# (refs/tags/...) and the weekly or push-triggered run (refs/heads/main) used
+# to get different groups, so they could overlap: a release that planned an
+# alias copy from the old image could write it over tags a scheduled build
+# had published in between. Serializing planning and publishing together
+# means each run plans against what the previous one actually left behind.
+# Runs that publish nothing (pull requests, dry runs) only supersede
+# themselves. Queued publishers wait; GitHub keeps one pending run per group,
+# so a third arrival replaces the pending one -- re-run it if that happens.
 concurrency:
-  group: database-images-${{ github.ref }}
+  group: ${{ (github.event_name == 'pull_request' || inputs.dry_run == true) && format('database-images-verify-{0}', github.ref) || 'database-images-publish' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:

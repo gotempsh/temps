@@ -49,6 +49,10 @@ pointed at the existing digest instead of being rebuilt. And if GHCR cannot be
 asked whether a tag exists (rate limit, outage), the run fails rather than
 treating the tag as missing.
 
+All publishing runs (release, weekly, push) share one concurrency group, so a
+run plans against what the previous one left behind and an alias copy can never
+write an older image over a newer one.
+
 To support a new major, add it to `CATALOG` in the planner script.
 
 The MariaDB image is published by `.github/workflows/mariadb-walg-image.yml`.
