@@ -1767,10 +1767,16 @@ mod tests {
 
     // =============================================================================
     // Integration Tests - GitHub API (requires network)
+    //
+    // Every test that calls the live github.com / gitlab.com APIs must end in
+    // `_real_api`: the unit-b job in .github/workflows/rust-tests.yml excludes
+    // that suffix, so a throttled or unavailable provider cannot fail a PR
+    // that never touched this crate. They still run on demand via
+    // `cargo test -p temps-git`.
     // =============================================================================
 
     #[tokio::test]
-    async fn test_github_provider_get_repository() {
+    async fn test_github_provider_get_repository_real_api() {
         let provider = GitHubPublicProvider::new();
 
         match provider.get_repository("expressjs", "express").await {
@@ -1787,7 +1793,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_github_provider_list_branches() {
+    async fn test_github_provider_list_branches_real_api() {
         let provider = GitHubPublicProvider::new();
 
         match provider.list_branches("expressjs", "express").await {
@@ -1804,7 +1810,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_github_provider_get_file_tree() {
+    async fn test_github_provider_get_file_tree_real_api() {
         let provider = GitHubPublicProvider::new();
 
         match provider
@@ -1824,7 +1830,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_github_provider_nonexistent_repo() {
+    async fn test_github_provider_nonexistent_repo_real_api() {
         let provider = GitHubPublicProvider::new();
 
         let result = provider
@@ -1848,7 +1854,7 @@ mod tests {
     // =============================================================================
 
     #[tokio::test]
-    async fn test_gitlab_provider_get_repository() {
+    async fn test_gitlab_provider_get_repository_real_api() {
         let provider = GitLabPublicProvider::new();
 
         // Using gitlab-org/gitlab as a well-known public repo
@@ -1866,7 +1872,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_gitlab_provider_list_branches() {
+    async fn test_gitlab_provider_list_branches_real_api() {
         let provider = GitLabPublicProvider::new();
 
         // Using a smaller public GitLab repo for faster testing
@@ -1892,7 +1898,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_gitlab_provider_nonexistent_repo() {
+    async fn test_gitlab_provider_nonexistent_repo_real_api() {
         let provider = GitLabPublicProvider::new();
 
         let result = provider
@@ -1916,7 +1922,7 @@ mod tests {
     // =============================================================================
 
     #[tokio::test]
-    async fn test_preset_detection_with_github() {
+    async fn test_preset_detection_with_github_real_api() {
         let provider = GitHubPublicProvider::new();
 
         match provider.get_file_tree("vercel", "next.js", "canary").await {
@@ -1937,7 +1943,7 @@ mod tests {
     // =============================================================================
 
     #[tokio::test]
-    async fn test_cache_with_real_branch_data() {
+    async fn test_cache_with_branch_data_real_api() {
         let cache_manager = GitProviderCacheManager::new();
         let provider = GitHubPublicProvider::new();
 

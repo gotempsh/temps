@@ -423,17 +423,14 @@ impl DomainService {
         let domain_name = domain_name_owned.as_str();
         let domain_id = domain.id;
 
-        // Clean up any existing order for this domain (important for renewals)
-        // This ensures we always start fresh with a new challenge
-        if let Some(existing_order) = self.repository.find_acme_order_by_domain(domain.id).await? {
-            info!(
-                "Deleting existing ACME order for domain: {} (order_url: {})",
-                domain_name, existing_order.order_url
-            );
-            self.repository
-                .delete_acme_order(&existing_order.order_url)
-                .await?;
-        }
+        // The order this request replaces (important for renewals: always start
+        // fresh with a new challenge). It is deleted only once its replacement
+        // exists — and never silently when it carries the receipt of DNS
+        // records Temps published for it: deleting first lost that receipt
+        // whenever the CA call then failed or returned a certificate outright,
+        // leaving the TXT records in the customer's zone with nothing to
+        // remove them.
+        let existing_order = self.repository.find_acme_order_by_domain(domain.id).await?;
 
         // Determine challenge type from domain's verification method
         let challenge_type = match domain.verification_method.as_str() {
@@ -515,7 +512,7 @@ impl DomainService {
                     "validation_url": challenge_data.validation_url
                 });
 
-                let order = crate::tls::models::AcmeOrder {
+                let mut order = crate::tls::models::AcmeOrder {
                     id: 0, // Will be set by database
                     order_url: challenge_data.order_url.clone().unwrap_or_default(),
                     domain_id: domain.id,
@@ -534,7 +531,36 @@ impl DomainService {
                     expires_at: Some(Utc::now() + chrono::Duration::days(7)), // ACME orders typically expire in 7 days
                 };
 
+                // The receipt of DNS records published for the replaced order
+                // moves to the new order, so cleanup after a successful
+                // verification still removes them.
+                if let Some(receipt) = existing_order.as_ref().and_then(cleanup_receipt_of) {
+                    if let Some(object) = order
+                        .authorizations
+                        .as_mut()
+                        .and_then(serde_json::Value::as_object_mut)
+                    {
+                        object.insert(
+                            crate::tls::models::DNS_CLEANUP_PLAN_KEY.to_string(),
+                            receipt,
+                        );
+                    }
+                }
+                let new_order_url = order.order_url.clone();
+
                 self.repository.save_acme_order(order).await?;
+
+                if let Some(old_order) = &existing_order {
+                    if old_order.order_url != new_order_url {
+                        info!(
+                            "Deleting replaced ACME order for domain: {} (order_url: {})",
+                            domain_name, old_order.order_url
+                        );
+                        self.repository
+                            .delete_acme_order(&old_order.order_url)
+                            .await?;
+                    }
+                }
 
                 // Update domain status based on challenge type
                 let mut domain_active: domains::ActiveModel = domain.into();
@@ -617,6 +643,17 @@ impl DomainService {
                             e
                         ))
                     })?;
+
+                // No new order exists, so a replaced order that carries a DNS
+                // cleanup receipt stays for the handler's cleanup (as after a
+                // normal verification); one without a receipt is just removed.
+                if let Some(old_order) = &existing_order {
+                    if cleanup_receipt_of(old_order).is_none() {
+                        self.repository
+                            .delete_acme_order(&old_order.order_url)
+                            .await?;
+                    }
+                }
 
                 let mut domain_active: domains::ActiveModel = domain.into();
                 domain_active.status = Set("active".to_string());
@@ -1832,6 +1869,16 @@ pub struct OnDemandCertStatus {
     pub latest_attempt: Option<on_demand_cert_attempts::Model>,
 }
 
+/// The DNS cleanup receipt (the plan of TXT records Temps published) stored on
+/// an ACME order, if it has one.
+fn cleanup_receipt_of(order: &crate::tls::models::AcmeOrder) -> Option<serde_json::Value> {
+    order
+        .authorizations
+        .as_ref()
+        .and_then(|authorizations| authorizations.get(crate::tls::models::DNS_CLEANUP_PLAN_KEY))
+        .cloned()
+}
+
 /// Render the full `Display` chain of an error — the top-level message plus every
 /// `source()` level joined by `: ` — for the `on_demand_cert_attempts.error_chain`
 /// audit column (ADR-018 §5). This is the operator's first-line diagnostic, so it
@@ -2446,6 +2493,11 @@ mod tests {
     /// Provider that hands out a distinct order and TXT value on every
     /// `provision` call and counts how often a challenge is submitted.
     struct ScriptedProvider {
+        /// When set, `provision` fails (as on a CA rate limit).
+        fail_provision: std::sync::atomic::AtomicBool,
+        /// When set, `provision` returns a certificate outright (the CA still
+        /// held a valid authorization).
+        immediate_certificate: std::sync::atomic::AtomicBool,
         provisions: std::sync::atomic::AtomicUsize,
         completions: std::sync::atomic::AtomicUsize,
         mode: std::sync::Mutex<CompletionMode>,
@@ -2454,6 +2506,8 @@ mod tests {
     impl ScriptedProvider {
         fn new(mode: CompletionMode) -> Arc<Self> {
             Arc::new(Self {
+                fail_provision: std::sync::atomic::AtomicBool::new(false),
+                immediate_certificate: std::sync::atomic::AtomicBool::new(false),
                 provisions: std::sync::atomic::AtomicUsize::new(0),
                 completions: std::sync::atomic::AtomicUsize::new(0),
                 mode: std::sync::Mutex::new(mode),
@@ -2477,6 +2531,20 @@ mod tests {
             _challenge: ChallengeType,
             _email: &str,
         ) -> Result<ProvisioningResult, crate::tls::ProviderError> {
+            if self
+                .fail_provision
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(crate::tls::ProviderError::Acme(
+                    "rate limited by the CA".to_string(),
+                ));
+            }
+            if self
+                .immediate_certificate
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Ok(ProvisioningResult::Certificate(mock_certificate(domain)));
+            }
             let n = self
                 .provisions
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -2590,6 +2658,138 @@ mod tests {
             .await
             .unwrap()
             .expect("domain row should exist")
+    }
+
+    /// Gives the domain's current order the receipt `setup-dns` leaves behind
+    /// and returns it with the order URL.
+    async fn attach_cleanup_receipt(
+        repository: &Arc<dyn CertificateRepository>,
+        domain_id: i32,
+        name: &str,
+    ) -> (serde_json::Value, String) {
+        let mut order = repository
+            .find_acme_order_by_domain(domain_id)
+            .await
+            .unwrap()
+            .expect("the order exists");
+        let receipt = serde_json::json!({
+            "provider_id": 3,
+            "zone": "example.com",
+            "records": [{
+                "name": format!("_acme-challenge.{name}"),
+                "value": "txt-value-1",
+                "record_id": "rec-1"
+            }]
+        });
+        order
+            .authorizations
+            .as_mut()
+            .and_then(|a| a.as_object_mut())
+            .expect("authorizations are an object")
+            .insert(
+                crate::tls::models::DNS_CLEANUP_PLAN_KEY.to_string(),
+                receipt.clone(),
+            );
+        let url = order.order_url.clone();
+        repository.save_acme_order(order).await.unwrap();
+        (receipt, url)
+    }
+
+    /// Replacing an order moves the receipt of the TXT records published for
+    /// it onto the new order instead of deleting it with the old row.
+    #[tokio::test]
+    async fn test_replacing_an_order_carries_its_dns_cleanup_receipt() {
+        let provider = ScriptedProvider::new(CompletionMode::Succeed);
+        let Some((service, repository, _db, _guard)) = scripted_service(provider).await else {
+            return;
+        };
+        let name = "receipt.example.com";
+        let created = service.create_domain(name, "dns-01").await.unwrap();
+        service
+            .request_challenge(name, "ops@example.com")
+            .await
+            .unwrap();
+        let (receipt, old_url) = attach_cleanup_receipt(&repository, created.id, name).await;
+
+        service
+            .request_challenge(name, "ops@example.com")
+            .await
+            .unwrap();
+
+        let current = repository
+            .find_acme_order_by_domain(created.id)
+            .await
+            .unwrap()
+            .expect("the new order exists");
+        assert_ne!(current.order_url, old_url, "the order was replaced");
+        assert_eq!(cleanup_receipt_of(&current), Some(receipt));
+    }
+
+    /// If the CA call that replaces an order fails, the old order — and the
+    /// receipt of the records published for it — must still be there.
+    #[tokio::test]
+    async fn test_failed_replacement_keeps_the_old_order_and_its_receipt() {
+        let provider = ScriptedProvider::new(CompletionMode::Succeed);
+        let Some((service, repository, _db, _guard)) = scripted_service(provider.clone()).await
+        else {
+            return;
+        };
+        let name = "keep.example.com";
+        let created = service.create_domain(name, "dns-01").await.unwrap();
+        service
+            .request_challenge(name, "ops@example.com")
+            .await
+            .unwrap();
+        let (receipt, url) = attach_cleanup_receipt(&repository, created.id, name).await;
+        provider
+            .fail_provision
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let result = service.request_challenge(name, "ops@example.com").await;
+
+        assert!(result.is_err(), "the CA refused the new order");
+        let kept = repository
+            .find_acme_order_by_domain(created.id)
+            .await
+            .unwrap()
+            .expect("the old order must not be deleted before its replacement exists");
+        assert_eq!(kept.order_url, url);
+        assert_eq!(cleanup_receipt_of(&kept), Some(receipt));
+    }
+
+    /// A certificate issued outright leaves no new order to carry the receipt,
+    /// so the old order stays for the handler's DNS cleanup.
+    #[tokio::test]
+    async fn test_immediate_certificate_keeps_the_order_that_has_a_receipt() {
+        let provider = ScriptedProvider::new(CompletionMode::Succeed);
+        let Some((service, repository, _db, _guard)) = scripted_service(provider.clone()).await
+        else {
+            return;
+        };
+        let name = "cached.example.com";
+        let created = service.create_domain(name, "dns-01").await.unwrap();
+        service
+            .request_challenge(name, "ops@example.com")
+            .await
+            .unwrap();
+        let (receipt, url) = attach_cleanup_receipt(&repository, created.id, name).await;
+        provider
+            .immediate_certificate
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let issued = service
+            .request_challenge(name, "ops@example.com")
+            .await
+            .expect("certificate issued outright");
+
+        assert_eq!(issued.status, "completed");
+        let kept = repository
+            .find_acme_order_by_domain(created.id)
+            .await
+            .unwrap()
+            .expect("the order with the receipt is retained for cleanup");
+        assert_eq!(kept.order_url, url);
+        assert_eq!(cleanup_receipt_of(&kept), Some(receipt));
     }
 
     #[tokio::test]

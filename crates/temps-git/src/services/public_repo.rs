@@ -1802,7 +1802,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_github_nonexistent_repo() {
+    async fn test_github_nonexistent_repo_real_api() {
         let provider = GitHubPublicProvider::new();
 
         let result = provider
@@ -1896,7 +1896,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_gitlab_nonexistent_repo() {
+    async fn test_gitlab_nonexistent_repo_real_api() {
         let provider = GitLabPublicProvider::new();
 
         let result = provider
@@ -1920,7 +1920,7 @@ mod tests {
     // =============================================================================
 
     #[tokio::test]
-    async fn test_preset_detection_with_github() {
+    async fn test_preset_detection_with_github_real_api() {
         let provider = GitHubPublicProvider::new();
 
         match provider.get_file_tree("vercel", "next.js", "canary").await {

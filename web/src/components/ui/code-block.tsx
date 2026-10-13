@@ -7,6 +7,7 @@ import { Check, Copy, Hash, WrapText } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { scrollableRegionProps, useScrollableRegion } from './scrollable-region'
 import type { HighlighterCore } from 'shiki/core'
+import { withReadableDarkComments } from './code-block-theme'
 
 /**
  * Languages this block can highlight.
@@ -98,7 +99,9 @@ async function getHighlighter(): Promise<HighlighterCore> {
       return createHighlighterCore({
         themes: [
           import('shiki/themes/github-light.mjs'),
-          import('shiki/themes/github-dark.mjs'),
+          import('shiki/themes/github-dark.mjs').then((module) =>
+            withReadableDarkComments(module.default)
+          ),
         ],
         langs: [],
         engine: createJavaScriptRegexEngine({ forgiving: true }),

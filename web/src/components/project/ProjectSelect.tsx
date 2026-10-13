@@ -68,6 +68,10 @@ export function ProjectSelect({
     onOpenChange?.(next)
   }
   const queryClient = useQueryClient()
+  // A button with role="combobox" takes no name from its content, so without
+  // `ariaLabel` the picker would be an unnamed control. Fall back to the
+  // visible value (e.g. "All projects") by reference.
+  const valueId = React.useId()
 
   const projectsQuery = useQuery({
     queryKey: ['project-selector-catalog'],
@@ -142,6 +146,7 @@ export function ProjectSelect({
           variant="outline"
           role="combobox"
           aria-label={ariaLabel}
+          aria-labelledby={ariaLabel ? undefined : valueId}
           aria-expanded={open}
           disabled={disabled}
           className={cn(
@@ -152,7 +157,9 @@ export function ProjectSelect({
         >
           <span className="flex min-w-0 items-center">
             {selected && projectImage(selected)}
-            <span className="truncate">{triggerLabel}</span>
+            <span id={valueId} className="truncate">
+              {triggerLabel}
+            </span>
           </span>
           <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
         </Button>

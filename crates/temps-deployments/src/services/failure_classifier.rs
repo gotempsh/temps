@@ -692,7 +692,13 @@ fn buildkit_missing_path(lower: &str) -> Option<&str> {
     .filter_map(|marker| lower.find(marker))
     .min()?;
     let tail = &lower[marker..];
-    let end = tail.find("\": not found")?;
+    // Current daemons print `"<path>": not found`; older ones (Docker 20.10
+    // era, still found on self-hosted workers) print `"<path>" not found: not
+    // found`. Take whichever closes the quoted path first.
+    let end = ["\": not found", "\" not found"]
+        .iter()
+        .filter_map(|closing| tail.find(closing))
+        .min()?;
     let quoted = tail[..end].trim_end_matches('\\');
     let start = quoted.rfind('"')?;
     Some(quoted[start + 1..].trim_end_matches('\\'))
@@ -1782,6 +1788,21 @@ mod tests {
     }
 
     #[test]
+    fn older_buildkit_wording_is_classified_like_the_current_one() {
+        let context_file = wrapped(
+            "build_image",
+            "Failed to build image: Build failed: Docker stream error: failed to solve: failed to compute cache key: \"/requirements.txt\" not found: not found",
+        );
+        assert_class(&context_file, S::Build, C::DockerfileCopyNotFound);
+
+        let output = wrapped(
+            "build_image",
+            "Failed to build image: Dockerfile:9\n   9 | >>> COPY --from=builder /app/dist /srv\nERROR: failed to solve: failed to compute cache key: \"/app/dist\" not found: not found",
+        );
+        assert_class(&output, S::Build, C::StaticOutputMissing);
+    }
+
+    #[test]
     fn buildkit_missing_path_extracts_the_quoted_source() {
         assert_eq!(
             buildkit_missing_path(
@@ -1794,6 +1815,19 @@ mod tests {
                 "failed to calculate checksum of ref a: \\\"/app/dist\\\": not found"
             ),
             Some("/app/dist")
+        );
+        // Older daemons close the quoted path with `" not found: not found`.
+        assert_eq!(
+            buildkit_missing_path(
+                "failed to compute cache key: \"/app/dist\" not found: not found"
+            ),
+            Some("/app/dist")
+        );
+        assert_eq!(
+            buildkit_missing_path(
+                "failed to calculate checksum of ref a: \\\"/node_modules\\\" not found: not found"
+            ),
+            Some("/node_modules")
         );
         assert_eq!(buildkit_missing_path("COPY node_modules ./"), None);
         assert_eq!(

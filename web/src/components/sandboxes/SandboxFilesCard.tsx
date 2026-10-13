@@ -41,20 +41,24 @@ import { problemDetail } from '@/lib/api-problem'
 import {
   DEFAULT_FILE_MODE,
   MAX_EDITABLE_BYTES,
+  type FileProperties,
   decodeFile,
   defaultFilePath,
   encodeText,
-  fileModeArgv,
+  filePropertiesArgv,
   filesUnavailableReason,
   formatFileMode,
   isEditableFile,
-  parseFileMode,
+  parseFileProperties,
+  propertiesAfterSave,
+  saveRisks,
+  writeMode,
   validateSandboxPath,
 } from './sandbox-files'
 
 /** Cache key for a file's permission bits (read via `stat`, see the card). */
-function fileModeQueryKey(sandboxId: string, path: string) {
-  return [{ _id: 'sandboxFileMode', sandboxId, path }] as const
+function filePropertiesQueryKey(sandboxId: string, path: string) {
+  return [{ _id: 'sandboxFileProperties', sandboxId, path }] as const
 }
 
 const pathFormSchema = z.object({
@@ -70,6 +74,8 @@ interface SandboxFilesCardProps {
   workDir: string
   status: string
   lifecycle?: string
+  /** Isolation backend ("docker", "firecracker", ...); decides save warnings. */
+  backend?: string | null
 }
 
 /**
@@ -83,6 +89,7 @@ export function SandboxFilesCard({
   workDir,
   status,
   lifecycle,
+  backend,
 }: SandboxFilesCardProps) {
   const [openPath, setOpenPath] = useState<string | null>(null)
   // Bumped when the operator re-opens the open path, after the fresh stat and
@@ -125,15 +132,15 @@ export function SandboxFilesCard({
   // does not report one, so read it (`stat -c %a`) and send it back with the
   // save. Without this, editing a script drops its executable bit and a 0600
   // file becomes world-readable. `null` means it could not be read.
-  const modeQuery = useQuery({
-    queryKey: fileModeQueryKey(sandboxId, openPath ?? ''),
-    queryFn: async (): Promise<number | null> => {
+  const propertiesQuery = useQuery({
+    queryKey: filePropertiesQueryKey(sandboxId, openPath ?? ''),
+    queryFn: async (): Promise<FileProperties | null> => {
       const { data } = await exec({
         path: { id: sandboxId },
-        body: { cmd: fileModeArgv(openPath ?? '') },
+        body: { cmd: filePropertiesArgv(openPath ?? '') },
         throwOnError: true,
       })
-      return data.exit_code === 0 ? parseFileMode(data.stdout) : null
+      return data.exit_code === 0 ? parseFileProperties(data.stdout) : null
     },
     enabled:
       openPath !== null && blocked === null && !!stat?.exists && readable,
@@ -160,9 +167,18 @@ export function SandboxFilesCard({
     const wasReadable = readable
     const fresh = await statQuery.refetch()
     if (wasReadable && isEditableFile(fresh.data)) {
-      await Promise.all([readQuery.refetch(), modeQuery.refetch()])
+      await Promise.all([readQuery.refetch(), propertiesQuery.refetch()])
     }
     setGeneration((current) => current + 1)
+  }
+
+  // What the file looks like right now, read when Save is pressed. The cached
+  // properties are from when the file was opened; the terminal beside this card
+  // can have replaced it with a symlink or changed its owner since. A probe
+  // that fails reads as "unknown", which asks before saving.
+  const readFreshProperties = async (): Promise<FileProperties | null> => {
+    const result = await propertiesQuery.refetch()
+    return result.isSuccess ? result.data : null
   }
 
   return (
@@ -174,9 +190,10 @@ export function SandboxFilesCard({
         </CardTitle>
         <CardDescription>
           Open a text file by its absolute path, edit it and save it back into
-          the sandbox; its permissions are kept. Opening a file again reloads it
-          and discards unsaved edits. Browsing directories needs a listing
-          endpoint that does not exist yet.
+          the sandbox; its permissions are kept, and you are asked first when a
+          save would change ownership or a symbolic link. Opening a file again
+          reloads it and discards unsaved edits. Browsing directories needs a
+          listing endpoint that does not exist yet.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -233,8 +250,12 @@ export function SandboxFilesCard({
           statError={statQuery.isError ? statQuery.error : null}
           statLoading={statQuery.isPending}
           stat={stat}
-          readLoading={readable && (readQuery.isPending || modeQuery.isPending)}
-          mode={modeQuery.isSuccess ? modeQuery.data : null}
+          readLoading={
+            readable && (readQuery.isPending || propertiesQuery.isPending)
+          }
+          properties={propertiesQuery.isSuccess ? propertiesQuery.data : null}
+          readFreshProperties={readFreshProperties}
+          backend={backend}
           readError={readQuery.isError ? readQuery.error : null}
           contentsB64={readQuery.data?.contents_b64}
           generation={generation}
@@ -258,8 +279,10 @@ interface FileSectionProps {
   readLoading: boolean
   readError: unknown
   contentsB64: string | undefined
-  /** Permission bits of an existing file; `null` when they could not be read. */
-  mode: number | null
+  /** Mode and owner of an existing file; `null` when they could not be read. */
+  properties: FileProperties | null
+  readFreshProperties: () => Promise<FileProperties | null>
+  backend: string | null | undefined
   generation: number
 }
 
@@ -273,7 +296,9 @@ function FileSection({
   readLoading,
   readError,
   contentsB64,
-  mode,
+  properties,
+  readFreshProperties,
+  backend,
   generation,
 }: FileSectionProps) {
   if (path === null) return null
@@ -353,7 +378,9 @@ function FileSection({
       path={path}
       exists={stat.exists}
       initial={initial}
-      mode={stat.exists ? mode : DEFAULT_FILE_MODE}
+      properties={properties}
+      readFreshProperties={readFreshProperties}
+      backend={backend}
       locked={locked}
     />
   )
@@ -364,15 +391,21 @@ function FileEditor({
   path,
   exists,
   initial,
-  mode,
+  properties,
+  readFreshProperties,
+  backend,
   locked,
 }: {
   sandboxId: string
   path: string
   exists: boolean
   initial: string
-  /** Mode to write with; `null` when an existing file's mode is unknown. */
-  mode: number | null
+  /** What an existing file looked like; `null` when it could not be read. */
+  properties: FileProperties | null
+  /** Probes the file again, at the moment of saving. */
+  readFreshProperties: () => Promise<FileProperties | null>
+  /** Decides which save warnings are true; see `writeSemantics`. */
+  backend: string | null | undefined
   locked: boolean
 }) {
   const queryClient = useQueryClient()
@@ -382,7 +415,12 @@ function FileEditor({
   // flight stays in the editor, still marked unsaved.
   const [saved, setSaved] = useState(initial)
   const dirty = draft !== saved
-  const [confirmUnknownMode, setConfirmUnknownMode] = useState(false)
+  // What a save would change besides the text, as found by the probe that
+  // runs when Save is pressed; set only when the operator has to confirm.
+  const [review, setReview] = useState<{
+    risks: string[]
+    mode: number
+  } | null>(null)
 
   const save = useMutation({
     ...writeFileMutation(),
@@ -400,10 +438,16 @@ function FileEditor({
           contents_b64: variables.body.contents_b64,
         }
       )
-      // Same for the mode, so a new file does not flash a loading state.
+      // Same for the file's properties, so a new file does not flash a
+      // loading state and the next save compares against what is there now.
       queryClient.setQueryData(
-        fileModeQueryKey(sandboxId, path),
-        variables.body.mode ?? DEFAULT_FILE_MODE
+        filePropertiesQueryKey(sandboxId, path),
+        propertiesAfterSave(
+          path,
+          variables.body.mode ?? DEFAULT_FILE_MODE,
+          backend,
+          properties
+        )
       )
       void queryClient.invalidateQueries({
         predicate: (query) =>
@@ -413,7 +457,7 @@ function FileEditor({
     },
   })
 
-  const send = () => {
+  const send = (mode: number) => {
     const sent = draft
     save.mutate(
       {
@@ -422,12 +466,27 @@ function FileEditor({
           path,
           contents_b64: encodeText(sent),
           // Always explicit: omitting it makes the API write 0644.
-          mode: mode ?? DEFAULT_FILE_MODE,
+          mode,
         },
       },
       { onSuccess: () => setSaved(sent) }
     )
   }
+
+  // Decide from the file as it is now, not as it was when it was opened: if it
+  // has since become a symlink or changed owner, the operator is asked. The
+  // editor text is untouched by the probe. A file that did not exist when it
+  // was opened has nothing to compare against and is written at 0644.
+  const preflight = useMutation({
+    mutationFn: readFreshProperties,
+    meta: { errorTitle: 'Failed to check the file before saving' },
+    onSuccess: (fresh) => {
+      const risks = saveRisks(path, fresh, backend)
+      const mode = writeMode(fresh)
+      if (risks.length > 0) setReview({ risks, mode })
+      else send(mode)
+    },
+  })
 
   return (
     <div className="space-y-2">
@@ -435,24 +494,24 @@ function FileEditor({
         <div className="flex min-w-0 items-center gap-2">
           <span className="truncate font-mono text-xs">{path}</span>
           {!exists && <Badge variant="neutral-subtle">new file</Badge>}
-          {exists && mode !== null && (
+          {exists && properties && (
             <Badge variant="outline" className="font-mono">
-              {formatFileMode(mode)}
+              {formatFileMode(properties.mode & 0o777)}
             </Badge>
           )}
           {dirty && <Badge variant="warning-subtle">unsaved changes</Badge>}
         </div>
         <Button
           size="sm"
-          disabled={!dirty || save.isPending || locked}
+          disabled={!dirty || save.isPending || preflight.isPending || locked}
           onClick={() => {
-            // An existing file whose permissions could not be read would be
-            // reset to 0644: say so first instead of doing it silently.
-            if (exists && mode === null) setConfirmUnknownMode(true)
-            else send()
+            // Anything a save would change besides the text is said first,
+            // not done silently.
+            if (exists) preflight.mutate()
+            else send(DEFAULT_FILE_MODE)
           }}
         >
-          {save.isPending ? (
+          {save.isPending || preflight.isPending ? (
             <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />
           ) : (
             <Save className="mr-1.5 h-4 w-4" />
@@ -469,21 +528,31 @@ function FileEditor({
         className="min-h-[240px] font-mono text-xs"
       />
       <ConfirmDialog
-        open={confirmUnknownMode}
-        onOpenChange={setConfirmUnknownMode}
-        title="Save without the file's permissions?"
+        open={review !== null}
+        onOpenChange={(open) => {
+          if (!open) setReview(null)
+        }}
+        title="Saving will change more than the text"
         description={
           <>
-            The permissions of <span className="font-mono">{path}</span> could
-            not be read, so saving will reset it to 0644 (rw-r--r--). If it is a
-            script or holds credentials, edit it from the terminal instead.
+            Saving <span className="font-mono">{path}</span> from here:
+            <span className="mt-2 block">
+              {(review?.risks ?? []).map((risk) => (
+                <span key={risk} className="mb-1 block">
+                  • {risk}
+                </span>
+              ))}
+            </span>
+            <span className="mt-2 block">
+              Edit it from the terminal if that is not what you want.
+            </span>
           </>
         }
         confirmLabel="Save anyway"
         destructive={false}
         onConfirm={() => {
-          setConfirmUnknownMode(false)
-          send()
+          if (review) send(review.mode)
+          setReview(null)
         }}
       />
     </div>
