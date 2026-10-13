@@ -6,22 +6,23 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 
 ## `projects` (alias: `project`, `p`)
 
-Manage projects
+Manage services: each one deployable app (the console calls these Services). To group services that ship together into a Project, as the console calls it, use `project-groups`.
 
 **Subcommands:**
 
 - `secrets` - Manage project secrets — mounted into the deployed container as files at /run/secrets/<KEY>, not environment variables. Distinct from `temps secrets` (agent/MCP-sandbox-scoped).
-- `list` (`ls`) - List all projects
-- `create` (`new`) - Create a new project (git-based or manual deployment)
+- `list` (`ls`) - List all services
+- `create` (`new`) - Create a new service (git-based or manual deployment); add it to a project with `project-groups add`
 - `cloudflare-capability` (`delivery-capability`) - Show whether Cloudflare/Bunny delivery is ready and which one new services get by default
-- `show` (`get`) - Show project details
-- `update` (`edit`) - Update project name and description
-- `settings` - Update project settings (name, slug, attack mode, preview environments, vulnerability scanning, image retention)
+- `show` (`get`) - Show service details, including the project (group) it belongs to
+- `group` - Show which project (group of services) a service belongs to
+- `update` (`edit`) - Update service name and description
+- `settings` - Update service settings (name, slug, attack mode, preview environments, vulnerability scanning, image retention)
 - `git` - Update git repository settings
-- `source` - Show or change how a project is deployed (primary source, and whether it also accepts `drop` uploads)
+- `source` - Show or change how a service is deployed (primary source, and whether it also accepts `drop` uploads)
 - `hosting` - Show or set whether Temps runs the app (hosted) or it runs elsewhere (external, labelled External and never deployed)
 - `config` - Update deployment configuration (resources, replicas)
-- `delete` (`rm`) - Delete a project
+- `delete` (`rm`) - Delete a service
 
 ### `projects secrets`
 
@@ -92,7 +93,7 @@ Delete a project secret
 
 ### `projects list` (alias: `ls`)
 
-List all projects
+List all services
 
 **Options:**
 
@@ -104,24 +105,24 @@ List all projects
 
 ### `projects create` (alias: `new`)
 
-Create a new project (git-based or manual deployment)
+Create a new service (git-based or manual deployment); add it to a project with `project-groups add`
 
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-n, --name <name>` | Project name | - | No |
-| `-d, --description <description>` | Project description | - | No |
+| `-n, --name <name>` | Service name | - | No |
+| `-d, --description <description>` | Service description | - | No |
 | `--repo <repository>` | Repository in owner/name format (nested groups supported: group/subgroup/name) | - | No |
 | `--branch <branch>` | Git branch | - | No |
 | `--directory <directory>` | Root directory (relative to repo) | - | No |
 | `--preset <preset>` | Build preset (e.g., nextjs, nodejs, static, docker) | - | No |
 | `--connection <id>` | Git connection ID | - | No |
-| `--manual` | Create a manual (non-git) project - deploy via Docker image or static files | - | No |
+| `--manual` | Create a manual (non-git) service - deploy via Docker image or static files | - | No |
 | `--source-type <type>` | Manual deployment method: manual (flexible), docker_image, or static_files | - | No |
 | `--image <image>` | Docker image for the first deployment (manual mode) | - | No |
 | `--port <port>` | Application/container port (manual mode, default: 3000) | - | No |
-| `--external` | The app runs elsewhere (Vercel, Netlify, a VPS): Temps only receives its telemetry and never deploys it | - | No |
+| `--external` | The app runs elsewhere (Vercel, Netlify, a VPS): Temps only receives its telemetry and never deploys it (needs --name with --yes) | - | No |
 | `--delivery-provider <provider>` | Delivery provider for the new service: none, cloudflare or bunny (default: instance setting; see `projects cloudflare-capability`) | - | No |
 | `-y, --yes` | Skip optional prompts (services, env vars, set-default) | - | No |
 
@@ -137,18 +138,29 @@ Show whether Cloudflare/Bunny delivery is ready and which one new services get b
 
 ### `projects show` (alias: `get`)
 
-Show project details
+Show service details, including the project (group) it belongs to
 
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | No |
+| `-p, --project <project>` | Service slug or ID | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `projects group`
+
+Show which project (group of services) a service belongs to
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Service slug or ID | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `projects update` (alias: `edit`)
 
-Update project name and description
+Update service name and description
 
 **Options:**
 
@@ -162,7 +174,7 @@ Update project name and description
 
 ### `projects settings`
 
-Update project settings (name, slug, attack mode, preview environments, vulnerability scanning, image retention)
+Update service settings (name, slug, attack mode, preview environments, vulnerability scanning, image retention)
 
 **Options:**
 
@@ -202,7 +214,7 @@ Update git repository settings
 
 ### `projects source`
 
-Show or change how a project is deployed (primary source, and whether it also accepts `drop` uploads)
+Show or change how a service is deployed (primary source, and whether it also accepts `drop` uploads)
 
 **Options:**
 
@@ -247,7 +259,7 @@ Update deployment configuration (resources, replicas)
 
 ### `projects delete` (alias: `rm`)
 
-Delete a project
+Delete a service
 
 **Options:**
 

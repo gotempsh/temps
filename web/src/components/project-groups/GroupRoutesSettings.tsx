@@ -130,6 +130,7 @@ export function GroupRoutesSettings({
 
       {routes.isLoading ? (
         <div
+          role="status"
           className="divide-y rounded-lg border"
           aria-busy="true"
           aria-label="Loading routes"

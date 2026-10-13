@@ -41,7 +41,7 @@ function renderPicker(props: { ariaLabel?: string; value?: number | null }) {
 // the picker was an unnamed control (axe `button-name`).
 test('names itself after its visible value when no label is given', async () => {
   const { view, api } = renderPicker({})
-  const picker = await view.findByRole('combobox', { name: 'All projects' })
+  const picker = await view.findByRole('combobox', { name: 'All services' })
   expect(picker.getAttribute('aria-label')).toBeNull()
   api.restore()
 })

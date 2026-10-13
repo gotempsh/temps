@@ -11,7 +11,7 @@ Browse templates and create them
 **Subcommands:**
 
 - `list` (`ls`) - List available templates
-- `create` - Create a template: every service, the databases it needs, its shared variables and path routes
+- `create` - Create a template: every service (an app, what `projects` manages), the databases it needs, its shared variables and path routes
 - `validate` - Validate a Temps-native template YAML file or directory offline
 
 ### `templates list` (alias: `ls`)
@@ -27,15 +27,15 @@ List available templates
 
 ### `templates create`
 
-Create a template: every service, the databases it needs, its shared variables and path routes
+Create a template: every service (an app, what `projects` manages), the databases it needs, its shared variables and path routes
 
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--project <name>` | Put the services in a new project with this name (default for several services) | - | No |
-| `--into <project>` | Add the services to an existing project (slug or id) | - | No |
-| `--standalone` | Create a one-service template without a project (default for one service) | - | No |
+| `--project <name>` | Put the services in a new project (group) with this name; the default for several services | - | No |
+| `--into <project>` | Add the services to an existing project (group), by slug or id (see: project-groups list) | - | No |
+| `--standalone` | Create a one-service template without a project (group); the default for one service | - | No |
 | `--name <service=name...>` | Name a created service; a one-service template also takes a bare name | - | No |
 | `--env <[service:]KEY=VALUE...>` | Set a variable; prefix the service when the template cannot tell | - | No |
 | `--secret <[service:]KEY=VALUE...>` | Set a secret variable (write-only once stored) | - | No |
@@ -47,6 +47,7 @@ Create a template: every service, the databases it needs, its shared variables a
 | `--no-auto-deploy` | Do not deploy on push to the new repository | - | No |
 | `--idempotency-key <key>` | Reuse a key to get the same result instead of creating twice | - | No |
 | `--no-wait` | Return right away instead of waiting until it finishes | - | No |
+| `--timeout <minutes>` | Stop waiting after this long (default 30); it keeps running on the server | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `templates validate`

@@ -168,7 +168,7 @@ export const CATEGORY_META: Record<
   group: {
     label: TERMS.group.singular,
     icon: Boxes,
-    tone: 'bg-violet-500/10 text-violet-600 dark:text-violet-400',
+    tone: 'bg-violet-500/10 text-violet-700 dark:text-violet-400',
   },
   project: {
     label: TERMS.service.singular,

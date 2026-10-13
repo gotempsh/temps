@@ -42,13 +42,19 @@ export function ProjectFailureBanner({
   const [pendingAction, setPendingAction] = useState<RecoveryAction | null>(
     null
   )
+  const isExternalProject =
+    project.hosting === 'external' || project.source_type === 'external'
   const {
     failedDeployment,
     rollbackTarget,
     containerIssues,
     healthEnvironment,
     environmentsQuery,
-  } = useProjectFailureState(project.id, lastDeployment)
+  } = useProjectFailureState(project.id, lastDeployment, {
+    // Same rule as the header: Temps never deploys an externally hosted
+    // project, so there are no environments to poll and nothing to recover.
+    enabled: !isExternalProject,
+  })
 
   const failedEnvironment = failedDeployment
     ? environmentsQuery.data?.find(

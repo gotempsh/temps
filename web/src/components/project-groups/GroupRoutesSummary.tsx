@@ -194,11 +194,11 @@ export function RouteAddresses({
               </span>
             )}
             {!e.target_environment_slug ? (
-              <span className="text-amber-600 dark:text-amber-500">
+              <span className="text-amber-700 dark:text-amber-500">
                 → no matching {route.target_project_name} environment
               </span>
             ) : !e.target_deployed ? (
-              <span className="flex items-center gap-1 text-amber-600 dark:text-amber-500">
+              <span className="flex items-center gap-1 text-amber-700 dark:text-amber-500">
                 <AlertTriangle className="size-3" aria-hidden="true" />
                 502 until {route.target_project_name} is deployed in{' '}
                 {e.target_environment_slug}

@@ -137,7 +137,9 @@ export function ProjectDetailHeader({
   // Latest build and currently deployed version can be different, including
   // during builds, after failures, and following a rollback.
   const { status: deploymentStatus, environmentsQuery } =
-    useProjectFailureState(project.id, lastDeployment)
+    useProjectFailureState(project.id, lastDeployment, {
+      enabled: !isExternal,
+    })
   // When a build finishes, its environment pointer is already set; refetch at
   // once so "Deploying" turns into "Deployed" instead of briefly reading
   // "Not deployed" until the next poll.

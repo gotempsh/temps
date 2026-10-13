@@ -47,7 +47,7 @@ Use this index or search for a top-level command heading to load only the releva
 - [`whoami`](#whoami) - Display current authenticated user and active context
 - [`context`](#context) - Manage CLI contexts (one set of credentials per Temps server)
 - [`configure`](#configure) - Configure CLI settings (AWS-style wizard)
-- [`projects`](#projects) - Manage projects
+- [`projects`](#projects) - Manage services: each one deployable app (the console calls these Services). To group services that ship together into a Project, as the console calls it, use `project-groups`.
 - [`drop`](#drop) - Detect and deploy a local source directory or ZIP without Git
 - [`deploy`](#deploy) - Deploy a project from git
 - [`deploy:static`](#deploystatic) - Deploy static files (tar.gz, zip, or directory)
@@ -66,7 +66,7 @@ Use this index or search for a top-level command heading to load only the releva
 - [`users`](#users) - Manage platform users
 - [`teams`](#teams) - Manage teams and project access
 - [`access`](#access) - Manage which teams can reach a project
-- [`project-groups`](#project-groups) - Group services that ship together into one project and share variables between them (shown as "Projects" in the console)
+- [`project-groups`](#project-groups) - Manage Projects (what the console calls a Project): groups of services that ship together and share a repository, variables and path routes. A service is what the `projects` command manages; the `services` command manages databases and caches, not these.
 - [`instantiations`](#instantiations) - Follow and retry template creations and imports
 - [`apikeys`](#apikeys) - Manage API keys for programmatic access
 - [`monitors`](#monitors) - Manage uptime monitors for status pages
@@ -264,22 +264,23 @@ Reset configuration to defaults
 
 ## `projects` (alias: `project`, `p`)
 
-Manage projects
+Manage services: each one deployable app (the console calls these Services). To group services that ship together into a Project, as the console calls it, use `project-groups`.
 
 **Subcommands:**
 
 - `secrets` - Manage project secrets — mounted into the deployed container as files at /run/secrets/<KEY>, not environment variables. Distinct from `temps secrets` (agent/MCP-sandbox-scoped).
-- `list` (`ls`) - List all projects
-- `create` (`new`) - Create a new project (git-based or manual deployment)
+- `list` (`ls`) - List all services
+- `create` (`new`) - Create a new service (git-based or manual deployment); add it to a project with `project-groups add`
 - `cloudflare-capability` (`delivery-capability`) - Show whether Cloudflare/Bunny delivery is ready and which one new services get by default
-- `show` (`get`) - Show project details
-- `update` (`edit`) - Update project name and description
-- `settings` - Update project settings (name, slug, attack mode, preview environments, vulnerability scanning, image retention)
+- `show` (`get`) - Show service details, including the project (group) it belongs to
+- `group` - Show which project (group of services) a service belongs to
+- `update` (`edit`) - Update service name and description
+- `settings` - Update service settings (name, slug, attack mode, preview environments, vulnerability scanning, image retention)
 - `git` - Update git repository settings
-- `source` - Show or change how a project is deployed (primary source, and whether it also accepts `drop` uploads)
+- `source` - Show or change how a service is deployed (primary source, and whether it also accepts `drop` uploads)
 - `hosting` - Show or set whether Temps runs the app (hosted) or it runs elsewhere (external, labelled External and never deployed)
 - `config` - Update deployment configuration (resources, replicas)
-- `delete` (`rm`) - Delete a project
+- `delete` (`rm`) - Delete a service
 
 ### `projects secrets`
 
@@ -350,7 +351,7 @@ Delete a project secret
 
 ### `projects list` (alias: `ls`)
 
-List all projects
+List all services
 
 **Options:**
 
@@ -362,24 +363,24 @@ List all projects
 
 ### `projects create` (alias: `new`)
 
-Create a new project (git-based or manual deployment)
+Create a new service (git-based or manual deployment); add it to a project with `project-groups add`
 
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-n, --name <name>` | Project name | - | No |
-| `-d, --description <description>` | Project description | - | No |
+| `-n, --name <name>` | Service name | - | No |
+| `-d, --description <description>` | Service description | - | No |
 | `--repo <repository>` | Repository in owner/name format (nested groups supported: group/subgroup/name) | - | No |
 | `--branch <branch>` | Git branch | - | No |
 | `--directory <directory>` | Root directory (relative to repo) | - | No |
 | `--preset <preset>` | Build preset (e.g., nextjs, nodejs, static, docker) | - | No |
 | `--connection <id>` | Git connection ID | - | No |
-| `--manual` | Create a manual (non-git) project - deploy via Docker image or static files | - | No |
+| `--manual` | Create a manual (non-git) service - deploy via Docker image or static files | - | No |
 | `--source-type <type>` | Manual deployment method: manual (flexible), docker_image, or static_files | - | No |
 | `--image <image>` | Docker image for the first deployment (manual mode) | - | No |
 | `--port <port>` | Application/container port (manual mode, default: 3000) | - | No |
-| `--external` | The app runs elsewhere (Vercel, Netlify, a VPS): Temps only receives its telemetry and never deploys it | - | No |
+| `--external` | The app runs elsewhere (Vercel, Netlify, a VPS): Temps only receives its telemetry and never deploys it (needs --name with --yes) | - | No |
 | `--delivery-provider <provider>` | Delivery provider for the new service: none, cloudflare or bunny (default: instance setting; see `projects cloudflare-capability`) | - | No |
 | `-y, --yes` | Skip optional prompts (services, env vars, set-default) | - | No |
 
@@ -395,18 +396,29 @@ Show whether Cloudflare/Bunny delivery is ready and which one new services get b
 
 ### `projects show` (alias: `get`)
 
-Show project details
+Show service details, including the project (group) it belongs to
 
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | No |
+| `-p, --project <project>` | Service slug or ID | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `projects group`
+
+Show which project (group of services) a service belongs to
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Service slug or ID | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `projects update` (alias: `edit`)
 
-Update project name and description
+Update service name and description
 
 **Options:**
 
@@ -420,7 +432,7 @@ Update project name and description
 
 ### `projects settings`
 
-Update project settings (name, slug, attack mode, preview environments, vulnerability scanning, image retention)
+Update service settings (name, slug, attack mode, preview environments, vulnerability scanning, image retention)
 
 **Options:**
 
@@ -460,7 +472,7 @@ Update git repository settings
 
 ### `projects source`
 
-Show or change how a project is deployed (primary source, and whether it also accepts `drop` uploads)
+Show or change how a service is deployed (primary source, and whether it also accepts `drop` uploads)
 
 **Options:**
 
@@ -505,7 +517,7 @@ Update deployment configuration (resources, replicas)
 
 ### `projects delete` (alias: `rm`)
 
-Delete a project
+Delete a service
 
 **Options:**
 
@@ -3068,37 +3080,39 @@ Revoke a team's access to a project
 
 ## `project-groups` (alias: `pg`)
 
-Group services that ship together into one project and share variables between them (shown as "Projects" in the console)
+Manage Projects (what the console calls a Project): groups of services that ship together and share a repository, variables and path routes. A service is what the `projects` command manages; the `services` command manages databases and caches, not these.
 
 **Subcommands:**
 
-- `list` (`ls`) - List project groups and their services
-- `show` (`get`) - Show a project group (id or slug)
-- `create` (`new`) - Create a project group, optionally with services
-- `update` (`edit`) - Rename a project group or change its description
-- `delete` (`rm`) - Delete a project group; its services keep running, ungrouped
-- `add` - Add services (project slugs or ids) to a group, moving them out of any other group
-- `remove` - Remove a service from a group; it becomes standalone
+- `list` (`ls`) - List projects (groups) and their services
+- `show` (`get`) - Show a project (group), by slug or id
+- `create` (`new`) - Create a project (group), optionally with services
+- `update` (`edit`) - Rename a project (group) or change its description
+- `delete` (`rm`) - Delete a project (group); its services keep running as standalone services
+- `add` - Add services to a project (group), by slug or id as listed by `projects list`; moves them out of any other project
+- `remove` - Remove a service (slug or id) from a project (group); it becomes a standalone service
 - `repo` - The repository a project deploys its services from (monorepos)
 - `import` - Scan the project's repository and add its apps as services that follow it
 - `follow` - Make a service follow the project's repository and branch (keeps its directory)
 - `unfollow` - Stop a service following the project's repository; it keeps its current settings
 - `routes` - Serve a path of one service's domains from another service (e.g. /api → backend)
-- `vars` - Variables shared by every service in a group
+- `vars` - Variables shared by every service in a project (group)
 
 ### `project-groups list` (alias: `ls`)
 
-List project groups and their services
+List projects (groups) and their services
 
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--page <n>` | Page number (default 1) | - | No |
+| `--per-page <n>` | How many per page (default 100, at most 100) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `project-groups show` (alias: `get`)
 
-Show a project group (id or slug)
+Show a project (group), by slug or id
 
 **Options:**
 
@@ -3108,21 +3122,21 @@ Show a project group (id or slug)
 
 ### `project-groups create` (alias: `new`)
 
-Create a project group, optionally with services
+Create a project (group), optionally with services
 
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-n, --name <name>` | Group name | - | No |
+| `-n, --name <name>` | Project name | - | No |
 | `-s, --slug <slug>` | URL slug (derived from the name when omitted) | - | No |
 | `-d, --description <text>` | What the services do together | - | No |
-| `--service <service...>` | Services (project slugs or ids) to put in the group | - | No |
+| `--service <service...>` | Services to put in the project, by slug or id as listed by `projects list` (apps, not the databases of the `services` command) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `project-groups update` (alias: `edit`)
 
-Rename a project group or change its description
+Rename a project (group) or change its description
 
 **Options:**
 
@@ -3135,7 +3149,7 @@ Rename a project group or change its description
 
 ### `project-groups delete` (alias: `rm`)
 
-Delete a project group; its services keep running, ungrouped
+Delete a project (group); its services keep running as standalone services
 
 **Options:**
 
@@ -3145,11 +3159,11 @@ Delete a project group; its services keep running, ungrouped
 
 ### `project-groups add`
 
-Add services (project slugs or ids) to a group, moving them out of any other group
+Add services to a project (group), by slug or id as listed by `projects list`; moves them out of any other project
 
 ### `project-groups remove`
 
-Remove a service from a group; it becomes standalone
+Remove a service (slug or id) from a project (group); it becomes a standalone service
 
 ### `project-groups repo`
 
@@ -3205,6 +3219,7 @@ Scan the project's repository and add its apps as services that follow it
 |------|-------------|---------|----------|
 | `-p, --path <dir...>` | Only these app directories (default: every app without a service) | - | No |
 | `--dry-run` | List what would be created without creating anything | - | No |
+| `--timeout <minutes>` | Stop waiting after this long (default 30); the import keeps running on the server | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `project-groups follow`
@@ -3258,17 +3273,18 @@ Stop routing <prefix>; <source> serves it itself again
 
 ### `project-groups vars`
 
-Variables shared by every service in a group
+Variables shared by every service in a project (group)
 
 **Subcommands:**
 
-- `list` (`ls`) - List shared variables (values are masked)
-- `set` - Create or update a shared variable; a service's own variable still wins
+- `list` (`ls`) - List shared variables (secret values are never shown)
+- `set` - Create or update a shared variable; a service's own variable still wins. Omit the value to type it at a hidden prompt, or pass --value-stdin to pipe it (keeps secrets out of shell history)
+- `inherited` - Show the shared variables a service (slug or id) receives from its project, and which of them the service's own variables override
 - `unset` - Remove a shared variable
 
 #### `project-groups vars list` (alias: `ls`)
 
-List shared variables (values are masked)
+List shared variables (secret values are never shown)
 
 **Options:**
 
@@ -3278,7 +3294,7 @@ List shared variables (values are masked)
 
 #### `project-groups vars set`
 
-Create or update a shared variable; a service's own variable still wins
+Create or update a shared variable; a service's own variable still wins. Omit the value to type it at a hidden prompt, or pass --value-stdin to pipe it (keeps secrets out of shell history)
 
 **Options:**
 
@@ -3286,7 +3302,19 @@ Create or update a shared variable; a service's own variable still wins
 |------|-------------|---------|----------|
 | `-e, --environment <slug>` | Only this environment (e.g. production); default: all | - | No |
 | `--secret` | Write-only: the value can never be read back | - | No |
-| `--no-preview` | Do not send an all-environments variable to preview deployments | - | No |
+| `--value-stdin` | Read the value from stdin, e.g. `cat key.pem \| ... vars set shop TLS_KEY --secret --value-stdin` | - | No |
+| `--preview` | Also send an all-environments variable to preview deployments (off by default) | - | No |
+| `--no-preview` | Do not send it to preview deployments | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `project-groups vars inherited`
+
+Show the shared variables a service (slug or id) receives from its project, and which of them the service's own variables override
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
 
 #### `project-groups vars unset`
@@ -3306,23 +3334,25 @@ Follow and retry template creations and imports
 
 **Subcommands:**
 
-- `list` (`ls`) - List your recent template creations and imports
-- `show` - Show every step of a template creation or import
+- `list` (`ls`) - List your recent template creations and imports, newest first
+- `show` (`get`) - Show every step of a template creation or import
 - `retry` - Continue from the step that failed; finished steps are not repeated
 
 ### `instantiations list` (alias: `ls`)
 
-List your recent template creations and imports
+List your recent template creations and imports, newest first
 
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--group <id>` | Only those that added services to this project (group id) | - | No |
-| `--limit <n>` | At most this many (default 20) | - | No |
+| `--group <project>` | Only those that added services to this project (group slug or id) | - | No |
+| `--page <n>` | Page number (default 1) | - | No |
+| `--per-page <n>` | How many per page (default 20, at most 100) | - | No |
+| `--limit <n>` | Same as --per-page | - | No |
 | `--json` | Output in JSON format | - | No |
 
-### `instantiations show`
+### `instantiations show` (alias: `get`)
 
 Show every step of a template creation or import
 
@@ -3331,6 +3361,7 @@ Show every step of a template creation or import
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--wait` | Wait until it finishes | - | No |
+| `--timeout <minutes>` | With --wait: stop waiting after this long (default 30) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `instantiations retry`
@@ -3342,6 +3373,7 @@ Continue from the step that failed; finished steps are not repeated
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--no-wait` | Return right away instead of waiting until it finishes | - | No |
+| `--timeout <minutes>` | Stop waiting after this long (default 30); it keeps running on the server | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `apikeys` (alias: `keys`)
@@ -6866,7 +6898,7 @@ Browse templates and create them
 **Subcommands:**
 
 - `list` (`ls`) - List available templates
-- `create` - Create a template: every service, the databases it needs, its shared variables and path routes
+- `create` - Create a template: every service (an app, what `projects` manages), the databases it needs, its shared variables and path routes
 - `validate` - Validate a Temps-native template YAML file or directory offline
 
 ### `templates list` (alias: `ls`)
@@ -6882,15 +6914,15 @@ List available templates
 
 ### `templates create`
 
-Create a template: every service, the databases it needs, its shared variables and path routes
+Create a template: every service (an app, what `projects` manages), the databases it needs, its shared variables and path routes
 
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--project <name>` | Put the services in a new project with this name (default for several services) | - | No |
-| `--into <project>` | Add the services to an existing project (slug or id) | - | No |
-| `--standalone` | Create a one-service template without a project (default for one service) | - | No |
+| `--project <name>` | Put the services in a new project (group) with this name; the default for several services | - | No |
+| `--into <project>` | Add the services to an existing project (group), by slug or id (see: project-groups list) | - | No |
+| `--standalone` | Create a one-service template without a project (group); the default for one service | - | No |
 | `--name <service=name...>` | Name a created service; a one-service template also takes a bare name | - | No |
 | `--env <[service:]KEY=VALUE...>` | Set a variable; prefix the service when the template cannot tell | - | No |
 | `--secret <[service:]KEY=VALUE...>` | Set a secret variable (write-only once stored) | - | No |
@@ -6902,6 +6934,7 @@ Create a template: every service, the databases it needs, its shared variables a
 | `--no-auto-deploy` | Do not deploy on push to the new repository | - | No |
 | `--idempotency-key <key>` | Reuse a key to get the same result instead of creating twice | - | No |
 | `--no-wait` | Return right away instead of waiting until it finishes | - | No |
+| `--timeout <minutes>` | Stop waiting after this long (default 30); it keeps running on the server | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `templates validate`

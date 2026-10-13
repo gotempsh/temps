@@ -5822,6 +5822,48 @@ export type CreateGlobalConversationRequest = {
     ai_thinking_level?: string | null;
 };
 
+export type CreateGroupEnvVarRequest = {
+    /**
+     * Environment slug (e.g. `production`, `staging`) this applies to.
+     * Omit to apply to every environment.
+     */
+    environment_slug?: string | null;
+    /**
+     * Whether an unscoped variable also reaches preview environments.
+     * Defaults to `false` — opt-in, matching the per-service variable default
+     * so that sensitive group-level values don't leak into previews unless
+     * deliberately enabled.
+     */
+    include_in_preview?: boolean;
+    /**
+     * Write-only: the value can never be read back through the API.
+     */
+    is_secret?: boolean;
+    key: string;
+    value: string;
+};
+
+export type CreateGroupRouteRequest = {
+    /**
+     * Path prefix handed to the target, e.g. `/api`. Matches the prefix
+     * itself and everything below it (`/api/users`), never `/apiary`.
+     */
+    path_prefix: string;
+    /**
+     * The service whose hostnames receive the requests.
+     */
+    source_project_id: number;
+    /**
+     * Remove the prefix before forwarding (`/api/users` → `/users`). Off by
+     * default: most backends expect the path they were called with.
+     */
+    strip_prefix?: boolean;
+    /**
+     * The service that serves requests under the prefix.
+     */
+    target_project_id: number;
+};
+
 export type CreateIncidentRequest = {
     description?: string | null;
     environment_id?: number | null;
@@ -6202,6 +6244,20 @@ export type CreateProjectFromTemplateResponse = {
     template_slug: string;
 };
 
+export type CreateProjectGroupRequest = {
+    description?: string | null;
+    name: string;
+    /**
+     * Projects to place in the group right away, in display order. A
+     * project that is already in another group is moved.
+     */
+    project_ids?: Array<number>;
+    /**
+     * URL-safe identifier. Derived from `name` when omitted.
+     */
+    slug?: string | null;
+};
+
 export type CreateProjectRequest = {
     automatic_deploy?: boolean | null;
     build_command?: string | null;
@@ -6243,6 +6299,12 @@ export type CreateProjectRequest = {
     exposed_port?: number | null;
     git_provider_connection_id?: number | null;
     git_url?: string | null;
+    /**
+     * `external` for an app that runs elsewhere and only sends Temps its
+     * telemetry. Temps never deploys an external project. Defaults to
+     * `hosted`.
+     */
+    hosting?: Hosting;
     install_command?: string | null;
     is_on_demand?: boolean | null;
     is_public_repo?: boolean | null;
@@ -6961,6 +7023,20 @@ export type DataImportSpec = {
      * A complete example of a source connection string.
      */
     source_url_example: string;
+};
+
+/**
+ * A managed database for the template: one that exists, or a new one.
+ */
+export type DatabaseChoice = {
+    service_id: number;
+    type: 'existing';
+} | {
+    /**
+     * Name of the new database; derived from the project when omitted.
+     */
+    name?: string | null;
+    type: 'create';
 };
 
 /**
@@ -9564,7 +9640,7 @@ export type EnvExampleVariableResponse = {
 };
 
 /**
- * Input for environment variable
+ * A variable value supplied when creating from a template.
  */
 export type EnvVarInput = {
     /**
@@ -11135,6 +11211,28 @@ export type ForecastParams = {
     threshold: number;
 };
 
+/**
+ * Fork the template's repository into a git account, so the code becomes
+ * the user's and pushes deploy. Starters only.
+ */
+export type ForkRequest = {
+    /**
+     * Deploy on push to the fork.
+     */
+    automatic_deploy?: boolean;
+    git_provider_connection_id: number;
+    private?: boolean;
+    /**
+     * Name of the repository to create.
+     */
+    repository_name: string;
+    /**
+     * Account or organization to create it in; the connection's user when
+     * omitted.
+     */
+    repository_owner?: string | null;
+};
+
 export type FullError = {
     /**
      * Full JSONB blob from `error_events.data` — stack trace, breadcrumbs,
@@ -12420,6 +12518,25 @@ export type GlobalTracesResponse = {
 };
 
 /**
+ * A group variable as returned by the API. `value` is `"***"` in lists,
+ * plaintext only in the create/update response of a non-secret variable,
+ * and always `null` for secrets.
+ */
+export type GroupEnvVarResponse = {
+    created_at: string;
+    /**
+     * Environment slug this applies to; `null` means every environment.
+     */
+    environment_slug?: string | null;
+    id: number;
+    include_in_preview: boolean;
+    is_secret: boolean;
+    key: string;
+    updated_at: string;
+    value?: string | null;
+};
+
+/**
  * What to group or facet by.
  */
 export type GroupKey = {
@@ -12434,6 +12551,74 @@ export type GroupKey = {
      * An attribute key.
      */
     name: string;
+};
+
+/**
+ * The repository a group points at, as stored plus what it resolves to.
+ */
+export type GroupRepository = {
+    /**
+     * HTTPS clone URL, when known.
+     */
+    clone_url?: string | null;
+    /**
+     * The connection the repository is read through. Null for a public
+     * repository (see `public_provider`), or when the git connection was
+     * deleted; the repository must then be connected again before members
+     * can follow it.
+     */
+    git_provider_connection_id?: number | null;
+    main_branch: string;
+    /**
+     * `github` or `gitlab` when the repository is public and read without a
+     * connection. Pushes to a public repository cannot trigger deploys.
+     */
+    public_provider?: string | null;
+    repo_name: string;
+    repo_owner: string;
+    /**
+     * The synced repository record, used to scan a connected repo for apps.
+     * Null for public repositories, and when the connection's repository
+     * list does not include it (yet).
+     */
+    repository_id?: number | null;
+};
+
+export type GroupRepositoryResponse = {
+    repository?: GroupRepository | null;
+};
+
+/**
+ * How a route applies to one environment of its source service.
+ */
+export type GroupRouteEnvironment = {
+    source_environment_id: number;
+    source_environment_slug: string;
+    /**
+     * Whether the target environment has a deployment to serve requests.
+     */
+    target_deployed: boolean;
+    /**
+     * The target environment requests go to: the one with the same slug,
+     * or for a preview, the target's preview of the same branch. `None`
+     * means requests under the prefix are answered with an error instead of
+     * reaching another environment.
+     */
+    target_environment_id?: number | null;
+    target_environment_slug?: string | null;
+};
+
+export type GroupRouteResponse = {
+    created_at: string;
+    environments: Array<GroupRouteEnvironment>;
+    group_id: number;
+    id: number;
+    path_prefix: string;
+    source_project_id: number;
+    source_project_name: string;
+    strip_prefix: boolean;
+    target_project_id: number;
+    target_project_name: string;
 };
 
 export type GroupedPageMetric = {
@@ -12821,6 +13006,14 @@ export type HistogramSummary = {
      */
     sum: number;
 };
+
+/**
+ * Whether Temps runs a project's app.
+ *
+ * `External` projects run elsewhere (Vercel, Netlify, a VPS) and only send
+ * Temps their analytics, errors and traces; they are never deployed.
+ */
+export type Hosting = 'hosted' | 'external';
 
 /**
  * A single generated-hostname change in a flatten preview/apply.
@@ -13262,6 +13455,17 @@ export type ImportSelector = {
 };
 
 /**
+ * Add apps of a project's repository as services of the project.
+ */
+export type ImportServicesRequest = {
+    apps: Array<ImportedApp>;
+    /**
+     * Chosen by the client; see [`InstantiateTemplateRequest::idempotency_key`].
+     */
+    idempotency_key: string;
+};
+
+/**
  * Import source identifier
  */
 export type ImportSource = 'docker' | 'coolify' | 'dokploy' | 'vercel' | 'netlify' | 'railway' | 'render' | 'fly' | 'kubernetes' | 'caprover' | 'portainer' | 'kamal' | 'custom';
@@ -13415,6 +13619,23 @@ export type ImportTraefikAcmeJsonResponse = {
 };
 
 /**
+ * An app found in a project's repository, to add as a service.
+ */
+export type ImportedApp = {
+    /**
+     * Directory of the app in the repository (`.` for the root).
+     */
+    directory: string;
+    exposed_port?: number | null;
+    /**
+     * Name of the service to create.
+     */
+    name: string;
+    preset: string;
+    preset_config?: unknown;
+};
+
+/**
  * Per-host result from a Path B import.
  */
 export type ImportedHostVerdict = {
@@ -13563,6 +13784,32 @@ export type IngestErrorsResponse = {
     errors: Array<IngestErrorSummary>;
 };
 
+export type InheritedEnvVarResponse = {
+    /**
+     * The project also defines this key itself (in some environment), and
+     * its own value wins wherever both apply.
+     */
+    defined_on_project: boolean;
+    environment_slug?: string | null;
+    include_in_preview: boolean;
+    is_secret: boolean;
+    key: string;
+};
+
+/**
+ * What a project inherits from its group. `group` is null when ungrouped.
+ */
+export type InheritedEnvVarsResponse = {
+    group?: InheritedGroupRef | null;
+    variables: Array<InheritedEnvVarResponse>;
+};
+
+export type InheritedGroupRef = {
+    id: number;
+    name: string;
+    slug: string;
+};
+
 export type InitAuthResponse = {
     auth_url: string;
     session_token: string;
@@ -13670,6 +13917,120 @@ export type InstallationReportingSettings = {
      * with the official Temps registry after a verified install succeeds.
      */
     enabled: boolean;
+};
+
+/**
+ * Create a template.
+ */
+export type InstantiateTemplateRequest = {
+    /**
+     * One choice per database type the template needs.
+     */
+    databases?: {
+        [key: string]: DatabaseChoice;
+    };
+    environment_variables?: Array<TemplateVariableInput>;
+    fork?: ForkRequest | null;
+    /**
+     * Chosen by the client. Sending the same key again returns the same
+     * instantiation instead of creating the template twice.
+     */
+    idempotency_key: string;
+    /**
+     * Runtime overrides for services that run a prebuilt image, by the
+     * template's service name.
+     */
+    runtime_overrides?: {
+        [key: string]: TemplateRuntimeOverrides;
+    };
+    /**
+     * Names for the created services, by the template's service name.
+     */
+    service_names?: {
+        [key: string]: string;
+    };
+    target: InstantiationTarget;
+};
+
+export type InstantiatedService = {
+    name: string;
+    /**
+     * Set once the service exists.
+     */
+    project_id?: number | null;
+    slug: string;
+    /**
+     * Name of the service in the template.
+     */
+    template_service: string;
+};
+
+/**
+ * Paginated list of instantiations.
+ */
+export type InstantiationListResponse = {
+    items: Array<InstantiationResponse>;
+    page: number;
+    per_page: number;
+    total: number;
+};
+
+export type InstantiationResponse = {
+    created_at: string;
+    /**
+     * Why it failed, when it did.
+     */
+    error?: string | null;
+    finished_at?: string | null;
+    /**
+     * The project the services go into, once known.
+     */
+    group_id?: number | null;
+    id: number;
+    /**
+     * `template` or `import`.
+     */
+    kind: string;
+    name: string;
+    services: Array<InstantiatedService>;
+    status: InstantiationStatus;
+    steps: Array<InstantiationStep>;
+    template_slug?: string | null;
+    updated_at: string;
+};
+
+export type InstantiationStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'interrupted';
+
+export type InstantiationStep = {
+    error?: string | null;
+    /**
+     * Stable identifier, such as `service:backend`.
+     */
+    key: string;
+    /**
+     * What the step does, for display.
+     */
+    label: string;
+    status: StepStatus;
+};
+
+/**
+ * Where the services of a template go.
+ */
+export type InstantiationTarget = {
+    name: string;
+    /**
+     * Explicit slug for the project. When omitted the slug is derived from
+     * `name` via `ProjectGroupService::slugify`. Useful when the name does
+     * not produce a valid Latin slug (non-Latin scripts, emoji-only names).
+     */
+    slug?: string | null;
+    type: 'new_project';
+} | {
+    group_id: number;
+    type: 'existing_project';
+} | {
+    type: 'no_project';
 };
 
 export type IntegrationResponse = {
@@ -14782,6 +15143,18 @@ export type McpServerSettings = {
      * Settings UI to activate the MCP server.
      */
     enabled?: boolean;
+};
+
+/**
+ * What happened to one inheriting member when the group's repository
+ * changed. `error` is set when that member could not be updated; it then
+ * still points at its previous repository or branch.
+ */
+export type MemberSyncResult = {
+    error?: string | null;
+    name: string;
+    project_id: number;
+    slug: string;
 };
 
 export type MessageContent = string | Array<ContentPart>;
@@ -18783,6 +19156,88 @@ export type ProjectEnvVarInput = {
     value: string;
 };
 
+export type ProjectGroupListResponse = {
+    groups: Array<ProjectGroupResponse>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+/**
+ * A project as it appears inside a group.
+ */
+export type ProjectGroupMemberResponse = {
+    /**
+     * Directory of the repository the project builds from.
+     */
+    directory: string;
+    /**
+     * For a project that follows the group's repository: whether it points
+     * at it right now. False means a change could not be applied to it (or
+     * its git settings were edited directly); set the repository again.
+     */
+    follows_repository?: boolean | null;
+    /**
+     * `external` for a service whose app runs outside Temps.
+     */
+    hosting: Hosting;
+    id: number;
+    /**
+     * Whether the project follows the group's repository and branch.
+     */
+    inherits_repository: boolean;
+    last_deployment?: string | null;
+    /**
+     * Branch the project deploys from.
+     */
+    main_branch: string;
+    name: string;
+    preset: string;
+    project_type: string;
+    repo_name: string;
+    repo_owner: string;
+    slug: string;
+    source_type: string;
+};
+
+/**
+ * The group a project belongs to; `group` is null for an ungrouped project.
+ */
+export type ProjectGroupMembershipResponse = {
+    group?: ProjectGroupResponse | null;
+};
+
+/**
+ * A group's repository as listed with the group. The full record (with the
+ * synced repository id used to scan it) is at
+ * `GET /project-groups/{group_id}/repository`.
+ */
+export type ProjectGroupRepositoryRef = {
+    git_provider_connection_id?: number | null;
+    main_branch: string;
+    /**
+     * `github` or `gitlab` for a public repository read without a
+     * connection.
+     */
+    public_provider?: string | null;
+    repo_name: string;
+    repo_owner: string;
+};
+
+export type ProjectGroupResponse = {
+    created_at: string;
+    description?: string | null;
+    id: number;
+    name: string;
+    /**
+     * Member projects the caller can access, in display order.
+     */
+    projects: Array<ProjectGroupMemberResponse>;
+    repository?: ProjectGroupRepositoryRef | null;
+    slug: string;
+    updated_at: string;
+};
+
 /**
  * Health summary for a single project over the requested time range.
  */
@@ -18961,6 +19416,12 @@ export type ProjectResponse = {
      * or webhook was removed / never created).
      */
     gitlab_webhook_id?: number | null;
+    /**
+     * `hosted`: Temps builds and runs the app. `external`: the app runs
+     * elsewhere (Vercel, Netlify, a VPS) and only sends Temps its analytics,
+     * errors and traces; Temps never deploys it.
+     */
+    hosting: Hosting;
     id: number;
     /**
      * Hours to retain built Docker images before nightly cleanup. Null = use the
@@ -19083,49 +19544,34 @@ export type ProjectStatsBreakdown = {
 };
 
 /**
- * A curated project template
+ * A curated template: one or more services, the managed databases they use,
+ * the variables they share and the routes between them (ADR-051).
+ *
+ * Two YAML shapes load into it. The current one lists service definitions
+ * under `services`. The original one-service shape keeps the service's
+ * fields at the top level and uses `services` for the managed databases; it
+ * loads as a template whose only service is named after the slug. Which
+ * shape a document uses is decided by its structure, never guessed.
  */
 export type ProjectTemplate = {
     /**
-     * Optional command passed to the container image. This is needed for
-     * production images whose default command is intentionally a development
-     * mode (for example Keycloak).
+     * Managed databases the template needs (e.g., ["postgres", "redis"]).
      */
-    command?: Array<string> | null;
+    databases: Array<string>;
     /**
      * Short description
      */
     description?: string | null;
     /**
-     * Environment variables template
-     */
-    env_vars?: Array<EnvVarTemplate>;
-    /**
-     * Container port the prebuilt image listens on (used for routing when
-     * deploying from `image`). Falls back to the image's EXPOSE / 3000 default.
-     */
-    exposed_port?: number | null;
-    /**
      * Feature highlights
      */
-    features?: Array<string>;
+    features: Array<string>;
     /**
-     * Git repository reference (supports any git provider). Always present as
-     * the source-of-truth / build fallback, even for image-based templates.
+     * Source repository shared by the services that don't declare their own.
+     * Always present as the source-of-truth / build fallback, even for
+     * image-based templates.
      */
     git: GitRef;
-    /**
-     * HTTP health-check path probed after the container starts (image deploys
-     * can't read `.temps.yaml`). Must start with '/'. Defaults to "/".
-     */
-    health_check_path?: string | null;
-    /**
-     * Prebuilt Docker image reference (e.g. "ghcr.io/org/app:latest"). When set,
-     * the one-click deploy pulls and runs this image directly (source_type
-     * docker_image) instead of building from `git` — instant, no BuildKit. When
-     * absent, the template builds from source.
-     */
-    image?: string | null;
     /**
      * URL to template image/icon
      */
@@ -19133,41 +19579,23 @@ export type ProjectTemplate = {
     /**
      * Whether the template is featured/promoted
      */
-    is_featured?: boolean;
+    is_featured: boolean;
     /**
      * Whether the template is publicly visible
      */
-    is_public?: boolean;
+    is_public: boolean;
     /**
-     * Gallery this template belongs to. Older configurations default to a
-     * source-code starter, preserving their existing behaviour.
+     * Who owns the code once the template is created.
      */
-    kind?: TemplateKind;
-    /**
-     * Environment aliases populated from a linked managed service. The outer
-     * key is the Temps service type and each inner entry maps an application
-     * variable to a variable supplied by that service.
-     *
-     * Example: `postgres.KC_DB_USERNAME: POSTGRES_USER`.
-     */
-    managed_service_bindings?: {
-        [key: string]: {
-            [key: string]: string;
-        };
-    };
+    kind: TemplateKind;
     /**
      * Display name
      */
     name: string;
     /**
-     * Framework/preset to use (e.g., "nextjs", "fastapi", "dockerfile")
+     * Path routes between the services.
      */
-    preset: string;
-    /**
-     * Preset-specific configuration
-     */
-    preset_config?: unknown;
-    resources?: TemplateResources | null;
+    routes: Array<TemplateRoute>;
     /**
      * URL to a full screenshot/banner preview of the deployed template (e.g.
      * `/templates/nextjs-saas-starter.png`). Rendered as a wide preview on the
@@ -19175,9 +19603,14 @@ export type ProjectTemplate = {
      */
     screenshot_url?: string | null;
     /**
-     * Required external services (e.g., ["postgres", "redis"])
+     * The services the template creates; never empty.
      */
-    services?: Array<string>;
+    services: Array<TemplateServiceSpec>;
+    /**
+     * Variables shared by every service. Created in a project, they become
+     * the project's shared variables.
+     */
+    shared_env_vars: Array<EnvVarTemplate>;
     /**
      * Unique identifier for the template (used in URLs)
      */
@@ -19185,17 +19618,17 @@ export type ProjectTemplate = {
     /**
      * Sort order for display (lower = first)
      */
-    sort_order?: number;
+    sort_order: number;
     /**
      * Tags/categories for filtering
      */
-    tags?: Array<string>;
+    tags: Array<string>;
     /**
-     * Version of this template release. Service projects pin this value and
-     * the complete resolved definition so catalog updates are always an
+     * Version of this template release. Apps pin this value and the
+     * complete resolved definition so catalog updates are always an
      * explicit, reviewable upgrade rather than a silent runtime mutation.
      */
-    version?: string;
+    version: string;
 };
 
 /**
@@ -23290,9 +23723,9 @@ export type ServiceStatsReport = {
 export type ServiceTemplateChangeKind = 'added' | 'removed' | 'changed';
 
 /**
- * Immutable template release attached to a service project.
+ * Immutable app release attached to a service created from it.
  *
- * The resolved definition is deliberately stored with the project. The live
+ * The resolved definition is deliberately stored with the service. The live
  * catalog is only needed to discover a newer release; deployments, edits and
  * rollbacks continue to work if the catalog later changes or disappears.
  */
@@ -23302,11 +23735,17 @@ export type ServiceTemplateInstance = {
      */
     schema_version: string;
     /**
-     * Stable service family identifier.
+     * Which of the template's services this one is. Absent on snapshots
+     * written before templates could have several services: those are the
+     * template's only service.
+     */
+    service?: string | null;
+    /**
+     * Stable app family identifier.
      */
     slug: string;
     /**
-     * Exact resolved release from which this project was created/upgraded.
+     * Exact resolved release from which this service was created/upgraded.
      */
     template: ProjectTemplate;
     /**
@@ -23603,6 +24042,31 @@ export type SetFlagEnvironmentRequest = {
     value?: unknown;
 };
 
+export type SetGroupRepositoryRequest = {
+    /**
+     * The connection to read the repository through. Set exactly one of
+     * this and `public_provider`.
+     */
+    git_provider_connection_id?: number | null;
+    main_branch: string;
+    /**
+     * `github` or `gitlab`, to use a public repository without a
+     * connection. Pushes to it cannot trigger deploys.
+     */
+    public_provider?: string | null;
+    repo_name: string;
+    repo_owner: string;
+};
+
+export type SetGroupRepositoryResponse = {
+    group: ProjectGroupResponse;
+    /**
+     * One entry per project that follows the repository. An entry with an
+     * `error` still points at its previous repository or branch.
+     */
+    services: Array<MemberSyncResult>;
+};
+
 export type SetHttpCheckEnabled = {
     enabled: boolean;
 };
@@ -23666,6 +24130,27 @@ export type SetPreviewPasswordResponse = {
      * users can confirm which password is live without re-entering it.
      */
     preview_password_hint: string;
+};
+
+/**
+ * Whether Temps runs a project's app or only observes an app running
+ * elsewhere.
+ */
+export type SetProjectHostingRequest = {
+    /**
+     * `external` stops Temps from deploying the project (deployments already
+     * running keep running until stopped); `hosted` lets it deploy again.
+     */
+    hosting: Hosting;
+};
+
+export type SetRepositoryInheritanceRequest = {
+    /**
+     * True: the project follows the group's repository and branch (and is
+     * pointed at them now, keeping its own directory). False: it keeps its
+     * current git settings and stops following.
+     */
+    inherit: boolean;
 };
 
 /**
@@ -24967,6 +25452,8 @@ export type StepResult = {
     success: boolean;
 };
 
+export type StepStatus = 'pending' | 'done' | 'failed';
+
 export type StepUpResponse = {
     /**
      * ISO 8601 timestamp after which sensitive actions require verification
@@ -25364,9 +25851,9 @@ export type TelemetryWriteIntervalResponse = {
 };
 
 /**
- * Where a template is presented in the project creation flow.
+ * Who owns a template's code once it is created (ADR-051).
  */
-export type TemplateKind = 'starter' | 'service';
+export type TemplateKind = 'starter' | 'app';
 
 /**
  * Resource profile required by a curated template. CPU values use the same
@@ -25388,11 +25875,15 @@ export type TemplateResponse = {
      */
     command?: Array<string> | null;
     /**
+     * Managed databases the template needs.
+     */
+    databases: Array<string>;
+    /**
      * Short description
      */
     description?: string | null;
     /**
-     * Environment variables template
+     * Variables of the first service, followed by the shared variables.
      */
     env_vars: Array<EnvVarTemplateResponse>;
     /**
@@ -25425,11 +25916,12 @@ export type TemplateResponse = {
      */
     is_featured: boolean;
     /**
-     * Gallery this template belongs to.
+     * Who owns the code once the template is created.
      */
     kind: TemplateKind;
     /**
-     * Managed-service environment aliases used at deployment time.
+     * Managed-service environment aliases of the first service, used at
+     * deployment time.
      */
     managed_service_bindings: {
         [key: string]: {
@@ -25441,19 +25933,32 @@ export type TemplateResponse = {
      */
     name: string;
     /**
-     * Framework/preset to use
+     * Framework/preset of the first service.
      */
     preset: string;
     resources?: TemplateResources | null;
+    /**
+     * Path routes between the services.
+     */
+    routes: Array<TemplateRoute>;
     /**
      * URL to a wide screenshot/banner preview of the deployed template.
      * Absent for templates that don't have one captured yet.
      */
     screenshot_url?: string | null;
     /**
-     * Required external services
+     * Every service the template creates, in order.
+     */
+    service_definitions: Array<TemplateServiceResponse>;
+    /**
+     * Managed databases the template needs. Same as `databases`; kept for
+     * clients written before templates could have several services.
      */
     services: Array<string>;
+    /**
+     * Variables shared by all services; they become project variables.
+     */
+    shared_env_vars: Array<EnvVarTemplateResponse>;
     /**
      * Unique identifier for the template (used in URLs)
      */
@@ -25463,9 +25968,203 @@ export type TemplateResponse = {
      */
     tags: Array<string>;
     /**
-     * Immutable release identifier for service templates.
+     * Immutable release identifier for apps.
      */
     version: string;
+};
+
+/**
+ * A path route between two services of the template (ADR-050).
+ */
+export type TemplateRoute = {
+    /**
+     * Path prefix handed to `target`, such as `/api`.
+     */
+    prefix: string;
+    /**
+     * Service whose hostnames receive the requests.
+     */
+    source: string;
+    /**
+     * Forward `/api/users` as `/users`.
+     */
+    strip_prefix?: boolean;
+    /**
+     * Service that answers requests under `prefix`.
+     */
+    target: string;
+};
+
+/**
+ * Runtime overrides for a service that runs a prebuilt image. Curated
+ * template values are used for everything left unset.
+ */
+export type TemplateRuntimeOverrides = {
+    /**
+     * Entrypoint arguments. An empty list uses the image's own command.
+     */
+    command?: Array<string> | null;
+    /**
+     * CPU limit in microcores. Zero means uncapped.
+     */
+    cpu_limit?: number | null;
+    /**
+     * CPU request in microcores (1_000_000 = one CPU core).
+     */
+    cpu_request?: number | null;
+    /**
+     * Public container port.
+     */
+    exposed_port?: number | null;
+    /**
+     * Relative HTTP health-check path.
+     */
+    health_check_path?: string | null;
+    /**
+     * Image reference; must be pinned to a sha256 digest.
+     */
+    image?: string | null;
+    /**
+     * Memory limit in MiB. Zero means uncapped.
+     */
+    memory_limit?: number | null;
+    /**
+     * Memory request in MiB.
+     */
+    memory_request?: number | null;
+};
+
+/**
+ * One service of a template.
+ */
+export type TemplateServiceResponse = {
+    /**
+     * Managed-database environment aliases used at deployment time.
+     */
+    database_bindings: {
+        [key: string]: {
+            [key: string]: string;
+        };
+    };
+    /**
+     * Managed databases linked to this service.
+     */
+    databases: Array<string>;
+    /**
+     * Directory of the source the service builds from.
+     */
+    directory?: string | null;
+    /**
+     * Variables of this service.
+     */
+    env_vars: Array<EnvVarTemplateResponse>;
+    /**
+     * Container port the service listens on.
+     */
+    exposed_port?: number | null;
+    git?: GitRefResponse | null;
+    /**
+     * HTTP health-check path.
+     */
+    health_check_path?: string | null;
+    /**
+     * Prebuilt image the service runs instead of building.
+     */
+    image?: string | null;
+    /**
+     * Name of the service within the template.
+     */
+    name: string;
+    /**
+     * Framework/preset to use.
+     */
+    preset: string;
+    resources?: TemplateResources | null;
+};
+
+/**
+ * One deployable unit of a template: it becomes one service (a `projects`
+ * row) when the template is created.
+ */
+export type TemplateServiceSpec = {
+    /**
+     * Optional command passed to the container image. This is needed for
+     * production images whose default command is intentionally a development
+     * mode (for example Keycloak).
+     */
+    command?: Array<string> | null;
+    /**
+     * Environment aliases populated from a linked managed database. The outer
+     * key is the database type and each inner entry maps an application
+     * variable to a variable supplied by that database.
+     *
+     * Example: `postgres.KC_DB_USERNAME: POSTGRES_USER`.
+     */
+    database_bindings?: {
+        [key: string]: {
+            [key: string]: string;
+        };
+    };
+    /**
+     * Managed databases (types listed in the template's `databases`) linked
+     * to this service. Filled in on load: a service is linked to every
+     * database it binds, and a template's only service to all of them.
+     */
+    databases?: Array<string>;
+    /**
+     * Directory of the source this service builds from. Overrides the path
+     * of its repository reference.
+     */
+    directory?: string | null;
+    /**
+     * Variables of this service only.
+     */
+    env_vars?: Array<EnvVarTemplate>;
+    /**
+     * Container port the service listens on. Falls back to the image's
+     * EXPOSE / 3000 default.
+     */
+    exposed_port?: number | null;
+    git?: GitRef | null;
+    /**
+     * HTTP health-check path probed after the container starts. Must start
+     * with '/'. Defaults to "/".
+     */
+    health_check_path?: string | null;
+    /**
+     * Prebuilt Docker image reference (e.g. "ghcr.io/org/app@sha256:…"). When
+     * set, the service pulls and runs this image instead of building from
+     * source.
+     */
+    image?: string | null;
+    /**
+     * Name of the service, unique within the template. It names the created
+     * service and is how routes and variable references point at it.
+     */
+    name: string;
+    /**
+     * Framework/preset to use (e.g., "nextjs", "python", "dockerfile")
+     */
+    preset: string;
+    /**
+     * Preset-specific configuration
+     */
+    preset_config?: unknown;
+    resources?: TemplateResources | null;
+};
+
+/**
+ * A variable value for the template.
+ */
+export type TemplateVariableInput = {
+    is_secret?: boolean;
+    name: string;
+    /**
+     * The service the variable belongs to. Needed only when the name is not
+     * declared by the template, or is declared by several services.
+     */
+    service?: string | null;
+    value: string;
 };
 
 /**
@@ -27119,6 +27818,12 @@ export type UpdateGitSettingsRequest = {
     repo_owner: string;
 };
 
+export type UpdateGroupEnvVarRequest = {
+    include_in_preview?: boolean | null;
+    is_secret?: boolean | null;
+    value?: string | null;
+};
+
 export type UpdateIncidentStatusRequest = {
     /**
      * Show this update on the project's published status pages. Defaults to
@@ -27329,6 +28034,15 @@ export type UpdateProjectCloudTelemetryRequest = {
 export type UpdateProjectDeliverySettingsRequest = {
     default_profile_id?: number | null;
     environment_overrides?: Array<EnvironmentDeliveryOverride>;
+};
+
+export type UpdateProjectGroupRequest = {
+    /**
+     * An empty string clears the description.
+     */
+    description?: string | null;
+    name?: string | null;
+    slug?: string | null;
 };
 
 /**
@@ -45609,6 +46323,107 @@ export type SetIncidentUpdateVisibilityResponses = {
 
 export type SetIncidentUpdateVisibilityResponse = SetIncidentUpdateVisibilityResponses[keyof SetIncidentUpdateVisibilityResponses];
 
+export type ListInstantiationsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Only instantiations that put services into this project.
+         */
+        group_id?: number | null;
+        /**
+         * 1-indexed page number (default 1).
+         */
+        page?: number | null;
+        /**
+         * Items per page (default 20, max 100). `limit` is accepted as an alias
+         * for compatibility with earlier clients.
+         */
+        per_page?: number | null;
+        /**
+         * Alias for `per_page`; `per_page` takes precedence when both are sent.
+         */
+        limit?: number | null;
+    };
+    url: '/instantiations';
+};
+
+export type ListInstantiationsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+};
+
+export type ListInstantiationsResponses = {
+    /**
+     * Newest first, paginated
+     */
+    200: InstantiationListResponse;
+};
+
+export type ListInstantiationsResponse = ListInstantiationsResponses[keyof ListInstantiationsResponses];
+
+export type GetInstantiationData = {
+    body?: never;
+    path: {
+        /**
+         * Instantiation ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/instantiations/{id}';
+};
+
+export type GetInstantiationErrors = {
+    /**
+     * Not found
+     */
+    404: unknown;
+};
+
+export type GetInstantiationResponses = {
+    /**
+     * Its status and every step
+     */
+    200: InstantiationResponse;
+};
+
+export type GetInstantiationResponse = GetInstantiationResponses[keyof GetInstantiationResponses];
+
+export type RetryInstantiationData = {
+    body?: never;
+    path: {
+        /**
+         * Instantiation ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/instantiations/{id}/retry';
+};
+
+export type RetryInstantiationErrors = {
+    /**
+     * Not found
+     */
+    404: unknown;
+    /**
+     * It is running or already succeeded
+     */
+    409: unknown;
+};
+
+export type RetryInstantiationResponses = {
+    /**
+     * Running again
+     */
+    202: InstantiationResponse;
+};
+
+export type RetryInstantiationResponse = RetryInstantiationResponses[keyof RetryInstantiationResponses];
+
 export type AdminListNodesData = {
     body?: never;
     path?: never;
@@ -52613,6 +53428,737 @@ export type UpgradePreviewGatewayResponses = {
 
 export type UpgradePreviewGatewayResponse = UpgradePreviewGatewayResponses[keyof UpgradePreviewGatewayResponses];
 
+export type ListProjectGroupsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * 1-indexed page
+         */
+        page?: number;
+        /**
+         * default 20, max 100
+         */
+        page_size?: number;
+    };
+    url: '/project-groups';
+};
+
+export type ListProjectGroupsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+};
+
+export type ListProjectGroupsResponses = {
+    /**
+     * Project groups, ordered by name
+     */
+    200: ProjectGroupListResponse;
+};
+
+export type ListProjectGroupsResponse = ListProjectGroupsResponses[keyof ListProjectGroupsResponses];
+
+export type CreateProjectGroupData = {
+    body: CreateProjectGroupRequest;
+    path?: never;
+    query?: never;
+    url: '/project-groups';
+};
+
+export type CreateProjectGroupErrors = {
+    /**
+     * Validation error
+     */
+    400: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * A listed project does not exist, or a route dropped by moving a listed project involves a service the caller cannot see
+     */
+    404: unknown;
+    /**
+     * Slug already taken, or a listed project gained a route or changed group while the request was being authorized; retry
+     */
+    409: unknown;
+};
+
+export type CreateProjectGroupResponses = {
+    /**
+     * Project group created
+     */
+    201: ProjectGroupResponse;
+};
+
+export type CreateProjectGroupResponse = CreateProjectGroupResponses[keyof CreateProjectGroupResponses];
+
+export type GetProjectGroupBySlugData = {
+    body?: never;
+    path: {
+        /**
+         * Project group slug
+         */
+        slug: string;
+    };
+    query?: never;
+    url: '/project-groups/by-slug/{slug}';
+};
+
+export type GetProjectGroupBySlugErrors = {
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Project group not found
+     */
+    404: unknown;
+};
+
+export type GetProjectGroupBySlugResponses = {
+    /**
+     * Project group
+     */
+    200: ProjectGroupResponse;
+};
+
+export type GetProjectGroupBySlugResponse = GetProjectGroupBySlugResponses[keyof GetProjectGroupBySlugResponses];
+
+export type DeleteProjectGroupData = {
+    body?: never;
+    path: {
+        /**
+         * Project group ID
+         */
+        group_id: number;
+    };
+    query?: never;
+    url: '/project-groups/{group_id}';
+};
+
+export type DeleteProjectGroupErrors = {
+    /**
+     * Insufficient permissions, no access to a member project, or no ProjectsWrite on a service whose route in the group is deleted with it
+     */
+    403: unknown;
+    /**
+     * Project group not found, or a route that would be deleted involves a service the caller cannot see
+     */
+    404: unknown;
+    /**
+     * A route appeared in the group while the request was being authorized; retry
+     */
+    409: unknown;
+};
+
+export type DeleteProjectGroupResponses = {
+    /**
+     * Project group deleted; its projects are now ungrouped and otherwise unchanged
+     */
+    204: void;
+};
+
+export type DeleteProjectGroupResponse = DeleteProjectGroupResponses[keyof DeleteProjectGroupResponses];
+
+export type GetProjectGroupData = {
+    body?: never;
+    path: {
+        /**
+         * Project group ID
+         */
+        group_id: number;
+    };
+    query?: never;
+    url: '/project-groups/{group_id}';
+};
+
+export type GetProjectGroupErrors = {
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Project group not found
+     */
+    404: unknown;
+};
+
+export type GetProjectGroupResponses = {
+    /**
+     * Project group
+     */
+    200: ProjectGroupResponse;
+};
+
+export type GetProjectGroupResponse = GetProjectGroupResponses[keyof GetProjectGroupResponses];
+
+export type UpdateProjectGroupData = {
+    body: UpdateProjectGroupRequest;
+    path: {
+        /**
+         * Project group ID
+         */
+        group_id: number;
+    };
+    query?: never;
+    url: '/project-groups/{group_id}';
+};
+
+export type UpdateProjectGroupErrors = {
+    /**
+     * Validation error
+     */
+    400: unknown;
+    /**
+     * Insufficient permissions or no access to a member project
+     */
+    403: unknown;
+    /**
+     * Project group not found
+     */
+    404: unknown;
+    /**
+     * Slug already taken
+     */
+    409: unknown;
+};
+
+export type UpdateProjectGroupResponses = {
+    /**
+     * Project group updated
+     */
+    200: ProjectGroupResponse;
+};
+
+export type UpdateProjectGroupResponse = UpdateProjectGroupResponses[keyof UpdateProjectGroupResponses];
+
+export type ListGroupEnvVarsData = {
+    body?: never;
+    path: {
+        /**
+         * Project group ID
+         */
+        group_id: number;
+    };
+    query?: never;
+    url: '/project-groups/{group_id}/env-vars';
+};
+
+export type ListGroupEnvVarsErrors = {
+    /**
+     * Insufficient permissions on a member project
+     */
+    403: unknown;
+    /**
+     * Project group not found
+     */
+    404: unknown;
+};
+
+export type ListGroupEnvVarsResponses = {
+    /**
+     * Variables every project in the group inherits (values masked)
+     */
+    200: Array<GroupEnvVarResponse>;
+};
+
+export type ListGroupEnvVarsResponse = ListGroupEnvVarsResponses[keyof ListGroupEnvVarsResponses];
+
+export type CreateGroupEnvVarData = {
+    body: CreateGroupEnvVarRequest;
+    path: {
+        /**
+         * Project group ID
+         */
+        group_id: number;
+    };
+    query?: never;
+    url: '/project-groups/{group_id}/env-vars';
+};
+
+export type CreateGroupEnvVarErrors = {
+    /**
+     * Validation error
+     */
+    400: unknown;
+    /**
+     * Insufficient permissions on a member project
+     */
+    403: unknown;
+    /**
+     * Project group not found
+     */
+    404: unknown;
+    /**
+     * Variable already exists for that scope
+     */
+    409: unknown;
+};
+
+export type CreateGroupEnvVarResponses = {
+    /**
+     * Variable created; applies to each project's next deployment
+     */
+    201: GroupEnvVarResponse;
+};
+
+export type CreateGroupEnvVarResponse = CreateGroupEnvVarResponses[keyof CreateGroupEnvVarResponses];
+
+export type DeleteGroupEnvVarData = {
+    body?: never;
+    path: {
+        /**
+         * Project group ID
+         */
+        group_id: number;
+        /**
+         * Variable ID
+         */
+        var_id: number;
+    };
+    query?: never;
+    url: '/project-groups/{group_id}/env-vars/{var_id}';
+};
+
+export type DeleteGroupEnvVarErrors = {
+    /**
+     * Insufficient permissions on a member project
+     */
+    403: unknown;
+    /**
+     * Project group or variable not found
+     */
+    404: unknown;
+};
+
+export type DeleteGroupEnvVarResponses = {
+    /**
+     * Variable deleted; projects stop receiving it on their next deployment
+     */
+    204: void;
+};
+
+export type DeleteGroupEnvVarResponse = DeleteGroupEnvVarResponses[keyof DeleteGroupEnvVarResponses];
+
+export type UpdateGroupEnvVarData = {
+    body: UpdateGroupEnvVarRequest;
+    path: {
+        /**
+         * Project group ID
+         */
+        group_id: number;
+        /**
+         * Variable ID
+         */
+        var_id: number;
+    };
+    query?: never;
+    url: '/project-groups/{group_id}/env-vars/{var_id}';
+};
+
+export type UpdateGroupEnvVarErrors = {
+    /**
+     * Validation error
+     */
+    400: unknown;
+    /**
+     * Insufficient permissions on a member project
+     */
+    403: unknown;
+    /**
+     * Project group or variable not found
+     */
+    404: unknown;
+};
+
+export type UpdateGroupEnvVarResponses = {
+    /**
+     * Variable updated; applies to each project's next deployment
+     */
+    200: GroupEnvVarResponse;
+};
+
+export type UpdateGroupEnvVarResponse = UpdateGroupEnvVarResponses[keyof UpdateGroupEnvVarResponses];
+
+export type ImportProjectServicesData = {
+    body: ImportServicesRequest;
+    path: {
+        /**
+         * Project group ID
+         */
+        group_id: number;
+    };
+    query?: never;
+    url: '/project-groups/{group_id}/import';
+};
+
+export type ImportProjectServicesErrors = {
+    /**
+     * Invalid request, or the project has no repository
+     */
+    400: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Project group not found
+     */
+    404: unknown;
+    /**
+     * The idempotency key was used for a different request
+     */
+    409: unknown;
+};
+
+export type ImportProjectServicesResponses = {
+    /**
+     * The import already started with this idempotency key
+     */
+    200: InstantiationResponse;
+    /**
+     * Accepted; the services are being created
+     */
+    202: InstantiationResponse;
+};
+
+export type ImportProjectServicesResponse = ImportProjectServicesResponses[keyof ImportProjectServicesResponses];
+
+export type RemoveProjectFromGroupData = {
+    body?: never;
+    path: {
+        /**
+         * Project group ID
+         */
+        group_id: number;
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/project-groups/{group_id}/projects/{project_id}';
+};
+
+export type RemoveProjectFromGroupErrors = {
+    /**
+     * Insufficient permissions on the project, or no ProjectsWrite on a service whose route to or from it is dropped with it
+     */
+    403: unknown;
+    /**
+     * Project group not found, the project is not in it, or a route that would be dropped involves a service the caller cannot see
+     */
+    404: unknown;
+    /**
+     * A route involving the project appeared while the request was being authorized; retry
+     */
+    409: unknown;
+};
+
+export type RemoveProjectFromGroupResponses = {
+    /**
+     * Project removed from the group; it is now ungrouped
+     */
+    204: void;
+};
+
+export type RemoveProjectFromGroupResponse = RemoveProjectFromGroupResponses[keyof RemoveProjectFromGroupResponses];
+
+export type AddProjectToGroupData = {
+    body?: never;
+    path: {
+        /**
+         * Project group ID
+         */
+        group_id: number;
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/project-groups/{group_id}/projects/{project_id}';
+};
+
+export type AddProjectToGroupErrors = {
+    /**
+     * Insufficient permissions on the project, or on the group's projects: joining gives it their shared variables, so it requires managing them; or no ProjectsWrite on a service whose route to or from the project is dropped by leaving its previous group
+     */
+    403: unknown;
+    /**
+     * Project group or project not found, or a route that would be dropped involves a service the caller cannot see
+     */
+    404: unknown;
+    /**
+     * A route involving the project appeared, or the project changed group, while the request was being authorized; retry
+     */
+    409: unknown;
+};
+
+export type AddProjectToGroupResponses = {
+    /**
+     * Project placed in the group (moved out of any other group)
+     */
+    200: ProjectGroupResponse;
+};
+
+export type AddProjectToGroupResponse = AddProjectToGroupResponses[keyof AddProjectToGroupResponses];
+
+export type SetRepositoryInheritanceData = {
+    body: SetRepositoryInheritanceRequest;
+    path: {
+        /**
+         * Project group ID
+         */
+        group_id: number;
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/project-groups/{group_id}/projects/{project_id}/repository-inheritance';
+};
+
+export type SetRepositoryInheritanceErrors = {
+    /**
+     * The project cannot follow the repository (not deployed from Git, branch missing, …)
+     */
+    400: unknown;
+    /**
+     * Insufficient permissions on the project
+     */
+    403: unknown;
+    /**
+     * Project group not found, or the project is not in it
+     */
+    404: unknown;
+    /**
+     * The group has no repository yet
+     */
+    409: unknown;
+};
+
+export type SetRepositoryInheritanceResponses = {
+    /**
+     * Inheritance updated
+     */
+    200: ProjectGroupResponse;
+};
+
+export type SetRepositoryInheritanceResponse = SetRepositoryInheritanceResponses[keyof SetRepositoryInheritanceResponses];
+
+export type ClearGroupRepositoryData = {
+    body?: never;
+    path: {
+        /**
+         * Project group ID
+         */
+        group_id: number;
+    };
+    query?: never;
+    url: '/project-groups/{group_id}/repository';
+};
+
+export type ClearGroupRepositoryErrors = {
+    /**
+     * Insufficient permissions, or no access to every project in the group
+     */
+    403: unknown;
+    /**
+     * Project group not found
+     */
+    404: unknown;
+};
+
+export type ClearGroupRepositoryResponses = {
+    /**
+     * Repository removed; projects keep their current git settings and stop following
+     */
+    200: ProjectGroupResponse;
+};
+
+export type ClearGroupRepositoryResponse = ClearGroupRepositoryResponses[keyof ClearGroupRepositoryResponses];
+
+export type GetGroupRepositoryData = {
+    body?: never;
+    path: {
+        /**
+         * Project group ID
+         */
+        group_id: number;
+    };
+    query?: never;
+    url: '/project-groups/{group_id}/repository';
+};
+
+export type GetGroupRepositoryErrors = {
+    /**
+     * Project group not found
+     */
+    404: unknown;
+};
+
+export type GetGroupRepositoryResponses = {
+    /**
+     * The group's repository, if any
+     */
+    200: GroupRepositoryResponse;
+};
+
+export type GetGroupRepositoryResponse = GetGroupRepositoryResponses[keyof GetGroupRepositoryResponses];
+
+export type SetGroupRepositoryData = {
+    body: SetGroupRepositoryRequest;
+    path: {
+        /**
+         * Project group ID
+         */
+        group_id: number;
+    };
+    query?: never;
+    url: '/project-groups/{group_id}/repository';
+};
+
+export type SetGroupRepositoryErrors = {
+    /**
+     * Connection, repository or branch not usable
+     */
+    400: unknown;
+    /**
+     * Insufficient permissions, or no access to every project in the group
+     */
+    403: unknown;
+    /**
+     * Project group not found
+     */
+    404: unknown;
+};
+
+export type SetGroupRepositoryResponses = {
+    /**
+     * Repository set and written through to every project that follows it; see `services` for per-project outcomes
+     */
+    200: SetGroupRepositoryResponse;
+};
+
+export type SetGroupRepositoryResponse2 = SetGroupRepositoryResponses[keyof SetGroupRepositoryResponses];
+
+export type ListGroupRoutesData = {
+    body?: never;
+    path: {
+        /**
+         * Project group ID
+         */
+        group_id: number;
+    };
+    query?: never;
+    url: '/project-groups/{group_id}/routes';
+};
+
+export type ListGroupRoutesErrors = {
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Project group not found
+     */
+    404: unknown;
+};
+
+export type ListGroupRoutesResponses = {
+    /**
+     * Path routes between the project's services, with how each applies per environment
+     */
+    200: Array<GroupRouteResponse>;
+};
+
+export type ListGroupRoutesResponse = ListGroupRoutesResponses[keyof ListGroupRoutesResponses];
+
+export type CreateGroupRouteData = {
+    body: CreateGroupRouteRequest;
+    path: {
+        /**
+         * Project group ID
+         */
+        group_id: number;
+    };
+    query?: never;
+    url: '/project-groups/{group_id}/routes';
+};
+
+export type CreateGroupRouteErrors = {
+    /**
+     * Invalid prefix, or source and target are the same service
+     */
+    400: unknown;
+    /**
+     * Insufficient permissions on the source or target service
+     */
+    403: unknown;
+    /**
+     * Project group not found, or a service is not in it
+     */
+    404: unknown;
+    /**
+     * The source service already routes this prefix
+     */
+    409: unknown;
+};
+
+export type CreateGroupRouteResponses = {
+    /**
+     * Route created; the proxy applies it within seconds, no redeploy needed
+     */
+    201: GroupRouteResponse;
+};
+
+export type CreateGroupRouteResponse = CreateGroupRouteResponses[keyof CreateGroupRouteResponses];
+
+export type DeleteGroupRouteData = {
+    body?: never;
+    path: {
+        /**
+         * Project group ID
+         */
+        group_id: number;
+        /**
+         * Route ID
+         */
+        route_id: number;
+    };
+    query?: never;
+    url: '/project-groups/{group_id}/routes/{route_id}';
+};
+
+export type DeleteGroupRouteErrors = {
+    /**
+     * Insufficient permissions on the source or target service
+     */
+    403: unknown;
+    /**
+     * Project group or route not found
+     */
+    404: unknown;
+};
+
+export type DeleteGroupRouteResponses = {
+    /**
+     * Route removed; the source service serves the prefix itself again
+     */
+    204: void;
+};
+
+export type DeleteGroupRouteResponse = DeleteGroupRouteResponses[keyof DeleteGroupRouteResponses];
+
 export type GetProjectsData = {
     body?: never;
     path?: never;
@@ -52629,6 +54175,14 @@ export type GetProjectsData = {
          * Case-insensitive project name or slug filter
          */
         search?: string;
+        /**
+         * When true, return only services that are not a member of any project group. Mutually exclusive with project_group_id.
+         */
+        ungrouped?: boolean;
+        /**
+         * Return only services that are members of this project group. Mutually exclusive with ungrouped.
+         */
+        project_group_id?: number;
     };
     url: '/projects';
 };
@@ -53101,6 +54655,46 @@ export type GetProjectDeploymentsResponses = {
 };
 
 export type GetProjectDeploymentsResponse = GetProjectDeploymentsResponses[keyof GetProjectDeploymentsResponses];
+
+export type SetProjectHostingData = {
+    body: SetProjectHostingRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/projects/{id}/hosting';
+};
+
+export type SetProjectHostingErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SetProjectHostingResponses = {
+    /**
+     * Hosting updated
+     */
+    200: ProjectResponse;
+};
+
+export type SetProjectHostingResponse = SetProjectHostingResponses[keyof SetProjectHostingResponses];
 
 export type GetLastDeploymentData = {
     body?: never;
@@ -61116,6 +62710,34 @@ export type ReinstallGitlabWebhookResponses = {
 
 export type ReinstallGitlabWebhookResponse = ReinstallGitlabWebhookResponses[keyof ReinstallGitlabWebhookResponses];
 
+export type GetProjectGroupMembershipData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/group';
+};
+
+export type GetProjectGroupMembershipErrors = {
+    /**
+     * Insufficient permissions on the project
+     */
+    403: unknown;
+};
+
+export type GetProjectGroupMembershipResponses = {
+    /**
+     * The project's group, or null when ungrouped
+     */
+    200: ProjectGroupMembershipResponse;
+};
+
+export type GetProjectGroupMembershipResponse = GetProjectGroupMembershipResponses[keyof GetProjectGroupMembershipResponses];
+
 export type HasErrorGroupsData = {
     body?: never;
     path: {
@@ -61854,6 +63476,34 @@ export type GetBucketedIncidentsResponses = {
 };
 
 export type GetBucketedIncidentsResponse = GetBucketedIncidentsResponses[keyof GetBucketedIncidentsResponses];
+
+export type GetInheritedEnvVarsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/inherited-env-vars';
+};
+
+export type GetInheritedEnvVarsErrors = {
+    /**
+     * Insufficient permissions on the project
+     */
+    403: unknown;
+};
+
+export type GetInheritedEnvVarsResponses = {
+    /**
+     * Variables this project inherits from its group (names only)
+     */
+    200: InheritedEnvVarsResponse;
+};
+
+export type GetInheritedEnvVarsResponse = GetInheritedEnvVarsResponses[keyof GetInheritedEnvVarsResponses];
 
 export type PurgeProjectLogsData = {
     body: PurgeLogsRequest;
@@ -68991,6 +70641,54 @@ export type GetProjectTemplateResponses = {
 };
 
 export type GetProjectTemplateResponse = GetProjectTemplateResponses[keyof GetProjectTemplateResponses];
+
+export type InstantiateTemplateData = {
+    body: InstantiateTemplateRequest;
+    path: {
+        /**
+         * Template slug
+         */
+        slug: string;
+    };
+    query?: never;
+    url: '/templates/{slug}/instantiate';
+};
+
+export type InstantiateTemplateErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Insufficient permissions, or a reserved slug only an instance admin may claim
+     */
+    403: unknown;
+    /**
+     * Template or project not found
+     */
+    404: unknown;
+    /**
+     * The idempotency key was used for a different request
+     */
+    409: unknown;
+    /**
+     * A reserved slug requires a recently MFA-verified session
+     */
+    428: unknown;
+};
+
+export type InstantiateTemplateResponses = {
+    /**
+     * The instantiation already started with this idempotency key
+     */
+    200: InstantiationResponse;
+    /**
+     * Accepted; the services are being created
+     */
+    202: InstantiationResponse;
+};
+
+export type InstantiateTemplateResponse = InstantiateTemplateResponses[keyof InstantiateTemplateResponses];
 
 export type ListTraefikDiscoveredRoutesData = {
     body?: never;
