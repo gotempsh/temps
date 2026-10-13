@@ -8,62 +8,99 @@ import { useNodeCapability } from '@/hooks/useNodeCapability'
 import {
   describeDockerSocket,
   HOST_DOCKER_ACCESS_EXPLANATION,
-  shouldShowDockerSocketOnboarding,
+  hostDockerAccessPlacement,
+  type HostDockerAccessPlacement,
 } from '@/lib/docker-socket'
 import { canAddWorkerNode, sameOriginSetupPath } from '@/lib/worker-nodes'
-import { Plug } from 'lucide-react'
+import { Plug, ShieldAlert } from 'lucide-react'
 import { Link } from 'react-router'
 
 /**
- * Onboarding for the ADR-045 host Docker socket grant (see
- * `docs/adr/045-host-docker-socket-grant.md`).
+ * Where Build & deploy shows the ADR-045 host Docker socket grant (see
+ * `docs/adr/045-host-docker-socket-grant.md`): leading the page when the
+ * project holds it, in the collapsed "Advanced" section when an operator
+ * could grant it, nowhere otherwise.
+ */
+export function useHostDockerAccess(project: ProjectResponse): {
+  placement: HostDockerAccessPlacement
+  canManageNodes: boolean
+} {
+  const { data: nodeCapability } = useNodeCapability()
+  const canManageNodes = canAddWorkerNode(nodeCapability)
+  return {
+    placement: hostDockerAccessPlacement(project.docker_socket, canManageNodes),
+    canManageNodes,
+  }
+}
+
+function ViewHostsButton({ project }: { project: ProjectResponse }) {
+  const setupPath = sameOriginSetupPath(
+    project.docker_socket?.setup_path ?? undefined
+  )
+  return (
+    <Button asChild size="sm" variant="outline">
+      <Link to={setupPath}>View hosts</Link>
+    </Button>
+  )
+}
+
+/**
+ * A granted project is root-equivalent on every host that grants it. Anyone
+ * changing how it builds and deploys should see that before anything else.
+ * The link to the hosts page only renders for a viewer who can open it.
+ */
+export function HostDockerAccessAlert({
+  project,
+  canManageNodes,
+}: {
+  project: ProjectResponse
+  canManageNodes: boolean
+}) {
+  const description = describeDockerSocket(project.docker_socket)
+  return (
+    <Alert>
+      <ShieldAlert className="h-4 w-4" />
+      <AlertTitle>{description.label}</AlertTitle>
+      <AlertDescription>
+        <p>{description.detail}</p>
+        <p className="mt-2">{HOST_DOCKER_ACCESS_EXPLANATION}</p>
+        {canManageNodes && (
+          <div className="mt-3">
+            <ViewHostsButton project={project} />
+          </div>
+        )}
+      </AlertDescription>
+    </Alert>
+  )
+}
+
+/**
+ * Onboarding for a project without the grant, shown to operators only.
  *
  * The grant is host policy — an environment variable on the machine that runs
  * the container — so there is nothing to click here and deliberately no write
  * path: an API that could set it would be one step from host root. What the
- * operator gets instead is the thing they cannot get from a silent absence:
- * what the capability does, that this project does not have it, the exact
- * variable to set, and the page listing the hosts they could set it on.
- *
- * Renders nothing when the project already holds the grant (the header badge
- * says so), when the response did not compute the capability, or for a viewer
- * who cannot manage nodes — the setup page needs Settings permissions, so
- * linking them there would be a dead end.
+ * operator gets instead is what the capability does, that this project does
+ * not have it, the exact variable to set, and the page listing the hosts they
+ * could set it on.
  */
-export function HostDockerAccessAlert({
+export function HostDockerAccessOnboarding({
   project,
 }: {
   project: ProjectResponse
 }) {
-  const { data: nodeCapability } = useNodeCapability()
-
-  const capability = project.docker_socket
-  const description = describeDockerSocket(capability)
-
-  if (
-    !shouldShowDockerSocketOnboarding(
-      capability,
-      canAddWorkerNode(nodeCapability)
-    )
-  ) {
-    return null
-  }
-
-  const setupPath = sameOriginSetupPath(capability?.setup_path ?? undefined)
-
+  const description = describeDockerSocket(project.docker_socket)
   return (
-    <Alert>
-      <Plug className="h-4 w-4" />
-      <AlertTitle>{description.label}</AlertTitle>
-      <AlertDescription>
-        <p>{HOST_DOCKER_ACCESS_EXPLANATION}</p>
-        <p className="mt-2">{description.detail}</p>
-        <div className="mt-3">
-          <Button asChild size="sm" variant="outline">
-            <Link to={setupPath}>View hosts</Link>
-          </Button>
-        </div>
-      </AlertDescription>
-    </Alert>
+    <div className="space-y-2 text-sm">
+      <p className="flex items-center gap-2 font-medium">
+        <Plug className="size-4 text-muted-foreground" aria-hidden="true" />
+        Not granted
+      </p>
+      <p className="text-muted-foreground">{HOST_DOCKER_ACCESS_EXPLANATION}</p>
+      <p className="text-muted-foreground">{description.detail}</p>
+      <div className="pt-1">
+        <ViewHostsButton project={project} />
+      </div>
+    </div>
   )
 }

@@ -91,14 +91,19 @@ impl TrackingService {
         }
     }
 
-    /// Get the base URL for tracking endpoints from the config service
+    /// Get the base URL for tracking endpoints from the config service.
+    ///
+    /// The open pixel and click redirect are fetched by the recipient's mail
+    /// client and browser, never by an operator, so they are built from the
+    /// public ingress URL (ADR-051): a console that is restricted to an
+    /// allowlist would otherwise record no opens or clicks at all.
     async fn get_base_url(&self) -> String {
         #[cfg(test)]
         if let Some(ref url) = self.base_url_override {
             return url.clone();
         }
         self.config_service
-            .get_external_url_or_default()
+            .get_public_ingress_url()
             .await
             .unwrap_or_else(|_| "http://localhost:3000".to_string())
     }
@@ -537,6 +542,87 @@ mod tests {
     use super::*;
 
     const TEST_BASE_URL: &str = "https://app.example.com";
+
+    /// A tracking service that resolves its base URL through the config
+    /// service, backed by a settings row with the given URLs.
+    fn service_with_settings(external: Option<&str>, ingress: Option<&str>) -> TrackingService {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let settings = temps_core::AppSettings {
+            external_url: external.map(str::to_string),
+            public_ingress_url: ingress.map(str::to_string),
+            ..Default::default()
+        };
+        let settings_db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![temps_entities::settings::Model {
+                id: 1,
+                data: settings.to_json(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            }]])
+            .into_connection();
+        let server_config = temps_config::ServerConfig::new(
+            "127.0.0.1:3000".to_string(),
+            "postgresql://test".to_string(),
+            None,
+            Some("127.0.0.1:8000".to_string()),
+        )
+        .expect("ServerConfig::new");
+        let config_service = Arc::new(temps_config::ConfigService::new(
+            Arc::new(server_config),
+            Arc::new(settings_db),
+        ));
+        TrackingService::new(
+            Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
+            config_service,
+        )
+    }
+
+    // ADR-051 D2: the pixel and click redirect are fetched by mail clients,
+    // so they are built from the public ingress URL, not the console's.
+    #[tokio::test]
+    async fn tracking_urls_use_the_public_ingress_url_when_set() {
+        let service = service_with_settings(
+            Some("https://console.example.com"),
+            Some("https://hooks.example.com"),
+        );
+        let email_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+
+        let result = service
+            .transform_html(
+                email_id,
+                r#"<html><body><a href="https://docs.example.org/start">Start</a></body></html>"#,
+                true,
+                true,
+            )
+            .await;
+
+        assert!(result.html.contains(
+            "https://hooks.example.com/api/emails/550e8400-e29b-41d4-a716-446655440000/track/open"
+        ));
+        assert!(result.html.contains(
+            "https://hooks.example.com/api/emails/550e8400-e29b-41d4-a716-446655440000/track/click/0"
+        ));
+        assert!(
+            !result.html.contains("console.example.com"),
+            "the restricted console host must not appear in an email: {}",
+            result.html
+        );
+    }
+
+    #[tokio::test]
+    async fn tracking_urls_fall_back_to_the_external_url_when_ingress_is_unset() {
+        let service = service_with_settings(Some("https://console.example.com"), None);
+        let email_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+
+        let result = service
+            .transform_html(email_id, "<html><body>Hi</body></html>", true, false)
+            .await;
+
+        assert!(result.html.contains(
+            "https://console.example.com/api/emails/550e8400-e29b-41d4-a716-446655440000/track/open"
+        ));
+    }
 
     #[test]
     fn test_inject_tracking_pixel_with_body_tag() {

@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { DeliveryProjectOption } from '@/components/domains/DeliveryProjectOption'
 import {
   createProject,
   deleteProject,
@@ -14,10 +13,14 @@ import {
   type EnvironmentResponse,
   type ProjectResponse,
 } from '@/api/client'
+import { DropDeliveryRow } from '@/components/drop/DropDeliveryRow'
 import { DropZone } from '@/components/drop/DropZone'
 import { DropEnvironmentVariables } from '@/components/drop/DropEnvironmentVariables'
 import { DetectedPresetCard } from '@/components/drop/DetectedPresetCard'
+import { DropLeftOutNotice } from '@/components/drop/DropLeftOutNotice'
 import { DetectedPresetGrid } from '@/components/drop/DetectedPresetGrid'
+import { DropNoProjectFound } from '@/components/drop/DropNoProjectFound'
+import { DropInvalidArchive } from '@/components/drop/DropInvalidArchive'
 import { PageContainer } from '@/components/layout/PageContainer'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
@@ -37,8 +40,14 @@ import {
   htmlRootCandidates,
   isDropArchive,
   type DropFile,
+  type DropLeftOutPath,
 } from '@/lib/drop-archive'
-import { dropErrorMessage, inferredProjectName } from '@/lib/drop-files'
+import {
+  dropArchiveErrorDetails,
+  dropArchiveErrorReason,
+  dropErrorMessage,
+  inferredProjectName,
+} from '@/lib/drop-files'
 import { consumeDropFilesHandoff } from '@/lib/drop-handoff'
 import { sourceArchiveUploadsSupported } from '@/lib/platform-capabilities'
 import {
@@ -47,14 +56,17 @@ import {
   type DropEnvironmentVariable,
 } from '@/lib/drop-environment-variables'
 import {
+  dropDetectionGap,
   prepareAndInspectDrop,
   presetConfigForDropCandidate,
 } from '@/lib/drop-preset-detection'
+import type { DropDeliveryChoice } from '@/lib/drop-delivery'
 import { ensureDropProjectName } from '@/lib/drop-project-name'
 import { cn } from '@/lib/utils'
 import {
   ArrowRight,
   Check,
+  FolderOpen,
   Loader2,
   RotateCcw,
   UploadCloud,
@@ -108,12 +120,20 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
   const [files, setFiles] = useState<DropFile[]>([])
   const [projectName, setProjectName] = useState('')
   const [deliveryProvider, setDeliveryProvider] = useState<
-    'none' | 'cloudflare' | 'bunny' | undefined
+    DropDeliveryChoice | undefined
   >(undefined)
   const [nameWasEdited, setNameWasEdited] = useState(false)
   const [rootPage, setRootPage] = useState('')
   const [stage, setStage] = useState<DropStage>('idle')
   const [error, setError] = useState<string | null>(null)
+  const [archiveErrorDetails, setArchiveErrorDetails] = useState<string | null>(
+    null
+  )
+  const [archiveErrorReason, setArchiveErrorReason] = useState<
+    string | undefined
+  >()
+  // Files Temps looks for, once inspection found nothing it can build.
+  const [detectionGap, setDetectionGap] = useState<string[] | null>(null)
   const [project, setProject] = useState<ProjectResponse | null>(null)
   const [environment, setEnvironment] = useState<EnvironmentResponse | null>(
     null
@@ -122,6 +142,11 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
   const [inspection, setInspection] = useState<DropInspectionResponse | null>(
     null
   )
+  // What the upload left out; shown alongside `inspection` only.
+  const [leftOut, setLeftOut] = useState<{
+    paths: DropLeftOutPath[]
+    fileCount: number
+  }>({ paths: [], fileCount: 0 })
   const [selectedCandidateIndex, setSelectedCandidateIndex] = useState('0')
   const [environmentVariables, setEnvironmentVariables] = useState<
     DropEnvironmentVariable[]
@@ -153,6 +178,8 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
   const isBusy = !['idle', 'done'].includes(stage)
   const selectedCandidate =
     inspection?.candidates[Number(selectedCandidateIndex)]
+  const needsNewSelection =
+    detectionGap !== null || archiveErrorDetails !== null
 
   const inspectArchive = async (archive: File, signal?: AbortSignal) => {
     const response = await inspectDropArchive({
@@ -172,6 +199,8 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
     const controller = new AbortController()
     detectionAbortRef.current = controller
     try {
+      setArchiveErrorDetails(null)
+      setArchiveErrorReason(undefined)
       setStage('packing')
       const result = await prepareAndInspectDrop(
         nextFiles,
@@ -189,7 +218,10 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
       if (detectionRunRef.current !== runId) return
 
       setPreparedArchive(result.archive)
+      setArchiveErrorDetails(null)
+      setArchiveErrorReason(undefined)
       setInspection(result.inspection)
+      setLeftOut({ paths: result.leftOut, fileCount: result.leftOutFileCount })
       setSelectedCandidateIndex('0')
       if (!nameWasEdited) {
         setProjectName(ensureDropProjectName(result.inspection.suggestedName))
@@ -198,6 +230,9 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
     } catch (caught) {
       if (detectionRunRef.current !== runId) return
       setError(dropErrorMessage(caught))
+      setArchiveErrorDetails(dropArchiveErrorDetails(caught))
+      setArchiveErrorReason(dropArchiveErrorReason(caught))
+      setDetectionGap(dropDetectionGap(caught))
       setPreparedArchive(null)
       setInspection(null)
       setStage('idle')
@@ -214,6 +249,9 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
     detectionAbortRef.current = null
     setFiles(nextFiles)
     setError(null)
+    setArchiveErrorDetails(null)
+    setArchiveErrorReason(undefined)
+    setDetectionGap(null)
     setProject(null)
     setEnvironment(null)
     setPreparedArchive(null)
@@ -256,7 +294,10 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
     setRootPage('')
     setStage('idle')
     setError(null)
+    setArchiveErrorDetails(null)
+    setArchiveErrorReason(undefined)
     setProject(null)
+    setDetectionGap(null)
     setEnvironment(null)
     setPreparedArchive(null)
     setInspection(null)
@@ -273,6 +314,8 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
     const normalizedProjectName = ensureDropProjectName(projectName)
     setProjectName(normalizedProjectName)
     setError(null)
+    setArchiveErrorDetails(null)
+    setArchiveErrorReason(undefined)
     try {
       const archive = preparedArchive
       const detected = inspection
@@ -394,7 +437,7 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
           <div className="mb-8 flex size-14 items-center justify-center rounded-2xl bg-emerald-500 text-white shadow-lg shadow-emerald-500/20">
             <Check className="size-7" />
           </div>
-          <p className="mb-3 font-mono text-xs uppercase tracking-[0.28em] text-emerald-600 dark:text-emerald-400">
+          <p className="mb-3 font-mono text-xs uppercase tracking-[0.28em] text-emerald-700 dark:text-emerald-400">
             Drop accepted
           </p>
           <h1 className="text-balance text-4xl font-semibold tracking-tight sm:text-6xl">
@@ -507,10 +550,6 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
               </div>
 
               <div className="flex-1 space-y-6 py-6">
-                <DeliveryProjectOption
-                  value={deliveryProvider}
-                  onChange={setDeliveryProvider}
-                />
                 <div className="space-y-2">
                   <Label htmlFor="drop-name">Project name</Label>
                   <Input
@@ -547,6 +586,7 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
                           setPreparedArchive(null)
                           setInspection(null)
                           setError(null)
+                          setDetectionGap(null)
                           void detectSelection(files, value, runId)
                         }}
                         disabled={isBusy}
@@ -583,11 +623,21 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
                   </div>
                 )}
 
-                {(!inspection || inspection.candidates.length === 1) && (
-                  <DetectedPresetCard
-                    candidate={selectedCandidate}
-                    isDetecting={stage === 'packing' || stage === 'detecting'}
-                    phase={stage === 'packing' ? 'packing' : 'detecting'}
+                {/* Once nothing deployable was found, "Temps will identify the
+                    framework" is no longer true; the gap notice replaces it. */}
+                {!detectionGap &&
+                  (!inspection || inspection.candidates.length === 1) && (
+                    <DetectedPresetCard
+                      candidate={selectedCandidate}
+                      isDetecting={stage === 'packing' || stage === 'detecting'}
+                      phase={stage === 'packing' ? 'packing' : 'detecting'}
+                    />
+                  )}
+
+                {inspection && (
+                  <DropLeftOutNotice
+                    leftOut={leftOut.paths}
+                    fileCount={leftOut.fileCount}
                   />
                 )}
 
@@ -597,7 +647,9 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
                     <span className="font-medium">
                       {inspection
                         ? selectedCandidate?.label
-                        : 'Pending detection'}
+                        : detectionGap
+                          ? 'Nothing detected'
+                          : 'Pending detection'}
                     </span>
                   </div>
                   <div className="mt-3 flex items-center justify-between gap-3">
@@ -606,6 +658,11 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
                     </span>
                     <span className="font-medium">None</span>
                   </div>
+                  <DropDeliveryRow
+                    value={deliveryProvider}
+                    onChange={setDeliveryProvider}
+                    disabled={isBusy}
+                  />
                   <div className="mt-3 flex items-center justify-between gap-3">
                     <span className="text-muted-foreground">
                       Environment variables
@@ -622,13 +679,22 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
                   </div>
                 </div>
 
-                {error && (
-                  <div
-                    role="alert"
-                    className="rounded-xl border border-destructive/30 bg-destructive/5 p-4 text-sm leading-6 text-destructive"
-                  >
-                    {error}
-                  </div>
+                {archiveErrorDetails !== null ? (
+                  <DropInvalidArchive
+                    details={archiveErrorDetails}
+                    reason={archiveErrorReason}
+                  />
+                ) : detectionGap ? (
+                  <DropNoProjectFound supportedFiles={detectionGap} />
+                ) : (
+                  error && (
+                    <div
+                      role="alert"
+                      className="rounded-xl border border-destructive/30 bg-destructive/5 p-4 text-sm leading-6 text-destructive"
+                    >
+                      {error}
+                    </div>
+                  )
                 )}
               </div>
 
@@ -636,14 +702,24 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
                 size="lg"
                 className="h-12 w-full"
                 disabled={files.length === 0 || isBusy}
-                onClick={deploy}
+                onClick={needsNewSelection ? reset : deploy}
               >
                 {isBusy ? (
                   <Loader2 className="mr-2 size-4 animate-spin" />
+                ) : needsNewSelection ? (
+                  <FolderOpen className="mr-2 size-4" />
                 ) : (
                   <UploadCloud className="mr-2 size-4" />
                 )}
-                {stageLabel(stage, selectedCandidate?.label, files.length > 0)}
+                {archiveErrorDetails !== null
+                  ? 'Choose another archive'
+                  : detectionGap
+                    ? 'Choose different files'
+                    : stageLabel(
+                        stage,
+                        selectedCandidate?.label,
+                        files.length > 0
+                      )}
               </Button>
               <p className="mt-3 text-center text-xs text-muted-foreground">
                 Failed setup is rolled back automatically.

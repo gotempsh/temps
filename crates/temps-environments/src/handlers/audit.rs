@@ -56,6 +56,10 @@ pub struct EnvironmentSettingsUpdatedFields {
     /// `None` = unchanged, `Some(None)` = cleared (inherit the proxy default),
     /// `Some(Some(b))` = overridden.
     pub force_https: Option<Option<bool>>,
+    /// Per-environment build location override change (tri-state):
+    /// `None` = unchanged, `Some(None)` = cleared (inherit the project),
+    /// `Some(Some(location))` = overridden.
+    pub build_location: Option<Option<temps_entities::deployment_config::BuildLocation>>,
 }
 
 // Add these new audit structs after the other audit structs

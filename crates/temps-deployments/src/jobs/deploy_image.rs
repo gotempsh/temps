@@ -6,6 +6,7 @@
 //! Deploys built container images to target environments
 
 use super::image_source::{DeployImageSource, ExpectedImageIdentity};
+use super::node_image::{copy_node_built_image, NodeImageCopy};
 use async_trait::async_trait;
 use futures::StreamExt;
 use sea_orm::{sea_query::Expr, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
@@ -41,6 +42,10 @@ fn verify_worker_image_platform(
     )))
 }
 
+/// Prefix of the placeholder `image_id` an external-image deploy carries: it
+/// names no real image, so it is never an identity to verify against.
+const EXTERNAL_IMAGE_ID_PREFIX: &str = "external-";
+
 /// Typed output from BuildImageJob
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildImageOutput {
@@ -61,6 +66,15 @@ pub struct BuildImageOutput {
     /// The worker that built this image. `None` means it is local or registry sourced.
     #[serde(default)]
     pub builder_node_id: Option<i32>,
+    /// For a mixed-architecture worker build, the worker holding each
+    /// platform's image, keyed like `image_tags_by_platform`. Empty when one
+    /// node (`builder_node_id`) or the control plane holds every tag.
+    #[serde(default)]
+    pub builder_node_ids_by_platform: HashMap<String, i32>,
+    /// For a mixed-architecture worker build, the id each worker reported
+    /// for the image it built, keyed like `image_tags_by_platform`.
+    #[serde(default)]
+    pub image_ids_by_platform: HashMap<String, String>,
 }
 
 impl BuildImageOutput {
@@ -109,6 +123,12 @@ impl BuildImageOutput {
                 "Worker build '{build_job_id}' has no verified platform metadata; rebuild before deployment"
             )));
         }
+        let builder_node_ids_by_platform: HashMap<String, i32> = context
+            .get_output(build_job_id, "builder_node_ids_by_platform")?
+            .unwrap_or_default();
+        let image_ids_by_platform: HashMap<String, String> = context
+            .get_output(build_job_id, "image_ids_by_platform")?
+            .unwrap_or_default();
 
         Ok(Self {
             image_tag,
@@ -118,7 +138,42 @@ impl BuildImageOutput {
             dockerfile_path: PathBuf::from(dockerfile_path_str),
             image_tags_by_platform,
             builder_node_id,
+            builder_node_ids_by_platform,
+            image_ids_by_platform,
         })
+    }
+
+    /// The image id recorded at build time for a worker-built `tag`: each
+    /// architecture's id for a mixed-architecture build, and the build's own
+    /// `image_id` for the primary tag of any worker build (single-architecture
+    /// ones record no per-platform ids). `None` for a control-plane build or
+    /// an external image, whose identity is checked elsewhere.
+    pub fn expected_image_id_for_tag(&self, tag: &str) -> Option<&str> {
+        self.image_tags_by_platform
+            .iter()
+            .find(|(_, built)| built.as_str() == tag)
+            .and_then(|(platform, _)| self.image_ids_by_platform.get(platform))
+            .map(String::as_str)
+            .or_else(|| {
+                (self.builder_node_id.is_some()
+                    && tag == self.image_tag
+                    && !self.image_id.trim().is_empty()
+                    && !self.image_id.starts_with(EXTERNAL_IMAGE_ID_PREFIX))
+                .then_some(self.image_id.as_str())
+            })
+    }
+
+    /// The worker holding `tag`: the one that built that tag's platform on a
+    /// mixed-architecture worker build, otherwise the single builder. Keyed
+    /// by tag rather than by node platform so the source can never disagree
+    /// with the tag [`Self::tag_for_platform`] chose.
+    pub fn builder_node_for_tag(&self, tag: &str) -> Option<i32> {
+        self.image_tags_by_platform
+            .iter()
+            .find(|(_, built)| built.as_str() == tag)
+            .and_then(|(platform, _)| self.builder_node_ids_by_platform.get(platform))
+            .copied()
+            .or(self.builder_node_id)
     }
 
     /// The tag to deploy on a node running `platform`.
@@ -137,6 +192,86 @@ impl BuildImageOutput {
             .find(|(built, _)| temps_deployer::platform::platforms_match(built, platform))
             .map(|(_, tag)| tag.as_str())
             .unwrap_or(&self.image_tag)
+    }
+}
+
+/// The worker-built images a rollback or promotion reuses: what the origin
+/// deployment's `BuildImageJob` recorded about where each tag lives.
+///
+/// Without it a reused image is a single tag the control plane would have to
+/// hold, so a rollback of a mixed-architecture deployment would hand every
+/// node the primary architecture's tag, and in the control-plane profile
+/// (no daemon to export from) fail on any node that does not already have it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReusedWorkerBuild {
+    /// Image ID of the primary tag, as built.
+    pub image_id: Option<String>,
+    pub image_tags_by_platform: HashMap<String, String>,
+    pub builder_node_id: Option<i32>,
+    pub builder_node_ids_by_platform: HashMap<String, i32>,
+    /// The id of each architecture's image as built; a reused tag is only
+    /// fetched from a worker still holding exactly this image.
+    pub image_ids_by_platform: HashMap<String, String>,
+}
+
+impl ReusedWorkerBuild {
+    /// Read a `BuildImageJob`'s saved outputs, if that build ran on a worker
+    /// and produced `image_tag` as its primary tag. `None` for a control
+    /// plane build, a registry image, or outputs of another tag -- the
+    /// reused deployment then keeps its single-tag behaviour.
+    pub fn from_build_outputs(outputs: &serde_json::Value, image_tag: &str) -> Option<Self> {
+        if outputs.get("image_tag").and_then(|value| value.as_str()) != Some(image_tag) {
+            return None;
+        }
+        let builder_node_id = outputs
+            .get("builder_node_id")
+            .and_then(|value| value.as_i64())
+            .and_then(|value| i32::try_from(value).ok())?;
+        let image_tags_by_platform: HashMap<String, String> = outputs
+            .get("image_tags_by_platform")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default();
+        // A worker build always records its verified platform; without it the
+        // deploy would refuse the image anyway (see `BuildImageOutput`).
+        if image_tags_by_platform.is_empty() {
+            return None;
+        }
+        let builder_node_ids_by_platform: HashMap<String, i32> = outputs
+            .get("builder_node_ids_by_platform")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default();
+        let image_ids_by_platform: HashMap<String, String> = outputs
+            .get("image_ids_by_platform")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default();
+        // Several builders without the id of each image is a build recorded
+        // before ids were: refuse to trust where its tags now live.
+        if builder_node_ids_by_platform.len() > 1
+            && builder_node_ids_by_platform
+                .keys()
+                .any(|platform| !image_ids_by_platform.contains_key(platform))
+        {
+            return None;
+        }
+        Some(Self {
+            image_id: outputs
+                .get("image_id")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            image_tags_by_platform,
+            builder_node_id: Some(builder_node_id),
+            builder_node_ids_by_platform,
+            image_ids_by_platform,
+        })
+    }
+
+    /// Whether this build produced one image per architecture on several
+    /// workers.
+    pub fn is_per_architecture(&self) -> bool {
+        self.builder_node_ids_by_platform.len() > 1
     }
 }
 
@@ -552,6 +687,9 @@ pub struct DeployImageJob {
     /// resolved earlier in the same workflow. Only consulted before exporting
     /// the control plane's copy of a registry image to a worker.
     expected_image_identity: Option<ExpectedImageIdentity>,
+    /// For a rollback/promotion of a worker-built image: where each
+    /// architecture's tag lives. Only read with `external_image_tag`.
+    reused_worker_build: Option<ReusedWorkerBuild>,
     /// Docker log rotation config to prevent unbounded log growth
     log_config: Option<ContainerLogConfig>,
     /// Encryption service for decrypting node tokens during remote deployments
@@ -1057,6 +1195,7 @@ impl DeployImageJob {
             external_image_tag: None,
             image_source: None,
             expected_image_identity: None,
+            reused_worker_build: None,
             log_config: None,
             encryption_service: None,
             config_service: None,
@@ -1117,6 +1256,13 @@ impl DeployImageJob {
 
     pub fn with_node_scheduler(mut self, scheduler: Arc<crate::services::NodeScheduler>) -> Self {
         self.node_scheduler = Some(scheduler);
+        self
+    }
+
+    /// Deploy a reused worker-built image from the workers that hold it. See
+    /// [`ReusedWorkerBuild`].
+    pub fn with_reused_worker_build(mut self, reused: ReusedWorkerBuild) -> Self {
+        self.reused_worker_build = Some(reused);
         self
     }
 
@@ -1559,6 +1705,64 @@ impl DeployImageJob {
         }
     }
 
+    /// Make an image built on worker `builder_node_id` available to the
+    /// control plane's own Docker, for a replica placed on the control plane.
+    async fn ensure_node_built_image_local(
+        &self,
+        image_tag: &str,
+        expected_image_id: Option<&str>,
+        builder_node_id: i32,
+        context: &WorkflowContext,
+    ) -> Result<(), WorkflowError> {
+        let local = self.image_builder.clone().ok_or_else(|| {
+            WorkflowError::JobExecutionFailed(format!(
+                "Cannot run worker-built image '{image_tag}' on the control plane: this \
+                 control plane has no image builder to import it into"
+            ))
+        })?;
+        // The build normally copied the image here already. Accept it by id
+        // before resolving the worker at all, so a worker that has since
+        // restarted, left the cluster, or pruned the image cannot fail a
+        // replica that already has what it needs.
+        if let (Some(expected), Ok(cached)) =
+            (expected_image_id, local.inspect_image(image_tag).await)
+        {
+            if super::node_image::same_image_id(&cached.id, expected) {
+                return Ok(());
+            }
+        }
+        let owner = self.remote_deployer_for_node_id(builder_node_id).await?;
+        let owner_name = owner.node_name().to_string();
+        let started = std::time::Instant::now();
+        let copied = copy_node_built_image(
+            owner.as_ref(),
+            &owner_name,
+            local.as_ref(),
+            image_tag,
+            expected_image_id,
+        )
+        .await;
+        match copied {
+            Ok(NodeImageCopy::AlreadyPresent) => Ok(()),
+            Ok(NodeImageCopy::Transferred) => {
+                self.log(
+                    context,
+                    format!(
+                        "Image '{}' transferred from build node '{}' to the control plane in {:.1}s",
+                        image_tag,
+                        owner_name,
+                        started.elapsed().as_secs_f64()
+                    ),
+                )
+                .await
+            }
+            Err(error) => {
+                self.log(context, format!("ERROR: {}", error)).await?;
+                Err(error)
+            }
+        }
+    }
+
     /// Agent client for a node known only by id (e.g. the node that built
     /// this deployment's image).
     async fn remote_deployer_for_node_id(
@@ -1616,15 +1820,8 @@ impl DeployImageJob {
         Ok(Arc::new(remote.with_platform(node.architecture)))
     }
 
-    /// Ensure the image exists on a remote node, transferring it if needed.
-    ///
-    /// 1. Checks if the image already exists on the remote node (via agent API).
-    /// 2. A node-built image stays on its builder or streams directly from
-    ///    that node to the target's agent, never through local Docker.
-    /// 3. Registry images are pulled by the worker, with a verified local-copy
-    ///    fallback when the control plane actually holds the image.
-    /// 4. Control-plane-local images are exported from its Docker daemon and
-    ///    imported by the worker; the no-daemon profile fails with a remedy.
+    /// [`Self::ensure_worker_image_on_remote`] with no recorded image id.
+    #[cfg(test)]
     async fn ensure_image_on_remote(
         &self,
         image_tag: &str,
@@ -1634,6 +1831,61 @@ impl DeployImageJob {
         builder_node_id: Option<i32>,
         target_node_id: Option<i32>,
     ) -> Result<(), WorkflowError> {
+        self.ensure_worker_image_on_remote(
+            image_tag,
+            None,
+            remote,
+            node_name,
+            context,
+            builder_node_id,
+            target_node_id,
+        )
+        .await
+    }
+
+    /// Ensure the image exists on a remote node, transferring it if needed.
+    ///
+    /// 1. Checks if the image already exists on the remote node (via agent API).
+    /// 2. A node-built image stays on its builder or streams directly from
+    ///    that node to the target's agent, never through local Docker.
+    /// 3. Registry images are pulled by the worker, with a verified local-copy
+    ///    fallback when the control plane actually holds the image.
+    /// 4. Control-plane-local images are exported from its Docker daemon and
+    ///    imported by the worker; the no-daemon profile fails with a remedy.
+    ///
+    /// With `expected_image_id` -- the id recorded when a mixed-architecture
+    /// worker build produced `image_tag` -- the image only runs if it is that
+    /// exact image: a target that already holds it needs nothing from its
+    /// builder, and a builder that now serves something else under the tag
+    /// (a node re-registered by another machine, a tag rebuilt since) is
+    /// refused rather than trusted.
+    #[allow(clippy::too_many_arguments)]
+    async fn ensure_worker_image_on_remote(
+        &self,
+        image_tag: &str,
+        expected_image_id: Option<&str>,
+        remote: &Arc<temps_deployer::remote::RemoteNodeDeployer>,
+        node_name: &str,
+        context: &WorkflowContext,
+        builder_node_id: Option<i32>,
+        target_node_id: Option<i32>,
+    ) -> Result<(), WorkflowError> {
+        if let (Some(_), Some(expected)) = (builder_node_id, expected_image_id) {
+            if let Ok(cached) = remote.inspect_image(image_tag).await {
+                if super::node_image::same_image_id(&cached.id, expected) {
+                    let platform = match remote.platform() {
+                        Some(platform) => Some(platform),
+                        None => remote.refresh_platform().await,
+                    };
+                    return verify_worker_image_platform(
+                        image_tag,
+                        &cached.platform,
+                        platform.as_deref(),
+                        node_name,
+                    );
+                }
+            }
+        }
         if let Some(builder_id) = builder_node_id {
             let owner = if Some(builder_id) == target_node_id {
                 remote.clone()
@@ -1646,6 +1898,19 @@ impl DeployImageJob {
                     owner.node_name()
                 ))
             })?;
+            if let Some(expected) = expected_image_id {
+                if !super::node_image::same_image_id(&info.id, expected) {
+                    let msg = format!(
+                        "Image '{image_tag}' on build node '{}' (id={builder_id}) is {}, not the \
+                         {expected} built for this deployment; refusing to run it on '{node_name}'. \
+                         Redeploy to rebuild the image",
+                        owner.node_name(),
+                        info.id
+                    );
+                    self.log(context, format!("ERROR: {msg}")).await?;
+                    return Err(WorkflowError::JobValidationFailed(msg));
+                }
+            }
             let platform = match remote.platform() {
                 Some(platform) => Some(platform),
                 None => remote.refresh_platform().await,
@@ -2506,6 +2771,7 @@ impl DeployImageJob {
                         // place a socket-granted project on a host that does
                         // not grant it.
                         project_slug: self.config.project_slug.as_deref(),
+                        exclude_control_plane: false,
                     },
                 )
                 .await
@@ -2522,6 +2788,9 @@ impl DeployImageJob {
                             format!("WARNING: node {}", exclusion)
                         };
                         self.log(context, line).await?;
+                    }
+                    for warning in &outcome.warnings {
+                        self.log(context, format!("WARNING: {warning}")).await?;
                     }
 
                     let assignments = outcome.assignments;
@@ -2570,6 +2839,12 @@ impl DeployImageJob {
                         ..
                     }
                     | crate::services::node_service::NodeError::PlacementConstraintsUnsatisfied {
+                        ..
+                    }
+                    // Only dedicated nodes could take it and none is pinned.
+                    // Degrading to Local would either start an image the
+                    // control plane cannot run or ignore a label selector.
+                    | crate::services::node_service::NodeError::DedicatedNodesNotPinned {
                         ..
                     }
                     | crate::services::node_service::NodeError::Validation {
@@ -2707,6 +2982,21 @@ impl DeployImageJob {
             // Select deployer based on node assignment
             let deployer: Arc<dyn ContainerDeployer> = match assignment {
                 crate::services::NodeAssignment::Local => {
+                    // A build moved off the control plane (build location
+                    // `node`) copies its image here when it finishes; if that
+                    // copy failed, retry it before starting the replica.
+                    if let Some(builder_id) = image_output.builder_node_for_tag(&replica_image_tag)
+                    {
+                        let expected_image_id =
+                            image_output.expected_image_id_for_tag(&replica_image_tag);
+                        self.ensure_node_built_image_local(
+                            &replica_image_tag,
+                            expected_image_id,
+                            builder_id,
+                            context,
+                        )
+                        .await?;
+                    }
                     // Remote replicas are checked before the image is
                     // transferred; local ones had no equivalent guard, so a
                     // mismatch here surfaced only as a container that won't
@@ -2787,12 +3077,13 @@ impl DeployImageJob {
                         .to_string();
 
                     // Transfer image to remote node if it doesn't already exist there
-                    self.ensure_image_on_remote(
+                    self.ensure_worker_image_on_remote(
                         &replica_image_tag,
+                        image_output.expected_image_id_for_tag(&replica_image_tag),
                         &remote,
                         node_name,
                         context,
-                        image_output.builder_node_id,
+                        image_output.builder_node_for_tag(&replica_image_tag),
                         assignment.node_id(),
                     )
                     .await?;
@@ -3728,9 +4019,12 @@ impl WorkflowTask for DeployImageJob {
             // External image provided directly - create synthetic BuildImageOutput
             self.log(&context, format!("Using external image: {}", external_tag))
                 .await?;
-            BuildImageOutput {
+            let synthetic = BuildImageOutput {
                 image_tag: external_tag.clone(),
-                image_id: format!("external-{}", external_tag.replace(":", "-")),
+                image_id: format!(
+                    "{EXTERNAL_IMAGE_ID_PREFIX}{}",
+                    external_tag.replace(":", "-")
+                ),
                 size_bytes: 0, // Not applicable for external images
                 build_context: std::path::PathBuf::from("."),
                 dockerfile_path: std::path::PathBuf::from("."),
@@ -3738,6 +4032,37 @@ impl WorkflowTask for DeployImageJob {
                 // reads the real architecture from the image itself.
                 image_tags_by_platform: HashMap::new(),
                 builder_node_id: None,
+                builder_node_ids_by_platform: HashMap::new(),
+                image_ids_by_platform: HashMap::new(),
+            };
+            match &self.reused_worker_build {
+                // A rollback/promotion of a worker build: each node gets the
+                // tag of its own architecture, from the worker holding it.
+                Some(reused) => {
+                    if reused.is_per_architecture() {
+                        let mut platforms: Vec<String> =
+                            reused.image_tags_by_platform.keys().cloned().collect();
+                        platforms.sort();
+                        self.log(
+                            &context,
+                            format!(
+                                "Reusing the per-architecture images of the original build ({}); \
+                                 each replica runs the image built for its node's architecture",
+                                platforms.join(", ")
+                            ),
+                        )
+                        .await?;
+                    }
+                    BuildImageOutput {
+                        image_id: reused.image_id.clone().unwrap_or(synthetic.image_id),
+                        image_tags_by_platform: reused.image_tags_by_platform.clone(),
+                        builder_node_id: reused.builder_node_id,
+                        builder_node_ids_by_platform: reused.builder_node_ids_by_platform.clone(),
+                        image_ids_by_platform: reused.image_ids_by_platform.clone(),
+                        ..synthetic
+                    }
+                }
+                None => synthetic,
             }
         } else {
             // Standard workflow - get from build job output
@@ -4521,6 +4846,245 @@ mod tests {
         assert_eq!(recovered.as_slice(), ["candidate", "cleanup"]);
     }
 
+    /// Each replica's image comes from the worker that built that tag's
+    /// architecture; a single-builder build keeps its one builder for every
+    /// tag, and an unknown tag falls back to it rather than to another
+    /// architecture's builder.
+    #[test]
+    fn each_tag_is_fetched_from_the_worker_that_built_it() {
+        let mut output = build_output_with_tags(&[
+            ("linux/amd64", "myapp:latest"),
+            ("linux/arm64", "myapp:latest-arm64"),
+        ]);
+        output.builder_node_id = Some(4);
+        output.builder_node_ids_by_platform = HashMap::from([
+            ("linux/amd64".to_string(), 4),
+            ("linux/arm64".to_string(), 5),
+        ]);
+
+        let arm_tag = output.tag_for_platform(Some("linux/arm64")).to_string();
+        let amd_tag = output.tag_for_platform(Some("linux/amd64")).to_string();
+        assert_eq!(arm_tag, "myapp:latest-arm64");
+        assert_eq!(output.builder_node_for_tag(&arm_tag), Some(5));
+        assert_eq!(output.builder_node_for_tag(&amd_tag), Some(4));
+        assert_eq!(output.builder_node_for_tag("myapp:unknown"), Some(4));
+        output.image_ids_by_platform = HashMap::from([
+            ("linux/amd64".to_string(), "sha256:amd".to_string()),
+            ("linux/arm64".to_string(), "sha256:arm".to_string()),
+        ]);
+        assert_eq!(
+            output.expected_image_id_for_tag(&arm_tag),
+            Some("sha256:arm")
+        );
+        assert_eq!(output.expected_image_id_for_tag("myapp:unknown"), None);
+
+        let mut single = build_output_with_tags(&[("linux/arm64", "myapp:latest")]);
+        single.builder_node_id = Some(7);
+        assert_eq!(single.builder_node_for_tag("myapp:latest"), Some(7));
+        assert_eq!(
+            build_output_with_tags(&[]).builder_node_for_tag("myapp:latest"),
+            None
+        );
+    }
+
+    #[test]
+    fn reused_worker_build_reads_only_a_matching_worker_build() {
+        let outputs = serde_json::json!({
+            "image_tag": "app:latest",
+            "image_id": "sha256:amd",
+            "builder_node_id": 4,
+            "image_tags_by_platform": {
+                "linux/amd64": "app:latest",
+                "linux/arm64": "app:latest-arm64"
+            },
+            "builder_node_ids_by_platform": { "linux/amd64": 4, "linux/arm64": 5 },
+            "image_ids_by_platform": { "linux/amd64": "sha256:amd", "linux/arm64": "sha256:arm" }
+        });
+        let reused = ReusedWorkerBuild::from_build_outputs(&outputs, "app:latest").unwrap();
+        assert_eq!(
+            reused
+                .image_ids_by_platform
+                .get("linux/arm64")
+                .map(String::as_str),
+            Some("sha256:arm")
+        );
+        // Per-architecture builders without the id of each image (a build
+        // recorded before ids were) are never trusted as image sources.
+        let mut without_ids = outputs.clone();
+        without_ids["image_ids_by_platform"] = serde_json::json!({ "linux/amd64": "sha256:amd" });
+        assert!(ReusedWorkerBuild::from_build_outputs(&without_ids, "app:latest").is_none());
+        assert!(reused.is_per_architecture());
+        assert_eq!(
+            reused.builder_node_ids_by_platform.get("linux/arm64"),
+            Some(&5)
+        );
+        assert_eq!(reused.image_id.as_deref(), Some("sha256:amd"));
+
+        // Another tag, a control-plane build (no builder), or a worker build
+        // without verified platforms is not reused.
+        assert!(ReusedWorkerBuild::from_build_outputs(&outputs, "app:v2").is_none());
+        let mut local = outputs.clone();
+        local["builder_node_id"] = serde_json::Value::Null;
+        assert!(ReusedWorkerBuild::from_build_outputs(&local, "app:latest").is_none());
+        let mut unverified = outputs.clone();
+        unverified["image_tags_by_platform"] = serde_json::json!({});
+        assert!(ReusedWorkerBuild::from_build_outputs(&unverified, "app:latest").is_none());
+
+        // A single-worker build is reusable but not per-architecture.
+        let single = serde_json::json!({
+            "image_tag": "app:latest",
+            "builder_node_id": 7,
+            "image_tags_by_platform": { "linux/arm64": "app:latest" }
+        });
+        let single = ReusedWorkerBuild::from_build_outputs(&single, "app:latest").unwrap();
+        assert!(!single.is_per_architecture());
+        assert_eq!(single.builder_node_id, Some(7));
+    }
+
+    fn inspect_body(id: &str, platform: &str) -> String {
+        serde_json::json!({
+            "id": id, "architecture": temps_deployer::platform::platform_arch(platform),
+            "os": "linux", "platform": platform, "size_bytes": 1, "tags": ["app:latest-arm64"],
+            "created": null, "working_dir": null
+        })
+        .to_string()
+    }
+
+    /// A single-architecture worker build records no per-platform ids, so its
+    /// primary tag is bound to the build's own `image_id` -- on a rollback
+    /// too. A control-plane build and an external image name no id to verify.
+    #[test]
+    fn a_single_worker_build_binds_its_primary_tag_to_the_built_image_id() {
+        let mut worker = build_output_with_tags(&[("linux/arm64", "myapp:latest")]);
+        worker.builder_node_id = Some(7);
+        assert_eq!(
+            worker.expected_image_id_for_tag("myapp:latest"),
+            Some("sha256:abc")
+        );
+        assert_eq!(worker.expected_image_id_for_tag("myapp:other"), None);
+
+        let control_plane = build_output_with_tags(&[]);
+        assert_eq!(
+            control_plane.expected_image_id_for_tag("myapp:latest"),
+            None
+        );
+
+        let mut external = build_output_with_tags(&[("linux/arm64", "myapp:latest")]);
+        external.builder_node_id = Some(7);
+        external.image_id = format!("{EXTERNAL_IMAGE_ID_PREFIX}myapp-latest");
+        assert_eq!(external.expected_image_id_for_tag("myapp:latest"), None);
+
+        // A rollback of a single worker build keeps that binding.
+        let reused = ReusedWorkerBuild::from_build_outputs(
+            &serde_json::json!({
+                "image_tag": "myapp:latest",
+                "image_id": "sha256:built",
+                "builder_node_id": 7,
+                "image_tags_by_platform": { "linux/arm64": "myapp:latest" }
+            }),
+            "myapp:latest",
+        )
+        .unwrap();
+        let rolled_back = BuildImageOutput {
+            image_id: reused.image_id.clone().unwrap(),
+            image_tags_by_platform: reused.image_tags_by_platform.clone(),
+            builder_node_id: reused.builder_node_id,
+            builder_node_ids_by_platform: reused.builder_node_ids_by_platform.clone(),
+            image_ids_by_platform: reused.image_ids_by_platform.clone(),
+            ..build_output_with_tags(&[])
+        };
+        assert_eq!(
+            rolled_back.expected_image_id_for_tag("myapp:latest"),
+            Some("sha256:built")
+        );
+    }
+
+    /// A target that already holds exactly the image recorded at build time
+    /// runs it without its builder being contacted at all -- this job has no
+    /// scheduler, so reaching for the builder would fail.
+    #[tokio::test]
+    async fn a_target_holding_the_recorded_image_needs_nothing_from_its_builder() {
+        let url = spawn_sequenced_agent(1, |request| {
+            assert!(request.contains("/agent/images/inspect?"), "{request}");
+            ("200 OK", inspect_body("sha256:arm", "linux/arm64"))
+        })
+        .await;
+        let remote = Arc::new(
+            temps_deployer::remote::RemoteNodeDeployer::new(url, "token".into(), "w-arm".into())
+                .unwrap()
+                .with_platform(Some("linux/arm64".into())),
+        );
+        let job = job_with_target(Arc::new(TrackingMockContainerDeployer::new()));
+        let context = crate::test_utils::create_test_context("wf".into(), 1, 1, 1);
+        job.ensure_worker_image_on_remote(
+            "app:latest-arm64",
+            Some("sha256:arm"),
+            &remote,
+            "w-arm",
+            &context,
+            Some(5),
+            Some(9),
+        )
+        .await
+        .expect("the recorded image is already on the target");
+    }
+
+    /// A builder that now holds a different image under the tag -- rebuilt,
+    /// or a node row re-registered by another machine -- is refused instead
+    /// of being trusted as the image's source.
+    #[tokio::test]
+    async fn a_builder_serving_another_image_under_the_tag_is_refused() {
+        let url = spawn_sequenced_agent(2, |request| {
+            assert!(request.contains("/agent/images/inspect?"), "{request}");
+            ("200 OK", inspect_body("sha256:tampered", "linux/arm64"))
+        })
+        .await;
+        let remote = Arc::new(
+            temps_deployer::remote::RemoteNodeDeployer::new(url, "token".into(), "w-arm".into())
+                .unwrap()
+                .with_platform(Some("linux/arm64".into())),
+        );
+        let job = job_with_target(Arc::new(TrackingMockContainerDeployer::new()));
+        let context = crate::test_utils::create_test_context("wf".into(), 1, 1, 1);
+        // Same node builds and runs it: the owner is the target itself.
+        let error = job
+            .ensure_worker_image_on_remote(
+                "app:latest-arm64",
+                Some("sha256:arm"),
+                &remote,
+                "w-arm",
+                &context,
+                Some(5),
+                Some(5),
+            )
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("sha256:tampered"), "{message}");
+        assert!(message.contains("refusing to run it"), "{message}");
+    }
+
+    /// A rollback of a mixed-architecture build schedules on exactly the
+    /// architectures the original build covered, with no control-plane
+    /// Docker to inspect.
+    #[tokio::test]
+    async fn reused_worker_build_offers_every_architecture_to_the_scheduler() {
+        let job = job_with_image_builder(PlatformOnlyImageBuilder {
+            platform: "linux/amd64".into(),
+            discovered: None,
+            image_platform: None,
+            discoverable: None,
+        });
+        let mut output = build_output_with_tags(&[
+            ("linux/amd64", "myapp:latest"),
+            ("linux/arm64", "myapp:latest-arm64"),
+        ]);
+        output.builder_node_id = Some(4);
+        let mut platforms = job.available_image_platforms(&output).await;
+        platforms.sort();
+        assert_eq!(platforms, vec!["linux/amd64", "linux/arm64"]);
+    }
+
     fn build_output_with_tags(tags: &[(&str, &str)]) -> BuildImageOutput {
         BuildImageOutput {
             image_tag: "myapp:latest".to_string(),
@@ -4533,6 +5097,8 @@ mod tests {
                 .map(|(p, t)| (p.to_string(), t.to_string()))
                 .collect(),
             builder_node_id: None,
+            builder_node_ids_by_platform: HashMap::new(),
+            image_ids_by_platform: HashMap::new(),
         }
     }
 
@@ -6284,8 +6850,9 @@ mod tests {
             updated_at: chrono::Utc::now(),
         };
 
+        // `list_active`, then `list_all` to say why node 99 is not usable.
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results(vec![vec![node]])
+            .append_query_results(vec![vec![node.clone()], vec![node]])
             .into_connection();
         let node_service = Arc::new(NodeService::new(Arc::new(db)));
         let scheduler = Arc::new(NodeScheduler::new(node_service));
@@ -6299,7 +6866,7 @@ mod tests {
         match error {
             NodeError::PlacementConstraintsUnsatisfied { excluded } => {
                 assert!(
-                    excluded.contains("no active node matched"),
+                    excluded.contains("'node 99' is listed in target_nodes but does not exist"),
                     "unexpected placement diagnostic: {excluded}"
                 );
             }

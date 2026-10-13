@@ -8,7 +8,7 @@ description: |
 
 Implement privacy-aware session recording with `@temps-sdk/react-analytics` (rrweb under the hood).
 
-> **Verified against `@temps-sdk/react-analytics@0.0.4`.** A prior version of
+> **Verified against `@temps-sdk/react-analytics@0.0.7`.** A prior version of
 > this skill documented `<SessionRecordingProvider enabled maskAllInputs
 > blockClass sampling>` and `startRecording`/`stopRecording`/`isRecording` —
 > **none of those exist**. Use the API described in this skill. If a maintainer
@@ -20,13 +20,13 @@ Implement privacy-aware session recording with `@temps-sdk/react-analytics` (rrw
 ## Installation
 
 ```bash
-npm install --ignore-scripts --save-exact @temps-sdk/react-analytics@0.0.4
+npm install --ignore-scripts --save-exact @temps-sdk/react-analytics@0.0.7
 ```
 
 Before running the install, explain that it changes the application's
 dependencies and lockfile and ask for confirmation. The reviewed npm package
 integrity is
-`sha512-UMCA7nwvrUabu3Ro40zx0arhSsFhnYT41ddKChT8NebkBo+DjUK37UClujAzbE+1CIgRfYbP3VcHQwvzCvUlOw==`.
+`sha512-2b0N/9Ya/wyWLInMolj8jVSWiWOC5R6CkrXeCFdfv4hgUWcHtkgj+vFZdR+qxNGEDfYna4LbFShIimNxytbw7w==`.
 Verify that the resolved lockfile records this exact version and integrity.
 
 ## There are two ways to record — pick one

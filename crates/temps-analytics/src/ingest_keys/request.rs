@@ -47,7 +47,7 @@ use tracing::{error, warn};
 
 use super::rate_limiter::AnalyticsIngestRateLimiter;
 use super::service::AnalyticsIngestKeyService;
-use super::types::ResolvedIngestScope;
+use super::types::{AnalyticsIngestKeyError, ResolvedIngestScope};
 
 /// Header carrying an analytics ingest key. Lowercase because `HeaderMap`
 /// lookups are case-insensitive only when the probe is already lowercase.
@@ -68,27 +68,33 @@ pub const ANALYTICS_INGEST_KEY_QUERY_PARAM: &str = "temps_key";
 /// an encoded value is by definition not one of ours and correctly fails to
 /// resolve.
 pub fn extract_analytics_key(headers: &HeaderMap, raw_query: Option<&str>) -> Option<String> {
+    analytics_key(headers, raw_query).map(str::to_string)
+}
+
+/// Borrowing form of [`extract_analytics_key`], with identical precedence and
+/// rules: the returned slice points into `headers` or `raw_query`.
+///
+/// For callers on the per-request path that only inspect the key — the CORS
+/// layer, the body extractor's "is this keyed?" check — so they do not
+/// allocate a copy of it on every request.
+pub fn analytics_key<'a>(headers: &'a HeaderMap, raw_query: Option<&'a str>) -> Option<&'a str> {
     let from_header = headers
         .get(ANALYTICS_INGEST_KEY_HEADER)
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty());
 
-    if let Some(value) = from_header {
-        return Some(value.to_string());
-    }
-
-    raw_query.and_then(key_from_query)
+    from_header.or_else(|| raw_query.and_then(key_from_query))
 }
 
-fn key_from_query(raw_query: &str) -> Option<String> {
+fn key_from_query(raw_query: &str) -> Option<&str> {
     raw_query.split('&').find_map(|pair| {
         let (name, value) = pair.split_once('=')?;
         if name != ANALYTICS_INGEST_KEY_QUERY_PARAM {
             return None;
         }
         let value = value.trim();
-        (!value.is_empty()).then(|| value.to_string())
+        (!value.is_empty()).then_some(value)
     })
 }
 
@@ -253,6 +259,66 @@ fn ingest_key_lookup_failed_problem() -> Problem {
         .build()
 }
 
+/// Why [`resolve_within_unresolved_budget`] could not answer.
+#[derive(Debug)]
+pub enum BudgetedResolveError {
+    /// The key is not cached and the global unresolved-key budget is spent,
+    /// so no query was made.
+    BudgetExhausted,
+    /// The lookup itself failed (storage error).
+    Lookup(AnalyticsIngestKeyError),
+}
+
+/// Resolve `key`, charging the global unresolved-key budget for exactly the
+/// database queries that did not resolve a key: misses and failures alike.
+///
+/// This is the one place a presented key may reach the database, for the
+/// handlers and the CORS layer alike. The budget is a backstop against
+/// unbounded query load from keys the cache cannot answer — a flood of
+/// distinct valid-shaped garbage (`resolve()`'s cache only helps on an exact
+/// repeated string), or a failing database, whose errors are never cached and
+/// so would otherwise be retried by every request. Charging per *query*
+/// rather than per *request* keeps it honest in both directions:
+///
+/// * Every unresolving query is charged, wherever it happens. A request
+///   rejected before its handler runs (a bad body, a wrong method, a
+///   preflight) still paid for the lookup the CORS layer made, so it must
+///   still count.
+/// * A cache hit costs nothing and is never charged or gated, so the same
+///   request resolved twice (CORS layer, then handler) counts once, and a
+///   flood of garbage — or a database outage — cannot lock out a valid key
+///   that is already cached.
+pub async fn resolve_within_unresolved_budget(
+    key_service: &AnalyticsIngestKeyService,
+    rate_limiter: &AnalyticsIngestRateLimiter,
+    key: &str,
+) -> Result<Option<ResolvedIngestScope>, BudgetedResolveError> {
+    if let Some(answer) = key_service.resolve_without_query(key).await {
+        return Ok(answer);
+    }
+
+    if rate_limiter.unresolved_budget_exhausted().await {
+        return Err(BudgetedResolveError::BudgetExhausted);
+    }
+
+    match key_service.resolve(key).await {
+        Ok(Some(scope)) => Ok(Some(scope)),
+        Ok(None) => {
+            rate_limiter.record_unresolved_attempt().await;
+            Ok(None)
+        }
+        Err(e) => {
+            // A failed lookup is uncached, so without a charge every request
+            // carrying an uncached key — preflights included — would retry the
+            // failing database unbounded and slow its recovery. Charged, they
+            // are capped at the same per-minute budget; past it they are
+            // refused without a query until the window rolls.
+            rate_limiter.record_unresolved_attempt().await;
+            Err(BudgetedResolveError::Lookup(e))
+        }
+    }
+}
+
 /// Run steps 2a–2d of the ADR-040 precedence for a presented key.
 ///
 /// On `Ok`, the returned scope **replaces** Host-based resolution entirely: the
@@ -267,27 +333,21 @@ pub async fn resolve_keyed_ingest_scope(
     key: &str,
     origin: Option<&str>,
 ) -> Result<ResolvedIngestScope, Problem> {
-    // 2a-pre. A global, IP-independent backstop against a flood of distinct
-    // valid-shaped garbage keys: `resolve()`'s cache only helps on an exact
-    // repeated string, so without this, every unique bad key costs a DB
-    // query with no limit at all (see `unresolved_budget_exhausted`'s doc).
-    if rate_limiter.unresolved_budget_exhausted().await {
-        warn!("Rejecting analytics ingest: global unresolved-key rate limit exceeded");
-        return Err(ingest_rate_limited_problem(Some(
-            super::rate_limiter::UNRESOLVED_KEY_RATE_LIMIT_PER_MINUTE,
-        )));
-    }
-
-    // 2a. Resolve, or 401. A storage failure is a 500, never a 401.
-    let scope = key_service.resolve(key).await.map_err(|e| {
-        error!("Failed to resolve an analytics ingest key: {}", e);
-        ingest_key_lookup_failed_problem()
-    })?;
-    let scope = match scope {
-        Some(scope) => scope,
-        None => {
-            rate_limiter.record_unresolved_attempt().await;
-            return Err(invalid_ingest_key_problem());
+    // 2a. Resolve, or 401 — under the global unresolved-key budget (see
+    // `resolve_within_unresolved_budget`). A storage failure is a 500, never a
+    // 401, and an exhausted budget is a 429.
+    let scope = match resolve_within_unresolved_budget(key_service, rate_limiter, key).await {
+        Ok(Some(scope)) => scope,
+        Ok(None) => return Err(invalid_ingest_key_problem()),
+        Err(BudgetedResolveError::BudgetExhausted) => {
+            warn!("Rejecting analytics ingest: global unresolved-key rate limit exceeded");
+            return Err(ingest_rate_limited_problem(Some(
+                super::rate_limiter::UNRESOLVED_KEY_RATE_LIMIT_PER_MINUTE,
+            )));
+        }
+        Err(BudgetedResolveError::Lookup(e)) => {
+            error!("Failed to resolve an analytics ingest key: {}", e);
+            return Err(ingest_key_lookup_failed_problem());
         }
     };
 
@@ -353,30 +413,101 @@ fn is_valid_client_identity(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-/// Resolve a visitor/session identity, preferring the Temps-issued, encrypted
-/// cookie (tamper-evident) over the SDK's client-generated fallback.
+/// Which resolution branch an ingest request took, as far as visitor/session
+/// identity is concerned. Build it with [`IngestBranch::keyed`] or use
+/// [`IngestBranch::HostResolved`]; see [`resolve_client_identity`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestBranch {
+    /// No key: the scope came from the `Host` header and the route table.
+    HostResolved,
+    /// A key resolved the scope. `cross_origin` is whether the browser sent the
+    /// request from a page on another origin than the one it is addressed to.
+    Keyed { cross_origin: bool },
+}
+
+impl IngestBranch {
+    /// The branch for a keyed request with these headers.
+    pub fn keyed(headers: &HeaderMap) -> Self {
+        Self::Keyed {
+            cross_origin: is_cross_origin_request(headers),
+        }
+    }
+
+    /// Whether this branch is the keyed one.
+    pub fn is_keyed(self) -> bool {
+        matches!(self, Self::Keyed { .. })
+    }
+}
+
+/// Whether a browser sent this request from another origin.
 ///
-/// `keyed` must be `true` only on the ADR-040 keyed-ingest branch — the one
-/// case where Temps never serves the page's HTML and so never gets a chance
-/// to issue its own cookie. On the Host-resolved branch (`keyed = false`),
-/// `payload_value` is never consulted, cookie-absent or not: that branch's
-/// identity has always come from a cookie the Temps proxy issues and can
-/// verify, and accepting a client-supplied override there — which any caller
-/// can trigger simply by omitting the cookie — would let an unauthenticated
-/// `/_temps/event` (etc.) request forge another visitor's identity or spray
-/// fabricated ones on every Temps-hosted app, not just the cross-origin case
-/// this fallback exists for.
+/// `Sec-Fetch-Site` decides when present: it is a forbidden header, so no page
+/// can forge it. Otherwise the `Origin` header is compared with the request's
+/// own `Host` (authority only — TLS may terminate in front of Temps, so the
+/// scheme the server sees is not the one the browser used). Browsers send
+/// `Origin` on every POST, same-origin or not, so a POST without one came from
+/// a non-browser caller, which controls its own cookies anyway.
+///
+/// Fails closed: an `Origin` that cannot be compared — no `Host`, `null`,
+/// unparsable — counts as cross-origin.
+fn is_cross_origin_request(headers: &HeaderMap) -> bool {
+    if let Some(site) = headers.get("sec-fetch-site") {
+        return site.to_str().map_or(true, |site| site != "same-origin");
+    }
+
+    let Some(origin) = headers.get(header::ORIGIN) else {
+        return false;
+    };
+    let origin_authority = origin
+        .to_str()
+        .ok()
+        .and_then(|origin| origin.split_once("://"))
+        .map(|(_, authority)| authority);
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok());
+
+    match (origin_authority, host) {
+        (Some(origin_authority), Some(host)) => !origin_authority.eq_ignore_ascii_case(host),
+        _ => true,
+    }
+}
+
+/// Resolve a visitor/session identity, preferring the Temps-issued, encrypted
+/// cookie (tamper-evident) over the SDK's client-generated fallback — but only
+/// where a cookie can be trusted to be the visitor's own doing.
+///
+/// * [`IngestBranch::HostResolved`] — cookie only. `payload_value` is never
+///   consulted, cookie-absent or not: that branch's identity has always come
+///   from a cookie the Temps proxy issues and can verify, and accepting a
+///   client-supplied override there — which any caller can trigger simply by
+///   omitting the cookie — would let an unauthenticated `/_temps/event` (etc.)
+///   request forge another visitor's identity or spray fabricated ones on every
+///   Temps-hosted app, not just the cross-origin case this fallback exists for.
+/// * Keyed, same origin — cookie, then the payload's fallback id. Temps served
+///   neither the page nor its cookie in the case this branch exists for, but a
+///   Temps-hosted app that also configures a key keeps its cookie identity.
+/// * Keyed, **cross origin** — payload only; the cookie is ignored even when
+///   present. A cross-origin request can carry the visitor's cookies without
+///   the visitor having done anything: a `text/plain` POST or a credentialed
+///   beacon from any page that has read the (public) key. Honouring the cookie
+///   would let that page write into the visitor's real session. It also keeps
+///   one identity per page: the SDK's `fetch` events are never credentialed, so
+///   if unload beacons — which are — took the cookie, a `page_leave` would land
+///   on a different visitor than its own `page_view`.
 pub fn resolve_client_identity(
     cookie: Option<String>,
     payload_value: Option<String>,
-    keyed: bool,
+    branch: IngestBranch,
 ) -> Option<String> {
-    cookie.or_else(|| {
-        if !keyed {
-            return None;
-        }
-        payload_value.filter(|id| is_valid_client_identity(id))
-    })
+    let payload = || payload_value.filter(|id| is_valid_client_identity(id));
+    match branch {
+        IngestBranch::HostResolved => cookie,
+        IngestBranch::Keyed {
+            cross_origin: false,
+        } => cookie.or_else(payload),
+        IngestBranch::Keyed { cross_origin: true } => payload(),
+    }
 }
 
 #[cfg(test)]
@@ -490,6 +621,66 @@ mod tests {
         assert_eq!(
             extract_analytics_key(&HeaderMap::new(), Some("temps_key")),
             None
+        );
+    }
+
+    #[test]
+    fn analytics_key_borrows_from_the_request() {
+        let headers = headers_with_key("  pa_from_header  ");
+        let key = analytics_key(&headers, Some("temps_key=pa_from_query")).unwrap();
+        assert_eq!(key, "pa_from_header");
+        let header_bytes = headers[ANALYTICS_INGEST_KEY_HEADER]
+            .as_bytes()
+            .as_ptr_range();
+        assert!(
+            header_bytes.contains(&key.as_ptr()),
+            "the key must be a slice of the header, not a copy"
+        );
+
+        let query = "a=1&temps_key=pa_q";
+        let no_headers = HeaderMap::new();
+        let key = analytics_key(&no_headers, Some(query)).unwrap();
+        assert_eq!(key, "pa_q");
+        assert!(query.as_bytes().as_ptr_range().contains(&key.as_ptr()));
+    }
+
+    /// A failing database answers nothing the cache can keep, so every
+    /// request carrying an uncached key would retry it. Each failure must
+    /// spend the unresolved-key budget, and once it is spent no further query
+    /// may be made.
+    #[tokio::test]
+    async fn failed_lookups_are_charged_and_capped() {
+        use crate::ingest_keys::UNRESOLVED_KEY_RATE_LIMIT_PER_MINUTE;
+        use sea_orm::{DatabaseBackend, DbErr, MockDatabase};
+        use std::sync::Arc;
+
+        let limit = UNRESOLVED_KEY_RATE_LIMIT_PER_MINUTE as usize;
+        // Exactly `limit` scripted failures. A query beyond them would come
+        // back as a different `Lookup` error, not `BudgetExhausted`.
+        let db = MockDatabase::new(DatabaseBackend::Postgres).append_query_errors(
+            (0..limit).map(|_| DbErr::Custom("database unavailable".to_string())),
+        );
+        let service = AnalyticsIngestKeyService::new(Arc::new(db.into_connection()));
+        let limiter = AnalyticsIngestRateLimiter::new();
+        let key = format!("pa_{}", "f".repeat(64));
+
+        for attempt in 0..limit {
+            assert!(
+                matches!(
+                    resolve_within_unresolved_budget(&service, &limiter, &key).await,
+                    Err(BudgetedResolveError::Lookup(_))
+                ),
+                "attempt {attempt} should have reached the database and failed"
+            );
+        }
+
+        assert!(limiter.unresolved_budget_exhausted().await);
+        assert!(
+            matches!(
+                resolve_within_unresolved_budget(&service, &limiter, &key).await,
+                Err(BudgetedResolveError::BudgetExhausted)
+            ),
+            "once the budget is spent, a failing database must not be queried again"
         );
     }
 
@@ -642,22 +833,137 @@ mod tests {
         assert!(!rendered.contains("pa_"), "{rendered}");
     }
 
+    const KEYED_SAME_ORIGIN: IngestBranch = IngestBranch::Keyed {
+        cross_origin: false,
+    };
+    const KEYED_CROSS_ORIGIN: IngestBranch = IngestBranch::Keyed { cross_origin: true };
+
     #[test]
     fn resolve_client_identity_prefers_cookie_over_payload() {
         assert_eq!(
             resolve_client_identity(
                 Some("cookie-id".to_string()),
                 Some("payload-id".to_string()),
-                true,
+                KEYED_SAME_ORIGIN,
+            ),
+            Some("cookie-id".to_string())
+        );
+        assert_eq!(
+            resolve_client_identity(
+                Some("cookie-id".to_string()),
+                Some("payload-id".to_string()),
+                IngestBranch::HostResolved,
             ),
             Some("cookie-id".to_string())
         );
     }
 
     #[test]
+    fn resolve_client_identity_ignores_cookies_on_cross_origin_keyed_requests() {
+        // A credentialed beacon or a `text/plain` POST from another site can
+        // carry the visitor's cookie without the visitor doing anything.
+        assert_eq!(
+            resolve_client_identity(
+                Some("cookie-id".to_string()),
+                Some("payload-id-1".to_string()),
+                KEYED_CROSS_ORIGIN,
+            ),
+            Some("payload-id-1".to_string())
+        );
+        assert_eq!(
+            resolve_client_identity(Some("cookie-id".to_string()), None, KEYED_CROSS_ORIGIN),
+            None
+        );
+    }
+
+    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(*name, HeaderValue::from_str(value).unwrap());
+        }
+        map
+    }
+
+    #[test]
+    fn sec_fetch_site_decides_cross_origin_when_present() {
+        assert_eq!(
+            IngestBranch::keyed(&headers(&[("sec-fetch-site", "same-origin")])),
+            KEYED_SAME_ORIGIN
+        );
+        // `same-site` is a sibling subdomain: still another origin.
+        for site in ["same-site", "cross-site", "none"] {
+            assert_eq!(
+                IngestBranch::keyed(&headers(&[
+                    ("sec-fetch-site", site),
+                    // Even a matching Origin/Host cannot override it.
+                    ("origin", "https://a.example"),
+                    ("host", "a.example"),
+                ])),
+                KEYED_CROSS_ORIGIN,
+                "{site}"
+            );
+        }
+    }
+
+    #[test]
+    fn origin_is_compared_with_host_without_sec_fetch_site() {
+        assert_eq!(
+            IngestBranch::keyed(&headers(&[
+                ("origin", "https://App.Example.com:8443"),
+                ("host", "app.example.com:8443"),
+            ])),
+            KEYED_SAME_ORIGIN
+        );
+        // TLS terminated in front of Temps: the scheme does not matter.
+        assert_eq!(
+            IngestBranch::keyed(&headers(&[
+                ("origin", "https://app.example.com"),
+                ("host", "app.example.com"),
+            ])),
+            KEYED_SAME_ORIGIN
+        );
+        for (origin, host) in [
+            ("https://shop.example.com", "analytics.example.com"),
+            ("http://localhost:3000", "localhost:8080"),
+        ] {
+            assert_eq!(
+                IngestBranch::keyed(&headers(&[("origin", origin), ("host", host)])),
+                KEYED_CROSS_ORIGIN,
+                "{origin} -> {host}"
+            );
+        }
+    }
+
+    #[test]
+    fn uncomparable_origins_fail_closed() {
+        assert_eq!(
+            IngestBranch::keyed(&headers(&[("origin", "null"), ("host", "null")])),
+            KEYED_CROSS_ORIGIN
+        );
+        assert_eq!(
+            IngestBranch::keyed(&headers(&[("origin", "https://app.example.com")])),
+            KEYED_CROSS_ORIGIN
+        );
+    }
+
+    #[test]
+    fn a_request_without_origin_is_not_cross_origin() {
+        // Browsers send Origin on every POST; its absence means a server-side
+        // caller, which supplies its own cookies.
+        assert_eq!(
+            IngestBranch::keyed(&headers(&[("host", "app.example.com")])),
+            KEYED_SAME_ORIGIN
+        );
+    }
+
+    #[test]
     fn resolve_client_identity_falls_back_to_payload_only_when_keyed() {
         assert_eq!(
-            resolve_client_identity(None, Some("payload-id-1".to_string()), true),
+            resolve_client_identity(None, Some("payload-id-1".to_string()), KEYED_SAME_ORIGIN),
+            Some("payload-id-1".to_string())
+        );
+        assert_eq!(
+            resolve_client_identity(None, Some("payload-id-1".to_string()), KEYED_CROSS_ORIGIN),
             Some("payload-id-1".to_string())
         );
     }
@@ -668,35 +974,57 @@ mod tests {
         // there is never grounds to trust a client-supplied value, since any
         // unauthenticated caller can simply omit the cookie.
         assert_eq!(
-            resolve_client_identity(None, Some("payload-id-1".to_string()), false),
+            resolve_client_identity(
+                None,
+                Some("payload-id-1".to_string()),
+                IngestBranch::HostResolved
+            ),
             None
         );
     }
 
     #[test]
     fn resolve_client_identity_none_when_both_absent() {
-        assert_eq!(resolve_client_identity(None, None, true), None);
-        assert_eq!(resolve_client_identity(None, None, false), None);
+        assert_eq!(resolve_client_identity(None, None, KEYED_SAME_ORIGIN), None);
+        assert_eq!(
+            resolve_client_identity(None, None, KEYED_CROSS_ORIGIN),
+            None
+        );
+        assert_eq!(
+            resolve_client_identity(None, None, IngestBranch::HostResolved),
+            None
+        );
     }
 
     #[test]
     fn resolve_client_identity_rejects_malformed_payload_values() {
         // Too short.
         assert_eq!(
-            resolve_client_identity(None, Some("short".to_string()), true),
+            resolve_client_identity(None, Some("short".to_string()), KEYED_CROSS_ORIGIN),
             None
         );
         // Too long.
         let oversized = "a".repeat(65);
-        assert_eq!(resolve_client_identity(None, Some(oversized), true), None);
+        assert_eq!(
+            resolve_client_identity(None, Some(oversized), KEYED_CROSS_ORIGIN),
+            None
+        );
         // Disallowed characters — the values this exists to store are keys
         // into `GROUP BY`/join queries, never HTML or query-string metacharacters.
         assert_eq!(
-            resolve_client_identity(None, Some("<script>alert(1)</script>".to_string()), true),
+            resolve_client_identity(
+                None,
+                Some("<script>alert(1)</script>".to_string()),
+                KEYED_CROSS_ORIGIN
+            ),
             None
         );
         assert_eq!(
-            resolve_client_identity(None, Some("has spaces here".to_string()), true),
+            resolve_client_identity(
+                None,
+                Some("has spaces here".to_string()),
+                KEYED_CROSS_ORIGIN
+            ),
             None
         );
     }
@@ -708,7 +1036,7 @@ mod tests {
             resolve_client_identity(
                 None,
                 Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
-                true,
+                KEYED_CROSS_ORIGIN,
             ),
             Some("550e8400-e29b-41d4-a716-446655440000".to_string())
         );
@@ -717,7 +1045,7 @@ mod tests {
             resolve_client_identity(
                 None,
                 Some("visitor_1699999999999_abc123xyz".to_string()),
-                true
+                KEYED_CROSS_ORIGIN
             ),
             Some("visitor_1699999999999_abc123xyz".to_string())
         );

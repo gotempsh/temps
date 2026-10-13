@@ -123,7 +123,7 @@ async function mockDelivery(
 }
 
 async function openDeliverySettings(page: Page) {
-  await page.goto(`/projects/${project.slug}/settings/domains`)
+  await page.goto(`/projects/${project.slug}/domains`)
   // Delivery lives in the collapsed "DNS and CDN settings" section, below
   // the project's domains.
   await page.getByRole('button', { name: 'DNS and CDN settings' }).click()

@@ -12,6 +12,8 @@
 //!   single-node install behaves exactly as before. When the operator has
 //!   excluded it, the allowed active worker with the fewest live sandboxes
 //!   wins (ties → lowest id).
+//! * A dedicated node (`temps.sh/role=dedicated`) is never chosen
+//!   automatically; it takes a sandbox only when the request names it.
 
 use sea_orm::{
     ColumnTrait, DatabaseConnection, EntityTrait, FromQueryResult, QueryFilter, QueryOrder,
@@ -106,6 +108,11 @@ pub struct PlacementNode {
     pub reason: Option<String>,
     /// Sandboxes currently hosted on the node (not destroyed).
     pub live_sandboxes: u64,
+    /// Labelled `temps.sh/role=dedicated`: automatic placement never picks
+    /// it, but a sandbox that requests it by id or name may still run there
+    /// when it is `eligible`. Always `false` for the control plane.
+    #[serde(default)]
+    pub dedicated: bool,
 }
 
 /// Why an otherwise active worker cannot take new sandboxes.
@@ -159,6 +166,9 @@ pub struct WorkerNode {
     pub status: String,
     /// Why an otherwise active node cannot take sandboxes.
     pub blocked: Option<Blocked>,
+    /// Labelled `temps.sh/role=dedicated`: only an explicit request may
+    /// place a sandbox on it.
+    pub dedicated: bool,
 }
 
 /// Why a worker cannot take a new sandbox right now.
@@ -219,6 +229,7 @@ pub fn is_https_address(address: &str) -> bool {
 /// scheduler (`temps_deployments::services::node_scheduler`).
 const NODE_ROLE_LABEL: &str = "temps.sh/role";
 const BUILDER_NODE_ROLE: &str = "builder";
+const DEDICATED_NODE_ROLE: &str = "dedicated";
 
 /// A node that has not sent a heartbeat for this long is treated as down,
 /// matching the deploy scheduler's threshold.
@@ -292,12 +303,27 @@ pub fn candidates(
             if policy.allows(CONTROL_PLANE_NODE_ID) {
                 return Ok(Candidates::ControlPlane);
             }
-            let mut ranked: Vec<&WorkerNode> = workers
+            let (mut ranked, dedicated): (Vec<&WorkerNode>, Vec<&WorkerNode>) = workers
                 .iter()
                 .filter(|w| policy.allows(w.id) && w.placeable().is_ok())
-                .collect();
+                .partition(|w| !w.dedicated);
             if ranked.is_empty() {
-                return Err(SandboxError::NoPlacementNode);
+                if dedicated.is_empty() {
+                    return Err(SandboxError::NoPlacementNode);
+                }
+                return Err(SandboxError::DedicatedNodesOnly {
+                    nodes: dedicated
+                        .iter()
+                        .map(|w| {
+                            format!(
+                                "node {} ({}) is dedicated ({NODE_ROLE_LABEL}={DEDICATED_NODE_ROLE}) \
+                                 and only takes sandboxes that request it",
+                                w.id, w.name
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                });
             }
             ranked.sort_by_key(|w| (live.get(&w.id).copied().unwrap_or(0), w.id));
             Ok(Candidates::Ranked(
@@ -469,6 +495,7 @@ pub fn describe(
         eligible: cp_allowed,
         reason: (!cp_allowed).then(|| "excluded by sandbox placement settings".to_string()),
         live_sandboxes: live.get(&CONTROL_PLANE_NODE_ID).copied().unwrap_or(0),
+        dedicated: false,
     }];
     for w in workers {
         let allowed = policy.allows(w.id);
@@ -488,6 +515,7 @@ pub fn describe(
             eligible: allowed && active,
             reason,
             live_sandboxes: live.get(&w.id).copied().unwrap_or(0),
+            dedicated: w.dedicated,
         });
     }
     out
@@ -514,11 +542,9 @@ pub fn classify(n: nodes::Model, now: chrono::DateTime<chrono::Utc>) -> Option<W
     if n.role == "control-plane" {
         return None;
     }
-    let build_only = n
-        .labels
-        .get(NODE_ROLE_LABEL)
-        .and_then(|v| v.as_str())
-        .is_some_and(|role| role == BUILDER_NODE_ROLE);
+    let role = n.labels.get(NODE_ROLE_LABEL).and_then(|v| v.as_str());
+    let build_only = role == Some(BUILDER_NODE_ROLE);
+    let dedicated = role == Some(DEDICATED_NODE_ROLE);
     let stale = n
         .last_heartbeat
         .is_none_or(|at| (now - at).num_seconds() > HEARTBEAT_THRESHOLD_SECS);
@@ -536,6 +562,7 @@ pub fn classify(n: nodes::Model, now: chrono::DateTime<chrono::Utc>) -> Option<W
         name: n.name,
         status: n.status,
         blocked,
+        dedicated,
     })
 }
 
@@ -685,6 +712,26 @@ pub(crate) mod tests {
     /// Sandbox calls carry the node token, env vars and file contents, so a
     /// node whose agent is only reachable over plain http:// takes none.
     #[test]
+    fn classify_marks_dedicated_nodes_without_blocking_them() {
+        let now = chrono::Utc::now();
+        let mut row = node_row("worker", "active", Some(10));
+        row.labels = serde_json::json!({ "temps.sh/role": "dedicated" });
+        let w = classify(row, now).unwrap();
+        assert!(w.dedicated);
+        // Still placeable: an explicit request may use it.
+        assert_eq!(w.blocked, None);
+        assert!(w.placeable().is_ok());
+
+        let w = classify(node_row("worker", "active", Some(10)), now).unwrap();
+        assert!(!w.dedicated);
+        let mut builder = node_row("worker", "active", Some(10));
+        builder.labels = serde_json::json!({ "temps.sh/role": "builder" });
+        let w = classify(builder, now).unwrap();
+        assert!(!w.dedicated);
+        assert_eq!(w.blocked, Some(Blocked::BuildOnly));
+    }
+
+    #[test]
     fn classify_blocks_plain_http_nodes() {
         let now = chrono::Utc::now();
         let mut row = node_row("worker", "active", Some(10));
@@ -737,18 +784,21 @@ pub(crate) mod tests {
                 name: "worker-1".into(),
                 status: "active".into(),
                 blocked: None,
+                dedicated: false,
             },
             WorkerNode {
                 id: 4,
                 name: "worker-2".into(),
                 status: "active".into(),
                 blocked: None,
+                dedicated: false,
             },
             WorkerNode {
                 id: 5,
                 name: "worker-3".into(),
                 status: "offline".into(),
                 blocked: None,
+                dedicated: false,
             },
         ]
     }
@@ -949,6 +999,97 @@ pub(crate) mod tests {
         assert!(rows.iter().find(|n| n.id == 4).unwrap().eligible);
     }
 
+    /// worker-1 (id 3) dedicated, worker-2 (id 4) ordinary.
+    fn workers_with_dedicated() -> Vec<WorkerNode> {
+        let mut ws = workers();
+        ws[0].dedicated = true;
+        ws
+    }
+
+    #[test]
+    fn automatic_placement_never_picks_a_dedicated_node() {
+        // worker-1 has fewer sandboxes but is dedicated.
+        let live = HashMap::from([(3, 0), (4, 5)]);
+        assert_eq!(
+            candidates(&only(&[3, 4]), &workers_with_dedicated(), &live, None).unwrap(),
+            Candidates::Ranked(vec![(4, "worker-2".into())])
+        );
+    }
+
+    #[test]
+    fn explicit_request_may_use_a_dedicated_node_by_id_or_name() {
+        let live = HashMap::new();
+        let ws = workers_with_dedicated();
+        assert_eq!(
+            choose(&only(&[3, 4]), &ws, &live, Some(&RequestedNode::Id(3))).unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            choose(
+                &only(&[3, 4]),
+                &ws,
+                &live,
+                Some(&RequestedNode::Name("worker-1".into()))
+            )
+            .unwrap(),
+            Some(3)
+        );
+        // The operator allow-list still applies to an explicit request.
+        let err = choose(&only(&[4]), &ws, &live, Some(&RequestedNode::Id(3))).unwrap_err();
+        assert!(
+            matches!(err, SandboxError::NodeNotAllowed { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn only_dedicated_nodes_left_is_a_typed_error_naming_them() {
+        let err = choose(
+            &only(&[3]),
+            &workers_with_dedicated(),
+            &HashMap::new(),
+            None,
+        )
+        .unwrap_err();
+        match &err {
+            SandboxError::DedicatedNodesOnly { nodes } => assert_eq!(
+                nodes,
+                "node 3 (worker-1) is dedicated (temps.sh/role=dedicated) and only takes \
+                 sandboxes that request it"
+            ),
+            other => panic!("expected DedicatedNodesOnly, got {other:?}"),
+        }
+        assert!(err.to_string().contains("as `node`"), "{err}");
+        // With nothing dedicated in the allowed set the old error stands.
+        let err = choose(
+            &only(&[5]),
+            &workers_with_dedicated(),
+            &HashMap::new(),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SandboxError::NoPlacementNode), "{err:?}");
+    }
+
+    /// The control plane stays the default when allowed, exactly as on a
+    /// single-node install; a dedicated worker does not change that.
+    #[test]
+    fn control_plane_default_is_unchanged_by_dedicated_workers() {
+        assert_eq!(
+            choose(&all(), &workers_with_dedicated(), &HashMap::new(), None).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn describe_flags_dedicated_nodes() {
+        let rows = describe(&all(), &workers_with_dedicated(), &HashMap::new());
+        assert!(!rows[0].dedicated, "the control plane is never dedicated");
+        let w1 = rows.iter().find(|n| n.id == 3).unwrap();
+        assert!(w1.dedicated && w1.eligible && w1.reason.is_none());
+        assert!(!rows.iter().find(|n| n.id == 4).unwrap().dedicated);
+    }
+
     #[test]
     fn candidates_rank_every_eligible_worker() {
         let live = HashMap::from([(3, 2), (4, 1)]);
@@ -958,6 +1099,7 @@ pub(crate) mod tests {
             name: "worker-6".into(),
             status: "active".into(),
             blocked: None,
+            dedicated: false,
         });
         assert_eq!(
             candidates(&only(&[3, 4, 5, 6]), &ws, &live, None).unwrap(),

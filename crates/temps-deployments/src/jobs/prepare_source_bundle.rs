@@ -7,14 +7,42 @@ use async_trait::async_trait;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use temps_core::drop_entries::{classify_drop_entry, DropEntryDisposition, DropSkipReport};
 use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
+use temps_logs::{LogLevel, LogService};
 
-#[derive(Debug)]
+/// Entry name for diagnostics. This is the decoded name that `enclosed_name`
+/// and the classifier operate on (legacy CP437 names included), so an error
+/// names the same path the archive actually contains. `ZipFile::name` is
+/// fallible since zip 9; only on a real decode error fall back to a lossy
+/// rendering of the raw bytes.
+fn entry_display_name<R: Read + ?Sized>(entry: &zip::read::ZipFile<'_, R>) -> String {
+    match entry.name() {
+        Ok(name) => name.into_owned(),
+        Err(_) => String::from_utf8_lossy(entry.name_raw()).into_owned(),
+    }
+}
+
 pub struct PrepareSourceBundleJob {
     job_id: String,
     archive_path: PathBuf,
     project_slug: String,
     extraction_id: uuid::Uuid,
+    log_service: Option<Arc<LogService>>,
+    log_id: Option<String>,
+}
+
+impl std::fmt::Debug for PrepareSourceBundleJob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrepareSourceBundleJob")
+            .field("job_id", &self.job_id)
+            .field("archive_path", &self.archive_path)
+            .field("project_slug", &self.project_slug)
+            .field("extraction_id", &self.extraction_id)
+            .field("log_id", &self.log_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PrepareSourceBundleJob {
@@ -24,7 +52,36 @@ impl PrepareSourceBundleJob {
             archive_path,
             project_slug,
             extraction_id: uuid::Uuid::new_v4(),
+            log_service: None,
+            log_id: None,
         }
+    }
+
+    /// Write this job's lines to its deployment log, as the other jobs do.
+    pub fn with_log_service(mut self, log_service: Arc<LogService>, log_id: String) -> Self {
+        self.log_service = Some(log_service);
+        self.log_id = Some(log_id);
+        self
+    }
+
+    async fn log(
+        &self,
+        context: &WorkflowContext,
+        level: LogLevel,
+        message: String,
+    ) -> Result<(), WorkflowError> {
+        if let (Some(log_service), Some(log_id)) = (&self.log_service, &self.log_id) {
+            log_service
+                .append_structured_log(log_id, level, message.clone())
+                .await
+                .map_err(|e| {
+                    WorkflowError::Other(format!(
+                        "Failed to write log for job {}: {e}",
+                        self.job_id
+                    ))
+                })?;
+        }
+        context.log(message).await
     }
 
     fn target_path(&self, context: &WorkflowContext) -> PathBuf {
@@ -49,28 +106,20 @@ impl PrepareSourceBundleJob {
                 reason: "entry path escapes the source root".to_string(),
             });
         }
-        if path.components().any(|component| {
-            let Component::Normal(value) = component else {
-                return false;
-            };
-            let name = value.to_string_lossy();
-            name == ".git"
-                || name == "node_modules"
-                || name == ".env"
-                || name.starts_with(".env.")
-                || name.ends_with(".pem")
-                || name.ends_with(".key")
-                || name == "credentials.json"
-        }) {
-            return Err(WorkflowError::InvalidArchiveEntry {
-                path: path.display().to_string(),
-                reason: "sensitive or generated paths are not accepted in Drop uploads".to_string(),
-            });
-        }
         Ok(())
     }
 
-    fn extract_archive(archive_path: &Path, target: &Path) -> Result<u32, WorkflowError> {
+    /// Extract the kept entries of a Drop archive into `target`.
+    ///
+    /// Applies the same rule as the upload inspection
+    /// ([`temps_core::drop_entries`]): version control, installed
+    /// dependencies, environment files and OS metadata are left out and
+    /// reported; private keys and credentials refuse the archive. Returns the
+    /// number of files written and what was left out.
+    fn extract_archive(
+        archive_path: &Path,
+        target: &Path,
+    ) -> Result<(u32, DropSkipReport), WorkflowError> {
         const MAX_ENTRIES: u32 = 20_000;
         const MAX_ENTRY_BYTES: u64 = 500 * 1024 * 1024;
         const MAX_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -89,6 +138,7 @@ impl PrepareSourceBundleJob {
         let mut file_count = 0u32;
         let mut total = 0u64;
         let mut written_total = 0u64;
+        let mut skipped = DropSkipReport::default();
         for index in 0..archive.len() {
             entry_count = entry_count.saturating_add(1);
             if entry_count > MAX_ENTRIES {
@@ -105,16 +155,37 @@ impl PrepareSourceBundleJob {
                 entry
                     .enclosed_name()
                     .ok_or_else(|| WorkflowError::InvalidArchiveEntry {
-                        path: entry.name().to_string(),
+                        path: entry_display_name(&entry),
                         reason: "entry path escapes the source root".to_string(),
                     })?;
             Self::validate_path(&enclosed)?;
+            match classify_drop_entry(&enclosed) {
+                DropEntryDisposition::Keep => {}
+                DropEntryDisposition::Skip {
+                    reason,
+                    reported_path,
+                } => {
+                    if !entry.is_dir() {
+                        skipped.record(reason, reported_path);
+                    }
+                    continue;
+                }
+                DropEntryDisposition::Refuse { reason } => {
+                    return Err(WorkflowError::InvalidArchiveEntry {
+                        path: entry_display_name(&entry),
+                        reason: format!(
+                            "{reason}; Drop never accepts private keys or credentials, remove \
+                             it from the archive"
+                        ),
+                    });
+                }
+            }
             if entry
                 .unix_mode()
                 .is_some_and(|mode| mode & 0o170000 == 0o120000)
             {
                 return Err(WorkflowError::InvalidArchiveEntry {
-                    path: entry.name().to_string(),
+                    path: entry_display_name(&entry),
                     reason: "symbolic links are not allowed".to_string(),
                 });
             }
@@ -149,7 +220,7 @@ impl PrepareSourceBundleJob {
                 ));
             }
         }
-        Ok(file_count)
+        Ok((file_count, skipped))
     }
 }
 
@@ -170,7 +241,7 @@ impl WorkflowTask for PrepareSourceBundleJob {
         let archive_path = self.archive_path.clone();
         let extraction_target = target.clone();
         let extraction_permit = super::acquire_archive_extraction_permit().await?;
-        let file_count = tokio::task::spawn_blocking(move || {
+        let (file_count, skipped) = tokio::task::spawn_blocking(move || {
             let _extraction_permit = extraction_permit;
             fs::create_dir_all(&extraction_target).map_err(WorkflowError::IoError)?;
             Self::extract_archive(&archive_path, &extraction_target)
@@ -179,6 +250,20 @@ impl WorkflowTask for PrepareSourceBundleJob {
         .map_err(|error| {
             WorkflowError::JobExecutionFailed(format!("Source extraction task failed: {error}"))
         })??;
+        if !skipped.is_empty() {
+            self.log(
+                &context,
+                LogLevel::Warning,
+                format!(
+                    "Left out of the uploaded source ({} file(s)): {}. Version control, \
+                     installed dependencies, environment files and OS metadata are never \
+                     deployed; set environment variables in the environment's settings",
+                    skipped.total_files(),
+                    skipped.summary()
+                ),
+            )
+            .await?;
+        }
         if file_count == 0 {
             return Err(WorkflowError::JobExecutionFailed(
                 "Uploaded source archive is empty".to_string(),
@@ -239,13 +324,155 @@ mod tests {
         ));
     }
 
+    fn zip_with(temporary: &Path, files: &[(&str, &str)]) -> PathBuf {
+        let archive_path = temporary.join("source.zip");
+        let file = fs::File::create(&archive_path).expect("archive file");
+        let mut archive = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        for (name, contents) in files {
+            archive.start_file(*name, options).expect("file entry");
+            archive
+                .write_all(contents.as_bytes())
+                .expect("file content");
+        }
+        archive.finish().expect("complete archive");
+        archive_path
+    }
+
+    /// A legacy archive stores names in CP437 with no UTF-8 flag; zip decodes
+    /// them, and diagnostics must show the decoded name rather than the
+    /// replacement-character rendering of the raw bytes.
     #[test]
-    fn rejects_sensitive_entries() {
-        for path in [".env", "app/.env.local", ".git/config", "server.key"] {
-            assert!(matches!(
-                PrepareSourceBundleJob::validate_path(Path::new(path)),
-                Err(WorkflowError::InvalidArchiveEntry { .. })
-            ));
+    fn entry_display_name_uses_the_decoded_cp437_name() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        // `X` is patched to 0x82 (e-acute in CP437); same length, so offsets
+        // and CRCs are untouched, and an ASCII name carries no UTF-8 flag.
+        let path = zip_with(temporary.path(), &[("cafX/server.key", "fixture-only")]);
+        let mut bytes = fs::read(&path).expect("read archive");
+        let mut patched = 0;
+        while let Some(at) = bytes.windows(4).position(|window| window == b"cafX") {
+            bytes[at + 3] = 0x82;
+            patched += 1;
+        }
+        assert_eq!(patched, 2, "local header and central directory");
+        fs::write(&path, &bytes).expect("write archive");
+
+        let mut archive =
+            zip::ZipArchive::new(fs::File::open(&path).expect("open archive")).expect("zip");
+        let entry = archive.by_index(0).expect("entry");
+        assert_eq!(entry_display_name(&entry), "caf\u{e9}/server.key");
+    }
+
+    /// The build must see exactly what the upload inspection kept: templates
+    /// in, secrets and generated directories out (and reported), keys refused.
+    #[test]
+    fn extraction_keeps_templates_and_leaves_out_secrets_and_generated_directories() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let archive_path = zip_with(
+            temporary.path(),
+            &[
+                ("src/main.rs", "fn main() {}"),
+                (".env.example", "PORT=8080"),
+                (".env", "fixture-only"),
+                ("app/.env.local", "fixture-only"),
+                (".git/config", "[core]"),
+                ("node_modules/a/index.js", "1"),
+                ("node_modules/a/test/cert.pem", "fixture-only"),
+            ],
+        );
+        let target = temporary.path().join("extracted");
+        fs::create_dir_all(&target).expect("target");
+
+        let (count, skipped) = PrepareSourceBundleJob::extract_archive(&archive_path, &target)
+            .expect("archive should extract");
+
+        assert_eq!(count, 2);
+        assert!(target.join("src/main.rs").is_file());
+        assert!(target.join(".env.example").is_file());
+        for left_out in [".env", "app/.env.local", ".git", "node_modules"] {
+            assert!(!target.join(left_out).exists(), "{left_out} was extracted");
+        }
+        assert_eq!(skipped.total_files(), 5);
+        assert_eq!(
+            skipped.summary(),
+            ".env, .git/, app/.env.local, node_modules/ (2 files)"
+        );
+    }
+
+    struct DiscardingLogWriter;
+
+    #[async_trait]
+    impl temps_core::LogWriter for DiscardingLogWriter {
+        async fn write_log(&self, _message: String) -> Result<(), WorkflowError> {
+            Ok(())
+        }
+        fn stage_id(&self) -> i32 {
+            0
+        }
+    }
+
+    /// The deployment log is the only place the user sees what was left out
+    /// of the build, so the line must reach the job's own log.
+    #[tokio::test]
+    async fn the_deployment_log_says_what_was_left_out() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let archive_path = zip_with(
+            temporary.path(),
+            &[
+                ("index.html", "<!doctype html>"),
+                (".env", "fixture-only"),
+                ("node_modules/a/index.js", "1"),
+            ],
+        );
+        let log_service = Arc::new(LogService::new(temporary.path().join("logs")));
+        let job = PrepareSourceBundleJob::new(
+            "prepare_source_bundle".to_string(),
+            archive_path,
+            "app".to_string(),
+        )
+        .with_log_service(
+            log_service.clone(),
+            "deployment-1-job-prepare.log".to_string(),
+        );
+        let mut context =
+            WorkflowContext::new("run-1".to_string(), 1, 1, 1, Arc::new(DiscardingLogWriter));
+        context.work_dir = Some(temporary.path().join("work"));
+
+        let result = job.execute(context).await.expect("extraction succeeds");
+
+        let logs = log_service
+            .get_structured_logs("deployment-1-job-prepare.log")
+            .await
+            .expect("the job wrote its log");
+        let line = logs
+            .iter()
+            .find(|entry| entry.message.starts_with("Left out of the uploaded source"))
+            .expect("the left-out line is in the job log");
+        assert!(
+            line.message.contains("(2 file(s)): .env, node_modules/"),
+            "{}",
+            line.message
+        );
+        assert_eq!(line.level, LogLevel::Warning);
+        job.cleanup(&result.context).await.expect("cleanup");
+    }
+
+    #[test]
+    fn extraction_refuses_private_keys_by_name() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let archive_path = zip_with(
+            temporary.path(),
+            &[("src/main.rs", "fn main() {}"), ("deploy/server.key", "x")],
+        );
+        let target = temporary.path().join("extracted");
+        fs::create_dir_all(&target).expect("target");
+
+        match PrepareSourceBundleJob::extract_archive(&archive_path, &target) {
+            Err(WorkflowError::InvalidArchiveEntry { path, reason }) => {
+                assert_eq!(path, "deploy/server.key");
+                assert!(reason.contains("private key"), "{reason}");
+            }
+            other => panic!("expected InvalidArchiveEntry, got {other:?}"),
         }
     }
 
@@ -267,10 +494,11 @@ mod tests {
 
         let target = temporary.path().join("extracted");
         fs::create_dir_all(&target).expect("target");
-        let count = PrepareSourceBundleJob::extract_archive(&archive_path, &target)
+        let (count, skipped) = PrepareSourceBundleJob::extract_archive(&archive_path, &target)
             .expect("archive should extract");
 
         assert_eq!(count, 1);
+        assert!(skipped.is_empty());
         assert_eq!(
             fs::read_to_string(target.join("src/main.rs")).expect("extracted file"),
             "fn main() {}"

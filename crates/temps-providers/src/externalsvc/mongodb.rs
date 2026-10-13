@@ -440,7 +440,7 @@ impl MongodbService {
     }
 
     fn get_container_name(&self) -> String {
-        format!("temps-mongodb-{}", self.name)
+        mongodb_container_name(&self.name)
     }
 
     /// The container this service actually runs in: the imported container's
@@ -499,7 +499,14 @@ impl MongodbService {
                     *config = attempt_config;
                     return Ok(());
                 }
-                Err(e) if attempt < MAX_ATTEMPTS && is_port_conflict_error(&e.to_string()) => {
+                // A failed guarded recreate has already put the original
+                // back under this name; never remove it as "the failed attempt".
+                Err(e)
+                    if attempt < MAX_ATTEMPTS
+                        && e.downcast_ref::<super::recreate_guard::RecreateGuardError>()
+                            .is_none()
+                        && is_port_conflict_error(&e.to_string()) =>
+                {
                     warn!(
                         "Port {} for MongoDB container was already allocated (attempt {}/{}), retrying with a fresh port: {}",
                         attempt_config.port, attempt, MAX_ATTEMPTS, e
@@ -524,6 +531,18 @@ impl MongodbService {
             }
         }
         unreachable!("loop always returns Ok or Err before exhausting MAX_ATTEMPTS")
+    }
+
+    /// The storage a container created by this service mounts, for
+    /// [`recreate_guard`](super::recreate_guard).
+    fn replacement_storage(&self) -> super::recreate_guard::ReplacementStorage {
+        super::recreate_guard::ReplacementStorage {
+            data_dir: "/data/db".to_string(),
+            mounts: vec![super::recreate_guard::PlannedMount {
+                volume: format!("temps-mongodb-{}-data", self.name),
+                target: "/data/db".to_string(),
+            }],
+        }
     }
 
     async fn create_container_once(
@@ -1395,6 +1414,7 @@ impl MongodbService {
             &s3_source.bucket_name,
             backup_location,
             &staged,
+            &super::NoopRestoreGate,
         )
         .await?;
         info!("Downloaded backup, size: {} bytes", size);
@@ -2285,8 +2305,43 @@ impl MongodbService {
     }
 }
 
+/// Container name of a service named `name`. The single derivation shared by
+/// the engine and anything that must find its container without an instance.
+pub(crate) fn mongodb_container_name(name: &str) -> String {
+    format!("temps-mongodb-{}", name)
+}
+
+/// Data volumes of a service named `name`, as `remove()` deletes them.
+pub(crate) fn mongodb_volume_names(name: &str) -> [String; 1] {
+    [format!("temps-mongodb-{}-data", name)]
+}
+
 #[async_trait]
 impl ExternalService for MongodbService {
+    fn recreate_plan(
+        &self,
+        _service_config: &ServiceConfig,
+    ) -> Option<(
+        super::recreate_guard::ManagedEngine,
+        super::recreate_guard::ReplacementStorage,
+    )> {
+        Some((
+            super::recreate_guard::ManagedEngine::MongoDb,
+            self.replacement_storage(),
+        ))
+    }
+
+    fn docker_resource_names(&self) -> Option<super::DockerResourceNames> {
+        Some(super::DockerResourceNames {
+            containers: vec![mongodb_container_name(&self.name)],
+            volumes: mongodb_volume_names(&self.name).to_vec(),
+        })
+    }
+
+    fn data_import(&self) -> Option<&dyn crate::data_import::DataImportEngine> {
+        Some(self)
+    }
+
     fn get_effective_address(&self, service_config: ServiceConfig) -> Result<(String, String)> {
         self.get_effective_address_for_environment(
             service_config,
@@ -2496,7 +2551,7 @@ impl ExternalService for MongodbService {
                 all: true,
                 filters: Some(HashMap::from([(
                     "name".to_string(),
-                    vec![container_name.clone()],
+                    vec![super::exact_container_name_filter(&container_name)],
                 )])),
                 ..Default::default()
             }))
@@ -2556,33 +2611,71 @@ impl ExternalService for MongodbService {
                     container_name,
                     config.replica_set.as_deref().unwrap_or("")
                 );
-                let _ = docker
-                    .stop_container(
-                        &container_name,
-                        Some(StopContainerOptions {
-                            t: Some(10),
-                            signal: None,
-                        }),
-                    )
-                    .await;
-                docker
-                    .remove_container(
-                        &container_name,
-                        Some(bollard::query_parameters::RemoveContainerOptions {
-                            v: false, // keep the data volume
-                            force: true,
-                            ..Default::default()
-                        }),
-                    )
-                    .await
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "Failed to remove standalone MongoDB container before \
-                             replica-set recreate: {}",
-                            e
+                // The shared guard refuses unless the new container mounts
+                // the data the old one uses, keeps the old one until the new
+                // one shows the same databases, and restores it otherwise.
+                let recreated = super::recreate_guard::recreate_preserving_data(
+                    super::recreate_guard::RecreateRequest {
+                        docker,
+                        engine: super::recreate_guard::ManagedEngine::MongoDb,
+                        service_name: &self.name,
+                        container_name: &container_name,
+                        replacement: self.replacement_storage(),
+                        operation: "enabling its replica set",
+                    },
+                    || self.create_container_once(docker, &config, &limits),
+                )
+                .await;
+                let start_original = || async {
+                    docker
+                        .start_container(
+                            &container_name,
+                            None::<bollard::query_parameters::StartContainerOptions>,
                         )
-                    })?;
-                self.create_container(docker, &mut config, &limits).await?;
+                        .await
+                        .or_else(|e| match e {
+                            bollard::errors::Error::DockerResponseServerError {
+                                status_code: 304,
+                                ..
+                            } => Ok(()),
+                            e => Err(e),
+                        })
+                        .map_err(|e| anyhow::anyhow!("Failed to start MongoDB container: {}", e))
+                };
+                match recreated {
+                    Ok(_) => {}
+                    // The layout cannot carry the data over. Nothing was
+                    // changed; the data matters more than replica-set mode,
+                    // so the standalone server starts as it is, and no
+                    // replica-set connection strings are handed out for it.
+                    // (Changing the setting is refused before it is saved,
+                    // so this is only reached for a setting saved earlier.)
+                    Err(e) if e.is_refusal() => {
+                        warn!(
+                            service = %self.name,
+                            container = %container_name,
+                            error = %e,
+                            "Not enabling the replica set; starting the existing standalone container unchanged"
+                        );
+                        config.replica_set = None;
+                        start_original().await?;
+                    }
+                    // A replacement was attempted and rolled back, verified:
+                    // the standalone original is back. Keep it running, but
+                    // report that the replica set was not enabled.
+                    Err(e) if e.original_in_place() => {
+                        start_original().await?;
+                        return Err(anyhow::anyhow!(
+                            "The replica set of MongoDB service '{}' was not enabled; the \
+                             standalone server was restored and is running: {}",
+                            self.name,
+                            e
+                        ));
+                    }
+                    // The rollback did not complete: never start anything
+                    // that may share the data with another server.
+                    Err(e) => return Err(e.into()),
+                }
                 *self.config.write().await = Some(config);
             } else {
                 docker
@@ -2644,7 +2737,7 @@ impl ExternalService for MongodbService {
             .map_err(|e| anyhow::anyhow!("Failed to remove MongoDB container: {}", e))?;
 
         // Remove the volume
-        let volume_name = format!("temps-mongodb-{}-data", self.name);
+        let [volume_name] = mongodb_volume_names(&self.name);
         let _ = self
             .docker
             .remove_volume(
@@ -3074,6 +3167,13 @@ impl ExternalService for MongodbService {
     /// captured in the backup, which is what every meaningful restore scenario
     /// (including our e2e test's "post-backup documents must be absent after
     /// restore") requires.
+    /// Sidecar archive restores stage the archive on the host and pass the
+    /// gate before mongorestore runs. Legacy WAL-G (`s3://`) restores do not,
+    /// so the orchestrator gates those before calling in.
+    fn defers_target_writes(&self, backup_location: &str) -> bool {
+        !backup_location.starts_with("s3://")
+    }
+
     async fn restore_in_place(&self, ctx: super::RestoreContext<'_>) -> Result<()> {
         // WAL-G backups (created by the old gotempsh/mongodb-walg path) store
         // the whole backup set under an "s3://" prefix; they have their own
@@ -3115,6 +3215,7 @@ impl ExternalService for MongodbService {
             &ctx.s3_source.bucket_name,
             ctx.backup_location,
             &host_archive_path,
+            ctx.gate,
         )
         .await?;
 
@@ -3123,6 +3224,10 @@ impl ExternalService for MongodbService {
             archive_size,
             host_archive_path.display()
         );
+
+        // Last safe point: the archive is staged on the host and mongorestore
+        // has not run. `restore_dir` removes the archive when it drops.
+        ctx.gate.begin_target_writes().await?;
 
         // ── Run mongorestore sidecar ────────────────────────────────────────
         let result = self
@@ -3246,6 +3351,7 @@ impl ExternalService for MongodbService {
             &ctx.s3_source.bucket_name,
             ctx.backup_location,
             &host_archive_path,
+            ctx.gate,
         )
         .await?;
         info!(
@@ -3328,7 +3434,10 @@ impl ExternalService for MongodbService {
         info!("Starting MongoDB upgrade");
 
         let _old_mongodb_config = self.get_mongodb_config(old_config)?;
-        let mut new_mongodb_config = self.get_mongodb_config(new_config)?;
+        // The service's own limits: a provider built for this call has
+        // none loaded, and the new container must keep them.
+        let upgrade_limits = ServiceResourceLimits::from_parameters(&new_config.parameters);
+        let new_mongodb_config = self.get_mongodb_config(new_config)?;
 
         // Verify the new image can be pulled BEFORE stopping the old container
         info!(
@@ -3339,15 +3448,32 @@ impl ExternalService for MongodbService {
             .await?;
         info!("New Docker image verified and is available");
 
-        // Stop the old container
-        info!("Stopping old MongoDB container");
-        self.stop().await?;
+        if new_mongodb_config.container_name.is_some() {
+            return Err(anyhow::anyhow!(
+                "Refusing to change the image of imported MongoDB service '{}': Temps does not \
+                 manage that container's lifecycle or storage. Nothing was changed",
+                self.name
+            ));
+        }
 
-        // Create container with new image (keeping the same volume for data persistence)
-        info!("Starting MongoDB container with new image");
-        let limits = self.resource_limits.read().await.clone();
-        self.create_container(&self.docker, &mut new_mongodb_config, &limits)
-            .await?;
+        // Replace the container through the shared guard: same data volume
+        // or refuse, keep the old container until the new one lists the same
+        // databases, restore it otherwise.
+        info!("Recreating MongoDB container with new image");
+        let limits = upgrade_limits;
+        let container_name = self.get_container_name();
+        super::recreate_guard::recreate_preserving_data(
+            super::recreate_guard::RecreateRequest {
+                docker: &self.docker,
+                engine: super::recreate_guard::ManagedEngine::MongoDb,
+                service_name: &self.name,
+                container_name: &container_name,
+                replacement: self.replacement_storage(),
+                operation: "changing its image",
+            },
+            || self.create_container_once(&self.docker, &new_mongodb_config, &limits),
+        )
+        .await?;
         *self.config.write().await = Some(new_mongodb_config);
 
         info!("MongoDB upgrade completed successfully");
@@ -3503,6 +3629,9 @@ impl ExternalService for MongodbService {
         Ok(config)
     }
 }
+
+/// Importing data from an external MongoDB server (see `crate::data_import`).
+mod data_import;
 
 #[cfg(test)]
 mod tests {

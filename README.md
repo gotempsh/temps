@@ -132,6 +132,8 @@ Point any OTLP exporter at Temps and get distributed traces, metrics, and struct
 
 **Real hardware-level isolation, not just containers.** Sandboxes run on **Firecracker microVMs** — the same tech behind AWS Lambda — with a **Docker** backend as the default. Run `temps firecracker setup` and Temps routes sandboxes to microVMs automatically; each one gets its own kernel, so untrusted agent-generated code never shares a kernel with your host.
 
+**Experimental: microsandbox (libkrun) microVMs.** A second microVM backend that boots in ~150 ms from a cached image, pulls OCI images natively and also runs on Apple Silicon Macs. Run `temps microsandbox setup`, restart `temps serve`, and pick it per sandbox (`backend: "microsandbox"`) or as the host default. It is meant for trusted and agent workloads; keep Firecracker for hostile multi-tenant code. Not included in the musl container image. See [ADR-050](docs/adr/050-microsandbox-sandbox-backend.md).
+
 **A drop-in SDK.** `@temps-sdk/sandbox` is compatible with the `@vercel/sandbox` shape — switch providers by changing the import and base URL:
 
 ```ts

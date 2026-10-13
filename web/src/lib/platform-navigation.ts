@@ -16,6 +16,7 @@ const PLATFORM_TOOL_PREFIXES = [
   '/delivery-profiles',
   '/proxy-logs',
   '/audit-logs',
+  '/revenue',
 ] as const
 
 export function isPlatformToolsRoute(pathname: string): boolean {

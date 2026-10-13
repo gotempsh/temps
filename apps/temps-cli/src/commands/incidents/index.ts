@@ -10,6 +10,7 @@ import {
   getIncident,
   updateIncidentStatus,
   getIncidentUpdates,
+  setIncidentUpdateVisibility,
   getBucketedIncidents,
 } from '../../api/sdk.gen.js'
 import type { IncidentResponse, IncidentUpdateResponse } from '../../api/types.gen.js'
@@ -60,6 +61,14 @@ interface UpdateStatusOptions {
   id: string
   status?: string
   message?: string
+  public?: boolean
+}
+
+interface VisibilityOptions {
+  id: string
+  updateId: string
+  public?: boolean
+  private?: boolean
 }
 
 interface UpdatesOptions {
@@ -118,7 +127,17 @@ export function registerIncidentsCommands(program: Command): void {
     .requiredOption('--id <id>', 'Incident ID')
     .option('-s, --status <status>', 'New status (investigating, identified, monitoring, resolved)')
     .option('-m, --message <message>', 'Status update message')
+    .option('--public', 'Show this update on published status pages (private by default)')
     .action(updateStatusAction)
+
+  incidents
+    .command('set-visibility')
+    .description('Show or hide an incident update on published status pages')
+    .requiredOption('--id <id>', 'Incident ID')
+    .requiredOption('--update-id <id>', 'Incident update ID (see `incidents updates`)')
+    .option('--public', 'Show the update on published status pages')
+    .option('--private', 'Hide the update from published status pages')
+    .action(setVisibilityAction)
 
   incidents
     .command('updates')
@@ -176,13 +195,30 @@ export function isValidIncidentStatus(status: string): boolean {
 }
 
 /**
- * The list endpoint may return a bare array or a paginated `{ data: [...] }`
- * envelope. Typed `unknown` because the SDK's generated response type for
- * this endpoint is `unknown` (no response body schema in the OpenAPI spec).
+ * The list endpoint returns `{ incidents, total }`. Older servers documented
+ * no response schema, so a bare array or a `{ data: [...] }` envelope is
+ * still accepted rather than silently showing an empty list.
  */
 export function extractIncidentsList(data: unknown): IncidentResponse[] {
   if (Array.isArray(data)) return data as IncidentResponse[]
-  return (data as { data?: IncidentResponse[] } | undefined)?.data ?? []
+  const envelope = data as
+    | { incidents?: IncidentResponse[]; data?: IncidentResponse[] }
+    | undefined
+  return envelope?.incidents ?? envelope?.data ?? []
+}
+
+/** `--public` / `--private` to a visibility, or an error message. */
+export function resolveVisibility(options: {
+  public?: boolean
+  private?: boolean
+}): boolean | string {
+  if (options.public && options.private) {
+    return 'Pass either --public or --private, not both'
+  }
+  if (!options.public && !options.private) {
+    return 'Pass --public or --private'
+  }
+  return options.public === true
 }
 
 export function buildBucketedQuery(options: {
@@ -433,6 +469,7 @@ async function updateStatusAction(options: UpdateStatusOptions): Promise<void> {
       body: {
         status,
         message,
+        is_public: options.public === true,
       },
     })
     if (error) {
@@ -443,11 +480,53 @@ async function updateStatusAction(options: UpdateStatusOptions): Promise<void> {
 
   newline()
   success(`Incident status updated to ${incidentStatusBadge(status)}`)
+  info(
+    options.public
+      ? 'This update is shown on published status pages.'
+      : 'This update is private. Pass --public to show it on published status pages.',
+  )
   if (incident) {
     keyValue('ID', incident.id)
     keyValue('Title', incident.title)
     keyValue('Status', incidentStatusBadge(incident.status))
   }
+  newline()
+}
+
+async function setVisibilityAction(options: VisibilityOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseInt(options.id, 10)
+  const updateId = parseInt(options.updateId, 10)
+  if (isNaN(id) || isNaN(updateId)) {
+    warning('Invalid incident or update ID')
+    return
+  }
+  const visibility = resolveVisibility(options)
+  if (typeof visibility === 'string') {
+    warning(visibility)
+    return
+  }
+
+  const update = await withSpinner('Changing update visibility...', async () => {
+    const { data, error } = await setIncidentUpdateVisibility({
+      client,
+      path: { incident_id: id, update_id: updateId },
+      body: { is_public: visibility },
+    })
+    if (error) {
+      throw new Error(getErrorMessage(error))
+    }
+    return data
+  })
+
+  newline()
+  success(
+    update?.is_public
+      ? `Update ${updateId} is now shown on published status pages`
+      : `Update ${updateId} is now private`,
+  )
   newline()
 }
 
@@ -490,6 +569,7 @@ async function listUpdatesAction(options: UpdatesOptions): Promise<void> {
     { header: 'ID', key: 'id', width: 6 },
     { header: 'Status', key: 'status', color: (v) => incidentStatusBadge(v) },
     { header: 'Message', key: 'message' },
+    { header: 'Public', accessor: (u) => (u.is_public ? 'yes' : 'no') },
     { header: 'Created', accessor: (u) => formatDate(u.created_at), color: (v) => colors.muted(v) },
   ]
 

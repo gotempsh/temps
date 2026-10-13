@@ -7,7 +7,6 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useProjectSetup } from '@/hooks/useProjectSetup'
-import { usePageTitle } from '@/hooks/usePageTitle'
 import { cn } from '@/lib/utils'
 import {
   ArrowRight,
@@ -20,7 +19,6 @@ import { Link } from 'react-router'
 
 export function ProjectSetup({ project }: { project: ProjectResponse }) {
   const setup = useProjectSetup(project)
-  usePageTitle(`${project.name} setup`)
 
   if (setup.isLoading) {
     return <ProjectSetupSkeleton />
@@ -46,10 +44,7 @@ export function ProjectSetup({ project }: { project: ProjectResponse }) {
             <BadgeCheck className="size-4" />
             Production readiness
           </div>
-          <h1 className="text-2xl font-semibold tracking-tight sm:text-3xl">
-            Project setup
-          </h1>
-          <p className="mt-1.5 max-w-2xl text-sm leading-relaxed text-muted-foreground">
+          <p className="max-w-2xl text-sm leading-relaxed text-muted-foreground">
             Connect the pieces that make {project.name} observable, reachable,
             and ready to operate in production.
           </p>
@@ -76,11 +71,11 @@ export function ProjectSetup({ project }: { project: ProjectResponse }) {
             <div className="flex flex-col gap-5 sm:flex-row sm:items-center sm:justify-between">
               {setup.allDone ? (
                 <div className="flex items-start gap-4">
-                  <div className="flex size-11 shrink-0 items-center justify-center rounded-xl bg-emerald-500/10 text-emerald-500">
+                  <div className="flex size-11 shrink-0 items-center justify-center rounded-xl bg-emerald-500/10 text-emerald-700 dark:text-emerald-500">
                     <CheckCircle2 className="size-5" />
                   </div>
                   <div>
-                    <p className="text-xs font-medium text-emerald-500">
+                    <p className="text-xs font-medium text-emerald-700 dark:text-emerald-500">
                       Setup complete
                     </p>
                     <h2 className="mt-0.5 text-lg font-semibold tracking-tight">
@@ -169,7 +164,7 @@ export function ProjectSetup({ project }: { project: ProjectResponse }) {
                     className={cn(
                       'flex size-10 items-center justify-center rounded-xl border bg-muted text-muted-foreground',
                       step.done &&
-                        'border-emerald-500/20 bg-emerald-500/10 text-emerald-500'
+                        'border-emerald-500/20 bg-emerald-500/10 text-emerald-700 dark:text-emerald-500'
                     )}
                   >
                     {step.done ? (
@@ -187,7 +182,7 @@ export function ProjectSetup({ project }: { project: ProjectResponse }) {
                   <div className="flex items-center gap-2">
                     <h3 className="text-sm font-semibold">{step.title}</h3>
                     {step.done && (
-                      <span className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium text-emerald-500">
+                      <span className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium text-emerald-700 dark:text-emerald-500">
                         Complete
                       </span>
                     )}
@@ -215,7 +210,6 @@ function ProjectSetupSkeleton() {
     <div className="w-full space-y-6 py-2 sm:py-4">
       <div className="space-y-2">
         <Skeleton className="h-4 w-36" />
-        <Skeleton className="h-9 w-52" />
         <Skeleton className="h-4 w-full max-w-xl" />
       </div>
       <Skeleton className="h-44 w-full rounded-xl" />

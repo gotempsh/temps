@@ -52,6 +52,7 @@ mod extraction_limit_tests {
 }
 
 pub mod build_image;
+pub mod builder_node;
 pub mod capture_source_files;
 pub mod capture_source_maps;
 pub mod configure_agents;
@@ -66,6 +67,7 @@ pub mod download_repo;
 pub mod image_source;
 pub mod mark_deployment_complete;
 pub mod node_health_check;
+pub(crate) mod node_image;
 pub mod npmrc;
 pub mod persist_static_assets;
 // Test-only: a demo/mock harness (mock `ImageBuilder`/`ContainerDeployer`,
@@ -82,9 +84,11 @@ pub mod prepare_source_bundle;
 pub mod pull_external_image;
 pub mod scan_vulnerabilities;
 pub mod take_screenshot;
+pub(crate) mod temps_yaml;
 pub mod verify_local_image;
 
 pub use build_image::*;
+pub use builder_node::BuilderNodeResolver;
 pub use capture_source_files::*;
 pub use capture_source_maps::*;
 pub use configure_agents::*;

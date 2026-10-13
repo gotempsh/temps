@@ -16,7 +16,7 @@ use futures_util::StreamExt;
 use reqwest::{Method, StatusCode};
 
 use crate::error::AiGatewayError;
-use crate::providers::external_http_client;
+use crate::providers::{with_bearer, ProviderHttpClient};
 
 /// Largest JSON reply read into memory from a native endpoint. Responses and
 /// batch objects are far smaller; this only bounds a misbehaving upstream.
@@ -67,10 +67,13 @@ pub fn validate_upstream_id(kind: &str, id: &str) -> Result<(), AiGatewayError> 
 #[derive(Clone)]
 pub struct OpenAiNativeClient {
     /// Inference and object metadata calls.
-    client: reqwest::Client,
+    client: ProviderHttpClient,
     /// File uploads and downloads, which can move up to 200 MB and so need a
     /// longer overall deadline than a single model call.
-    transfer_client: reqwest::Client,
+    transfer_client: ProviderHttpClient,
+    /// Whether callers must re-check base URLs against the outbound policy
+    /// before sending. Only the loopback test client turns this off.
+    enforce_url_policy: bool,
 }
 
 impl Default for OpenAiNativeClient {
@@ -82,17 +85,24 @@ impl Default for OpenAiNativeClient {
 impl OpenAiNativeClient {
     pub fn new() -> Self {
         Self {
-            client: external_http_client(NATIVE_REQUEST_TIMEOUT),
-            transfer_client: external_http_client(FILE_TRANSFER_TIMEOUT),
+            client: ProviderHttpClient::new(NATIVE_REQUEST_TIMEOUT),
+            transfer_client: ProviderHttpClient::new(FILE_TRANSFER_TIMEOUT),
+            enforce_url_policy: true,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn for_test() -> Self {
         Self {
-            client: reqwest::Client::new(),
-            transfer_client: reqwest::Client::new(),
+            client: ProviderHttpClient::unrestricted_for_tests(),
+            transfer_client: ProviderHttpClient::unrestricted_for_tests(),
+            enforce_url_policy: false,
         }
+    }
+
+    /// Whether base URLs must pass the outbound policy before use.
+    pub(crate) fn enforces_url_policy(&self) -> bool {
+        self.enforce_url_policy
     }
 
     fn url(base_url: &str, path: &str) -> String {
@@ -115,9 +125,7 @@ impl OpenAiNativeClient {
         } else {
             &self.client
         };
-        let mut request = client
-            .request(method, Self::url(base_url, path))
-            .bearer_auth(api_key);
+        let mut request = with_bearer(client.request(method, &Self::url(base_url, path)), api_key);
         if let Some(body) = json_body {
             request = request
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -162,13 +170,13 @@ impl OpenAiNativeClient {
             form = form.text(name.clone(), value.clone());
         }
         let form = form.part("file", part);
-        let response = self
-            .transfer_client
-            .post(Self::url(base_url, "files"))
-            .bearer_auth(api_key)
-            .multipart(form)
-            .send()
-            .await?;
+        let response = with_bearer(
+            self.transfer_client.post(&Self::url(base_url, "files")),
+            api_key,
+        )
+        .multipart(form)
+        .send()
+        .await?;
         read_reply(response, "files").await
     }
 }
@@ -241,10 +249,11 @@ mod tests {
             .mount(&server)
             .await;
         // Loopback is allowed only by this test client; production always
-        // uses the hardened external_http_client.
+        // uses the hardened ProviderHttpClient.
         let client = OpenAiNativeClient {
-            client: reqwest::Client::new(),
-            transfer_client: reqwest::Client::new(),
+            client: ProviderHttpClient::unrestricted_for_tests(),
+            transfer_client: ProviderHttpClient::unrestricted_for_tests(),
+            enforce_url_policy: false,
         };
         let reply = client
             .send_buffered(

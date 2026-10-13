@@ -25,11 +25,11 @@ use tokio::sync::OnceCell;
 use tracing::{debug, error, info, warn};
 
 use crate::jobs::{
-    AgentSyncService, BuildImageJobBuilder, ConfigureAgentsJobBuilder, ConfigureCronsJobBuilder,
-    ConfigureMetricAlertsJobBuilder, CronConfigService, DeployImageJobBuilder,
-    DeployStaticBundleJob, DeployStaticFromSourceJob, DeployStaticJob, DeploymentTarget,
-    DownloadRepoBuilder, MetricAlertConfigService, PrepareSourceBundleJob, PullExternalImageJob,
-    ResourceUsage, VerifyLocalImageJob,
+    AgentSyncService, BuildImageJobBuilder, BuilderNodeResolver, ConfigureAgentsJobBuilder,
+    ConfigureCronsJobBuilder, ConfigureMetricAlertsJobBuilder, CronConfigService,
+    DeployImageJobBuilder, DeployStaticBundleJob, DeployStaticFromSourceJob, DeployStaticJob,
+    DeploymentTarget, DownloadRepoBuilder, MetricAlertConfigService, PrepareSourceBundleJob,
+    PullExternalImageJob, ResourceUsage, VerifyLocalImageJob,
 };
 use crate::services::DeploymentJobTracker;
 use temps_screenshots::ScreenshotService;
@@ -144,28 +144,287 @@ fn deploy_failed_telemetry_event(
 /// The node chosen to build a source image in the control-plane profile.
 struct SelectedNodeBuilder {
     node_id: i32,
+    node_name: String,
     platform: String,
     remote: Arc<dyn ImageBuilder>,
+}
+
+/// How many images a worker build of a non-static deployment produces.
+#[derive(Debug, PartialEq, Eq)]
+enum WorkerBuildScope {
+    /// Every target node runs one architecture: one build, as always.
+    SingleArchitecture,
+    /// The target nodes span several architectures: one native build per
+    /// platform, each on a worker of that architecture.
+    PerArchitecture,
 }
 
 fn validate_worker_build_scope(
     deployment_id: i32,
     platforms: &[String],
-    needs_static_extraction: bool,
-) -> Result<(), WorkflowExecutionError> {
-    let reason = if needs_static_extraction {
-        Some("Static image builds require artifact extraction, which worker build protocol v1 does not support. Use a full-profile control plane or deploy a prebuilt static bundle.")
-    } else if platforms.len() != 1 {
-        Some("Worker build protocol v1 requires exactly one target architecture. Restrict target nodes/labels to a single architecture, or deploy a prebuilt multi-platform registry image.")
-    } else {
-        None
-    };
-    match reason {
-        Some(reason) => Err(WorkflowExecutionError::InvalidJobConfig(format!(
-            "Deployment {deployment_id}: {reason} Reported target platforms: {platforms:?}"
+) -> Result<WorkerBuildScope, WorkflowExecutionError> {
+    match platforms.len() {
+        0 => Err(WorkflowExecutionError::InvalidJobConfig(format!(
+            "Deployment {deployment_id}: no target worker has reported a buildable \
+             architecture, so there is no platform to build for. Check that a worker is active \
+             and has completed a heartbeat (`temps join`), and that the target nodes/labels \
+             select it"
         ))),
-        None => Ok(()),
+        1 => Ok(WorkerBuildScope::SingleArchitecture),
+        _ => Ok(WorkerBuildScope::PerArchitecture),
     }
+}
+
+/// Open an authenticated agent connection to `node` for image work.
+async fn connect_build_node(
+    node: &temps_entities::nodes::Model,
+    config: &temps_config::ConfigService,
+    encryption: &temps_core::EncryptionService,
+) -> Result<temps_deployer::remote::RemoteNodeDeployer, String> {
+    let sealed_token = node.token_encrypted.as_deref().ok_or_else(|| {
+        format!(
+            "Build node '{}' (id={}) has no encrypted agent token; re-register it",
+            node.name, node.id
+        )
+    })?;
+    let token = encryption.decrypt(sealed_token).map_err(|error| {
+        format!(
+            "Cannot decrypt build node '{}' (id={}) token: {error}",
+            node.name, node.id
+        )
+    })?;
+    let token = String::from_utf8(token).map_err(|error| {
+        format!(
+            "Build node '{}' (id={}) token is not UTF-8: {error}",
+            node.name, node.id
+        )
+    })?;
+    crate::cluster_ca::build_node_deployer(
+        &node.address,
+        token,
+        node.name.clone(),
+        config,
+        encryption,
+    )
+    .await
+    .map_err(|error| {
+        format!(
+            "Cannot connect to build node '{}' (id={}): {error}",
+            node.name, node.id
+        )
+    })
+}
+
+/// How long a per-architecture build candidate has to answer its health probe.
+const BUILDER_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Connect to `node` and confirm, over its authenticated agent channel, that
+/// it is reachable and runs `platform` -- what its agent reports now, not
+/// only what its node row last recorded. `Err` is why it was passed over.
+async fn probe_platform_builder(
+    node: &temps_entities::nodes::Model,
+    platform: &str,
+    config: &temps_config::ConfigService,
+    encryption: &temps_core::EncryptionService,
+) -> Result<temps_deployer::remote::RemoteNodeDeployer, String> {
+    let remote = connect_build_node(node, config, encryption).await?;
+    // Bounded: a worker that accepts the connection and never answers must
+    // not hold up the deployment for the client's full request timeout.
+    let reported = tokio::time::timeout(BUILDER_PROBE_TIMEOUT, remote.refresh_platform())
+        .await
+        .map_err(|_| {
+            format!(
+                "worker '{}' (id={}) did not answer on its agent connection within {}s",
+                node.name,
+                node.id,
+                BUILDER_PROBE_TIMEOUT.as_secs()
+            )
+        })?;
+    match reported {
+        Some(reported) if temps_deployer::platform::platforms_match(&reported, platform) => {
+            Ok(remote)
+        }
+        Some(reported) => Err(format!(
+            "worker '{}' (id={}) is recorded as {platform} but its agent reports {reported}",
+            node.name, node.id
+        )),
+        None => Err(format!(
+            "worker '{}' (id={}) did not answer on its agent connection",
+            node.name, node.id
+        )),
+    }
+}
+
+/// Reaches the worker that built an image, for jobs that read files out of
+/// it after the build (static output, immutable assets).
+struct NodeBuilderResolver {
+    scheduler: Arc<crate::services::NodeScheduler>,
+    config: Arc<temps_config::ConfigService>,
+    encryption: Arc<temps_core::EncryptionService>,
+}
+
+#[async_trait::async_trait]
+impl BuilderNodeResolver for NodeBuilderResolver {
+    async fn image_builder_for_node(
+        &self,
+        node_id: i32,
+    ) -> Result<Arc<dyn ImageBuilder>, WorkflowError> {
+        let node = self
+            .scheduler
+            .node_service()
+            .get_by_id(node_id)
+            .await
+            .map_err(|error| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Failed to load build node {node_id}: {error}"
+                ))
+            })?;
+        let platform = node.architecture.clone();
+        let remote = connect_build_node(&node, &self.config, &self.encryption)
+            .await
+            .map_err(WorkflowError::JobExecutionFailed)?;
+        Ok(Arc::new(remote.with_platform(platform)))
+    }
+}
+
+/// What a worker must build for a deployment whose build location is
+/// `node` on a control plane that could also build it itself.
+#[derive(Debug, PartialEq, Eq)]
+struct OffloadBuildCandidate {
+    /// The platform the image must be built for. `None` for a static site:
+    /// its output is architecture-independent and the image never runs, so
+    /// any worker may build it.
+    platform: Option<String>,
+}
+
+/// Secret variables a framework inlines into the application, which keep an
+/// offloaded build on the control plane: a worker never receives a secret
+/// value, so the bundle it built would hold them empty. Names only.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "{names} {verb} inlined into the application at build time, but {pronoun} secret, and \
+     secret values never leave the control plane for a worker build",
+    names = .variables.join(", "),
+    verb = if .variables.len() == 1 { "is" } else { "are" },
+    pronoun = if .variables.len() == 1 { "it is" } else { "they are" }
+)]
+struct InlinedVariablesKeepBuildLocal {
+    variables: Vec<String>,
+}
+
+/// A worker build receives every value that is not secret -- the project's
+/// own variables and the platform's public ones alike -- so only a secret
+/// variable the framework inlines changes what a worker would build.
+fn inlined_variables_allow_offload(
+    withheld_inlined_variables: &[String],
+) -> Result<(), InlinedVariablesKeepBuildLocal> {
+    if withheld_inlined_variables.is_empty() {
+        return Ok(());
+    }
+    Err(InlinedVariablesKeepBuildLocal {
+        variables: withheld_inlined_variables.to_vec(),
+    })
+}
+
+/// The inlined variables among `build_args` whose values a worker build
+/// would not receive (not in the planner's `worker_build_arg_keys`).
+fn withheld_inlined_variables<'a>(
+    build_args: impl IntoIterator<Item = &'a String>,
+    worker_build_arg_keys: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    crate::jobs::build_image::build_inlined_variables(
+        build_args
+            .into_iter()
+            .filter(|name| !worker_build_arg_keys.contains(*name))
+            .map(String::as_str),
+    )
+}
+
+/// Whether a build that the control plane would run can move to a worker
+/// node without changing what it produces, and for which platform.
+///
+/// `Err` is the reason it stays on the control plane, phrased for the build
+/// log. Every reason is a limit of worker build protocol v1 or of what this
+/// server knows, never a configuration error, so the deployment still ships.
+fn offload_build_candidate(
+    static_output_only: bool,
+    needs_npm_credentials: bool,
+    cross_build_platforms: &[String],
+    control_plane_platform: Option<&str>,
+    scheduler_available: bool,
+) -> Result<OffloadBuildCandidate, String> {
+    if !scheduler_available {
+        return Err("node scheduling is not available on this server".to_string());
+    }
+    // `.npmrc` is generated from these on the control plane only; a worker
+    // build would fail outright, and the values must not leave this host.
+    if needs_npm_credentials {
+        return Err(
+            "this build uses NPM_TOKEN or NPM_RC for private packages, and worker \
+             builds cannot receive registry credentials yet"
+                .to_string(),
+        );
+    }
+    // DeployStaticJob reads the output files from the build node, and the
+    // image itself runs nowhere.
+    if static_output_only {
+        return Ok(OffloadBuildCandidate { platform: None });
+    }
+    if cross_build_platforms.len() > 1 {
+        return Err(format!(
+            "cross-architecture builds need {} images ({}), and a worker builds exactly one. \
+             Turn off cross-architecture builds or restrict target nodes to one architecture",
+            cross_build_platforms.len(),
+            cross_build_platforms.join(", ")
+        ));
+    }
+    // One requested platform is still one image; otherwise the native build
+    // is for the control plane's own platform.
+    let platform = cross_build_platforms
+        .first()
+        .map(String::as_str)
+        .or(control_plane_platform)
+        .map(str::trim)
+        .filter(|platform| temps_deployer::platform::is_buildable_platform(platform))
+        .ok_or_else(|| {
+            "the control plane's Docker platform is not known yet, so no worker of the \
+             matching architecture can be chosen"
+                .to_string()
+        })?;
+    Ok(OffloadBuildCandidate {
+        platform: Some(temps_deployer::platform::canonicalize_platform(platform)),
+    })
+}
+
+/// A deployment's placement constraints: the environment's `target_nodes`
+/// and `target_labels`, each inheriting the project's when the environment
+/// does not set it. One resolver for the build, the pre-build placement check
+/// and the deploy, so all three reason about the same pool of nodes.
+fn resolve_placement_constraints(
+    environment_config: Option<&temps_entities::deployment_config::DeploymentConfig>,
+    project_config: Option<&temps_entities::deployment_config::DeploymentConfig>,
+) -> (Option<Vec<i32>>, Option<serde_json::Value>) {
+    let configs = [environment_config, project_config];
+    let target_nodes = configs
+        .iter()
+        .flatten()
+        .find_map(|config| config.configured_target_nodes().map(<[i32]>::to_vec));
+    let target_labels = configs
+        .iter()
+        .flatten()
+        .find_map(|config| config.configured_target_labels().cloned());
+    (target_nodes, target_labels)
+}
+
+/// Whether any of a deployment's jobs places replicas on nodes. Static sites
+/// and compose stacks are served or run without the node scheduler.
+fn places_replicas(db_jobs: &[deployment_jobs::Model]) -> bool {
+    db_jobs.iter().any(|job| {
+        matches!(
+            job.job_type.as_str(),
+            "DeployImageJob" | "DeployContainerJob"
+        )
+    })
 }
 
 /// Service for executing deployment workflows
@@ -182,6 +441,9 @@ pub struct WorkflowExecutionService {
     agent_sync_service: Arc<dyn AgentSyncService>,
     config_service: Arc<temps_config::ConfigService>,
     screenshot_service: Arc<ScreenshotService>,
+    /// Shared with on-demand `take_screenshot` operations, so the pipeline's
+    /// capture never overlaps one of the same deployment.
+    capture_guard: Arc<crate::jobs::DeploymentCaptureGuard>,
     docker_handle: Arc<DockerHandle>,
     source_map_service: OnceCell<Arc<SourceMapService>>,
     node_scheduler: OnceCell<Arc<crate::services::NodeScheduler>>,
@@ -215,6 +477,7 @@ impl WorkflowExecutionService {
         agent_sync_service: Arc<dyn AgentSyncService>,
         config_service: Arc<temps_config::ConfigService>,
         screenshot_service: Arc<ScreenshotService>,
+        capture_guard: Arc<crate::jobs::DeploymentCaptureGuard>,
         docker_handle: Arc<DockerHandle>,
     ) -> Self {
         Self {
@@ -230,6 +493,7 @@ impl WorkflowExecutionService {
             agent_sync_service,
             config_service,
             screenshot_service,
+            capture_guard,
             docker_handle,
             source_map_service: OnceCell::new(),
             node_scheduler: OnceCell::new(),
@@ -644,6 +908,9 @@ impl WorkflowExecutionService {
         deployment: &deployments::Model,
         db_jobs: &[deployment_jobs::Model],
     ) -> Result<WorkflowBuilder, WorkflowExecutionError> {
+        self.preflight_dedicated_placement(project, environment, deployment, db_jobs)
+            .await?;
+
         for db_job in db_jobs {
             // Create log path for this job
             self.log_service
@@ -691,6 +958,76 @@ impl WorkflowExecutionService {
         }
 
         Ok(workflow_builder)
+    }
+
+    /// Fail a deployment whose replicas could only land on dedicated nodes it
+    /// does not pin, before its source is downloaded or built.
+    ///
+    /// Replicas are placed by `DeployImageJob`, after the build, because the
+    /// image's platforms narrow the pool. This runs that same placement now,
+    /// with no platform constraint: platforms only ever remove nodes, so a
+    /// pool that holds nothing but unpinned dedicated nodes now holds nothing
+    /// later either, and the build would be wasted. Only that answer fails
+    /// the deployment here. Every other placement outcome is still decided by
+    /// `DeployImageJob` with the image in hand, as before.
+    async fn preflight_dedicated_placement(
+        &self,
+        project: &projects::Model,
+        environment: &environments::Model,
+        deployment: &deployments::Model,
+        db_jobs: &[deployment_jobs::Model],
+    ) -> Result<(), WorkflowExecutionError> {
+        if !places_replicas(db_jobs) {
+            return Ok(());
+        }
+        let Some(scheduler) = self.node_scheduler.get() else {
+            return Ok(());
+        };
+        let (target_nodes, target_labels) = resolve_placement_constraints(
+            environment.deployment_config.as_ref(),
+            project.deployment_config.as_ref(),
+        );
+        let outcome = scheduler
+            .schedule_placement(crate::services::node_scheduler::ReplicaPlacementRequest {
+                replica_count: 1,
+                labels: target_labels.as_ref(),
+                target_node_ids: target_nodes.as_deref(),
+                anti_affinity: false,
+                exclude_node_ids: &[],
+                image_platforms: &[],
+                project_slug: Some(&project.slug),
+                exclude_control_plane: false,
+            })
+            .await;
+        match outcome {
+            Err(
+                source @ crate::services::node_service::NodeError::DedicatedNodesNotPinned {
+                    ..
+                },
+            ) => {
+                warn!(
+                    deployment_id = deployment.id,
+                    project_slug = %project.slug,
+                    environment_id = environment.id,
+                    "Failing deployment before the build: {}",
+                    source
+                );
+                Err(WorkflowExecutionError::DedicatedNodesNotPinned {
+                    deployment_id: deployment.id,
+                    source,
+                })
+            }
+            Err(error) => {
+                debug!(
+                    deployment_id = deployment.id,
+                    "Pre-build placement check inconclusive ({}); placement is decided after \
+                     the build",
+                    error
+                );
+                Ok(())
+            }
+            Ok(_) => Ok(()),
+        }
     }
 
     /// Close out the planned-but-never-started `deployment_jobs` rows when the
@@ -931,6 +1268,27 @@ impl WorkflowExecutionService {
                     "build_args",
                 )
                 .map_err(|e| WorkflowExecutionError::InvalidJobConfig(e.to_string()))?;
+                // Worker builds cannot receive registry credentials, so a
+                // build that needs them stays on the control plane.
+                let needs_npm_credentials =
+                    crate::jobs::npmrc::plan_npmrc(&build_args_map).is_some();
+                // Names whose values may be sent to a worker build (names
+                // only, plaintext). A job planned before the field existed
+                // has none: a worker then receives no value at all.
+                let worker_build_arg_keys: std::collections::BTreeSet<String> = config
+                    .get(crate::services::workflow_planner::WORKER_BUILD_ARG_KEYS_FIELD)
+                    .and_then(|value| value.as_array())
+                    .map(|keys| {
+                        keys.iter()
+                            .filter_map(|key| key.as_str().map(str::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                // Only a secret value the framework inlines changes what a
+                // worker builds; such a build stays here when it can.
+                let inlined_build_variables =
+                    withheld_inlined_variables(build_args_map.keys(), &worker_build_arg_keys);
+                builder = builder.worker_build_arg_keys(worker_build_arg_keys);
                 if !build_args_map.is_empty() {
                     let build_args: Vec<(String, String)> = build_args_map.into_iter().collect();
                     builder = builder.build_args(build_args);
@@ -981,30 +1339,17 @@ impl WorkflowExecutionService {
                     );
                 }
 
+                // The platforms a multi-arch build must cover; empty for the
+                // usual single native build.
+                let mut cross_build_platforms: Vec<String> = Vec::new();
                 if let (true, Some(scheduler)) = (
                     cross_builds_enabled && local_workloads_enabled,
                     self.node_scheduler.get(),
                 ) {
-                    let target_nodes = environment
-                        .deployment_config
-                        .as_ref()
-                        .and_then(|c| c.configured_target_nodes().map(<[i32]>::to_vec))
-                        .or_else(|| {
-                            project
-                                .deployment_config
-                                .as_ref()
-                                .and_then(|c| c.configured_target_nodes().map(<[i32]>::to_vec))
-                        });
-                    let target_labels = environment
-                        .deployment_config
-                        .as_ref()
-                        .and_then(|c| c.configured_target_labels().cloned())
-                        .or_else(|| {
-                            project
-                                .deployment_config
-                                .as_ref()
-                                .and_then(|c| c.configured_target_labels().cloned())
-                        });
+                    let (target_nodes, target_labels) = resolve_placement_constraints(
+                        environment.deployment_config.as_ref(),
+                        project.deployment_config.as_ref(),
+                    );
 
                     match scheduler
                         .required_build_platforms_for_project(
@@ -1020,6 +1365,7 @@ impl WorkflowExecutionService {
                                 platforms = ?platforms,
                                 "Cluster spans multiple architectures — building one image per platform"
                             );
+                            cross_build_platforms = platforms.clone();
                             builder = builder.target_platforms(platforms);
                         }
                         Ok(_) => {}
@@ -1040,52 +1386,117 @@ impl WorkflowExecutionService {
                     }
                 }
 
-                let image_builder: Arc<dyn ImageBuilder> = if local_workloads_enabled {
+                let build_location =
+                    temps_entities::deployment_config::DeploymentConfig::resolve_build_location(
+                        environment.deployment_config.as_ref(),
+                        project.deployment_config.as_ref(),
+                    );
+                let image_builder: Arc<dyn ImageBuilder> = if local_workloads_enabled
+                    && build_location
+                        == temps_entities::deployment_config::BuildLocation::ControlPlane
+                {
                     self.image_builder.clone()
+                } else if local_workloads_enabled {
+                    // The operator asked to keep this build off the control
+                    // plane. A worker build is a preference: when no worker
+                    // can produce the same image the control plane would, the
+                    // build stays here and the build log says why.
+                    let (target_nodes, target_labels) = resolve_placement_constraints(
+                        environment.deployment_config.as_ref(),
+                        project.deployment_config.as_ref(),
+                    );
+                    match self
+                        .select_offload_builder(
+                            deployment.id,
+                            &project.slug,
+                            target_nodes.as_deref(),
+                            target_labels.as_ref(),
+                            &cross_build_platforms,
+                            needs_npm_credentials,
+                            &inlined_build_variables,
+                        )
+                        .await
+                    {
+                        Ok(selected) => {
+                            // The control plane's own post-build jobs read
+                            // the image from its daemon, so the finished
+                            // image is streamed back once the build is done.
+                            builder = builder
+                                .remote_builder_node_id(selected.node_id)
+                                .target_platforms(vec![selected.platform.clone()])
+                                .copy_image_to_control_plane(
+                                    self.image_builder.clone(),
+                                    selected.node_name.clone(),
+                                );
+                            selected.remote
+                        }
+                        Err(reason) => {
+                            warn!(
+                                deployment_id = deployment.id,
+                                project_slug = %project.slug,
+                                "Build location is 'node' but building on the control plane: {}",
+                                reason
+                            );
+                            builder = builder.build_location_notice(format!(
+                                "⚠️ Build location is set to 'node', but this build runs on the \
+                                 control plane: {reason}"
+                            ));
+                            self.image_builder.clone()
+                        }
+                    }
                 } else {
-                    // Fail before sending source or starting a build that the
-                    // downstream static job cannot extract without a daemon.
-                    let static_job = deployment_jobs::Entity::find()
+                    // A static site's image is only read for its output
+                    // files, which DeployStaticJob fetches from the build node
+                    // and the control plane serves; it never runs anywhere.
+                    let static_output_only = deployment_jobs::Entity::find()
                         .filter(deployment_jobs::Column::DeploymentId.eq(deployment.id))
                         .filter(deployment_jobs::Column::JobType.eq("DeployStaticJob"))
                         .one(self.db.as_ref())
-                        .await?;
-                    if static_job.is_some() {
-                        validate_worker_build_scope(deployment.id, &[], true)?;
-                    }
+                        .await?
+                        .is_some();
                     // No local daemon: build on a node. The image is then
                     // handed to each replica's node by DeployImageJob.
-                    let target_nodes = environment
-                        .deployment_config
-                        .as_ref()
-                        .and_then(|config| config.configured_target_nodes().map(|ids| ids.to_vec()))
-                        .or_else(|| {
-                            project.deployment_config.as_ref().and_then(|config| {
-                                config.configured_target_nodes().map(|ids| ids.to_vec())
-                            })
-                        });
-                    let target_labels = environment
-                        .deployment_config
-                        .as_ref()
-                        .and_then(|config| config.configured_target_labels().cloned())
-                        .or_else(|| {
-                            project
-                                .deployment_config
-                                .as_ref()
-                                .and_then(|config| config.configured_target_labels().cloned())
-                        });
-                    let selected = self
+                    let (target_nodes, target_labels) = resolve_placement_constraints(
+                        environment.deployment_config.as_ref(),
+                        project.deployment_config.as_ref(),
+                    );
+                    let mut selected = self
                         .select_node_builder(
                             deployment.id,
                             &project.slug,
                             target_nodes.as_deref(),
                             target_labels.as_ref(),
+                            static_output_only,
                         )
                         .await?;
-                    builder = builder
-                        .remote_builder_node_id(selected.node_id)
-                        .target_platforms(vec![selected.platform.clone()]);
-                    selected.remote
+                    if selected.len() > 1 {
+                        // A mixed-architecture deployment: one native build
+                        // per architecture, each on its own worker.
+                        let primary = selected[0].remote.clone();
+                        builder = builder.platform_builders(
+                            selected
+                                .into_iter()
+                                .map(|selected| crate::jobs::build_image::WorkerPlatformBuilder {
+                                    platform: selected.platform,
+                                    node_id: selected.node_id,
+                                    node_name: selected.node_name,
+                                    builder: selected.remote,
+                                })
+                                .collect(),
+                        );
+                        primary
+                    } else {
+                        let selected = selected.pop().ok_or_else(|| {
+                            WorkflowExecutionError::JobCreationFailed(format!(
+                                "Deployment {}: no build node was selected",
+                                deployment.id
+                            ))
+                        })?;
+                        builder = builder
+                            .remote_builder_node_id(selected.node_id)
+                            .target_platforms(vec![selected.platform.clone()]);
+                        selected.remote
+                    }
                 };
                 let job = builder.build(image_builder)?;
 
@@ -1210,29 +1621,11 @@ impl WorkflowExecutionService {
                     None
                 };
 
-                // Resolve target_nodes from environment or project config
-                let target_nodes = environment
-                    .deployment_config
-                    .as_ref()
-                    .and_then(|c| c.configured_target_nodes().map(<[i32]>::to_vec))
-                    .or_else(|| {
-                        project
-                            .deployment_config
-                            .as_ref()
-                            .and_then(|c| c.configured_target_nodes().map(<[i32]>::to_vec))
-                    });
-
-                // Resolve target_labels from environment or project config
-                let target_labels = environment
-                    .deployment_config
-                    .as_ref()
-                    .and_then(|c| c.configured_target_labels().cloned())
-                    .or_else(|| {
-                        project
-                            .deployment_config
-                            .as_ref()
-                            .and_then(|c| c.configured_target_labels().cloned())
-                    });
+                // Same constraints the pre-build placement check used
+                let (target_nodes, target_labels) = resolve_placement_constraints(
+                    environment.deployment_config.as_ref(),
+                    project.deployment_config.as_ref(),
+                );
 
                 // Resolve CPU/memory limits + requests from environment first,
                 // then project. Each field is resolved independently so an
@@ -1653,6 +2046,7 @@ impl WorkflowExecutionService {
                     .job_id(db_job.job_id.clone())
                     .deployment_id(deployment_id)
                     .screenshot_service(screenshot_service.clone())
+                    .capture_guard(self.capture_guard.clone())
                     .config_service(self.config_service.clone())
                     .db(self.db.clone())
                     .log_id(db_job.log_id.clone())
@@ -1819,6 +2213,10 @@ impl WorkflowExecutionService {
                 )
                 .with_log_id(db_job.log_id.clone())
                 .with_log_service(self.log_service.clone());
+                let job = match self.builder_node_resolver() {
+                    Some(resolver) => job.with_builder_node_resolver(resolver),
+                    None => job,
+                };
 
                 Ok(Arc::new(job))
             }
@@ -1978,6 +2376,10 @@ impl WorkflowExecutionService {
                 // Wire database for URL→hash mapping
                 job = job.with_db(self.db.clone());
 
+                if let Some(resolver) = self.builder_node_resolver() {
+                    job = job.with_builder_node_resolver(resolver);
+                }
+
                 Ok(Arc::new(job))
             }
 
@@ -2031,6 +2433,10 @@ impl WorkflowExecutionService {
                 )
                 .with_log_id(db_job.log_id.clone())
                 .with_log_service(self.log_service.clone());
+                let job = match self.builder_node_resolver() {
+                    Some(resolver) => job.with_builder_node_resolver(resolver),
+                    None => job,
+                };
 
                 Ok(Arc::new(job))
             }
@@ -2259,11 +2665,14 @@ impl WorkflowExecutionService {
                     ));
                 }
                 let absolute_path = self.config_service.data_dir().join(archive_path);
-                Ok(Arc::new(PrepareSourceBundleJob::new(
-                    db_job.job_id.clone(),
-                    absolute_path,
-                    project.slug.clone(),
-                )))
+                Ok(Arc::new(
+                    PrepareSourceBundleJob::new(
+                        db_job.job_id.clone(),
+                        absolute_path,
+                        project.slug.clone(),
+                    )
+                    .with_log_service(self.log_service.clone(), db_job.log_id.clone()),
+                ))
             }
 
             // Unsupported job types - log warning but don't fail the entire workflow
@@ -2460,6 +2869,156 @@ impl WorkflowExecutionService {
         }
     }
 
+    /// Choose a worker node to build a source image that would otherwise be
+    /// built by this control plane's own Docker (build location `node`).
+    ///
+    /// The node must produce exactly the image a local build would: the
+    /// control plane's architecture and one platform -- or, for a static
+    /// site, any architecture. A node labelled `temps.sh/role=builder` is
+    /// preferred; otherwise the worker this deployment would be placed on
+    /// builds it, so that replica needs no transfer. `Err` carries the reason
+    /// the build stays on the control plane, written verbatim into the build
+    /// log.
+    #[allow(clippy::too_many_arguments)]
+    async fn select_offload_builder(
+        &self,
+        deployment_id: i32,
+        project_slug: &str,
+        target_nodes: Option<&[i32]>,
+        target_labels: Option<&serde_json::Value>,
+        cross_build_platforms: &[String],
+        needs_npm_credentials: bool,
+        inlined_build_variables: &[String],
+    ) -> Result<SelectedNodeBuilder, String> {
+        // The reason becomes the build-log line explaining why the build
+        // stays on the control plane.
+        inlined_variables_allow_offload(inlined_build_variables)
+            .map_err(|reason| reason.to_string())?;
+        let static_output_only = deployment_jobs::Entity::find()
+            .filter(deployment_jobs::Column::DeploymentId.eq(deployment_id))
+            .filter(deployment_jobs::Column::JobType.eq("DeployStaticJob"))
+            .one(self.db.as_ref())
+            .await
+            .map_err(|error| {
+                format!("could not read the jobs of deployment {deployment_id}: {error}")
+            })?
+            .is_some();
+        let control_plane_platform = if static_output_only {
+            None
+        } else {
+            self.image_builder.ensure_platform_discovered().await
+        };
+        let scheduler = self.node_scheduler.get();
+        let candidate = offload_build_candidate(
+            static_output_only,
+            needs_npm_credentials,
+            cross_build_platforms,
+            control_plane_platform.as_deref(),
+            scheduler.is_some(),
+        )?;
+        let Some(scheduler) = scheduler else {
+            return Err("node scheduling is not available on this server".to_string());
+        };
+
+        // A dedicated builder needs no placement: one of the required
+        // platform, or of any architecture for a static site. Placement below
+        // only considers workload nodes, so this is the only way a builder-only
+        // node can take the build.
+        let dedicated = match &candidate.platform {
+            Some(platform) => scheduler
+                .select_builder_node(platform)
+                .await
+                .map(|node| node.map(|node| (node, platform.clone()))),
+            None => scheduler.select_any_builder_node().await.map(|node| {
+                node.and_then(|node| {
+                    let platform = node.architecture.as_deref().map(|architecture| {
+                        temps_deployer::platform::canonicalize_platform(architecture)
+                    })?;
+                    Some((node, platform))
+                })
+            }),
+        }
+        .map_err(|error| format!("could not list build nodes: {error}"))?;
+        if let Some((node, platform)) = dedicated {
+            return self
+                .connect_build_node(deployment_id, node, platform)
+                .await
+                .map_err(|error| error.to_string());
+        }
+
+        let required_platforms: Vec<String> = candidate.platform.iter().cloned().collect();
+        let outcome = scheduler
+            .schedule_placement(crate::services::node_scheduler::ReplicaPlacementRequest {
+                replica_count: 1,
+                labels: target_labels,
+                target_node_ids: target_nodes,
+                anti_affinity: true,
+                exclude_node_ids: &[],
+                image_platforms: &required_platforms,
+                project_slug: Some(project_slug),
+                // Only workers: the control plane is what the build is
+                // moving off, so it must never win the placement.
+                exclude_control_plane: true,
+            })
+            .await;
+        let no_worker = || {
+            let needed = candidate
+                .platform
+                .as_deref()
+                .map(|platform| format!(" runs {platform}"))
+                .unwrap_or_default();
+            format!(
+                "no active worker node{needed} for this deployment. Join one with `temps join`, \
+                 or label a node `{}={}` to dedicate it to builds",
+                crate::services::node_scheduler::NODE_ROLE_LABEL,
+                crate::services::node_scheduler::BUILDER_NODE_ROLE,
+            )
+        };
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            // An empty worker pool, with or without placement constraints.
+            Err(
+                crate::services::node_service::NodeError::NoCompatibleNode { .. }
+                | crate::services::node_service::NodeError::LocalWorkloadsDisabled { .. },
+            ) => return Err(no_worker()),
+            Err(error) => return Err(format!("could not choose a worker node: {error}")),
+        };
+        let Some(crate::services::NodeAssignment::Remote {
+            node_id: target_id,
+            node_name: target_name,
+            platform: target_platform,
+            ..
+        }) = outcome.assignments.into_iter().next()
+        else {
+            return Err(no_worker());
+        };
+
+        let platform = match candidate.platform {
+            Some(platform) => platform,
+            // A static site builds for whatever the chosen worker runs; no
+            // dedicated builder exists, or it would have been picked above.
+            None => target_platform
+                .filter(|value| temps_deployer::platform::is_buildable_platform(value))
+                .map(|value| temps_deployer::platform::canonicalize_platform(&value))
+                .ok_or_else(|| {
+                    format!(
+                        "worker '{target_name}' (id={target_id}) has not reported a \
+                         buildable architecture yet"
+                    )
+                })?,
+        };
+        let node = scheduler
+            .node_service()
+            .get_by_id(target_id)
+            .await
+            .map_err(|error| {
+                format!("could not load worker '{target_name}' (id={target_id}): {error}")
+            })?;
+        self.connect_build_node(deployment_id, node, platform)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     #[allow(dead_code)]
     /// Choose the node that builds a source image when the control plane
     /// has no Docker daemon.
@@ -2470,29 +3029,67 @@ impl WorkflowExecutionService {
     /// (`temps.sh/role=builder`) of that architecture is preferred so build
     /// load stays off application hosts; without one, the placement target
     /// builds the image itself and no transfer is needed for it.
+    /// The resolver jobs use to read an image back from the worker that
+    /// built it. `None` only before the scheduler and encryption service are
+    /// wired, in which case no worker build can have run either.
+    fn builder_node_resolver(&self) -> Option<Arc<dyn BuilderNodeResolver>> {
+        let scheduler = self.node_scheduler.get()?.clone();
+        let encryption = self.encryption_service.get()?.clone();
+        Some(Arc::new(NodeBuilderResolver {
+            scheduler,
+            config: self.config_service.clone(),
+            encryption,
+        }))
+    }
+
     async fn select_node_builder(
         &self,
         deployment_id: i32,
         project_slug: &str,
         target_nodes: Option<&[i32]>,
         target_labels: Option<&serde_json::Value>,
-    ) -> Result<SelectedNodeBuilder, WorkflowExecutionError> {
+        static_output_only: bool,
+    ) -> Result<Vec<SelectedNodeBuilder>, WorkflowExecutionError> {
         let scheduler = self.node_scheduler.get().ok_or_else(|| {
             WorkflowExecutionError::JobCreationFailed(format!(
                 "Deployment {deployment_id} cannot select a build node: node scheduler is unavailable"
             ))
         })?;
-        let required_platforms = scheduler
-            .required_build_platforms_for_project(target_labels, target_nodes, Some(project_slug))
-            .await
-            .map_err(|error| {
-                WorkflowExecutionError::JobCreationFailed(format!(
-                    "Deployment {deployment_id} cannot determine worker build platforms: {error}"
-                ))
-            })?;
-        // Inspect the entire eligible target set, not just the first replica.
-        // Protocol v1 has one image owner; never silently drop other platforms.
-        validate_worker_build_scope(deployment_id, &required_platforms, false)?;
+        // Static output is architecture-independent and never runs on a
+        // node, so any eligible worker may build it.
+        let required_platforms = if static_output_only {
+            Vec::new()
+        } else {
+            let platforms = scheduler
+                .required_build_platforms_for_project(
+                    target_labels,
+                    target_nodes,
+                    Some(project_slug),
+                )
+                .await
+                .map_err(|error| {
+                    WorkflowExecutionError::JobCreationFailed(format!(
+                        "Deployment {deployment_id} cannot determine worker build platforms: {error}"
+                    ))
+                })?;
+            // Inspect the entire eligible target set, not just the first
+            // replica: every architecture a replica may land on needs its
+            // own image, built natively on a worker of that architecture.
+            if validate_worker_build_scope(deployment_id, &platforms)?
+                == WorkerBuildScope::PerArchitecture
+            {
+                return self
+                    .select_platform_builders(
+                        deployment_id,
+                        project_slug,
+                        target_nodes,
+                        target_labels,
+                        &platforms,
+                    )
+                    .await;
+            }
+            platforms
+        };
         let outcome = scheduler
             .schedule_placement(crate::services::node_scheduler::ReplicaPlacementRequest {
                 replica_count: 1,
@@ -2502,6 +3099,7 @@ impl WorkflowExecutionService {
                 exclude_node_ids: &[],
                 image_platforms: &required_platforms,
                 project_slug: Some(project_slug),
+                exclude_control_plane: false,
             })
             .await
             .map_err(|error| {
@@ -2551,45 +3149,185 @@ impl WorkflowExecutionService {
                     ))
                 })?,
         };
-        let build_only = crate::services::node_scheduler::is_build_only_node(&node);
-        let sealed_token = node.token_encrypted.as_deref().ok_or_else(|| {
+        Ok(vec![
+            self.connect_build_node(deployment_id, node, platform)
+                .await?,
+        ])
+    }
+
+    /// Choose one worker per platform for a deployment whose target nodes
+    /// span several architectures, each building its own architecture
+    /// natively.
+    ///
+    /// For every platform a dedicated builder (`temps.sh/role=builder`) of
+    /// that architecture is preferred, then a node this deployment could be
+    /// placed on. Each candidate is probed over its authenticated agent
+    /// connection first: an unreachable worker, or one whose agent reports
+    /// another architecture than its node row, is passed over for the next
+    /// one. A platform with no usable worker stops the deployment with
+    /// [`WorkflowExecutionError::NoBuilderForArchitecture`] before anything
+    /// is built -- there is no emulated fallback.
+    async fn select_platform_builders(
+        &self,
+        deployment_id: i32,
+        project_slug: &str,
+        target_nodes: Option<&[i32]>,
+        target_labels: Option<&serde_json::Value>,
+        platforms: &[String],
+    ) -> Result<Vec<SelectedNodeBuilder>, WorkflowExecutionError> {
+        let scheduler = self.node_scheduler.get().ok_or_else(|| {
             WorkflowExecutionError::JobCreationFailed(format!(
-                "Build node '{}' (id={}) has no encrypted agent token; re-register it",
-                node.name, node.id
+                "Deployment {deployment_id} cannot select build nodes: node scheduler is unavailable"
             ))
         })?;
+        let encryption = self.encryption_service.get().ok_or_else(|| {
+            WorkflowExecutionError::JobCreationFailed(format!(
+                "Deployment {deployment_id} cannot reach its build nodes: the encryption service \
+                 that unseals agent tokens is unavailable"
+            ))
+        })?;
+        // Every architecture's candidates are probed at the same time, so a
+        // slow or unreachable worker of one architecture does not hold up the
+        // choice for the others. The result keeps `platforms`' order.
+        futures::future::try_join_all(platforms.iter().map(|platform| async move {
+            let mut passed_over: Vec<String> = Vec::new();
+            let mut tried: Vec<i32> = Vec::new();
+            let no_builder = |reason: String| WorkflowExecutionError::NoBuilderForArchitecture {
+                deployment_id,
+                platform: platform.clone(),
+                reason,
+            };
+
+            // Every dedicated builder of this architecture, lowest id first,
+            // before any application worker: placement below never offers a
+            // build-only node, so one that is skipped here is never tried.
+            let mut dedicated: std::collections::VecDeque<_> = scheduler
+                .select_builder_nodes(platform)
+                .await
+                .map_err(|error| {
+                    WorkflowExecutionError::JobCreationFailed(format!(
+                        "Deployment {deployment_id} cannot list {platform} build nodes: {error}"
+                    ))
+                })?
+                .into();
+            let builder = loop {
+                let node = match dedicated.pop_front() {
+                    Some(node) => node,
+                    None => {
+                        let outcome = scheduler
+                            .schedule_placement(
+                                crate::services::node_scheduler::ReplicaPlacementRequest {
+                                    replica_count: 1,
+                                    labels: target_labels,
+                                    target_node_ids: target_nodes,
+                                    anti_affinity: true,
+                                    exclude_node_ids: &tried,
+                                    image_platforms: std::slice::from_ref(platform),
+                                    project_slug: Some(project_slug),
+                                    exclude_control_plane: true,
+                                },
+                            )
+                            .await;
+                        let assignment = match outcome {
+                            Ok(outcome) => outcome.assignments.into_iter().next(),
+                            Err(error) if passed_over.is_empty() => {
+                                return Err(no_builder(format!(
+                                    "no eligible {platform} worker: {error}"
+                                )));
+                            }
+                            Err(_) => None,
+                        };
+                        // The scheduler relaxes `exclude_node_ids` once every
+                        // candidate is excluded and offers one again, so a
+                        // repeat means no other worker of this platform is left.
+                        let Some(crate::services::NodeAssignment::Remote { node_id, .. }) =
+                            assignment.filter(|assignment| {
+                                assignment
+                                    .node_id()
+                                    .is_some_and(|node_id| !tried.contains(&node_id))
+                            })
+                        else {
+                            return Err(no_builder(if passed_over.is_empty() {
+                                format!("no eligible {platform} worker")
+                            } else {
+                                passed_over.join("; ")
+                            }));
+                        };
+                        scheduler
+                            .node_service()
+                            .get_by_id(node_id)
+                            .await
+                            .map_err(|error| {
+                                WorkflowExecutionError::JobCreationFailed(format!(
+                                    "Cannot load worker {node_id} to build {platform} for \
+                                         deployment {deployment_id}: {error}"
+                                ))
+                            })?
+                    }
+                };
+                tried.push(node.id);
+                match probe_platform_builder(
+                    &node,
+                    platform,
+                    self.config_service.as_ref(),
+                    encryption.as_ref(),
+                )
+                .await
+                {
+                    Ok(remote) => break (node, remote),
+                    Err(reason) => {
+                        warn!(
+                            deployment_id,
+                            node_id = node.id,
+                            node_name = %node.name,
+                            platform = %platform,
+                            "Passing over worker for a per-architecture build: {}",
+                            reason
+                        );
+                        passed_over.push(reason);
+                    }
+                }
+            };
+            let (node, remote) = builder;
+            info!(
+                deployment_id,
+                node_id = node.id,
+                node_name = %node.name,
+                build_only = crate::services::node_scheduler::is_build_only_node(&node),
+                platform = %platform,
+                "Building one architecture of a mixed-architecture deployment on node"
+            );
+            Ok::<_, WorkflowExecutionError>(SelectedNodeBuilder {
+                node_id: node.id,
+                node_name: node.name.clone(),
+                platform: platform.clone(),
+                remote: Arc::new(remote),
+            })
+        }))
+        .await
+    }
+
+    /// Open an authenticated agent client to `node` for building `platform`.
+    async fn connect_build_node(
+        &self,
+        deployment_id: i32,
+        node: temps_entities::nodes::Model,
+        platform: String,
+    ) -> Result<SelectedNodeBuilder, WorkflowExecutionError> {
+        let build_only = crate::services::node_scheduler::is_build_only_node(&node);
         let encryption = self.encryption_service.get().ok_or_else(|| {
             WorkflowExecutionError::JobCreationFailed(format!(
                 "Deployment {deployment_id} cannot decrypt the token for build node '{}' (id={})",
                 node.name, node.id
             ))
         })?;
-        let token = encryption.decrypt(sealed_token).map_err(|error| {
-            WorkflowExecutionError::JobCreationFailed(format!(
-                "Cannot decrypt build node '{}' (id={}) token: {error}",
-                node.name, node.id
-            ))
-        })?;
-        let token = String::from_utf8(token).map_err(|error| {
-            WorkflowExecutionError::JobCreationFailed(format!(
-                "Build node '{}' (id={}) token is not UTF-8: {error}",
-                node.name, node.id
-            ))
-        })?;
-        let remote = crate::cluster_ca::build_node_deployer(
-            &node.address,
-            token,
-            node.name.clone(),
-            self.config_service.as_ref(),
-            encryption.as_ref(),
-        )
-        .await
-        .map_err(|error| {
-            WorkflowExecutionError::JobCreationFailed(format!(
-                "Cannot connect to build node '{}' (id={}): {error}",
-                node.name, node.id
-            ))
-        })?;
+        let remote = connect_build_node(&node, self.config_service.as_ref(), encryption.as_ref())
+            .await
+            .map_err(|reason| {
+                WorkflowExecutionError::JobCreationFailed(format!(
+                    "Deployment {deployment_id}: {reason}"
+                ))
+            })?;
         info!(
             deployment_id,
             node_id = node.id,
@@ -2600,6 +3338,7 @@ impl WorkflowExecutionService {
         );
         Ok(SelectedNodeBuilder {
             node_id: node.id,
+            node_name: node.name.clone(),
             platform: platform.clone(),
             remote: Arc::new(remote.with_platform(Some(platform))),
         })
@@ -3298,6 +4037,19 @@ impl WorkflowExecutionService {
             }
         }
 
+        // Containers a drain or failover took out of routing on a worker
+        // without confirming they were removed (`retired`, `failed_over`)
+        // are no longer live rows, so neither query above sees them. Once
+        // their deployment is superseded nothing else removes them, and one
+        // on a node that came back keeps running unrouted (#1384). Each is
+        // removed only after Docker's labels confirm it belongs to this
+        // project, like node removal does, and recorded as removed; one that
+        // cannot be confirmed yet (node offline) is left for the next
+        // successful deployment. Bounded per deployment.
+        total_containers_cleaned += self
+            .remove_retired_worker_containers(project_id, environment_id, current_deployment)
+            .await;
+
         if total_containers_cleaned > 0 {
             info!(
                 "Cleaned up {} containers from previous deployments",
@@ -3306,6 +4058,130 @@ impl WorkflowExecutionService {
         }
 
         Ok(first_stopped_container_id)
+    }
+
+    /// See the end of [`Self::teardown_previous_deployment`]. Returns how many
+    /// containers were confirmed gone. Failures are logged, never returned:
+    /// the new deployment is already live.
+    async fn remove_retired_worker_containers(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        current_deployment: &deployments::Model,
+    ) -> usize {
+        use crate::services::node_service::{
+            remove_retired_container, CONTAINER_STATUS_FAILED_OVER,
+            CONTAINER_STATUS_FAILED_OVER_RECOVERING, CONTAINER_STATUS_RETIRED,
+        };
+        use sea_orm::{JoinType, RelationTrait};
+        use temps_entities::{deployment_containers, nodes};
+
+        const MAX_RETIRED_WORKER_CLEANUPS: u64 = 20;
+        // Least recently attempted first, and a failed attempt moves to the
+        // back (below), so containers on one unreachable worker never keep
+        // the ones on other workers from being attempted. Offline nodes are
+        // skipped: nothing on them can be removed until they return.
+        let retired = match deployment_containers::Entity::find()
+            .find_also_related(deployments::Entity)
+            .join(
+                JoinType::InnerJoin,
+                deployment_containers::Relation::Node.def(),
+            )
+            .filter(nodes::Column::Status.ne("offline"))
+            .filter(deployment_containers::Column::DeletedAt.is_not_null())
+            .filter(deployment_containers::Column::NodeId.is_not_null())
+            .filter(deployment_containers::Column::Status.is_in([
+                CONTAINER_STATUS_RETIRED,
+                CONTAINER_STATUS_FAILED_OVER,
+                CONTAINER_STATUS_FAILED_OVER_RECOVERING,
+            ]))
+            .filter(deployments::Column::ProjectId.eq(project_id))
+            .filter(deployments::Column::EnvironmentId.eq(environment_id))
+            .filter(
+                Condition::any()
+                    .add(deployments::Column::CreatedAt.lt(current_deployment.created_at))
+                    .add(
+                        Condition::all()
+                            .add(deployments::Column::CreatedAt.eq(current_deployment.created_at))
+                            .add(deployments::Column::Id.lt(current_deployment.id)),
+                    ),
+            )
+            .order_by_asc(deployment_containers::Column::DeletedAt)
+            .order_by_asc(deployment_containers::Column::Id)
+            .limit(MAX_RETIRED_WORKER_CLEANUPS)
+            .all(self.db.as_ref())
+            .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                warn!(
+                    project_id,
+                    environment_id,
+                    "Could not look up retired worker containers of superseded deployments: {error}"
+                );
+                return 0;
+            }
+        };
+
+        let mut removed = 0;
+        for (container, _) in retired {
+            let outcome = match self.teardown_deployer_for_node(container.node_id).await {
+                Ok(deployer) => remove_retired_container(
+                    self.db.as_ref(),
+                    deployer.as_ref(),
+                    &container,
+                    project_id,
+                )
+                .await
+                .map_err(|error| error.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            match outcome {
+                Ok(()) => {
+                    removed += 1;
+                    info!(
+                        project_id,
+                        deployment_id = container.deployment_id,
+                        node_id = ?container.node_id,
+                        container_id = %container.container_id,
+                        "Removed retired worker container of a superseded deployment"
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        project_id,
+                        deployment_id = container.deployment_id,
+                        node_id = ?container.node_id,
+                        container_id = %container.container_id,
+                        "Retired worker container left for a later cleanup: {error}"
+                    );
+                    // Move it behind the rows not yet attempted: `deleted_at`
+                    // of a row out of routing is when it was last handled.
+                    // Only while the row is as read, so no other outcome is
+                    // overwritten.
+                    let read_status = match &container.status {
+                        Some(status) => deployment_containers::Column::Status.eq(status.clone()),
+                        None => deployment_containers::Column::Status.is_null(),
+                    };
+                    if let Err(error) = deployment_containers::Entity::update_many()
+                        .col_expr(
+                            deployment_containers::Column::DeletedAt,
+                            Expr::value(Some(chrono::Utc::now())),
+                        )
+                        .filter(deployment_containers::Column::Id.eq(container.id))
+                        .filter(read_status)
+                        .exec(self.db.as_ref())
+                        .await
+                    {
+                        warn!(
+                            container_id = %container.container_id,
+                            "Could not reschedule the cleanup of a retired worker container: {error}"
+                        );
+                    }
+                }
+            }
+        }
+        removed
     }
 }
 
@@ -3407,6 +4283,29 @@ pub enum WorkflowExecutionError {
 
     #[error("Validation error: {0}")]
     Validation(String),
+
+    #[error("Deployment {deployment_id} has no node to run on: {source}")]
+    DedicatedNodesNotPinned {
+        deployment_id: i32,
+        #[source]
+        source: crate::services::node_service::NodeError,
+    },
+
+    /// A mixed-architecture deployment has a target architecture that no
+    /// reachable worker of that architecture can build. Builds are never
+    /// emulated, so the deployment stops before anything is built.
+    #[error(
+        "Deployment {deployment_id} targets {platform} nodes, but no {platform} worker can \
+         build its image: {reason}. Each architecture is built natively on a worker of that \
+         architecture, never emulated: bring a {platform} worker online (or label one \
+         `temps.sh/role=builder`), or restrict this environment's target nodes/labels to the \
+         architectures that have a reachable worker"
+    )]
+    NoBuilderForArchitecture {
+        deployment_id: i32,
+        platform: String,
+        reason: String,
+    },
 }
 
 impl WorkflowExecutionError {
@@ -3423,7 +4322,13 @@ impl WorkflowExecutionError {
             Self::DeploymentNotFound(_)
             | Self::ProjectNotFound(_)
             | Self::EnvironmentNotFound(_)
-            | Self::Validation(_) => true,
+            | Self::Validation(_)
+            // The operator's placement configuration, recorded on the
+            // deployment as its failure reason.
+            | Self::DedicatedNodesNotPinned { .. }
+            // The cluster's state: a target architecture has no reachable
+            // worker. Recorded on the deployment with the fix.
+            | Self::NoBuilderForArchitecture { .. } => true,
             Self::DatabaseError(_)
             | Self::NoJobsFound(_)
             | Self::MissingJobConfig(_)
@@ -3473,17 +4378,221 @@ mod tests {
         }
     }
 
+    /// One target architecture keeps the single worker build every
+    /// homogeneous cluster does today; several get one native build per
+    /// architecture; none is a configuration error naming the deployment.
     #[test]
-    fn worker_build_scope_rejects_mixed_architectures_and_static_before_building() {
-        use super::validate_worker_build_scope;
-        assert!(validate_worker_build_scope(42, &["linux/amd64".into()], false).is_ok());
-        for platforms in [vec![], vec!["linux/amd64".into(), "linux/arm64".into()]] {
-            let error = validate_worker_build_scope(42, &platforms, false).unwrap_err();
-            assert!(error.to_string().contains("Deployment 42"));
-            assert!(error.to_string().contains("target nodes/labels"));
+    fn worker_build_scope_groups_target_platforms() {
+        use super::{validate_worker_build_scope, WorkerBuildScope};
+        assert_eq!(
+            validate_worker_build_scope(42, &["linux/amd64".into()]).unwrap(),
+            WorkerBuildScope::SingleArchitecture
+        );
+        assert_eq!(
+            validate_worker_build_scope(42, &["linux/amd64".into(), "linux/arm64".into()]).unwrap(),
+            WorkerBuildScope::PerArchitecture
+        );
+        let error = validate_worker_build_scope(42, &[]).unwrap_err();
+        assert!(error.to_string().contains("Deployment 42"), "{error}");
+        assert!(error.to_string().contains("target nodes/labels"), "{error}");
+    }
+
+    /// The refusal names the architecture and both fixes, and is recorded as
+    /// an outcome of the deployment (cluster state), not a Temps fault.
+    #[test]
+    fn no_builder_for_architecture_names_the_platform_and_the_fix() {
+        let error = WorkflowExecutionError::NoBuilderForArchitecture {
+            deployment_id: 9,
+            platform: "linux/amd64".to_string(),
+            reason: "worker 'w-amd' (id=3) did not answer on its agent connection".to_string(),
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("Deployment 9 targets linux/amd64 nodes"),
+            "{message}"
+        );
+        assert!(message.contains("w-amd"), "{message}");
+        assert!(message.contains("never emulated"), "{message}");
+        assert!(
+            message.contains("bring a linux/amd64 worker online"),
+            "{message}"
+        );
+        assert!(message.contains("target nodes/labels"), "{message}");
+        assert!(error.is_workload_outcome());
+        let classified =
+            crate::services::failure_classifier::classify_failure_reason(Some(&message));
+        assert_eq!(
+            classified.code,
+            crate::services::failure_classifier::DeploymentFailureCode::ImagePlatformMismatch
+        );
+    }
+
+    /// Build location `node` moves a build only when a worker can produce the
+    /// same image the control plane would; anything else stays local with a
+    /// reason the build log can show.
+    #[test]
+    fn offload_build_candidate_builds_the_control_plane_platform_on_a_worker() {
+        use super::{offload_build_candidate, OffloadBuildCandidate};
+
+        assert_eq!(
+            offload_build_candidate(false, false, &[], Some("linux/amd64"), true),
+            Ok(OffloadBuildCandidate {
+                platform: Some("linux/amd64".to_string())
+            })
+        );
+        // A single requested platform is still one image, built for that
+        // platform rather than the control plane's.
+        assert_eq!(
+            offload_build_candidate(
+                false,
+                false,
+                &["linux/arm64".into()],
+                Some("linux/amd64"),
+                true
+            ),
+            Ok(OffloadBuildCandidate {
+                platform: Some("linux/arm64".to_string())
+            })
+        );
+        assert_eq!(
+            offload_build_candidate(false, false, &[], Some(" linux/amd64 "), true),
+            Ok(OffloadBuildCandidate {
+                platform: Some("linux/amd64".to_string())
+            })
+        );
+    }
+
+    /// A static site's output is read from the build node and never runs,
+    /// so any worker may build it -- even when the control plane's own
+    /// platform is unknown or the cluster spans several architectures.
+    #[test]
+    fn offload_build_candidate_lets_any_worker_build_a_static_site() {
+        use super::{offload_build_candidate, OffloadBuildCandidate};
+
+        for platform in [None, Some("linux/amd64")] {
+            assert_eq!(
+                offload_build_candidate(true, false, &[], platform, true),
+                Ok(OffloadBuildCandidate { platform: None })
+            );
         }
-        let error = validate_worker_build_scope(42, &["linux/arm64".into()], true).unwrap_err();
-        assert!(error.to_string().contains("artifact extraction"));
+        assert_eq!(
+            offload_build_candidate(
+                true,
+                false,
+                &["linux/amd64".into(), "linux/arm64".into()],
+                Some("linux/amd64"),
+                true
+            ),
+            Ok(OffloadBuildCandidate { platform: None })
+        );
+    }
+
+    #[test]
+    fn offload_build_candidate_explains_every_reason_to_stay_local() {
+        use super::offload_build_candidate;
+
+        let multi_arch = offload_build_candidate(
+            false,
+            false,
+            &["linux/amd64".into(), "linux/arm64".into()],
+            Some("linux/amd64"),
+            true,
+        )
+        .unwrap_err();
+        assert!(multi_arch.contains("2 images"), "{multi_arch}");
+        assert!(
+            multi_arch.contains("linux/amd64, linux/arm64"),
+            "{multi_arch}"
+        );
+
+        for static_output_only in [false, true] {
+            let no_scheduler =
+                offload_build_candidate(static_output_only, false, &[], Some("linux/amd64"), false)
+                    .unwrap_err();
+            assert!(no_scheduler.contains("node scheduling"), "{no_scheduler}");
+        }
+
+        for platform in [None, Some(""), Some("not-a-platform")] {
+            let unknown = offload_build_candidate(false, false, &[], platform, true).unwrap_err();
+            assert!(unknown.contains("platform is not known"), "{unknown}");
+        }
+    }
+
+    /// Only a secret variable the framework inlines keeps an offloaded build
+    /// on the control plane, named (never its value). The platform's public
+    /// variables -- `VITE_SENTRY_DSN`, `VITE_SENTRY_TUNNEL` and the other
+    /// frameworks' equivalents -- and the project's non-secret variables are
+    /// sent to the worker, so they never keep a build here (issue #1344).
+    #[test]
+    fn inlined_build_variables_keep_offloaded_builds_local() {
+        use super::{inlined_variables_allow_offload, withheld_inlined_variables};
+        use std::collections::BTreeSet;
+
+        let build_args: Vec<String> = [
+            "HOST",
+            "SENTRY_DSN",
+            "VITE_SENTRY_DSN",
+            "VITE_SENTRY_TUNNEL",
+            "NEXT_PUBLIC_SENTRY_DSN",
+            "PUBLIC_SENTRY_TUNNEL",
+            "VITE_API_URL",
+            "VITE_PRIVATE_KEY",
+            "TEMPS_API_TOKEN",
+            "BUILDKIT_CACHE_MOUNT_NS",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let sent: BTreeSet<String> = build_args
+            .iter()
+            .filter(|name| !matches!(name.as_str(), "VITE_PRIVATE_KEY" | "TEMPS_API_TOKEN"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            withheld_inlined_variables(&build_args, &sent),
+            vec!["VITE_PRIVATE_KEY".to_string()]
+        );
+        let all_public: BTreeSet<String> = sent
+            .iter()
+            .cloned()
+            .chain(["VITE_PRIVATE_KEY".to_string()])
+            .collect();
+        assert_eq!(
+            inlined_variables_allow_offload(&withheld_inlined_variables(&build_args, &all_public)),
+            Ok(())
+        );
+
+        assert_eq!(inlined_variables_allow_offload(&[]), Ok(()));
+        let one = inlined_variables_allow_offload(&["VITE_API_URL".to_string()]).unwrap_err();
+        assert_eq!(one.variables, vec!["VITE_API_URL".to_string()]);
+        assert!(one.to_string().contains("VITE_API_URL is inlined"), "{one}");
+        assert!(one.to_string().contains("it is secret"), "{one}");
+        let two = inlined_variables_allow_offload(&[
+            "NEXT_PUBLIC_A".to_string(),
+            "NEXT_PUBLIC_B".to_string(),
+        ])
+        .unwrap_err();
+        assert!(
+            two.to_string()
+                .contains("NEXT_PUBLIC_A, NEXT_PUBLIC_B are inlined"),
+            "{two}"
+        );
+    }
+
+    /// Private npm credentials are only ever written into a build context on
+    /// the control plane, so such a build -- static or not -- stays there
+    /// with a reason instead of failing on the worker.
+    #[test]
+    fn offload_build_candidate_keeps_npm_credential_builds_local() {
+        use super::offload_build_candidate;
+
+        for static_output_only in [false, true] {
+            let reason =
+                offload_build_candidate(static_output_only, true, &[], Some("linux/amd64"), true)
+                    .unwrap_err();
+            assert!(reason.contains("NPM_TOKEN"), "{reason}");
+            assert!(reason.contains("NPM_RC"), "{reason}");
+        }
     }
     use super::*;
     use crate::services::failure_classifier::{
@@ -4034,6 +5143,8 @@ mod tests {
                 file_count: 10,
                 total_size_bytes: 1024,
                 deployed_at: Utc::now(),
+                skipped_count: 0,
+                skipped_paths: Vec::new(),
             })
         }
 
@@ -4297,6 +5408,7 @@ mod tests {
             Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
             config_service,
             screenshot_service,
+            Arc::new(crate::jobs::DeploymentCaptureGuard::default()),
             docker,
         );
 
@@ -4330,6 +5442,7 @@ mod tests {
             Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
             config_service,
             screenshot_service,
+            Arc::new(crate::jobs::DeploymentCaptureGuard::default()),
             docker_handle,
         ))
     }
@@ -4475,6 +5588,7 @@ mod tests {
             Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
             config_service,
             screenshot_service,
+            Arc::new(crate::jobs::DeploymentCaptureGuard::default()),
             docker,
         );
 
@@ -4553,6 +5667,7 @@ mod tests {
             Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
             config_service,
             screenshot_service,
+            Arc::new(crate::jobs::DeploymentCaptureGuard::default()),
             docker,
         );
 
@@ -4630,6 +5745,7 @@ mod tests {
             Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
             config_service,
             screenshot_service,
+            Arc::new(crate::jobs::DeploymentCaptureGuard::default()),
             Arc::new(DockerHandle::available(Arc::new(
                 bollard::Docker::connect_with_local_defaults()?,
             ))),
@@ -4824,6 +5940,149 @@ mod tests {
         > {
             unimplemented!("not exercised by this test")
         }
+    }
+
+    /// Greptile on #1395: cleanup of retired worker containers must not be
+    /// starved by one unreachable worker. A failed attempt moves the row to
+    /// the back (its `deleted_at` is re-stamped), and containers on offline
+    /// nodes are not attempted at all.
+    #[tokio::test]
+    async fn test_retired_worker_cleanup_rotates_failures_and_skips_offline_nodes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::services::node_service::{
+            CONTAINER_STATUS_FAILED_OVER, CONTAINER_STATUS_RETIRED,
+        };
+        use temps_entities::{deployment_containers, nodes};
+
+        if !docker_available().await {
+            eprintln!("Skipping retired worker cleanup test: Docker unavailable");
+            return Ok(());
+        }
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, current_deployment) = create_test_data(&db).await?;
+
+        let previous_deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("superseded-deployment".to_string()),
+            state: Set("stopped".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            created_at: Set(Utc::now() - chrono::Duration::minutes(30)),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let node = |name: &str, status: &str| nodes::ActiveModel {
+            name: Set(name.to_string()),
+            token_hash: Set("unused".to_string()),
+            // No agent token: the node's deployer cannot be built, so every
+            // attempt on it fails like an unreachable worker.
+            token_encrypted: Set(None),
+            address: Set("https://127.0.0.1:39999".to_string()),
+            private_address: Set("127.0.0.1".to_string()),
+            role: Set("worker".to_string()),
+            status: Set(status.to_string()),
+            labels: Set(serde_json::json!({})),
+            capacity: Set(serde_json::json!({})),
+            dns_resolver_consecutive_failures: Set(0),
+            ..Default::default()
+        };
+        let unreachable = node("unreachable-worker", "active")
+            .insert(db.as_ref())
+            .await?;
+        let offline = node("offline-worker", "offline")
+            .insert(db.as_ref())
+            .await?;
+
+        let handled_at = Utc::now() - chrono::Duration::hours(2);
+        let retired =
+            |container_id: &str, node_id: i32, status: &str| deployment_containers::ActiveModel {
+                deployment_id: Set(previous_deployment.id),
+                container_id: Set(container_id.to_string()),
+                container_name: Set(container_id.to_string()),
+                container_port: Set(3000),
+                status: Set(Some(status.to_string())),
+                node_id: Set(Some(node_id)),
+                deleted_at: Set(Some(handled_at)),
+                deployed_at: Set(Utc::now()),
+                ..Default::default()
+            };
+        let on_unreachable = retired(
+            "retired-unreachable",
+            unreachable.id,
+            CONTAINER_STATUS_RETIRED,
+        )
+        .insert(db.as_ref())
+        .await?;
+        let on_offline = retired(
+            "failed-over-offline",
+            offline.id,
+            CONTAINER_STATUS_FAILED_OVER,
+        )
+        .insert(db.as_ref())
+        .await?;
+
+        let (queue, _receiver) = temps_queue::BroadcastQueueService::create_broadcast_channel(100);
+        let config_service = create_mock_config_service(db.clone());
+        let service = WorkflowExecutionService::new(
+            db.clone(),
+            Arc::new(queue) as Arc<dyn temps_core::JobQueue>,
+            Arc::new(MockGitProvider),
+            Arc::new(MockImageBuilder { should_fail: false }),
+            Arc::new(MockContainerDeployer { should_fail: false }),
+            Arc::new(MockStaticDeployer),
+            Arc::new(LogService::new(std::env::temp_dir())),
+            Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>,
+            Arc::new(crate::jobs::NoOpMetricAlertConfigService)
+                as Arc<dyn crate::jobs::MetricAlertConfigService>,
+            Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
+            config_service.clone(),
+            Arc::new(ScreenshotService::new(config_service).await?),
+            Arc::new(crate::jobs::DeploymentCaptureGuard::default()),
+            Arc::new(DockerHandle::available(Arc::new(
+                bollard::Docker::connect_with_local_defaults()?,
+            ))),
+        );
+
+        let removed = service
+            .remove_retired_worker_containers(project.id, environment.id, &current_deployment)
+            .await;
+        assert_eq!(removed, 0, "nothing could be removed");
+
+        let reread = |id: i32| {
+            let db = db.clone();
+            async move {
+                deployment_containers::Entity::find_by_id(id)
+                    .one(db.as_ref())
+                    .await
+                    .map(|row| row.expect("row exists"))
+            }
+        };
+        let after_unreachable = reread(on_unreachable.id).await?;
+        assert_eq!(
+            after_unreachable.status.as_deref(),
+            Some(CONTAINER_STATUS_RETIRED)
+        );
+        assert!(
+            after_unreachable.deleted_at > Some(handled_at),
+            "a failed attempt moves the row behind those not yet attempted"
+        );
+        let after_offline = reread(on_offline.id).await?;
+        assert_eq!(
+            after_offline.status.as_deref(),
+            Some(CONTAINER_STATUS_FAILED_OVER)
+        );
+        assert_eq!(
+            after_offline.deleted_at.map(|at| at.timestamp_micros()),
+            Some(handled_at.timestamp_micros()),
+            "containers on an offline node are not attempted"
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -5071,6 +6330,7 @@ mod tests {
             Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
             config_service,
             screenshot_service,
+            Arc::new(crate::jobs::DeploymentCaptureGuard::default()),
             docker,
         );
 
@@ -5279,5 +6539,744 @@ mod tests {
 
         assert!(provider.is_cancelled("rollback-42").await.unwrap());
         assert!(provider.is_cancelled("promote-42").await.unwrap());
+    }
+
+    /// A worker labelled `temps.sh/role=dedicated` that answers the node
+    /// scheduler's one `list_active` query.
+    fn dedicated_scheduler(local_workloads_enabled: bool) -> Arc<crate::services::NodeScheduler> {
+        let node = temps_entities::nodes::Model {
+            architecture: Some("linux/amd64".to_string()),
+            id: 7,
+            name: "gpu-1".to_string(),
+            token_hash: "hash_7".to_string(),
+            token_encrypted: None,
+            address: "https://10.0.0.7:3100".to_string(),
+            private_address: "10.0.0.7".to_string(),
+            public_endpoint: None,
+            wg_public_key: None,
+            role: "worker".to_string(),
+            status: "active".to_string(),
+            labels: serde_json::json!({ "temps.sh/role": "dedicated", "gpu": "true" }),
+            capacity: serde_json::json!({}),
+            last_heartbeat: Some(Utc::now()),
+            edge_public_key: None,
+            compute_cidr: None,
+            underlay_address: None,
+            mesh_wg_public_key: None,
+            mesh_wg_endpoint: None,
+            mesh_wg_address: None,
+            failover_at: None,
+            dns_resolver_running: None,
+            dns_resolver_tasks_alive: None,
+            dns_resolver_last_sync_at: None,
+            dns_resolver_consecutive_failures: 0,
+            dns_resolver_last_error: None,
+            dns_resolver_record_count: None,
+            public_ingress_enabled: false,
+            public_ingress_running: None,
+            public_ingress_last_error: None,
+            public_ingress_certificate_count: None,
+            public_ingress_route_count: None,
+            public_ingress_unsupported_route_count: None,
+            public_ingress_unsupported_reasons: serde_json::json!([]),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![node]])
+            .into_connection();
+        let node_service = Arc::new(crate::services::NodeService::new(Arc::new(db)));
+        Arc::new(
+            crate::services::NodeScheduler::new(node_service)
+                .with_local_workloads_enabled(local_workloads_enabled),
+        )
+    }
+
+    fn planned_job(deployment_id: i32, job_id: &str, job_type: &str) -> deployment_jobs::Model {
+        deployment_jobs::Model {
+            id: 0,
+            deployment_id,
+            job_id: job_id.to_string(),
+            job_type: job_type.to_string(),
+            name: job_id.to_string(),
+            description: None,
+            status: JobStatus::Pending,
+            log_id: format!("deployment-{deployment_id}-job-{job_id}"),
+            job_config: Some(serde_json::json!({})),
+            outputs: None,
+            dependencies: None,
+            execution_order: None,
+            started_at: None,
+            finished_at: None,
+            error_message: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn with_placement(
+        target_nodes: Option<Vec<i32>>,
+        target_labels: Option<serde_json::Value>,
+    ) -> Option<temps_entities::deployment_config::DeploymentConfig> {
+        Some(temps_entities::deployment_config::DeploymentConfig {
+            target_nodes,
+            target_labels,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn placement_constraints_inherit_each_unset_field_from_the_project() {
+        let project = with_placement(Some(vec![3]), Some(serde_json::json!({ "gpu": "true" })));
+        assert_eq!(
+            resolve_placement_constraints(with_placement(None, None).as_ref(), project.as_ref()),
+            (Some(vec![3]), Some(serde_json::json!({ "gpu": "true" })))
+        );
+        assert_eq!(
+            resolve_placement_constraints(None, project.as_ref()),
+            (Some(vec![3]), Some(serde_json::json!({ "gpu": "true" })))
+        );
+
+        // An environment value wins field by field; an empty one is unset.
+        let environment = with_placement(Some(vec![]), Some(serde_json::json!({ "zone": "a" })));
+        assert_eq!(
+            resolve_placement_constraints(environment.as_ref(), project.as_ref()),
+            (Some(vec![3]), Some(serde_json::json!({ "zone": "a" })))
+        );
+        let environment = with_placement(Some(vec![9]), Some(serde_json::json!({})));
+        assert_eq!(
+            resolve_placement_constraints(environment.as_ref(), project.as_ref()),
+            (Some(vec![9]), Some(serde_json::json!({ "gpu": "true" })))
+        );
+
+        assert_eq!(resolve_placement_constraints(None, None), (None, None));
+    }
+
+    #[test]
+    fn only_container_deployments_are_checked_for_placement() {
+        assert!(places_replicas(&[
+            planned_job(1, "build_image", "BuildImageJob"),
+            planned_job(1, "deploy_container", "DeployImageJob"),
+        ]));
+        assert!(places_replicas(&[planned_job(
+            1,
+            "deploy",
+            "DeployContainerJob"
+        )]));
+        assert!(!places_replicas(&[
+            planned_job(1, "build_image", "BuildImageJob"),
+            planned_job(1, "deploy_static", "DeployStaticJob"),
+        ]));
+        assert!(!places_replicas(&[planned_job(
+            1,
+            "deploy_compose",
+            "DeployComposeJob"
+        )]));
+    }
+
+    /// A selector that matches only a dedicated worker cannot place a single
+    /// replica, so the deployment fails while its workflow is assembled: no
+    /// job starts, and the source is never downloaded or built.
+    #[tokio::test]
+    async fn a_deployment_only_dedicated_nodes_could_run_fails_before_any_job_runs(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return Ok(());
+        }
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (_project, environment, deployment) = create_test_data(&db).await?;
+        let mut environment: environments::ActiveModel = environment.into();
+        environment.deployment_config = Set(with_placement(
+            None,
+            Some(serde_json::json!({ "gpu": "true" })),
+        ));
+        environment.update(db.as_ref()).await?;
+
+        let mut job_ids = Vec::new();
+        for (order, (job_id, job_type)) in [
+            ("download_repo", "DownloadRepoJob"),
+            ("build_image", "BuildImageJob"),
+            ("deploy_container", "DeployImageJob"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let job = deployment_jobs::ActiveModel {
+                deployment_id: Set(deployment.id),
+                job_id: Set(job_id.to_string()),
+                job_type: Set(job_type.to_string()),
+                name: Set(job_id.to_string()),
+                status: Set(JobStatus::Pending),
+                log_id: Set(format!("deployment-{}-job-{job_id}", deployment.id)),
+                job_config: Set(Some(serde_json::json!({}))),
+                execution_order: Set(Some(order as i32)),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await?;
+            job_ids.push(job.id);
+        }
+
+        let service = service_with_docker_handle(db.clone(), disabled_docker_handle()).await?;
+        service.set_node_scheduler(dedicated_scheduler(true));
+
+        let error = service
+            .execute_deployment_workflow(deployment.id)
+            .await
+            .expect_err("a deployment with no placeable node must fail");
+        match &error {
+            WorkflowExecutionError::DedicatedNodesNotPinned {
+                deployment_id,
+                source:
+                    crate::services::node_service::NodeError::DedicatedNodesNotPinned { excluded },
+            } => {
+                assert_eq!(*deployment_id, deployment.id);
+                assert!(
+                    excluded.contains("node 7 (gpu-1) is dedicated"),
+                    "the error must name the dedicated node: {excluded}"
+                );
+            }
+            other => panic!("expected DedicatedNodesNotPinned, got {other:?}"),
+        }
+        assert!(error.is_workload_outcome());
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("Deployment {}", deployment.id)),
+            "{message}"
+        );
+        assert!(message.contains("pin the environment to it"), "{message}");
+
+        for job_id in job_ids {
+            let row = deployment_jobs::Entity::find_by_id(job_id)
+                .one(db.as_ref())
+                .await?
+                .ok_or_else(|| format!("job row {job_id} disappeared"))?;
+            assert_eq!(
+                row.status,
+                JobStatus::Cancelled,
+                "job {} must never start: {:?}",
+                row.job_id,
+                row.error_message
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Every placement the deploy step could satisfy passes the pre-build
+    /// check, and deployments that place no replicas skip it.
+    #[tokio::test]
+    async fn the_pre_build_placement_check_only_rejects_unpinned_dedicated_placement(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return Ok(());
+        }
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, mut environment, deployment) = create_test_data(&db).await?;
+        let container_jobs = [
+            planned_job(deployment.id, "build_image", "BuildImageJob"),
+            planned_job(deployment.id, "deploy_container", "DeployImageJob"),
+        ];
+        let static_jobs = [
+            planned_job(deployment.id, "build_image", "BuildImageJob"),
+            planned_job(deployment.id, "deploy_static", "DeployStaticJob"),
+        ];
+        let check = |local_workloads_enabled: bool,
+                     environment: environments::Model,
+                     jobs: &'static str| {
+            let db = db.clone();
+            let project = project.clone();
+            let deployment = deployment.clone();
+            let jobs = if jobs == "static" {
+                static_jobs.to_vec()
+            } else {
+                container_jobs.to_vec()
+            };
+            async move {
+                let service = service_with_docker_handle(db, disabled_docker_handle()).await?;
+                service.set_node_scheduler(dedicated_scheduler(local_workloads_enabled));
+                Ok::<_, Box<dyn std::error::Error>>(
+                    service
+                        .preflight_dedicated_placement(&project, &environment, &deployment, &jobs)
+                        .await,
+                )
+            }
+        };
+
+        // Pinned: the dedicated node is the placement.
+        environment.deployment_config = with_placement(Some(vec![7]), None);
+        assert!(check(false, environment.clone(), "container")
+            .await?
+            .is_ok());
+
+        // Unpinned on a control plane that runs workloads: it lands locally.
+        environment.deployment_config = None;
+        assert!(check(true, environment.clone(), "container").await?.is_ok());
+
+        // Unpinned, and the control plane runs none: nowhere to go.
+        assert!(matches!(
+            check(false, environment.clone(), "container").await?,
+            Err(WorkflowExecutionError::DedicatedNodesNotPinned { .. })
+        ));
+
+        // A static site places no replicas, whatever its selector says.
+        environment.deployment_config =
+            with_placement(None, Some(serde_json::json!({ "gpu": "true" })));
+        assert!(check(true, environment.clone(), "static").await?.is_ok());
+        assert!(matches!(
+            check(true, environment, "container").await?,
+            Err(WorkflowExecutionError::DedicatedNodesNotPinned { .. })
+        ));
+
+        Ok(())
+    }
+
+    /// A stand-in worker agent that answers `GET /agent/health` with
+    /// `platform`, for as long as the test runs.
+    async fn spawn_health_agent(platform: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0_u8; 8192];
+                    let _ = stream.read(&mut buf).await;
+                    let body = serde_json::json!({
+                        "success": true,
+                        "data": { "status": "ok", "platform": platform }
+                    })
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{address}")
+    }
+
+    /// An address nothing listens on: a worker that is down.
+    async fn unreachable_agent() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{address}")
+    }
+
+    const TEST_MASTER_KEY: &str = "01234567890123456789012345678901";
+
+    async fn insert_worker(
+        db: &DbConnection,
+        name: &str,
+        address: &str,
+        architecture: &str,
+    ) -> Result<temps_entities::nodes::Model, Box<dyn std::error::Error>> {
+        insert_node(db, name, address, architecture, serde_json::json!({})).await
+    }
+
+    async fn insert_node(
+        db: &DbConnection,
+        name: &str,
+        address: &str,
+        architecture: &str,
+        labels: serde_json::Value,
+    ) -> Result<temps_entities::nodes::Model, Box<dyn std::error::Error>> {
+        let encryption = temps_core::EncryptionService::new(TEST_MASTER_KEY)?;
+        Ok(temps_entities::nodes::ActiveModel {
+            name: Set(name.to_string()),
+            token_hash: Set(format!("hash-{name}")),
+            token_encrypted: Set(Some(encryption.encrypt(b"agent-token")?)),
+            address: Set(address.to_string()),
+            private_address: Set("127.0.0.1".to_string()),
+            role: Set("worker".to_string()),
+            status: Set("active".to_string()),
+            labels: Set(labels),
+            capacity: Set(serde_json::json!({})),
+            architecture: Set(Some(architecture.to_string())),
+            last_heartbeat: Set(Some(Utc::now())),
+            dns_resolver_consecutive_failures: Set(0),
+            ..Default::default()
+        }
+        .insert(db)
+        .await?)
+    }
+
+    /// The control-plane profile: no Docker daemon, no local workloads.
+    async fn control_plane_service(
+        db: Arc<DbConnection>,
+    ) -> Result<WorkflowExecutionService, Box<dyn std::error::Error>> {
+        let service = service_with_docker_handle(db.clone(), disabled_docker_handle()).await?;
+        let node_service = Arc::new(crate::services::NodeService::new(db));
+        service.set_node_scheduler(Arc::new(
+            crate::services::NodeScheduler::new(node_service).with_local_workloads_enabled(false),
+        ));
+        service.set_encryption_service(Arc::new(temps_core::EncryptionService::new(
+            TEST_MASTER_KEY,
+        )?));
+        Ok(service)
+    }
+
+    fn platforms_and_nodes(selected: &[SelectedNodeBuilder]) -> Vec<(String, i32)> {
+        selected
+            .iter()
+            .map(|selected| (selected.platform.clone(), selected.node_id))
+            .collect()
+    }
+
+    /// Target nodes spanning two architectures get one builder per
+    /// architecture, each a worker of that architecture -- in the order the
+    /// scheduler lists the platforms, so the first owns the plain tag.
+    #[tokio::test]
+    async fn mixed_architecture_targets_get_one_native_builder_per_platform(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let arm = insert_worker(
+            &db,
+            "w-arm",
+            &spawn_health_agent("linux/arm64").await,
+            "linux/arm64",
+        )
+        .await?;
+        let amd = insert_worker(
+            &db,
+            "w-amd",
+            &spawn_health_agent("linux/amd64").await,
+            "linux/amd64",
+        )
+        .await?;
+        let service = control_plane_service(db).await?;
+
+        let selected = service
+            .select_node_builder(1, "app", None, None, false)
+            .await?;
+
+        assert_eq!(
+            platforms_and_nodes(&selected),
+            vec![
+                ("linux/amd64".to_string(), amd.id),
+                ("linux/arm64".to_string(), arm.id)
+            ]
+        );
+        Ok(())
+    }
+
+    /// A single-architecture cluster keeps exactly one build, as before.
+    #[tokio::test]
+    async fn single_architecture_targets_keep_one_builder() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        insert_worker(
+            &db,
+            "w-arm-1",
+            &spawn_health_agent("linux/arm64").await,
+            "linux/arm64",
+        )
+        .await?;
+        insert_worker(
+            &db,
+            "w-arm-2",
+            &spawn_health_agent("linux/arm64").await,
+            "linux/arm64",
+        )
+        .await?;
+        let service = control_plane_service(db).await?;
+
+        let selected = service
+            .select_node_builder(1, "app", None, None, false)
+            .await?;
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].platform, "linux/arm64");
+        Ok(())
+    }
+
+    /// An unreachable worker of one architecture is passed over for another
+    /// worker of the same architecture.
+    #[tokio::test]
+    async fn an_unreachable_builder_is_replaced_by_another_of_its_architecture(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        insert_worker(
+            &db,
+            "w-arm",
+            &spawn_health_agent("linux/arm64").await,
+            "linux/arm64",
+        )
+        .await?;
+        let dead =
+            insert_worker(&db, "w-amd-down", &unreachable_agent().await, "linux/amd64").await?;
+        let live = insert_worker(
+            &db,
+            "w-amd-up",
+            &spawn_health_agent("linux/amd64").await,
+            "linux/amd64",
+        )
+        .await?;
+        let service = control_plane_service(db).await?;
+
+        let selected = service
+            .select_node_builder(1, "app", None, None, false)
+            .await?;
+
+        let amd = selected
+            .iter()
+            .find(|selected| selected.platform == "linux/amd64")
+            .expect("an amd64 builder");
+        assert_eq!(amd.node_id, live.id);
+        assert_ne!(amd.node_id, dead.id);
+        Ok(())
+    }
+
+    /// A target architecture with no reachable worker -- or only one whose
+    /// agent reports another architecture than its node row -- stops the
+    /// deployment with a typed error naming that architecture. Nothing is
+    /// emulated and nothing is built for the other architecture first.
+    #[tokio::test]
+    async fn an_architecture_without_a_usable_worker_is_refused(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for (amd_address, why) in [
+            (unreachable_agent().await, "did not answer"),
+            (
+                spawn_health_agent("linux/arm64").await,
+                "is recorded as linux/amd64 but its agent reports linux/arm64",
+            ),
+        ] {
+            let test_db = TestDatabase::with_migrations().await?;
+            let db = test_db.connection_arc();
+            insert_worker(
+                &db,
+                "w-arm",
+                &spawn_health_agent("linux/arm64").await,
+                "linux/arm64",
+            )
+            .await?;
+            insert_worker(&db, "w-amd", &amd_address, "linux/amd64").await?;
+            let service = control_plane_service(db).await?;
+
+            let error = match service
+                .select_node_builder(17, "app", None, None, false)
+                .await
+            {
+                Ok(selected) => panic!(
+                    "expected a refusal, got {:?}",
+                    platforms_and_nodes(&selected)
+                ),
+                Err(error) => error,
+            };
+            match &error {
+                WorkflowExecutionError::NoBuilderForArchitecture {
+                    deployment_id,
+                    platform,
+                    reason,
+                } => {
+                    assert_eq!(*deployment_id, 17);
+                    assert_eq!(platform, "linux/amd64");
+                    assert!(reason.contains("w-amd"), "{reason}");
+                    assert!(reason.contains(why), "{reason}");
+                }
+                other => panic!("expected NoBuilderForArchitecture, got {other}"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Every dedicated builder of an architecture is tried before any
+    /// application worker: with the first amd64 builder and the amd64
+    /// application worker both down, the second amd64 builder still builds.
+    #[tokio::test]
+    async fn a_spare_dedicated_builder_replaces_an_unreachable_one(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let builder = serde_json::json!({ "temps.sh/role": "builder" });
+        insert_worker(
+            &db,
+            "w-arm",
+            &spawn_health_agent("linux/arm64").await,
+            "linux/arm64",
+        )
+        .await?;
+        insert_worker(&db, "w-amd", &unreachable_agent().await, "linux/amd64").await?;
+        let first = insert_node(
+            &db,
+            "b-amd-1",
+            &unreachable_agent().await,
+            "linux/amd64",
+            builder.clone(),
+        )
+        .await?;
+        let spare = insert_node(
+            &db,
+            "b-amd-2",
+            &spawn_health_agent("linux/amd64").await,
+            "linux/amd64",
+            builder,
+        )
+        .await?;
+        assert!(first.id < spare.id);
+        let service = control_plane_service(db).await?;
+
+        let selected = service
+            .select_node_builder(1, "app", None, None, false)
+            .await?;
+
+        let amd = selected
+            .iter()
+            .find(|selected| selected.platform == "linux/amd64")
+            .expect("an amd64 builder");
+        assert_eq!(amd.node_id, spare.id);
+        Ok(())
+    }
+
+    /// Target nodes pin the architectures built: a deployment restricted to
+    /// one architecture builds once even on a mixed cluster.
+    #[tokio::test]
+    async fn target_nodes_restrict_the_architectures_built(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let arm = insert_worker(
+            &db,
+            "w-arm",
+            &spawn_health_agent("linux/arm64").await,
+            "linux/arm64",
+        )
+        .await?;
+        insert_worker(
+            &db,
+            "w-amd",
+            &spawn_health_agent("linux/amd64").await,
+            "linux/amd64",
+        )
+        .await?;
+        let service = control_plane_service(db).await?;
+
+        let selected = service
+            .select_node_builder(1, "app", Some(&[arm.id]), None, false)
+            .await?;
+
+        assert_eq!(
+            platforms_and_nodes(&selected),
+            vec![("linux/arm64".to_string(), arm.id)]
+        );
+        Ok(())
+    }
+
+    /// Replicas of a mixed-architecture build land only on nodes whose
+    /// architecture has an image, and each replica's tag and image source are
+    /// the ones built for its node. With one node drained, its replica moves
+    /// to a node of the other architecture and takes that architecture's
+    /// image -- never the drained architecture's.
+    #[tokio::test]
+    async fn replicas_are_placed_and_sourced_by_architecture(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let arm = insert_worker(&db, "w-arm", "http://127.0.0.1:9", "linux/arm64").await?;
+        let amd = insert_worker(&db, "w-amd", "http://127.0.0.1:9", "linux/amd64").await?;
+        let scheduler = crate::services::NodeScheduler::new(Arc::new(
+            crate::services::NodeService::new(db.clone()),
+        ))
+        .with_local_workloads_enabled(false);
+        let output = crate::jobs::deploy_image::BuildImageOutput {
+            image_tag: "app:latest".to_string(),
+            image_id: "sha256:amd".to_string(),
+            size_bytes: 1,
+            build_context: ".".into(),
+            dockerfile_path: "Dockerfile".into(),
+            image_tags_by_platform: HashMap::from([
+                ("linux/amd64".to_string(), "app:latest".to_string()),
+                ("linux/arm64".to_string(), "app:latest-arm64".to_string()),
+            ]),
+            builder_node_id: Some(amd.id),
+            builder_node_ids_by_platform: HashMap::from([
+                ("linux/amd64".to_string(), amd.id),
+                ("linux/arm64".to_string(), arm.id),
+            ]),
+            image_ids_by_platform: HashMap::new(),
+        };
+        let platforms: Vec<String> = vec!["linux/amd64".into(), "linux/arm64".into()];
+
+        let placed = |exclude: Vec<i32>, replicas: u32| {
+            let scheduler = &scheduler;
+            let platforms = &platforms;
+            async move {
+                scheduler
+                    .schedule_placement(crate::services::node_scheduler::ReplicaPlacementRequest {
+                        replica_count: replicas,
+                        labels: None,
+                        target_node_ids: None,
+                        anti_affinity: true,
+                        exclude_node_ids: &exclude,
+                        image_platforms: platforms,
+                        project_slug: Some("app"),
+                        exclude_control_plane: false,
+                    })
+                    .await
+            }
+        };
+
+        let outcome = placed(vec![], 2).await?;
+        let mut seen = Vec::new();
+        for assignment in &outcome.assignments {
+            let node_id = assignment.node_id().expect("a worker");
+            let tag = output.tag_for_platform(assignment.platform());
+            let source = output.builder_node_for_tag(tag);
+            seen.push((node_id, tag.to_string(), source));
+        }
+        seen.sort();
+        let mut expected = vec![
+            (arm.id, "app:latest-arm64".to_string(), Some(arm.id)),
+            (amd.id, "app:latest".to_string(), Some(amd.id)),
+        ];
+        expected.sort();
+        assert_eq!(seen, expected);
+
+        // Drain the arm64 node: its replica moves to the amd64 node, which
+        // runs (and already holds) the amd64 image.
+        temps_entities::nodes::Entity::update_many()
+            .col_expr(
+                temps_entities::nodes::Column::Status,
+                sea_orm::sea_query::Expr::value("draining"),
+            )
+            .filter(temps_entities::nodes::Column::Id.eq(arm.id))
+            .exec(db.as_ref())
+            .await?;
+        let outcome = placed(vec![], 1).await?;
+        let moved = &outcome.assignments[0];
+        assert_eq!(moved.node_id(), Some(amd.id));
+        let tag = output.tag_for_platform(moved.platform());
+        assert_eq!(tag, "app:latest");
+        assert_eq!(output.builder_node_for_tag(tag), Some(amd.id));
+
+        // A build that only covered arm64 can never be placed on the amd64
+        // node that remains: the deployment fails instead of running the
+        // wrong architecture.
+        let error = scheduler
+            .schedule_placement(crate::services::node_scheduler::ReplicaPlacementRequest {
+                replica_count: 1,
+                labels: None,
+                target_node_ids: None,
+                anti_affinity: true,
+                exclude_node_ids: &[],
+                image_platforms: &["linux/arm64".to_string()],
+                project_slug: Some("app"),
+                exclude_control_plane: false,
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("linux/arm64"), "{error}");
+        Ok(())
     }
 }

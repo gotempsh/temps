@@ -12,13 +12,13 @@ from pathlib import Path
 
 
 LINK = re.compile(r"\[[^]]*\]\(([^)]+)\)")
-PINNED_CLI = "@temps-sdk/cli@0.1.36"
+PINNED_CLI = "@temps-sdk/cli@0.1.37"
 # sha512 of the published tarball for PINNED_CLI, as reported by
 # `npm view @temps-sdk/cli@<version> dist.integrity`. Refresh it in the same
 # commit that bumps PINNED_CLI, once the release is actually on npm — the value
 # has no version substring, so a find-and-replace bump silently leaves it stale
 # and every preflight guard below fails closed against the new release.
-PINNED_CLI_INTEGRITY = "sha512-Md9Hs2IQug6YIL8mzeq7GyGsI+bN2lttm1gsri27+nfH7S9Knez8ZLbQXbLoM+er6G3sYyYbhjWEEJn6jq8A3A=="
+PINNED_CLI_INTEGRITY = "sha512-JMAlVb21dV5UKXg64xoL0bEAzTa0XUEsO6e8Az4jNRy31MaiXqYtgQkcVviC/fgzZqmvdnpHt+K8N5gw6WYL7A=="
 INTEGRITY_PIN = re.compile(r"expected_temps_cli_integrity='([^']*)'")
 # Skills whose preflight guard installs the pinned CLI. They embed the same
 # hash independently, so they are validated together.

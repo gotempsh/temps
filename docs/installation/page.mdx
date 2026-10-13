@@ -44,17 +44,27 @@ chosen tag. A checksum detects corrupted downloads; it does not establish the
 publisher's identity. The installer and `temps upgrade` verify checksums, but do
 not perform this cosign verification automatically.
 
-The main container image is signed by digest. Replace the digest below with the
-published image digest for the release, and use that same digest when deploying:
+The main container image is signed by digest and carries a GitHub build
+provenance attestation for that digest. Image tags drop the leading `v` (release
+`v0.1.0` is `ghcr.io/gotempsh/temps:0.1.0`). Resolve the tag to its digest once,
+verify that digest, and use that same digest when deploying:
 
 ```bash
-image=ghcr.io/gotempsh/temps@sha256:REPLACE_WITH_RELEASE_DIGEST
+digest=$(docker buildx imagetools inspect "ghcr.io/gotempsh/temps:${tag#v}" \
+  --format '{{.Manifest.Digest}}')
+image="ghcr.io/gotempsh/temps@$digest"
 cosign verify "$image" \
   --certificate-identity "$identity" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
+gh attestation verify "oci://$image" --repo gotempsh/temps \
+  --signer-workflow gotempsh/temps/.github/workflows/release.yml
 docker buildx imagetools inspect "$image" --format '{{json .SBOM}}'
 docker buildx imagetools inspect "$image" --format '{{json .Provenance}}'
 ```
+
+`gh attestation verify` also accepts a tag (`oci://ghcr.io/gotempsh/temps:0.1.0`),
+but a tag can be moved after you verify it; deploy the digest you verified.
+Older releases may have the cosign signature but no image attestation.
 
 BuildKit publishes image SBOM and provenance metadata per platform. Inspect these
 alongside the signed digest; the binary dependency SBOM describes build inputs
@@ -80,7 +90,10 @@ and is not a claim that all packages are present in the runtime image.
 
 ### Supported Operating Systems
 
-- **Linux** (Ubuntu 20.04+, Debian 11+, RHEL 8+, Amazon Linux 2)
+- **Linux** on AMD64 or ARM64 with glibc 2.35 or newer (Ubuntu 22.04+, Debian 12+).
+  The release binaries are built against glibc 2.35 (Ubuntu 22.04), so they do not
+  support distributions with an older glibc, such as RHEL 8/9, Amazon Linux 2, and
+  Amazon Linux 2023; [build from source](#build-from-source) there.
 - **macOS** (Intel and Apple Silicon)
 
 ### Required Ports
@@ -221,6 +234,13 @@ sudo mv temps /usr/local/bin/temps
 temps --version
 ```
 
+```bash {{ title: 'Linux ARM64' }}
+curl -LO https://github.com/gotempsh/temps/releases/latest/download/temps-linux-arm64.tar.gz
+tar -xzf temps-linux-arm64.tar.gz
+sudo mv temps /usr/local/bin/temps
+temps --version
+```
+
 ```bash {{ title: 'macOS Intel' }}
 curl -LO https://github.com/gotempsh/temps/releases/latest/download/temps-darwin-amd64.tar.gz
 tar -xzf temps-darwin-amd64.tar.gz
@@ -236,6 +256,11 @@ temps --version
 ```
 
 </CodeGroup>
+
+`releases/latest` is the newest stable release. To install a specific release,
+replace `latest/download` with `download/<tag>` (for example
+`download/v0.1.0`), and [verify the archive](#verify-release-downloads) before
+extracting it.
 
 ### Build from Source
 

@@ -349,9 +349,9 @@ export function TemplateConfigurator({
   const schema = useMemo(
     () =>
       formSchema.extend({
-        runtime: createTemplateRuntimeDefaultsSchema(template.kind).optional(),
+        runtime: createTemplateRuntimeDefaultsSchema().optional(),
       }),
-    [template.kind]
+    []
   )
   const form = useForm<FormValues>({
     resolver: zodResolver(schema),

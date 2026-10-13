@@ -619,6 +619,7 @@ export function FunnelForm({
                               </Popover>
                               {formData.steps.length > 1 && (
                                 <Button
+                                  aria-label="Remove step"
                                   type="button"
                                   variant="ghost"
                                   size="icon"
@@ -831,6 +832,7 @@ export function FunnelForm({
                                               )}
 
                                               <Button
+                                                aria-label="Remove filter"
                                                 type="button"
                                                 variant="ghost"
                                                 size="icon"

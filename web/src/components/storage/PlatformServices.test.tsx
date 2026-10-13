@@ -75,7 +75,11 @@ for (const error of [
     const client = clientWithStatus()
     fail(client, 0, error)
     const html = render(client)
-    expect(html).toContain('KV Store status unavailable')
+    expect(html).toContain(
+      error instanceof TypeError || error.status !== 403
+        ? 'KV Store status unavailable'
+        : 'KV Store status: access denied'
+    )
     expect(html).toContain('Status unknown')
     expect(html).not.toContain('Enable KV Store')
     expect(html).not.toContain('Disabled')

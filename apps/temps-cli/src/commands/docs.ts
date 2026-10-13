@@ -233,8 +233,8 @@ bunx @temps-sdk/cli@${version} containers list --project-id 1 --environment-id 1
 # List environments
 bunx @temps-sdk/cli@${version} environments list --project my-app
 
-# Set environment variables on the intended server
-bunx @temps-sdk/cli@${version} --target-context production environments vars set --project my-app --key DATABASE_URL
+# Set an environment variable on the intended server (prompts for the value)
+bunx @temps-sdk/cli@${version} --target-context production environments vars set --project my-app DATABASE_URL --environments production
 
 # View environment variables
 bunx @temps-sdk/cli@${version} environments vars list --project my-app
@@ -243,14 +243,17 @@ bunx @temps-sdk/cli@${version} environments vars list --project my-app
 ### Managing Domains
 
 \`\`\`bash
-# Add a custom domain on the intended server
-bunx @temps-sdk/cli@${version} --target-context production domains add --project my-app --domain app.example.com
+# Request a certificate for a domain on the intended server
+bunx @temps-sdk/cli@${version} --target-context production domains add --domain app.example.com
+
+# Route the domain to a project environment
+bunx @temps-sdk/cli@${version} --target-context production custom-domains create --project-id 1 --environment-id 1 --domain app.example.com
 
 # List domains
-bunx @temps-sdk/cli@${version} domains list --project my-app
+bunx @temps-sdk/cli@${version} domains list
 
 # Remove a domain from the intended server
-bunx @temps-sdk/cli@${version} --target-context production domains remove --project my-app --domain app.example.com
+bunx @temps-sdk/cli@${version} --target-context production domains remove --domain app.example.com
 \`\`\`
 
 ## Environment Variables

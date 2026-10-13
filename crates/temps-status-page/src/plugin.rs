@@ -12,8 +12,13 @@ use temps_core::{Job, JobQueue, JobReceiver};
 use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
+use crate::routes::public::{create_public_router, PublicStatusState};
 use crate::routes::status_page::{create_router, StatusPageApiDoc, StatusPageAppState};
-use crate::services::{HealthCheckService, MonitorService, StatusPageService};
+use crate::services::public_pages::{DomainServiceCertificates, StatusPageDomainService};
+use crate::services::{
+    HealthCheckService, MonitorService, PublicStatusPageService, StatusPageService,
+    StatusSnapshotCache,
+};
 
 /// Status Page Plugin for monitoring and incident management
 pub struct StatusPagePlugin;
@@ -36,6 +41,7 @@ impl StatusPagePlugin {
         mut receiver: Box<dyn JobReceiver>,
         monitor_service: Arc<MonitorService>,
         health_check_service: Arc<HealthCheckService>,
+        public_status_page_service: Arc<PublicStatusPageService>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let post_deploy_checks = Arc::new(tokio::sync::Semaphore::new(
             MAX_CONCURRENT_POST_DEPLOY_CHECKS,
@@ -52,7 +58,12 @@ impl StatusPagePlugin {
                         Job::ProjectDeleted(job) => {
                             tracing::info!("Received ProjectDeleted job: {:?}", job);
                             // When a project is deleted, all monitors for its environments
-                            // will be deleted when environments are deleted
+                            // will be deleted when environments are deleted. Its status
+                            // pages cascade away in the database; stop serving them now
+                            // rather than at the next snapshot refresh.
+                            public_status_page_service
+                                .remove_project_pages(job.project_id)
+                                .await;
                         }
                         Job::EnvironmentCreated(job) => {
                             tracing::info!("Received EnvironmentCreated job: {:?}", job);
@@ -244,6 +255,22 @@ impl TempsPlugin for StatusPagePlugin {
             );
             context.register_service(health_check_service.clone());
 
+            // Publishable status pages (#1412): one snapshot cache shared by the
+            // management service (writes) and the public router (reads), kept
+            // fresh by a background loop so public traffic never queries.
+            let snapshot_cache = Arc::new(StatusSnapshotCache::new(db.clone()));
+            context.register_service(snapshot_cache.clone());
+            let public_status_page_service = Arc::new(PublicStatusPageService::new(
+                db.clone(),
+                context.require_service::<temps_config::ConfigService>(),
+                snapshot_cache.clone(),
+            ));
+            context.register_service(public_status_page_service.clone());
+            let deletion_hook: Arc<dyn temps_core::ProjectDeletionHook> =
+                public_status_page_service.clone();
+            context.register_service(deletion_hook);
+            tokio::spawn(snapshot_cache.run_refresh_loop());
+
             // Start the health check scheduler with job receiver for realtime monitor creation
             let scheduler_service = health_check_service.clone();
             let scheduler_job_receiver = queue_service.subscribe();
@@ -257,12 +284,14 @@ impl TempsPlugin for StatusPagePlugin {
             let job_receiver = queue_service.subscribe();
             let monitor_service_clone = monitor_service.clone();
             let health_check_service_clone = health_check_service.clone();
+            let public_status_page_service_clone = public_status_page_service.clone();
             tokio::spawn(async move {
                 tracing::debug!("Starting status page job listener");
                 if let Err(e) = Self::process_jobs(
                     job_receiver,
                     monitor_service_clone,
                     health_check_service_clone,
+                    public_status_page_service_clone,
                 )
                 .await
                 {
@@ -277,6 +306,23 @@ impl TempsPlugin for StatusPagePlugin {
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         let status_page_service = context.require_service::<StatusPageService>();
+        let public_status_page_service = context.require_service::<PublicStatusPageService>();
+        // Custom hostnames (#1412). Built here rather than in
+        // `register_services` because the domain/ACME service and the route
+        // table are registered by other plugins; `configure_routes` runs once
+        // all of them are in the registry.
+        let status_page_domain_service = Arc::new(StatusPageDomainService::new(
+            context.require_service::<sea_orm::DatabaseConnection>(),
+            context.require_service::<temps_config::ConfigService>(),
+            context.require_service::<StatusSnapshotCache>(),
+            Arc::new(DomainServiceCertificates::new(
+                context.require_service::<temps_domains::DomainService>(),
+            )),
+            // Every attach checks the hostname against the route table; the
+            // console registers it before any plugin runs, so a missing one
+            // is a wiring bug that must stop startup, not a 503 per attach.
+            context.require_service::<dyn temps_core::route_table::RouteTableRefresher>(),
+        ));
         let telemetry = context
             .get_service::<dyn temps_core::TelemetryReporter>()
             .unwrap_or_else(|| Arc::new(temps_core::telemetry::NoopTelemetryReporter));
@@ -286,6 +332,8 @@ impl TempsPlugin for StatusPagePlugin {
 
         struct AppState {
             status_page_service: Arc<StatusPageService>,
+            public_status_page_service: Arc<PublicStatusPageService>,
+            status_page_domain_service: Arc<StatusPageDomainService>,
             telemetry: Arc<dyn temps_core::TelemetryReporter>,
             audit_service: Arc<dyn temps_core::AuditLogger>,
             project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
@@ -294,6 +342,14 @@ impl TempsPlugin for StatusPagePlugin {
         impl StatusPageAppState for AppState {
             fn status_page_service(&self) -> &StatusPageService {
                 &self.status_page_service
+            }
+
+            fn public_status_page_service(&self) -> &PublicStatusPageService {
+                &self.public_status_page_service
+            }
+
+            fn status_page_domain_service(&self) -> &StatusPageDomainService {
+                &self.status_page_domain_service
             }
 
             fn telemetry(&self) -> &Arc<dyn temps_core::TelemetryReporter> {
@@ -311,6 +367,8 @@ impl TempsPlugin for StatusPagePlugin {
 
         let app_state = Arc::new(AppState {
             status_page_service,
+            public_status_page_service,
+            status_page_domain_service,
             telemetry,
             audit_service,
             project_access_checker,
@@ -318,6 +376,14 @@ impl TempsPlugin for StatusPagePlugin {
 
         let routes = create_router().with_state(app_state);
         Some(PluginRoutes::new(routes))
+    }
+
+    /// The unauthenticated, read-only public status pages (ADR-051 public
+    /// surface). Reads only the snapshot cache; see `routes::public`.
+    fn configure_public_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
+        let cache = context.require_service::<StatusSnapshotCache>();
+        let state = Arc::new(PublicStatusState::new(cache));
+        Some(PluginRoutes::new(create_public_router(state)))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {

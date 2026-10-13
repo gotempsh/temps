@@ -200,11 +200,11 @@ export function SessionDetail({
       case '3xx':
         return 'text-blue-600'
       case '2xx':
-        return 'text-green-600'
+        return 'text-green-700 dark:text-green-600'
       case '4xx':
-        return 'text-yellow-600'
+        return 'text-yellow-700 dark:text-yellow-600'
       case '5xx':
-        return 'text-red-600'
+        return 'text-red-700 dark:text-red-600'
       default:
         return 'text-gray-600'
     }
@@ -254,6 +254,7 @@ export function SessionDetail({
       {/* Header */}
       <div className="flex items-center gap-4">
         <Button
+          aria-label="Back"
           variant="ghost"
           size="icon"
           onClick={() =>
@@ -538,7 +539,7 @@ export function SessionDetail({
                               className="cursor-pointer hover:bg-muted/50"
                               onClick={() =>
                                 navigate(
-                                  `/projects/${project.slug}/logs/${log.id}${
+                                  `/projects/${project.slug}/request-logs/${log.id}${
                                     log.timestamp
                                       ? `?ts=${encodeURIComponent(log.timestamp)}`
                                       : ''

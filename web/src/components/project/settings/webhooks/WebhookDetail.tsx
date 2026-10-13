@@ -39,6 +39,7 @@ import {
 import { useState } from 'react'
 import { useNavigate, useParams } from 'react-router'
 import { DeliveryDetailDialog } from './DeliveryDetailDialog'
+import { settingsSectionHref } from '@/lib/project-settings-sections'
 
 interface WebhookDetailProps {
   project: ProjectResponse
@@ -88,7 +89,7 @@ export function WebhookDetail({ project }: WebhookDetailProps) {
     return (
       <div className="space-y-6">
         <div className="flex items-center gap-4">
-          <Button variant="ghost" size="icon" disabled>
+          <Button aria-label="Back" variant="ghost" size="icon" disabled>
             <ArrowLeft className="h-4 w-4" />
           </Button>
           <div className="flex-1">
@@ -114,10 +115,13 @@ export function WebhookDetail({ project }: WebhookDetailProps) {
       <div className="space-y-6">
         <div className="flex items-center gap-4">
           <Button
+            aria-label="Back"
             variant="ghost"
             size="icon"
             onClick={() =>
-              navigate(`/projects/${project.slug}/settings/webhooks`)
+              navigate(
+                settingsSectionHref(project.slug, 'integrations', 'webhooks')
+              )
             }
           >
             <ArrowLeft className="h-4 w-4" />
@@ -157,10 +161,13 @@ export function WebhookDetail({ project }: WebhookDetailProps) {
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-4">
           <Button
+            aria-label="Back"
             variant="ghost"
             size="icon"
             onClick={() =>
-              navigate(`/projects/${project.slug}/settings/webhooks`)
+              navigate(
+                settingsSectionHref(project.slug, 'integrations', 'webhooks')
+              )
             }
           >
             <ArrowLeft className="h-4 w-4" />
@@ -248,6 +255,7 @@ export function WebhookDetail({ project }: WebhookDetailProps) {
                 {webhook.url}
               </code>
               <Button
+                aria-label="Open webhook URL in a new tab"
                 variant="ghost"
                 size="sm"
                 onClick={() => window.open(webhook.url, '_blank')}
@@ -346,7 +354,7 @@ export function WebhookDetail({ project }: WebhookDetailProps) {
                         {delivery.success ? (
                           <Badge
                             variant="outline"
-                            className="gap-1 border-green-500/50 text-green-600 bg-green-50 dark:bg-green-950"
+                            className="gap-1 border-green-500/50 text-green-700 dark:text-green-600 bg-green-50 dark:bg-green-950"
                           >
                             <CheckCircle2 className="h-3 w-3" />
                             {delivery.status_code}
@@ -354,7 +362,7 @@ export function WebhookDetail({ project }: WebhookDetailProps) {
                         ) : (
                           <Badge
                             variant="outline"
-                            className="gap-1 border-red-500/50 text-red-600 bg-red-50 dark:bg-red-950"
+                            className="gap-1 border-red-500/50 text-red-700 dark:text-red-600 bg-red-50 dark:bg-red-950"
                           >
                             <XCircle className="h-3 w-3" />
                             {delivery.status_code || 'Failed'}

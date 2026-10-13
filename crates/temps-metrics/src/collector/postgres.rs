@@ -133,43 +133,86 @@ impl Collector for PostgresCollector {
         })
         .await;
 
-        match collect_result {
-            Err(_elapsed) => {
-                warn!(
-                    source_id,
-                    engine = "postgres",
-                    timeout_secs = timeout.as_secs(),
-                    "postgres metric queries timed out; returning empty batch"
-                );
-                Ok(vec![])
-            }
-            Ok(Err(e)) => {
-                // Query-level errors (e.g. permission denied on pg_stat_*) are
-                // safe to log — they do not contain connection credentials.
-                let detail = e
-                    .as_db_error()
-                    .map(|d| format!("{}: {}", d.severity(), d.message()))
-                    .unwrap_or_else(|| e.to_string());
-                warn!(
-                    source_id,
-                    engine = "postgres",
-                    error = %detail,
-                    "postgres metric query failed; returning empty batch"
-                );
-                Ok(vec![])
-            }
-            Ok(Ok(points)) => {
-                debug!(
-                    source_id,
-                    engine = "postgres",
-                    point_count = points.len(),
-                    "postgres metric collection complete"
-                );
-                Ok(points)
-            }
+        Ok(collection_outcome(source_id, timeout, collect_result))
+    }
+}
+
+impl PostgresCollector {
+    /// Collect from a client the caller already connected.
+    ///
+    /// HA (cluster-topology) services have no single host/port to build a
+    /// connection string from: the caller resolves the cluster's current
+    /// primary and dials it over TLS, then hands the client here. The
+    /// client's connection driver is owned by the caller.
+    pub async fn collect_from_client(
+        &self,
+        client: &tokio_postgres::Client,
+        config: &CollectorConfig,
+    ) -> Vec<MetricPoint> {
+        let collect_result =
+            tokio::time::timeout(config.timeout, collect_metrics(client, config)).await;
+        collection_outcome(config.source_id, config.timeout, collect_result)
+    }
+}
+
+/// Turn the outcome of a metric collection into the batch to write, logging
+/// why it is empty when it is.
+fn collection_outcome(
+    source_id: i32,
+    timeout: std::time::Duration,
+    collect_result: Result<
+        Result<Vec<MetricPoint>, tokio_postgres::Error>,
+        tokio::time::error::Elapsed,
+    >,
+) -> Vec<MetricPoint> {
+    match collect_result {
+        Err(_elapsed) => {
+            warn!(
+                source_id,
+                engine = "postgres",
+                timeout_secs = timeout.as_secs(),
+                "postgres metric queries timed out; returning empty batch"
+            );
+            vec![]
+        }
+        Ok(Err(e)) => {
+            // Query-level errors (e.g. permission denied on pg_stat_*) are
+            // safe to log — they do not contain connection credentials.
+            let detail = e
+                .as_db_error()
+                .map(|d| format!("{}: {}", d.severity(), d.message()))
+                .unwrap_or_else(|| e.to_string());
+            warn!(
+                source_id,
+                engine = "postgres",
+                error = %detail,
+                "postgres metric query failed; returning empty batch"
+            );
+            vec![]
+        }
+        Ok(Ok(points)) => {
+            debug!(
+                source_id,
+                engine = "postgres",
+                point_count = points.len(),
+                "postgres metric collection complete"
+            );
+            points
         }
     }
 }
+
+/// Per-replica lag on a primary.
+///
+/// `EXTRACT(EPOCH FROM interval)` returns `numeric` since PostgreSQL 14, which
+/// does not decode as `f64`: without the `::float8` casts every scrape of a
+/// primary with at least one standby panicked ("error deserializing column
+/// 1"). Standalone servers never have standbys, so only HA clusters hit it.
+const REPLICATION_LAG_QUERY: &str = "SELECT \
+        client_addr::text AS replica_addr, \
+        EXTRACT(EPOCH FROM write_lag)::float8 AS write_lag_secs, \
+        EXTRACT(EPOCH FROM replay_lag)::float8 AS replay_lag_secs \
+     FROM pg_stat_replication";
 
 /// Run all pg_stat_* queries inside a single read-only transaction and
 /// assemble the resulting [`MetricPoint`]s.
@@ -589,22 +632,15 @@ async fn collect_metrics(
     // 3. pg_stat_replication — per-replica write and replay lag (seconds)
     // -------------------------------------------------------------------------
     {
-        let rows = client
-            .query(
-                "SELECT \
-                    client_addr::text AS replica_addr, \
-                    EXTRACT(EPOCH FROM write_lag) AS write_lag_secs, \
-                    EXTRACT(EPOCH FROM replay_lag) AS replay_lag_secs \
-                 FROM pg_stat_replication",
-                &[],
-            )
-            .await?;
+        let rows = client.query(REPLICATION_LAG_QUERY, &[]).await?;
 
         for row in &rows {
-            // `client_addr` may be NULL for unix-socket standbys.
-            let replica_addr: Option<&str> = row.get(0);
-            let write_lag: Option<f64> = row.get(1);
-            let replay_lag: Option<f64> = row.get(2);
+            // `client_addr` may be NULL for unix-socket standbys. `try_get`,
+            // not `get`: a type mismatch must fail this scrape as a logged
+            // query error, never panic the scrape task.
+            let replica_addr: Option<&str> = row.try_get(0)?;
+            let write_lag: Option<f64> = row.try_get(1)?;
+            let replay_lag: Option<f64> = row.try_get(2)?;
 
             let label_value = replica_addr.unwrap_or("unknown").to_owned();
             let mut replica_labels = HashMap::new();
@@ -904,6 +940,73 @@ mod tests {
     use super::*;
     use crate::store::SourceKind;
     use std::time::Duration;
+
+    /// Regression: on a primary with a standby the replication query's lag
+    /// columns came back as `numeric` and decoding them as `f64` panicked
+    /// the scrape task, so an HA cluster never recorded any Postgres metric.
+    /// A prepared statement reports its result types without needing a
+    /// standby, so this checks the exact query against a real server.
+    #[tokio::test]
+    async fn replication_lag_columns_decode_as_f64() {
+        use testcontainers::{
+            core::{ContainerPort, WaitFor},
+            runners::AsyncRunner,
+            GenericImage, ImageExt,
+        };
+
+        let container = match GenericImage::new("postgres", "18-alpine")
+            .with_exposed_port(ContainerPort::Tcp(5432))
+            .with_wait_for(WaitFor::message_on_stderr(
+                "database system is ready to accept connections",
+            ))
+            .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+            .start()
+            .await
+        {
+            Ok(container) => container,
+            Err(e) => {
+                println!("Docker not available, skipping: {e}");
+                return;
+            }
+        };
+        let (Ok(host), Ok(port)) = (
+            container.get_host().await,
+            container.get_host_port_ipv4(5432).await,
+        ) else {
+            println!("Could not resolve the test container's address, skipping");
+            return;
+        };
+        let conn_str = format!("host={host} port={port} user=postgres dbname=postgres");
+
+        // The ready message is logged once during init and again after the
+        // restart that follows it; retry briefly across that restart.
+        let mut client = None;
+        for _ in 0..20 {
+            if let Ok((c, connection)) = tokio_postgres::connect(&conn_str, NoTls).await {
+                tokio::spawn(connection);
+                client = Some(c);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let client = client.expect("test postgres must accept connections");
+
+        let statement = client
+            .prepare(REPLICATION_LAG_QUERY)
+            .await
+            .expect("the replication lag query must parse on PostgreSQL 18");
+        let types: Vec<&tokio_postgres::types::Type> =
+            statement.columns().iter().map(|c| c.type_()).collect();
+        assert_eq!(
+            types,
+            vec![
+                &tokio_postgres::types::Type::TEXT,
+                &tokio_postgres::types::Type::FLOAT8,
+                &tokio_postgres::types::Type::FLOAT8,
+            ],
+            "lag columns must be float8 so they decode as f64"
+        );
+    }
 
     #[test]
     fn postgres_collector_engine_name() {

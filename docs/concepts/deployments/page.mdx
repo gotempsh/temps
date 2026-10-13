@@ -11,6 +11,7 @@ export const sections = [
   { title: 'What is a deployment', id: 'what-is-a-deployment' },
   { title: 'The deployment pipeline', id: 'the-deployment-pipeline' },
   { title: 'Deployment states', id: 'deployment-states' },
+  { title: 'Following operations', id: 'following-operations' },
   { title: 'Jobs and stages', id: 'jobs-and-stages' },
   { title: 'Build detection', id: 'build-detection' },
   { title: 'Zero-downtime deploys', id: 'zero-downtime-deploys' },
@@ -107,6 +108,22 @@ The deployment status changes to `completed`. Post-deploy tasks run in the backg
 | `stopped` | Container was stopped after being deployed |
 
 A deployment can only be cancelled while in `pending` or `running` state. Once a deployment reaches `completed`, it stays in that state until a new deployment replaces it.
+
+---
+
+## Following operations {{ anchor: true, id: 'following-operations' }}
+
+The **Operations** button in the console header (the activity icon next to the backup alerts bell) lists the work you can follow without leaving the page you are on: deployments, rollbacks, promotions, storage restores, backups and autofix runs. A badge shows how many are still in flight. Each row shows the status, the project and environment (or the storage service), how long ago it started or finished, and why it failed when it did. Click a row to open its detail page.
+
+When you start a redeploy, rollback, promotion, backup or autofix run, the confirmation toast has a **View in operations** action that opens the tray.
+
+- The list is built from the deployment, restore, backup and autofix records Temps already keeps, so it survives a page refresh and shows work started from another tab, the CLI or the API.
+- It covers the last 7 days, plus anything still running regardless of age.
+- You only see operations in projects you can access. Backups of the Temps control plane, and restores of services not linked to a project, are shown to instance administrators only.
+- A redeploy is listed as a deployment: Temps does not record it any differently.
+- Container restarts are shown only while the request is in flight, in the tab that started them. They are not recorded, so they disappear after a refresh.
+
+The same list is available from the API as `GET /operations`.
 
 ---
 

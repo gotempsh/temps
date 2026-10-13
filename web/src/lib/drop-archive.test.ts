@@ -3,9 +3,11 @@
 
 import { describe, expect, test } from 'bun:test'
 import {
+  classifyDropPath,
   formatDetectedProjectLabel,
   htmlRootCandidates,
   normalizeDropFiles,
+  partitionDropFiles,
   prepareDrop,
   type DropFile,
 } from './drop-archive'
@@ -56,6 +58,108 @@ describe('drop archive preparation', () => {
     ])
 
     expect(files.map(({ path }) => path)).toEqual(['index.html'])
+  })
+
+  test('keeps environment templates, as a ZIP of the same folder does', () => {
+    const files = normalizeDropFiles([
+      dropped('app/Cargo.toml'),
+      dropped('app/.env.example', 'PORT=8080'),
+      dropped('app/.env.sample'),
+      dropped('app/.env.template'),
+      dropped('app/.env.dist'),
+      dropped('app/.env', 'TOKEN=secret'),
+    ])
+
+    expect(files.map(({ path }) => path)).toEqual([
+      'Cargo.toml',
+      '.env.example',
+      '.env.sample',
+      '.env.template',
+      '.env.dist',
+    ])
+  })
+
+  test('reports what it left out, one line per directory', () => {
+    const { leftOut } = partitionDropFiles([
+      dropped('app/index.js'),
+      dropped('app/.env', 'TOKEN=secret'),
+      dropped('app/node_modules/a/index.js'),
+      dropped('app/node_modules/b/index.js'),
+      dropped('app/.git/HEAD'),
+      dropped('app/certs/server.key', 'secret'),
+    ])
+
+    expect(leftOut).toEqual([
+      { path: '.env', reason: 'environment_file', files: 1 },
+      { path: '.git/', reason: 'version_control', files: 1 },
+      { path: 'certs/server.key', reason: 'private_key', files: 1 },
+      { path: 'node_modules/', reason: 'dependencies', files: 2 },
+    ])
+  })
+
+  test('keeps folders whose names are inherited object properties', () => {
+    const files = normalizeDropFiles([
+      dropped('app/src/constructor/index.ts'),
+      dropped('app/src/toString/index.ts'),
+      dropped('app/src/__proto__/index.ts'),
+      dropped('app/src/hasOwnProperty/index.ts'),
+    ])
+
+    expect(files.map(({ path }) => path)).toEqual([
+      'src/constructor/index.ts',
+      'src/toString/index.ts',
+      'src/__proto__/index.ts',
+      'src/hasOwnProperty/index.ts',
+    ])
+  })
+
+  test('leaves out an excluded folder even when it is the one selected', () => {
+    for (const [folder, reason] of [
+      ['node_modules', 'dependencies'],
+      ['.git', 'version_control'],
+    ] as const) {
+      const { kept, leftOut, leftOutFileCount } = partitionDropFiles([
+        dropped(`${folder}/a/index.js`),
+        dropped(`${folder}/b/index.js`),
+      ])
+
+      expect(kept).toEqual([])
+      expect(leftOutFileCount).toBe(2)
+      expect(leftOut).toEqual([{ path: `${folder}/`, reason, files: 2 }])
+    }
+  })
+
+  test('counts every file left out, beyond the listed paths', () => {
+    const files = [dropped('app/index.js')]
+    for (let index = 0; index < 51; index += 1) {
+      files.push(dropped(`app/pkg-${index}/.env`, 'TOKEN=secret'))
+    }
+    const { leftOut, leftOutFileCount } = partitionDropFiles(files)
+
+    expect(leftOut).toHaveLength(50)
+    expect(leftOutFileCount).toBe(51)
+  })
+
+  test('explains a folder whose every file is left out', async () => {
+    await expect(
+      prepareDrop([dropped('node_modules/a/index.js')])
+    ).rejects.toThrow('everything in it is left out (node_modules/)')
+  })
+
+  test('classifies paths with the same rule as the server', () => {
+    expect(classifyDropPath('apps/api/.env.production.example')).toEqual({
+      kind: 'keep',
+    })
+    expect(classifyDropPath('node_modules/x/test/cert.pem')).toEqual({
+      kind: 'skip',
+      reason: 'dependencies',
+      reportedPath: 'node_modules/',
+    })
+    expect(classifyDropPath('config/.env.local')).toEqual({
+      kind: 'skip',
+      reason: 'environment_file',
+      reportedPath: 'config/.env.local',
+    })
   })
 
   test('finds root page choices when index.html is absent', () => {

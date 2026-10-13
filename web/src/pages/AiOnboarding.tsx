@@ -182,7 +182,7 @@ export function AiOnboarding() {
             {apiKeysLoading ? (
               <Skeleton className="h-10 w-44" />
             ) : effectiveHarnessStatus === 'connected' ? (
-              <div className="inline-flex items-center gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/5 px-4 py-2.5 text-sm font-medium text-emerald-600 dark:text-emerald-400">
+              <div className="inline-flex items-center gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/5 px-4 py-2.5 text-sm font-medium text-emerald-700 dark:text-emerald-400">
                 <Check className="size-4" />
                 Harness connected
               </div>
@@ -236,7 +236,7 @@ export function AiOnboarding() {
         >
           <div className="space-y-3">
             <Alert className="border-amber-500/25 bg-amber-500/5">
-              <ShieldAlert className="size-4 text-amber-600 dark:text-amber-400" />
+              <ShieldAlert className="size-4 text-amber-700 dark:text-amber-400" />
               <AlertTitle>Full platform access</AlertTitle>
               <AlertDescription>
                 This admin key can change the entire instance. Use a dedicated
@@ -455,7 +455,7 @@ function OnboardingStep({
                 className={cn(
                   'flex size-9 items-center justify-center rounded-lg border',
                   ready
-                    ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-500'
+                    ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-500'
                     : 'bg-muted text-muted-foreground'
                 )}
               >
@@ -476,7 +476,7 @@ function OnboardingStep({
                 className={cn(
                   'inline-flex items-center gap-1.5 rounded-full border px-2 py-1 text-[10px] font-medium uppercase tracking-wide',
                   ready
-                    ? 'border-emerald-500/30 bg-emerald-500/5 text-emerald-600 dark:text-emerald-400'
+                    ? 'border-emerald-500/30 bg-emerald-500/5 text-emerald-700 dark:text-emerald-400'
                     : 'text-muted-foreground'
                 )}
               >
@@ -516,6 +516,7 @@ function Command({
       <p className="text-[11px] font-medium text-muted-foreground">{label}</p>
       <div className="flex min-w-0 items-start gap-2 rounded-lg border bg-background px-3 py-2.5">
         <pre
+          tabIndex={0}
           className={cn(
             'm-0 min-w-0 flex-1 overflow-x-auto font-mono text-xs',
             multiline ? 'whitespace-pre leading-relaxed' : 'whitespace-nowrap'

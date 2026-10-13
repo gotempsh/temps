@@ -707,6 +707,7 @@ export default function DnsProviderDetail() {
                 </div>
                 <div className="flex items-center gap-2">
                   <Button
+                    aria-label="Refresh"
                     variant="outline"
                     size="sm"
                     onClick={() => refetchDomains()}
@@ -916,6 +917,7 @@ export default function DnsProviderDetail() {
                             </Button>
                           )}
                           <Button
+                            aria-label="Remove domain"
                             variant="ghost"
                             size="icon"
                             onClick={() => setDomainToRemove(domain)}

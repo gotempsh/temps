@@ -47,6 +47,10 @@ pub struct AppState {
     /// in the handler, so the challenge cannot drift away from the guard it
     /// protects. See [`temps_core::SensitiveActionAuthorizer`].
     pub sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
+    /// Optional hook run right after the deletion fence commits, so features
+    /// that serve project data publicly stop doing so before cleanup starts.
+    /// `None` when no plugin registers one.
+    pub project_deletion_hook: Option<Arc<dyn temps_core::ProjectDeletionHook>>,
 }
 
 // Domain-related types
@@ -618,6 +622,10 @@ impl ProjectResponse {
                     .deployment_config
                     .clone()
                     .and_then(|c| c.cross_architecture_builds),
+                build_location: project
+                    .deployment_config
+                    .clone()
+                    .and_then(|c| c.build_location),
             },
         }
     }
@@ -704,6 +712,27 @@ impl From<CustomDomainWithInfo> for CustomDomainResponse {
     }
 }
 
+/// Result of looking a hostname up among the custom domains the caller can see.
+///
+/// "Not assigned to any project" is a normal state for a certificate that has
+/// not been attached yet, so it is expressed as `custom_domain: null` with a
+/// 200 rather than a 404. A hostname that belongs to a project the caller
+/// cannot see is deliberately reported the same way.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct CustomDomainLookupResponse {
+    /// The matching assignment, or `null` when the hostname is not assigned to
+    /// a project environment visible to the caller.
+    pub custom_domain: Option<CustomDomainResponse>,
+}
+
+impl From<Option<CustomDomainWithInfo>> for CustomDomainLookupResponse {
+    fn from(value: Option<CustomDomainWithInfo>) -> Self {
+        Self {
+            custom_domain: value.map(CustomDomainResponse::from),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct CheckDomainConfigurationRequest {
     pub domain: String,
@@ -746,6 +775,12 @@ pub struct UpdateDeploymentConfigRequest {
     /// are emulated on the control plane and substantially slower, so they are
     /// opted into rather than triggered by cluster topology.
     pub cross_architecture_builds: Option<bool>,
+    /// Where source images are built: `control_plane` (the default) or
+    /// `node` to move builds onto a worker node, falling back to the control
+    /// plane when no worker can take the build. Environments inherit this
+    /// and may override it. Absent leaves the current value unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_location: Option<temps_entities::deployment_config::BuildLocation>,
     /// Project-level default timeout for regular (non-streaming) HTTP
     /// requests, in seconds (0 = no timeout, or 1-86400). Environments may
     /// override this; always clamped to the operator's global hard ceiling
@@ -1268,6 +1303,12 @@ impl From<ProjectError> for Problem {
                 .with_title("Invalid Git URL")
                 .with_detail(error.to_string()),
 
+            ProjectError::DirectoryNotInRepository { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Root Directory Not In Repository")
+                    .with_detail(error.to_string())
+            }
+
             // 403, not 409: the slug is not taken, the caller is not allowed
             // to take it. An admin sending the same request succeeds.
             ProjectError::DockerSocketSlugReserved { .. } => {
@@ -1479,6 +1520,41 @@ mod tests {
     use axum::response::IntoResponse;
 
     #[test]
+    fn custom_domain_lookup_without_assignment_serializes_explicit_null() {
+        let response = CustomDomainLookupResponse::from(None);
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value, serde_json::json!({ "custom_domain": null }));
+    }
+
+    #[test]
+    fn custom_domain_lookup_with_assignment_wraps_the_domain() {
+        let now = chrono::Utc::now();
+        let model = temps_entities::project_custom_domains::Model {
+            id: 7,
+            project_id: 3,
+            environment_id: 5,
+            domain: "app.example.com".to_string(),
+            redirect_to: None,
+            status_code: None,
+            branch: None,
+            status: "active".to_string(),
+            message: None,
+            created_at: now,
+            updated_at: now,
+            certificate_id: None,
+            service_name: None,
+        };
+        let response = CustomDomainLookupResponse::from(Some(CustomDomainWithInfo {
+            custom_domain: model,
+            domain_info: None,
+            environment: None,
+        }));
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["custom_domain"]["id"], 7);
+        assert_eq!(value["custom_domain"]["domain"], "app.example.com");
+    }
+
+    #[test]
     fn external_project_request_only_needs_name() {
         let request: CreateProjectRequest = serde_json::from_value(serde_json::json!({
             "name": "External app", "source_type": "external"
@@ -1509,6 +1585,37 @@ mod tests {
         assert!(problem.body["detail"]
             .as_str()
             .is_some_and(|detail| detail.contains("Connect this project")));
+    }
+
+    /// Issue #1350: a root directory missing from the repository is the
+    /// caller's input to fix, so it is a 400 naming repository, branch and path.
+    #[test]
+    fn root_directory_not_in_repository_is_a_contextual_400() {
+        let problem: Problem = ProjectError::DirectoryNotInRepository {
+            repository: "example/monorepo".to_string(),
+            branch: "main".to_string(),
+            directory: "apps/apii".to_string(),
+            explanation: "'apps' has no 'apii'; it contains: api, web".to_string(),
+        }
+        .into();
+
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            problem.body.get("title"),
+            Some(&serde_json::json!("Root Directory Not In Repository"))
+        );
+        let detail = problem.body["detail"].as_str().unwrap_or_default();
+        for expected in [
+            "'apps/apii'",
+            "example/monorepo",
+            "branch 'main'",
+            "'apps' has no 'apii'; it contains: api, web",
+        ] {
+            assert!(
+                detail.contains(expected),
+                "{expected} missing from: {detail}"
+            );
+        }
     }
 
     #[test]

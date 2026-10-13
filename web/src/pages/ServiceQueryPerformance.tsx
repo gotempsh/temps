@@ -375,7 +375,7 @@ function SlowQueriesContent({
             ) : (
               <Trash2 className="size-3.5" />
             )}
-            <span className="hidden sm:inline">Reset statistics</span>
+            <span className="max-sm:sr-only">Reset statistics</span>
           </Button>
           <Button
             variant="outline"
@@ -387,7 +387,7 @@ function SlowQueriesContent({
             <RefreshCw
               className={cn('size-3.5', isFetching && 'animate-spin')}
             />
-            <span className="hidden sm:inline">Refresh</span>
+            <span className="max-sm:sr-only">Refresh</span>
           </Button>
         </div>
       </div>
@@ -502,9 +502,7 @@ function SlowQueriesContent({
               <span className="sm:hidden">
                 {page} / {totalPages}
               </span>
-              <span className="hidden sm:inline text-muted-foreground/50">
-                ·
-              </span>
+              <span className="hidden sm:inline text-muted-foreground">·</span>
               <div className="flex items-center gap-1.5">
                 <span className="text-xs">Per page:</span>
                 <Select
@@ -526,6 +524,7 @@ function SlowQueriesContent({
             </div>
             <div className="flex items-center gap-1">
               <Button
+                aria-label="Previous page"
                 variant="outline"
                 size="icon"
                 className="size-8"
@@ -538,6 +537,7 @@ function SlowQueriesContent({
                 {page} / {totalPages}
               </span>
               <Button
+                aria-label="Next page"
                 variant="outline"
                 size="icon"
                 className="size-8"
@@ -665,7 +665,10 @@ function QueryDetailSheet({
               <p className="mb-2 text-xs font-semibold uppercase tracking-widest text-muted-foreground">
                 Query
               </p>
-              <pre className="overflow-x-auto rounded-lg border bg-muted/50 p-4 font-mono text-xs leading-relaxed whitespace-pre-wrap break-all">
+              <pre
+                tabIndex={0}
+                className="overflow-x-auto rounded-lg border bg-muted/50 p-4 font-mono text-xs leading-relaxed whitespace-pre-wrap break-all"
+              >
                 <HighlightedCode code={row.query} language="sql" />
               </pre>
             </div>
@@ -737,7 +740,7 @@ function StatCell({
         {badge === 'good' && (
           <Badge
             variant="outline"
-            className="text-[10px] text-green-600 border-green-200 bg-green-50"
+            className="text-[10px] text-green-700 dark:text-green-600 border-green-200 bg-green-50"
           >
             good
           </Badge>
@@ -745,7 +748,7 @@ function StatCell({
         {badge === 'warn' && (
           <Badge
             variant="outline"
-            className="text-[10px] text-amber-600 border-amber-200 bg-amber-50"
+            className="text-[10px] text-amber-700 border-amber-200 bg-amber-50"
           >
             low
           </Badge>
@@ -753,7 +756,7 @@ function StatCell({
         {badge === 'bad' && (
           <Badge
             variant="outline"
-            className="text-[10px] text-red-600 border-red-200 bg-red-50"
+            className="text-[10px] text-red-700 dark:text-red-600 border-red-200 bg-red-50"
           >
             poor
           </Badge>
@@ -809,9 +812,9 @@ export function ServiceQueryPerformance() {
             onClick={() => navigate(`/storage/${serviceId}`)}
           >
             <ArrowLeft className="size-4" />
-            <span className="hidden sm:inline">{serviceName}</span>
+            <span className="max-sm:sr-only">{serviceName}</span>
           </Button>
-          <span className="text-muted-foreground/40">/</span>
+          <span className="text-muted-foreground">/</span>
           <span className="text-sm font-medium">Query Performance</span>
         </div>
       </div>

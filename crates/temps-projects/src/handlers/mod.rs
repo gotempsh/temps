@@ -5,6 +5,7 @@ mod audit;
 pub mod custom_domains;
 #[allow(clippy::module_inception)]
 mod handlers;
+pub mod operations;
 mod preset_configs;
 pub mod templates;
 mod types;

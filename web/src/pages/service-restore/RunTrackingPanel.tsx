@@ -10,14 +10,17 @@ import { Checkbox } from '@/components/ui/checkbox'
 import { CopyButton } from '@/components/ui/copy-button'
 import { Label } from '@/components/ui/label'
 import { Skeleton } from '@/components/ui/skeleton'
+import { TimeAgo } from '@/components/utils/TimeAgo'
 import {
   AlertCircle,
   AlertTriangle,
   ArrowLeft,
+  Ban,
   CheckCircle2,
   CircleDashed,
   Clock,
   Database,
+  FileArchive,
   Info,
   Loader2,
   RefreshCw,
@@ -37,6 +40,11 @@ import {
   type TimeFormatter,
   formatConfirmedTime,
 } from './restore-state'
+import {
+  cancelAvailability,
+  notCancellableReason,
+  sourceBackupSummary,
+} from './run-context'
 
 export interface RunTrackingPanelProps {
   serviceId: number
@@ -49,6 +57,9 @@ export interface RunTrackingPanelProps {
   onBack: () => void
   onStartNew: () => void
   onOpenRestored: (serviceId: number) => void
+  /** Ask the server to cancel the run. Only offered before it writes data. */
+  onCancel: () => void
+  cancelling: boolean
   formatTime?: TimeFormatter
 }
 
@@ -62,11 +73,14 @@ export function RunTrackingPanel({
   onBack,
   onStartNew,
   onOpenRestored,
+  onCancel,
+  cancelling,
   formatTime = formatConfirmedTime,
 }: RunTrackingPanelProps) {
   const [checkedAfterInterrupt, setCheckedAfterInterrupt] = useState(false)
   const run = runFromView(view)
   const terminal = view.kind === 'terminal'
+  const cancel = cancelAvailability(view)
 
   return (
     <div className="space-y-4">
@@ -101,6 +115,7 @@ export function RunTrackingPanel({
               </span>
             ) : null}
           </div>
+          {run ? <SourceBackupLine run={run} /> : null}
         </CardHeader>
         <CardContent className="space-y-4">
           <RunStatusProblem
@@ -178,7 +193,27 @@ export function RunTrackingPanel({
               Back to restore setup
             </Button>
           ) : null}
+          {cancel === 'available' ? (
+            <Button variant="outline" onClick={onCancel} disabled={cancelling}>
+              {cancelling ? (
+                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+              ) : (
+                <Ban className="h-4 w-4 mr-2" />
+              )}
+              {cancelling ? 'Cancelling…' : 'Cancel restore'}
+            </Button>
+          ) : null}
         </div>
+        {cancel === 'available' ? (
+          <p className="text-sm text-muted-foreground">
+            The restore has not changed any existing data yet, so it can be
+            cancelled safely. A new database it was creating is removed.
+          </p>
+        ) : cancel === 'past_safe_point' && view.kind === 'tracking' ? (
+          <p className="text-sm text-muted-foreground">
+            {notCancellableReason(view.run)}
+          </p>
+        ) : null}
         {!terminal && view.kind !== 'not_found' ? (
           <p className="text-sm text-muted-foreground">
             Leaving this page does not stop the restore: it keeps running on the
@@ -186,6 +221,34 @@ export function RunTrackingPanel({
           </p>
         ) : null}
       </div>
+    </div>
+  )
+}
+
+function SourceBackupLine({ run }: { run: RestoreRunView }) {
+  const backup = sourceBackupSummary(run)
+  return (
+    <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-muted-foreground">
+      <FileArchive className="h-4 w-4 shrink-0" />
+      <span>Restoring from</span>
+      {backup.href ? (
+        <Link
+          to={backup.href}
+          className="font-medium text-foreground hover:underline"
+        >
+          {backup.label}
+        </Link>
+      ) : (
+        <span className="font-mono text-xs text-foreground break-all">
+          {backup.label}
+        </span>
+      )}
+      {backup.takenAt ? (
+        <span>
+          taken <TimeAgo date={backup.takenAt} />
+        </span>
+      ) : null}
+      {backup.note ? <span className="w-full">{backup.note}</span> : null}
     </div>
   )
 }

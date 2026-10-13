@@ -20,6 +20,14 @@ import {
   targetNodesToPayload,
 } from '@/lib/environment-placement'
 import { projectHasGitRepo } from '@/lib/project-git'
+import { nodeSchedulingRole, targetNodesHint } from '@/lib/node-role'
+import { NodeRoleBadge } from '@/components/nodes/NodeRoleBadge'
+import {
+  BUILD_LOCATION_LABELS,
+  buildLocationToPayload,
+  buildLocationToSelect,
+  type BuildLocationSelect,
+} from '@/lib/build-location'
 import {
   Select,
   SelectContent,
@@ -33,6 +41,7 @@ import {
   Cpu,
   GitBranch,
   Gauge,
+  Hammer,
   KeyRound,
   Loader2,
   Moon,
@@ -42,6 +51,7 @@ import {
   X,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
+import { Link } from 'react-router'
 import { toast } from 'sonner'
 
 interface EnvironmentConfigurationCardProps {
@@ -153,6 +163,9 @@ export function EnvironmentConfigurationCard({
     force_https: forceHttpsToSelect(environment.force_https),
     protected: environment.protected ?? false,
     anti_affinity: environment.deployment_config?.antiAffinity ?? true,
+    build_location: buildLocationToSelect(
+      environment.deployment_config?.buildLocation
+    ),
     target_nodes: (environment.deployment_config?.targetNodes ??
       []) as number[],
     target_labels: (environment.deployment_config?.targetLabels ??
@@ -223,6 +236,9 @@ export function EnvironmentConfigurationCard({
       force_https: forceHttpsToSelect(environment.force_https),
       protected: environment.protected ?? false,
       anti_affinity: environment.deployment_config?.antiAffinity ?? true,
+      build_location: buildLocationToSelect(
+        environment.deployment_config?.buildLocation
+      ),
       target_nodes: (environment.deployment_config?.targetNodes ??
         []) as number[],
       target_labels: (environment.deployment_config?.targetLabels ??
@@ -322,6 +338,8 @@ export function EnvironmentConfigurationCard({
         // certificate-driven default), true/false force it.
         force_https: forceHttpsToPayload(formData.force_https),
         anti_affinity: formData.anti_affinity,
+        // Tri-state: null clears the override (follow the project).
+        build_location: buildLocationToPayload(formData.build_location),
         target_nodes: targetNodesToPayload(formData.target_nodes),
         target_labels: targetLabelsToPayload(formData.target_labels),
         on_demand: formData.on_demand,
@@ -397,13 +415,19 @@ export function EnvironmentConfigurationCard({
             {/* Deploy on push toggle */}
             <div className="flex items-start sm:items-center gap-3 p-3 border rounded-lg mt-4">
               <div className="flex-1 min-w-0">
-                <Label className="text-sm font-medium">Deploy on push</Label>
+                <Label
+                  htmlFor="env-automatic-deploy"
+                  className="text-sm font-medium"
+                >
+                  Deploy on push
+                </Label>
                 <p className="text-xs text-muted-foreground">
                   Automatically deploy when a commit is pushed to this branch.
                   Disable to deploy on demand only.
                 </p>
               </div>
               <Switch
+                id="env-automatic-deploy"
                 checked={formData.automatic_deploy}
                 onCheckedChange={(checked) =>
                   setFormData((prev) => ({
@@ -591,13 +615,16 @@ export function EnvironmentConfigurationCard({
           <div className="space-y-4">
             <div className="flex items-start sm:items-center gap-3 p-3 border rounded-lg">
               <div className="flex-1 min-w-0">
-                <Label className="text-sm font-medium">Enable On-Demand</Label>
+                <Label htmlFor="env-on-demand" className="text-sm font-medium">
+                  Enable On-Demand
+                </Label>
                 <p className="text-xs text-muted-foreground">
                   Automatically stop containers after idle timeout and restart
                   on the next request.
                 </p>
               </div>
               <Switch
+                id="env-on-demand"
                 checked={formData.on_demand}
                 onCheckedChange={(checked) =>
                   setFormData((prev) => ({
@@ -651,7 +678,7 @@ export function EnvironmentConfigurationCard({
                   </p>
                 </div>
                 {environment.sleeping && (
-                  <div className="flex items-center gap-2 p-2 rounded-md bg-yellow-500/10 border border-yellow-500/20 text-yellow-600 dark:text-yellow-400 text-xs">
+                  <div className="flex items-center gap-2 p-2 rounded-md bg-yellow-500/10 border border-yellow-500/20 text-yellow-700 dark:text-yellow-400 text-xs">
                     <Moon className="h-3.5 w-3.5" />
                     This environment is currently sleeping. It will wake on the
                     next request.
@@ -751,6 +778,74 @@ export function EnvironmentConfigurationCard({
           </div>
         </SettingsSection>
 
+        {/* Build location: always visible so operators learn builds can
+            move off the control plane, even before a worker has joined. */}
+        <SettingsSection title="Builds" icon={Hammer}>
+          <div className="space-y-2">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+              <div className="flex-1 min-w-0">
+                <Label className="text-sm font-medium">Build location</Label>
+                <p className="text-xs text-muted-foreground">
+                  Where this environment&apos;s images are built. Building on a
+                  worker node keeps the CPU and memory of a build away from the
+                  proxy and running apps on the control plane.
+                </p>
+              </div>
+              <Select
+                value={formData.build_location}
+                onValueChange={(value) =>
+                  setFormData((prev) => ({
+                    ...prev,
+                    build_location: value as BuildLocationSelect,
+                  }))
+                }
+              >
+                <SelectTrigger className="w-full sm:w-[220px]">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="inherit">
+                    Inherit from project (
+                    {
+                      BUILD_LOCATION_LABELS[
+                        project.deployment_config?.buildLocation ??
+                          'control_plane'
+                      ]
+                    }
+                    )
+                  </SelectItem>
+                  <SelectItem value="control_plane">
+                    {BUILD_LOCATION_LABELS.control_plane}
+                  </SelectItem>
+                  <SelectItem value="node">
+                    {BUILD_LOCATION_LABELS.node}
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              A node labelled <code>temps.sh/role=builder</code> is preferred. A{' '}
+              <code>temps.sh/role=dedicated</code> node builds only for
+              environments that select it in Target Nodes. When no worker can
+              take a build (none joined, none of the right architecture,
+              multi-architecture builds), it runs on the control plane and the
+              build log says why. Worker builds do not receive build arguments.
+            </p>
+            {nodesQuery.isSuccess && activeNodes.length === 0 && (
+              <p className="text-xs text-muted-foreground">
+                No worker node is active yet, so builds run on the control
+                plane.{' '}
+                <Link
+                  to="/settings/nodes"
+                  className="underline underline-offset-2"
+                >
+                  Add a worker node
+                </Link>
+              </p>
+            )}
+          </div>
+        </SettingsSection>
+
         {/* Node Scheduling */}
         {activeNodes.length > 0 && (
           <SettingsSection title="Node scheduling" icon={Network}>
@@ -758,7 +853,10 @@ export function EnvironmentConfigurationCard({
               {/* Protected environment toggle */}
               <div className="flex items-start sm:items-center gap-3 p-3 border rounded-lg">
                 <div className="flex-1 min-w-0">
-                  <Label className="text-sm font-medium flex items-center gap-1.5">
+                  <Label
+                    htmlFor="env-protected"
+                    className="text-sm font-medium flex items-center gap-1.5"
+                  >
                     <Shield className="h-4 w-4 shrink-0" />
                     Protected
                   </Label>
@@ -768,6 +866,7 @@ export function EnvironmentConfigurationCard({
                   </p>
                 </div>
                 <Switch
+                  id="env-protected"
                   checked={formData.protected}
                   onCheckedChange={(checked) =>
                     setFormData((prev) => ({
@@ -781,12 +880,18 @@ export function EnvironmentConfigurationCard({
               {/* Anti-affinity toggle */}
               <div className="flex items-start sm:items-center gap-3 p-3 border rounded-lg">
                 <div className="flex-1 min-w-0">
-                  <Label className="text-sm font-medium">Anti-affinity</Label>
+                  <Label
+                    htmlFor="env-anti-affinity"
+                    className="text-sm font-medium"
+                  >
+                    Anti-affinity
+                  </Label>
                   <p className="text-xs text-muted-foreground">
                     Spread replicas across different nodes (best-effort).
                   </p>
                 </div>
                 <Switch
+                  id="env-anti-affinity"
                   checked={formData.anti_affinity}
                   onCheckedChange={(checked) =>
                     setFormData((prev) => ({
@@ -801,8 +906,7 @@ export function EnvironmentConfigurationCard({
               <div>
                 <Label className="text-sm font-medium">Target Nodes</Label>
                 <p className="text-xs text-muted-foreground mb-2">
-                  Restrict deployments to specific nodes. Leave empty to use all
-                  active nodes.
+                  {targetNodesHint(activeNodes)}
                 </p>
                 <div className="space-y-2">
                   {activeNodes.map((node) => {
@@ -832,7 +936,17 @@ export function EnvironmentConfigurationCard({
                           <span className="text-xs text-muted-foreground ml-2">
                             {node.private_address}
                           </span>
+                          {nodeSchedulingRole(node.labels) === 'dedicated' && (
+                            <p className="text-xs text-muted-foreground">
+                              Dedicated: only runs environments that select it
+                              here.
+                            </p>
+                          )}
                         </div>
+                        <NodeRoleBadge
+                          labels={node.labels}
+                          className="text-[10px] shrink-0"
+                        />
                         <Badge
                           variant="secondary"
                           className="text-[10px] shrink-0"
@@ -866,7 +980,8 @@ export function EnvironmentConfigurationCard({
                 <Label className="text-sm font-medium">Label Selectors</Label>
                 <p className="text-xs text-muted-foreground mb-2">
                   Only deploy to nodes matching these labels. All keys must
-                  match (AND logic).
+                  match (AND logic). Labels never select a dedicated node; pick
+                  it in Target Nodes instead.
                 </p>
 
                 {/* Existing labels */}
@@ -881,6 +996,7 @@ export function EnvironmentConfigurationCard({
                         >
                           {key}={value}
                           <button
+                            aria-label="Remove label"
                             type="button"
                             className="ml-1 hover:text-destructive"
                             onClick={() => {
@@ -914,6 +1030,7 @@ export function EnvironmentConfigurationCard({
                     className="flex-1"
                   />
                   <Button
+                    aria-label="Add label"
                     type="button"
                     variant="outline"
                     size="icon"
@@ -1011,12 +1128,18 @@ export function EnvironmentConfigurationCard({
 
             <div className="flex items-start sm:items-center gap-3 p-3 border rounded-lg">
               <div className="flex-1 min-w-0">
-                <Label className="text-sm font-medium">Security Headers</Label>
+                <Label
+                  htmlFor="env-security-headers"
+                  className="text-sm font-medium"
+                >
+                  Security Headers
+                </Label>
                 <p className="text-xs text-muted-foreground">
                   Enable security headers
                 </p>
               </div>
               <Switch
+                id="env-security-headers"
                 checked={formData.security?.enabled ?? false}
                 onCheckedChange={(checked) =>
                   setFormData((prev) => ({
@@ -1068,7 +1191,10 @@ export function EnvironmentConfigurationCard({
             {/* Password Protection */}
             <div className="flex items-start sm:items-center gap-3 p-3 border rounded-lg">
               <div className="flex-1 min-w-0">
-                <Label className="text-sm font-medium flex items-center gap-1.5">
+                <Label
+                  htmlFor="env-password-protection"
+                  className="text-sm font-medium flex items-center gap-1.5"
+                >
                   <KeyRound className="h-4 w-4 shrink-0" />
                   Password Protection
                 </Label>
@@ -1077,6 +1203,7 @@ export function EnvironmentConfigurationCard({
                 </p>
               </div>
               <Switch
+                id="env-password-protection"
                 checked={formData.password_enabled}
                 onCheckedChange={(checked) =>
                   setFormData((prev) => ({

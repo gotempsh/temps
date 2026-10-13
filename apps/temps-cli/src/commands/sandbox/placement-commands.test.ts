@@ -298,6 +298,23 @@ describe('sandbox create / list with nodes', () => {
     expect(requests[0]?.body).toEqual({})
   })
 
+  it('sends --backend in the create body', async () => {
+    route = (req) =>
+      req.method === 'POST' && req.path === '/v1/sandboxes'
+        ? { status: 201, body: { sandbox: sandboxInner({ backend: 'microsandbox' }) } }
+        : undefined
+    await run('create', '--backend', 'MicroSandbox', '--json')
+    expect(requests[0]?.body).toEqual({ backend: 'microsandbox' })
+  })
+
+  it('rejects an unknown --backend before sending anything', async () => {
+    route = () => ({ status: 201, body: { sandbox: sandboxInner() } })
+    await expect(run('create', '--backend', 'kvm', '--json')).rejects.toThrow(
+      "Unknown --backend 'kvm'. Expected one of: docker, firecracker, microsandbox",
+    )
+    expect(requests).toEqual([])
+  })
+
   it('shows a Node column in sandbox list', async () => {
     route = (req) =>
       req.path === '/v1/sandboxes'

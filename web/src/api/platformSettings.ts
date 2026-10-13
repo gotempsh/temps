@@ -201,6 +201,8 @@ export type PublicHostnameStrategy = 'standard' | 'flat'
 export interface PlatformSettings extends AppSettingsResponse {
   external_url: string | null
   internal_url: string | null
+  /** Base URL handed to third parties that call back (ADR-051); null = use external_url. */
+  public_ingress_url?: string | null
   letsencrypt: LetsEncryptSettings
   preview_domain: string
   /** Public address synced DNS records point at (IP → A/AAAA, else CNAME). */
@@ -215,6 +217,8 @@ export interface PlatformSettings extends AppSettingsResponse {
   disk_space_alert: DiskSpaceAlertSettings
   ai_config: AiConfigSettings
   insecure_tls: boolean
+  /** Private networks user-configured outbound requests may reach. */
+  trusted_private_networks: string[]
   build_limits: BuildLimitsSettings
   /** Enabled, running services included in the metrics scrape cycle. */
   monitored_services_count: number | null
@@ -305,6 +309,9 @@ export function buildPlatformSettingsUpdateBody(
     dns_provider: updated.dns_provider,
     external_url: updated.external_url,
     internal_url: updated.internal_url,
+    // Sent explicitly so clearing the field (null) reaches the server; an
+    // omitted key would keep the stored value.
+    public_ingress_url: updated.public_ingress_url ?? null,
     letsencrypt: updated.letsencrypt,
     preview_domain: updated.preview_domain,
     edge_target: updated.edge_target,
@@ -318,6 +325,9 @@ export function buildPlatformSettingsUpdateBody(
     security_headers: updated.security_headers,
     rate_limiting: updated.rate_limiting,
     trust_loopback_forwarded_ip: updated.trust_loopback_forwarded_ip,
+    // Edited on the Security page; the server also preserves an omitted
+    // value, but the page's own save must carry it to take effect.
+    trusted_private_networks: updated.trusted_private_networks,
     // The settings endpoint replaces the full AppSettings document. Omitting
     // this field makes serde restore DockerRegistrySettings::default(), so a
     // successful save immediately clears the registry configuration.
@@ -372,6 +382,10 @@ export function buildPlatformSettingsUpdateBody(
     // Same reasoning: omitting this would silently disable the MCP server on
     // every unrelated settings save.
     mcp_server: updated.mcp_server,
+    // The server preserves an omitted block (#1171), but the On-demand TLS
+    // page edits it through this builder, so it must be sent for a save
+    // there to take effect.
+    on_demand_tls: updated.on_demand_tls,
   }
   return body
 }

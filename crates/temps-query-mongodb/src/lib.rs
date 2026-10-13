@@ -497,10 +497,7 @@ impl DataSource for MongoDBSource {
             }
 
             // Depth >= 1: Not supported (MongoDB has flat database -> collection structure)
-            _ => Err(DataError::InvalidQuery(format!(
-                "MongoDB hierarchy only supports 1 level (database). Path depth: {}. Use list_entities to list collections.",
-                path.depth()
-            ))),
+            _ => Err(DataError::container_path_too_deep("MongoDB", path, 1)),
         }
     }
 
@@ -569,10 +566,11 @@ impl DataSource for MongoDBSource {
         }
 
         if container_path.depth() > 1 {
-            return Err(DataError::InvalidQuery(format!(
-                "MongoDB only supports 1 level hierarchy (database). Path depth: {}",
-                container_path.depth()
-            )));
+            return Err(DataError::container_path_too_deep(
+                "MongoDB",
+                container_path,
+                1,
+            ));
         }
 
         let db_name = &container_path.segments[0];
@@ -593,10 +591,11 @@ impl DataSource for MongoDBSource {
         }
 
         if container_path.depth() > 1 {
-            return Err(DataError::InvalidQuery(format!(
-                "MongoDB only supports 1 level hierarchy (database). Path depth: {}",
-                container_path.depth()
-            )));
+            return Err(DataError::container_path_too_deep(
+                "MongoDB",
+                container_path,
+                1,
+            ));
         }
 
         let db_name = &container_path.segments[0];

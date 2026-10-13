@@ -394,6 +394,8 @@ async fn test_workflow_execution_service_with_real_jobs() {
                 file_count: 10,
                 total_size_bytes: 1024,
                 deployed_at: Utc::now(),
+                skipped_count: 0,
+                skipped_paths: Vec::new(),
             })
         }
 
@@ -471,6 +473,7 @@ async fn test_workflow_execution_service_with_real_jobs() {
             as Arc<dyn temps_deployments::jobs::AgentSyncService>,
         config_service.clone(),
         screenshot_service.clone(),
+        Arc::new(temps_deployments::jobs::DeploymentCaptureGuard::default()),
         docker,
     ));
 

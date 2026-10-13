@@ -21,7 +21,7 @@ configuration change. See the
 
 **Please do not report security vulnerabilities through public GitHub issues.**
 
-Instead, please report them via email to **security@temps.sh**.
+Instead, please report them via email to **david@temps.sh**.
 
 You should receive a response within 48 hours. If for some reason you do not, please follow up via email to ensure we received your original message.
 

@@ -64,11 +64,15 @@ pub async fn run_domain_backfill(
 
     // Build a ClickHouse client from the same connection args the events path
     // uses. Construction does no I/O.
-    let ch = ::clickhouse::Client::default()
-        .with_url(&args.clickhouse_url)
-        .with_database(&args.clickhouse_database)
-        .with_user(&args.clickhouse_user)
-        .with_password(&args.clickhouse_password);
+    // Built by the shared constructor so the wire-compression mode is the
+    // stored `clickhouse.compression` setting, as for `temps serve`.
+    let ch = temps_clickhouse::build_client(
+        &args.clickhouse_url,
+        &args.clickhouse_database,
+        &args.clickhouse_user,
+        &args.clickhouse_password,
+        temps_config::stored_clickhouse_compression(db.as_ref()).await,
+    );
 
     // 1. Ensure the target schema exists (idempotent). Always run it — a
     //    backfill against a database where `temps serve` never enabled CH would

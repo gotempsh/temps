@@ -13,23 +13,50 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
-use temps_auth::{permission_guard, project_access_guard, project_permission_guard, RequireAuth};
+use temps_auth::{
+    permission_guard, project_access_guard, project_permission_guard, project_scope_guard,
+    RequireAuth,
+};
 use temps_core::error_builder::{bad_request, forbidden, internal_server_error, not_found};
 use temps_core::problemdetails::{PermissionDenialKind, Problem};
 use temps_core::{AuditLogger, DateTime, RequestMetadata};
 use utoipa::OpenApi;
 
 use super::audit::{StatusPageMutationAction, StatusPageMutationAudit};
+use super::public::{__path_get_public_status_page, __path_get_public_status_page_json};
+use super::status_pages::{
+    __path_add_status_page_domain, __path_create_status_page, __path_delete_status_page,
+    __path_get_status_page, __path_list_status_page_domains, __path_list_status_pages,
+    __path_publish_status_page, __path_remove_status_page_domain, __path_renew_status_page_domain,
+    __path_rotate_status_page_url, __path_unpublish_status_page, __path_update_status_page,
+    __path_verify_status_page_domain, add_status_page_domain, create_status_page,
+    delete_status_page, get_status_page, list_status_page_domains, list_status_pages,
+    publish_status_page, remove_status_page_domain, renew_status_page_domain,
+    rotate_status_page_url, unpublish_status_page, update_status_page, verify_status_page_domain,
+};
+use crate::services::public_pages::{
+    AddStatusPageDomainRequest, CreateStatusPageRequest, DnsRecordInstruction,
+    PublicComponentStatus, PublicDayStatus, PublicIncident, PublicIncidentSeverity,
+    PublicIncidentStatus, PublicIncidentUpdate, PublicStatusComponent, PublicStatusPageResponse,
+    PublicUptimeDay, StatusPageDomainResponse, StatusPageDomainService, StatusPageDomainStatus,
+    StatusPageListResponse, StatusPageMonitorInput, StatusPageMonitorResponse, StatusPageResponse,
+    UpdateStatusPageRequest, VerificationMethod,
+};
 use crate::services::{
     CreateIncidentRequest, CreateMonitorRequest, CurrentStatusResponse, IncidentBucketedResponse,
-    IncidentResponse, IncidentUpdateResponse, MonitorResponse, ProjectMonitorHealth,
-    StatusBucketedResponse, StatusPageError, StatusPageOverview, StatusPageService,
-    UpdateIncidentStatusRequest, UpdateMonitorRequest, UptimeHistoryResponse,
+    IncidentListResponse, IncidentResponse, IncidentUpdateResponse, MonitorResponse,
+    ProjectMonitorHealth, PublicStatusPageService, StatusBucketedResponse, StatusPageError,
+    StatusPageOverview, StatusPageService, UpdateIncidentStatusRequest,
+    UpdateIncidentUpdateVisibilityRequest, UpdateMonitorRequest, UptimeHistoryResponse,
 };
 
 /// Application state trait for status page routes
 pub trait StatusPageAppState: Send + Sync + 'static {
     fn status_page_service(&self) -> &StatusPageService;
+    /// Publishable status pages (#1412).
+    fn public_status_page_service(&self) -> &PublicStatusPageService;
+    /// Custom hostnames of status pages (#1412).
+    fn status_page_domain_service(&self) -> &StatusPageDomainService;
     fn telemetry(&self) -> &std::sync::Arc<dyn temps_core::TelemetryReporter>;
     fn audit_service(&self) -> &Arc<dyn AuditLogger>;
     /// Optional checker for team-based project access (human sessions only).
@@ -54,8 +81,24 @@ pub trait StatusPageAppState: Send + Sync + 'static {
         get_incident,
         update_incident_status,
         get_incident_updates,
+        set_incident_update_visibility,
         get_bucketed_incidents,
         get_projects_monitor_health,
+        list_status_pages,
+        create_status_page,
+        get_status_page,
+        update_status_page,
+        publish_status_page,
+        unpublish_status_page,
+        rotate_status_page_url,
+        delete_status_page,
+        list_status_page_domains,
+        add_status_page_domain,
+        verify_status_page_domain,
+        renew_status_page_domain,
+        remove_status_page_domain,
+        get_public_status_page,
+        get_public_status_page_json,
     ),
     components(
         schemas(
@@ -67,12 +110,34 @@ pub trait StatusPageAppState: Send + Sync + 'static {
             UptimeHistoryResponse,
             StatusBucketedResponse,
             IncidentResponse,
+            IncidentListResponse,
             CreateIncidentRequest,
             UpdateIncidentStatusRequest,
             IncidentUpdateResponse,
+            UpdateIncidentUpdateVisibilityRequest,
             IncidentBucketedResponse,
             ProjectMonitorHealth,
             ProjectsMonitorHealthResponse,
+            CreateStatusPageRequest,
+            UpdateStatusPageRequest,
+            StatusPageMonitorInput,
+            StatusPageMonitorResponse,
+            StatusPageResponse,
+            StatusPageListResponse,
+            PublicStatusPageResponse,
+            PublicStatusComponent,
+            PublicComponentStatus,
+            PublicUptimeDay,
+            PublicDayStatus,
+            PublicIncident,
+            PublicIncidentSeverity,
+            PublicIncidentStatus,
+            PublicIncidentUpdate,
+            AddStatusPageDomainRequest,
+            StatusPageDomainResponse,
+            StatusPageDomainStatus,
+            DnsRecordInstruction,
+            VerificationMethod,
         )
     ),
     tags(
@@ -215,6 +280,7 @@ where
             environment_id: monitor.environment_id,
             monitor_id: Some(monitor.id),
             status: None,
+            is_public: None,
         },
     )
     .await;
@@ -364,6 +430,7 @@ where
             environment_id: monitor.environment_id,
             monitor_id: Some(monitor_id),
             status: None,
+            is_public: None,
         },
     )
     .await;
@@ -433,6 +500,7 @@ where
             environment_id: None,
             monitor_id: Some(monitor_id),
             status: None,
+            is_public: None,
         },
     )
     .await;
@@ -671,6 +739,7 @@ where
             environment_id: incident.environment_id,
             monitor_id: incident.monitor_id,
             status: Some(incident.status.clone()),
+            is_public: None,
         },
     )
     .await;
@@ -690,7 +759,7 @@ where
         ("page_size" = Option<u64>, Query, description = "Items per page"),
     ),
     responses(
-        (status = 200, description = "Successfully retrieved incidents"),
+        (status = 200, description = "Successfully retrieved incidents", body = IncidentListResponse),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 500, description = "Internal server error"),
@@ -722,10 +791,7 @@ where
         .await
         .map_err(map_error)?;
 
-    Ok(Json(serde_json::json!({
-        "incidents": incidents,
-        "total": total,
-    })))
+    Ok(Json(IncidentListResponse { incidents, total }))
 }
 
 /// Get an incident by ID
@@ -814,12 +880,19 @@ where
         project_id,
         app_state.project_access_checker()
     );
+    let update_is_public = request.is_public;
     let incident = app_state
         .status_page_service()
         .incident_service()
         .update_incident_status(incident_id, request)
         .await
         .map_err(map_error)?;
+    // A public update, or a resolution of an incident that already has one,
+    // changes what published pages show.
+    app_state
+        .public_status_page_service()
+        .refresh_project_pages(project_id)
+        .await;
 
     record_status_page_audit(
         app_state.as_ref(),
@@ -834,6 +907,7 @@ where
             environment_id: incident.environment_id,
             monitor_id: incident.monitor_id,
             status: Some(incident.status.clone()),
+            is_public: Some(update_is_public),
         },
     )
     .await;
@@ -881,6 +955,88 @@ where
         .await
         .map(Json)
         .map_err(map_error)
+}
+
+/// Show or hide an incident update on published status pages
+#[utoipa::path(
+    patch,
+    path = "/incidents/{incident_id}/updates/{update_id}",
+    request_body = UpdateIncidentUpdateVisibilityRequest,
+    params(
+        ("incident_id" = i32, Path, description = "Incident ID"),
+        ("update_id" = i32, Path, description = "Incident update ID"),
+    ),
+    responses(
+        (status = 200, description = "Visibility changed; published pages re-render immediately", body = IncidentUpdateResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Incident or update not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "Status Page",
+    security(("bearer_auth" = []))
+)]
+pub async fn set_incident_update_visibility<T>(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<T>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path((incident_id, update_id)): Path<(i32, i32)>,
+    Json(request): Json<UpdateIncidentUpdateVisibilityRequest>,
+) -> Result<impl IntoResponse, Problem>
+where
+    T: StatusPageAppState,
+{
+    permission_guard!(auth, StatusPageWrite);
+    let project_id = app_state
+        .status_page_service()
+        .incident_service()
+        .get_incident_project_id(incident_id)
+        .await
+        .map_err(map_error)?;
+    project_permission_guard!(
+        auth,
+        StatusPageWrite,
+        project_id,
+        app_state.project_access_checker()
+    );
+    project_scope_guard!(auth, project_id);
+    let update = app_state
+        .status_page_service()
+        .incident_service()
+        .set_incident_update_visibility(incident_id, update_id, request.is_public)
+        .await
+        .map_err(map_error)?;
+    app_state
+        .public_status_page_service()
+        .refresh_project_pages(project_id)
+        .await;
+
+    record_status_page_audit(
+        app_state.as_ref(),
+        StatusPageMutationAudit {
+            actor_user_id: auth.user_id_opt(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+            action: StatusPageMutationAction::IncidentUpdateVisibilityChanged,
+            project_id,
+            resource_type: "incident_update",
+            resource_id: update.id,
+            environment_id: None,
+            monitor_id: None,
+            status: Some(
+                if update.is_public {
+                    "public"
+                } else {
+                    "private"
+                }
+                .to_string(),
+            ),
+            is_public: Some(update.is_public),
+        },
+    )
+    .await;
+
+    Ok(Json(update))
 }
 
 /// Get bucketed incident data for a project
@@ -1207,11 +1363,121 @@ where
             "/incidents/{incident_id}/updates",
             get(get_incident_updates),
         )
+        .route(
+            "/incidents/{incident_id}/updates/{update_id}",
+            patch(set_incident_update_visibility),
+        )
+        .route(
+            "/projects/{project_id}/status-pages",
+            get(list_status_pages).post(create_status_page),
+        )
+        .route(
+            "/status-pages/{status_page_id}",
+            get(get_status_page)
+                .patch(update_status_page)
+                .delete(delete_status_page),
+        )
+        .route(
+            "/status-pages/{status_page_id}/publish",
+            post(publish_status_page),
+        )
+        .route(
+            "/status-pages/{status_page_id}/unpublish",
+            post(unpublish_status_page),
+        )
+        .route(
+            "/status-pages/{status_page_id}/rotate-url",
+            post(rotate_status_page_url),
+        )
+        .route(
+            "/status-pages/{status_page_id}/domains",
+            get(list_status_page_domains).post(add_status_page_domain),
+        )
+        .route(
+            "/status-pages/{status_page_id}/domains/{domain_id}",
+            delete(remove_status_page_domain),
+        )
+        .route(
+            "/status-pages/{status_page_id}/domains/{domain_id}/verify",
+            post(verify_status_page_domain),
+        )
+        .route(
+            "/status-pages/{status_page_id}/domains/{domain_id}/renew",
+            post(renew_status_page_domain),
+        )
 }
 
-fn map_error(error: StatusPageError) -> Problem {
+pub(crate) fn map_error(error: StatusPageError) -> Problem {
     match error {
         StatusPageError::NotFound => not_found().detail("Resource not found").build(),
+        error @ (StatusPageError::StatusPageNotFound { .. }
+        | StatusPageError::IncidentUpdateNotFound { .. }
+        | StatusPageError::ProjectNotFound { .. }
+        | StatusPageError::StatusPageDomainNotFound { .. }) => {
+            not_found().detail(error.to_string()).build()
+        }
+        error @ (StatusPageError::InvalidHostname { .. }
+        | StatusPageError::DomainVerificationFailed { .. }
+        | StatusPageError::AcmeEmailRequired { .. }) => {
+            bad_request().detail(error.to_string()).build()
+        }
+        error @ StatusPageError::DomainOperationsThrottled { .. } => {
+            temps_core::error_builder::ErrorBuilder::new(StatusCode::TOO_MANY_REQUESTS)
+                .title("Too Many Domain Operations")
+                .detail(error.to_string())
+                .build()
+        }
+        error @ (StatusPageError::HostnameInUse { .. }
+        | StatusPageError::StatusPageDomainLimitReached { .. }
+        | StatusPageError::HostnameBindingChanged { .. }
+        | StatusPageError::DomainRequiresPublishedPage { .. }) => {
+            temps_core::error_builder::ErrorBuilder::new(StatusCode::CONFLICT)
+                .title("Hostname Unavailable")
+                .detail(error.to_string())
+                .build()
+        }
+        error @ StatusPageError::CertificateOperationInProgress { .. } => {
+            temps_core::error_builder::ErrorBuilder::new(StatusCode::CONFLICT)
+                .title("Certificate Operation In Progress")
+                .detail(error.to_string())
+                .build()
+        }
+        error @ StatusPageError::DomainNotRenewable { .. } => {
+            temps_core::error_builder::ErrorBuilder::new(StatusCode::CONFLICT)
+                .title("No Certificate To Renew")
+                .detail(error.to_string())
+                .build()
+        }
+        error @ StatusPageError::HostnameUnverifiable { .. } => {
+            tracing::error!(error = %error, "status page hostname availability check failed");
+            temps_core::error_builder::ErrorBuilder::new(StatusCode::SERVICE_UNAVAILABLE)
+                .title("Hostname Check Unavailable")
+                .detail(error.to_string())
+                .build()
+        }
+        error @ StatusPageError::CertificateOrder { .. } => {
+            tracing::error!(error = %error, "status page certificate order failed");
+            temps_core::error_builder::ErrorBuilder::new(StatusCode::BAD_GATEWAY)
+                .title("Certificate Order Failed")
+                .detail(error.to_string())
+                .build()
+        }
+        error @ (StatusPageError::MonitorsNotInProject { .. }
+        | StatusPageError::PublishWithoutMonitors { .. }
+        | StatusPageError::SystemUpdateCannotBePublic { .. }) => {
+            bad_request().detail(error.to_string()).build()
+        }
+        error @ StatusPageError::StatusPageLimitReached { .. } => {
+            temps_core::error_builder::ErrorBuilder::new(StatusCode::CONFLICT)
+                .title("Status Page Limit Reached")
+                .detail(error.to_string())
+                .build()
+        }
+        error
+        @ (StatusPageError::SlugGeneration { .. } | StatusPageError::SnapshotBuild { .. }) => {
+            tracing::error!(error = %error, "status page operation failed");
+            internal_server_error().detail(error.to_string()).build()
+        }
         StatusPageError::Validation(msg) => bad_request().detail(&msg).build(),
         StatusPageError::InvalidRequest(msg) => bad_request().detail(&msg).build(),
         StatusPageError::Database(err) => {
@@ -1430,6 +1696,8 @@ mod tests {
 
     struct TestAppState {
         status_page_service: StatusPageService,
+        public_status_page_service: PublicStatusPageService,
+        status_page_domain_service: StatusPageDomainService,
         telemetry: Arc<dyn TelemetryReporter>,
         audit_service: Arc<dyn AuditLogger>,
         project_access_checker: Option<Arc<dyn ProjectAccessChecker>>,
@@ -1438,6 +1706,14 @@ mod tests {
     impl StatusPageAppState for TestAppState {
         fn status_page_service(&self) -> &StatusPageService {
             &self.status_page_service
+        }
+
+        fn public_status_page_service(&self) -> &PublicStatusPageService {
+            &self.public_status_page_service
+        }
+
+        fn status_page_domain_service(&self) -> &StatusPageDomainService {
+            &self.status_page_domain_service
         }
 
         fn telemetry(&self) -> &Arc<dyn TelemetryReporter> {
@@ -1607,6 +1883,27 @@ mod tests {
         let test_db = TestDatabase::with_migrations().await.unwrap();
         let db = test_db.connection_arc();
         let config_service = create_mock_config_service(&db);
+        let snapshot_cache = Arc::new(crate::services::StatusSnapshotCache::new(db.clone()));
+        let public_status_page_service = PublicStatusPageService::new(
+            db.clone(),
+            config_service.clone(),
+            snapshot_cache.clone(),
+        );
+        let status_page_domain_service = StatusPageDomainService::new(
+            db.clone(),
+            config_service.clone(),
+            snapshot_cache,
+            Arc::new(
+                crate::services::public_pages::domains::test_support::FakeCertificates::new(
+                    db.clone(),
+                ),
+            ),
+            Arc::new(
+                crate::services::public_pages::domains::test_support::StubRouteTable {
+                    serving: Default::default(),
+                },
+            ),
+        );
         let status_page_service = StatusPageService::new(db.clone(), config_service);
 
         let project = create_test_project(&db).await;
@@ -1644,6 +1941,8 @@ mod tests {
 
         let app_state = Arc::new(TestAppState {
             status_page_service,
+            public_status_page_service,
+            status_page_domain_service,
             telemetry: Arc::new(NoopTelemetryReporter),
             audit_service,
             project_access_checker: make_checker(project.id),
@@ -1774,6 +2073,7 @@ mod tests {
             Json(UpdateIncidentStatusRequest {
                 status: "resolved".to_string(),
                 message: "forbidden update".to_string(),
+                is_public: false,
             }),
         )
         .await
@@ -1876,6 +2176,7 @@ mod tests {
             Json(UpdateIncidentStatusRequest {
                 status: "resolved".to_string(),
                 message: "authorized update".to_string(),
+                is_public: false,
             }),
         )
         .await;
@@ -1977,6 +2278,7 @@ mod tests {
             Json(UpdateIncidentStatusRequest {
                 status: "monitoring".to_string(),
                 message: "audit logger unavailable".to_string(),
+                is_public: false,
             }),
         )
         .await;
@@ -2038,6 +2340,7 @@ mod tests {
             Json(UpdateIncidentStatusRequest {
                 status: "resolved".to_string(),
                 message: "must not reach ownership lookup".to_string(),
+                is_public: false,
             }),
         )
         .await
@@ -2226,6 +2529,7 @@ mod tests {
             Json(UpdateIncidentStatusRequest {
                 status: "resolved".to_string(),
                 message: "forged update".to_string(),
+                is_public: false,
             }),
         )
         .await

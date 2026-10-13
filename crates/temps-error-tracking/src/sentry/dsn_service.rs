@@ -215,6 +215,27 @@ impl DSNService {
         deployment_id: Option<i32>,
         base_url: &str,
     ) -> Result<ProjectDSN, SentryIngesterError> {
+        self.get_or_create_project_dsn_reporting_creation(
+            project_id,
+            environment_id,
+            deployment_id,
+            base_url,
+        )
+        .await
+        .map(|(dsn, _created)| dsn)
+    }
+
+    /// Like [`Self::get_or_create_project_dsn`], but also reports whether a new
+    /// DSN was minted (`true`) or an existing active one was returned
+    /// (`false`), so callers can audit credential creation only when it
+    /// actually happened.
+    pub async fn get_or_create_project_dsn_reporting_creation(
+        &self,
+        project_id: i32,
+        environment_id: Option<i32>,
+        deployment_id: Option<i32>,
+        base_url: &str,
+    ) -> Result<(ProjectDSN, bool), SentryIngesterError> {
         // Check if DSN already exists
         let mut query = project_dsns::Entity::find()
             .filter(project_dsns::Column::ProjectId.eq(project_id))
@@ -236,20 +257,23 @@ impl DSNService {
             // Return existing DSN (scheme + host + port preserved, see build_dsn).
             let dsn = build_dsn(base_url, &existing_dsn.public_key, project_id);
 
-            return Ok(ProjectDSN {
-                id: existing_dsn.id,
-                project_id,
-                environment_id: existing_dsn.environment_id,
-                deployment_id: existing_dsn.deployment_id,
-                name: existing_dsn.name,
-                public_key: existing_dsn.public_key,
-                secret_key: existing_dsn.secret_key,
-                dsn,
-                created_at: existing_dsn.created_at,
-                is_active: existing_dsn.is_active,
-                event_count: existing_dsn.event_count,
-                rate_limit_per_minute: existing_dsn.rate_limit_per_minute,
-            });
+            return Ok((
+                ProjectDSN {
+                    id: existing_dsn.id,
+                    project_id,
+                    environment_id: existing_dsn.environment_id,
+                    deployment_id: existing_dsn.deployment_id,
+                    name: existing_dsn.name,
+                    public_key: existing_dsn.public_key,
+                    secret_key: existing_dsn.secret_key,
+                    dsn,
+                    created_at: existing_dsn.created_at,
+                    is_active: existing_dsn.is_active,
+                    event_count: existing_dsn.event_count,
+                    rate_limit_per_minute: existing_dsn.rate_limit_per_minute,
+                },
+                false,
+            ));
         }
 
         // Create new DSN if none exists
@@ -268,6 +292,7 @@ impl DSNService {
             base_url,
         )
         .await
+        .map(|dsn| (dsn, true))
     }
 
     /// Create a new DSN without checking for duplicates

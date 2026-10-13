@@ -262,6 +262,17 @@ impl SandboxProvider for NodeRoutingSandboxProvider {
             .await
     }
 
+    async fn sync_workspace_to_host(
+        &self,
+        handle: &SandboxHandle,
+        host_dir: &std::path::Path,
+    ) -> Result<(), AgentError> {
+        self.owner_of(handle)
+            .await?
+            .sync_workspace_to_host(handle, host_dir)
+            .await
+    }
+
     async fn kill_processes(
         &self,
         handle: &SandboxHandle,
@@ -1094,6 +1105,7 @@ mod tests {
             tls_address: None,
             console_address: "127.0.0.1:0".into(),
             console_admin_address: None,
+            console_ingress_address: None,
             admin_allowed_ips: Vec::new(),
             admin_allowed_hosts: Vec::new(),
             admin_trust_forwarded_for: false,

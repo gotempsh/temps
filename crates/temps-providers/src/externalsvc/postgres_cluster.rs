@@ -258,6 +258,21 @@ pub fn monitor_connection_string(
     conn
 }
 
+/// `host` as it must appear in a `postgresql://` URI authority: an IPv6
+/// literal is bracketed (RFC 3986), anything else is unchanged.
+///
+/// Cluster members advertise bare addresses (pg_autoctl `--hostname`, Docker
+/// port bindings and libpq `host=` all take `fd00::10` as is), but in a URI
+/// `user@fd00::10:6030` is unparsable: a data member given that monitor URI
+/// could never register.
+pub(crate) fn uri_host(host: &str) -> std::borrow::Cow<'_, str> {
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        std::borrow::Cow::Owned(format!("[{host}]"))
+    } else {
+        std::borrow::Cow::Borrowed(host)
+    }
+}
+
 fn generate_cluster_secret() -> String {
     use rand::{distr::Alphanumeric, RngExt};
     rand::rng()
@@ -285,11 +300,72 @@ fn is_valid_cluster_secret(value: &str) -> bool {
 // switched to SCRAM, so no connection that is needed for replication or
 // failover ever presents without a password.
 
+/// Shell functions the prepare snippets use to change a member's pg_autoctl
+/// configuration: `autoctl_config_run` (one `config get|set` that survives
+/// the keeper rewriting the file under it) and `autoctl_config_set` (store a
+/// value and read it back). Expect `PGDATA`.
+///
+/// pg_autoctl rewrites `pg_autoctl.cfg` in place -- truncate, then write, no
+/// lock -- every time a running keeper reloads (`keeper_ensure_configuration`
+/// calls `keeper_config_update`, which always writes the file), and every
+/// `pg_autoctl config set` signals that reload. A one-shot `config get` or
+/// `config set` that lands in the rewrite reads a half-written file and
+/// fails with "Failed to find section pg_autoctl" (exit status 1, 2 or 12);
+/// its own write can also be overwritten by the keeper's older copy. The
+/// in-place upgrade runs several of these back to back against a live
+/// keeper, so a single failure proves nothing: retry while the file exists,
+/// verify what was stored, and only then report -- with pg_autoctl's own
+/// message. `config set` echoes the value it stored, which can be a
+/// password, so stdout is captured into `AUTOCTL_OUT` and never printed.
+macro_rules! autoctl_config_helpers {
+    () => {
+        r#"autoctl_config_run() {
+  local attempt=1 status err_file
+  err_file=$(mktemp)
+  while :; do
+    status=0
+    AUTOCTL_OUT=$(gosu postgres pg_autoctl config "$1" --pgdata "$PGDATA" "${@:2}" 2>"$err_file") || status=$?
+    if [ "$status" -eq 0 ]; then
+      rm -f "$err_file"
+      return 0
+    fi
+    if [ "$attempt" -ge 20 ] || [ ! -f "$(gosu postgres pg_autoctl show file --pgdata "$PGDATA" --config 2>/dev/null)" ]; then
+      echo "temps: pg_autoctl config $1 ${2:-} exited $status after $attempt attempt(s) on $PGDATA:" >&2
+      cat "$err_file" >&2
+      rm -f "$err_file"
+      return "$status"
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.25
+  done
+}
+autoctl_config_set() {
+  local key=$1 value=$2 attempt=1
+  while :; do
+    autoctl_config_run set "$key" "$value" || return 1
+    autoctl_config_run get "$key" || return 1
+    if [ "$AUTOCTL_OUT" = "$value" ]; then
+      return 0
+    fi
+    if [ "$attempt" -ge 5 ]; then
+      echo "temps: pg_autoctl config $key was overwritten by the running keeper $attempt times in a row on $PGDATA" >&2
+      return 1
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.25
+  done
+}
+"#
+    };
+}
+
 /// Monitor, prepare: record `scram-sha-256` as the auth method pg_autoctl
 /// uses for rules it adds later, and set the `autoctl_node` password once
 /// Postgres accepts connections. Expects `PGDATA`, `MONITOR_PORT` and
 /// `AUTOCTL_NODE_PASSWORD`. Starts a background retry loop.
-const MONITOR_PREPARE_SNIPPET: &str = r#"gosu postgres pg_autoctl config set --pgdata "$PGDATA" postgresql.auth_method scram-sha-256 >/dev/null 2>&1 || true
+const MONITOR_PREPARE_SNIPPET: &str = concat!(
+    autoctl_config_helpers!(),
+    r#"autoctl_config_set postgresql.auth_method scram-sha-256 || true
 (
   for _ in $(seq 1 120); do
     if printf '%s\n' "ALTER ROLE autoctl_node PASSWORD :'pw';" \
@@ -300,7 +376,8 @@ const MONITOR_PREPARE_SNIPPET: &str = r#"gosu postgres pg_autoctl config set --p
     sleep 1
   done
   exit 1
-) &"#;
+) &"#
+);
 
 /// Monitor, enforce: rewrite every `trust` rule for `autoctl_node` (the
 /// legacy `0.0.0.0/0` rules, and pg_auto_failover's own LAN rule on clusters
@@ -348,19 +425,39 @@ chmod 600 "$PGPASS_FILE""#;
 /// replicates to the standbys). Expects `PGDATA`, `NODE_PORT`,
 /// `AUTOCTL_NODE_PASSWORD` and `REPLICATION_PASSWORD`. Starts a background
 /// retry loop.
-const NODE_PREPARE_SNIPPET: &str = r#"if gosu postgres pg_autoctl config get --pgdata "$PGDATA" postgresql.pgdata >/dev/null 2>&1; then
-  gosu postgres pg_autoctl config set --pgdata "$PGDATA" replication.password "$REPLICATION_PASSWORD" >/dev/null 2>&1 || exit 1
-  gosu postgres pg_autoctl config set --pgdata "$PGDATA" postgresql.auth_method scram-sha-256 >/dev/null 2>&1 || true
-  CURRENT_MONITOR=$(gosu postgres pg_autoctl config get --pgdata "$PGDATA" pg_autoctl.monitor 2>/dev/null || true)
+///
+/// Every configuration change goes through `autoctl_config_helpers!`: during
+/// the in-place upgrade the keeper is running and rewrites the file these
+/// calls read, and a failed step has to say which setting failed and why.
+///
+/// During the in-place upgrade (`TEMPS_AUTH_UPGRADE=1`, see
+/// [`PostgresClusterService::auth_upgrade_command`]), a standby that is still
+/// taking its initial base backup has pg_autoctl configuration but no
+/// database (`$PGDATA/PG_VERSION`) yet. It is not the primary and receives
+/// every role from the primary with that backup, so it has nothing to set and
+/// the loop exits 0 instead of waiting for a server that cannot start until
+/// the backup completes. The entrypoint does not set the flag: there the loop
+/// must keep waiting for `pg_autoctl run` to start PostgreSQL.
+const NODE_PREPARE_SNIPPET: &str = concat!(
+    autoctl_config_helpers!(),
+    r#"if [ -f "$(gosu postgres pg_autoctl show file --pgdata "$PGDATA" --config 2>/dev/null)" ]; then
+  autoctl_config_set replication.password "$REPLICATION_PASSWORD" || exit 1
+  autoctl_config_set postgresql.auth_method scram-sha-256 || true
+  autoctl_config_run get pg_autoctl.monitor || exit 1
+  CURRENT_MONITOR=$AUTOCTL_OUT
   if [ -n "$CURRENT_MONITOR" ]; then
     WANTED_MONITOR=$(printf '%s' "$CURRENT_MONITOR" | sed -E "s#^(postgres(ql)?://autoctl_node)(:[^@]*)?@#\1:${AUTOCTL_NODE_PASSWORD}@#")
     if [ "$WANTED_MONITOR" != "$CURRENT_MONITOR" ]; then
-      gosu postgres pg_autoctl config set --pgdata "$PGDATA" pg_autoctl.monitor "$WANTED_MONITOR" >/dev/null 2>&1 || exit 1
+      autoctl_config_set pg_autoctl.monitor "$WANTED_MONITOR" || exit 1
     fi
   fi
 fi
 (
   for _ in $(seq 1 300); do
+    if [ "${TEMPS_AUTH_UPGRADE:-}" = 1 ] && [ ! -f "$PGDATA/PG_VERSION" ]; then
+      echo "temps: $PGDATA holds no database yet (standby awaiting its initial base backup); the replication password is set on the primary" >&2
+      exit 0
+    fi
     IN_RECOVERY=$(gosu postgres psql -X -At -p "$NODE_PORT" -d postgres -c "SELECT pg_is_in_recovery()" 2>/dev/null || true)
     if [ "$IN_RECOVERY" = "t" ]; then
       exit 0
@@ -373,8 +470,10 @@ fi
     fi
     sleep 1
   done
+  echo "temps: PostgreSQL on port $NODE_PORT did not accept local connections within 300s; the replication password was not confirmed on this member" >&2
   exit 1
-) &"#;
+) &"#
+);
 
 /// Data node, enforce: rewrite every `trust` rule for
 /// `pgautofailover_replicator` (the legacy `0.0.0.0/0` rules and
@@ -400,6 +499,131 @@ if [ -f "$HBA" ]; then
   gosu postgres pg_ctl reload -D "$PGDATA" >/dev/null 2>&1 || true
 fi"#;
 
+/// Data node: create/update the configured application superuser and its
+/// database. Written through a quoted heredoc and run by psql with the
+/// variables `app_user`, `app_password` and `app_db`; values are quoted by
+/// psql (`:'var'`) and `format()` (`%I` / `%L`), never spliced as text, so
+/// any user-chosen password is safe. `password_encryption` is pinned so
+/// the stored password is always a SCRAM verifier.
+const APP_USER_SQL: &str = r#"SET password_encryption = 'scram-sha-256';
+SELECT format('CREATE ROLE %I LOGIN SUPERUSER', :'app_user')
+WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'app_user')\gexec
+SELECT format('ALTER ROLE %I WITH LOGIN SUPERUSER PASSWORD %L', :'app_user', :'app_password')\gexec
+SELECT format('CREATE DATABASE %I OWNER %I', :'app_db', :'app_user')
+WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'app_db')\gexec"#;
+
+/// Data node, application auth: choose the method of the application
+/// catch-all rules (`host`/`hostssl all all 0.0.0.0/0` and `::/0`).
+///
+/// A `scram-sha-256` rule refuses a role whose stored password is an MD5
+/// hash, while an `md5` rule accepts both MD5 and SCRAM verifiers (it then
+/// performs SCRAM). Without the plaintext a stored MD5 hash cannot be
+/// rehashed, so the rules are only switched to `scram-sha-256` once no
+/// login role stores an MD5 hash; otherwise they are kept (or put back) at
+/// `md5` and the reason is logged. pg_auto_failover writes
+/// `password_encryption = '<--auth method>'`, so roles on SCRAM-native
+/// members are SCRAM; MD5 hashes only appear from restored dumps or
+/// explicit `password_encryption = md5`.
+///
+/// Must run after [`NODE_ENFORCE_SNIPPET`]: both rewrite `pg_hba.conf`.
+/// Expects `PGDATA` and `NODE_PORT`. Starts a background job that exits 0
+/// once the rules are decided (keeping `md5` is a decision), and 1 when
+/// PostgreSQL never answered, so nothing was decided: the member keeps its
+/// current rules, and an upgrade waiting on the job must not record the
+/// cluster as converged. The entrypoint does not wait on it. During the
+/// upgrade a member with no database yet exits 0, for the reason given on
+/// [`NODE_PREPARE_SNIPPET`]: its base backup brings the primary's rules.
+const NODE_APP_AUTH_SNIPPET: &str = r#"(
+  HBA="$PGDATA/pg_hba.conf"
+  APP_RULE='^([[:space:]]*host(ssl)?[[:space:]]+all[[:space:]]+all[[:space:]]+(0\.0\.0\.0/0|::/0)[[:space:]]+)(md5|scram-sha-256)([[:space:]]|$)'
+  for _ in $(seq 1 300); do
+    if [ "${TEMPS_AUTH_UPGRADE:-}" = 1 ] && [ ! -f "$PGDATA/PG_VERSION" ]; then
+      echo "temps: $PGDATA holds no database yet (standby awaiting its initial base backup); it takes the primary's pg_hba rules with that backup" >&2
+      exit 0
+    fi
+    MD5_ROLES=$(gosu postgres psql -X -At -p "$NODE_PORT" -d postgres -c "SELECT count(*) FROM pg_authid WHERE rolcanlogin AND rolpassword LIKE 'md5%'" 2>/dev/null || true)
+    case "$MD5_ROLES" in
+      ''|*[!0-9]*) sleep 1; continue ;;
+    esac
+    if [ "$MD5_ROLES" = 0 ]; then
+      APP_AUTH=scram-sha-256
+    else
+      APP_AUTH=md5
+      echo "temps: keeping md5 for the application pg_hba rules on port $NODE_PORT: $MD5_ROLES login role(s) store an MD5 password hash, which scram-sha-256 would refuse; reset those passwords with password_encryption = scram-sha-256 and restart this member to switch" >&2
+    fi
+    if [ -f "$HBA" ]; then
+      APP_HBA=$(mktemp "$PGDATA/.temps-hba-app.XXXXXX")
+      sed -E "s#${APP_RULE}#\\1${APP_AUTH}\\5#" "$HBA" > "$APP_HBA"
+      if ! cmp -s "$HBA" "$APP_HBA"; then
+        cat "$APP_HBA" > "$HBA"
+        gosu postgres pg_ctl reload -D "$PGDATA" >/dev/null 2>&1 || true
+        echo "temps: application pg_hba rules on port $NODE_PORT now use $APP_AUTH" >&2
+      fi
+      rm -f "$APP_HBA"
+    fi
+    exit 0
+  done
+  echo "temps: application pg_hba rules left unchanged: PostgreSQL on port $NODE_PORT did not accept local connections" >&2
+  exit 1
+) &"#;
+
+/// Where the cluster image installs PostgreSQL's binaries. pg_autoctl runs
+/// `pg_basebackup` from the directory of the `pg_ctl` it uses, by absolute
+/// path, so this is the copy every standby clone goes through.
+const PG_BINDIR_GLOB: &str = "/usr/lib/postgresql/*/bin";
+
+/// Suffix of the real `pg_basebackup` once the fast-checkpoint wrapper is in
+/// place.
+const REAL_PG_BASEBACKUP_SUFFIX: &str = ".temps-real";
+
+/// Data node, before pg_autoctl starts: make every `pg_basebackup` request a
+/// fast checkpoint.
+///
+/// pg_autoctl clones a standby (the initial standby of a new cluster, a
+/// member added later, a node rebuilt after a failover) with
+/// `pg_basebackup` and offers no option for the checkpoint mode, so the
+/// backup waits for a *spread* checkpoint on the primary first. On an empty
+/// database that wait took about 96 s while the copy itself took under one;
+/// for that whole window the primary sits in `wait_primary` with no standby
+/// to fail over to. `--checkpoint=fast` makes the primary checkpoint
+/// immediately.
+///
+/// The real binary is moved aside once and a two-line wrapper put in its
+/// place, so it is idempotent across container restarts (the container
+/// filesystem survives them). The moved-aside binary decides whether a
+/// directory is handled, not `pg_basebackup` itself, so a stop between the
+/// move and the wrapper's install is repaired on the next start instead of
+/// leaving the standby without the command it clones with. Runs as root,
+/// before `pg_autoctl create`.
+fn fast_checkpoint_basebackup_snippet(bindir_glob: &str) -> String {
+    format!(
+        r#"for BIN in {bindir_glob}; do
+  BB="$BIN/pg_basebackup"
+  REAL="$BB{suffix}"
+  if [ ! -e "$REAL" ]; then
+    [ -f "$BB" ] || continue
+    mv "$BB" "$REAL" || {{ echo "temps: could not move $BB aside; standby clones keep the spread checkpoint" >&2; continue; }}
+  fi
+  printf '#!/bin/sh\n# Installed by Temps: request a fast checkpoint for every base backup.\nexec "%s" --checkpoint=fast "$@"\n' "$REAL" > "$BB.temps-wrapper"
+  chmod 755 "$BB.temps-wrapper"
+  mv "$BB.temps-wrapper" "$BB"
+done"#,
+        suffix = REAL_PG_BASEBACKUP_SUFFIX,
+    )
+}
+
+/// Removes pg_autoctl's pidfile left behind by an unclean stop.
+///
+/// pg_autoctl writes it under `/tmp/pg_autoctl/<PGDATA path>/pg_autoctl.pid`
+/// (e.g. `/tmp/pg_autoctl/var/lib/postgresql/monitor/pg_autoctl.pid`), and
+/// the container's `/tmp` survives a restart. The previous
+/// `rm -f /tmp/pg_autoctl/*.pid /tmp/pg_autoctl/*/*.pid` only reached two
+/// levels, so after a host reboot or Docker daemon restart the new PID 1 found
+/// "an instance already running with PID 1" — itself — and the member
+/// crash-looped forever. Runs before `pg_autoctl run`, when nothing can own it.
+const STALE_PIDFILE_CLEANUP: &str =
+    "find /tmp/pg_autoctl -type f -name '*.pid' -delete 2>/dev/null || true";
+
 /// One phase of the in-place SCRAM upgrade of a running cluster.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthUpgradeStep {
@@ -408,7 +632,9 @@ pub enum AuthUpgradeStep {
     /// On every data node: `.pgpass`, pg_autoctl config, monitor URI and
     /// (on the primary) the replicator password (rules unchanged).
     NodePrepare,
-    /// On every data node: switch replicator rules to SCRAM.
+    /// On every data node: switch replicator rules to SCRAM, and the
+    /// application catch-all rules too once no login role stores an MD5
+    /// hash (see [`NODE_APP_AUTH_SNIPPET`]).
     NodeEnforce,
     /// On the monitor: switch `autoctl_node` rules to SCRAM.
     MonitorEnforce,
@@ -503,7 +729,9 @@ impl PostgresClusterService {
             "MONITOR_URI".to_string(),
             format!(
                 "postgresql://autoctl_node:{}@{}:{}/pg_auto_failover",
-                auth.autoctl_node_password, monitor_hostname, monitor_port
+                auth.autoctl_node_password,
+                uri_host(monitor_hostname),
+                monitor_port
             ),
         );
         env.insert("POSTGRES_USER".to_string(), config.username.clone());
@@ -537,17 +765,33 @@ impl PostgresClusterService {
             AuthUpgradeStep::NodePrepare => ("/var/lib/postgresql/pgdata", NODE_PREPARE_SNIPPET),
             AuthUpgradeStep::NodeEnforce => ("/var/lib/postgresql/pgdata", NODE_ENFORCE_SNIPPET),
         };
-        let mut script = vec!["set -e".to_string(), format!("PGDATA={pgdata}")];
+        let mut script = vec![
+            "set -e".to_string(),
+            // `set -e` ends the script on a failing command, and several of
+            // them discard their own output. Name the command so a non-zero
+            // exit is never an empty string for the control plane to report.
+            r#"trap 'echo "temps: upgrade step stopped at line $LINENO: $BASH_COMMAND" >&2' ERR"#
+                .to_string(),
+            format!("PGDATA={pgdata}"),
+            // Lets the shared snippets tell this exec from the entrypoint.
+            "TEMPS_AUTH_UPGRADE=1".to_string(),
+        ];
         if matches!(
             step,
             AuthUpgradeStep::MonitorPrepare | AuthUpgradeStep::NodePrepare
         ) {
             // Preserve legacy entrypoints' initialization guard on restart,
             // while asking pg_autoctl for its actual XDG config location.
+            // A standby still taking its initial base backup has the config
+            // but no `$PGDATA` directory yet; creating one would collide with
+            // the backup that pg_autoctl moves into place, so it is skipped.
             script.push(
                 r#"CONFIG_FILE=$(gosu postgres pg_autoctl show file --pgdata "$PGDATA" --config)
-[ -f "$CONFIG_FILE" ]
-if [ "$CONFIG_FILE" != "$PGDATA/pg_autoctl.cfg" ] && [ ! -e "$PGDATA/pg_autoctl.cfg" ]; then
+if [ ! -f "$CONFIG_FILE" ]; then
+  echo "temps: pg_autoctl configuration file \"$CONFIG_FILE\" for $PGDATA does not exist; this member is not initialized" >&2
+  exit 1
+fi
+if [ -d "$PGDATA" ] && [ "$CONFIG_FILE" != "$PGDATA/pg_autoctl.cfg" ] && [ ! -e "$PGDATA/pg_autoctl.cfg" ]; then
   ln -s "$CONFIG_FILE" "$PGDATA/pg_autoctl.cfg"
   chown -h postgres:postgres "$PGDATA/pg_autoctl.cfg"
 fi"#
@@ -558,6 +802,15 @@ fi"#
             script.push(NODE_PGPASS_SNIPPET.to_string());
         }
         script.push(body.to_string());
+        if step == AuthUpgradeStep::NodeEnforce {
+            // Runs after the infrastructure rewrite (never concurrently with
+            // it) and is waited for so the step returns converged. Keeping
+            // `md5` is a logged decision and exits 0; a member whose
+            // PostgreSQL never answered exits 1 so the step fails and the
+            // cluster is not marked converged (it is retried next start).
+            script.push(NODE_APP_AUTH_SNIPPET.to_string());
+            script.push("wait $!".to_string());
+        }
         if matches!(
             step,
             AuthUpgradeStep::MonitorPrepare | AuthUpgradeStep::NodePrepare
@@ -567,7 +820,7 @@ fi"#
             // Existing keepers must load the new monitor/replication secrets
             // before any peer switches its HBA from trust to SCRAM.
             script.push(
-                "gosu postgres pg_autoctl reload --pgdata \"$PGDATA\" >/dev/null 2>&1".to_string(),
+                "gosu postgres pg_autoctl reload --pgdata \"$PGDATA\" >/dev/null".to_string(),
             );
         }
         vec!["bash".to_string(), "-c".to_string(), script.join("\n")]
@@ -611,7 +864,7 @@ fi"#
                 MONITOR_ENFORCE_SNIPPET,
                 MONITOR_PREPARE_SNIPPET,
                 "fi",
-                "rm -f /tmp/pg_autoctl/*.pid /tmp/pg_autoctl/*/*.pid",
+                STALE_PIDFILE_CLEANUP,
                 "exec gosu postgres pg_autoctl run --pgdata \"$PGDATA\"",
             ]
             .join("\n"),
@@ -631,12 +884,15 @@ fi"#
         // 4. pg_autoctl run — keeps running, handles replication and failover
         //
         // Runs as the `postgres` user because pg_ctl refuses to run as root.
+        let fast_checkpoint = fast_checkpoint_basebackup_snippet(PG_BINDIR_GLOB);
         vec![
             "bash".to_string(),
             "-c".to_string(),
             [
                 "PGDATA=/var/lib/postgresql/pgdata",
                 "chown -R postgres:postgres /var/lib/postgresql",
+                // Before `create` clones a standby: see the snippet.
+                fast_checkpoint.as_str(),
                 // Background HBA patcher: polls for pg_hba.conf and patches it
                 // as soon as it exists. pg_auto_failover only generates
                 // replication rules for peer addresses it resolves itself,
@@ -674,21 +930,31 @@ fi"#
                 // gets "no pg_hba.conf entry for host X, user Y" until
                 // we open it explicitly.
                 //
-                // We add ONE catch-all md5 rule rather than a per-user
+                // We add ONE catch-all SCRAM rule rather than a per-user
                 // entry so future roles work without a code change.
                 // Auth is still password-protected; the rule just
                 // says "if the role exists and the password matches,
                 // let it in from anywhere on the network the cluster
-                // already trusts".
+                // already trusts". pg_autoctl's `--auth scram-sha-256`
+                // sets `password_encryption = 'scram-sha-256'`, and the
+                // app user below is explicitly hashed with SCRAM.
+                // NODE_APP_AUTH_SNIPPET puts the rules back to md5 if a
+                // login role stores an MD5 hash (e.g. a standby cloned
+                // from a legacy primary, or a restored dump).
+                //
+                // Non-TLS `host` rules stay: linked apps receive a
+                // POSTGRES_URL without `sslmode`, and drivers whose
+                // default is no TLS (node-postgres, JDBC) would be
+                // refused by `hostnossl ... reject`.
                 //
                 // Order matters in pg_hba — the replicator rules above
                 // this block and pg_auto_failover's auto-generated
                 // monitor health-check rule match first.
-                "      if ! grep -q '^host all all 0\\.0\\.0\\.0/0 md5' \"$HBA\" 2>/dev/null; then",
-                "        echo 'hostssl all all 0.0.0.0/0 md5' >> \"$HBA\"",
-                "        echo 'hostssl all all ::/0 md5' >> \"$HBA\"",
-                "        echo 'host all all 0.0.0.0/0 md5' >> \"$HBA\"",
-                "        echo 'host all all ::/0 md5' >> \"$HBA\"",
+                "      if ! grep -Eq '^host all all 0\\.0\\.0\\.0/0 (md5|scram-sha-256)' \"$HBA\" 2>/dev/null; then",
+                "        echo 'hostssl all all 0.0.0.0/0 scram-sha-256' >> \"$HBA\"",
+                "        echo 'hostssl all all ::/0 scram-sha-256' >> \"$HBA\"",
+                "        echo 'host all all 0.0.0.0/0 scram-sha-256' >> \"$HBA\"",
+                "        echo 'host all all ::/0 scram-sha-256' >> \"$HBA\"",
                 "        gosu postgres pg_ctl reload -D \"$PGDATA\" 2>/dev/null || true",
                 "      fi",
                 "      break",
@@ -709,10 +975,24 @@ fi"#
                 // patcher finishes. So this is its own loop that retries
                 // every 2s until the ALTER succeeds, then exits.
                 //
-                // The script writes the SQL to a tempfile rather than
-                // -c'ing it inline so embedded $$ and quotes don't need
-                // round-trip escaping through the bash heredoc. We
-                // chmod the file 644 so `gosu postgres psql` (which
+                // The SQL is a fixed, quoted heredoc (`<<'SQL_EOF'`): the
+                // shell expands nothing in it. The user, password and
+                // database travel as psql variables and are quoted by
+                // psql (`:'var'`) and by `format()` (`%I` identifier,
+                // `%L` literal), so a password containing `'`, `$`,
+                // backticks or backslashes can neither break nor extend
+                // the SQL. (Splicing `${POSTGRES_PASSWORD}` into
+                // `PASSWORD '...'` let a `'` in a user-chosen password
+                // inject SQL running as superuser.)
+                //
+                // `password_encryption` is pinned for the session so the
+                // app user always stores a SCRAM verifier, which the
+                // `scram-sha-256` catch-all rule above requires.
+                //
+                // A standby is read-only and receives the role from the
+                // primary through replication, so it skips the ALTER.
+                //
+                // We chmod the file 644 so `gosu postgres psql` (which
                 // drops to the postgres user) can read it — without
                 // this it lives as 600 root:root, every retry hits
                 // EACCES, the loop times out and the password never
@@ -720,24 +1000,19 @@ fi"#
                 // caller including Browse Data.
                 "(",
                 "  SQL_FILE=$(mktemp /tmp/temps-app-user-XXXX.sql)",
-                "  cat > \"$SQL_FILE\" <<SQL_EOF",
-                "DO \\$\\$",
-                "BEGIN",
-                "  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${POSTGRES_USER}') THEN",
-                "    CREATE ROLE \"${POSTGRES_USER}\" LOGIN SUPERUSER PASSWORD '${POSTGRES_PASSWORD}';",
-                "  ELSE",
-                "    ALTER ROLE \"${POSTGRES_USER}\" WITH LOGIN SUPERUSER PASSWORD '${POSTGRES_PASSWORD}';",
-                "  END IF;",
-                "END",
-                "\\$\\$;",
-                "SELECT 'CREATE DATABASE \"${POSTGRES_DB}\" OWNER \"${POSTGRES_USER}\"'",
-                "WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = '${POSTGRES_DB}')\\gexec",
+                "  cat > \"$SQL_FILE\" <<'SQL_EOF'",
+                APP_USER_SQL,
                 "SQL_EOF",
                 "  chmod 644 \"$SQL_FILE\"",
                 "  for _ in $(seq 1 60); do",
-                "    if gosu postgres psql -p \"$NODE_PORT\" -d postgres -v ON_ERROR_STOP=1 -f \"$SQL_FILE\" >/dev/null 2>&1; then",
-                "      rm -f \"$SQL_FILE\"",
-                "      exit 0",
+                "    IN_RECOVERY=$(gosu postgres psql -X -At -p \"$NODE_PORT\" -d postgres -c 'SELECT pg_is_in_recovery()' 2>/dev/null || true)",
+                "    if [ \"$IN_RECOVERY\" = t ]; then",
+                "      break",
+                "    fi",
+                "    if [ \"$IN_RECOVERY\" = f ] && gosu postgres psql -X -q -p \"$NODE_PORT\" -d postgres -v ON_ERROR_STOP=1 \\",
+                "      -v app_user=\"$POSTGRES_USER\" -v app_password=\"$POSTGRES_PASSWORD\" -v app_db=\"$POSTGRES_DB\" \\",
+                "      -f \"$SQL_FILE\" >/dev/null 2>&1; then",
+                "      break",
                 "    fi",
                 "    sleep 2",
                 "  done",
@@ -756,7 +1031,8 @@ fi"#
                 "fi",
                 NODE_PREPARE_SNIPPET,
                 NODE_ENFORCE_SNIPPET,
-                "rm -f /tmp/pg_autoctl/*.pid /tmp/pg_autoctl/*/*.pid",
+                NODE_APP_AUTH_SNIPPET,
+                STALE_PIDFILE_CLEANUP,
                 "exec gosu postgres pg_autoctl run --pgdata \"$PGDATA\"",
             ]
             .join("\n"),
@@ -1041,7 +1317,7 @@ impl ExternalService for PostgresClusterService {
             // or pre-DNS deployments.
             let hosts: Vec<String> = data_nodes
                 .iter()
-                .map(|n| format!("{}:{}", n.hostname, n.port))
+                .map(|n| format!("{}:{}", uri_host(&n.hostname), n.port))
                 .collect();
             format!(
                 "postgresql://{}:{}@{}/{}?target_session_attrs=read-write",
@@ -1547,6 +1823,539 @@ exit 0
         }
     }
 
+    /// The monitor URI a pre-SCRAM keeper has in its configuration.
+    const LEGACY_MONITOR_URI: &str = "postgresql://autoctl_node@monitor-host:5432/pg_auto_failover";
+
+    /// A `gosu` standing in for `gosu postgres pg_autoctl ...` on a member.
+    ///
+    /// `show file` answers from `$CONFIG_FILE`; `config get|set` persist into
+    /// `$CONFIG_STORE.<key>` the way pg_autoctl's own file does; PostgreSQL
+    /// is down, so every psql call fails. The first `$FLAKY_CONFIG_CALLS`
+    /// `config` calls fail with the error pg_autoctl prints when it reads
+    /// its configuration mid-rewrite, and the first `$STALE_SETS`
+    /// `config set` calls store an older value, as the keeper's own copy
+    /// overwrites a value written between its read and its write.
+    const FAKE_GOSU: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >> "$COMMAND_LOG"
+case "$*" in
+  *"pg_autoctl show file"*) printf '%s\n' "$CONFIG_FILE" ;;
+  *"pg_autoctl config "*)
+    CALLS=$(cat "$CONFIG_STORE.calls" 2>/dev/null || echo 0)
+    CALLS=$((CALLS + 1))
+    echo "$CALLS" > "$CONFIG_STORE.calls"
+    if [ "$CALLS" -le "${FLAKY_CONFIG_CALLS:-0}" ]; then
+      echo "ERROR Failed to find section pg_autoctl in \"$CONFIG_FILE\"" >&2
+      exit 1
+    fi
+    # gosu postgres pg_autoctl config <verb> --pgdata <dir> <key> [value]
+    case "$4" in
+      set)
+        STALE=$(cat "$CONFIG_STORE.stale" 2>/dev/null || echo 0)
+        if [ "$STALE" -lt "${STALE_SETS:-0}" ]; then
+          echo $((STALE + 1)) > "$CONFIG_STORE.stale"
+          printf '%s' stale > "$CONFIG_STORE.$7"
+        else
+          printf '%s' "$8" > "$CONFIG_STORE.$7"
+        fi
+        printf '%s\n' "$8"
+        ;;
+      get)
+        cat "$CONFIG_STORE.$7" 2>/dev/null || exit 1
+        echo
+        ;;
+    esac
+    ;;
+  *psql*) exit 2 ;;
+esac
+exit 0
+"#;
+
+    struct NodePrepareRun {
+        success: bool,
+        stderr: String,
+        replication_password: String,
+        monitor_uri: String,
+    }
+
+    /// Runs the NodePrepare script against [`FAKE_GOSU`] on a standby with
+    /// no database yet (so the script ends after the configuration steps).
+    /// `None` when bash is unavailable.
+    fn run_node_prepare(
+        flaky_config_calls: u32,
+        stale_sets: u32,
+        config_file_exists: bool,
+    ) -> Option<NodePrepareRun> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        // `sleep` is a no-op so the retry backoff does not slow the test.
+        for command in ["chown", "chmod", "sleep"] {
+            let path = bin.join(command);
+            std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let gosu = bin.join("gosu");
+        std::fs::write(&gosu, FAKE_GOSU).unwrap();
+        std::fs::set_permissions(gosu, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let config_file = dir.path().join("xdg/pg_autoctl.cfg");
+        std::fs::create_dir_all(config_file.parent().unwrap()).unwrap();
+        if config_file_exists {
+            std::fs::write(&config_file, "[pg_autoctl]\n").unwrap();
+        }
+        let store = dir.path().join("config-store");
+        std::fs::write(
+            format!("{}.pg_autoctl.monitor", store.display()),
+            LEGACY_MONITOR_URI,
+        )
+        .unwrap();
+        let pgdata = dir.path().join("pgdata");
+        let script = PostgresClusterService::auth_upgrade_command(AuthUpgradeStep::NodePrepare)[2]
+            .replace("/var/lib/postgresql/pgdata", pgdata.to_str().unwrap())
+            .replace(
+                "/var/lib/postgresql/.pgpass",
+                dir.path().join(".pgpass").to_str().unwrap(),
+            );
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("COMMAND_LOG", dir.path().join("commands"))
+            .env("CONFIG_FILE", &config_file)
+            .env("CONFIG_STORE", &store)
+            .env("FLAKY_CONFIG_CALLS", flaky_config_calls.to_string())
+            .env("STALE_SETS", stale_sets.to_string())
+            .env("NODE_PORT", "6201")
+            .env("AUTOCTL_NODE_PASSWORD", "node-secret")
+            .env("REPLICATION_PASSWORD", "replication-secret")
+            .output()
+            .ok()?;
+        let read = |key: &str| {
+            std::fs::read_to_string(format!("{}.{key}", store.display())).unwrap_or_default()
+        };
+        Some(NodePrepareRun {
+            success: output.status.success(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            replication_password: read("replication.password"),
+            monitor_uri: read("pg_autoctl.monitor"),
+        })
+    }
+
+    /// A running keeper rewrites its configuration file in place on every
+    /// reload, and each `pg_autoctl config set` of the upgrade signals one.
+    /// The next `config get|set` can therefore read a half-written file and
+    /// fail ("Failed to find section pg_autoctl"). NodePrepare must retry
+    /// rather than turn that into a failed upgrade step.
+    #[test]
+    fn node_prepare_retries_pg_autoctl_config_while_the_keeper_rewrites_it() {
+        let Some(run) = run_node_prepare(7, 0, true) else {
+            eprintln!("bash unavailable; skipping");
+            return;
+        };
+        assert!(run.success, "NodePrepare failed: {}", run.stderr);
+        assert_eq!(run.replication_password, "replication-secret");
+        assert_eq!(
+            run.monitor_uri,
+            "postgresql://autoctl_node:node-secret@monitor-host:5432/pg_auto_failover"
+        );
+        assert!(
+            !run.stderr.contains("replication-secret") && !run.stderr.contains("node-secret"),
+            "credentials must never be printed: {}",
+            run.stderr
+        );
+    }
+
+    /// The keeper may write back its older copy over a value just stored.
+    /// NodePrepare reads every value back and stores it again.
+    #[test]
+    fn node_prepare_stores_again_a_value_the_keeper_overwrote() {
+        let Some(run) = run_node_prepare(0, 2, true) else {
+            eprintln!("bash unavailable; skipping");
+            return;
+        };
+        assert!(run.success, "NodePrepare failed: {}", run.stderr);
+        assert_eq!(run.replication_password, "replication-secret");
+        assert_eq!(
+            run.monitor_uri,
+            "postgresql://autoctl_node:node-secret@monitor-host:5432/pg_auto_failover"
+        );
+    }
+
+    /// A keeper that overwrites the value every time must not keep the step
+    /// looping: after five read-backs that disagree it stops, names the
+    /// setting, and fails without printing either password.
+    #[test]
+    fn node_prepare_gives_up_when_the_keeper_keeps_overwriting_a_value() {
+        let Some(run) = run_node_prepare(0, 1_000_000, true) else {
+            eprintln!("bash unavailable; skipping");
+            return;
+        };
+        assert!(!run.success, "repeated overwrites must fail the step");
+        assert!(
+            run.stderr
+                .contains("pg_autoctl config replication.password was overwritten"),
+            "names the setting and the cause: {}",
+            run.stderr
+        );
+        assert!(
+            run.stderr.contains("5 times in a row"),
+            "reports the attempt limit: {}",
+            run.stderr
+        );
+        assert!(
+            !run.stderr.contains("replication-secret") && !run.stderr.contains("node-secret"),
+            "credentials must never be printed: {}",
+            run.stderr
+        );
+        assert_eq!(
+            run.monitor_uri, LEGACY_MONITOR_URI,
+            "no later setting may be touched once the step has failed"
+        );
+    }
+
+    /// A step that cannot store the configuration must say which setting
+    /// failed and why -- the control plane reports this output, and an empty
+    /// string leaves nothing to act on -- without printing the password.
+    #[test]
+    fn node_prepare_reports_why_the_configuration_could_not_be_stored() {
+        let Some(run) = run_node_prepare(1_000_000, 0, true) else {
+            eprintln!("bash unavailable; skipping");
+            return;
+        };
+        assert!(!run.success, "a permanent pg_autoctl failure must fail");
+        assert!(
+            run.stderr.contains("config set replication.password"),
+            "names the setting: {}",
+            run.stderr
+        );
+        assert!(
+            run.stderr.contains("Failed to find section pg_autoctl"),
+            "carries pg_autoctl's own message: {}",
+            run.stderr
+        );
+        assert!(
+            !run.stderr.contains("replication-secret"),
+            "credentials must never be printed: {}",
+            run.stderr
+        );
+    }
+
+    /// A member whose pg_autoctl configuration does not exist is not
+    /// initialized; the step must say so instead of exiting silently.
+    #[test]
+    fn node_prepare_explains_a_missing_pg_autoctl_configuration() {
+        let Some(run) = run_node_prepare(0, 0, false) else {
+            eprintln!("bash unavailable; skipping");
+            return;
+        };
+        assert!(!run.success);
+        assert!(
+            run.stderr.contains("does not exist"),
+            "explains the failure: {}",
+            run.stderr
+        );
+    }
+
+    /// Regression for #1352: adding a replica re-ran the in-place upgrade on
+    /// an existing standby still waiting for its initial base backup. It has
+    /// pg_autoctl configuration but no `$PGDATA` directory, so NodePrepare
+    /// failed with "ln: failed to create symbolic link .../pg_autoctl.cfg".
+    /// Both data-node steps must instead converge without creating `$PGDATA`
+    /// (pg_autoctl moves the backup into place there) and without waiting for
+    /// a server that cannot start until the backup completes.
+    #[test]
+    fn data_node_upgrade_steps_converge_on_a_standby_without_a_database() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        for command in ["chown", "chmod"] {
+            let path = bin.join(command);
+            std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let config_file = dir.path().join("xdg/pg_autoctl.cfg");
+        std::fs::create_dir_all(config_file.parent().unwrap()).unwrap();
+        std::fs::write(&config_file, "[pg_autoctl]\n").unwrap();
+        // pg_autoctl answers from its configuration; PostgreSQL is not
+        // running, so every psql call fails.
+        let gosu = bin.join("gosu");
+        std::fs::write(&gosu, FAKE_GOSU).unwrap();
+        std::fs::set_permissions(gosu, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config_store = dir.path().join("config-store");
+        std::fs::write(
+            format!("{}.pg_autoctl.monitor", config_store.display()),
+            LEGACY_MONITOR_URI,
+        )
+        .unwrap();
+
+        let pgdata = dir.path().join("pgdata");
+        let pgpass = dir.path().join(".pgpass");
+        for step in [AuthUpgradeStep::NodePrepare, AuthUpgradeStep::NodeEnforce] {
+            let log = dir.path().join("commands");
+            std::fs::write(&log, "").unwrap();
+            let script = PostgresClusterService::auth_upgrade_command(step)[2]
+                .replace("/var/lib/postgresql/pgdata", pgdata.to_str().unwrap())
+                .replace("/var/lib/postgresql/.pgpass", pgpass.to_str().unwrap());
+            let Ok(mut child) = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(&script)
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .env("COMMAND_LOG", &log)
+                .env("CONFIG_FILE", &config_file)
+                .env("CONFIG_STORE", &config_store)
+                .env("NODE_PORT", "6201")
+                .env("AUTOCTL_NODE_PASSWORD", "node-secret")
+                .env("REPLICATION_PASSWORD", "replication-secret")
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+            else {
+                eprintln!("bash unavailable; skipping {step:?} script test");
+                return;
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if std::time::Instant::now() > deadline {
+                    let _ = child.kill();
+                    panic!(
+                        "{step:?} waited for a server a standby without a database cannot start"
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            };
+            let mut stderr = String::new();
+            std::io::Read::read_to_string(child.stderr.as_mut().unwrap(), &mut stderr).unwrap();
+            assert!(status.success(), "{step:?} failed: {stderr}");
+            assert!(
+                !pgdata.exists(),
+                "{step:?} must not create PGDATA ahead of the base backup"
+            );
+            assert!(stderr.contains("no database yet"), "{step:?}: {stderr}");
+            if step == AuthUpgradeStep::NodePrepare {
+                // The standby still records the credentials it will use.
+                let calls = std::fs::read_to_string(&log).unwrap();
+                assert!(calls.contains("config set"), "{calls}");
+                assert!(calls.contains("replication.password"), "{calls}");
+                assert!(std::fs::read_to_string(&pgpass)
+                    .unwrap()
+                    .contains("pgautofailover_replicator:replication-secret"));
+            }
+        }
+    }
+
+    /// The no-database shortcut belongs to the exec'd upgrade only: in the
+    /// entrypoint, the replicator-password loop must keep waiting for
+    /// `pg_autoctl run` to start PostgreSQL on a freshly initialized primary.
+    #[test]
+    fn entrypoint_keeps_waiting_for_postgres_before_setting_the_replicator_password() {
+        let docker =
+            Docker::connect_with_http("http://127.0.0.1:1", 120, bollard::API_DEFAULT_VERSION)
+                .unwrap();
+        let service = PostgresClusterService::new("test".into(), Arc::new(docker));
+        let entrypoint = &service.node_command()[2];
+        assert!(!entrypoint.contains("TEMPS_AUTH_UPGRADE=1"));
+        for step in [AuthUpgradeStep::NodePrepare, AuthUpgradeStep::NodeEnforce] {
+            assert!(PostgresClusterService::auth_upgrade_command(step)[2]
+                .contains("TEMPS_AUTH_UPGRADE=1"));
+        }
+    }
+
+    /// Regression: after an unclean restart a member found its own stale
+    /// pidfile ("already running with PID 1") and crash-looped, because the
+    /// cleanup glob stopped two levels below where pg_autoctl writes it.
+    #[test]
+    fn stale_pidfile_cleanup_reaches_pg_autoctls_nested_pidfile() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let runtime = root.path().join("pg_autoctl");
+        let nested = runtime.join("var/lib/postgresql/monitor");
+        std::fs::create_dir_all(&nested).expect("create pidfile dir");
+        let pidfile = nested.join("pg_autoctl.pid");
+        let unrelated = nested.join("pg_autoctl.state");
+        std::fs::write(&pidfile, "1\n").expect("write pidfile");
+        std::fs::write(&unrelated, "keep").expect("write state");
+
+        let script =
+            STALE_PIDFILE_CLEANUP.replace("/tmp/pg_autoctl", &runtime.display().to_string());
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .status()
+            .expect("run cleanup");
+
+        assert!(status.success());
+        assert!(!pidfile.exists(), "the nested pidfile must be removed");
+        assert!(unrelated.exists(), "only pidfiles are removed");
+
+        // A first boot has no runtime dir at all; that must not fail the
+        // `set -e` monitor script.
+        let missing = STALE_PIDFILE_CLEANUP.replace(
+            "/tmp/pg_autoctl",
+            &root.path().join("absent").display().to_string(),
+        );
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("set -e\n{missing}"))
+            .status()
+            .expect("run cleanup");
+        assert!(status.success());
+    }
+
+    #[test]
+    fn member_commands_clear_stale_pidfiles_before_running() {
+        let docker = Docker::connect_with_local_defaults().unwrap();
+        let svc = PostgresClusterService::new("ha-pg".to_string(), Arc::new(docker));
+        for script in [&svc.monitor_command()[2], &svc.node_command()[2]] {
+            let cleanup = script
+                .find(STALE_PIDFILE_CLEANUP)
+                .expect("the start script must clear stale pidfiles");
+            let run = script.find("pg_autoctl run").expect("runs pg_autoctl");
+            assert!(
+                cleanup < run,
+                "cleanup must happen before pg_autoctl starts"
+            );
+            assert!(!script.contains("/tmp/pg_autoctl/*/*.pid"));
+        }
+    }
+
+    #[test]
+    fn standby_clones_request_a_fast_checkpoint_before_pg_autoctl_starts() {
+        let script = offline_service().node_command()[2].clone();
+        let wrapper = script
+            .find(&fast_checkpoint_basebackup_snippet(PG_BINDIR_GLOB))
+            .expect("the data node script installs the fast-checkpoint wrapper");
+        let create = script
+            .find("pg_autoctl create postgres")
+            .expect("create runs");
+        let run = script.find("pg_autoctl run").expect("run runs");
+        assert!(
+            wrapper < create && wrapper < run,
+            "the wrapper must be in place before pg_autoctl clones a standby"
+        );
+        // The monitor never clones, so it does not touch its binaries.
+        assert!(!offline_service().monitor_command()[2].contains("pg_basebackup"));
+    }
+
+    /// Runs the real snippet against a stand-in `pg_basebackup` that records
+    /// its arguments, twice (a container restart), and checks what pg_autoctl
+    /// would actually execute.
+    #[cfg(unix)]
+    #[test]
+    fn fast_checkpoint_wrapper_passes_the_flag_and_survives_a_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let bindir = root.path().join("18").join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let recorded = root.path().join("args");
+        let original = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\n",
+            recorded.display()
+        );
+        let pg_basebackup = bindir.join("pg_basebackup");
+        std::fs::write(&pg_basebackup, &original).unwrap();
+        std::fs::set_permissions(
+            &pg_basebackup,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+
+        let glob = format!("{}/*/bin", root.path().display());
+        let snippet = fast_checkpoint_basebackup_snippet(&glob);
+        for _ in 0..2 {
+            let status = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(format!("set -e\n{snippet}"))
+                .status()
+                .expect("run the snippet");
+            assert!(status.success());
+        }
+
+        let real = bindir.join(format!("pg_basebackup{REAL_PG_BASEBACKUP_SUFFIX}"));
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            original,
+            "the real binary is moved aside once and never overwritten"
+        );
+        let status = std::process::Command::new(&pg_basebackup)
+            .args(["-w", "-d", "host=primary port=6121", "--wal-method=stream"])
+            .status()
+            .expect("run the wrapper");
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(&recorded).unwrap().trim(),
+            "--checkpoint=fast -w -d host=primary port=6121 --wal-method=stream"
+        );
+    }
+
+    /// A stop between moving the real binary aside and installing the
+    /// wrapper leaves only `pg_basebackup.temps-real`; the next start must
+    /// put the wrapper back rather than skip the directory.
+    #[cfg(unix)]
+    #[test]
+    fn fast_checkpoint_wrapper_is_repaired_after_an_interrupted_install() {
+        let root = tempfile::tempdir().unwrap();
+        let bindir = root.path().join("18").join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let recorded = root.path().join("args");
+        let real = bindir.join(format!("pg_basebackup{REAL_PG_BASEBACKUP_SUFFIX}"));
+        std::fs::write(
+            &real,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\n",
+                recorded.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&real, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let pg_basebackup = bindir.join("pg_basebackup");
+        assert!(
+            !pg_basebackup.exists(),
+            "the interrupted state has no command"
+        );
+
+        let glob = format!("{}/*/bin", root.path().display());
+        let status = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "set -e\n{}",
+                fast_checkpoint_basebackup_snippet(&glob)
+            ))
+            .status()
+            .expect("run the snippet");
+        assert!(status.success());
+
+        let status = std::process::Command::new(&pg_basebackup)
+            .args(["-w", "-D", "/tmp/x"])
+            .status()
+            .expect("run the repaired wrapper");
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(&recorded).unwrap().trim(),
+            "--checkpoint=fast -w -D /tmp/x"
+        );
+    }
+
+    /// No PostgreSQL bin directory (another image layout): nothing to wrap,
+    /// and the entrypoint must carry on.
+    #[cfg(unix)]
+    #[test]
+    fn fast_checkpoint_snippet_is_a_no_op_without_postgres_binaries() {
+        let root = tempfile::tempdir().unwrap();
+        let glob = format!("{}/*/bin", root.path().display());
+        let status = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "set -e\n{}",
+                fast_checkpoint_basebackup_snippet(&glob)
+            ))
+            .status()
+            .expect("run the snippet");
+        assert!(status.success());
+    }
+
     #[test]
     fn test_monitor_command_contains_ssl() {
         let docker = Docker::connect_with_defaults()
@@ -1594,6 +2403,319 @@ exit 0
         );
         assert!(script.contains("ALTER ROLE pgautofailover_replicator PASSWORD :'pw'"));
         assert_no_trust_for_infrastructure_roles(script);
+    }
+
+    /// Service whose command generators never contact Docker.
+    fn offline_service() -> PostgresClusterService {
+        let docker =
+            Docker::connect_with_http("http://127.0.0.1:1", 120, bollard::API_DEFAULT_VERSION)
+                .unwrap();
+        PostgresClusterService::new("test".into(), Arc::new(docker))
+    }
+
+    /// The `pg_hba` lines a script appends for the application catch-all.
+    fn app_catch_all_rules(script: &str) -> Vec<String> {
+        script
+            .lines()
+            .filter(|l| l.contains("echo '") && l.contains(" all all "))
+            .map(|l| l.trim().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn node_command_app_catch_all_uses_scram_not_md5() {
+        let script = offline_service().node_command()[2].clone();
+        let rules = app_catch_all_rules(&script);
+        assert_eq!(
+            rules,
+            [
+                "echo 'hostssl all all 0.0.0.0/0 scram-sha-256' >> \"$HBA\"",
+                "echo 'hostssl all all ::/0 scram-sha-256' >> \"$HBA\"",
+                "echo 'host all all 0.0.0.0/0 scram-sha-256' >> \"$HBA\"",
+                "echo 'host all all ::/0 scram-sha-256' >> \"$HBA\"",
+            ]
+        );
+        // An existing catch-all of either method (a legacy md5 volume, or
+        // a pg_hba.conf cloned from the primary) is not duplicated.
+        assert!(script
+            .contains("grep -Eq '^host all all 0\\.0\\.0\\.0/0 (md5|scram-sha-256)' \"$HBA\""));
+        // Linked apps receive a POSTGRES_URL without `sslmode`, so non-TLS
+        // application connections must keep working.
+        assert!(!script.contains("hostnossl all all"), "{script}");
+    }
+
+    #[test]
+    fn node_command_decides_app_auth_after_infrastructure_rewrite() {
+        let script = offline_service().node_command()[2].clone();
+        let enforce = script
+            .find(NODE_ENFORCE_SNIPPET)
+            .expect("infrastructure enforce runs");
+        let app_auth = script
+            .find(NODE_APP_AUTH_SNIPPET)
+            .expect("application auth decision runs");
+        assert!(
+            enforce < app_auth,
+            "both rewrite pg_hba.conf; they must not run concurrently"
+        );
+        assert!(app_auth < script.find("exec gosu postgres pg_autoctl run").unwrap());
+        // The decision is based on stored hashes, never on assumptions.
+        assert!(NODE_APP_AUTH_SNIPPET
+            .contains("FROM pg_authid WHERE rolcanlogin AND rolpassword LIKE 'md5%'"));
+    }
+
+    #[test]
+    fn auth_upgrade_node_enforce_applies_app_auth_decision_and_waits() {
+        let node =
+            PostgresClusterService::auth_upgrade_command(AuthUpgradeStep::NodeEnforce)[2].clone();
+        let enforce = node.find(NODE_ENFORCE_SNIPPET).expect("enforce body");
+        let app_auth = node.find(NODE_APP_AUTH_SNIPPET).expect("app auth decision");
+        assert!(enforce < app_auth);
+        assert!(node.trim_end().ends_with("wait $!"), "{node}");
+        for step in [
+            AuthUpgradeStep::MonitorPrepare,
+            AuthUpgradeStep::NodePrepare,
+            AuthUpgradeStep::MonitorEnforce,
+        ] {
+            let script = PostgresClusterService::auth_upgrade_command(step)[2].clone();
+            assert!(
+                !script.contains("rolpassword LIKE 'md5%'"),
+                "{step:?} must not touch application auth"
+            );
+        }
+    }
+
+    /// Run [`NODE_APP_AUTH_SNIPPET`] against a temporary `pg_hba.conf`
+    /// with `gosu` stubbed: `psql` reports `md5_roles`, `pg_ctl` is
+    /// recorded. Returns `(pg_hba.conf, stderr, reloaded)`, or `None` when
+    /// bash is unavailable.
+    #[cfg(unix)]
+    fn run_app_auth_snippet(hba: &str, md5_roles: &str) -> Option<(String, String, bool)> {
+        let (hba, stderr, reloaded, succeeded) = run_app_auth_snippet_status(hba, md5_roles)?;
+        assert!(succeeded, "snippet failed: {stderr}");
+        Some((hba, stderr, reloaded))
+    }
+
+    /// Like [`run_app_auth_snippet`], also returning whether the job exited
+    /// 0. `sleep` is stubbed so a PostgreSQL that never answers exhausts the
+    /// retry loop immediately.
+    #[cfg(unix)]
+    fn run_app_auth_snippet_status(
+        hba: &str,
+        md5_roles: &str,
+    ) -> Option<(String, String, bool, bool)> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let gosu = bin.join("gosu");
+        std::fs::write(
+            &gosu,
+            r#"#!/bin/sh
+shift
+case "$1" in
+  psql) printf '%s\n' "$MD5_ROLES_STUB" ;;
+  pg_ctl) printf 'reload\n' >> "$COMMAND_LOG" ;;
+esac
+exit 0
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(gosu, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let sleep = bin.join("sleep");
+        std::fs::write(&sleep, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(sleep, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pgdata = dir.path().join("pgdata");
+        std::fs::create_dir(&pgdata).unwrap();
+        std::fs::write(pgdata.join("pg_hba.conf"), hba).unwrap();
+        let log = dir.path().join("commands");
+        std::fs::write(&log, "").unwrap();
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!("{NODE_APP_AUTH_SNIPPET}\nwait $!"))
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("PGDATA", &pgdata)
+            .env("NODE_PORT", "5432")
+            .env("MD5_ROLES_STUB", md5_roles)
+            .env("COMMAND_LOG", &log)
+            .output()
+            .ok()?;
+        let leftovers: Vec<_> = std::fs::read_dir(&pgdata)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "pg_hba.conf")
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
+        Some((
+            std::fs::read_to_string(pgdata.join("pg_hba.conf")).unwrap(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            std::fs::read_to_string(&log).unwrap().contains("reload"),
+            output.status.success(),
+        ))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_auth_fails_when_postgres_never_answers_so_the_upgrade_is_retried() {
+        // `psql` prints nothing on every attempt, as when the server is down.
+        let Some((hba, stderr, reloaded, succeeded)) =
+            run_app_auth_snippet_status(LEGACY_NODE_HBA, "")
+        else {
+            eprintln!("bash unavailable; skipping");
+            return;
+        };
+        assert!(
+            !succeeded,
+            "an undecided member must fail the step, or the cluster is marked converged: {stderr}"
+        );
+        assert_eq!(hba, LEGACY_NODE_HBA, "rules must be left unchanged");
+        assert!(!reloaded);
+        assert!(
+            stderr.contains("did not accept local connections") && stderr.contains("5432"),
+            "{stderr}"
+        );
+    }
+
+    const LEGACY_NODE_HBA: &str = "\
+local   all             all                                     trust
+hostnossl all pgautofailover_replicator 0.0.0.0/0 reject # Temps infrastructure authentication
+hostssl all pgautofailover_replicator 0.0.0.0/0 scram-sha-256 # Temps infrastructure authentication
+hostssl all all 0.0.0.0/0 md5
+hostssl all all ::/0 md5
+host all all 0.0.0.0/0 md5
+host all all ::/0 md5
+hostssl all \"pgautofailover_monitor\" 172.26.0.2/32 trust # Auto-generated by pg_auto_failover
+host app_db app_user 10.0.0.0/8 md5
+";
+
+    #[cfg(unix)]
+    #[test]
+    fn app_auth_switches_catch_all_to_scram_when_no_md5_hashes_exist() {
+        let Some((hba, stderr, reloaded)) = run_app_auth_snippet(LEGACY_NODE_HBA, "0") else {
+            eprintln!("bash unavailable; skipping");
+            return;
+        };
+        let expected = LEGACY_NODE_HBA
+            .replace("all all 0.0.0.0/0 md5", "all all 0.0.0.0/0 scram-sha-256")
+            .replace("all all ::/0 md5", "all all ::/0 scram-sha-256");
+        // Only the four catch-all lines change: initdb's local trust, the
+        // infrastructure guards, pg_auto_failover's monitor rule and a
+        // narrower operator rule are untouched.
+        assert_eq!(hba, expected, "stderr: {stderr}");
+        assert!(hba.contains("host app_db app_user 10.0.0.0/8 md5"));
+        assert!(reloaded);
+        assert!(stderr.contains("now use scram-sha-256"), "{stderr}");
+
+        // Converged: a second run changes nothing and does not reload.
+        let (again, _, reloaded) = run_app_auth_snippet(&expected, "0").unwrap();
+        assert_eq!(again, expected);
+        assert!(!reloaded);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_auth_keeps_md5_and_explains_when_md5_hashes_exist() {
+        let Some((hba, stderr, reloaded)) = run_app_auth_snippet(LEGACY_NODE_HBA, "2") else {
+            eprintln!("bash unavailable; skipping");
+            return;
+        };
+        assert_eq!(hba, LEGACY_NODE_HBA);
+        assert!(!reloaded);
+        assert!(
+            stderr.contains("keeping md5")
+                && stderr.contains("2 login role(s) store an MD5 password hash"),
+            "{stderr}"
+        );
+
+        // A SCRAM catch-all (new member cloned from a primary that still has
+        // MD5-hashed roles) is put back to md5 so those roles can log in.
+        let scram =
+            LEGACY_NODE_HBA.replace("all all 0.0.0.0/0 md5", "all all 0.0.0.0/0 scram-sha-256");
+        let (restored, _, reloaded) = run_app_auth_snippet(&scram, "1").unwrap();
+        assert_eq!(restored, LEGACY_NODE_HBA);
+        assert!(reloaded);
+    }
+
+    /// The app-user SQL heredoc is quoted: nothing in it is expanded by
+    /// the shell, and the credentials only reach psql as variables.
+    #[test]
+    fn node_app_user_sql_never_splices_credentials() {
+        let script = offline_service().node_command()[2].clone();
+        assert!(script.contains("cat > \"$SQL_FILE\" <<'SQL_EOF'"));
+        assert!(!script.contains("<<SQL_EOF"));
+        for spliced in ["${POSTGRES_PASSWORD}", "${POSTGRES_USER}", "${POSTGRES_DB}"] {
+            assert!(!script.contains(spliced), "{spliced} spliced into SQL");
+        }
+        assert!(script.contains(
+            "-v app_user=\"$POSTGRES_USER\" -v app_password=\"$POSTGRES_PASSWORD\" -v app_db=\"$POSTGRES_DB\""
+        ));
+        // Values are quoted by psql and format(), never by hand.
+        assert!(APP_USER_SQL.contains(
+            "format('ALTER ROLE %I WITH LOGIN SUPERUSER PASSWORD %L', :'app_user', :'app_password')"
+        ));
+        assert!(
+            APP_USER_SQL.contains("format('CREATE DATABASE %I OWNER %I', :'app_db', :'app_user')")
+        );
+        // The stored password is a SCRAM verifier whatever the server default.
+        let pin = APP_USER_SQL
+            .find("SET password_encryption = 'scram-sha-256';")
+            .expect("password_encryption pinned");
+        assert!(pin < APP_USER_SQL.find("PASSWORD %L").unwrap());
+        // psql variables are not interpolated inside dollar-quoted bodies,
+        // so the statement must not be wrapped in a DO block.
+        assert!(!APP_USER_SQL.contains("$$"));
+    }
+
+    /// Run the generated heredoc with hostile credentials in the
+    /// environment: the SQL file must be byte-for-byte [`APP_USER_SQL`].
+    #[test]
+    fn node_app_user_heredoc_is_not_expanded_by_the_shell() {
+        let script = offline_service().node_command()[2].clone();
+        let start = script
+            .find("  cat > \"$SQL_FILE\" <<'SQL_EOF'")
+            .expect("heredoc present");
+        let end = script[start..]
+            .find("\nSQL_EOF")
+            .expect("heredoc terminated")
+            + start;
+        let heredoc = format!("{}\nSQL_EOF\ncat \"$SQL_FILE\"", &script[start..end]);
+        let marker = std::env::temp_dir().join(format!("temps-heredoc-{}", uuid::Uuid::new_v4()));
+        let Ok(output) = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "SQL_FILE=$(mktemp)\n{heredoc}\nrm -f \"$SQL_FILE\""
+            ))
+            .env("POSTGRES_USER", "app\"user")
+            .env(
+                "POSTGRES_PASSWORD",
+                format!(
+                    "pa'ss$(touch {m})`touch {m}`\\'; DROP ROLE x; --",
+                    m = marker.display()
+                ),
+            )
+            .env("POSTGRES_DB", "db'name")
+            .output()
+        else {
+            eprintln!("bash unavailable; skipping");
+            return;
+        };
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim_end(),
+            APP_USER_SQL
+        );
+        assert!(!marker.exists(), "password was executed by the shell");
+    }
+
+    #[test]
+    fn standby_skips_app_user_alter() {
+        let script = offline_service().node_command()[2].clone();
+        let probe = script
+            .find("-c 'SELECT pg_is_in_recovery()'")
+            .expect("recovery probe");
+        let alter = script.find("-f \"$SQL_FILE\"").expect("SQL applied");
+        assert!(probe < alter);
+        assert!(script.contains("if [ \"$IN_RECOVERY\" = f ] && gosu postgres psql"));
     }
 
     #[test]
@@ -1644,6 +2766,101 @@ exit 0
             !params.environment.contains_key("REPLICATION_PASSWORD"),
             "the monitor never needs the replication secret"
         );
+    }
+
+    #[test]
+    fn uri_host_brackets_only_ipv6_literals() {
+        assert_eq!(uri_host("fd00::10"), "[fd00::10]");
+        assert_eq!(uri_host("::1"), "[::1]");
+        assert_eq!(uri_host("10.52.0.10"), "10.52.0.10");
+        assert_eq!(uri_host("postgres-ha-pg-monitor"), "postgres-ha-pg-monitor");
+        assert_eq!(
+            uri_host("ha-pg-1.ha-pg.temps.local"),
+            "ha-pg-1.ha-pg.temps.local"
+        );
+        // Already bracketed is not a bare literal: left alone, not doubled.
+        assert_eq!(uri_host("[fd00::10]"), "[fd00::10]");
+    }
+
+    /// Regression: a control plane whose private address is IPv6 put it
+    /// bare into the data members' monitor URI
+    /// (`...@fd00::10:6030/pg_auto_failover`), which libpq cannot parse, so
+    /// worker data members could never register.
+    #[test]
+    fn ipv6_monitor_address_yields_a_parseable_monitor_uri() {
+        use std::str::FromStr;
+
+        let docker = Docker::connect_with_defaults()
+            .unwrap_or_else(|_| Docker::connect_with_local_defaults().unwrap());
+        let service = PostgresClusterService::new("ha-pg".to_string(), Arc::new(docker));
+        let config: PostgresClusterConfig =
+            serde_json::from_value(serde_json::json!({ "password": "secret" })).unwrap();
+        let spec = ClusterMemberSpec {
+            role: "replica".to_string(),
+            node_id: Some(2),
+            ordinal: 1,
+            hostname: Some("fd00::21".to_string()),
+        };
+
+        let params = service.build_member_params(
+            &spec,
+            &config,
+            "fd00::10",
+            6030,
+            6031,
+            crate::externalsvc::ServiceResourceLimits::default(),
+            &test_auth(),
+        );
+
+        let uri = params.environment.get("MONITOR_URI").unwrap();
+        assert!(uri.contains("@[fd00::10]:6030/pg_auto_failover"), "{uri}");
+        let parsed = tokio_postgres::Config::from_str(uri).expect("monitor URI must parse");
+        assert_eq!(
+            parsed.get_hosts(),
+            &[tokio_postgres::config::Host::Tcp("fd00::10".to_string())]
+        );
+        assert_eq!(parsed.get_ports(), &[6030]);
+        // pg_autoctl's `--hostname` takes the bare address.
+        assert_eq!(params.environment.get("NODE_HOSTNAME").unwrap(), "fd00::21");
+    }
+
+    #[test]
+    fn ipv6_members_yield_a_parseable_cluster_connection_string() {
+        use std::str::FromStr;
+
+        let docker = Docker::connect_with_defaults()
+            .unwrap_or_else(|_| Docker::connect_with_local_defaults().unwrap());
+        let service = PostgresClusterService::new("ha-pg".to_string(), Arc::new(docker));
+        let member = |hostname: &str, port: i32| ClusterMemberInfo {
+            role: "replica".to_string(),
+            hostname: hostname.to_string(),
+            port,
+            status: "running".to_string(),
+        };
+        let config = ServiceConfig {
+            name: "ha-pg".to_string(),
+            service_type: ServiceType::Postgres,
+            version: None,
+            parameters: serde_json::json!({ "password": "secret" }),
+        };
+
+        let url = service
+            .cluster_connection_string(
+                &[member("fd00::21", 6031), member("10.52.0.22", 6032)],
+                &config,
+            )
+            .unwrap();
+
+        assert!(url.contains("@[fd00::21]:6031,10.52.0.22:6032/"), "{url}");
+        let parsed = tokio_postgres::Config::from_str(&url).expect("cluster URL must parse");
+        assert_eq!(
+            parsed.get_hosts(),
+            &[
+                tokio_postgres::config::Host::Tcp("fd00::21".to_string()),
+                tokio_postgres::config::Host::Tcp("10.52.0.22".to_string()),
+            ]
+        );
+        assert_eq!(parsed.get_ports(), &[6031, 6032]);
     }
 
     #[test]
@@ -1710,9 +2927,11 @@ exit 0
 mod scram_docker_tests {
     use super::*;
     use bollard::exec::{CreateExecOptions, StartExecResults};
-    use bollard::models::{ContainerCreateBody, HostConfig, NetworkCreateRequest};
+    use bollard::models::{
+        ContainerCreateBody, HostConfig, NetworkCreateRequest, RestartPolicy, RestartPolicyNameEnum,
+    };
     use bollard::query_parameters::{
-        CreateContainerOptionsBuilder, RemoveContainerOptions, RenameContainerOptions,
+        CreateContainerOptionsBuilder, LogsOptions, RemoveContainerOptions, RenameContainerOptions,
         StartContainerOptions, StopContainerOptions,
     };
     use futures::{FutureExt, StreamExt};
@@ -1724,6 +2943,12 @@ mod scram_docker_tests {
         docker: Arc<Docker>,
         network: String,
         containers: Vec<String>,
+        /// Create containers with the `unless-stopped` policy real cluster
+        /// members run with, so a keeper that exits while its monitor is
+        /// down comes back as it would in production. Off by default:
+        /// tests that assert a deliberate exit need the container to stay
+        /// down.
+        restart_unless_stopped: bool,
     }
 
     impl Fixture {
@@ -1771,6 +2996,7 @@ mod scram_docker_tests {
                 docker,
                 network,
                 containers: Vec::new(),
+                restart_unless_stopped: false,
             })
         }
 
@@ -1793,6 +3019,10 @@ mod scram_docker_tests {
                 host_config: Some(HostConfig {
                     network_mode: Some(self.network.clone()),
                     volumes_from: volume_from.map(|name| vec![format!("{name}:rw")]),
+                    restart_policy: self.restart_unless_stopped.then(|| RestartPolicy {
+                        name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -1860,6 +3090,23 @@ mod scram_docker_tests {
             cmd: Vec<String>,
             env: &HashMap<String, String>,
         ) -> (i64, String) {
+            match self.try_exec(container, cmd, env).await {
+                Ok(result) => result,
+                Err(e) => panic!(
+                    "create exec in {container}: {e}\n{}",
+                    self.describe(container).await
+                ),
+            }
+        }
+
+        /// Like `exec`, but returns the error when the exec cannot be
+        /// created, e.g. while the container is restarting.
+        async fn try_exec(
+            &self,
+            container: &str,
+            cmd: Vec<String>,
+            env: &HashMap<String, String>,
+        ) -> Result<(i64, String), bollard::errors::Error> {
             let env: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
             let exec = self
                 .docker
@@ -1873,8 +3120,7 @@ mod scram_docker_tests {
                         ..Default::default()
                     },
                 )
-                .await
-                .unwrap_or_else(|e| panic!("create exec in {container}: {e}"));
+                .await?;
             let mut out = String::new();
             if let Ok(StartExecResults::Attached { mut output, .. }) =
                 self.docker.start_exec(&exec.id, None).await
@@ -1890,7 +3136,69 @@ mod scram_docker_tests {
                 .ok()
                 .and_then(|i| i.exit_code)
                 .unwrap_or(-1);
-            (code, out)
+            Ok((code, out))
+        }
+
+        /// State, restart count and recent output of `container`, for
+        /// failure messages: a container that is not running says why.
+        async fn describe(&self, container: &str) -> String {
+            let state = match self.docker.inspect_container(container, None).await {
+                Ok(info) => {
+                    let state = info.state.unwrap_or_default();
+                    format!(
+                        "{container}: status={:?} exit_code={:?} error={:?} restart_count={:?}",
+                        state.status, state.exit_code, state.error, info.restart_count
+                    )
+                }
+                Err(e) => format!("{container}: inspect failed: {e}"),
+            };
+            let mut logs = self.docker.logs(
+                container,
+                Some(LogsOptions {
+                    stdout: true,
+                    stderr: true,
+                    tail: "40".to_string(),
+                    ..Default::default()
+                }),
+            );
+            let mut tail = String::new();
+            while let Some(Ok(chunk)) = logs.next().await {
+                tail.push_str(&chunk.to_string());
+            }
+            format!("{state}\nlast log lines of {container}:\n{tail}")
+        }
+
+        /// Wait until `container` runs and its PostgreSQL accepts
+        /// connections. After a restart the monitor still reports the
+        /// member's last state, so `wait_for` alone can pass before the
+        /// member is back.
+        async fn wait_serving(&self, container: &str, timeout: Duration) {
+            let start = Instant::now();
+            loop {
+                let probe = self
+                    .try_exec(
+                        container,
+                        vec![
+                            "pg_isready".into(),
+                            "-h".into(),
+                            "127.0.0.1".into(),
+                            "-p".into(),
+                            "5432".into(),
+                        ],
+                        &HashMap::new(),
+                    )
+                    .await;
+                if matches!(probe, Ok((0, _))) {
+                    return;
+                }
+                if start.elapsed() >= timeout {
+                    panic!(
+                        "{container} did not accept connections within {timeout:?} (last probe: {probe:?})\n{}",
+                        self.describe(container).await
+                    );
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
         }
 
         async fn sh(&self, container: &str, script: &str) -> (i64, String) {
@@ -1900,6 +3208,20 @@ mod scram_docker_tests {
                 &HashMap::new(),
             )
             .await
+        }
+
+        /// Like `state`, for failure reports: a monitor that is down must
+        /// not replace the failure being reported with a second panic.
+        async fn state_for_report(&self, monitor: &str) -> String {
+            let command = vec![
+                "bash".to_string(),
+                "-c".to_string(),
+                format!("gosu postgres pg_autoctl show state --pgdata {MONITOR_PGDATA}"),
+            ];
+            match self.try_exec(monitor, command, &HashMap::new()).await {
+                Ok((_, out)) => out,
+                Err(e) => format!("cluster state unavailable: could not exec in {monitor}: {e}"),
+            }
         }
 
         async fn state(&self, monitor: &str) -> String {
@@ -2190,6 +3512,56 @@ mod scram_docker_tests {
                 .await;
             fx.wait_for(&monitor, &n1, "secondary", Duration::from_secs(180))
                 .await;
+
+            // A cluster marked converged at auth version 1 still has `md5`
+            // application rules until each member restarts. The version-2
+            // upgrade re-runs only `NodeEnforce`; on a running member with no
+            // MD5 hash that alone must switch them, on primary and standby.
+            let app_rules = "grep -E '^host(ssl)? all all (0\\.0\\.0\\.0/0|::/0) ' \
+                             /var/lib/postgresql/pgdata/pg_hba.conf";
+            for node in [&n1, &n2] {
+                let (code, out) = fx
+                    .sh(
+                        node,
+                        "sed -i -E 's#^(host(ssl)? all all (0\\.0\\.0\\.0/0|::/0) )scram-sha-256#\\1md5#' \
+                         /var/lib/postgresql/pgdata/pg_hba.conf \
+                         && gosu postgres pg_ctl reload -D /var/lib/postgresql/pgdata",
+                    )
+                    .await;
+                assert_eq!(code, 0, "{node}: put app rules back to md5: {out}");
+                let (_, before) = fx.sh(node, app_rules).await;
+                assert!(
+                    before.lines().count() == 4 && before.lines().all(|l| l.ends_with(" md5")),
+                    "{node}: expected four md5 app rules before the upgrade: {before}"
+                );
+
+                let (code, out) = fx
+                    .exec(
+                        node,
+                        PostgresClusterService::auth_upgrade_command(AuthUpgradeStep::NodeEnforce),
+                        &auth.env(),
+                    )
+                    .await;
+                assert_eq!(code, 0, "{node}: NodeEnforce: {out}");
+                let (_, after) = fx.sh(node, app_rules).await;
+                assert!(
+                    after.lines().count() == 4
+                        && after.lines().all(|l| l.ends_with(" scram-sha-256")),
+                    "{node}: app rules must switch to scram-sha-256: {after}"
+                );
+            }
+            // The application user still authenticates over TCP afterwards.
+            let (code, out) = fx
+                .sh(
+                    &n2,
+                    &format!(
+                        "PGPASSWORD=AppUserSecret123 psql -X -At \
+                         \"host={n2} port=5432 user=appuser dbname=appdb sslmode=require\" \
+                         -c 'SELECT 1'"
+                    ),
+                )
+                .await;
+            assert!(code == 0 && out.contains('1'), "app user login after upgrade: {out}");
         })
         .catch_unwind()
         .await;
@@ -2204,6 +3576,8 @@ mod scram_docker_tests {
         let Some(mut fx) = Fixture::new().await else {
             return;
         };
+        // This test restarts members while their monitor restarts too.
+        fx.restart_unless_stopped = true;
         let suffix = fx.network[fx.network.len() - 8..].to_string();
         let monitor = format!("legacy{suffix}-monitor");
         let n1 = format!("legacy{suffix}-1");
@@ -2288,7 +3662,13 @@ mod scram_docker_tests {
                             &auth.env(),
                         )
                         .await;
-                    assert_eq!(code, 0, "{step:?} on {target}: {out}");
+                    if code != 0 {
+                        panic!(
+                            "{step:?} on {target} exited {code}: {out:?}\n{}\ncluster state:\n{}",
+                            fx.describe(target).await,
+                            fx.state_for_report(&monitor).await,
+                        );
+                    }
                 }
             }
             for node in [&n1, &n2] {
@@ -2344,6 +3724,8 @@ mod scram_docker_tests {
                 )
                 .await
                 .unwrap_or_else(|e| panic!("restart {monitor}: {e}"));
+            fx.wait_serving(&monitor, Duration::from_secs(240)).await;
+            fx.wait_serving(&n1, Duration::from_secs(240)).await;
             fx.wait_for(&monitor, &n1, "secondary", Duration::from_secs(240))
                 .await;
             assert_infrastructure_roles_require_passwords(&fx, &n2, &monitor, &[&n1, &n2], &auth)

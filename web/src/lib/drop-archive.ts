@@ -10,16 +10,55 @@ export interface PreparedDrop {
   file: File
   fileCount: number
   rootPage: string | null
+  /** What a dropped folder left out of the upload (empty for a ZIP, whose
+   * left-out entries the server reports). At most 50 paths. */
+  leftOut: DropLeftOutPath[]
+  /** Files left out in total, including any beyond the listed paths. */
+  leftOutFileCount: number
 }
 
-const ARCHIVE_PATTERN = /\.zip$/i
-const IGNORED_PATH_PARTS = new Set([
-  '.DS_Store',
-  'Thumbs.db',
-  '__MACOSX',
-  '.git',
-  'node_modules',
+/**
+ * Why a file is not uploaded. Mirrors the server's `DropSkipReason`, plus
+ * `private_key`: a folder's keys and credentials are never packed, while a
+ * ZIP that contains one is refused by the server, naming the entry.
+ */
+export type DropLeftOutReason =
+  | 'version_control'
+  | 'dependencies'
+  | 'environment_file'
+  | 'os_metadata'
+  | 'private_key'
+
+/** One line of the "left out of the upload" notice. */
+export interface DropLeftOutPath {
+  /** The file, or the directory (ending in `/`) whose files were left out. */
+  path: string
+  reason: DropLeftOutReason
+  files: number
+}
+
+type DropPathDisposition =
+  | { kind: 'keep' }
+  | { kind: 'skip'; reason: DropLeftOutReason; reportedPath: string }
+
+/** Distinct left-out paths listed, matching the server's bound. */
+const MAX_LEFT_OUT_PATHS = 50
+
+/**
+ * Folders left out wherever they appear. A `Map`, not an object literal, so
+ * an ordinary folder named `constructor` or `toString` never matches an
+ * inherited property.
+ */
+const DIRECTORY_REASONS = new Map<string, DropLeftOutReason>([
+  ['.git', 'version_control'],
+  ['node_modules', 'dependencies'],
+  ['__MACOSX', 'os_metadata'],
 ])
+
+/** Last dot-separated suffixes that make a `.env.*` file a template. */
+const ENV_TEMPLATE_SUFFIXES = new Set(['example', 'sample', 'template', 'dist'])
+
+const ARCHIVE_PATTERN = /\.zip$/i
 const textEncoder = new TextEncoder()
 const MAX_BROWSER_PACKAGE_BYTES = 100 * 1024 * 1024
 
@@ -47,39 +86,114 @@ function cleanPath(path: string): string {
   return parts.join('/')
 }
 
-function shouldIgnore(path: string): boolean {
-  return path
-    .split('/')
-    .some(
+function isEnvironmentFile(name: string): boolean {
+  if (name === '.env') return true
+  if (!name.startsWith('.env.')) return false
+  const suffix = name.split('.').pop() ?? ''
+  return !ENV_TEMPLATE_SUFFIXES.has(suffix)
+}
+
+/**
+ * The server's Drop rule (`temps_core::drop_entries`), so a folder and a ZIP
+ * of the same project upload the same files: templates such as
+ * `.env.example` are kept; version control, dependencies, environment files,
+ * OS metadata and private keys are left out. Directory rules win, so a test
+ * certificate inside `node_modules/` is reported as dependencies.
+ */
+export function classifyDropPath(path: string): DropPathDisposition {
+  const parts = path.split('/').filter(Boolean)
+  const last = parts.length - 1
+  const through = (index: number) =>
+    parts.slice(0, index + 1).join('/') + (index < last ? '/' : '')
+  for (const [index, part] of parts.entries()) {
+    const reason = DIRECTORY_REASONS.get(part)
+    if (reason) return { kind: 'skip', reason, reportedPath: through(index) }
+  }
+  for (const [index, part] of parts.entries()) {
+    if (isEnvironmentFile(part)) {
+      return {
+        kind: 'skip',
+        reason: 'environment_file',
+        reportedPath: through(index),
+      }
+    }
+  }
+  if (parts[last] === '.DS_Store' || parts[last] === 'Thumbs.db') {
+    return { kind: 'skip', reason: 'os_metadata', reportedPath: path }
+  }
+  if (
+    parts.some(
       (part) =>
-        IGNORED_PATH_PARTS.has(part) ||
-        part === '.env' ||
-        part.startsWith('.env.') ||
         part.endsWith('.pem') ||
         part.endsWith('.key') ||
         part === 'credentials.json'
     )
+  ) {
+    return { kind: 'skip', reason: 'private_key', reportedPath: path }
+  }
+  return { kind: 'keep' }
+}
+
+/**
+ * Kept files, with a shared top folder removed, and what was left out.
+ *
+ * Paths are classified before the selected folder's name is removed, so
+ * choosing `node_modules` or `.git` itself still leaves it out. `leftOut`
+ * lists at most 50 paths; `leftOutFileCount` counts every file left out.
+ */
+export function partitionDropFiles(files: DropFile[]): {
+  kept: DropFile[]
+  leftOut: DropLeftOutPath[]
+  leftOutFileCount: number
+} {
+  const cleaned = files
+    .map(({ file, path }) => ({ file, path: cleanPath(path || file.name) }))
+    .filter(({ path }) => path)
+
+  // The selected folder's own name is not part of the project.
+  const splitPaths = cleaned.map(({ path }) => path.split('/'))
+  const firstPart = splitPaths[0]?.[0]
+  const hasSharedFolder =
+    splitPaths.length > 0 &&
+    splitPaths.every((parts) => parts.length > 1 && parts[0] === firstPart)
+  const sharedPrefix = hasSharedFolder ? `${firstPart}/` : ''
+  // Relative to the selected folder, unless the excluded path is that
+  // folder itself (`node_modules/` when node_modules was selected).
+  const relativeTo = (path: string) =>
+    sharedPrefix && path.startsWith(sharedPrefix) && path !== sharedPrefix
+      ? path.slice(sharedPrefix.length)
+      : path
+
+  const kept: DropFile[] = []
+  const leftOut = new Map<string, DropLeftOutPath>()
+  let leftOutFileCount = 0
+  for (const entry of cleaned) {
+    const disposition = classifyDropPath(entry.path)
+    if (disposition.kind === 'keep') {
+      kept.push({ file: entry.file, path: relativeTo(entry.path) })
+      continue
+    }
+    leftOutFileCount += 1
+    const reportedPath = relativeTo(disposition.reportedPath)
+    const listed = leftOut.get(reportedPath)
+    if (listed) listed.files += 1
+    else if (leftOut.size < MAX_LEFT_OUT_PATHS) {
+      leftOut.set(reportedPath, {
+        path: reportedPath,
+        reason: disposition.reason,
+        files: 1,
+      })
+    }
+  }
+  return {
+    kept,
+    leftOut: [...leftOut.values()].sort((a, b) => a.path.localeCompare(b.path)),
+    leftOutFileCount,
+  }
 }
 
 export function normalizeDropFiles(files: DropFile[]): DropFile[] {
-  const cleaned = files
-    .map(({ file, path }) => ({ file, path: cleanPath(path || file.name) }))
-    .filter(({ path }) => path && !shouldIgnore(path))
-
-  if (cleaned.length === 0) return []
-
-  const splitPaths = cleaned.map(({ path }) => path.split('/'))
-  const firstPart = splitPaths[0][0]
-  const hasSharedFolder = splitPaths.every(
-    (parts) => parts.length > 1 && parts[0] === firstPart
-  )
-
-  return hasSharedFolder
-    ? cleaned.map(({ file, path }) => ({
-        file,
-        path: path.slice(firstPart.length + 1),
-      }))
-    : cleaned
+  return partitionDropFiles(files).kept
 }
 
 export function htmlRootCandidates(files: DropFile[]): string[] {
@@ -231,11 +345,29 @@ export async function prepareDrop(
     if (rawFiles[0].file.size > 500 * 1024 * 1024) {
       throw new Error('Drop exceeds the 500 MB upload limit')
     }
-    return { file: rawFiles[0].file, fileCount: 1, rootPage: null }
+    return {
+      file: rawFiles[0].file,
+      fileCount: 1,
+      rootPage: null,
+      leftOut: [],
+      leftOutFileCount: 0,
+    }
   }
 
-  const files = normalizeDropFiles(rawFiles)
-  if (files.length === 0) throw new Error('The selected folder is empty')
+  const {
+    kept: files,
+    leftOut,
+    leftOutFileCount,
+  } = partitionDropFiles(rawFiles)
+  if (files.length === 0) {
+    throw new Error(
+      leftOutFileCount > 0
+        ? `Nothing in the selected folder can be uploaded: everything in it is left out (${leftOut
+            .map(({ path }) => path)
+            .join(', ')}). Select the project folder instead.`
+        : 'The selected folder is empty'
+    )
+  }
 
   const totalBytes = files.reduce((sum, { file }) => sum + file.size, 0)
   if (totalBytes > MAX_BROWSER_PACKAGE_BYTES) {
@@ -264,5 +396,7 @@ export async function prepareDrop(
     file: new File([archive], 'temps-drop.zip', { type: 'application/zip' }),
     fileCount: files.length,
     rootPage,
+    leftOut,
+    leftOutFileCount,
   }
 }

@@ -36,7 +36,9 @@ pub struct Model {
     /// owned the run died with the previous Temps process; `phase` then keeps
     /// the phase the run was in.
     pub status: String,
-    /// "prepare" | "provision" | "restore" | "recover" | "verify" | "completed" | "failed"
+    /// "prepare" | "download" | "provision" | "restore" | "recover" | "verify" |
+    /// "completed" | "failed". A `cancelled` or `interrupted` run keeps the
+    /// phase it stopped in.
     pub phase: String,
     /// PITR target serialized as JSON (Time | Xid | Lsn | Name).
     /// Null for non-PITR modes.
@@ -56,6 +58,12 @@ pub struct Model {
     pub created_by: i32,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
+    /// When a user asked to cancel the run. Recorded only while the run is in
+    /// a cancellable phase; the worker's move out of that phase is
+    /// conditional on this being NULL, so the two cannot both win.
+    pub cancel_requested_at: Option<DBDateTime>,
+    /// Who asked to cancel the run.
+    pub cancel_requested_by: Option<i32>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

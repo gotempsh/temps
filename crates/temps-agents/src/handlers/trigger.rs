@@ -70,14 +70,31 @@ impl AuditOperation for AgentRunTriggeredAudit {
 // lives in `handlers::workflows` — it owns its own routes, request type, and
 // audit struct.
 
+/// Request body ceiling for the agent webhook trigger. Matches what the route
+/// accepted before it declared a limit (axum's default).
+const WEBHOOK_TRIGGER_BODY_LIMIT: usize = 2 * 1024 * 1024;
+
+/// The agent webhook trigger (ADR-051 D3).
+///
+/// Called by whatever system the operator wired the agent to, from the open
+/// internet and with no session, so it is mounted on the public router. The
+/// handler authenticates the request with the agent's `X-Webhook-Token`
+/// (constant-time compared) and never reads the session cookie.
+pub fn public_routes() -> Router<Arc<AppState>> {
+    Router::new().route(
+        "/agents/webhook/{webhook_id}",
+        post(webhook_trigger).layer(axum::extract::DefaultBodyLimit::max(
+            WEBHOOK_TRIGGER_BODY_LIMIT,
+        )),
+    )
+}
+
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route(
             "/projects/{project_id}/agents/{slug}/trigger",
             post(trigger_agent),
         )
-        // Public webhook endpoint — X-Webhook-Token header auth
-        .route("/agents/webhook/{webhook_id}", post(webhook_trigger))
         .route(
             "/projects/{project_id}/agents/cli-status",
             get(get_cli_status),
@@ -438,6 +455,9 @@ pub struct SandboxStatusResponse {
     pub image_name: String,
     pub error: Option<String>,
     pub firecracker_available: bool,
+    /// Experimental microsandbox microVM backend (ADR-050). Always present:
+    /// when not configured it carries the reason and where to set it up.
+    pub microsandbox: crate::sandbox::microsandbox::MicrosandboxCapability,
 }
 
 #[utoipa::path(
@@ -488,6 +508,9 @@ pub async fn get_sandbox_status(
         image_name,
         error,
         firecracker_available: false,
+        microsandbox: crate::sandbox::microsandbox::microsandbox_capability(
+            &crate::sandbox::microsandbox::host_data_dir(),
+        ),
     }))
 }
 
@@ -532,6 +555,7 @@ pub async fn get_global_sandbox_status(
         });
     let firecracker_available =
         crate::sandbox::firecracker::is_firecracker_available(&data_dir).await;
+    let microsandbox = crate::sandbox::microsandbox::microsandbox_capability(&data_dir);
 
     Ok(Json(SandboxStatusResponse {
         docker_available,
@@ -539,6 +563,7 @@ pub async fn get_global_sandbox_status(
         image_name,
         error,
         firecracker_available,
+        microsandbox,
     }))
 }
 

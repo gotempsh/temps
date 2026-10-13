@@ -45,7 +45,15 @@ test('direct project links and direct flat settings navigation', async ({
   })
   await primary.getByRole('link', { name: 'Settings', exact: true }).click()
   const settings = page.getByRole('navigation', { name: 'Settings pages' })
-  await expect(settings.getByRole('link')).toHaveCount(7)
+  await expect(settings.getByRole('link')).toHaveText([
+    'General',
+    'Build & deploy',
+    'Domains',
+    'Variables',
+    'Automation',
+    'Integrations',
+    'Telemetry',
+  ])
   await expect(settings.locator('a > svg')).toHaveCount(7)
   await settings
     .getByRole('link', { name: 'Build & deploy', exact: true })
@@ -58,9 +66,10 @@ test('direct project links and direct flat settings navigation', async ({
     .locator('summary')
     .filter({ hasText: /^Build$/ })
     .click()
-  await expect(
-    page.getByRole('heading', { name: 'Build', exact: true })
-  ).toBeVisible()
+  await expect(page.locator('#settings-section-build')).toHaveAttribute(
+    'open',
+    ''
+  )
   await expect(
     settings.getByRole('link', { name: 'Build & deploy', exact: true })
   ).toHaveAttribute('aria-current', 'page')
@@ -71,9 +80,10 @@ test('direct project links and direct flat settings navigation', async ({
     .locator('summary')
     .filter({ hasText: /^Deployment$/ })
     .click()
-  await expect(
-    page.getByRole('heading', { name: 'Deployment', exact: true })
-  ).toBeVisible()
+  await expect(page.locator('#settings-section-deployment')).toHaveAttribute(
+    'open',
+    ''
+  )
   await expect(page).toHaveURL(/settings\/delivery$/)
   await page.screenshot({
     path: '/tmp/temps-project-settings-compact-icons.png',
@@ -103,16 +113,37 @@ test('direct project links and direct flat settings navigation', async ({
     path: '/tmp/temps-project-security-flat.png',
     fullPage: true,
   })
-  for (const [section, count] of [
-    ['Logs', 3],
-    ['Traces', 2],
-    ['Monitoring', 3],
-    ['Analytics', 11],
+  // Each contextual navigation lists exactly these pages, in this order.
+  // Naming them (rather than only counting) is what catches a page being
+  // added, dropped or renamed; `toHaveText` with an array also pins the count.
+  for (const [section, pages] of [
+    ['Logs', ['Application logs', 'Request logs', 'Telemetry logs']],
+    ['Traces', ['Traces', 'AI traces']],
+    ['Monitoring', ['Metrics', 'Uptime', 'Status pages', 'Alert rules']],
+    [
+      'Analytics',
+      [
+        'Overview',
+        'Visitors',
+        'Live visitors',
+        'Live globe',
+        'Journey',
+        'Activity report',
+        'Pages',
+        'Sessions',
+        'Funnels',
+        'Web performance',
+        'AI visitors',
+        'API traffic',
+        'AI crawlers',
+        'Revenue',
+      ],
+    ],
   ] as const) {
     await primary.getByRole('link', { name: section, exact: true }).click()
     const nav = page.getByRole('navigation', { name: `${section} pages` })
-    await expect(nav.getByRole('link')).toHaveCount(count)
-    await expect(nav.locator('a > svg')).toHaveCount(count)
+    await expect(nav.getByRole('link')).toHaveText([...pages])
+    await expect(nav.locator('a > svg')).toHaveCount(pages.length)
     await expect(
       primary.getByRole('link', { name: section, exact: true })
     ).toHaveAttribute('aria-current', 'page')
@@ -143,10 +174,18 @@ test('legacy build links and mobile contextual navigation stay usable', async ({
   expect(projects.length).toBeGreaterThan(0)
   const root = `/projects/${projects[0].slug}`
   await page.setViewportSize({ width: 390, height: 844 })
+  // The old standalone build page redirects to its section of Build & deploy,
+  // opened and scrolled into view.
   await page.goto(`${root}/settings/build?tab=previews`)
-  await expect(
-    page.getByRole('heading', { name: 'Preview environments', exact: true })
-  ).toBeVisible()
+  await expect(page).toHaveURL(/settings\/delivery\?section=previews$/)
+  await expect(page.locator('#settings-section-previews')).toHaveAttribute(
+    'open',
+    ''
+  )
+  await expect(page.locator('#settings-section-build')).not.toHaveAttribute(
+    'open',
+    ''
+  )
   await page
     .getByRole('button', { name: 'Settings pages', exact: true })
     .click()

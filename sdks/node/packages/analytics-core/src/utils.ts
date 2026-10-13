@@ -81,6 +81,25 @@ export function withIngestKey(url: string, ingestKey?: string): string {
   return `${url}${separator}${INGEST_KEY_QUERY_PARAM}=${encodeURIComponent(ingestKey)}`;
 }
 
+/**
+ * Wraps a JSON payload for `navigator.sendBeacon`.
+ *
+ * Beacons always use credentials mode `include`. A beacon whose Blob type is
+ * not CORS-safelisted (`application/json` is not) is preflighted, and a
+ * cross-origin preflight for a credentialed request fails unless the server
+ * answers with a credentialed grant — so on keyed, cross-origin ingest the
+ * unload events (`page_leave`, late Web Vitals, the final replay batch) were
+ * silently dropped. `text/plain` is safelisted: the beacon goes out with no
+ * preflight, and the server parses its body as JSON exactly as before.
+ *
+ * Only keyed requests are sent as `text/plain`. The server accepts that type
+ * on the keyed path alone, and an app without a key is served by Temps on its
+ * own origin, where `application/json` was never a problem.
+ */
+export function beaconBlob(payload: string, ingestKey?: string): Blob {
+  return new Blob([payload], { type: ingestKey ? "text/plain" : "application/json" });
+}
+
 export async function sendAnalytics(
   endpoint: string,
   data: Record<string, JsonValue>,
@@ -125,8 +144,7 @@ export function sendAnalyticsReliable(
       typeof navigator.sendBeacon === "function"
     ) {
       try {
-        const blob = new Blob([payload], { type: "application/json" });
-        if (navigator.sendBeacon(url, blob)) return true;
+        if (navigator.sendBeacon(url, beaconBlob(payload, ingestKey))) return true;
       } catch {
         // fall through to fetch
       }

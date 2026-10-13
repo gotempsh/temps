@@ -117,6 +117,8 @@ export interface SecuritySettingsFormData {
   security_headers: SecurityHeadersSettings
   rate_limiting: RateLimitSettings
   trust_loopback_forwarded_ip: boolean
+  /** Edited by SecurityPage itself; carried here so both share one form. */
+  trusted_private_networks_text: string
 }
 
 interface SecuritySettingsProps {
@@ -428,6 +430,7 @@ export function SecuritySettings({
                         placeholder="192.168.1.1 or 10.0.0.0/24"
                       />
                       <Button
+                        aria-label="Remove IP address"
                         type="button"
                         variant="outline"
                         size="icon"

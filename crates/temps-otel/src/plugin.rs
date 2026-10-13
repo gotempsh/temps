@@ -631,7 +631,24 @@ impl TempsPlugin for OtelPlugin {
             // are always delegated to TimescaleDbStorage regardless.
             // When ClickHouse is not configured, TimescaleDbStorage is
             // used for everything — the default, unchanged path.
-            let ch_config = read_clickhouse_otel_config_from_env();
+            // The wire-compression mode every ClickHouse client of this process
+            // uses, resolved once from the stored `clickhouse.compression`
+            // setting by `ConfigPlugin`. Without a ConfigService (a stripped
+            // test context) the default applies, as it did before the mode
+            // was configurable.
+            let clickhouse_compression = match context.get_service::<temps_config::ConfigService>()
+            {
+                Some(config_service) => config_service.clickhouse_compression(),
+                None => {
+                    tracing::warn!(
+                        "ConfigService unavailable; ClickHouse OTel clients use the default \
+                         compression mode instead of the stored setting"
+                    );
+                    temps_clickhouse::ClickHouseCompression::default()
+                }
+            };
+            let ch_config = read_clickhouse_otel_config_from_env()
+                .map(|cfg| cfg.with_compression(clickhouse_compression));
 
             // ── Facet cache ──────────────────────────────────────────────────
             //
@@ -1011,14 +1028,8 @@ impl TempsPlugin for OtelPlugin {
             // When CH is not configured, `ch_client_for_facets` is None and
             // create/delete operations warn and skip the mutation step.
             let ch_client_for_facets: Option<::clickhouse::Client> = {
-                let ch_cfg = read_clickhouse_otel_config_from_env();
-                ch_cfg.map(|cfg| {
-                    ::clickhouse::Client::default()
-                        .with_url(&cfg.url)
-                        .with_database(&cfg.database)
-                        .with_user(&cfg.user)
-                        .with_password(&cfg.password)
-                })
+                read_clickhouse_otel_config_from_env()
+                    .map(|cfg| cfg.with_compression(clickhouse_compression).client())
             };
             let facet_service = Arc::new(
                 FacetService::new(db.clone(), ch_client_for_facets, facet_cache.clone())
@@ -1106,11 +1117,7 @@ impl TempsPlugin for OtelPlugin {
             let cloud_backfill_source = cloud_link.as_ref().map(|_| {
                 Arc::new(match read_clickhouse_otel_config_from_env() {
                     Some(cfg) => crate::services::CloudBackfillSource::ClickHouse(Arc::new(
-                        ::clickhouse::Client::default()
-                            .with_url(&cfg.url)
-                            .with_database(&cfg.database)
-                            .with_user(&cfg.user)
-                            .with_password(&cfg.password),
+                        cfg.with_compression(clickhouse_compression).client(),
                     )),
                     None => crate::services::CloudBackfillSource::Timescale(db.clone()),
                 })

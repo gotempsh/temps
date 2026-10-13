@@ -25,6 +25,7 @@ pub use plugin::ConfigPlugin;
 pub use retention::{settings_retention_resolver, RETENTION_REFRESH_INTERVAL};
 pub use service::{
     anonymous_telemetry_preference, installation_mode, stateless_instance_id,
-    stateless_telemetry_anonymous_id, ClusterCaRotationResult, ClusterNetworkState, ConfigService,
-    ConfigServiceError, EffectiveTelemetryPolicies, InstallationMode, ServerConfig,
+    stateless_telemetry_anonymous_id, stored_clickhouse_compression, ClusterCaRotationResult,
+    ClusterNetworkState, ConfigService, ConfigServiceError, EffectiveTelemetryPolicies,
+    InstallationMode, ServerConfig, SettingsUpdateResult, TrustedPrivateNetworksIntent,
 };

@@ -15,7 +15,6 @@ import {
   getEnvironmentsOptions,
   getProjectDeploymentsOptions,
   hasTracesOptions,
-  listFacetsOptions,
   queryTraceSummariesOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { TelemetryBacklogBanner } from '@/components/observe/TelemetryBacklogBanner'
@@ -30,6 +29,8 @@ import {
 } from '@/components/project/setup/SetupWizardShell'
 import { Input } from '@/components/ui/input'
 import { useDebounce } from '@/hooks/useDebounce'
+import { useAttributeFilter } from '@/hooks/useAttributeFilter'
+import { attributesQueryValue } from '@/lib/attribute-facets'
 import {
   computeTracesTimeWindow,
   traceDetailPath,
@@ -72,7 +73,6 @@ import {
   RefreshCw,
   Search,
   Settings2,
-  Tag,
   Terminal,
   Workflow,
 } from 'lucide-react'
@@ -123,10 +123,10 @@ function formatDuration(ms: number): string {
 }
 
 function durationColor(ms: number): string {
-  if (ms < 100) return 'text-green-600 dark:text-green-400'
-  if (ms < 500) return 'text-yellow-600 dark:text-yellow-400'
-  if (ms < 2000) return 'text-orange-600 dark:text-orange-400'
-  return 'text-red-600 dark:text-red-400'
+  if (ms < 100) return 'text-green-700 dark:text-green-400'
+  if (ms < 500) return 'text-yellow-700 dark:text-yellow-400'
+  if (ms < 2000) return 'text-orange-700 dark:text-orange-400'
+  return 'text-red-700 dark:text-red-400'
 }
 
 const PAGE_SIZE = 10
@@ -736,10 +736,12 @@ export default function TracesList({ project }: TracesListProps) {
   const [deploymentId, setDeploymentId] = useState(
     () => searchParams.get('deploy') || 'all'
   )
-  // Attribute filter: restricted to registered facets only (see ADR-039 /
-  // the FacetToggle in TraceDetail) — an unfaceted attribute would force a
-  // JSON scan over every span in the project's whole retention window, which
-  // is exactly the query this platform can't afford at 500M+ rows.
+  // Attribute filter: restricted to registered facets (see ADR-039 / the
+  // FacetToggle in TraceDetail) — an unfaceted attribute would force a JSON
+  // scan over every span in the project's whole retention window, which is
+  // exactly the query this platform can't afford at 500M+ rows. The control is
+  // always shown: a key that is not a facet yet explains that and offers to
+  // create the facet instead of the filter silently not existing.
   const [rawAttrKey, setAttrKey] = useState(
     () => searchParams.get('attr_key') || ''
   )
@@ -783,21 +785,22 @@ export default function TracesList({ project }: TracesListProps) {
     enabled: !!project.id,
   })
 
-  // Registered facets — platform-global, so no project scoping. Backs the
-  // attribute-key dropdown below; only faceted keys are offered since only
-  // those are fast to filter on.
-  const { data: facetsData } = useQuery({
-    ...listFacetsOptions(),
-    staleTime: 30_000,
+  // Registered facets are platform-global, so there is no project scoping.
+  // Only a facet filters here; any other key gets the create-facet prompt.
+  const attribute = useAttributeFilter({
+    attrKey: rawAttrKey,
+    attrValue,
+    facetedOnly: true,
+    onKeyChange: (key) => {
+      setAttrKey(key)
+      setPage(1)
+    },
+    onValueChange: (value) => {
+      setAttrValue(value)
+      setPage(1)
+    },
   })
-  const facets = useMemo(() => facetsData?.data ?? [], [facetsData?.data])
-  // Shared links can outlive a facet registration. Once facets load, derive
-  // an empty selection so the removed key cannot silently trigger a slow JSON
-  // scan while the dropdown appears blank.
-  const attrKey =
-    facetsData && !facets.some((facet) => facet.attribute_key === rawAttrKey)
-      ? ''
-      : rawAttrKey
+  const attrKey = attribute.appliedKey
 
   // Fetch deployments for the selected environment (or all)
   const { data: deploymentsData } = useQuery({
@@ -892,10 +895,9 @@ export default function TracesList({ project }: TracesListProps) {
           environmentId !== 'all' ? Number(environmentId) : undefined,
         deployment_id:
           deploymentId !== 'all' ? Number(deploymentId) : undefined,
-        attributes:
-          attrKey && debouncedAttrValue
-            ? `${attrKey}=${debouncedAttrValue}`
-            : undefined,
+        attributes: attrKey
+          ? attributesQueryValue(attrKey, debouncedAttrValue)
+          : undefined,
         sort_by: sortBy ?? undefined,
         sort_order: sortBy ? sortOrder : undefined,
         // Explicit: this list renders "Showing X–Y of Z" and a page count, so
@@ -985,11 +987,6 @@ export default function TracesList({ project }: TracesListProps) {
     setDeploymentId(v)
     setPage(1)
   }, [])
-  const handleAttrKeyChange = useCallback((v: string) => {
-    setAttrKey(v === '__none__' ? '' : v)
-    setAttrValue('')
-    setPage(1)
-  }, [])
 
   return (
     <div className="space-y-6">
@@ -999,6 +996,7 @@ export default function TracesList({ project }: TracesListProps) {
         actions={
           <>
             <Button
+              aria-label="Refresh"
               variant="ghost"
               size="icon"
               onClick={() => {
@@ -1025,7 +1023,7 @@ export default function TracesList({ project }: TracesListProps) {
               }
             >
               <Gauge className="h-3.5 w-3.5" />
-              <span className="hidden sm:inline">Operations</span>
+              <span className="max-sm:sr-only">Operations</span>
             </Button>
             <Button
               variant="outline"
@@ -1036,7 +1034,7 @@ export default function TracesList({ project }: TracesListProps) {
               }
             >
               <Bot className="h-3.5 w-3.5" />
-              <span className="hidden sm:inline">AI Traces</span>
+              <span className="max-sm:sr-only">AI Traces</span>
             </Button>
             <Button
               variant="outline"
@@ -1052,7 +1050,7 @@ export default function TracesList({ project }: TracesListProps) {
               }}
             >
               <Settings2 className="h-3.5 w-3.5" />
-              <span className="hidden sm:inline">Setup</span>
+              <span className="max-sm:sr-only">Setup</span>
             </Button>
             {totalCount > 0 && (
               <span className="text-sm text-muted-foreground">
@@ -1196,49 +1194,12 @@ export default function TracesList({ project }: TracesListProps) {
                   />
                 </div>
 
-                {facets.length > 0 && (
-                  <>
-                    <Select
-                      value={attrKey || '__none__'}
-                      onValueChange={handleAttrKeyChange}
-                    >
-                      <SelectTrigger className="h-9 w-full sm:w-[200px]">
-                        <Tag className="mr-2 h-3.5 w-3.5" />
-                        <SelectValue placeholder="Attribute" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="__none__">
-                          No attribute filter
-                        </SelectItem>
-                        {facets.map((f) => (
-                          <SelectItem
-                            key={f.attribute_key}
-                            value={f.attribute_key}
-                          >
-                            {f.attribute_key}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-
-                    {attrKey && (
-                      <div className="relative flex-1 min-w-0 sm:min-w-[160px]">
-                        <Input
-                          placeholder={`Value for ${attrKey}…`}
-                          value={attrValue}
-                          onChange={(e) => {
-                            setAttrValue(e.target.value)
-                            setPage(1)
-                          }}
-                          className="h-9"
-                        />
-                      </div>
-                    )}
-                  </>
-                )}
+                {attribute.controls}
               </div>
             </CardContent>
           </Card>
+
+          {attribute.notice}
 
           {/* Table */}
           {isLoading ? (
@@ -1413,6 +1374,7 @@ export default function TracesList({ project }: TracesListProps) {
                 </div>
                 <div className="flex items-center justify-center gap-1">
                   <Button
+                    aria-label="Previous page"
                     variant="outline"
                     size="sm"
                     onClick={() => setPage((p) => Math.max(1, p - 1))}
@@ -1424,6 +1386,7 @@ export default function TracesList({ project }: TracesListProps) {
                     {page} / {totalPages}
                   </span>
                   <Button
+                    aria-label="Next page"
                     variant="outline"
                     size="sm"
                     onClick={() => setPage((p) => p + 1)}

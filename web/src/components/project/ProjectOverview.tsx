@@ -25,6 +25,7 @@ import { ThresholdLineChart } from '@/components/charts/threshold-line-chart'
 import { VisitorSparkline } from '@/components/dashboard/VisitorSparkline'
 import { LastDeployment } from '@/components/deployments/LastDeployment'
 import { RecentDeployments } from '@/components/deployments/RecentDeployments'
+import { ProjectFailureBanner } from '@/components/project/ProjectFailureBanner'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader } from '@/components/ui/card'
@@ -206,6 +207,7 @@ export function ProjectOverview({
 
   return (
     <>
+      <ProjectFailureBanner project={project} lastDeployment={lastDeployment} />
       <div className="@container/overview">
         <div className="grid gap-4 @5xl/overview:grid-cols-5">
           <Card className="@5xl/overview:col-span-3">
@@ -275,7 +277,7 @@ export function ProjectOverview({
                         className={cn(
                           'text-sm font-medium tabular-nums',
                           (apiTraffic?.overall_error_rate ?? 0) > 0.05
-                            ? 'text-amber-600 dark:text-amber-400'
+                            ? 'text-amber-700 dark:text-amber-400'
                             : 'text-muted-foreground'
                         )}
                       >
@@ -770,7 +772,7 @@ function RouteMetric({
       <p
         className={cn(
           'truncate text-sm font-medium tabular-nums',
-          warning && 'text-amber-600 dark:text-amber-400'
+          warning && 'text-amber-700 dark:text-amber-400'
         )}
       >
         {value}

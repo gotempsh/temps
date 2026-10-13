@@ -154,6 +154,23 @@ impl AnalyticsIngestKeyService {
 
     // ── Ingest path ──────────────────────────────────────────────────────
 
+    /// What [`Self::resolve`] would answer for `public_key` **without** a
+    /// database query, or `None` if answering would need one.
+    ///
+    /// A malformed key is answered (`Some(None)`) because `resolve` rejects it
+    /// before the database too. Lets a caller apply the global unresolved-key
+    /// budget to exactly the lookups that cost a query — see
+    /// [`super::request::resolve_within_unresolved_budget`].
+    pub async fn resolve_without_query(
+        &self,
+        public_key: &str,
+    ) -> Option<Option<ResolvedIngestScope>> {
+        if !is_well_formed_public_key(public_key) {
+            return Some(None);
+        }
+        self.resolve_cache.get(public_key).await
+    }
+
     /// Resolve a presented key to the scope its events belong to.
     ///
     /// `Ok(None)` means "no such active key" — the caller must answer 401 and

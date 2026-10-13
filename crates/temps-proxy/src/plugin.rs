@@ -65,9 +65,14 @@ impl TempsPlugin for ProxyPlugin {
             // selection degrades to the default TimescaleDB backend if it is
             // somehow absent — proxy logging must never fail to register. When
             // present and CH is enabled, the handler reads go to ClickHouse.
-            let server_config = context
-                .get_service::<temps_config::ConfigService>()
-                .map(|cs| cs.get_server_config());
+            let config_service = context.get_service::<temps_config::ConfigService>();
+            let server_config = config_service.as_ref().map(|cs| cs.get_server_config());
+            // The ClickHouse wire-compression mode this process runs with,
+            // resolved once from the stored setting by `ConfigPlugin`.
+            let clickhouse_compression = config_service
+                .as_ref()
+                .map(|cs| cs.clickhouse_compression())
+                .unwrap_or_default();
 
             // Pre-registered by the top-level `temps serve` orchestrator
             // (commands/serve/mod.rs) BEFORE any plugin's `register_services`
@@ -100,6 +105,7 @@ impl TempsPlugin for ProxyPlugin {
                     db.clone(),
                     ip_service.clone(),
                     retention_slot as Arc<dyn temps_core::RetentionResolver>,
+                    clickhouse_compression,
                 ),
                 None => {
                     tracing::debug!(
@@ -205,17 +211,9 @@ impl TempsPlugin for ProxyPlugin {
         let proxy_log_service = context.require_service::<ProxyLogService>();
         let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
         let ip_access_control_service = context.require_service::<IpAccessControlService>();
-        let challenge_service = context.require_service::<ChallengeService>();
-        let db = context.require_service::<DbConnection>();
 
         // Create the app state directly
         let app_state = Arc::new(crate::handler::types::AppState { lb_service });
-
-        // Create CAPTCHA state
-        let captcha_state = Arc::new(crate::handler::captcha::CaptchaState {
-            db: db.clone(),
-            challenge_service: challenge_service.clone(),
-        });
 
         let proxy_logs_state = Arc::new(crate::handler::proxy_logs::ProxyLogsState {
             service: proxy_log_service,
@@ -229,10 +227,25 @@ impl TempsPlugin for ProxyPlugin {
             .merge(
                 crate::handler::ip_access_control::create_routes()
                     .with_state(ip_access_control_service),
-            )
-            .merge(crate::handler::captcha::create_routes().with_state(captcha_state));
+            );
 
         Some(PluginRoutes::new(router))
+    }
+
+    /// The proof-of-work CAPTCHA endpoints. A visitor of a protected
+    /// application solves the challenge with no session and from any host, so
+    /// these belong on the public router: `/api/_temps/*` is served by the
+    /// console's public-only surface (ADR-051), and a route under that prefix
+    /// that is only mounted on the admin router is unreachable from there.
+    fn configure_public_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
+        let captcha_state = Arc::new(crate::handler::captcha::CaptchaState {
+            db: context.require_service::<DbConnection>(),
+            challenge_service: context.require_service::<ChallengeService>(),
+        });
+
+        Some(PluginRoutes::new(
+            crate::handler::captcha::create_routes().with_state(captcha_state),
+        ))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {

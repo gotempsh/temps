@@ -33,9 +33,12 @@ pub mod openapi;
 pub mod plugin;
 pub mod problemdetails;
 pub mod project_access;
+pub mod project_deletion;
 pub mod project_ip_gate;
 pub mod public_hostname;
 pub mod public_hostname_resolver;
+pub mod public_ingress;
+pub mod public_status_page;
 pub mod registry_prefix;
 #[cfg(test)]
 mod release_manifest;
@@ -131,6 +134,7 @@ pub use on_demand::*;
 pub use project_access::{
     ApplicationDataNetworkReconciler, MembershipPermissionResolver, ProjectAccessChecker,
 };
+pub use project_deletion::ProjectDeletionHook;
 pub use project_ip_gate::{OpenIpGate, ProjectIpGate, ProjectIpGateSlot};
 pub use public_hostname::{base_domain as public_base_domain, PublicHostnameStrategy};
 pub use public_hostname_resolver::{
@@ -169,12 +173,13 @@ pub use utils::*;
 pub use anyhow;
 pub use app_settings::{
     AgentSandboxSettings, AiChatLimitsSettings, AiConfigSettings, AiWorkspaceFileLimitsSettings,
-    AppSettings, BuildLimitsSettings, CeilingEnforcement, CloudSettings, ClusterDnsSettings,
-    ConnectionLimitSettings, ContainerLogSettings, DiskSpaceAlertSettings, DnsProviderSettings,
-    DockerRegistrySettings, GeoLicenseKeyIntent, GeoSettings, GeoSettingsError,
-    ImageRetentionSettings, LetsEncryptSettings, McpServerSettings, MetricsStoreKind,
-    MonitoringSettings, MultiNodeSettings, ObservabilityCompressionSettings,
-    ObservabilityRetentionSettings, OnDemandTlsSettings, PreviewGatewaySettings, ProviderConfig,
+    AppSettings, BlobSettings, BuildLimitsSettings, CeilingEnforcement, ClickHouseCompression,
+    ClickHouseSettings, CloudSettings, ClusterDnsSettings, ConnectionLimitSettings,
+    ContainerLogSettings, DiskSpaceAlertSettings, DnsProviderSettings, DockerRegistrySettings,
+    GeoLicenseKeyIntent, GeoSettings, GeoSettingsError, ImageRetentionSettings, KvSettings,
+    LetsEncryptSettings, McpServerSettings, MetricsStoreKind, MonitoringSettings,
+    MultiNodeSettings, ObservabilityCompressionSettings, ObservabilityRetentionSettings,
+    OnDemandTlsSettings, ParseClickHouseCompressionError, PreviewGatewaySettings, ProviderConfig,
     RateLimitSettings, RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings,
     SelfUpdateSettings, TenantResourceCeilings, DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
     DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES, DEFAULT_GEO_REFRESH_INTERVAL_HOURS,
@@ -218,3 +223,101 @@ pub use workflow_memory::{
 // Re-export standard datetime type for use across all crates
 pub use types::UtcDateTime;
 pub mod archive_security;
+pub mod drop_entries;
+
+/// Lockfile guards for unmaintained crates ignored by `dependency-scan.yml`.
+///
+/// `serde_yaml` and its `unsafe-libyaml` parser are unmaintained
+/// (RUSTSEC-2024-0449), so workspace crates use `yaml_serde` instead. The
+/// advisory stays in `dependency-scan.yml`'s ignore list only because
+/// pingora-core still depends on `serde_yaml` for a conf-file loader Temps
+/// never calls. Likewise `bincode` (RUSTSEC-2025-0141) is ignored only
+/// because the microsandbox SDK requires it. An ignore covers the whole
+/// advisory, so it would also hide anything else starting to depend on these
+/// crates; these tests fail on that instead. `Cargo.lock` is embedded at
+/// compile time, so they also run from prebuilt nextest archives.
+#[cfg(test)]
+mod unmaintained_dependency_guard_tests {
+    const CARGO_LOCK: &str = include_str!("../../../Cargo.lock");
+
+    /// The only packages allowed to depend on `bincode`; see the
+    /// RUSTSEC-2025-0141 note in `.github/workflows/dependency-scan.yml`.
+    const ALLOWED_BINCODE_DEPENDENTS: &[&str] = &[
+        "microsandbox-filesystem",
+        "msb_krun_devices",
+        "msb_krun_vmm",
+    ];
+
+    /// The only package allowed to depend on `serde_yaml`; see the
+    /// RUSTSEC-2024-0449 note in `.github/workflows/dependency-scan.yml`.
+    const ALLOWED_SERDE_YAML_DEPENDENTS: &[&str] = &["pingora-core"];
+
+    /// Names of locked packages whose `dependencies` list includes `dependency`.
+    fn dependents_of<'a>(lock: &'a str, dependency: &str) -> Vec<&'a str> {
+        lock.split("[[package]]")
+            .skip(1)
+            .filter(|block| {
+                block.lines().map(str::trim).any(|line| {
+                    line.strip_prefix('"')
+                        .and_then(|l| l.trim_end_matches(',').strip_suffix('"'))
+                        .and_then(|entry| entry.split_whitespace().next())
+                        == Some(dependency)
+                })
+            })
+            .filter_map(|block| {
+                block.lines().map(str::trim).find_map(|line| {
+                    line.strip_prefix("name = \"")
+                        .and_then(|l| l.strip_suffix('"'))
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dependents_of_reads_lockfile_entries() {
+        let lock = "[[package]]\nname = \"a\"\nversion = \"1.0.0\"\ndependencies = [\n \
+                    \"serde_yaml\",\n \"other 2.0.0\",\n]\n\n[[package]]\nname = \"b\"\n\
+                    version = \"1.0.0\"\ndependencies = [\n \"serde_yaml_ng\",\n]\n";
+        assert_eq!(dependents_of(lock, "serde_yaml"), vec!["a"]);
+        assert_eq!(dependents_of(lock, "other"), vec!["a"]);
+        assert!(dependents_of(lock, "missing").is_empty());
+    }
+
+    #[test]
+    fn workspace_does_not_depend_on_unmaintained_serde_yaml() {
+        let unexpected: Vec<_> = dependents_of(CARGO_LOCK, "serde_yaml")
+            .into_iter()
+            .filter(|name| !ALLOWED_SERDE_YAML_DEPENDENTS.contains(name))
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "{unexpected:?} depend on serde_yaml, which is unmaintained and parses with \
+             unsafe-libyaml (RUSTSEC-2024-0449). Use the workspace `yaml_serde` dependency \
+             (same API) instead; see the note above it in the root Cargo.toml."
+        );
+    }
+
+    #[test]
+    fn unsafe_libyaml_is_only_reached_through_serde_yaml() {
+        let dependents = dependents_of(CARGO_LOCK, "unsafe-libyaml");
+        assert!(
+            dependents.iter().all(|name| *name == "serde_yaml"),
+            "unsafe-libyaml (RUSTSEC-2024-0449) is pulled in by {dependents:?}; only \
+             pingora-core's serde_yaml is covered by the dependency-scan.yml exception"
+        );
+    }
+
+    #[test]
+    fn bincode_is_only_reached_through_microsandbox() {
+        let unexpected: Vec<_> = dependents_of(CARGO_LOCK, "bincode")
+            .into_iter()
+            .filter(|name| !ALLOWED_BINCODE_DEPENDENTS.contains(name))
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "{unexpected:?} depend on bincode, which is unmaintained (RUSTSEC-2025-0141). \
+             The dependency-scan.yml exception only covers the microsandbox SDK's crates; \
+             use postcard or serde_json instead of adding a new bincode user."
+        );
+    }
+}

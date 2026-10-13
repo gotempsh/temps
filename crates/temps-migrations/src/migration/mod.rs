@@ -313,6 +313,15 @@ mod m20261005_000001_ai_gateway_objects;
 mod m20261005_000001_certificate_address_history;
 mod m20261005_000002_ai_batch_reconciliation;
 mod m20261006_000001_restore_runs_interrupted_status;
+mod m20261007_000001_cron_executions_cron_index;
+mod m20261007_000002_restore_runs_cancellation;
+mod m20261008_000001_create_service_data_imports;
+mod m20261009_000001_unconfirm_legacy_worker_container_removals;
+mod m20261011_000001_create_public_status_pages;
+mod m20261012_000001_ai_provider_keys_self_hosted;
+mod m20261012_000002_create_status_page_domains;
+mod m20261012_000003_managed_daemon_beta_images;
+mod m20261013_000001_webhook_delivery_identity;
 
 pub struct Migrator;
 
@@ -697,6 +706,15 @@ impl MigratorTrait for Migrator {
             Box::new(m20261005_000002_ai_batch_reconciliation::Migration),
             Box::new(m20261005_000001_certificate_address_history::Migration),
             Box::new(m20261006_000001_restore_runs_interrupted_status::Migration),
+            Box::new(m20261007_000001_cron_executions_cron_index::Migration),
+            Box::new(m20261007_000002_restore_runs_cancellation::Migration),
+            Box::new(m20261008_000001_create_service_data_imports::Migration),
+            Box::new(m20261009_000001_unconfirm_legacy_worker_container_removals::Migration),
+            Box::new(m20261011_000001_create_public_status_pages::Migration),
+            Box::new(m20261012_000001_ai_provider_keys_self_hosted::Migration),
+            Box::new(m20261012_000002_create_status_page_domains::Migration),
+            Box::new(m20261012_000003_managed_daemon_beta_images::Migration),
+            Box::new(m20261013_000001_webhook_delivery_identity::Migration),
         ]
     }
 }

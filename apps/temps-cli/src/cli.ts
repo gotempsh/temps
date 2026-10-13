@@ -16,6 +16,7 @@ import { registerAuthCommands } from './commands/auth/index.js'
 import { registerContextCommands } from './commands/context/index.js'
 import { registerConfigureCommand } from './commands/configure.js'
 import { registerSetupCommand } from './commands/setup/index.js'
+import { registerStartCommands } from './commands/start/index.js'
 import { registerProjectsCommands } from './commands/projects/index.js'
 import { registerDeployCommands } from './commands/deploy/index.js'
 import { registerDomainsCommands } from './commands/domains/index.js'
@@ -61,6 +62,7 @@ import { registerGlobalLogsCommands } from './commands/global-logs/index.js'
 import { registerEmailDomainsCommands } from './commands/email-domains/index.js'
 import { registerEmailProvidersCommands } from './commands/email-providers/index.js'
 import { registerIncidentsCommands } from './commands/incidents/index.js'
+import { registerStatusPagesCommands } from './commands/status-pages/index.js'
 import { registerAlarmsCommands } from './commands/alarms/index.js'
 import { registerEmailsCommands } from './commands/emails/index.js'
 import { registerLoadBalancerCommands } from './commands/load-balancer/index.js'
@@ -220,6 +222,7 @@ export function createProgram(): Command {
   registerEmailDomainsCommands(program)
   registerEmailProvidersCommands(program)
   registerIncidentsCommands(program)
+  registerStatusPagesCommands(program)
   registerAlarmsCommands(program)
   registerEmailsCommands(program)
   registerLoadBalancerCommands(program)
@@ -257,6 +260,7 @@ export function createProgram(): Command {
 
   registerDocsCommand(program)
   registerSetupCommand(program)
+  registerStartCommands(program)
 
   // Custom help
   program.addHelpText('beforeAll', LOGO)

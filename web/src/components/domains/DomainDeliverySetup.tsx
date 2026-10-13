@@ -57,6 +57,7 @@ import {
   DeliveryProfileLimitNote,
   DeliveryProfileSelect,
 } from './DeliveryProfileSelect'
+import { ScrollRegion } from '@/components/ui/scroll-region'
 
 const schema = z.object({
   hostname: z.string().trim().min(1, 'Enter a hostname'),
@@ -267,7 +268,10 @@ export function DomainDeliverySetup({
                 <dd>{new Date(preview.expires_at).toLocaleString()}</dd>
               </dl>
             </div>
-            <div className="overflow-x-auto rounded-lg border">
+            <ScrollRegion
+              className="rounded-lg border"
+              regionLabel="Proposed DNS record, scrollable"
+            >
               <table className="w-full text-left text-sm">
                 <caption className="sr-only">Proposed DNS record</caption>
                 <thead className="bg-muted/40 text-xs text-muted-foreground">
@@ -293,7 +297,7 @@ export function DomainDeliverySetup({
                   </tr>
                 </tbody>
               </table>
-            </div>
+            </ScrollRegion>
             {preview.record.requires_adoption && (
               <div className="rounded-lg border border-amber-500/40 bg-amber-500/5 p-4">
                 <p className="text-sm font-medium">

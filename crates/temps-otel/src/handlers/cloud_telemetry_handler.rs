@@ -29,7 +29,8 @@ use tracing::error;
 use utoipa::ToSchema;
 
 use crate::services::telemetry_write_mode::{
-    CloudLinkSnapshot, ProjectTelemetryWriteSettings, TelemetryWriteModeError, CLOUD_SETUP_PATH,
+    project_telemetry_settings_path, CloudLinkSnapshot, ProjectTelemetryWriteSettings,
+    TelemetryWriteModeError, CLOUD_SETUP_PATH,
 };
 use crate::OtelAppState;
 use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
@@ -62,12 +63,15 @@ impl From<TelemetryWriteModeError> for Problem {
             // in a state where it can be honoured. Each carries `setup_path` so
             // the client renders an onboarding state pointing at the *specific*
             // missing prerequisite rather than a generic error.
-            TelemetryWriteModeError::FidelityTooLow { project_id, .. } => {
+            TelemetryWriteModeError::FidelityTooLow {
+                ref project_slug, ..
+            } => {
+                let setup_path = project_telemetry_settings_path(project_slug);
                 ErrorBuilder::new(axum::http::StatusCode::CONFLICT)
                     .title("Telemetry Fidelity Too Low For Cloud-Primary Writes")
                     .detail(error.to_string())
                     .value("configured", false)
-                    .value("setup_path", format!("/projects/{project_id}/settings"))
+                    .value("setup_path", setup_path)
                     .value("blocked_by", "fidelity")
                     .build()
             }
@@ -99,12 +103,16 @@ impl From<TelemetryWriteModeError> for Problem {
                     .build()
             }
 
-            TelemetryWriteModeError::FidelityDowngradeBlockedByWriteMode { project_id, .. } => {
+            TelemetryWriteModeError::FidelityDowngradeBlockedByWriteMode {
+                ref project_slug,
+                ..
+            } => {
+                let setup_path = project_telemetry_settings_path(project_slug);
                 ErrorBuilder::new(axum::http::StatusCode::CONFLICT)
                     .title("Cannot Lower Fidelity While Writes Are Cloud-Primary")
                     .detail(error.to_string())
                     .value("blocked_by", "write_mode")
-                    .value("setup_path", format!("/projects/{project_id}/settings"))
+                    .value("setup_path", setup_path)
                     .build()
             }
 
@@ -764,7 +772,7 @@ fn project_capability(
                  be read back — the project's traces would exist nowhere.",
                 settings.fidelity
             )),
-            Some(format!("/projects/{}/settings", settings.project_id)),
+            Some(project_telemetry_settings_path(&settings.project_slug)),
         );
     }
     instance_capability(link)
@@ -942,6 +950,7 @@ mod tests {
     ) -> ProjectTelemetryWriteSettings {
         ProjectTelemetryWriteSettings {
             project_id: 7,
+            project_slug: "storefront".to_string(),
             fidelity,
             write_mode,
             attribute_allowlist: Vec::new(),
@@ -1007,7 +1016,12 @@ mod tests {
         let reason = reason.expect("must say why");
         assert!(reason.contains("queryable"), "{reason}");
         assert!(!reason.contains("not linked"), "{reason}");
-        assert_eq!(setup_path.as_deref(), Some("/projects/7/settings"));
+        // The console routes projects on their slug and the fidelity control
+        // lives on the Telemetry tab; a numeric id here was a 404 (#1339).
+        assert_eq!(
+            setup_path.as_deref(),
+            Some("/projects/storefront/settings/telemetry")
+        );
     }
 
     #[test]
@@ -1064,6 +1078,7 @@ mod tests {
         for error in [
             TelemetryWriteModeError::FidelityTooLow {
                 project_id: 7,
+                project_slug: "storefront".to_string(),
                 fidelity: CloudTelemetryFidelity::Metered,
             },
             TelemetryWriteModeError::NotLinked {
@@ -1084,6 +1099,36 @@ mod tests {
                 problem.status_code,
                 axum::http::StatusCode::CONFLICT,
                 "a missing prerequisite is a conflict"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fidelity_refusals_link_to_the_projects_telemetry_tab_by_slug() {
+        // The console follows `setup_path` from the refusal toast. It routes
+        // projects on their slug, so a numeric id here opens a 404 (#1339).
+        for error in [
+            TelemetryWriteModeError::FidelityTooLow {
+                project_id: 7,
+                project_slug: "storefront".to_string(),
+                fidelity: CloudTelemetryFidelity::Metered,
+            },
+            TelemetryWriteModeError::FidelityDowngradeBlockedByWriteMode {
+                project_id: 7,
+                project_slug: "storefront".to_string(),
+                requested: CloudTelemetryFidelity::Metered,
+            },
+        ] {
+            let response = Problem::from(error).into_response();
+            assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+            let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .expect("problem body");
+            let body: serde_json::Value =
+                serde_json::from_slice(&body).expect("problem body is JSON");
+            assert_eq!(
+                body["setup_path"], "/projects/storefront/settings/telemetry",
+                "{body}"
             );
         }
     }

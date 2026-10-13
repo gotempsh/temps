@@ -23,6 +23,9 @@ export function Users() {
   const {
     data: users,
     isLoading,
+    isError,
+    error,
+    isFetching,
     refetch,
   } = useQuery({
     ...listUsersOptions({
@@ -49,6 +52,8 @@ export function Users() {
         <UsersManagement
           users={users}
           isLoading={isLoading}
+          error={isError ? error : undefined}
+          retrying={isFetching}
           reloadUsers={refetch}
           onEditUser={setSelectedUser}
         />

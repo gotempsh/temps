@@ -29,6 +29,9 @@ pub struct ClickHouseConfig {
     pub database: String,
     pub user: String,
     pub password: String,
+    /// Wire compression, resolved from the stored `clickhouse.compression`
+    /// setting. [`ClickHouseConfig::new`] starts at the default (LZ4).
+    pub compression: temps_clickhouse::ClickHouseCompression,
 }
 
 // Manual Debug that masks the password so it can never leak into logs, panic
@@ -40,6 +43,7 @@ impl std::fmt::Debug for ClickHouseConfig {
             .field("database", &self.database)
             .field("user", &self.user)
             .field("password", &"***")
+            .field("compression", &self.compression)
             .finish()
     }
 }
@@ -56,7 +60,17 @@ impl ClickHouseConfig {
             database: database.into(),
             user: user.into(),
             password: password.into(),
+            compression: temps_clickhouse::ClickHouseCompression::default(),
         }
+    }
+
+    /// Use `compression` for the client built from this config.
+    pub fn with_compression(
+        mut self,
+        compression: temps_clickhouse::ClickHouseCompression,
+    ) -> Self {
+        self.compression = compression;
+        self
     }
 }
 
@@ -70,11 +84,13 @@ impl ClickHouseBackend {
     /// Does not validate connectivity — call [`AnalyticsBackend::health_check`]
     /// or one of the migration entry points to do that.
     pub fn new(config: ClickHouseConfig) -> Self {
-        let client = ::clickhouse::Client::default()
-            .with_url(config.url)
-            .with_database(config.database)
-            .with_user(config.user)
-            .with_password(config.password);
+        let client = temps_clickhouse::build_client(
+            &config.url,
+            &config.database,
+            &config.user,
+            &config.password,
+            config.compression,
+        );
         Self { client }
     }
 

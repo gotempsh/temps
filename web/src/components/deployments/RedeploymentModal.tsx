@@ -53,12 +53,10 @@ import {
 } from 'lucide-react'
 import { BranchSelector, type ResolvedBranch } from './BranchSelector'
 import { gitProviderSetupPath, problemDetail } from '@/lib/api-problem'
-
-const COMMIT_SHA_PATTERN = /^[0-9a-f]{7,40}$/i
-
-function isValidCommitSha(commit: string) {
-  return COMMIT_SHA_PATTERN.test(commit.trim())
-}
+import {
+  isValidCommitSha,
+  redeployGitReference,
+} from '@/lib/redeploy-reference'
 
 function formatCommitDate(date: string) {
   const parsedDate = new Date(date)
@@ -518,15 +516,21 @@ export function RedeploymentModal({
         return
       }
 
-      await submit({
-        branch: defaultType === 'branch' ? defaultBranch : undefined,
-        commit:
-          defaultType === 'commit' || defaultType === 'tag'
-            ? defaultCommit
-            : undefined,
-        tag: defaultType === 'tag' ? defaultTag : undefined,
-        environmentId: defaultEnvironment,
+      // Pin the deployment's own commit: a branch alone would rebuild
+      // whatever the branch points at now, not what this deployment ran.
+      const reference = redeployGitReference({
+        type: defaultType || 'branch',
+        branch: defaultBranch,
+        commit: defaultCommit,
+        tag: defaultTag,
       })
+      if (!reference) {
+        toast.error(
+          'This deployment has no recorded commit to redeploy. Start a new deployment instead.'
+        )
+        return
+      }
+      await submit({ ...reference, environmentId: defaultEnvironment })
       return
     }
 
@@ -836,7 +840,7 @@ export function RedeploymentModal({
                   <TabsContent value="branch" className="space-y-2">
                     {branchNotFound && (
                       <Alert className="border-amber-200 bg-amber-50">
-                        <AlertTriangle className="h-4 w-4 text-amber-600" />
+                        <AlertTriangle className="h-4 w-4 text-amber-700 dark:text-amber-600" />
                         <AlertDescription className="text-amber-800">
                           The branch “{effectiveBranch}” for this environment
                           was not found in the repository. You can continue with

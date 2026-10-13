@@ -2,11 +2,40 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type { DropInspectionResponse, DropPresetCandidate } from '@/api/client'
-import { prepareDrop, type DropFile } from '@/lib/drop-archive'
+import {
+  prepareDrop,
+  type DropFile,
+  type DropLeftOutPath,
+} from '@/lib/drop-archive'
 
 export interface PreparedDropInspection {
   archive: File
   inspection: DropInspectionResponse
+  /** Everything left out of the upload: by the console for a folder, by the
+   * server for a ZIP. Empty when nothing was. */
+  leftOut: DropLeftOutPath[]
+  /** Files left out in total, including any beyond the listed paths. */
+  leftOutFileCount: number
+}
+
+/** Combine the console's and the server's left-out reports. */
+export function mergeLeftOut(
+  local: { leftOut: DropLeftOutPath[]; leftOutFileCount: number },
+  inspection: Pick<
+    DropInspectionResponse,
+    'skippedEntries' | 'skippedFileCount'
+  >
+): { leftOut: DropLeftOutPath[]; leftOutFileCount: number } {
+  const server = inspection.skippedEntries ?? []
+  const leftOut = [...local.leftOut, ...server].sort((a, b) =>
+    a.path.localeCompare(b.path)
+  )
+  return {
+    leftOut,
+    // Totals, not sums of the listed paths: either list may be truncated.
+    leftOutFileCount:
+      local.leftOutFileCount + (inspection.skippedFileCount ?? 0),
+  }
 }
 
 export function presetConfigForDropCandidate(
@@ -27,6 +56,28 @@ export function presetConfigForDropCandidate(
     return { dockerfilePath: candidate.dockerfilePath }
   }
   return undefined
+}
+
+/** Problem type `POST /drop/inspect` returns when nothing is deployable. */
+export const DROP_NO_PROJECT_PROBLEM_TYPE =
+  'https://temps.sh/probs/drop-no-deployable-project'
+
+/**
+ * The files Temps looks for, when `error` is the "nothing deployable"
+ * rejection; `null` for any other failure.
+ *
+ * Retrying detection on the same files cannot change that answer, so the
+ * console uses this to show what to add instead of offering a retry.
+ */
+export function dropDetectionGap(error: unknown): string[] | null {
+  if (!error || typeof error !== 'object') return null
+  const problem = error as { type?: unknown; supported_files?: unknown }
+  if (problem.type !== DROP_NO_PROJECT_PROBLEM_TYPE) return null
+  return Array.isArray(problem.supported_files)
+    ? problem.supported_files.filter(
+        (name): name is string => typeof name === 'string'
+      )
+    : []
 }
 
 interface PrepareAndInspectOptions {
@@ -51,5 +102,9 @@ export async function prepareAndInspectDrop(
     throw new Error('No deployable project preset was detected')
   }
 
-  return { archive: prepared.file, inspection }
+  return {
+    archive: prepared.file,
+    inspection,
+    ...mergeLeftOut(prepared, inspection),
+  }
 }

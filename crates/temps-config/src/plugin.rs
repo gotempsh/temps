@@ -44,9 +44,37 @@ impl TempsPlugin for ConfigPlugin {
             // Get required dependencies from the service registry
             let db = context.require_service::<sea_orm::DatabaseConnection>();
 
-            // Create ConfigService
+            // Create ConfigService. The ClickHouse wire-compression mode is
+            // resolved here, once, from the stored setting: this is the first
+            // point where the database is reachable and still before any
+            // plugin builds a ClickHouse client, and every such client reads
+            // it back through `ConfigService::clickhouse_compression`.
+            let config_service = ConfigService::new(self.server_config.clone(), db.clone());
+            let clickhouse_compression = config_service.stored_clickhouse_compression().await;
             let config_service =
-                Arc::new(ConfigService::new(self.server_config.clone(), db.clone()));
+                Arc::new(config_service.with_clickhouse_compression(clickhouse_compression));
+
+            // Preflight the instance's ClickHouse connection and keep
+            // re-checking it, so a server whose codec the client cannot decode
+            // is reported once, clearly, at startup, instead of surfacing much
+            // later as `Code: 60` on a dashboard.
+            if let (Some(url), Some(database), Some(user), Some(password)) = (
+                self.server_config.clickhouse_url.as_ref(),
+                self.server_config.clickhouse_database.as_ref(),
+                self.server_config.clickhouse_user.as_ref(),
+                self.server_config.clickhouse_password.as_ref(),
+            ) {
+                let clickhouse = temps_clickhouse::ClickHouseConfig::new(
+                    url.clone(),
+                    database.clone(),
+                    user.clone(),
+                    password.clone(),
+                )
+                .with_compression(clickhouse_compression);
+                context.register_service(temps_clickhouse::ClickHouseHealth::spawn_monitor(
+                    clickhouse,
+                ));
+            }
 
             // A control plane owns its cluster trust root independently of
             // whether a worker has joined yet. Full `temps serve` processes
@@ -101,6 +129,9 @@ impl TempsPlugin for ConfigPlugin {
         // that owns the binary and the process lifecycle registers an updater.
         let self_updater = context.get_service::<dyn temps_core::SelfUpdater>();
 
+        // Present only when ClickHouse is configured (see `register_services`).
+        let clickhouse_health = context.get_service::<temps_clickhouse::ClickHouseHealth>();
+
         // Create SettingsState
         let settings_state = Arc::new(SettingsState {
             config_service,
@@ -111,6 +142,7 @@ impl TempsPlugin for ConfigPlugin {
             enrollment_token_service,
             update_status,
             self_updater,
+            clickhouse_health,
         });
 
         // Configure routes with the state

@@ -37,8 +37,20 @@ pub(crate) fn extract_byok(headers: &HeaderMap) -> ByokOverride {
             .get("x-provider-base-url")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string()),
-        system_key_id: None,
+        system_key_id: provider_key_id_header(headers),
     }
+}
+
+/// `X-Temps-Provider-Key-Id: <id>` selects one administrator-configured
+/// provider key explicitly, e.g. when a model is served by more than one.
+/// The key must still be active and serve the model; a malformed value is
+/// ignored rather than treated as a selection.
+fn provider_key_id_header(headers: &HeaderMap) -> Option<i32> {
+    headers
+        .get("x-temps-provider-key-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .filter(|id| *id > 0)
 }
 
 /// Extract AI request context (conversation, tags, trace) from request headers.
@@ -332,12 +344,24 @@ pub(crate) fn error_to_response(error: AiGatewayError) -> impl IntoResponse {
                 OpenAiErrorResponse::server_error(message, "upstream_error"),
             )
         }
-        AiGatewayError::InvalidProviderUrl { reason } => (
+        // Covers both a caller-supplied X-Provider-Base-URL and a configured
+        // key's base URL that is (no longer) allowed, e.g. a hostname that
+        // now resolves to an untrusted private address.
+        AiGatewayError::InvalidProviderUrl { .. } => (
             StatusCode::BAD_REQUEST,
-            OpenAiErrorResponse::invalid_request(
-                format!("Invalid X-Provider-Base-URL: {}", reason),
-                "invalid_provider_url",
-            ),
+            OpenAiErrorResponse::invalid_request(error.to_string(), "invalid_provider_url"),
+        ),
+        AiGatewayError::AmbiguousModel { .. } => (
+            StatusCode::CONFLICT,
+            OpenAiErrorResponse::invalid_request(error.to_string(), "ambiguous_model"),
+        ),
+        AiGatewayError::SelfHostedModelUnavailable { .. } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            OpenAiErrorResponse::invalid_request(error.to_string(), "model_unavailable"),
+        ),
+        AiGatewayError::CapabilityNotDeclared { .. } => (
+            StatusCode::BAD_REQUEST,
+            OpenAiErrorResponse::invalid_request(error.to_string(), "capability_not_declared"),
         ),
         AiGatewayError::UnsupportedEndpoint { .. } => (
             StatusCode::BAD_REQUEST,
@@ -439,9 +463,9 @@ async fn chat_completions(
             .chat_completion_stream(&request, &byok)
             .await
         {
-            Ok((stream, cred_type)) => {
-                let provider_id =
-                    crate::providers::route_model_to_provider(&model).unwrap_or("unknown");
+            Ok((stream, served)) => {
+                let provider_id = served.provider_id;
+                let cred_type = served.credential_type;
 
                 info!(
                     model = model,
@@ -505,10 +529,10 @@ async fn chat_completions(
             .chat_completion(&request, &byok)
             .await
         {
-            Ok((response, cred_type)) => {
+            Ok((response, served)) => {
                 let latency = start.elapsed();
-                let provider_id =
-                    crate::providers::route_model_to_provider(&model).unwrap_or("unknown");
+                let provider_id = served.provider_id;
+                let cred_type = served.credential_type;
 
                 // Log usage asynchronously (don't block the response)
                 if let Some(ref usage) = response.usage {
@@ -700,10 +724,10 @@ async fn embeddings(
     let user_id = auth.user_id_opt();
 
     match app_state.gateway_service.embeddings(&request, &byok).await {
-        Ok((response, cred_type)) => {
+        Ok((response, served)) => {
             let latency = start.elapsed();
-            let provider_id =
-                crate::providers::route_model_to_provider(&request.model).unwrap_or("unknown");
+            let provider_id = served.provider_id;
+            let cred_type = served.credential_type;
 
             // Log usage asynchronously (don't block the response). Embeddings
             // only consume prompt tokens; there is no completion output.

@@ -168,6 +168,17 @@ pub enum SandboxError {
     #[error("Validation error: {message}")]
     Validation { message: String },
 
+    /// The container runtime could not pull the sandbox image: the tag is
+    /// not published, the registry is unreachable or access was denied.
+    /// Mapped to HTTP 503: the request is valid and retrying can succeed once
+    /// the image is available, but nothing about the request itself can fix it.
+    #[error("Sandbox image '{image}' could not be pulled for sandbox {sandbox_id}: {reason}")]
+    ImageUnavailable {
+        sandbox_id: String,
+        image: String,
+        reason: String,
+    },
+
     /// The sandbox exists but is not in a state that allows the requested
     /// operation (e.g. exec on a stopped sandbox). Mapped to HTTP 409.
     #[error("Sandbox {sandbox_id} is in state '{state}' — cannot {operation}")]
@@ -261,6 +272,16 @@ pub enum SandboxError {
     #[error("No node can run sandboxes: every allowed node is offline or the allow-list is empty. Allow a node under AI Workflows → Sandbox (/agent-sandbox/sandbox) or with `bunx @temps-sdk/cli sandbox nodes allow`.")]
     NoPlacementNode,
 
+    /// Automatic placement found only dedicated nodes
+    /// (`temps.sh/role=dedicated`), which take a sandbox only when it asks
+    /// for them by id or name.
+    #[error("No node can take this sandbox automatically: {nodes}. Request a dedicated node explicitly by passing its id or name as `node`, or allow a node without the temps.sh/role=dedicated label under AI Workflows → Sandbox (/agent-sandbox/sandbox) or with `bunx @temps-sdk/cli sandbox nodes allow`.")]
+    DedicatedNodesOnly {
+        /// The dedicated nodes passed over, formatted as
+        /// `node <id> (<name>) is dedicated …`.
+        nodes: String,
+    },
+
     /// The sandbox is attached to a project but that project has no active
     /// environment from which scoped service credentials can be issued.
     #[error("Project {project_id} attached to sandbox {sandbox_id} has no active environment")]
@@ -333,6 +354,13 @@ pub enum SandboxError {
 /// caller is responsible for passing the public `sandbox_id` so users see
 /// the opaque ID, not the internal integer.
 pub fn from_agent_error(sandbox_id: &str, err: AgentError) -> SandboxError {
+    if let Some((image, reason)) = err.image_pull_failure() {
+        return SandboxError::ImageUnavailable {
+            sandbox_id: sandbox_id.to_string(),
+            image: image.to_string(),
+            reason: reason.to_string(),
+        };
+    }
     match err {
         AgentError::SandboxNotFound { .. } => SandboxError::NotFound {
             sandbox_id: sandbox_id.to_string(),
@@ -397,6 +425,50 @@ mod tests {
         );
         let problem = temps_core::problemdetails::Problem::from(err);
         assert_eq!(problem.status_code, axum::http::StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn image_pull_failures_become_image_unavailable_with_image_and_cause() {
+        let err = from_agent_error(
+            "sbx_abc",
+            AgentError::SandboxCreationFailed {
+                run_id: 3,
+                provider: "docker".into(),
+                reason: temps_agents::error::image_pull_failure_reason(
+                    "registry.example.test/team/img:9.9.9",
+                    "manifest unknown",
+                ),
+            },
+        );
+        match &err {
+            SandboxError::ImageUnavailable {
+                sandbox_id,
+                image,
+                reason,
+            } => {
+                assert_eq!(sandbox_id, "sbx_abc");
+                assert_eq!(image, "registry.example.test/team/img:9.9.9");
+                assert_eq!(reason, "manifest unknown");
+            }
+            other => panic!("expected ImageUnavailable, got {other:?}"),
+        }
+        let message = err.to_string();
+        assert!(message.contains("registry.example.test/team/img:9.9.9"));
+        assert!(message.contains("sbx_abc"));
+        assert!(message.contains("manifest unknown"));
+    }
+
+    #[test]
+    fn other_creation_failures_stay_generic_exec_failures() {
+        let err = from_agent_error(
+            "sbx_abc",
+            AgentError::SandboxCreationFailed {
+                run_id: 3,
+                provider: "docker".into(),
+                reason: "no space left on device".into(),
+            },
+        );
+        assert!(matches!(err, SandboxError::ExecFailed { .. }), "{err:?}");
     }
 
     #[test]

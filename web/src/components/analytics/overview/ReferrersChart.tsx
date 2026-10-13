@@ -105,6 +105,7 @@ export function ReferrersChart({
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
             <Button
+              aria-label="Back to all referrers"
               variant="ghost"
               size="icon"
               className="h-6 w-6"

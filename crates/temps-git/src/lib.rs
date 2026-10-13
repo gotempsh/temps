@@ -27,3 +27,4 @@ pub use services::git_provider_manager_trait::{
 pub use services::pr_commenter::{
     CommentPhase, GitPrCommenter, PrCommenter, PrCommenterError, PreviewCommentContext,
 };
+pub use services::repository_directory::{MissingRepositoryDirectory, RepositoryDirectoryCheck};

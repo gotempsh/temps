@@ -112,9 +112,9 @@ const lastValue = (points: MetricDataPoint[] | undefined) =>
 // ---------------------------------------------------------------------------
 
 const TONE_TEXT: Record<UsageTone, string> = {
-  good: 'text-emerald-600 dark:text-emerald-400',
-  warn: 'text-amber-600 dark:text-amber-400',
-  poor: 'text-rose-600 dark:text-rose-400',
+  good: 'text-emerald-700 dark:text-emerald-400',
+  warn: 'text-amber-700 dark:text-amber-400',
+  poor: 'text-rose-700 dark:text-rose-400',
 }
 const TONE_BAR: Record<UsageTone, string> = {
   good: '[&>div]:bg-primary',
@@ -338,7 +338,9 @@ function DockerDiskUsageCard() {
           </div>
         ) : q.isError || !usage ? (
           <div className="space-y-2 text-sm">
-            <p className="text-rose-500">docker system df did not answer.</p>
+            <p className="text-rose-700 dark:text-rose-500">
+              docker system df did not answer.
+            </p>
             <p className="text-xs text-muted-foreground">
               {(q.error as { detail?: string } | null)?.detail ??
                 'Docker walks every image layer and volume for this figure; it can take up to a minute on a busy host.'}

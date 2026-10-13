@@ -57,6 +57,15 @@ use crate::services::cloud_fidelity::CloudPolicyCache;
 /// Console path that owns the Cloud link and its telemetry switch.
 pub const CLOUD_SETUP_PATH: &str = "/settings/cloud";
 
+/// Console path of a project's telemetry settings, where fidelity is set.
+///
+/// The console routes projects on `:slug` (`/projects/:slug/*` resolves through
+/// `GET /projects/by-slug/{slug}`, an exact match), so a numeric project id in
+/// this path would land on a "page not found" instead of the control.
+pub fn project_telemetry_settings_path(project_slug: &str) -> String {
+    format!("/projects/{project_slug}/settings/telemetry")
+}
+
 /// Writes a project's already-queued Cloud-bound spans back to the local span
 /// store and settles the rows.
 ///
@@ -101,6 +110,7 @@ pub enum TelemetryWriteModeError {
     )]
     FidelityTooLow {
         project_id: i32,
+        project_slug: String,
         fidelity: CloudTelemetryFidelity,
     },
 
@@ -142,6 +152,7 @@ pub enum TelemetryWriteModeError {
     )]
     FidelityDowngradeBlockedByWriteMode {
         project_id: i32,
+        project_slug: String,
         requested: CloudTelemetryFidelity,
     },
 
@@ -204,6 +215,9 @@ impl CloudLinkSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectTelemetryWriteSettings {
     pub project_id: i32,
+    /// What the console routes this project on; see
+    /// [`project_telemetry_settings_path`].
+    pub project_slug: String,
     pub fidelity: CloudTelemetryFidelity,
     pub write_mode: CloudTelemetryWriteMode,
     pub attribute_allowlist: Vec<String>,
@@ -316,6 +330,7 @@ pub struct TelemetryWriteModeService {
 #[derive(Debug, FromQueryResult)]
 struct ProjectModeRow {
     id: i32,
+    slug: String,
     cloud_telemetry_fidelity: CloudTelemetryFidelity,
     cloud_telemetry_write_mode: CloudTelemetryWriteMode,
     cloud_analytics_write_mode: CloudAnalyticsWriteMode,
@@ -540,6 +555,7 @@ impl TelemetryWriteModeService {
 
         Ok(ProjectTelemetryWriteSettings {
             project_id,
+            project_slug: row.slug,
             fidelity: row.cloud_telemetry_fidelity,
             write_mode: row.cloud_telemetry_write_mode,
             attribute_allowlist: row.cloud_telemetry_attribute_allowlist,
@@ -570,6 +586,7 @@ impl TelemetryWriteModeService {
             if !row.cloud_telemetry_fidelity.is_queryable() {
                 return Err(TelemetryWriteModeError::FidelityTooLow {
                     project_id,
+                    project_slug: row.slug,
                     fidelity: row.cloud_telemetry_fidelity,
                 });
             }
@@ -640,6 +657,7 @@ impl TelemetryWriteModeService {
             if !row.cloud_telemetry_fidelity.is_queryable() {
                 return Err(TelemetryWriteModeError::FidelityTooLow {
                     project_id,
+                    project_slug: row.slug,
                     fidelity: row.cloud_telemetry_fidelity,
                 });
             }
@@ -756,6 +774,7 @@ impl TelemetryWriteModeService {
             return Err(
                 TelemetryWriteModeError::FidelityDowngradeBlockedByWriteMode {
                     project_id,
+                    project_slug: row.slug,
                     requested,
                 },
             );
@@ -1232,6 +1251,7 @@ impl TelemetryWriteModeService {
         projects::Entity::find()
             .select_only()
             .column(projects::Column::Id)
+            .column(projects::Column::Slug)
             .column(projects::Column::CloudTelemetryFidelity)
             .column(projects::Column::CloudTelemetryWriteMode)
             .column(projects::Column::CloudAnalyticsWriteMode)
@@ -1748,6 +1768,7 @@ mod tests {
         // has to guess which of the three they need.
         let fidelity = TelemetryWriteModeError::FidelityTooLow {
             project_id: 7,
+            project_slug: "storefront".to_string(),
             fidelity: CloudTelemetryFidelity::Metered,
         }
         .to_string();
@@ -1861,6 +1882,7 @@ mod tests {
         // that is already correct.
         let by_mode = TelemetryWriteModeError::FidelityDowngradeBlockedByWriteMode {
             project_id: 7,
+            project_slug: "storefront".to_string(),
             requested: CloudTelemetryFidelity::Metered,
         }
         .to_string();
@@ -1878,6 +1900,7 @@ mod tests {
     fn the_downgrade_refusal_names_the_write_mode_as_the_thing_to_change() {
         let message = TelemetryWriteModeError::FidelityDowngradeBlockedByWriteMode {
             project_id: 7,
+            project_slug: "storefront".to_string(),
             requested: CloudTelemetryFidelity::Metered,
         }
         .to_string();

@@ -14,6 +14,33 @@ use utoipa::ToSchema;
 /// Smallest non-zero CPU limit Docker accepts: 0.01 cores, in microcores.
 pub const MIN_CPU_LIMIT_MICROCORES: i32 = 10_000;
 
+/// `pg_advisory_xact_lock` key that serializes every write of an
+/// environment's or project's `target_nodes` with node removal.
+///
+/// A settings save validates its node IDs and then writes the whole
+/// `deployment_config`; node removal rewrites every placement that names the
+/// node and deletes it. Without one lock around both, a save could validate
+/// against a node that is removed before it commits, or write back a copy of
+/// the config read before the removal, and either way put a deleted ID back.
+pub const NODE_PLACEMENT_LOCK_KEY: i64 = 0x5445_4D50_504C_4143;
+
+/// Take [`NODE_PLACEMENT_LOCK_KEY`] for the rest of the current transaction.
+///
+/// Call it first in the transaction, before any row lock, so every holder
+/// acquires its locks in the same order. Outside a transaction it is released
+/// immediately and protects nothing.
+pub async fn lock_node_placements<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+) -> Result<(), sea_orm::DbErr> {
+    conn.execute(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT pg_advisory_xact_lock($1)",
+        [NODE_PLACEMENT_LOCK_KEY.into()],
+    ))
+    .await
+    .map(|_| ())
+}
+
 /// Security configuration for projects and environments
 ///
 /// This configuration can be set at three levels:
@@ -241,6 +268,29 @@ impl RateLimitConfig {
     }
 }
 
+/// Where a source deployment's image is built.
+///
+/// The control plane is the default and the historical behaviour. `Node`
+/// moves the build — the most CPU- and memory-hungry step of a deployment —
+/// onto a worker node so it stops competing with the proxy, the database
+/// and running workloads on the control plane. A node labelled
+/// `temps.sh/role=builder` is preferred; otherwise the node the deployment
+/// is placed on builds it.
+///
+/// `Node` is a preference, not a requirement: when no worker can take the
+/// build (none joined, none of the right architecture, or a
+/// multi-architecture build) the build runs on the control plane and the
+/// build log says why. A static site may build on a worker of any
+/// architecture, since its output is read from that node and never runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BuildLocation {
+    /// Build with the control plane's own Docker daemon.
+    ControlPlane,
+    /// Build on a worker node, falling back to the control plane.
+    Node,
+}
+
 /// Deployment configuration shared between projects and environments
 ///
 /// This configuration can be set at the project level (as defaults) and
@@ -363,6 +413,16 @@ pub struct DeploymentConfig {
     /// (`None`) or overrides it, matching `automatic_deploy`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cross_architecture_builds: Option<bool>,
+
+    /// Where source images are built. `None` inherits (environment → project)
+    /// and resolves to [`BuildLocation::ControlPlane`]; see
+    /// [`DeploymentConfig::resolve_build_location`].
+    ///
+    /// Worker builds never receive build-argument values, so a Dockerfile
+    /// that declares `ARG` fails on a node with an explicit error instead of
+    /// building without its inputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_location: Option<BuildLocation>,
 
     /// Enable on-demand mode (scale-to-zero).
     /// When enabled, containers are stopped after `idle_timeout_seconds` of no traffic
@@ -547,6 +607,7 @@ impl Default for DeploymentConfig {
             target_labels: None,
             anti_affinity: true,
             cross_architecture_builds: None,
+            build_location: None,
             on_demand: false,
             idle_timeout_seconds: 300,
             wake_timeout_seconds: 30,
@@ -602,6 +663,18 @@ impl DeploymentConfig {
             .filter(|labels| !labels.as_object().is_some_and(serde_json::Map::is_empty))
     }
 
+    /// The effective build location for an environment of a project: the
+    /// environment's setting, else the project's, else the control plane.
+    pub fn resolve_build_location(
+        environment: Option<&DeploymentConfig>,
+        project: Option<&DeploymentConfig>,
+    ) -> BuildLocation {
+        environment
+            .and_then(|config| config.build_location)
+            .or_else(|| project.and_then(|config| config.build_location))
+            .unwrap_or(BuildLocation::ControlPlane)
+    }
+
     /// Merge this config with another, preferring values from `other`
     ///
     /// This is useful for merging environment-level config (other) with
@@ -653,6 +726,10 @@ impl DeploymentConfig {
             cross_architecture_builds: other
                 .cross_architecture_builds
                 .or(self.cross_architecture_builds),
+            // Env-wins, inheriting the project when unset: production can pin
+            // the control plane while previews of the same project build on
+            // nodes, or the other way round.
+            build_location: other.build_location.or(self.build_location),
             on_demand: other.on_demand || self.on_demand,
             idle_timeout_seconds: if other.idle_timeout_seconds != 300 {
                 other.idle_timeout_seconds
@@ -989,6 +1066,71 @@ mod tests {
                 .cross_architecture_builds,
             None
         );
+    }
+
+    /// Building on the control plane stays the default; a node build is an
+    /// opt-in that an environment can make or refuse independently of its
+    /// project.
+    #[test]
+    fn test_build_location_resolution() {
+        let project_node = DeploymentConfig {
+            build_location: Some(BuildLocation::Node),
+            ..Default::default()
+        };
+        let env_control_plane = DeploymentConfig {
+            build_location: Some(BuildLocation::ControlPlane),
+            ..Default::default()
+        };
+        let env_unset = DeploymentConfig::default();
+
+        assert_eq!(
+            DeploymentConfig::resolve_build_location(None, None),
+            BuildLocation::ControlPlane
+        );
+        assert_eq!(
+            DeploymentConfig::resolve_build_location(Some(&env_unset), Some(&env_unset)),
+            BuildLocation::ControlPlane
+        );
+        assert_eq!(
+            DeploymentConfig::resolve_build_location(Some(&env_unset), Some(&project_node)),
+            BuildLocation::Node
+        );
+        assert_eq!(
+            DeploymentConfig::resolve_build_location(Some(&env_control_plane), Some(&project_node)),
+            BuildLocation::ControlPlane
+        );
+        assert_eq!(
+            DeploymentConfig::resolve_build_location(Some(&project_node), None),
+            BuildLocation::Node
+        );
+        assert_eq!(
+            project_node.merge(&env_control_plane).build_location,
+            Some(BuildLocation::ControlPlane)
+        );
+        assert_eq!(
+            project_node.merge(&env_unset).build_location,
+            Some(BuildLocation::Node)
+        );
+    }
+
+    /// Rows written before the setting existed must keep deserializing, and
+    /// the wire format is the documented snake_case value.
+    #[test]
+    fn test_build_location_serde() {
+        let legacy: DeploymentConfig = serde_json::from_str("{}").expect("empty config parses");
+        assert_eq!(legacy.build_location, None);
+        assert!(!serde_json::to_string(&legacy)
+            .expect("serializes")
+            .contains("buildLocation"));
+
+        let parsed: DeploymentConfig =
+            serde_json::from_str(r#"{"buildLocation":"node"}"#).expect("node parses");
+        assert_eq!(parsed.build_location, Some(BuildLocation::Node));
+        assert_eq!(
+            serde_json::to_value(BuildLocation::ControlPlane).expect("serializes"),
+            serde_json::json!("control_plane")
+        );
+        assert!(serde_json::from_str::<DeploymentConfig>(r#"{"buildLocation":"cloud"}"#).is_err());
     }
 
     #[test]

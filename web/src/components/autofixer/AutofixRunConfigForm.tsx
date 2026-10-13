@@ -15,7 +15,8 @@ import {
 } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Textarea } from '@/components/ui/textarea'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { announceOperation } from '@/components/operations/operations-tray-store'
 import { AlertTriangle, ArrowRight, Loader2, Wand2 } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { Link } from 'react-router'
@@ -57,6 +58,7 @@ export function AutofixRunConfigForm({
   onStarted,
   onCancel,
 }: AutofixRunConfigFormProps) {
+  const queryClient = useQueryClient()
   const {
     data: catalog,
     isPending,
@@ -182,6 +184,7 @@ export function AutofixRunConfigForm({
         },
         throwOnError: true,
       })
+      announceOperation(queryClient, 'Autofix analysis started')
       onStarted(data.id)
     } catch (e) {
       setStartError(e instanceof Error ? e.message : 'Failed to start analysis')

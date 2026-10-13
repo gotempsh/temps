@@ -18,6 +18,9 @@ pub struct AppState {
     pub log_service: Arc<temps_logs::LogService>,
     pub cron_service: Arc<DatabaseCronConfigService>,
     pub external_deployment_manager: Arc<ExternalDeploymentManager>,
+    /// Starts on-demand screenshot captures (`take_screenshot` operation)
+    /// and records their pending/completed/failed outcome.
+    pub screenshot_operations: Arc<crate::services::ScreenshotOperationService>,
     pub remote_deployment_service: Arc<RemoteDeploymentService>,
     // Services for remote deployments
     pub db: Arc<DatabaseConnection>,
@@ -257,6 +260,17 @@ pub struct LatestDeploymentMediaResponse {
     /// Latest deployment media keyed by project ID. Projects with no
     /// deployments are omitted.
     pub projects: std::collections::HashMap<String, LatestDeploymentMediaResponseItem>,
+}
+
+/// Most recent deployment of a project.
+///
+/// A project that has never been deployed is a normal state, so it is
+/// reported as `deployment: null` with a 200 instead of a 404.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct LastDeploymentResponse {
+    /// The most recent deployment, or `null` when the project exists but has
+    /// no deployments yet.
+    pub deployment: Option<DeploymentResponse>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]

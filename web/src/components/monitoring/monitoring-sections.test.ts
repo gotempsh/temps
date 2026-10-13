@@ -21,6 +21,10 @@ describe('monitoring sections', () => {
     expect(monitoringSectionLabel('server')).toBe('Server')
   })
 
+  test('does not reuse the Settings "Notifications" name', () => {
+    expect(monitoringSectionLabel('notifications')).toBe('Delivery preferences')
+  })
+
   test('provides the user-facing alert rules label', () => {
     expect(monitoringSectionLabel('rules')).toBe('Alert rules')
   })

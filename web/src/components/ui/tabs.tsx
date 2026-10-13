@@ -28,23 +28,57 @@ const TabsTrigger = React.forwardRef<
   React.ComponentPropsWithoutRef<typeof TabsPrimitive.Trigger> & {
     count?: number
   }
->(({ className, children, count, ...props }, ref) => (
-  <TabsPrimitive.Trigger
-    ref={ref}
-    className={cn(
-      'inline-flex min-h-10 shrink-0 items-center justify-center gap-2 whitespace-nowrap border-b-2 border-transparent px-0 py-3 text-sm font-medium hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 data-[state=active]:border-foreground data-[state=active]:text-foreground',
-      className
-    )}
-    {...props}
-  >
-    {children}
-    {count !== undefined && (
-      <span className="rounded bg-muted px-1.5 text-xs tabular-nums text-muted-foreground">
-        {count.toLocaleString()}
-      </span>
-    )}
-  </TabsPrimitive.Trigger>
-))
+>(({ className, children, count, ...props }, forwardedRef) => {
+  const triggerRef = React.useRef<HTMLButtonElement | null>(null)
+  const controlsRef = React.useRef<string | null>(null)
+
+  const setRef = React.useCallback(
+    (node: HTMLButtonElement | null) => {
+      triggerRef.current = node
+      if (typeof forwardedRef === 'function') forwardedRef(node)
+      else if (forwardedRef) forwardedRef.current = node
+    },
+    [forwardedRef]
+  )
+
+  // Radix always sets `aria-controls` to the id of the panel it would render
+  // for this trigger. Tabs used purely as navigation (routes or filters with
+  // no `TabsContent`) have no such element, and an `aria-controls` that points
+  // nowhere is an axe `aria-valid-attr-value` violation. Keep the attribute
+  // only while the panel exists.
+  React.useEffect(() => {
+    const node = triggerRef.current
+    if (!node) return
+    if (controlsRef.current === null) {
+      controlsRef.current = node.getAttribute('aria-controls') ?? ''
+    }
+    const panelId = controlsRef.current
+    if (!panelId) return
+    if (document.getElementById(panelId)) {
+      node.setAttribute('aria-controls', panelId)
+    } else {
+      node.removeAttribute('aria-controls')
+    }
+  })
+
+  return (
+    <TabsPrimitive.Trigger
+      ref={setRef}
+      className={cn(
+        'inline-flex min-h-10 shrink-0 items-center justify-center gap-2 whitespace-nowrap border-b-2 border-transparent px-0 py-3 text-sm font-medium hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 data-[state=active]:border-foreground data-[state=active]:text-foreground',
+        className
+      )}
+      {...props}
+    >
+      {children}
+      {count !== undefined && (
+        <span className="rounded bg-muted px-1.5 text-xs tabular-nums text-muted-foreground">
+          {count.toLocaleString()}
+        </span>
+      )}
+    </TabsPrimitive.Trigger>
+  )
+})
 TabsTrigger.displayName = TabsPrimitive.Trigger.displayName
 
 const TabsContent = React.forwardRef<

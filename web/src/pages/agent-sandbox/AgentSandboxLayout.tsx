@@ -13,7 +13,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 
-// Sub-route definitions for the AI Workflows hub. The order here drives the
+// Sub-route definitions for the AI runtime settings hub. The order here drives the
 // tab order on desktop and the select-options order on mobile. Keep section
 // labels short — they share a row.
 const sections = [
@@ -37,7 +37,7 @@ function activeSection(pathname: string): SectionId {
 }
 
 export function AgentSandboxLayout() {
-  usePageTitle('AI Workflows')
+  usePageTitle('AI runtime settings')
   const location = useLocation()
   const navigate = useNavigate()
   const current = activeSection(location.pathname)
@@ -51,7 +51,7 @@ export function AgentSandboxLayout() {
     <div className="space-y-6 px-4 sm:px-0">
       <div>
         <h1 className="text-2xl font-semibold">
-          {current === 'providers' ? 'Harnesses' : 'AI Workflows'}
+          {current === 'providers' ? 'Harnesses' : 'AI runtime settings'}
         </h1>
         <p className="text-sm text-muted-foreground">
           {current === 'providers'

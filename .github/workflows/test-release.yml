@@ -39,10 +39,9 @@ jobs:
           sha256sum release/temps-darwin-arm64 > release/temps-darwin-arm64.sha256
 
           # Combined checksums
-          cat release/temps-linux-amd64.sha256 > release/checksums.txt
-          cat release/temps-linux-arm64.sha256 >> release/checksums.txt
-          cat release/temps-darwin-amd64.sha256 >> release/checksums.txt
-          cat release/temps-darwin-arm64.sha256 >> release/checksums.txt
+          cat release/temps-linux-amd64.sha256 release/temps-linux-arm64.sha256 \
+            release/temps-darwin-amd64.sha256 release/temps-darwin-arm64.sha256 \
+            > release/checksums.txt
 
       - name: Copy install script
         run: |
@@ -83,10 +82,17 @@ jobs:
 
           To create a real release, push a tag like `v0.1.0` (without `test-` prefix).
 
-          ## Quick Install (Test Only)
+          ## Installer (Test Only)
+
+          The attached `install.sh` is the real installer, published here only so
+          the upload can be checked. There is nothing to install from this
+          release: its assets are dummy files, not `temps-<os>-<arch>.tar.gz`
+          archives, and the installer deliberately ignores `test-v*` releases on
+          every channel and rejects them as a pinned version. To install a real
+          release, pass its tag explicitly:
 
           ```bash
-          curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/install.sh | bash
+          curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/scripts/install.sh | bash -s -- <tag>
           ```
 
           ## Files Included

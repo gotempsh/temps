@@ -660,7 +660,7 @@ export function RepositoryList({
                       </span>
                     )}
                     {repo.language && repo.pushed_at && (
-                      <span className="text-muted-foreground/40">•</span>
+                      <span className="text-muted-foreground">•</span>
                     )}
                     {repo.language && (
                       <span className="inline-flex items-center gap-1.5">
@@ -691,7 +691,7 @@ export function RepositoryList({
             disabled={currentPage === 1}
           >
             <ChevronLeft className="h-4 w-4 sm:mr-1" />
-            <span className="hidden sm:inline">Previous</span>
+            <span className="max-sm:sr-only">Previous</span>
           </Button>
 
           <span className="px-2 text-sm tabular-nums text-muted-foreground">
@@ -704,7 +704,7 @@ export function RepositoryList({
             onClick={() => setCurrentPage((p) => p + 1)}
             disabled={!hasMorePages}
           >
-            <span className="hidden sm:inline">Next</span>
+            <span className="max-sm:sr-only">Next</span>
             <ChevronRight className="h-4 w-4 sm:ml-1" />
           </Button>
         </div>

@@ -16,6 +16,8 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { WorkerNodeRequiredAlert } from '@/components/nodes/WorkerNodeRequiredBanner'
 import { WorkerIngressCard } from '@/components/nodes/WorkerIngressCard'
 import { NodeSandboxesPanel } from '@/components/nodes/NodeSandboxesPanel'
+import { NodeRoleBadge } from '@/components/nodes/NodeRoleBadge'
+import { NODE_ROLE_BADGE, nodeSchedulingRole } from '@/lib/node-role'
 import { NODE_HOSTS_SANDBOXES_TYPE } from '@/components/nodes/node-eviction'
 import { canManageSandboxPlacement } from '@/components/sandboxes/helpers'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
@@ -34,6 +36,8 @@ import {
 import {
   canAddWorkerNode,
   shouldPromptForFirstWorkerNode,
+  unremovedNodeContainers,
+  type UnremovedNodeContainers,
   WORKER_NODES_URL,
 } from '@/lib/worker-nodes'
 import {
@@ -61,6 +65,8 @@ import {
 import type {
   NodeInfoResponse,
   NodeContainerResponse,
+  NodePlacementReference,
+  RemoveNodeResponse,
   WireguardMeshStatusResponse,
 } from '@/api/client/types.gen'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
@@ -101,25 +107,27 @@ import {
 } from '@/components/ui/alert-dialog'
 import { toast } from 'sonner'
 import { client } from '@/api/client/client.gen'
+import { describeUpdatedPlacements } from '@/lib/node-placements'
 
 // ── Helpers ──
 
+/** Status tones, from the theme's contrast-checked status tokens. */
+const nodeStatusVariant: Record<
+  string,
+  'success-subtle' | 'destructive-subtle' | 'warning-subtle' | 'neutral-subtle'
+> = {
+  active: 'success-subtle',
+  offline: 'destructive-subtle',
+  draining: 'warning-subtle',
+  drained: 'neutral-subtle',
+  pending: 'warning-subtle',
+}
+
 function StatusBadge({ status }: { status: string }) {
-  const styles: Record<string, string> = {
-    active:
-      'bg-green-500/15 text-green-700 dark:text-green-400 border-green-500/20',
-    offline: 'bg-red-500/15 text-red-700 dark:text-red-400 border-red-500/20',
-    draining:
-      'bg-orange-500/15 text-orange-700 dark:text-orange-400 border-orange-500/20',
-    drained:
-      'bg-gray-500/15 text-gray-700 dark:text-gray-400 border-gray-500/20',
-    pending:
-      'bg-yellow-500/15 text-yellow-700 dark:text-yellow-400 border-yellow-500/20',
-  }
   return (
     <Badge
-      variant="default"
-      className={`${styles[status] ?? ''} text-xs capitalize`}
+      variant={nodeStatusVariant[status] ?? 'neutral-subtle'}
+      className="text-xs capitalize"
     >
       {status}
     </Badge>
@@ -387,7 +395,7 @@ function JoinTokenSection() {
           <AlertTitle className="text-amber-700 dark:text-amber-400">
             Save this token now
           </AlertTitle>
-          <AlertDescription className="text-amber-600 dark:text-amber-300">
+          <AlertDescription className="text-amber-700 dark:text-amber-300">
             This is the only time the join token will be displayed. Copy the
             command below and store the token securely.
           </AlertDescription>
@@ -418,10 +426,7 @@ function JoinTokenSection() {
     return (
       <div className="space-y-4">
         <div className="flex items-center gap-2 text-sm">
-          <Badge
-            variant="default"
-            className="bg-green-500/15 text-green-700 dark:text-green-400 border-green-500/20"
-          >
+          <Badge variant="success-subtle">
             <Shield className="h-3 w-3 mr-1" />
             Token configured
           </Badge>
@@ -471,7 +476,7 @@ function JoinTokenSection() {
         <AlertTitle className="text-amber-700 dark:text-amber-400">
           No join token configured
         </AlertTitle>
-        <AlertDescription className="text-amber-600 dark:text-amber-300">
+        <AlertDescription className="text-amber-700 dark:text-amber-300">
           Without a join token, any machine that knows the endpoint can register
           as a worker node. Generate a token to secure node registration.
         </AlertDescription>
@@ -494,6 +499,17 @@ function JoinTokenSection() {
         }}
       />
     </div>
+  )
+}
+
+/** One line under the node detail header saying what its role changes. */
+function NodeRoleDescription({ labels }: { labels: unknown }) {
+  const role = nodeSchedulingRole(labels)
+  if (!role) return null
+  return (
+    <p className="text-xs text-muted-foreground mt-1">
+      {NODE_ROLE_BADGE[role].description}
+    </p>
   )
 }
 
@@ -540,12 +556,15 @@ function NodeTable({
                       <span className="font-medium truncate max-w-[200px] block">
                         {node.name}
                       </span>
-                      <Badge
-                        variant="outline"
-                        className="text-[10px] capitalize mt-0.5"
-                      >
-                        {node.role}
-                      </Badge>
+                      <div className="flex flex-wrap items-center gap-1 mt-0.5">
+                        <Badge
+                          variant="outline"
+                          className="text-[10px] capitalize"
+                        >
+                          {node.role}
+                        </Badge>
+                        <NodeRoleBadge labels={node.labels} />
+                      </div>
                     </div>
                   </div>
                 </TableCell>
@@ -826,9 +845,9 @@ function MiniStat({
 }) {
   const accentClass =
     accent === 'green'
-      ? 'text-green-600 dark:text-green-400'
+      ? 'text-success-strong'
       : accent === 'yellow'
-        ? 'text-yellow-600 dark:text-yellow-400'
+        ? 'text-yellow-700 dark:text-yellow-400'
         : accent === 'blue'
           ? 'text-blue-600 dark:text-blue-400'
           : ''
@@ -899,6 +918,14 @@ function NodeDetail({
   const [showUndrainDialog, setShowUndrainDialog] = useState(false)
   const [drainPending, setDrainPending] = useState(false)
   const [removePending, setRemovePending] = useState(false)
+  // Containers a removal could not confirm are gone. While set, the remove
+  // dialog lists them and offers to remove the node anyway.
+  const [unremovedContainers, setUnremovedContainers] =
+    useState<UnremovedNodeContainers | null>(null)
+  // Environments pinned only to this node, from a refused removal.
+  const [pinnedPlacements, setPinnedPlacements] = useState<
+    NodePlacementReference[] | null
+  >(null)
   const [undrainPending, setUndrainPending] = useState(false)
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
@@ -928,7 +955,8 @@ function NodeDetail({
   })
   const liveSandboxes = sandboxesQuery.data?.total ?? 0
   const [searchParams, setSearchParams] = useSearchParams()
-  const tab = searchParams.get('tab') === 'sandboxes' ? 'sandboxes' : 'containers'
+  const tab =
+    searchParams.get('tab') === 'sandboxes' ? 'sandboxes' : 'containers'
 
   // Drain status decides whether the node can be removed; the server folds
   // in live sandboxes, which draining does not move. Poll every 5s while
@@ -957,7 +985,12 @@ function NodeDetail({
         if (handleSensitiveActionError(resp.error, () => handleDrain())) {
           return
         }
-        toast.error('Failed to drain node')
+        toast.error('Could not drain node', {
+          description: problemDetail(
+            resp.error,
+            'Check your permissions and try again.'
+          ),
+        })
         return
       }
       toast.success(`Node is now draining`)
@@ -976,20 +1009,45 @@ function NodeDetail({
     }
   }
 
-  const handleRemove = async () => {
+  const handleRemove = async (force = false) => {
     setRemovePending(true)
+    let keepDialogOpen = false
     try {
       const resp = await client.delete({
         url: '/internal/nodes/{node_id}',
         path: { node_id: nodeId },
+        query: force ? { force: true } : undefined,
       })
       if (resp.error) {
+        if (handleSensitiveActionError(resp.error, () => handleRemove(force))) {
+          return
+        }
+        // Containers Temps placed on the node may still exist: keep the
+        // dialog open with the list so the operator decides whether the
+        // host is gone for good.
+        const pinned = (resp.error as { placements?: unknown }).placements
+        if (Array.isArray(pinned) && pinned.length > 0) {
+          setPinnedPlacements(pinned as NodePlacementReference[])
+          keepDialogOpen = true
+          setShowRemoveDialog(true)
+          return
+        }
+        const unremoved = unremovedNodeContainers(resp.error)
+        if (unremoved && !force) {
+          setUnremovedContainers(unremoved)
+          keepDialogOpen = true
+          setShowRemoveDialog(true)
+          return
+        }
         // Live sandboxes block removal and draining doesn't move them:
         // point straight at the tab that can destroy them.
         const hostsSandboxes =
           (resp.error as { type?: unknown }).type === NODE_HOSTS_SANDBOXES_TYPE
         toast.error('Could not remove node', {
-          description: problemDetail(resp.error, 'Check your permissions and try again.'),
+          description: problemDetail(
+            resp.error,
+            'Check your permissions and try again.'
+          ),
           action: hostsSandboxes
             ? {
                 label: 'Show sandboxes',
@@ -1007,7 +1065,25 @@ function NodeDetail({
         })
         return
       }
-      toast.success('Node removed')
+      const removal = resp.data as RemoveNodeResponse | undefined
+      const orphaned = removal?.orphaned_containers ?? []
+      // Environments whose target nodes listed this node no longer do; say
+      // which, since a rejoined machine gets a new ID and is not targeted.
+      const placements = describeUpdatedPlacements(removal?.placements_updated)
+      if (orphaned.length > 0) {
+        toast.warning('Node removed', {
+          description: [
+            'Some containers could not be removed and were recorded as orphaned. If the host still exists, remove them there with docker rm -f.',
+            placements,
+          ]
+            .filter(Boolean)
+            .join(' '),
+        })
+      } else if (placements) {
+        toast.warning('Node removed', { description: placements })
+      } else {
+        toast.success('Node removed')
+      }
       queryClient.invalidateQueries({
         queryKey: adminListNodesOptions().queryKey,
       })
@@ -1017,7 +1093,11 @@ function NodeDetail({
       toast.error('Failed to remove node')
     } finally {
       setRemovePending(false)
-      setShowRemoveDialog(false)
+      if (!keepDialogOpen) {
+        setShowRemoveDialog(false)
+        setUnremovedContainers(null)
+        setPinnedPlacements(null)
+      }
     }
   }
 
@@ -1083,6 +1163,7 @@ function NodeDetail({
       {/* Header */}
       <div className="flex items-center gap-3">
         <Button
+          aria-label="Back"
           variant="ghost"
           size="icon"
           onClick={onBack}
@@ -1096,11 +1177,13 @@ function NodeDetail({
             <h3 className="text-lg font-semibold truncate">{node.name}</h3>
             <StatusBadge status={node.status} />
             <NodeArchitecture architecture={node.architecture} />
+            <NodeRoleBadge labels={node.labels} />
           </div>
           <p className="text-sm text-muted-foreground mt-0.5">
             {node.private_address} &middot; {node.role} &middot; Last heartbeat{' '}
             {formatRelativeTime(node.last_heartbeat)}
           </p>
+          <NodeRoleDescription labels={node.labels} />
         </div>
         <div className="flex items-center gap-2 shrink-0">
           {canDrain && (
@@ -1115,7 +1198,7 @@ function NodeDetail({
               ) : (
                 <Pause className="h-4 w-4 mr-1" />
               )}
-              <span className="hidden sm:inline">Drain</span>
+              <span className="max-sm:sr-only">Drain</span>
             </Button>
           )}
           {canUndrain && (
@@ -1130,7 +1213,7 @@ function NodeDetail({
               ) : (
                 <Play className="h-4 w-4 mr-1" />
               )}
-              <span className="hidden sm:inline">Undrain</span>
+              <span className="max-sm:sr-only">Undrain</span>
             </Button>
           )}
           {canRemove && (
@@ -1145,7 +1228,7 @@ function NodeDetail({
               ) : (
                 <Trash2 className="h-4 w-4 mr-1" />
               )}
-              <span className="hidden sm:inline">Remove</span>
+              <span className="max-sm:sr-only">Remove</span>
             </Button>
           )}
         </div>
@@ -1178,29 +1261,66 @@ function NodeDetail({
       </AlertDialog>
 
       {/* Remove confirmation dialog */}
-      <AlertDialog open={showRemoveDialog} onOpenChange={setShowRemoveDialog}>
+      <AlertDialog
+        open={showRemoveDialog}
+        onOpenChange={(open) => {
+          setShowRemoveDialog(open)
+          if (!open) {
+            setUnremovedContainers(null)
+            setPinnedPlacements(null)
+          }
+        }}
+      >
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>Remove node “{node.name}”?</AlertDialogTitle>
             <AlertDialogDescription>
-              This will permanently remove the node from the cluster. This
-              action cannot be undone. The node must be drained first (no active
-              containers) and host no sandboxes.
+              {pinnedPlacements
+                ? 'The node was not removed: it is the only target node of the environments below. Removing it would leave them with no target, so they could run on any node. Change their target nodes in each environment’s settings, then remove the node.'
+                : unremovedContainers
+                  ? `Temps could not confirm that ${unremovedContainers.count} container(s) it placed on this node are gone, so the node was not removed. Start the agent on the node and try again, or remove them on that host with docker rm -f. If the host is gone for good, remove the node anyway: these containers are then recorded as orphaned and never touched again.`
+                  : 'This will permanently remove the node from the cluster. This action cannot be undone. The node must be drained first (no active containers) and host no sandboxes. Containers Temps left on it are removed first, and it is taken out of the target nodes of every environment that lists it.'}
             </AlertDialogDescription>
           </AlertDialogHeader>
+          {pinnedPlacements && (
+            <ul
+              tabIndex={0}
+              className="max-h-48 space-y-1 overflow-y-auto rounded-md border p-2 text-sm"
+            >
+              {pinnedPlacements.map((placement) => (
+                <li
+                  key={`${placement.project_id}-${placement.environment_id ?? 'default'}`}
+                >
+                  {placement.environment_name
+                    ? `${placement.project_name} / ${placement.environment_name}`
+                    : `${placement.project_name} (project default)`}
+                </li>
+              ))}
+            </ul>
+          )}
+          {unremovedContainers && (
+            <ul
+              tabIndex={0}
+              className="max-h-48 space-y-1 overflow-y-auto rounded-md border p-2 font-mono text-xs break-all"
+            >
+              {unremovedContainers.lines.map((container) => (
+                <li key={container}>{container}</li>
+              ))}
+            </ul>
+          )}
           <AlertDialogFooter>
             <AlertDialogCancel disabled={removePending}>
               Cancel
             </AlertDialogCancel>
             <AlertDialogAction
-              onClick={handleRemove}
+              onClick={() => handleRemove(unremovedContainers !== null)}
               disabled={removePending}
               className="bg-destructive text-white hover:bg-destructive/90"
             >
               {removePending && (
                 <Loader2 className="h-4 w-4 animate-spin mr-1" />
               )}
-              Remove Node
+              {unremovedContainers ? 'Remove Anyway' : 'Remove Node'}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -1251,8 +1371,8 @@ function NodeDetail({
           <AlertTitle
             className={
               node.status === 'drained' || drainStatus?.drain_complete
-                ? 'text-green-700 dark:text-green-400'
-                : 'text-orange-700 dark:text-orange-400'
+                ? 'text-success-strong'
+                : 'text-warning-strong'
             }
           >
             {node.status === 'drained'
@@ -1264,8 +1384,8 @@ function NodeDetail({
           <AlertDescription
             className={
               node.status === 'drained' || drainStatus?.drain_complete
-                ? 'text-green-600 dark:text-green-300'
-                : 'text-orange-600 dark:text-orange-300'
+                ? 'text-success-strong'
+                : 'text-warning-strong'
             }
           >
             {node.status === 'drained'
@@ -1282,14 +1402,13 @@ function NodeDetail({
       {blockedBySandboxes && (
         <Alert>
           <AlertCircle className="h-4 w-4" />
-          <AlertTitle>This node still hosts {remainingSandboxes} sandbox(es)</AlertTitle>
+          <AlertTitle>
+            This node still hosts {remainingSandboxes} sandbox(es)
+          </AlertTitle>
           <AlertDescription>
             Draining does not move sandboxes, so the node can&rsquo;t be removed
             yet. Destroy them on the{' '}
-            <Link
-              to="?tab=sandboxes"
-              className="underline underline-offset-2"
-            >
+            <Link to="?tab=sandboxes" className="underline underline-offset-2">
               Sandboxes tab
             </Link>
             , then remove the node.
@@ -1414,13 +1533,11 @@ function NodeDetail({
                           <TableCell>
                             <Badge
                               variant={
-                                c.status === 'running' ? 'default' : 'secondary'
-                              }
-                              className={`text-xs ${
                                 c.status === 'running'
-                                  ? 'bg-green-500/15 text-green-700 dark:text-green-400 border-green-500/20'
-                                  : ''
-                              }`}
+                                  ? 'success-subtle'
+                                  : 'secondary'
+                              }
+                              className="text-xs"
                             >
                               {c.status}
                             </Badge>
@@ -1714,7 +1831,7 @@ export function NodesPage() {
                 {stranded.map((node) => node.name).join(', ')} joined with a
                 public address
               </AlertTitle>
-              <AlertDescription className="text-amber-600 dark:text-amber-300">
+              <AlertDescription className="text-amber-700 dark:text-amber-300">
                 {mesh?.state === 'starting'
                   ? 'They move onto the WireGuard mesh as soon as it is up.'
                   : 'Without the WireGuard mesh they cannot reach the control plane or other nodes privately, so cross-node networking does not work for them. Enable it under “Over the internet” above.'}

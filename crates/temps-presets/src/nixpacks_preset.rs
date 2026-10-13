@@ -31,7 +31,7 @@ use temps_entities::preset::NixpacksConfig;
 pub use temps_entities::preset::NixpacksProvider;
 use tracing::{debug, warn};
 
-fn provider_name(provider: NixpacksProvider) -> &'static str {
+pub(crate) fn provider_name(provider: NixpacksProvider) -> &'static str {
     match provider {
         NixpacksProvider::Auto => "Auto-detect",
         NixpacksProvider::Node => "Node.js",
@@ -259,7 +259,7 @@ impl NixpacksPreset {
     }
 
     /// The autopack provider that claims this project, if any.
-    fn detect_provider_id(path: &Path) -> Option<String> {
+    pub(crate) fn detect_provider_id(path: &Path) -> Option<String> {
         let app = match App::new(path) {
             Ok(app) => app,
             Err(error) => {
@@ -359,10 +359,6 @@ impl Drop for StagedConfig {
 
 #[async_trait]
 impl Preset for NixpacksPreset {
-    fn uses_autopack(&self) -> bool {
-        true
-    }
-
     fn project_type(&self) -> ProjectType {
         // The static provider serves a directory of pre-built files with no
         // language runtime (see `autopack_provider`'s "static" mapping) — it

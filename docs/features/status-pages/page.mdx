@@ -1,0 +1,167 @@
+export const metadata = {
+  title: 'Status Pages',
+  description:
+    'Publish a public status page for selected uptime monitors: current state, 90-day uptime history and incident updates you choose to share, at an unguessable link.',
+  alternates: {
+    canonical: '/docs/status-pages',
+  },
+}
+
+# Status Pages
+
+A status page shows your users whether your services are up, without giving them access to Temps. You pick which uptime monitors appear and what they are called; Temps publishes their current state, 90 days of daily uptime and the incident updates you mark as public, at an unguessable link. {{ className: 'lead' }}
+
+Status pages are **Beta**. See [feature maturity](/docs/feature-maturity).
+
+---
+
+## What a visitor sees
+
+- A banner with the overall state: all operational, degraded, or down.
+- One row per selected monitor, under the **public name** you gave it, with its current state, uptime over 90 days and a bar per day.
+- Active and recently resolved (last 14 days) incidents, showing only the updates you made public.
+
+The page is plain HTML with no JavaScript and refreshes itself every minute. The same data is available as JSON at `…/summary.json` for widgets and scripts.
+
+### What is never published
+
+A status page is built from an allowlist, not by hiding fields from the internal view. It never contains:
+
+- monitor names, URLs, check paths, hostnames or IP addresses;
+- probe response bodies or error messages;
+- project or environment names;
+- database IDs of any kind;
+- incident titles and descriptions (an incident's heading is derived from its severity, e.g. "Partial outage");
+- incident updates you did not make public;
+- anything about monitors you did not select, or incidents tied only to them.
+
+---
+
+## Create and publish a page
+
+1. Open the project and go to **Observe → Status Pages** (also linked from the **Uptime** page).
+2. Click **Create status page** and give it a public title. The page starts as a **draft**: its link returns "not found".
+3. Under **Monitors**, tick each monitor to show and type its **public name**, for example `API` or `Dashboard`. Internal names are never pre-filled as public names. Click **Save changes**.
+4. Click **Publish**. The **Public link** is now live; copy it and share it.
+
+Publishing needs at least one selected monitor.
+
+### From the CLI
+
+```bash
+# Create a draft showing monitor 12 as "API" and monitor 15 as "Dashboard"
+temps status-pages create --project-id 3 --title "Acme status" \
+  --monitor 12=API --monitor 15=Dashboard
+
+temps status-pages publish --id 1
+temps status-pages show --id 1        # prints the public URL
+```
+
+### From the API
+
+| Action | Endpoint |
+|---|---|
+| List a project's pages | `GET /api/projects/{project_id}/status-pages` |
+| Create a draft | `POST /api/projects/{project_id}/status-pages` |
+| Read one | `GET /api/status-pages/{id}` |
+| Change title, description or monitors | `PATCH /api/status-pages/{id}` |
+| Publish / unpublish | `POST /api/status-pages/{id}/publish`, `POST /api/status-pages/{id}/unpublish` |
+| Replace the public link | `POST /api/status-pages/{id}/rotate-url` |
+| Delete | `DELETE /api/status-pages/{id}` |
+
+The public view is served without authentication at `GET /api/status/{slug}` (HTML) and `GET /api/status/{slug}/summary.json` (JSON).
+
+---
+
+## Taking a page down
+
+Each of these makes the old link return "not found" **immediately**, before the API call returns:
+
+- **Unpublish** keeps the page and its settings as a draft.
+- **Replace public link** issues a new link and retires the old one, for when a link was shared too widely.
+- **Delete** removes the page. Deleting the project takes all its pages down; deleting a selected monitor removes it from the page.
+
+Public responses are sent with `Cache-Control: no-store`, so browsers and proxies do not keep a copy after you take the page down.
+
+---
+
+## Public incident updates
+
+Incident updates are **private by default**. To share one:
+
+- In the console, open a status page and use **Incident updates**: switch an existing update to **Public**, or post a new update with **Show on status pages** ticked.
+- From the CLI: `temps incidents update-status --id 7 --status identified --message "…" --public`, or `temps incidents set-visibility --id 7 --update-id 31 --public`.
+
+The automatic first update ("Incident created: …") contains the internal incident title and can never be made public.
+
+An incident appears on a page when it has at least one public update and it concerns a monitor selected on that page, an environment one of those monitors watches, or the whole project.
+
+---
+
+## Custom domains
+
+A page can also be served on your own hostname, such as `status.example.com`. The hostname serves **only** the page (`/`) and its JSON (`/summary.json`); every other path answers "not found", and the hostname never reaches the Temps console, its API, or any application.
+
+1. Open the status page and, under **Custom domains**, enter the hostname. Choose how to prove you control it:
+   - **HTTP**: the hostname already points at this Temps instance.
+   - **DNS TXT record**: prove control before moving traffic.
+2. Create the DNS records Temps shows. That is always a record pointing the hostname at Temps: a `CNAME` to your public ingress or console hostname, or an `A` record to the server's address. With DNS verification, it also includes a `TXT` record at `_acme-challenge.<hostname>`.
+3. Click **Verify**. Temps runs the same ACME flow it uses for every other certificate. Ownership is proven when the certificate is issued, and only then does the hostname start serving the page.
+
+### Renewing the certificate
+
+- **HTTP verification**: the certificate renews automatically within 30 days of expiry, like every other HTTP-01 certificate.
+- **DNS verification**: the certificate is **not** renewed automatically, because every order needs a new `TXT` value. Temps notifies you 30 days before expiry, and the console shows the expiry date. Click **Renew**: Temps starts a new order and shows the new `_acme-challenge` record. Publish it, then click **Verify**.
+
+The current certificate keeps serving while a renewal is in progress, and also when a renewal fails, until it expires. A failed renewal shows its error and a **Renew** button to try again. Only one verify or renew runs per hostname at a time; a second one started meanwhile is refused until the first finishes.
+
+```bash
+temps status-pages domains add --id 1 --hostname status.example.com          # HTTP verification
+temps status-pages domains add --id 1 --hostname status.example.com --dns    # DNS TXT verification
+temps status-pages domains verify --id 1 --domain-id 3
+temps status-pages domains renew --id 1 --domain-id 3                         # new order; DNS: prints the new TXT record
+temps status-pages domains list --id 1
+temps status-pages domains remove --id 1 --domain-id 3
+```
+
+| Action | Endpoint |
+|---|---|
+| List | `GET /api/status-pages/{id}/domains` |
+| Attach | `POST /api/status-pages/{id}/domains` |
+| Verify | `POST /api/status-pages/{id}/domains/{domain_id}/verify` |
+| Renew | `POST /api/status-pages/{id}/domains/{domain_id}/renew` |
+| Remove | `DELETE /api/status-pages/{id}/domains/{domain_id}` |
+
+A hostname cannot be attached if anything else on this instance uses it: an application, a project or environment domain, a custom route, the console or public ingress hostname, a name inside the preview or on-demand TLS zone, another status page, or a certificate already managed under **Domains**. Hostnames are compared after normalization (letter case, trailing dot, international names converted to punycode); wildcards and IP addresses are refused.
+
+**Until a hostname is verified**, it serves nothing and no certificate is issued or presented for it. On-demand TLS never mints certificates for status-page hostnames.
+
+**Taking it down.** Removing a hostname, unpublishing the page, or deleting the page or its project makes the hostname answer "not found" immediately:
+
+- Removing a hostname, or deleting the page or project, deletes its certificate (including the stored copy), which stops serving and renewal. The hostname keeps answering "not found" until it is attached again or used by an application.
+- Unpublishing also releases the certificates. After publishing again, click **Verify** on each hostname.
+
+Status-page hostnames are served by the control plane's proxy (single node, or `temps proxy` in a split control plane started with `--console-ingress-address`). Point them at the control plane, not at a worker node.
+
+## Permissions and audit
+
+Creating a page needs `status_page:create`; changing it, publishing, unpublishing, replacing its link or changing an incident update's visibility need `status_page:write`; deleting needs `status_page:delete`. On projects with team access these start at the project **admin** role, so viewers and deployers cannot publish anything.
+
+Adding, verifying, renewing and removing custom domains needs `status_page:write`. Every change and every verification or renewal attempt is written to the audit log (`STATUS_PAGE_DOMAIN_ADDED`, `STATUS_PAGE_DOMAIN_VERIFIED`, `STATUS_PAGE_DOMAIN_VERIFICATION_ATTEMPTED`, `STATUS_PAGE_DOMAIN_RENEWAL_REQUESTED`, `STATUS_PAGE_DOMAIN_REMOVED`, `STATUS_PAGE_CREATED`, `STATUS_PAGE_UPDATED`, `STATUS_PAGE_PUBLISHED`, `STATUS_PAGE_UNPUBLISHED`, `STATUS_PAGE_URL_ROTATED`, `STATUS_PAGE_DELETED`, `STATUS_PAGE_INCIDENT_UPDATE_VISIBILITY_CHANGED`), including the exact list of monitors selected when the selection changes.
+
+---
+
+## How it is served
+
+- Public requests are answered from an in-memory snapshot. They never run a probe or a database query, so traffic to a status page — including someone guessing links — cannot slow Temps down.
+- Snapshots are rebuilt every minute, and immediately when you change or publish a page or an incident update's visibility.
+- The link contains 128 random bits; it cannot be guessed or derived from any ID. Unknown, unpublished, deleted and replaced links all receive the same "not found" response.
+- Requests are rate-limited per client (300 per minute per IPv4 address or IPv6 /64). Visitors that cannot be tracked individually during a flood share a separate budget, so a flood of addresses cannot lock out visitors already being served.
+- The page asks search engines not to index it (`noindex`), so the link stays as private as you keep it.
+- Pages are served on Temps' public-only routes (the same surface as webhook receivers), so they keep working when the console itself is restricted to an IP allowlist. The link uses your public ingress URL when one is configured, otherwise the external URL.
+
+## Limits
+
+- 10 status pages per project, 50 monitors per page.
+- Titles up to 120 characters, descriptions up to 1,000, public names up to 80, incident update messages up to 5,000.
+- Up to 5 custom domains per page.

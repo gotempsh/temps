@@ -284,7 +284,23 @@ function SandboxNodeRow({
           <Badge variant={node.status === 'active' ? 'outline' : 'secondary'}>
             {node.status}
           </Badge>
+          {node.dedicated && (
+            <Badge
+              variant="default"
+              title="Dedicated node (temps.sh/role=dedicated)"
+            >
+              Dedicated
+            </Badge>
+          )}
         </div>
+        {/* A dedicated node is never chosen automatically; say how to use
+            it so an allowed-but-unused node is not a mystery. */}
+        {node.dedicated && node.eligible && (
+          <p className="pl-6 text-xs text-muted-foreground">
+            Only takes sandboxes that request it: create with{' '}
+            <code>--node {node.name}</code> or <code>{`node: "${node.name}"`}</code>.
+          </p>
+        )}
         {/* Why an allowed node still won't take sandboxes (offline, being
             evicted, plain-http address, …). */}
         {!node.eligible && node.reason && (
@@ -325,7 +341,7 @@ export function ControlPlaneExcludedWarning() {
 
 function SandboxNodesSkeleton() {
   return (
-    <div
+    <div role="status"
       className="space-y-4"
       aria-busy="true"
       aria-label="Loading sandbox nodes"

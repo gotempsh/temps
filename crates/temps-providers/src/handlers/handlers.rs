@@ -24,7 +24,7 @@ use temps_core::{
     },
     problemdetails::Problem,
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use utoipa::OpenApi;
 
 use super::audit::{
@@ -43,9 +43,10 @@ use crate::handlers::types::{
     EnvironmentVariableInfo, ExternalServiceDetails, ExternalServiceInfo, HealthCheckEntryResponse,
     ImportExternalServiceRequest, LinkServiceRequest, ProjectServiceInfo, ProviderMetadata,
     RepointContinuousArchiveSourceRequest, RetryClusterRequest, RuntimeCredentialsResponse,
-    SensitiveValueResponse, ServiceHealthResponse, ServiceHealthStatusBatchResponse,
-    ServiceHealthStatusEntryResponse, ServiceMemberInfo, ServiceParameter, ServiceTypeInfo,
-    ServiceTypeRoute, UpdateExternalServiceRequest, UpgradeExternalServiceRequest,
+    SensitiveValueResponse, ServiceDownAlertResponse, ServiceHealthResponse,
+    ServiceHealthStatusBatchResponse, ServiceHealthStatusEntryResponse, ServiceMemberInfo,
+    ServiceParameter, ServiceTypeInfo, ServiceTypeRoute, UpdateExternalServiceRequest,
+    UpgradeExternalServiceRequest,
 };
 use crate::services::{DatabaseProvisioningConfig, EnvironmentVariableOptions};
 use temps_core::AuditContext;
@@ -75,7 +76,48 @@ pub(crate) fn worker_node_required(
         E::LocalWorkloadsDisabled { .. } => {
             Some(temps_core::worker_node_required_problem(error.to_string()))
         }
-        _ => None,
+        E::ServiceNameConflict { .. }
+        | E::ServiceNameRestoreConflict { .. }
+        | E::ServiceContainerRestoreConflict { .. }
+        | E::AmbiguousServiceName { .. }
+        | E::ServiceResourceConflict { .. }
+        | E::ServiceContainerConflict { .. }
+        | E::ServiceNotFound { .. }
+        | E::ServiceNotFoundByName { .. }
+        | E::ServiceNotFoundBySlug { .. }
+        | E::InitializationFailed { .. }
+        | E::UpgradeRejected { .. }
+        | E::EncryptionFailed { .. }
+        | E::DecryptionFailed { .. }
+        | E::InvalidServiceType { .. }
+        | E::ServiceNotLinkedToProject { .. }
+        | E::ServiceClaimDenied { .. }
+        | E::InvalidDatabaseProvisioning { .. }
+        | E::ProjectNotFound { .. }
+        | E::EnvironmentNotFound { .. }
+        | E::DatabaseError { .. }
+        | E::ArchiveSourceDesynced { .. }
+        | E::ParameterValidationFailed { .. }
+        | E::DataSafetyRefusal { .. }
+        | E::StartFailed { .. }
+        | E::UpgradeInProgress { .. }
+        | E::StopFailed { .. }
+        | E::DeletionFailed { .. }
+        | E::ServiceHasLinkedProjects { .. }
+        | E::EnvironmentVariableNotFound { .. }
+        | E::ParameterNotFound { .. }
+        | E::ParameterNotSensitive { .. }
+        | E::EncryptedVariableAccessDenied { .. }
+        | E::DockerError { .. }
+        | E::DuplicateServiceType { .. }
+        | E::InternalError { .. }
+        | E::ControlPlaneAddressRequired { .. }
+        | E::ControlPlaneMemberUnreachable { .. }
+        | E::ClusterPortsUnavailable { .. }
+        | E::ClusterMemberLimitExceeded { .. }
+        | E::ClusterMemberProvisioning { .. }
+        | E::ClusterNotSettled { .. }
+        | E::ClusterBusy { .. } => None,
     }
 }
 
@@ -92,7 +134,198 @@ pub(crate) fn external_service_problem(
     error: &crate::services::ExternalServiceError,
     detail: String,
 ) -> Problem {
-    worker_node_required(error).unwrap_or_else(|| internal_server_error().detail(detail).build())
+    worker_node_required(error)
+        .or_else(|| data_safety_problem(error))
+        .or_else(|| service_name_problem(error))
+        .or_else(|| cluster_placement_problem(error))
+        .unwrap_or_else(|| internal_server_error().detail(detail).build())
+}
+
+/// A change refused because it would leave the service without its data
+/// (#1415): a 409 with the reason and the safe manual steps in `detail`.
+fn data_safety_problem(error: &crate::services::ExternalServiceError) -> Option<Problem> {
+    use crate::services::ExternalServiceError as E;
+    match error {
+        E::DataSafetyRefusal { service_id, .. } => Some(
+            conflict()
+                .title("Change Would Lose Data")
+                .detail(error.to_string())
+                .value("error_code", "DATA_SAFETY_REFUSAL")
+                .value("service_id", *service_id)
+                .build(),
+        ),
+        // Every other condition keeps its own classification.
+        E::ServiceNameConflict { .. }
+        | E::ServiceNameRestoreConflict { .. }
+        | E::ServiceContainerRestoreConflict { .. }
+        | E::AmbiguousServiceName { .. }
+        | E::ServiceResourceConflict { .. }
+        | E::ServiceContainerConflict { .. }
+        | E::ServiceNotFound { .. }
+        | E::ServiceNotFoundByName { .. }
+        | E::ServiceNotFoundBySlug { .. }
+        | E::InitializationFailed { .. }
+        | E::UpgradeRejected { .. }
+        | E::EncryptionFailed { .. }
+        | E::DecryptionFailed { .. }
+        | E::InvalidServiceType { .. }
+        | E::ServiceNotLinkedToProject { .. }
+        | E::ServiceClaimDenied { .. }
+        | E::InvalidDatabaseProvisioning { .. }
+        | E::ProjectNotFound { .. }
+        | E::EnvironmentNotFound { .. }
+        | E::DatabaseError { .. }
+        | E::ArchiveSourceDesynced { .. }
+        | E::ParameterValidationFailed { .. }
+        | E::StartFailed { .. }
+        | E::UpgradeInProgress { .. }
+        | E::StopFailed { .. }
+        | E::DeletionFailed { .. }
+        | E::ServiceHasLinkedProjects { .. }
+        | E::EnvironmentVariableNotFound { .. }
+        | E::ParameterNotFound { .. }
+        | E::ParameterNotSensitive { .. }
+        | E::EncryptedVariableAccessDenied { .. }
+        | E::DockerError { .. }
+        | E::DuplicateServiceType { .. }
+        | E::InternalError { .. }
+        | E::DockerUnavailable(_)
+        | E::LocalWorkloadsDisabled { .. }
+        | E::ControlPlaneAddressRequired { .. }
+        | E::ControlPlaneMemberUnreachable { .. }
+        | E::ClusterPortsUnavailable { .. }
+        | E::ClusterMemberLimitExceeded { .. }
+        | E::ClusterMemberProvisioning { .. }
+        | E::ClusterNotSettled { .. }
+        | E::ClusterBusy { .. } => None,
+    }
+}
+
+fn service_name_problem(error: &crate::services::ExternalServiceError) -> Option<Problem> {
+    use crate::services::ExternalServiceError as E;
+    match error {
+        E::ServiceNameConflict { .. }
+        | E::ServiceNameRestoreConflict { .. }
+        | E::ServiceContainerRestoreConflict { .. }
+        | E::AmbiguousServiceName { .. }
+        | E::ServiceResourceConflict { .. }
+        | E::ServiceContainerConflict { .. } => Some(
+            conflict()
+                .title("Service Name Conflict")
+                .detail(error.to_string())
+                .value("error_code", "SERVICE_NAME_CONFLICT")
+                .build(),
+        ),
+        // Other conditions retain the worker, placement or handler classification.
+        E::ServiceNotFound { .. }
+        | E::ServiceNotFoundByName { .. }
+        | E::ServiceNotFoundBySlug { .. }
+        | E::InitializationFailed { .. }
+        | E::UpgradeRejected { .. }
+        | E::EncryptionFailed { .. }
+        | E::DecryptionFailed { .. }
+        | E::InvalidServiceType { .. }
+        | E::ServiceNotLinkedToProject { .. }
+        | E::ServiceClaimDenied { .. }
+        | E::InvalidDatabaseProvisioning { .. }
+        | E::ProjectNotFound { .. }
+        | E::EnvironmentNotFound { .. }
+        | E::DatabaseError { .. }
+        | E::ArchiveSourceDesynced { .. }
+        | E::ParameterValidationFailed { .. }
+        | E::DataSafetyRefusal { .. }
+        | E::StartFailed { .. }
+        | E::UpgradeInProgress { .. }
+        | E::StopFailed { .. }
+        | E::DeletionFailed { .. }
+        | E::ServiceHasLinkedProjects { .. }
+        | E::EnvironmentVariableNotFound { .. }
+        | E::ParameterNotFound { .. }
+        | E::ParameterNotSensitive { .. }
+        | E::EncryptedVariableAccessDenied { .. }
+        | E::DockerError { .. }
+        | E::DuplicateServiceType { .. }
+        | E::InternalError { .. }
+        | E::DockerUnavailable(_)
+        | E::LocalWorkloadsDisabled { .. }
+        | E::ControlPlaneAddressRequired { .. }
+        | E::ControlPlaneMemberUnreachable { .. }
+        | E::ClusterPortsUnavailable { .. }
+        | E::ClusterMemberLimitExceeded { .. }
+        | E::ClusterMemberProvisioning { .. }
+        | E::ClusterNotSettled { .. }
+        | E::ClusterBusy { .. } => None,
+    }
+}
+
+/// A cluster placement the current configuration cannot serve: members on
+/// worker nodes could not reach members on the control plane, or the
+/// cluster's members cannot be given host ports — a 409 with the remedy in
+/// `detail`. A member list larger than a cluster can hold is a 400. Never a
+/// 500: nothing failed, the operator has a configuration step to take first.
+fn cluster_placement_problem(error: &crate::services::ExternalServiceError) -> Option<Problem> {
+    use crate::services::ExternalServiceError as E;
+    // Every variant is listed, no catch-all: a new variant must be classified
+    // here before it compiles, instead of silently falling through to a
+    // handler's generic 500.
+    let title = match error {
+        E::ControlPlaneAddressRequired { .. } | E::ControlPlaneMemberUnreachable { .. } => {
+            "Cluster Placement Not Reachable"
+        }
+        E::ClusterPortsUnavailable { .. } => "Cluster Ports Unavailable",
+        E::ClusterMemberProvisioning { .. } => "Cluster Member Still Provisioning",
+        E::ClusterNotSettled { .. } => "Cluster Not Ready",
+        E::ClusterBusy { .. } => "Cluster Busy",
+        // The request itself is invalid, not in conflict with any state.
+        E::ClusterMemberLimitExceeded { .. } => {
+            return Some(
+                bad_request()
+                    .title("Too Many Cluster Members")
+                    .detail(error.to_string())
+                    .build(),
+            )
+        }
+        // Not placement conditions: each handler classifies these itself
+        // (and `worker_node_required` owns the two "no daemon" variants).
+        E::ServiceNameConflict { .. }
+        | E::ServiceNameRestoreConflict { .. }
+        | E::ServiceContainerRestoreConflict { .. }
+        | E::AmbiguousServiceName { .. }
+        | E::ServiceResourceConflict { .. }
+        | E::ServiceContainerConflict { .. }
+        | E::ServiceNotFound { .. }
+        | E::ServiceNotFoundByName { .. }
+        | E::ServiceNotFoundBySlug { .. }
+        | E::InitializationFailed { .. }
+        | E::UpgradeRejected { .. }
+        | E::EncryptionFailed { .. }
+        | E::DecryptionFailed { .. }
+        | E::InvalidServiceType { .. }
+        | E::ServiceNotLinkedToProject { .. }
+        | E::ServiceClaimDenied { .. }
+        | E::InvalidDatabaseProvisioning { .. }
+        | E::ProjectNotFound { .. }
+        | E::EnvironmentNotFound { .. }
+        | E::DatabaseError { .. }
+        | E::ArchiveSourceDesynced { .. }
+        | E::ParameterValidationFailed { .. }
+        | E::DataSafetyRefusal { .. }
+        | E::StartFailed { .. }
+        | E::UpgradeInProgress { .. }
+        | E::StopFailed { .. }
+        | E::DeletionFailed { .. }
+        | E::ServiceHasLinkedProjects { .. }
+        | E::EnvironmentVariableNotFound { .. }
+        | E::ParameterNotFound { .. }
+        | E::ParameterNotSensitive { .. }
+        | E::EncryptedVariableAccessDenied { .. }
+        | E::DockerError { .. }
+        | E::DuplicateServiceType { .. }
+        | E::InternalError { .. }
+        | E::DockerUnavailable(_)
+        | E::LocalWorkloadsDisabled { .. } => return None,
+    };
+    Some(conflict().title(title).detail(error.to_string()).build())
 }
 
 /// Get available service types
@@ -213,6 +446,7 @@ async fn list_available_containers(
     request_body = ImportExternalServiceRequest,
     responses(
         (status = 201, description = "Service imported successfully", body = ExternalServiceInfo),
+        (status = 409, description = "Service name, container, or volumes are already owned by another service or an active restore"),
         (status = 400, description = "Invalid request"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
@@ -251,6 +485,11 @@ async fn import_external_service(
         .await
         .map_err(|e| {
             error!("Failed to import service: {}", e);
+            if let Some(error) = e.downcast_ref::<crate::services::ExternalServiceError>() {
+                if let Some(problem) = service_name_problem(error) {
+                    return problem;
+                }
+            }
             bad_request()
                 .detail(format!("Failed to import service: {}", e))
                 .build()
@@ -596,6 +835,7 @@ async fn get_service(
     responses(
         (status = 201, description = "Service created successfully", body = ExternalServiceInfo),
         (status = 400, description = "Invalid request"),
+        (status = 409, description = "Service name, container, or volumes are already owned by another service or an active restore"),
         (status = 500, description = "Internal server error")
     )
 )]
@@ -812,7 +1052,11 @@ fn service_create_failure_code(
         }
         E::ParameterValidationFailed { .. }
         | E::InvalidServiceType { .. }
-        | E::InvalidDatabaseProvisioning { .. } => OperationFailureCode::InvalidConfiguration,
+        | E::InvalidDatabaseProvisioning { .. }
+        | E::ControlPlaneAddressRequired { .. }
+        | E::ControlPlaneMemberUnreachable { .. }
+        | E::ClusterPortsUnavailable { .. }
+        | E::ClusterMemberLimitExceeded { .. } => OperationFailureCode::InvalidConfiguration,
         E::DuplicateServiceType { .. } => OperationFailureCode::Conflict,
         E::ProjectNotFound { .. } | E::EnvironmentNotFound { .. } => OperationFailureCode::NotFound,
         E::DatabaseError { .. } => OperationFailureCode::Database,
@@ -876,7 +1120,7 @@ async fn rollback_unlinked_service(
         (status = 200, description = "Service updated successfully", body = ExternalServiceInfo),
         (status = 400, description = "Invalid request"),
         (status = 404, description = "Service not found"),
-        (status = 409, description = "A major upgrade is in progress for this service"),
+        (status = 409, description = "A major upgrade is in progress, or duplicate service names prevent safe resource control"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -1184,7 +1428,7 @@ fn upgrade_error_problem(e: &crate::services::ExternalServiceError) -> Option<Pr
         (status = 200, description = "Service upgraded successfully", body = ExternalServiceInfo),
         (status = 400, description = "Invalid request or upgrade not supported"),
         (status = 404, description = "Service not found"),
-        (status = 409, description = "A major upgrade is already in progress for this service"),
+        (status = 409, description = "A major upgrade is already in progress, or duplicate service names prevent safe resource control"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -1252,6 +1496,7 @@ async fn upgrade_service(
     responses(
         (status = 204, description = "Service deleted successfully"),
         (status = 400, description = "Cannot delete: service is still linked to projects"),
+        (status = 409, description = "An active restore uses this service, or duplicate service names prevent safe resource control"),
         (status = 404, description = "Service not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -1424,6 +1669,43 @@ async fn get_cluster_health(
     Ok((StatusCode::OK, Json(body)))
 }
 
+/// Build the health response, adding the down-alert state once the failure
+/// streak has reached the alert threshold.
+async fn service_health_response(
+    app_state: &AppState,
+    snap: crate::services::ServiceHealthSnapshot,
+) -> ServiceHealthResponse {
+    let service_id = snap.service_id;
+    let reached_threshold =
+        snap.consecutive_failures >= crate::health_monitor::CONSECUTIVE_FAILURES_BEFORE_ALERT;
+    let alarm = snap.down_alarm.clone();
+    let mut response = ServiceHealthResponse::from(snap);
+    if reached_threshold {
+        let severity = crate::health_monitor::DOWN_ALERT_SEVERITY.as_str();
+        let destinations = match app_state
+            .notification_service
+            .destination_count(severity)
+            .await
+        {
+            Ok(count) => count,
+            Err(e) => {
+                warn!(
+                    "Could not count {} notification destinations for service {} health status: {}",
+                    severity, service_id, e
+                );
+                None
+            }
+        };
+        response.down_alert = Some(ServiceDownAlertResponse::new(
+            alarm.as_ref(),
+            severity,
+            destinations,
+            chrono::Utc::now(),
+        ));
+    }
+    response
+}
+
 /// Persisted health status for an external service
 ///
 /// Returns the latest health probe result recorded by
@@ -1462,7 +1744,10 @@ async fn get_service_health_status(
         .get_health_snapshot(id, limit)
         .await
     {
-        Ok(snap) => Ok((StatusCode::OK, Json(ServiceHealthResponse::from(snap)))),
+        Ok(snap) => Ok((
+            StatusCode::OK,
+            Json(service_health_response(&app_state, snap).await),
+        )),
         Err(crate::services::ExternalServiceError::ServiceNotFound { .. }) => {
             Err(not_found().detail("Service not found").build())
         }
@@ -1543,7 +1828,10 @@ async fn trigger_service_health_check(
         .get_health_snapshot(id, 50)
         .await
     {
-        Ok(snap) => Ok((StatusCode::OK, Json(ServiceHealthResponse::from(snap)))),
+        Ok(snap) => Ok((
+            StatusCode::OK,
+            Json(service_health_response(&app_state, snap).await),
+        )),
         Err(crate::services::ExternalServiceError::ServiceNotFound { .. }) => {
             Err(not_found().detail("Service not found").build())
         }
@@ -1826,7 +2114,7 @@ async fn list_service_health_statuses(
     responses(
         (status = 200, description = "Service started successfully", body = ExternalServiceInfo),
         (status = 404, description = "Service not found"),
-        (status = 409, description = "A Postgres major upgrade is in progress for this service"),
+        (status = 409, description = "A Postgres major upgrade is in progress, duplicate service names prevent safe resource control, another cluster action is in progress, the cluster or one of its members is still being provisioned, or the cluster's provisioning failed"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -2176,6 +2464,17 @@ async fn remove_cluster_member(
                 "Failed to remove cluster member {} from service {}: {}",
                 member_id, id, e
             );
+            // Classified before the message matching below, whose "Cannot
+            // remove" would turn this conflict into a 400.
+            if matches!(
+                e,
+                crate::services::ExternalServiceError::ClusterMemberProvisioning { .. }
+            ) {
+                return Err(external_service_problem(
+                    &e,
+                    format!("Failed to remove cluster member: {}", e),
+                ));
+            }
             let msg = e.to_string();
             if msg.contains("not found") {
                 Err(not_found().detail(msg).build())
@@ -2295,6 +2594,7 @@ async fn promote_cluster_member(
     responses(
         (status = 200, description = "Service stopped successfully", body = ExternalServiceInfo),
         (status = 404, description = "Service not found"),
+        (status = 409, description = "Duplicate service names prevent safe resource control, another cluster action is in progress, or the cluster or one of its members is still being provisioned"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -3455,6 +3755,11 @@ async fn update_service_resources(
         ProviderMetadata,
         ExternalServiceDetails,
         ExternalServiceInfo,
+        crate::readiness::ServiceReadiness,
+        crate::readiness::ReadinessPhase,
+        crate::readiness::InitializationFailure,
+        crate::readiness::InitializationFailureKind,
+        crate::readiness::ReadinessNextAction,
         CreateExternalServiceRequest,
         UpdateExternalServiceRequest,
         UpgradeExternalServiceRequest,
@@ -3470,11 +3775,14 @@ async fn update_service_resources(
         EnvironmentVariableInfo,
         SensitiveValueResponse,
         ServiceHealthResponse,
+        ServiceDownAlertResponse,
         HealthCheckEntryResponse,
         ServiceHealthStatusBatchResponse,
         ServiceHealthStatusEntryResponse,
         ClusterHealthReportResponse,
         ClusterMemberHealthResponse,
+        super::types::ClusterProtectionResponse,
+        crate::services::ClusterProtectionState,
         crate::externalsvc::ServiceResourceLimits,
         crate::externalsvc::postgres_wal_health::PostgresWalHealth,
         crate::externalsvc::postgres_wal_health::ArchiveMode,
@@ -3735,6 +4043,12 @@ mod tests {
         });
         let state = Arc::new(AppState {
             external_service_manager: manager.clone(),
+            data_import_service: crate::handlers::types::test_support::data_import_service(
+                manager.clone(),
+                db.clone(),
+            ),
+            sensitive_action_authorizer:
+                crate::handlers::types::test_support::allow_sensitive_actions(),
             audit_service: Arc::new(RecordingAuditLogger::default()),
             query_service: Arc::new(crate::QueryService::new(manager)),
             health_monitor: None,
@@ -3745,6 +4059,9 @@ mod tests {
             telemetry: Arc::new(temps_core::NoopTelemetryReporter),
             project_access_checker: Some(Arc::new(NarrowedServiceAccessChecker)),
             application_network_reconciler: Some(network_reconciler.clone()),
+            notification_service: Arc::new(crate::handlers::types::StaticNotificationService {
+                destinations: Some(0),
+            }),
         });
 
         let result = link_service_to_project(
@@ -3959,6 +4276,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn service_name_errors_return_actionable_conflict() {
+        let error = crate::services::ExternalServiceError::ServiceNameConflict {
+            name: "app-db".to_string(),
+            existing_service_id: 7,
+        };
+        let problem = external_service_problem(&error, "fallback".to_string());
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert!(problem.body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("Choose a unique name"));
+    }
+
     // Guards the shared error->status mapping used by update_service /
     // upgrade_service / start_service. The exact bug this class of test exists
     // for (a dead `e.to_string() == "Service not found"` arm returning 500
@@ -4043,6 +4374,114 @@ mod tests {
             let shared = upgrade_error_problem(error).expect("shared mapping classifies it");
             assert_eq!(shared.body.get("detail"), problem.body.get("detail"));
         }
+    }
+
+    /// A cluster whose worker members could not reach its control-plane
+    /// members is a configuration conflict with a remedy — a 409 carrying the
+    /// cluster name and the fix, through every handler's generic path, and
+    /// classified as invalid configuration for telemetry.
+    #[test]
+    fn unreachable_cluster_placement_is_an_actionable_conflict() {
+        use crate::services::ExternalServiceError as E;
+
+        let no_address = E::ControlPlaneAddressRequired {
+            name: "ha-pg".to_string(),
+            reason: "no control-plane private address is configured".to_string(),
+        };
+        let loopback_only = E::ControlPlaneMemberUnreachable {
+            name: "ha-pg".to_string(),
+            container_name: "postgres-ha-pg-monitor".to_string(),
+            port: 6090,
+            address: "10.52.0.10".to_string(),
+        };
+
+        let no_ports = E::ClusterPortsUnavailable {
+            service_id: 6001,
+            reason: "member ordinal 10 is outside the cluster's 10-port block".to_string(),
+        };
+
+        for (error, remedy) in [
+            (&no_address, "--private-address"),
+            (&loopback_only, "recreate it"),
+            (&no_ports, "10-port block"),
+        ] {
+            let problem = external_service_problem(error, "Failed to do a thing".to_string());
+            assert_eq!(problem.status_code, StatusCode::CONFLICT, "{error}");
+            let detail = problem
+                .body
+                .get("detail")
+                .and_then(|v| v.as_str())
+                .expect("detail is always set");
+            assert!(
+                detail.contains("ha-pg") || detail.contains("6001"),
+                "the error must name the cluster: {detail}"
+            );
+            assert!(detail.contains(remedy), "{detail}");
+            assert_eq!(
+                service_create_failure_code(error),
+                OperationFailureCode::InvalidConfiguration
+            );
+        }
+    }
+
+    /// Too many members is a bad request on every endpoint (create, retry),
+    /// never a generic 500.
+    #[test]
+    fn too_many_cluster_members_is_a_bad_request() {
+        let error = crate::services::ExternalServiceError::ClusterMemberLimitExceeded {
+            name: "ha-pg".to_string(),
+            requested: 11,
+            max: 10,
+        };
+        let problem = external_service_problem(&error, "Failed to retry cluster".to_string());
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .expect("detail is always set");
+        assert!(
+            detail.contains("ha-pg") && detail.contains("at most 10"),
+            "{detail}"
+        );
+        assert_eq!(
+            service_create_failure_code(&error),
+            OperationFailureCode::InvalidConfiguration
+        );
+    }
+
+    /// #1353: stopping a cluster while a member is provisioning is a 409
+    /// naming the member, not a Docker 404 surfaced as a 500.
+    #[test]
+    fn cluster_member_provisioning_is_a_conflict() {
+        let error = crate::services::ExternalServiceError::ClusterMemberProvisioning {
+            service_id: 7,
+            action: "stop",
+            container_name: "postgres-ha-3".to_string(),
+            status: "creating".to_string(),
+        };
+        let problem = external_service_problem(&error, "Failed to stop service".to_string());
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        let detail = problem.body.get("detail").and_then(|v| v.as_str()).unwrap();
+        assert!(detail.contains("postgres-ha-3"), "{detail}");
+    }
+
+    /// Greptile on #1366: a lifecycle action on a cluster another one is
+    /// changing is refused at once with a 409, never queued on a database
+    /// connection.
+    #[test]
+    fn cluster_busy_is_a_conflict() {
+        let error = crate::services::ExternalServiceError::ClusterBusy {
+            service_id: 7,
+            action: "stop",
+        };
+        let problem = external_service_problem(&error, "Failed to stop service".to_string());
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        let detail = problem.body.get("detail").and_then(|v| v.as_str()).unwrap();
+        assert!(
+            detail.contains("service 7") && detail.contains("in progress"),
+            "{detail}"
+        );
     }
 
     /// Everything else keeps the caller's context and its 500.
@@ -4253,6 +4692,12 @@ mod tests {
         let audit_logger = RecordingAuditLogger::default();
         let state = Arc::new(AppState {
             external_service_manager: manager.clone(),
+            data_import_service: crate::handlers::types::test_support::data_import_service(
+                manager.clone(),
+                db.clone(),
+            ),
+            sensitive_action_authorizer:
+                crate::handlers::types::test_support::allow_sensitive_actions(),
             audit_service: Arc::new(audit_logger.clone()),
             query_service: Arc::new(crate::QueryService::new(manager)),
             health_monitor: None,
@@ -4263,6 +4708,9 @@ mod tests {
             telemetry: Arc::new(temps_core::NoopTelemetryReporter),
             project_access_checker: None,
             application_network_reconciler: None,
+            notification_service: Arc::new(crate::handlers::types::StaticNotificationService {
+                destinations: Some(0),
+            }),
         });
 
         let response = reveal_service_parameter(

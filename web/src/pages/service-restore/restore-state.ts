@@ -222,6 +222,9 @@ export function restoreGate(
 
 export const PHASES: ReadonlyArray<{ id: string; label: string }> = [
   { id: 'prepare', label: 'Prepare' },
+  // Engines that stage the backup locally (PostgreSQL WAL-G, MongoDB
+  // archives) download it here, before writing anything; it stays cancellable.
+  { id: 'download', label: 'Download backup' },
   { id: 'provision', label: 'Provision' },
   { id: 'restore', label: 'Restore data' },
   { id: 'recover', label: 'Recover WAL' },

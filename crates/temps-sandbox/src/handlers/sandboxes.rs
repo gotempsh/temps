@@ -113,6 +113,29 @@ impl From<SandboxError> for Problem {
                     .with_title("Sandbox Creation Failed")
                     .with_detail(error.to_string())
             }
+            SandboxError::ImageUnavailable {
+                ref sandbox_id,
+                ref image,
+                ref reason,
+            } => {
+                // The registry's own error text can carry hostnames and request
+                // detail, so it goes to the log; the response names the image.
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    image = %image,
+                    reason = %reason,
+                    "sandbox image could not be pulled"
+                );
+                let detail = format!(
+                    "Sandbox image '{image}' could not be pulled for sandbox {sandbox_id}. \
+                     Check that this host can reach the image registry and that the \
+                     tag is published; an administrator can pre-load it with `docker pull {image}`."
+                );
+                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .with_type("https://temps.sh/probs/sandbox-image-unavailable")
+                    .with_title("Sandbox Image Unavailable")
+                    .with_detail(detail)
+            }
             SandboxError::ExecFailed { .. } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Sandbox Exec Failed")
@@ -182,6 +205,12 @@ impl From<SandboxError> for Problem {
                 .with_type("https://temps.sh/probs/sandbox-no-placement-node")
                 .with_title("No Node Available For Sandboxes")
                 .with_detail(error.to_string()),
+            SandboxError::DedicatedNodesOnly { .. } => {
+                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
+                    .with_type("https://temps.sh/probs/sandbox-dedicated-node-only")
+                    .with_title("Only Dedicated Nodes Available For Sandboxes")
+                    .with_detail(error.to_string())
+            }
             SandboxError::RuntimeEnvironmentNotFound { .. } => {
                 problemdetails::new(StatusCode::NOT_FOUND)
                     .with_title("Sandbox Runtime Environment Not Found")
@@ -305,11 +334,15 @@ fn validate_seed_url(url: &str, kind: &str) -> Result<(), SandboxError> {
                 "host points to a private, loopback, or metadata address".to_string()
             }
             UrlValidationError::DnsResolutionFailed(m) => format!("dns: {m}"),
-            // Only ever returned by validate_loopback_or_private_url/_async
-            // (the inverse check used by local-only providers), never by
-            // validate_external_url -- unreachable here, kept explicit so
-            // this match stays exhaustive as the shared enum grows.
-            UrlValidationError::NotLocalOrPrivate => "unexpected validation error".to_string(),
+            // NotLocalOrPrivate is only returned by the inverse
+            // validate_loopback_or_private_url/_async check, and
+            // InvalidTrustedNetwork only by the settings parser -- never by
+            // validate_external_url. Unreachable here, kept explicit so this
+            // match stays exhaustive as the shared enum grows.
+            UrlValidationError::NotLocalOrPrivate
+            | UrlValidationError::InvalidTrustedNetwork { .. } => {
+                "unexpected validation error".to_string()
+            }
         };
         SandboxError::Validation {
             message: format!("{kind} source: {detail}"),
@@ -523,11 +556,13 @@ pub struct CreateSandboxBody {
     /// extra round-trip.
     #[serde(default)]
     pub ports: Vec<u16>,
-    /// Isolation backend: `"docker"` (default) or `"firecracker"` (ADR-029,
+    /// Isolation backend: `"docker"` (default), `"firecracker"` (ADR-029,
     /// hardware-virtualized microVM — requires a host provisioned with
-    /// `temps firecracker setup`). Omit for the platform default; existing
-    /// clients are unaffected. Requesting an unavailable backend fails with
-    /// 400 rather than silently downgrading isolation.
+    /// `temps firecracker setup`) or `"microsandbox"` (ADR-050, experimental
+    /// libkrun microVM — requires `temps microsandbox setup`). Omit for the
+    /// platform default; existing clients are unaffected. Requesting an
+    /// unavailable backend fails with 400 rather than silently downgrading
+    /// isolation.
     #[serde(default)]
     pub backend: Option<String>,
     /// Lifecycle class (ADR-036, temps-native): `"ephemeral"` (default) or
@@ -656,7 +691,7 @@ pub struct SandboxInner {
     // temps-native extras — the SDK ignores fields it doesn't know about.
     pub name: String,
     pub image: Option<String>,
-    /// Isolation backend: "docker" | "firecracker". `None` on legacy rows
+    /// Isolation backend: "docker" | "firecracker" | "microsandbox". `None` on legacy rows
     /// created before the backend was recorded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
@@ -2885,6 +2920,12 @@ mod tests {
                 StatusCode::UNPROCESSABLE_ENTITY,
             ),
             (
+                SandboxError::DedicatedNodesOnly {
+                    nodes: "node 7 (gpu-1) is dedicated".into(),
+                },
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
                 SandboxError::Unavailable {
                     reason: "worker node 'w2' is unavailable".into(),
                 },
@@ -2898,11 +2939,36 @@ mod tests {
                 },
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
+            (
+                SandboxError::ImageUnavailable {
+                    sandbox_id: "sbx_1".into(),
+                    image: "registry.example.test/team/img:1.0.0".into(),
+                    reason: "manifest unknown".into(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
         ];
         for (error, status) in cases {
             let label = error.to_string();
             assert_eq!(Problem::from(error).status_code, status, "{label}");
         }
+    }
+
+    #[test]
+    fn image_unavailable_problem_names_the_image_and_remediation_without_the_registry_error() {
+        let problem = Problem::from(SandboxError::ImageUnavailable {
+            sandbox_id: "sbx_1".into(),
+            image: "registry.example.test/team/img:1.0.0".into(),
+            reason: "manifest unknown".into(),
+        });
+        assert_eq!(problem.status_code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(problem.body["title"], "Sandbox Image Unavailable");
+        let detail = problem.body["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains("registry.example.test/team/img:1.0.0"));
+        assert!(detail.contains("sbx_1"));
+        assert!(detail.contains("docker pull"));
+        // The registry's own text stays in the server log, not the response.
+        assert!(!detail.contains("manifest unknown"));
     }
 
     #[test]

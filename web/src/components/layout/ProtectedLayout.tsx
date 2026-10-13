@@ -188,7 +188,10 @@ function ErrorDetails({ error, message }: { error: unknown; message: string }) {
             )}
           </Button>
         </div>
-        <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-all rounded bg-background p-3 font-mono text-xs">
+        <pre
+          tabIndex={0}
+          className="max-h-48 overflow-auto whitespace-pre-wrap break-all rounded bg-background p-3 font-mono text-xs"
+        >
           {payload}
         </pre>
       </div>
@@ -319,7 +322,7 @@ export const ProtectedLayout = ({
               <span>
                 Still not working? Check the{' '}
                 <a
-                  href="https://docs.temps.sh"
+                  href="https://temps.sh/docs"
                   target="_blank"
                   rel="noreferrer"
                   className="inline-flex items-center gap-1 font-medium text-foreground underline-offset-4 hover:underline"

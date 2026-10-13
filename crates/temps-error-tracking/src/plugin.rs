@@ -463,6 +463,7 @@ impl TempsPlugin for ErrorTrackingPlugin {
             crate::handlers::sentry_compat_handlers::SentryCompatAppState {
                 source_map_service: source_map_service.clone(),
                 db,
+                audit_service: audit_service.clone(),
             },
         );
         let sentry_compat_routes =

@@ -148,6 +148,7 @@ use crate::services::secret_service::SecretService;
         trigger::WebhookTriggerRequest,
         trigger::WebhookTriggerResponse,
         trigger::SandboxStatusResponse,
+        crate::sandbox::microsandbox::MicrosandboxCapability,
         trigger::SmokeTestResponse,
         trigger::SaveAgentTokenRequest,
         trigger::SaveAgentTokenResponse,
@@ -274,4 +275,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .merge(secrets::routes())
         .merge(trigger::routes())
         .merge(workflows::routes())
+}
+
+/// Routes third parties call without a session (ADR-051 D3): the agent
+/// webhook trigger, authenticated by its `X-Webhook-Token`.
+pub fn configure_public_routes() -> Router<Arc<AppState>> {
+    trigger::public_routes()
 }

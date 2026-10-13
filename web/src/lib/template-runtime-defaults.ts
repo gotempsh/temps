@@ -60,9 +60,12 @@ function utf8ByteLength(value: string): number {
   return new TextEncoder().encode(value).length
 }
 
-export const createTemplateRuntimeDefaultsSchema = (
-  kind: 'starter' | 'service'
-) =>
+/**
+ * Every template image must be pinned by digest: the server rejects mutable
+ * tags for starter and service templates alike, so the form explains it before
+ * submission instead of the request failing afterwards.
+ */
+export const createTemplateRuntimeDefaultsSchema = () =>
   z
     .object({
       image: z
@@ -74,9 +77,8 @@ export const createTemplateRuntimeDefaultsSchema = (
           'Image reference cannot exceed 512 bytes'
         )
         .refine(
-          (value) =>
-            kind !== 'service' || /^.+@sha256:[0-9a-fA-F]{64}$/.test(value),
-          'Image reference must use an immutable SHA-256 digest'
+          (value) => /^.+@sha256:[0-9a-fA-F]{64}$/.test(value),
+          'Image reference must use an immutable SHA-256 digest (name@sha256:…)'
         )
         .refine(
           (value) =>
@@ -172,7 +174,7 @@ export const createTemplateRuntimeDefaultsSchema = (
     })
 
 export const templateRuntimeDefaultsSchema =
-  createTemplateRuntimeDefaultsSchema('service')
+  createTemplateRuntimeDefaultsSchema()
 
 export type TemplateRuntimeDefaults = z.infer<
   typeof templateRuntimeDefaultsSchema

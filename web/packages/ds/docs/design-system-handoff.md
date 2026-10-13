@@ -51,46 +51,46 @@ as separate authored layers) mirrors `web/src/globals.css` exactly —
 `scripts/tokens.mjs check` fails the build if they drift. `src/tokens.css` is
 generated from `tokens.json`, scoped to `.tds` (never `:root`).
 
-| Group | Examples | Source |
-|---|---|---|
-| Color (base) | `gray-0..900`, `blue`, `green-success`, `green-chart`, `amber`, `red`, `purple` | `tokens.json` `base.color` |
-| Color (semantic) | `background`, `primary`, `success`, `chart-1..5`, `sidebar*` | `tokens.json` `semantic.light`/`.dark` |
-| Radius | `sm` 0.25rem, `md` 0.375rem, `lg` 0.5rem (default), `xl` 0.75rem | `base.radius` |
-| Type | Geist / Geist Mono | `base.font` |
-| Shadow | `2xs`..`2xl`, distinct light/dark opacity+blur | `semantic.*.shadow` |
+| Group            | Examples                                                                        | Source                                 |
+| ---------------- | ------------------------------------------------------------------------------- | -------------------------------------- |
+| Color (base)     | `gray-0..900`, `blue`, `green-success`, `green-chart`, `amber`, `red`, `purple` | `tokens.json` `base.color`             |
+| Color (semantic) | `background`, `primary`, `success`, `chart-1..5`, `sidebar*`                    | `tokens.json` `semantic.light`/`.dark` |
+| Radius           | `sm` 0.25rem, `md` 0.375rem, `lg` 0.5rem (default), `xl` 0.75rem                | `base.radius`                          |
+| Type             | Geist / Geist Mono                                                              | `base.font`                            |
+| Shadow           | `2xs`..`2xl`, distinct light/dark opacity+blur                                  | `semantic.*.shadow`                    |
 
 ## Primitive catalogue
 
-| Primitive | Key props | When | Enforced |
-|---|---|---|---|
-| `PageHeader`/`PageContainer` | `title`, `description`, `verdict`, `actions` | Every page | Honour-system |
-| `Status`/`StatusDot` | `tone` (5 values), `variant` | Any state anywhere | Type-level (tone union) |
-| `PageState` | variant `empty`\|`not-set-up`\|`failed`; `not-set-up` requires `requirement`, `example`, `settingsHref` | No data / unconfigured / error | Type-level for `not-set-up` |
-| `Button` | `busy`, `busyLabel` | Any async action button | Honour-system |
-| `CopyAction` | `value`, `label` | Copyable values | Honour-system |
-| `Field`/`FormErrors` | `label`, `error`, `description` | Every form control | Honour-system |
-| `Callout` | `tone` (info/success/warning/error) | In-page notices | Honour-system |
-| `EchoDialog` | `phrase`, `confirmLabel`, `onConfirm` | Irreversible destructive actions | Honour-system |
-| `Picker` | `items`, `value`, `onValueChange` | Inline searchable select | Honour-system |
-| `DateTimeRange` / `TimeRangeFilter` | controlled value + `onChange`, `maxRangeDays?` | Compact 1h / 6h / 24h / 7d shortcuts and validated custom local date/time; `TimeRangeFilter` accepts URL strings | Existing date-range unit tests |
-| `ResponsivePagination` | `page`, `pageSize`, `total`, `totalPages`, `onPageChange` | Tables with counts, mobile controls, and optional page-size changes; promoted console implementation | Existing console behavior |
-| `TimeChart` | wraps `ThresholdLineChart` props | Any time series | Honour-system |
-| `useUrlState` | `state`, `patch`, `clear` | Any filter/tab/page state | Honour-system |
-| `Kbd` | `keys` | Keyboard shortcut hints | Honour-system |
-| `SettingsGroup` | `title`, `description?`, `children` | Open aligned settings sections; headings left, controls right, stacked on mobile | Shared layout |
-| `SettingsSection` | `title`, `icon`, `defaultOpen`, `hasError` | Collapsible form sections that preserve unsaved values and reveal invalid fields; promoted from the console | Existing section tests |
-| `HelpPopover` / `Disclosure` | `label`, `children` | Optional context on click/keyboard; longer details collapsed by default. Keep required instructions and warnings visible. | Native/Radix semantics |
-| `LogLevelBadge` | `level` | Shared log severity in explorer, inspector, live and history: neutral routine output, semantic warning/error emphasis | Shared primitive |
-| `LogLine` | `content`, `isHighlighted`, `searchTerm` | One row of a monospace log stream | Honour-system |
-| `ResourceStat` | `icon`, `value`, `limit?` | Inline CPU/memory/disk usage display | Honour-system |
-| `fmt.ts` | `fmtNumber`, `fmtBytes`, `fmtDuration`, `fmtRelativeTime`, `fmtDate(Time)` | Any formatted number/date | Honour-system |
-| `notify` | `notify.ok(message, description?)`, `notify.fail(message, description?)` | Background events the user isn't watching (RULES.md § Notifications) | Honour-system |
-| `Article` | `children` | Long-form content read top to bottom (release notes, postmortems, docs) — not for record/scan pages, that's `Detail` | Honour-system |
-| `GitProviderMark` | `provider`, `variant?`, `className?`, `label?` | Existing GitHub/GitLab/Bitbucket/Gitea brand marks; optional monochrome variant; branch fallback for unknown providers | Label and fallback unit tests |
-| `ProjectAvatar` | `name` | Deterministic project identity where there's no deployment media (pickers, ledger rows, headers) — never a guaranteed-404 favicon fetch | Honour-system |
-| `DataTable` | `columns`, `rows`, `rowKey`, `renderRow?`, `isLoading?`, `aria-label?`, `pagination?` | Any table — embedded (settings sub-panel, `Detail`'s `main`) or as `Ledger`'s body | Honour-system |
-| `CompactRow` | `timestamp`, `icon`, `primary`, `secondary?`, `meta?` | One row of a dense event/log/activity list (promoted from Observe's `ObserveRowShell`) | Honour-system |
-| `Wizard` | `title`, `description`, `currentStep`, `steps`, `footer?`, `celebrate?` | Any multi-step flow (setup wizard, onboarding, "connect a resource") | Honour-system |
+| Primitive                           | Key props                                                                                               | When                                                                                                                                                                                    | Enforced                       |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------ |
+| `PageHeader`/`PageContainer`        | `title`, `description`, `verdict`, `actions`                                                            | Every page                                                                                                                                                                              | Honour-system                  |
+| `Status`/`StatusDot`                | `tone` (5 values), `variant`                                                                            | Any state anywhere                                                                                                                                                                      | Type-level (tone union)        |
+| `PageState`                         | variant `empty`\|`not-set-up`\|`failed`; `not-set-up` requires `requirement`, `example`, `settingsHref` | No data / unconfigured / error                                                                                                                                                          | Type-level for `not-set-up`    |
+| `Button`                            | `busy`, `busyLabel`                                                                                     | Any async action button                                                                                                                                                                 | Honour-system                  |
+| `CopyAction`                        | `value`, `label`                                                                                        | Copyable values                                                                                                                                                                         | Honour-system                  |
+| `Field`/`FormErrors`                | `label`, `error`, `description`                                                                         | Every form control                                                                                                                                                                      | Honour-system                  |
+| `Callout`                           | `tone` (info/success/warning/error)                                                                     | In-page notices                                                                                                                                                                         | Honour-system                  |
+| `EchoDialog`                        | `phrase`, `confirmLabel`, `onConfirm`                                                                   | Irreversible destructive actions                                                                                                                                                        | Honour-system                  |
+| `Picker`                            | `items`, `value`, `onValueChange`                                                                       | Inline searchable select                                                                                                                                                                | Honour-system                  |
+| `DateTimeRange` / `TimeRangeFilter` | controlled value + `onChange`, `maxRangeDays?`                                                          | Compact 1h / 6h / 24h / 7d shortcuts and validated custom local date/time; `TimeRangeFilter` accepts URL strings                                                                        | Existing date-range unit tests |
+| `ResponsivePagination`              | `page`, `pageSize`, `total`, `totalPages`, `onPageChange`                                               | Tables with counts, mobile controls, and optional page-size changes; promoted console implementation                                                                                    | Existing console behavior      |
+| `TimeChart`                         | wraps `ThresholdLineChart` props                                                                        | Any time series                                                                                                                                                                         | Honour-system                  |
+| `useUrlState`                       | `state`, `patch`, `clear`                                                                               | Any filter/tab/page state                                                                                                                                                               | Honour-system                  |
+| `Kbd`                               | `keys`                                                                                                  | Keyboard shortcut hints                                                                                                                                                                 | Honour-system                  |
+| `SettingsGroup`                     | `title`, `description?`, `children`                                                                     | Open aligned settings sections; headings left, controls right, stacked on mobile                                                                                                        | Shared layout                  |
+| `SettingsSection`                   | `title`, `icon`, `id?`, `defaultOpen`, `hasError`                                                       | Collapsible form sections that preserve unsaved values and reveal invalid fields; `id` lets a page deep-link to a section (the console uses `?section=<id>`); promoted from the console | Existing section tests         |
+| `HelpPopover` / `Disclosure`        | `label`, `children`                                                                                     | Optional context on click/keyboard; longer details collapsed by default. Keep required instructions and warnings visible.                                                               | Native/Radix semantics         |
+| `LogLevelBadge`                     | `level`                                                                                                 | Shared log severity in explorer, inspector, live and history: neutral routine output, semantic warning/error emphasis                                                                   | Shared primitive               |
+| `LogLine`                           | `content`, `isHighlighted`, `searchTerm`                                                                | One row of a monospace log stream                                                                                                                                                       | Honour-system                  |
+| `ResourceStat`                      | `icon`, `value`, `limit?`                                                                               | Inline CPU/memory/disk usage display                                                                                                                                                    | Honour-system                  |
+| `fmt.ts`                            | `fmtNumber`, `fmtBytes`, `fmtDuration`, `fmtRelativeTime`, `fmtDate(Time)`                              | Any formatted number/date                                                                                                                                                               | Honour-system                  |
+| `notify`                            | `notify.ok(message, description?)`, `notify.fail(message, description?)`                                | Background events the user isn't watching (RULES.md § Notifications)                                                                                                                    | Honour-system                  |
+| `Article`                           | `children`                                                                                              | Long-form content read top to bottom (release notes, postmortems, docs) — not for record/scan pages, that's `Detail`                                                                    | Honour-system                  |
+| `GitProviderMark`                   | `provider`, `variant?`, `className?`, `label?`                                                          | Existing GitHub/GitLab/Bitbucket/Gitea brand marks; optional monochrome variant; branch fallback for unknown providers                                                                  | Label and fallback unit tests  |
+| `ProjectAvatar`                     | `name`                                                                                                  | Deterministic project identity where there's no deployment media (pickers, ledger rows, headers) — never a guaranteed-404 favicon fetch                                                 | Honour-system                  |
+| `DataTable`                         | `columns`, `rows`, `rowKey`, `renderRow?`, `isLoading?`, `aria-label?`, `pagination?`                   | Any table — embedded (settings sub-panel, `Detail`'s `main`) or as `Ledger`'s body                                                                                                      | Honour-system                  |
+| `CompactRow`                        | `timestamp`, `icon`, `primary`, `secondary?`, `meta?`                                                   | One row of a dense event/log/activity list (promoted from Observe's `ObserveRowShell`)                                                                                                  | Honour-system                  |
+| `Wizard`                            | `title`, `description`, `currentStep`, `steps`, `footer?`, `celebrate?`                                 | Any multi-step flow (setup wizard, onboarding, "connect a resource")                                                                                                                    | Honour-system                  |
 
 ## Page templates + record recipe
 
@@ -162,18 +162,18 @@ Lint only, by explicit user decision for this phase (no Playwright visual
 baselines, no axe — that was the retired package's approach and is more than
 this phase needs):
 
-| Check | Machine-checked | Honour-system |
-|---|---|---|
-| Tokens match `globals.css`/`tokens.css` | Yes (`tokens:check`) | — |
-| No raw hex/oklch/px/ms in `src/` | Yes (`audit-records.mjs`) | Anything outside `--dir` scope (production `web/src` isn't scanned yet) |
-| TypeScript types | Yes (`typecheck`) | — |
-| Record recipe order, "not set up" copy quality, color-as-state discipline | — | Yes — see `RULES.md` |
-| Sandbox screens actually use the templates | — | Yes (reviewed by hand this pass) |
+| Check                                                                     | Machine-checked           | Honour-system                                                           |
+| ------------------------------------------------------------------------- | ------------------------- | ----------------------------------------------------------------------- |
+| Tokens match `globals.css`/`tokens.css`                                   | Yes (`tokens:check`)      | —                                                                       |
+| No raw hex/oklch/px/ms in `src/`                                          | Yes (`audit-records.mjs`) | Anything outside `--dir` scope (production `web/src` isn't scanned yet) |
+| TypeScript types                                                          | Yes (`typecheck`)         | —                                                                       |
+| Record recipe order, "not set up" copy quality, color-as-state discipline | —                         | Yes — see `RULES.md`                                                    |
+| Sandbox screens actually use the templates                                | —                         | Yes (reviewed by hand this pass)                                        |
 
 ## Follow-ups (numbered; partial progress noted per item)
 
 1. Migrate the ~39 files that hand-roll `className="flex items-center
-   justify-between"` instead of `PageHeader` (grep
+justify-between"` instead of `PageHeader` (grep
    `flex items-center justify-between` under `web/src/pages` and
    `web/src/components`). Not attempted this pass beyond the one promoted
    file (`PageContainer.tsx` itself).
@@ -293,12 +293,12 @@ this phase needs):
       `pages/settings/NodesPage.tsx`,
       `pages/settings/OtelPipelineStatusPage.tsx`,
       `pages/settings/TraefikDiscoveryPage.tsx`.
-    `CronJobDetail.tsx` is also migrated: shared status and formatters,
-    independent configuration/history loading, retryable failures, and cached
-    data retained after refresh failures. Adjacent regression tests cover these
-    states. The remaining sites listed above each need
-    its own review for sorting/inline-editing/virtualization behavior that
-    a mechanical swap could silently drop.
+      `CronJobDetail.tsx` is also migrated: shared status and formatters,
+      independent configuration/history loading, retryable failures, and cached
+      data retained after refresh failures. Adjacent regression tests cover these
+      states. The remaining sites listed above each need
+      its own review for sorting/inline-editing/virtualization behavior that
+      a mechanical swap could silently drop.
 14. `pages/Projects.tsx`'s card grid was evaluated for migration onto
     `CardGrid` and deliberately **not migrated** — it has batch analytics/
     health/uptime-monitor fetching keyed off the visible page, a bounded
@@ -400,12 +400,12 @@ and long-name confirmation at 390px without document overflow.
 
 ### Progressive disclosure polish
 
-| Before | After | Why |
-|---|---|---|
-| Server header explained sampling, refresh and keyboard navigation | Freshness stays visible; optional details in named help | Status is the first thing operators need |
-| Wizard repeated its title and selection instructions | Compact progress, required format guidance, sample label, optional walkthrough | Keep decisions and actions prominent |
-| Settings explained redirect mechanics in a paragraph | Concise visible redirect-loop warning; mechanics collapsed | Preserve consequences without burying the setting |
-| Sandbox settings explained its test procedure in the subtitle | Sample label with collapsed walkthrough | Keep implementation notes outside the workflow |
+| Before                                                            | After                                                                          | Why                                               |
+| ----------------------------------------------------------------- | ------------------------------------------------------------------------------ | ------------------------------------------------- |
+| Server header explained sampling, refresh and keyboard navigation | Freshness stays visible; optional details in named help                        | Status is the first thing operators need          |
+| Wizard repeated its title and selection instructions              | Compact progress, required format guidance, sample label, optional walkthrough | Keep decisions and actions prominent              |
+| Settings explained redirect mechanics in a paragraph              | Concise visible redirect-loop warning; mechanics collapsed                     | Preserve consequences without burying the setting |
+| Sandbox settings explained its test procedure in the subtitle     | Sample label with collapsed walkthrough                                        | Keep implementation notes outside the workflow    |
 
 Verified console typecheck, package lint, console and sandbox builds, help and
 query unit tests. Browser checks covered HelpPopover open/Escape/focus return,
@@ -478,18 +478,18 @@ still need a separate pass. Rankings are design judgments from the rendered UI.
 
 ### Next work, in order
 
-| Priority | Route | Observed issue | Proposed change |
-|---|---|---|---|
-| 1 | /monitoring | Four large shadowed cards, long label-to-switch distances, uneven heights and independent save buttons competing for attention | Aligned section headings and bounded control columns. Preserve independent save scopes, show save feedback beside the affected section; do not silently combine API writes |
-| 1 | /settings/request-timeouts | Every primary group is collapsed; no normal page heading in the content | Shared PageHeader and aligned rows; expose common timeout controls and current values, keep override ceilings advanced |
-| 1 | /settings/build-limits | Three equal columns contain very unequal amounts of technical explanation; nested notice and outer card dominate | Aligned settings sections. Keep restart requirement and BuildKit applicability visible; move legacy implementation details into named help. Avoid implying unsupported limits are enforced |
-| 2 | /settings/notifications | Page title/description followed by another large provider title/description; provider cards repeat their type | One page header with Providers/Routes navigation and the relevant action. Compact provider rows or quieter cards; preserve enabled state and destination identity |
-| 2 | /logs | Several toolbar groups compete, tiny dense text, side facets reduce message width; duplicate-looking environment labels appeared | Give search/range primary placement, group presentation/export actions, consider an optional facet panel. Investigate environment identity before merging labels; presentation changes must preserve filtering and wrapping contracts |
-| 2 | /monitoring/server | Repeated metric descriptions and chart subtitles, equally heavy cards; capacity forecast is small relative to its significance | Compact overview metrics, concise chart captions, optional sampling help. Keep capacity warnings conspicuous. Do not change sampling/forecast semantics during styling |
-| 3 | /projects | Setup strip, migration actions, card graphs and multiple status cues compete with browsing; some project names truncate | Review the surrounding collection toolbar/onboarding priority first. Card internals remain explicitly deferred; don't mechanically migrate this page |
-| 3 | /settings/load-balancer | Heading scale differs from adjacent settings pages; list is otherwise concise | Normalize header and action placement; retain the compact route list |
-| Keep / light polish | /errors | Search, filters and table are already clear; description is longer than needed | Shorten optional copy and keep the existing collection structure |
-| Implemented this pass | /settings | Generic collapsed Troubleshooting hid a named operational action | Visible Route table heading left, short purpose/reload explanation and Reload route table action right; same pattern in sandbox |
+| Priority              | Route                      | Observed issue                                                                                                                   | Proposed change                                                                                                                                                                                                                       |
+| --------------------- | -------------------------- | -------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1                     | /monitoring                | Four large shadowed cards, long label-to-switch distances, uneven heights and independent save buttons competing for attention   | Aligned section headings and bounded control columns. Preserve independent save scopes, show save feedback beside the affected section; do not silently combine API writes                                                            |
+| 1                     | /settings/request-timeouts | Every primary group is collapsed; no normal page heading in the content                                                          | Shared PageHeader and aligned rows; expose common timeout controls and current values, keep override ceilings advanced                                                                                                                |
+| 1                     | /settings/build-limits     | Three equal columns contain very unequal amounts of technical explanation; nested notice and outer card dominate                 | Aligned settings sections. Keep restart requirement and BuildKit applicability visible; move legacy implementation details into named help. Avoid implying unsupported limits are enforced                                            |
+| 2                     | /settings/notifications    | Page title/description followed by another large provider title/description; provider cards repeat their type                    | One page header with Providers/Routes navigation and the relevant action. Compact provider rows or quieter cards; preserve enabled state and destination identity                                                                     |
+| 2                     | /logs                      | Several toolbar groups compete, tiny dense text, side facets reduce message width; duplicate-looking environment labels appeared | Give search/range primary placement, group presentation/export actions, consider an optional facet panel. Investigate environment identity before merging labels; presentation changes must preserve filtering and wrapping contracts |
+| 2                     | /monitoring/server         | Repeated metric descriptions and chart subtitles, equally heavy cards; capacity forecast is small relative to its significance   | Compact overview metrics, concise chart captions, optional sampling help. Keep capacity warnings conspicuous. Do not change sampling/forecast semantics during styling                                                                |
+| 3                     | /projects                  | Setup strip, migration actions, card graphs and multiple status cues compete with browsing; some project names truncate          | Review the surrounding collection toolbar/onboarding priority first. Card internals remain explicitly deferred; don't mechanically migrate this page                                                                                  |
+| 3                     | /settings/load-balancer    | Heading scale differs from adjacent settings pages; list is otherwise concise                                                    | Normalize header and action placement; retain the compact route list                                                                                                                                                                  |
+| Keep / light polish   | /errors                    | Search, filters and table are already clear; description is longer than needed                                                   | Shorten optional copy and keep the existing collection structure                                                                                                                                                                      |
+| Implemented this pass | /settings                  | Generic collapsed Troubleshooting hid a named operational action                                                                 | Visible Route table heading left, short purpose/reload explanation and Reload route table action right; same pattern in sandbox                                                                                                       |
 
 ### Design-system implications
 
@@ -522,7 +522,6 @@ and persistent right arrow, implemented as a router link. `DataTable` and
 column instead. The `/ledger` reference screen demonstrates this. Do not turn
 rows into buttons or add a redundant View action. Full-width details reserve
 aside space only when there is an aside. See `RULES.md` and root `DESIGN.md`.
-
 
 ### Canonical tabs: underline navigation
 

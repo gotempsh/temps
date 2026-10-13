@@ -4,7 +4,7 @@
 use chrono::{Duration, Utc};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, FromQueryResult,
-    PaginatorTrait, QueryFilter, QueryOrder, Set,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -12,6 +12,11 @@ use temps_entities::{error_alert_fires, error_alert_rules, error_events, error_g
 use tracing::{error, info, warn};
 
 use super::types::ErrorTrackingError;
+
+/// Error alert rules one project may hold (#1210). Rules are evaluated for
+/// every ingested error, so an unbounded rule set is an unbounded per-event
+/// cost an API caller controls.
+pub const MAX_ERROR_ALERT_RULES_PER_PROJECT: u64 = 100;
 
 /// Trigger types that can fire an error alert
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -340,7 +345,32 @@ impl ErrorAlertService {
             ..Default::default()
         };
 
-        let result = rule.insert(self.db.as_ref()).await?;
+        // Count and insert under a lock on the project row so concurrent
+        // creations for one project serialize and cannot overshoot the limit.
+        let txn = self.db.begin().await?;
+        if temps_entities::projects::Entity::find_by_id(project_id)
+            .lock_exclusive()
+            .one(&txn)
+            .await?
+            .is_none()
+        {
+            txn.rollback().await?;
+            return Err(ErrorTrackingError::ProjectNotFound);
+        }
+        let existing = error_alert_rules::Entity::find()
+            .filter(error_alert_rules::Column::ProjectId.eq(project_id))
+            .count(&txn)
+            .await?;
+        if existing >= MAX_ERROR_ALERT_RULES_PER_PROJECT {
+            txn.rollback().await?;
+            return Err(ErrorTrackingError::AlertRuleLimitReached {
+                project_id,
+                existing,
+                limit: MAX_ERROR_ALERT_RULES_PER_PROJECT,
+            });
+        }
+        let result = rule.insert(&txn).await?;
+        txn.commit().await?;
         Ok(result)
     }
 
@@ -763,5 +793,94 @@ mod tests {
         let json = serde_json::json!({"statuses": ["resolved", "assigned"]});
         let config: StatusChangeConfig = serde_json::from_value(json).unwrap();
         assert_eq!(config.statuses, vec!["resolved", "assigned"]);
+    }
+
+    async fn create_numbered_rule(
+        service: &ErrorAlertService,
+        project_id: i32,
+        n: usize,
+    ) -> Result<error_alert_rules::Model, ErrorTrackingError> {
+        service
+            .create_rule(
+                project_id,
+                format!("Rule {n}"),
+                "new_issue".to_string(),
+                serde_json::json!({}),
+                None,
+                None,
+                "Normal".to_string(),
+                30,
+                true,
+            )
+            .await
+    }
+
+    /// #1210: rule creation stops at the per-project limit, counts only the
+    /// project's own rules, and reports a missing project as not found.
+    #[tokio::test]
+    async fn create_rule_stops_at_the_per_project_limit() {
+        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                eprintln!("Skipping alert-rule limit test: {error}");
+                return;
+            }
+            Err(error) => panic!("alert-rule limit test database setup failed: {error}"),
+        };
+        let db = test_db.connection_arc();
+        let insert_project = |slug: &'static str| {
+            let db = db.clone();
+            async move {
+                let now = Utc::now();
+                temps_entities::projects::ActiveModel {
+                    name: Set(slug.to_string()),
+                    repo_name: Set("repo".to_string()),
+                    repo_owner: Set("owner".to_string()),
+                    directory: Set("/".to_string()),
+                    main_branch: Set("main".to_string()),
+                    slug: Set(format!("{slug}-{}", uuid::Uuid::new_v4())),
+                    preset: Set(temps_entities::preset::Preset::NextJs),
+                    created_at: Set(now),
+                    updated_at: Set(now),
+                    ..Default::default()
+                }
+                .insert(db.as_ref())
+                .await
+                .expect("insert project")
+            }
+        };
+        let project = insert_project("limit-project").await;
+        let other = insert_project("other-project").await;
+        let service = ErrorAlertService::new(db.clone());
+
+        for n in 0..MAX_ERROR_ALERT_RULES_PER_PROJECT as usize {
+            create_numbered_rule(&service, project.id, n)
+                .await
+                .expect("rules under the limit are created");
+        }
+        let over = create_numbered_rule(&service, project.id, 999).await;
+        assert!(
+            matches!(
+                over,
+                Err(ErrorTrackingError::AlertRuleLimitReached {
+                    project_id,
+                    existing: 100,
+                    limit: 100,
+                }) if project_id == project.id
+            ),
+            "{over:?}"
+        );
+
+        // Another project's budget is independent.
+        create_numbered_rule(&service, other.id, 0)
+            .await
+            .expect("another project is not affected");
+
+        let missing = create_numbered_rule(&service, project.id + 100_000, 0).await;
+        assert!(
+            matches!(missing, Err(ErrorTrackingError::ProjectNotFound)),
+            "{missing:?}"
+        );
     }
 }

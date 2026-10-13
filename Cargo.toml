@@ -107,7 +107,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0-beta.56"
+version = "0.1.0-beta.57"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Temps Contributors"]
@@ -132,7 +132,12 @@ async-stream = "0.3"
 serde = { version = "=1.0.228", features = ["derive", "rc"] }
 serde_derive = "1.0"
 serde_json = "1.0.140"
-serde_yaml = "0.9"
+# The YAML organization's maintained continuation of `serde_yaml` (same API).
+# `serde_yaml` and its `unsafe-libyaml` parser are unmaintained
+# (RUSTSEC-2024-0449); `yaml_serde` parses with the maintained `libyaml-rs`.
+# Do not reintroduce `serde_yaml` -- the only remaining copy in Cargo.lock is
+# Pingora's, which Temps never feeds YAML (see dependency-scan.yml).
+yaml_serde = "0.10"
 serde_urlencoded = "0.7.1"
 serde_bytes = "0.11.17"
 serde_path_to_error = "0.1.20"
@@ -330,7 +335,7 @@ flate2 = "1.0"
 tar = "0.4.45"
 walkdir = "2"
 include_dir = "0.7"
-zip = "8.6"
+zip = "9.0"
 zstd = "0.14"
 
 # ============================================================================
@@ -533,21 +538,24 @@ debug = false
 #
 # 5. RUSTSEC-2023-0071: rsa 0.9.10 (MEDIUM severity)
 #    - Title: Marvin Attack: potential key recovery through timing sidechannels
-#    - Dependency paths:
-#        jsonwebtoken 10.4.0 <- octocrab      (GitHub App JWT signing;
-#          crates/temps-git/src/services/github.rs,
-#          crates/temps-git/src/services/git_provider_manager.rs)
-#        jsonwebtoken 10.4.0 <- openidconnect (OIDC id_token verification)
+#    - Dependency paths (keep in sync with the ignore justification in
+#      .github/workflows/dependency-scan.yml):
+#        jsonwebtoken 10 <- octocrab, and jsonwebtoken 11 direct in temps-git
+#          (GitHub App JWT RS256 signing)
+#        jsonwebtoken <- openidconnect <- temps-auth (OIDC id_token verification)
 #        rsa direct usage in crates/temps-dns/src/providers/gcp.rs
 #          (GCP Cloud DNS service-account JWT signing, sign_rs256())
+#        sqlx-mysql (client-side RSA-OAEP *encryption* of the password)
+#        temps-email-tracking (SNS message signature verification only)
+#        dev-only key generation in temps-deployments tests and
+#          examples/google-indexing-plugin
 #    - Status: no fixed version exists upstream (the rsa crate has no constant-time
 #      release yet). Tracked.
 #    - Assessment: the Marvin Attack is an adaptive chosen-ciphertext attack against
-#      RSA-PKCS#1v1.5 *decryption*. Temps has zero RSA decryption usage -- all three
-#      paths above are RSA *signing* only (OIDC verification is a separate,
-#      unaffected public-key op). Signing uses a non-constant-time modexp, which is
-#      a real but much narrower timing side-channel than Marvin's decryption
-#      oracle. Network latency is not a security boundary and does not prove
+#      RSA-PKCS#1v1.5 *decryption*. Temps has zero RSA decryption usage -- the paths
+#      above are signing, verification, client-side encryption and test keygen.
+#      Signing uses a non-constant-time modexp, which is a real but much
+#      narrower timing side-channel than Marvin's decryption oracle. Network latency is not a security boundary and does not prove
 #      signing timing unobservable. No exploitability measurement or independent
 #      review is recorded here; this remains a dependency exception requiring
 #      maintainer risk review, not a security assurance. russh also pulls

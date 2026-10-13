@@ -313,6 +313,111 @@ pub struct OnDemandConfigEntry {
     pub wake_timeout_seconds: i32,
 }
 
+/// Why an application hostname currently has no live upstream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnavailableReason {
+    /// The current deployment has no running container the proxy can reach:
+    /// every container exited, was stopped, or lost its published port.
+    NoLiveBackend,
+    /// The current deployment was paused by the user.
+    Paused,
+}
+
+impl UnavailableReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoLiveBackend => "no_live_backend",
+            Self::Paused => "paused",
+        }
+    }
+}
+
+/// An application hostname whose deployment exists but cannot serve traffic
+/// right now (issue #1334).
+///
+/// These hosts are kept out of the routable maps, so nothing ever dials a
+/// dead or reassigned port, but they are remembered so the proxy can answer
+/// with a 503 instead of falling back to the console. Without this, a
+/// stopped app's hostname served the console SPA with HTTP 200 and uptime
+/// monitors reported the app as operational.
+#[derive(Clone, Debug)]
+pub struct UnavailableRoute {
+    pub project: Arc<projects::Model>,
+    pub environment: Arc<environments::Model>,
+    pub deployment: Arc<deployments::Model>,
+    pub reason: UnavailableReason,
+}
+
+/// Hostnames of a deployment that has no live upstream, keyed like the route
+/// maps. Wildcard hosts are stored by their base domain so a lookup never
+/// allocates.
+#[derive(Clone, Debug, Default)]
+struct UnavailableHosts {
+    exact: HashMap<String, UnavailableRoute>,
+    wildcard_bases: HashMap<String, UnavailableRoute>,
+}
+
+impl UnavailableHosts {
+    /// Record `host` unless an earlier pass already did. Like the live route
+    /// maps, the first section of `load_routes` to claim a host owns it.
+    fn record(&mut self, host: &str, route: &UnavailableRoute) {
+        let (map, key) = match host.strip_prefix("*.") {
+            Some(base) if !base.is_empty() => (&mut self.wildcard_bases, base),
+            Some(_) => return,
+            None => (&mut self.exact, host),
+        };
+        if !map.contains_key(key) {
+            map.insert(key.to_string(), route.clone());
+        }
+    }
+
+    fn get(&self, host: &str) -> Option<&UnavailableRoute> {
+        self.exact.get(host).or_else(|| {
+            let (label, base) = host.split_once('.')?;
+            if label.is_empty() {
+                return None;
+            }
+            self.wildcard_bases.get(base)
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.exact.len() + self.wildcard_bases.len()
+    }
+}
+
+/// Describe a deployment whose hostnames are skipped for lack of a live
+/// upstream. `None` when the project is unknown, since the proxy needs the
+/// full context to attribute the failed request.
+fn unavailable_route_for(
+    project: Option<&Arc<projects::Model>>,
+    environment: &Arc<environments::Model>,
+    deployment: &Arc<deployments::Model>,
+) -> Option<UnavailableRoute> {
+    let reason = if deployment.state == "paused" {
+        UnavailableReason::Paused
+    } else {
+        UnavailableReason::NoLiveBackend
+    };
+    Some(UnavailableRoute {
+        project: Arc::clone(project?),
+        environment: Arc::clone(environment),
+        deployment: Arc::clone(deployment),
+        reason,
+    })
+}
+
+/// Whether a Compose project deliberately has no public URL: without a
+/// public-port selection its generic hostnames stay private, so an empty
+/// backend there is the configured state, not an outage.
+fn compose_without_public_ports(project: Option<&projects::Model>) -> bool {
+    matches!(
+        project.and_then(|project| project.preset_config.as_ref()),
+        Some(temps_entities::preset::PresetConfig::DockerCompose(config))
+            if config.public_ports.is_empty()
+    )
+}
+
 /// A single backend entry: network address plus container metadata for tracking.
 #[derive(Clone, Debug)]
 pub struct BackendEntry {
@@ -506,11 +611,119 @@ pub type OnCertEligibleCallback = Arc<
         + Sync,
 >;
 
+/// A custom hostname attached to a public status page (#1412).
+///
+/// Every attached hostname is reserved for the status page, whatever its
+/// state: no project route, sleeping wildcard or console fall-through may
+/// ever answer it. `slug` is `Some` only while the page is published and the
+/// hostname's ownership has been proven (its `domains` row holds a valid
+/// certificate); otherwise the proxy answers 404 and no certificate is
+/// served for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StatusPageHostRoute {
+    pub slug: Option<Arc<str>>,
+}
+
+/// Lowercase `host`, dropping a `:port` suffix and a trailing dot, the same
+/// way the status-page hostname column is stored. Borrows when already
+/// normalized, which is the common case for proxy lookups.
+pub fn normalize_route_hostname(host: &str) -> std::borrow::Cow<'_, str> {
+    let host = match host.rsplit_once(':') {
+        Some((name, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => name,
+        _ => host,
+    };
+    let host = host.trim_end_matches('.');
+    if host.bytes().any(|b| b.is_ascii_uppercase()) {
+        std::borrow::Cow::Owned(host.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(host)
+    }
+}
+
+#[derive(Debug, sea_orm::FromQueryResult)]
+struct StatusPageHostRow {
+    hostname: String,
+    slug: Option<String>,
+    attached: bool,
+    serving: bool,
+}
+
+/// Status-page hostname bindings, split into hostnames attached to a page and
+/// tombstones (removed hostnames, or ones whose page or project was deleted).
+#[derive(Debug, Default)]
+struct StatusPageHostBindings {
+    attached: HashMap<String, StatusPageHostRoute>,
+    tombstones: HashSet<String>,
+}
+
+/// Load every status-page hostname binding (#1412).
+async fn load_status_page_hosts(
+    db: &DatabaseConnection,
+) -> Result<StatusPageHostBindings, sea_orm::DbErr> {
+    use sea_orm::{FromQueryResult, Statement};
+    let rows = StatusPageHostRow::find_by_statement(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        r#"
+        SELECT spd.hostname,
+               sp.slug,
+               (sp.id IS NOT NULL) AS attached,
+               -- Ownership is proven once the binding's own `domains` row
+               -- holds a certificate: the row is created empty for the
+               -- binding and only ACME issuance fills it. Its `status` is not
+               -- consulted, because a renewal order moves it to
+               -- `challenge_requested` while the current certificate is
+               -- still valid and must keep being served.
+               COALESCE(
+                   sp.is_published
+                   AND NOT p.is_deleted
+                   AND d.certificate IS NOT NULL
+                   AND d.private_key IS NOT NULL
+                   AND (d.expiration_time IS NULL OR d.expiration_time > now())
+                   AND lower(d.domain) = spd.hostname,
+                   FALSE
+               ) AS serving
+        FROM status_page_domains spd
+        LEFT JOIN status_pages sp ON sp.id = spd.status_page_id
+        LEFT JOIN projects p ON p.id = sp.project_id
+        LEFT JOIN domains d ON d.id = spd.domain_id
+        "#,
+    ))
+    .all(db)
+    .await?;
+    let mut bindings = StatusPageHostBindings::default();
+    for row in rows {
+        let host = normalize_route_hostname(&row.hostname).into_owned();
+        if host.is_empty() {
+            continue;
+        }
+        if !row.attached {
+            bindings.tombstones.insert(host);
+            continue;
+        }
+        let slug = row
+            .serving
+            .then_some(row.slug)
+            .flatten()
+            .map(Arc::<str>::from);
+        bindings.attached.insert(host, StatusPageHostRoute { slug });
+    }
+    Ok(bindings)
+}
+
 #[derive(Clone, Debug, Default)]
 struct LegacyRouteTable {
     exact: HashMap<String, RouteInfo>,
     wildcards: WildcardMatcher,
     reserved_console_host: Option<String>,
+    /// Hostname of an explicit `public_ingress_url` that is not the console
+    /// hostname (ADR-051). Reserved exactly like the console hostname, and
+    /// additionally pinned by the proxy to the public-only console surface.
+    reserved_ingress_host: Option<String>,
+    /// Custom hostnames of status pages (#1412), reserved like the console
+    /// and ingress hosts. Never part of `exact`, so they are not exported to
+    /// worker nodes, not cert-eligible for on-demand TLS, and never resolve
+    /// to a project.
+    status_page_hosts: HashMap<String, StatusPageHostRoute>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -521,11 +734,35 @@ struct RouteTableSnapshot {
     tls_wildcards: WildcardMatcher,
     legacy: LegacyRouteTable,
     ownership: RouteOwnershipSnapshot,
+    /// Application hosts with no live upstream. Deliberately not part of
+    /// `ownership`, so on-demand wake gating is unchanged.
+    unavailable: UnavailableHosts,
+}
+
+impl RouteTableSnapshot {
+    /// Whether any routable map resolves `host`, in the same order as
+    /// `resolve_route_for_sni`, without cloning a `RouteInfo`.
+    fn has_live_route(&self, host: &str) -> bool {
+        self.tls_routes.contains_key(host)
+            || self.tls_wildcards.match_domain(host).is_some()
+            || self.http_routes.contains_key(host)
+            || self.legacy.exact.contains_key(host)
+            || self.http_wildcards.match_domain(host).is_some()
+            || self.legacy.wildcards.match_domain(host).is_some()
+    }
 }
 
 impl LegacyRouteTable {
+    /// Whether `host` belongs to the platform itself (console or public
+    /// ingress) and must therefore never resolve to a project route.
+    fn is_reserved(&self, host: &str) -> bool {
+        self.reserved_console_host.as_deref() == Some(host)
+            || self.reserved_ingress_host.as_deref() == Some(host)
+            || self.status_page_hosts.contains_key(host)
+    }
+
     fn get(&self, host: &str) -> Option<&RouteInfo> {
-        if self.reserved_console_host.as_deref() == Some(host) {
+        if self.is_reserved(host) {
             return None;
         }
         self.exact
@@ -568,12 +805,10 @@ fn build_route_ownership_snapshot<'a>(
     legacy_hosts: impl IntoIterator<Item = &'a String>,
     http_hosts: impl IntoIterator<Item = &'a String>,
     tls_hosts: impl IntoIterator<Item = &'a String>,
-    reserved_console_host: Option<String>,
+    reserved_hosts: impl IntoIterator<Item = String>,
 ) -> RouteOwnershipSnapshot {
     let mut snapshot = RouteOwnershipSnapshot::default();
-    if let Some(host) = reserved_console_host {
-        snapshot.reserved_hosts.insert(host);
-    }
+    snapshot.reserved_hosts.extend(reserved_hosts);
     for host in legacy_hosts.into_iter().chain(http_hosts).chain(tls_hosts) {
         if let Some(base) = host.strip_prefix("*.") {
             if !base.is_empty() {
@@ -584,6 +819,190 @@ fn build_route_ownership_snapshot<'a>(
         }
     }
     snapshot
+}
+
+/// Why `CachedPeerTable::load_routes` did not complete.
+#[derive(Debug, thiserror::Error)]
+pub enum RouteLoadError {
+    /// Reading the routes failed; the previous route table stays in place.
+    #[error("Failed to load routes from the database: {0}")]
+    Database(#[from] sea_orm::DbErr),
+
+    /// The routes were read and are live in this process, but their
+    /// generation could not be claimed, so worker nodes have not been given
+    /// them yet. A background retry publishes the generation; callers must
+    /// not report this reload as complete.
+    #[error(
+        "Route table reloaded and live in this process ({route_count} routes), but not yet \
+         published to worker nodes: {source}"
+    )]
+    GenerationUnpublished {
+        route_count: usize,
+        #[source]
+        source: RouteGenerationError,
+    },
+}
+
+/// Whether a process numbers route generations from the durable
+/// `route_generation` row or only for itself.
+///
+/// The row is what `mark_deployment_complete` waits for every worker to ACK,
+/// and workers ACK the generation the route-sync snapshot endpoint gave them.
+/// So the row must have exactly one writer: the process serving that endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RouteGenerationRole {
+    /// Serves `/internal/nodes/{id}/routes/snapshot` (`temps serve`): every
+    /// reload claims its generation from `route_generation`.
+    #[default]
+    Authoritative,
+    /// Loads routes without answering workers (split-mode `temps proxy`):
+    /// generations are local to the process and the row is never written.
+    Local,
+}
+
+/// Why a reload could not claim its generation from `route_generation`.
+#[derive(Debug, thiserror::Error)]
+pub enum RouteGenerationError {
+    #[error(
+        "Failed to claim the next route generation after in-memory generation {previous} \
+         from route_generation (id = 1): {source}"
+    )]
+    Claim {
+        previous: u64,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+
+    #[error(
+        "route_generation singleton row (id = 1) is missing, so the route generation after \
+         {previous} cannot be persisted and the worker completion gate cannot advance"
+    )]
+    MissingRow { previous: u64 },
+
+    #[error("route_generation (id = 1) returned negative generation {value}")]
+    Negative { value: i64 },
+
+    #[error(
+        "Claiming the route generation after in-memory generation {previous} from \
+         route_generation (id = 1) did not finish within {timeout_ms} ms"
+    )]
+    Timeout { previous: u64, timeout_ms: u128 },
+}
+
+/// How long a reload may wait to claim its generation. Every reload waits
+/// for the claim before waking route waiters (readiness checks, worker
+/// long-polls), so a stalled database must not hold them asleep for longer
+/// than this; a claim that gives up is retried in the background.
+pub(crate) const ROUTE_GENERATION_CLAIM_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(2);
+
+/// Extra time the client allows past the server-side statement timeout, for
+/// a connection that stalls outside a statement (acquire, `BEGIN`, `COMMIT`).
+const ROUTE_GENERATION_CLAIM_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// First delay before retrying a failed claim, doubled per attempt.
+const ROUTE_GENERATION_RETRY_INITIAL_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(250);
+
+/// Longest delay between claim retries while the database stays unavailable.
+const ROUTE_GENERATION_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Atomically claim the generation after `previous` from the durable counter,
+/// bounded by [`ROUTE_GENERATION_CLAIM_TIMEOUT`].
+pub(crate) async fn claim_route_generation(
+    db: &DatabaseConnection,
+    previous: u64,
+) -> Result<u64, RouteGenerationError> {
+    claim_route_generation_within(db, previous, ROUTE_GENERATION_CLAIM_TIMEOUT).await
+}
+
+/// Atomically claim the generation after `previous`, giving up after
+/// `timeout` (plus a short grace for a connection that stalls outside a
+/// statement).
+///
+/// `GREATEST(current, previous, <highest stored node ACK>) + 1` in a single
+/// `UPDATE ... RETURNING`: the row lock serializes concurrent claims, so each
+/// caller gets a distinct value, and the result is above the stored value,
+/// the in-memory value, and every generation a node has acknowledged (one
+/// aggregate over one row per node).
+///
+/// `Ok` only once the claim has committed. The statement runs under
+/// `SET LOCAL statement_timeout`; any failure or timeout, including a
+/// `COMMIT` whose outcome is unknown, is an error, and the caller publishes
+/// nothing. A commit that did land despite a lost reply is harmless: the
+/// retried claim starts above it, so the value is skipped, never reissued.
+pub(crate) async fn claim_route_generation_within(
+    db: &DatabaseConnection,
+    previous: u64,
+    timeout: std::time::Duration,
+) -> Result<u64, RouteGenerationError> {
+    let timeout_ms = timeout.as_millis();
+    match tokio::time::timeout(
+        timeout + ROUTE_GENERATION_CLAIM_GRACE,
+        claim_and_commit(db, previous, timeout_ms),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(RouteGenerationError::Timeout {
+            previous,
+            timeout_ms,
+        }),
+    }
+}
+
+/// The body of [`claim_route_generation_within`], without its bound.
+async fn claim_and_commit(
+    db: &DatabaseConnection,
+    previous: u64,
+    timeout_ms: u128,
+) -> Result<u64, RouteGenerationError> {
+    use sea_orm::{ConnectionTrait, TransactionTrait};
+    let claim_error = |source| RouteGenerationError::Claim { previous, source };
+    // Leave room for the `+ 1` below; 9.2e18 reloads is unreachable anyway.
+    let previous_i64 = i64::try_from(previous)
+        .unwrap_or(i64::MAX - 1)
+        .min(i64::MAX - 1);
+    let txn = db.begin().await.map_err(claim_error)?;
+    // An integer literal, not user input; `SET` cannot take a bind parameter.
+    txn.execute(sea_orm::Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        format!("SET LOCAL statement_timeout = {}", timeout_ms.max(1)),
+    ))
+    .await
+    .map_err(claim_error)?;
+    let row = txn
+        .query_one(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "UPDATE route_generation SET current = GREATEST(current, $1, \
+             (SELECT COALESCE(MAX(applied_generation), 0) FROM node_route_state)) + 1, \
+             updated_at = now() WHERE id = 1 RETURNING current",
+            [previous_i64.into()],
+        ))
+        .await
+        .map_err(claim_error)?
+        .ok_or(RouteGenerationError::MissingRow { previous })?;
+    let value = row.try_get::<i64>("", "current").map_err(claim_error)?;
+    let claimed = u64::try_from(value).map_err(|_| RouteGenerationError::Negative { value })?;
+    txn.commit().await.map_err(claim_error)?;
+    Ok(claimed)
+}
+
+/// Raise `counter` to a committed claim and return the generation now
+/// published.
+///
+/// Only ever stores `claimed` itself, never a value derived from it, so every
+/// published generation is one the database committed. A claim is always
+/// above the in-memory value it was made from; it can only be at or below the
+/// counter when a concurrent claim (the background retry racing a reload)
+/// committed and was adopted first, and that later number already covers the
+/// routes this claim was for, so the counter is left as it is.
+pub(crate) fn adopt_claimed_generation(
+    counter: &std::sync::atomic::AtomicU64,
+    claimed: u64,
+) -> u64 {
+    let previous = counter.fetch_max(claimed, std::sync::atomic::Ordering::AcqRel);
+    previous.max(claimed)
 }
 
 pub struct CachedPeerTable {
@@ -619,10 +1038,28 @@ pub struct CachedPeerTable {
     /// Bumped at the end of every successful `load_routes()`. Workers
     /// long-poll `GET /internal/.../routes/snapshot?since=N` and the
     /// handler waits until this counter exceeds `N` (or a timeout)
-    /// before returning the current snapshot. Restart-safe: a CP
-    /// restart resets the counter; agents detect this (current < their
-    /// applied) and re-fetch a fresh snapshot.
-    generation: std::sync::atomic::AtomicU64,
+    /// before returning the current snapshot.
+    ///
+    /// In the [`RouteGenerationRole::Authoritative`] process each value is
+    /// claimed from the durable `route_generation` row (see
+    /// [`Self::advance_generation`]), so the numbering agents ACK and the
+    /// completion gate compares is one sequence, monotonic across restarts.
+    /// Shared with the claim-retry task (see [`Self::schedule_claim_retry`]).
+    generation: Arc<std::sync::atomic::AtomicU64>,
+
+    /// Whether at least one `load_routes()` has published a route snapshot.
+    /// Separate from `generation`, which an authoritative process only
+    /// advances once a generation is durably claimed.
+    loaded: std::sync::atomic::AtomicBool,
+
+    /// A claim-retry task is running (at most one per table).
+    claim_retry_pending: Arc<std::sync::atomic::AtomicBool>,
+
+    /// Whether this process owns the durable `route_generation` row
+    /// ([`RouteGenerationRole::Authoritative`], the default) or only numbers
+    /// its own reloads ([`RouteGenerationRole::Local`]). Read once per reload,
+    /// never on the request path.
+    generation_authoritative: std::sync::atomic::AtomicBool,
 
     /// Notify hookup so long-poll handlers can sleep until the next
     /// generation bump rather than spinning. Awoken on every
@@ -662,7 +1099,10 @@ impl CachedPeerTable {
             on_sleeping_callback: parking_lot::Mutex::new(None),
             on_reload_callback: parking_lot::Mutex::new(None),
             on_cert_eligible_callback: parking_lot::Mutex::new(None),
-            generation: std::sync::atomic::AtomicU64::new(0),
+            generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            loaded: std::sync::atomic::AtomicBool::new(false),
+            claim_retry_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            generation_authoritative: std::sync::atomic::AtomicBool::new(true),
             generation_changed: Arc::new(tokio::sync::Notify::new()),
             // Off until the bootstrap says otherwise: label discovery is
             // opt-in, so the safe default is "adopt nothing".
@@ -698,6 +1138,136 @@ impl CachedPeerTable {
         *self.traefik_discovery_network.write() = network;
     }
 
+    /// Choose whether this process owns the durable `route_generation` row.
+    ///
+    /// Exactly one process per control plane numbers the generations workers
+    /// ACK: the one serving `GET /internal/nodes/{id}/routes/snapshot`
+    /// (`temps serve`). The split-mode `temps proxy` loads the same routes
+    /// from the same database but never answers workers, so it uses
+    /// [`RouteGenerationRole::Local`]. When both wrote the row, whichever
+    /// process had reloaded more often could set the completion gate's target
+    /// to a generation the snapshot endpoint had never issued, and a worker
+    /// deployment then timed out waiting for ACKs that could not arrive.
+    ///
+    /// Call it before the first `load_routes()`.
+    pub fn set_route_generation_role(&self, role: RouteGenerationRole) {
+        let authoritative = role == RouteGenerationRole::Authoritative;
+        self.generation_authoritative
+            .store(authoritative, std::sync::atomic::Ordering::Release);
+        if authoritative {
+            debug!("Route generations are claimed from the durable route_generation row");
+        } else {
+            info!(
+                "Route generations are numbered locally in this process; route_generation is \
+                 owned by the process serving the worker route-sync endpoint"
+            );
+        }
+    }
+
+    /// The role set by [`Self::set_route_generation_role`].
+    pub fn route_generation_role(&self) -> RouteGenerationRole {
+        if self
+            .generation_authoritative
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            RouteGenerationRole::Authoritative
+        } else {
+            RouteGenerationRole::Local
+        }
+    }
+
+    /// Number the reload that just finished, returning the generation it
+    /// published, or why it could not be claimed yet.
+    ///
+    /// Authoritative: one atomic statement claims the next value of the
+    /// durable counter (see [`claim_route_generation_within`]). A single-row
+    /// update cannot interleave with another writer's, so two claims never
+    /// return the same value, and taking the greatest of the stored value,
+    /// the in-memory value and every stored node ACK means no sequence goes
+    /// backwards: a restored database below this process's numbering, or a
+    /// process that restarted below the database's, both continue from the
+    /// higher one.
+    ///
+    /// A generation is published only once its claim has committed, so a
+    /// number workers were given always exists in the row and can never be
+    /// issued again, even across a restart. When the claim fails (the
+    /// database is unreachable, stalls past `ROUTE_GENERATION_CLAIM_TIMEOUT`,
+    /// or the commit cannot be confirmed) the reload's routes are already
+    /// live in this process, and a single background task retries the claim
+    /// with backoff and publishes the generation for whatever routes are
+    /// current when it succeeds. Workers keep their previous routes until
+    /// then.
+    ///
+    /// Local: the in-memory counter only; the row is never touched.
+    ///
+    /// Runs once per reload (control plane, serialized by
+    /// `route_reload_lock`), never per request.
+    async fn advance_generation(&self) -> Result<u64, RouteGenerationError> {
+        use std::sync::atomic::Ordering;
+        if !self.generation_authoritative.load(Ordering::Acquire) {
+            return Ok(self.generation.fetch_add(1, Ordering::AcqRel) + 1);
+        }
+        let previous = self.generation.load(Ordering::Acquire);
+        match claim_route_generation(self.db.as_ref(), previous).await {
+            Ok(claimed) => Ok(adopt_claimed_generation(&self.generation, claimed)),
+            Err(error) => {
+                warn!(
+                    previous_generation = previous,
+                    "{error}; the new routes are live in this process, and their generation \
+                     will be published to workers once a retried claim commits"
+                );
+                self.schedule_claim_retry();
+                Err(error)
+            }
+        }
+    }
+
+    /// Retry a failed generation claim in the background until one commits,
+    /// then publish it and wake waiters. At most one task per table; a
+    /// reload whose own claim succeeds in the meantime is harmless (the
+    /// retry then claims and publishes one more, higher, generation).
+    fn schedule_claim_retry(&self) {
+        use std::sync::atomic::Ordering;
+        if self.claim_retry_pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let db = self.db.clone();
+        let generation = self.generation.clone();
+        let notify = self.generation_changed.clone();
+        let pending = self.claim_retry_pending.clone();
+        tokio::spawn(async move {
+            let mut delay = ROUTE_GENERATION_RETRY_INITIAL_DELAY;
+            let mut attempt: u32 = 0;
+            loop {
+                tokio::time::sleep(delay).await;
+                attempt = attempt.saturating_add(1);
+                let previous = generation.load(Ordering::Acquire);
+                match claim_route_generation(db.as_ref(), previous).await {
+                    Ok(claimed) => {
+                        let published = adopt_claimed_generation(&generation, claimed);
+                        pending.store(false, Ordering::Release);
+                        notify.notify_waiters();
+                        info!(
+                            generation = published,
+                            attempt,
+                            "Published route generation {published} after retrying its claim"
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        warn!(
+                            previous_generation = previous,
+                            attempt,
+                            retry_in_ms = delay.as_millis() as u64,
+                            "{error}; retrying the route generation claim"
+                        );
+                        delay = (delay * 2).min(ROUTE_GENERATION_RETRY_MAX_DELAY);
+                    }
+                }
+            }
+        });
+    }
+
     /// Current in-memory route table generation. Bumped on every
     /// successful `load_routes()`. Workers poll this via the sync
     /// endpoint to know when to refetch.
@@ -713,13 +1283,13 @@ impl CachedPeerTable {
 
     /// Whether the route table has completed at least one successful load.
     ///
-    /// `generation` only ever increments at the very end of a successful
-    /// `load_routes()`, so `generation == 0` reliably means "never loaded".
+    /// Set by every successful `load_routes()` before waiters are woken,
+    /// whether or not the reload's generation has been claimed yet.
     /// Used by the proxy to decide whether to wait for the first load before
     /// falling back to the console for an unmatched host (the proxy now binds
     /// its listeners before the initial route load completes).
     pub fn has_loaded(&self) -> bool {
-        self.current_generation() > 0
+        self.loaded.load(std::sync::atomic::Ordering::Acquire) || self.current_generation() > 0
     }
 
     /// Wait until the route table has loaded at least once, up to `timeout`.
@@ -784,7 +1354,7 @@ impl CachedPeerTable {
     /// Checks exact matches first, then wildcard patterns.
     pub fn get_route_by_host(&self, host: &str) -> Option<RouteInfo> {
         let snapshot = self.route_snapshot.load();
-        if snapshot.legacy.reserved_console_host.as_deref() == Some(host) {
+        if snapshot.legacy.is_reserved(host) {
             return None;
         }
 
@@ -814,7 +1384,7 @@ impl CachedPeerTable {
     /// Checks exact matches first, then wildcard patterns.
     pub fn get_route_by_sni(&self, sni: &str) -> Option<RouteInfo> {
         let snapshot = self.route_snapshot.load();
-        if snapshot.legacy.reserved_console_host.as_deref() == Some(sni) {
+        if snapshot.legacy.is_reserved(sni) {
             return None;
         }
 
@@ -839,7 +1409,7 @@ impl CachedPeerTable {
     /// and reject every certable host. O(1) per map, no I/O.
     pub fn resolve_route_for_sni(&self, sni: &str) -> Option<RouteInfo> {
         let snapshot = self.route_snapshot.load();
-        if snapshot.legacy.reserved_console_host.as_deref() == Some(sni) {
+        if snapshot.legacy.is_reserved(sni) {
             return None;
         }
         snapshot
@@ -870,7 +1440,12 @@ impl CachedPeerTable {
             snapshot.legacy.exact.keys(),
             snapshot.http_routes.keys(),
             snapshot.tls_routes.keys(),
-            snapshot.legacy.reserved_console_host.clone(),
+            snapshot
+                .legacy
+                .reserved_console_host
+                .iter()
+                .chain(snapshot.legacy.reserved_ingress_host.iter())
+                .cloned(),
         );
         self.route_snapshot.store(Arc::new(snapshot));
     }
@@ -893,10 +1468,20 @@ impl CachedPeerTable {
         self.route_snapshot.store(Arc::new(snapshot));
     }
 
+    /// Reserve the public ingress hostname for cross-crate tests without
+    /// database setup.
+    #[doc(hidden)]
+    pub fn reserve_public_ingress_hostname_for_test(&self, host: &str) {
+        let mut snapshot = (*self.route_snapshot.load_full()).clone();
+        snapshot.legacy.reserved_ingress_host = Some(host.to_string());
+        snapshot.ownership.reserved_hosts.insert(host.to_string());
+        self.route_snapshot.store(Arc::new(snapshot));
+    }
+
     /// Load all routes from the database into the cache with full models.
     /// This queries environment_domains, custom_routes, and project_custom_domains.
     /// Returns a list of sleeping on-demand environments that were skipped during route loading.
-    pub async fn load_routes(&self) -> Result<Vec<SleepingEnvironmentEntry>, sea_orm::DbErr> {
+    pub async fn load_routes(&self) -> Result<Vec<SleepingEnvironmentEntry>, RouteLoadError> {
         let _reload_guard = self.route_reload_lock.lock().await;
         use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter};
         use temps_entities::{
@@ -906,6 +1491,9 @@ impl CachedPeerTable {
 
         let mut routes = HashMap::new();
         let mut sleeping_environments: Vec<SleepingEnvironmentEntry> = Vec::new();
+        // App hostnames skipped below because their deployment has no live
+        // upstream. Served as a 503 by the proxy instead of the console.
+        let mut unavailable = UnavailableHosts::default();
 
         // Build entity caches as we go - only cache what we actually need for routing
         let mut projects_cache: HashMap<i32, Arc<projects::Model>> = HashMap::new();
@@ -1056,9 +1644,9 @@ impl CachedPeerTable {
                         // Determine backend type: static directory or upstream containers
                         let backend = if let Some(static_dir) = &deployment.static_dir_location {
                             // Static deployment - serve from directory
-                            BackendType::StaticDir {
+                            Some(BackendType::StaticDir {
                                 path: static_dir.clone(),
-                            }
+                            })
                         } else if !containers.is_empty() {
                             let public_port = project
                                 .and_then(|project| project.preset_config.as_ref())
@@ -1068,45 +1656,64 @@ impl CachedPeerTable {
                                     }
                                     _ => None,
                                 });
-                            let Some(route_containers) =
-                                select_public_route_containers(&containers, public_port)
-                            else {
-                                continue;
-                            };
-                            let mut backend_entries = Vec::with_capacity(route_containers.len());
-                            for c in route_containers {
-                                let node_addr = resolve_node_private_address(
-                                    c.node_id,
-                                    &mut nodes_cache,
-                                    self.db.as_ref(),
-                                )
-                                .await;
-                                let entry = match public_port {
-                                    Some(port) => build_public_compose_backend_entry(
-                                        c,
-                                        node_addr.as_deref(),
-                                        port,
-                                        self.runtime_context.as_ref(),
-                                    ),
-                                    None => build_backend_entry(
-                                        c,
-                                        node_addr.as_deref(),
-                                        self.runtime_context.as_ref(),
-                                    ),
-                                };
-                                if let Some(entry) = entry {
-                                    backend_entries.push(entry);
+                            match select_public_route_containers(&containers, public_port) {
+                                // A Compose stack without a public port is private.
+                                None if public_port.is_none() => continue,
+                                // The public service has no running container.
+                                None => None,
+                                Some(route_containers) => {
+                                    let mut backend_entries =
+                                        Vec::with_capacity(route_containers.len());
+                                    for c in route_containers {
+                                        let node_addr = resolve_node_private_address(
+                                            c.node_id,
+                                            &mut nodes_cache,
+                                            self.db.as_ref(),
+                                        )
+                                        .await;
+                                        let entry = match public_port {
+                                            Some(port) => build_public_compose_backend_entry(
+                                                c,
+                                                node_addr.as_deref(),
+                                                port,
+                                                self.runtime_context.as_ref(),
+                                            ),
+                                            None => build_backend_entry(
+                                                c,
+                                                node_addr.as_deref(),
+                                                self.runtime_context.as_ref(),
+                                            ),
+                                        };
+                                        if let Some(entry) = entry {
+                                            backend_entries.push(entry);
+                                        }
+                                    }
+                                    (!backend_entries.is_empty()).then(|| BackendType::Upstream {
+                                        backends: backend_entries,
+                                        round_robin_counter: Arc::new(AtomicUsize::new(0)),
+                                    })
                                 }
                             }
-                            if backend_entries.is_empty() {
-                                continue;
-                            }
-                            BackendType::Upstream {
-                                backends: backend_entries,
-                                round_robin_counter: Arc::new(AtomicUsize::new(0)),
-                            }
                         } else {
-                            // No backend available, skip this route
+                            None
+                        };
+
+                        // No live backend (containers stopped, crashed or
+                        // unreachable, or the deployment is paused): keep the
+                        // host out of the routable maps, but remember it so
+                        // the proxy answers 503 instead of the console.
+                        let Some(backend) = backend else {
+                            if !compose_without_public_ports(project.map(Arc::as_ref)) {
+                                if let Some(route) =
+                                    unavailable_route_for(project, environment, deployment)
+                                {
+                                    debug!(
+                                        "Environment domain has no live backend: {} (project={}, env={}, deploy={}, reason={})",
+                                        env_domain.domain, environment.project_id, environment.id, deployment_id, route.reason.as_str()
+                                    );
+                                    unavailable.record(&env_domain.domain, &route);
+                                }
+                            }
                             continue;
                         };
 
@@ -1343,9 +1950,9 @@ impl CachedPeerTable {
                         // Determine backend type: static directory or upstream containers
                         let backend = if let Some(static_dir) = &deployment.static_dir_location {
                             // Static deployment - serve from directory
-                            BackendType::StaticDir {
+                            Some(BackendType::StaticDir {
                                 path: static_dir.clone(),
-                            }
+                            })
                         } else if !target_containers.is_empty() {
                             // Container deployment - proxy to containers
                             let mut backend_entries = Vec::with_capacity(target_containers.len());
@@ -1364,15 +1971,26 @@ impl CachedPeerTable {
                                     backend_entries.push(entry);
                                 }
                             }
-                            if backend_entries.is_empty() {
-                                continue;
-                            }
-                            BackendType::Upstream {
+                            (!backend_entries.is_empty()).then(|| BackendType::Upstream {
                                 backends: backend_entries,
                                 round_robin_counter: Arc::new(AtomicUsize::new(0)),
-                            }
+                            })
                         } else {
-                            // No backend available, skip this route
+                            None
+                        };
+
+                        // An operator-attached domain with no live backend is
+                        // an outage, never a console URL (see section 1).
+                        let Some(backend) = backend else {
+                            if let Some(route) =
+                                unavailable_route_for(project, environment, deployment)
+                            {
+                                debug!(
+                                    "Custom domain has no live backend: {} (project={}, env={}, deploy={}, reason={})",
+                                    custom_domain.domain, custom_domain.project_id, environment.id, deployment_id, route.reason.as_str()
+                                );
+                                unavailable.record(&custom_domain.domain, &route);
+                            }
                             continue;
                         };
 
@@ -1565,15 +2183,18 @@ impl CachedPeerTable {
                     // Determine backend type: static directory or upstream containers
                     let backend = if let Some(static_dir) = &deployment.static_dir_location {
                         // Static deployment - serve from directory
-                        BackendType::StaticDir {
+                        Some(BackendType::StaticDir {
                             path: static_dir.clone(),
-                        }
+                        })
                     } else if !containers.is_empty() {
                         // For Compose deployments, the main route uses only
                         // the first explicitly configured public port. A stack
-                        // with no public ports (or a stale service reference)
-                        // remains private instead of exposing whichever
-                        // container happened to be discovered first.
+                        // with no public ports remains private instead of
+                        // exposing whichever container happened to be
+                        // discovered first. When the public service has no
+                        // running container (or a stale service reference),
+                        // nothing is routed and the hosts are reported
+                        // unavailable below.
                         let is_compose = containers.iter().any(|c| c.service_name.is_some());
                         let (route_containers, public_port): (
                             Vec<&deployment_containers::Model>,
@@ -1599,9 +2220,6 @@ impl CachedPeerTable {
                                         .iter()
                                         .filter(|c| c.service_name.as_deref() == Some(&pp.service))
                                         .collect();
-                                    if cs.is_empty() {
-                                        continue;
-                                    }
                                     (cs, Some(pp))
                                 }
                                 None => continue,
@@ -1635,15 +2253,49 @@ impl CachedPeerTable {
                                 backend_entries.push(entry);
                             }
                         }
-                        if backend_entries.is_empty() {
-                            continue;
-                        }
-                        BackendType::Upstream {
+                        (!backend_entries.is_empty()).then(|| BackendType::Upstream {
                             backends: backend_entries,
                             round_robin_counter: Arc::new(AtomicUsize::new(0)),
-                        }
+                        })
                     } else {
-                        // No backend available, skip this route
+                        None
+                    };
+
+                    // No live backend: report every hostname this section
+                    // would have routed for the environment as unavailable
+                    // (see section 1), including the public Compose service
+                    // URLs and the internal `*.temps.local` name.
+                    let Some(backend) = backend else {
+                        let route = environment
+                            .filter(|_| !compose_without_public_ports(project.map(Arc::as_ref)))
+                            .and_then(|environment| {
+                                unavailable_route_for(project, environment, deployment)
+                            });
+                        if let Some(route) = route {
+                            let mut hosts = vec![
+                                main_url.clone(),
+                                PublicHostnameStrategy::Standard
+                                    .environment_hostname(&preview_domain, main_url),
+                            ];
+                            let env_slug = env.slug.trim();
+                            let proj_slug = route.project.slug.trim();
+                            if !env_slug.is_empty() && !proj_slug.is_empty() {
+                                hosts.push(format!("{}.{}.temps.local", env_slug, proj_slug));
+                            }
+                            hosts.extend(compose_public_service_hostnames(
+                                route.project.preset_config.as_ref(),
+                                &preview_domain,
+                                match_strategy(&hostname_strategies, &preview_domain),
+                                main_url,
+                            ));
+                            debug!(
+                                "Environment has no live backend: {:?} (project={}, env={}, deploy={}, reason={})",
+                                hosts, env.project_id, env.id, deployment_id, route.reason.as_str()
+                            );
+                            for host in &hosts {
+                                unavailable.record(host, &route);
+                            }
+                        }
                         continue;
                     };
 
@@ -1790,11 +2442,29 @@ impl CachedPeerTable {
 
                             let route_labels =
                                 temps_entities::preset::compose_public_route_labels(&public_ports);
+                            // A public service with no running container (or
+                            // no reachable port) is down while the rest of
+                            // the stack runs: its URL answers 503.
+                            let svc_unavailable = environment.and_then(|environment| {
+                                unavailable_route_for(project, environment, deployment)
+                            });
+                            let svc_strategy =
+                                match_strategy(&hostname_strategies, &preview_domain);
                             for (public_port, route_label) in public_ports.iter().zip(&route_labels)
                             {
+                                let svc_domain = svc_strategy.service_hostname(
+                                    &preview_domain,
+                                    main_url,
+                                    route_label,
+                                );
                                 let svc_containers = match services.get(&public_port.service) {
                                     Some(c) => c,
-                                    None => continue,
+                                    None => {
+                                        if let Some(route) = &svc_unavailable {
+                                            unavailable.record(&svc_domain, route);
+                                        }
+                                        continue;
+                                    }
                                 };
 
                                 let mut svc_backends = Vec::with_capacity(svc_containers.len());
@@ -1824,6 +2494,9 @@ impl CachedPeerTable {
                                 }
 
                                 if svc_backends.is_empty() {
+                                    if let Some(route) = &svc_unavailable {
+                                        unavailable.record(&svc_domain, route);
+                                    }
                                     continue;
                                 }
 
@@ -1847,13 +2520,6 @@ impl CachedPeerTable {
                                     cert_eligible: true,
                                 };
 
-                                let svc_strategy =
-                                    match_strategy(&hostname_strategies, &preview_domain);
-                                let svc_domain = svc_strategy.service_hostname(
-                                    &preview_domain,
-                                    main_url,
-                                    route_label,
-                                );
                                 if let std::collections::hash_map::Entry::Vacant(e) =
                                     routes.entry(svc_domain.clone())
                                 {
@@ -1961,9 +2627,9 @@ impl CachedPeerTable {
                     // Determine backend type: static directory or upstream containers
                     let backend = if let Some(static_dir) = &deployment.static_dir_location {
                         // Static deployment - serve from directory
-                        BackendType::StaticDir {
+                        Some(BackendType::StaticDir {
                             path: static_dir.clone(),
-                        }
+                        })
                     } else if !containers.is_empty() {
                         let public_port =
                             project
@@ -1975,52 +2641,69 @@ impl CachedPeerTable {
                                     }
                                     _ => None,
                                 });
-                        let Some(route_containers) =
-                            select_public_route_containers(&containers, public_port)
-                        else {
-                            continue;
-                        };
-                        let mut backend_entries = Vec::with_capacity(route_containers.len());
-                        for c in route_containers {
-                            let node_addr = resolve_node_private_address(
-                                c.node_id,
-                                &mut nodes_cache,
-                                self.db.as_ref(),
-                            )
-                            .await;
-                            let entry = match public_port {
-                                Some(port) => build_public_compose_backend_entry(
-                                    c,
-                                    node_addr.as_deref(),
-                                    port,
-                                    self.runtime_context.as_ref(),
-                                ),
-                                None => build_backend_entry(
-                                    c,
-                                    node_addr.as_deref(),
-                                    self.runtime_context.as_ref(),
-                                ),
-                            };
-                            if let Some(entry) = entry {
-                                backend_entries.push(entry);
+                        match select_public_route_containers(&containers, public_port) {
+                            // A Compose stack without a public port is private.
+                            None if public_port.is_none() => continue,
+                            // The public service has no running container.
+                            None => None,
+                            Some(route_containers) => {
+                                let mut backend_entries =
+                                    Vec::with_capacity(route_containers.len());
+                                for c in route_containers {
+                                    let node_addr = resolve_node_private_address(
+                                        c.node_id,
+                                        &mut nodes_cache,
+                                        self.db.as_ref(),
+                                    )
+                                    .await;
+                                    let entry = match public_port {
+                                        Some(port) => build_public_compose_backend_entry(
+                                            c,
+                                            node_addr.as_deref(),
+                                            port,
+                                            self.runtime_context.as_ref(),
+                                        ),
+                                        None => build_backend_entry(
+                                            c,
+                                            node_addr.as_deref(),
+                                            self.runtime_context.as_ref(),
+                                        ),
+                                    };
+                                    if let Some(entry) = entry {
+                                        backend_entries.push(entry);
+                                    }
+                                }
+                                (!backend_entries.is_empty()).then(|| BackendType::Upstream {
+                                    backends: backend_entries,
+                                    round_robin_counter: Arc::new(AtomicUsize::new(0)),
+                                })
                             }
                         }
-                        if backend_entries.is_empty() {
-                            continue;
-                        }
-                        BackendType::Upstream {
-                            backends: backend_entries,
-                            round_robin_counter: Arc::new(AtomicUsize::new(0)),
-                        }
                     } else {
-                        // No backend available, skip this route
-                        continue;
+                        None
                     };
 
                     // Generate a fallback route using deployment slug if no other routes exist
                     // This ensures every active deployment is accessible
                     let fallback_domain = PublicHostnameStrategy::Standard
                         .deployment_hostname(&preview_domain, &deployment.slug);
+
+                    // No live backend: the deployment URL answers 503 (see
+                    // section 1) rather than falling through to the console.
+                    let Some(backend) = backend else {
+                        if !compose_without_public_ports(Some(project.as_ref())) {
+                            if let Some(route) =
+                                unavailable_route_for(Some(project), environment, deployment)
+                            {
+                                debug!(
+                                    "Deployment fallback host has no live backend: {} (project={}, env={}, deploy={}, reason={})",
+                                    fallback_domain, env.project_id, env.id, deployment_id, route.reason.as_str()
+                                );
+                                unavailable.record(&fallback_domain, &route);
+                            }
+                        }
+                        continue;
+                    };
 
                     if !routes.contains_key(&fallback_domain) {
                         routes.insert(
@@ -2206,6 +2889,65 @@ impl CachedPeerTable {
             );
         }
 
+        // 7. Custom hostnames of public status pages (#1412). A hostname
+        // attached to a page is reserved for it: any project route on it is
+        // dropped, and it serves only while the page is published, its project
+        // is not being deleted, and its own `domains` row holds a valid
+        // certificate (ownership proven through ACME). A tombstone (removed
+        // hostname, or deleted page/project) answers 404 too, but only while
+        // nothing else claims the name: any application route wins over it.
+        // The console and public ingress hostnames win over both.
+        let status_bindings = load_status_page_hosts(self.db.as_ref()).await?;
+        let console_host_for_status = app_settings.console_hostname();
+        let ingress_host_for_status = app_settings.dedicated_public_ingress_hostname();
+        let is_platform_host = |host: &str| {
+            console_host_for_status.as_deref() == Some(host)
+                || ingress_host_for_status.as_deref() == Some(host)
+        };
+        let mut status_page_hosts: HashMap<String, StatusPageHostRoute> = HashMap::new();
+        for (host, route) in status_bindings.attached {
+            if is_platform_host(&host) {
+                continue;
+            }
+            let removed = routes.remove(&host).is_some()
+                | http_routes_map.remove(&host).is_some()
+                | tls_routes_map.remove(&host).is_some();
+            if removed {
+                warn!(
+                    "Ignoring project route for status-page hostname '{}' — it is attached to a status page",
+                    host
+                );
+            }
+            unavailable.exact.remove(&host);
+            status_page_hosts.insert(host, route);
+        }
+        for host in status_bindings.tombstones {
+            let claimed = is_platform_host(&host)
+                || status_page_hosts.contains_key(&host)
+                || routes.contains_key(&host)
+                || http_routes_map.contains_key(&host)
+                || tls_routes_map.contains_key(&host)
+                || unavailable.exact.contains_key(&host)
+                || http_wildcards_matcher.match_domain(&host).is_some()
+                || tls_wildcards_matcher.match_domain(&host).is_some()
+                || host
+                    .split_once('.')
+                    .is_some_and(|(_, parent)| routes.contains_key(&format!("*.{parent}")));
+            if !claimed {
+                status_page_hosts.insert(host, StatusPageHostRoute { slug: None });
+            }
+        }
+        if !status_page_hosts.is_empty() {
+            debug!(
+                "Section 7: Loaded {} status-page hostnames ({} serving)",
+                status_page_hosts.len(),
+                status_page_hosts
+                    .values()
+                    .filter(|r| r.slug.is_some())
+                    .count()
+            );
+        }
+
         // The console hostname is owned by the control plane, never by a
         // project. A route pointing it at a deployment locks the operator out
         // of the console entirely (issue #478) — the create/update API now
@@ -2222,6 +2964,43 @@ impl CachedPeerTable {
                     console_host
                 );
             }
+        }
+
+        // The public ingress hostname is owned by the control plane for the
+        // same reason (ADR-051): a project route on it would swallow every
+        // third-party callback. The settings API refuses a hostname that is
+        // already routed, so this only fires for a route created by a path
+        // that bypassed that check.
+        let ingress_host = app_settings.dedicated_public_ingress_hostname();
+        if let Some(ingress_host) = ingress_host.as_ref() {
+            let removed = routes.remove(ingress_host).is_some()
+                | http_routes_map.remove(ingress_host).is_some()
+                | tls_routes_map.remove(ingress_host).is_some();
+            if removed {
+                warn!(
+                    "Ignoring project route for reserved public ingress hostname '{}' — Temps serves third-party callbacks on it (ADR-051)",
+                    ingress_host
+                );
+            }
+        }
+
+        // A live route always wins over an unavailable entry for the same
+        // host, whichever section recorded it, and the console hostname is
+        // never reported as an application host. Lookups re-check live
+        // wildcard routes; this keeps the map down to hosts that matter.
+        unavailable.exact.retain(|host, _| {
+            !routes.contains_key(host)
+                && !http_routes_map.contains_key(host)
+                && !tls_routes_map.contains_key(host)
+        });
+        unavailable
+            .wildcard_bases
+            .retain(|base, _| !routes.contains_key(&format!("*.{base}")));
+        if let Some(console_host) = app_settings.console_hostname() {
+            unavailable.exact.remove(&console_host);
+        }
+        if let Some(ingress_host) = ingress_host.as_ref() {
+            unavailable.exact.remove(ingress_host);
         }
 
         // Build the wildcard index for legacy project/environment routes. A
@@ -2244,7 +3023,11 @@ impl CachedPeerTable {
             routes.keys(),
             http_routes_map.keys(),
             tls_routes_map.keys(),
-            app_settings.console_hostname(),
+            app_settings
+                .console_hostname()
+                .into_iter()
+                .chain(ingress_host.clone())
+                .chain(status_page_hosts.keys().cloned()),
         );
 
         // Atomically replace all route tables
@@ -2254,6 +3037,7 @@ impl CachedPeerTable {
         let http_wildcards_count = http_wildcards_matcher.len();
         let tls_wildcards_count = tls_wildcards_matcher.len();
         let legacy_wildcards_count = legacy_wildcards_matcher.len();
+        let unavailable_count = unavailable.len();
 
         let new_snapshot = Arc::new(RouteTableSnapshot {
             http_routes: http_routes_map,
@@ -2264,8 +3048,11 @@ impl CachedPeerTable {
                 exact: routes,
                 wildcards: legacy_wildcards_matcher,
                 reserved_console_host: app_settings.console_hostname(),
+                reserved_ingress_host: ingress_host,
+                status_page_hosts,
             },
             ownership: route_ownership,
+            unavailable,
         });
 
         // Collect on-demand configs for awake environments so the idle sweep can track them.
@@ -2311,8 +3098,8 @@ impl CachedPeerTable {
         }
 
         info!(
-            "Route table loaded with {} legacy routes; typed caches contain {} HTTP exact, {} TLS exact, {} HTTP wildcards, {} TLS wildcards, {} legacy wildcards",
-            route_count, http_routes_count, tls_routes_count, http_wildcards_count, tls_wildcards_count, legacy_wildcards_count
+            "Route table loaded with {} legacy routes; typed caches contain {} HTTP exact, {} TLS exact, {} HTTP wildcards, {} TLS wildcards, {} legacy wildcards; {} application hosts have no live backend",
+            route_count, http_routes_count, tls_routes_count, http_wildcards_count, tls_wildcards_count, legacy_wildcards_count, unavailable_count
         );
         debug!(
             "Found {} on-demand configs for idle tracking",
@@ -2333,10 +3120,26 @@ impl CachedPeerTable {
         // sees the new value. Do this BEFORE the DNS reconcile so readiness
         // waiters are released as soon as the in-memory maps are live —
         // they must never be gated on DNS work.
-        let new_gen = self
-            .generation
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-            + 1;
+        //
+        // The authoritative process claims the number from the durable
+        // counter, so it continues across restarts. Restarting at 1 would
+        // leave every agent long-polling with a `since` above it -- not woken
+        // by new generations until its 25s poll expires -- and leave their
+        // old, higher ACKs satisfying the completion gate for routes they
+        // never received. The claim is also the only write of that row, so
+        // `mark_deployment_complete`'s target is always a generation the
+        // snapshot endpoint has issued.
+        self.loaded
+            .store(true, std::sync::atomic::Ordering::Release);
+        let published = self.advance_generation().await;
+        debug!(
+            generation = ?published.as_ref().ok(),
+            role = ?self.route_generation_role(),
+            "Route table reloaded"
+        );
+        // Always wake: first-load waiters key off `loaded`, and route-sync
+        // long-polls re-check the generation and keep waiting if it has not
+        // moved yet.
         self.generation_changed.notify_waiters();
 
         // Fire the async on-reload hook used by the deployment-DNS publisher
@@ -2373,23 +3176,20 @@ impl CachedPeerTable {
             }
         }
 
-        // Persist the new generation into the durable singleton so
-        // `mark_deployment_complete` can wait until every active
-        // worker's `node_route_state.applied_generation` reaches it.
-        // Best-effort — a transient DB error here doesn't block the
-        // route table itself, and the next successful reload will
-        // overwrite the stale value.
-        let new_gen_i64: i64 = new_gen.try_into().unwrap_or(i64::MAX);
-        let stmt = sea_orm::Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "UPDATE route_generation SET current = $1, updated_at = now() WHERE id = 1",
-            [new_gen_i64.into()],
-        );
-        if let Err(e) = sea_orm::ConnectionTrait::execute(self.db.as_ref(), stmt).await {
-            tracing::warn!(error = %e, "failed to persist route_generation");
+        // A reload whose generation was not claimed must not count as a
+        // completed reload: callers publish `RouteTableUpdated` on success,
+        // and the deployment completion gate would then compare workers'
+        // old ACKs against the unchanged durable target and pass while they
+        // still serve the previous routes. Failing here keeps the gate
+        // waiting; it re-requests a reload, whose claim (or the background
+        // retry) publishes the generation.
+        match published {
+            Ok(_) => Ok(sleeping_environments),
+            Err(source) => Err(RouteLoadError::GenerationUnpublished {
+                route_count: self.len(),
+                source,
+            }),
         }
-
-        Ok(sleeping_environments)
     }
 
     /// Get route information for a host (O(1) lookup)
@@ -2397,15 +3197,92 @@ impl CachedPeerTable {
         self.route_snapshot.load().legacy.get(host).cloned()
     }
 
-    /// Whether this hostname is reserved for the control-plane console.
-    /// Wake-on-request checks this before consulting sleeping wildcards.
+    /// Look up an application hostname whose deployment currently has no live
+    /// upstream (stopped or crashed containers, or a paused deployment).
+    ///
+    /// Returns `None` whenever a live route resolves the host, so a routable
+    /// host is never reported as unavailable, and for the reserved console
+    /// hostname. Sleeping on-demand environments are never recorded here:
+    /// they keep going through the wake path. One snapshot load; meant for
+    /// the proxy's route-miss path, not for every request.
+    pub fn get_unavailable_route(&self, host: &str) -> Option<UnavailableRoute> {
+        let snapshot = self.route_snapshot.load();
+        // The unavailable map is usually empty, so check it first: console
+        // and unknown-host requests pay one hash lookup, not the full chain.
+        let route = snapshot.unavailable.get(host)?;
+        if snapshot.legacy.is_reserved(host) || snapshot.has_live_route(host) {
+            return None;
+        }
+        Some(route.clone())
+    }
+
+    /// Record a status-page hostname for cross-crate tests without database
+    /// setup. Not used on the production load path.
+    #[doc(hidden)]
+    pub fn insert_status_page_host_for_test(&self, host: &str, slug: Option<&str>) {
+        let mut snapshot = (*self.route_snapshot.load_full()).clone();
+        snapshot.legacy.status_page_hosts.insert(
+            normalize_route_hostname(host).into_owned(),
+            StatusPageHostRoute {
+                slug: slug.map(Arc::from),
+            },
+        );
+        self.route_snapshot.store(Arc::new(snapshot));
+    }
+
+    /// Record an unavailable hostname for cross-crate tests without database
+    /// setup. Not used on the production load path.
+    #[doc(hidden)]
+    pub fn insert_unavailable_route_for_test(&self, host: &str, route: UnavailableRoute) {
+        let mut snapshot = (*self.route_snapshot.load_full()).clone();
+        snapshot.unavailable.record(host, &route);
+        self.route_snapshot.store(Arc::new(snapshot));
+    }
+
+    /// Whether this hostname is reserved for the control plane: the console
+    /// hostname or the public ingress hostname. Wake-on-request checks this
+    /// before consulting sleeping wildcards.
     pub fn is_reserved_hostname(&self, host: &str) -> bool {
-        self.route_snapshot
-            .load()
+        self.route_snapshot.load().legacy.is_reserved(host)
+    }
+
+    /// Whether `host` is the dedicated public ingress hostname (ADR-051): an
+    /// explicit `public_ingress_url` whose host is not the console host.
+    ///
+    /// The proxy sends such a request to the public-only console surface, and
+    /// nowhere else. One lock-free snapshot load and one string comparison
+    /// with no allocation, so it is safe on the per-request path. `host` may
+    /// be a raw `Host` header: a `:port` suffix, a trailing dot and letter
+    /// case are ignored.
+    pub fn is_public_ingress_hostname(&self, host: &str) -> bool {
+        let snapshot = self.route_snapshot.load();
+        let Some(reserved) = snapshot.legacy.reserved_ingress_host.as_deref() else {
+            return false;
+        };
+        let host = match host.rsplit_once(':') {
+            Some((name, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+                name
+            }
+            _ => host,
+        };
+        reserved.eq_ignore_ascii_case(host.trim_end_matches('.'))
+    }
+
+    /// The status-page binding for `host`, if it is a status page's custom
+    /// hostname (#1412). One lock-free snapshot load and one hash lookup; no
+    /// allocation unless `host` carries uppercase letters. `host` may be a raw
+    /// `Host` header: a `:port` suffix, a trailing dot and letter case are
+    /// ignored.
+    pub fn status_page_host(&self, host: &str) -> Option<StatusPageHostRoute> {
+        let snapshot = self.route_snapshot.load();
+        if snapshot.legacy.status_page_hosts.is_empty() {
+            return None;
+        }
+        snapshot
             .legacy
-            .reserved_console_host
-            .as_deref()
-            == Some(host)
+            .status_page_hosts
+            .get(normalize_route_hostname(host).as_ref())
+            .cloned()
     }
 
     /// Return whether an active route or reserved control-plane hostname owns
@@ -2514,6 +3391,144 @@ impl temps_core::route_table::RouteTableRefresher for CachedPeerTable {
         let count =
             snapshot.legacy.exact.len() + snapshot.http_routes.len() + snapshot.tls_routes.len();
         Ok(count)
+    }
+
+    async fn application_serving_host(
+        &self,
+        host: &str,
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self
+            .application_use_of(host)
+            .await?
+            .map(|usage| usage.describe().to_string()))
+    }
+}
+
+/// How an application currently uses a hostname. See
+/// [`CachedPeerTable::application_use_of`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApplicationHostUse {
+    /// A live route resolves it: an exact route, or a wildcard that covers it.
+    LiveRoute,
+    /// It belongs to a deployment with no live upstream (stopped, crashed or
+    /// paused). The proxy answers 503 on it today.
+    StoppedDeployment,
+    /// It wakes an on-demand environment that is currently asleep.
+    SleepingEnvironment,
+    /// It is the generated hostname of an environment that has not been
+    /// deployed yet, and becomes a live route on its first deployment.
+    EnvironmentHostname,
+}
+
+impl ApplicationHostUse {
+    /// A phrase that completes "… is already used by …".
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::LiveRoute => "a deployed application",
+            Self::StoppedDeployment => "an application whose deployment is stopped or paused",
+            Self::SleepingEnvironment => "a sleeping on-demand environment",
+            Self::EnvironmentHostname => "an environment's generated hostname",
+        }
+    }
+}
+
+/// Whether a stored route hostname, exact or a single-label wildcard
+/// (`*.example.com`), covers `host`. Mirrors `WildcardMatcher`: a wildcard
+/// stands for exactly one label.
+fn stored_hostname_covers(stored: &str, host: &str) -> bool {
+    let stored = stored.trim_end_matches('.');
+    match stored.strip_prefix("*.") {
+        Some(base) if !base.is_empty() => host
+            .split_once('.')
+            .is_some_and(|(label, rest)| !label.is_empty() && rest.eq_ignore_ascii_case(base)),
+        Some(_) => false,
+        None => stored.eq_ignore_ascii_case(host),
+    }
+}
+
+impl CachedPeerTable {
+    /// What serves `host` as an application right now, judged against a fresh
+    /// load of the route table.
+    ///
+    /// This is the complete answer to "would reserving this hostname for the
+    /// platform take something offline": the route table is where exact
+    /// routes, wildcard routes and generated environment names all come
+    /// together, and it is what drops a project route once a host is
+    /// reserved. Checked, in order:
+    ///
+    /// 1. live routes, including wildcard matches;
+    /// 2. hosts whose deployment is stopped or paused;
+    /// 3. hosts that wake a sleeping on-demand environment;
+    /// 4. the generated hostname of an environment not deployed yet.
+    ///
+    /// A host that is already reserved (the console, the current public
+    /// ingress host) is not reported: no project route exists on it.
+    ///
+    /// Reloads the table, so it belongs on a rare control-plane write, never
+    /// on a request path.
+    pub async fn application_use_of(
+        &self,
+        host: &str,
+    ) -> Result<Option<ApplicationHostUse>, RouteLoadError> {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        use temps_entities::{environments, settings};
+
+        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        if host.is_empty() {
+            return Ok(None);
+        }
+
+        let sleeping = self.load_routes().await?;
+        {
+            let snapshot = self.route_snapshot.load();
+            if snapshot.legacy.is_reserved(&host) {
+                return Ok(None);
+            }
+            if snapshot.has_live_route(&host) {
+                return Ok(Some(ApplicationHostUse::LiveRoute));
+            }
+            if snapshot.unavailable.get(&host).is_some() {
+                return Ok(Some(ApplicationHostUse::StoppedDeployment));
+            }
+        }
+        if sleeping
+            .iter()
+            .any(|entry| stored_hostname_covers(&entry.domain, &host))
+        {
+            return Ok(Some(ApplicationHostUse::SleepingEnvironment));
+        }
+
+        // An environment that has never been deployed has no route yet, but
+        // its generated hostname is already promised to it. One indexed
+        // lookup by subdomain rather than a scan of every environment.
+        let preview_domain = settings::Entity::find()
+            .one(self.db.as_ref())
+            .await?
+            .map(|s| AppSettings::from_json(s.data))
+            .unwrap_or_default()
+            .preview_domain;
+        let preview_base = preview_domain
+            .trim()
+            .trim_start_matches("*.")
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        let subdomain = host
+            .strip_suffix(preview_base.as_str())
+            .and_then(|label| label.strip_suffix('.'))
+            .filter(|label| !preview_base.is_empty() && !label.is_empty() && !label.contains('.'));
+        if let Some(subdomain) = subdomain {
+            let claimed = environments::Entity::find()
+                .filter(environments::Column::Subdomain.eq(subdomain))
+                .filter(environments::Column::DeletedAt.is_null())
+                .one(self.db.as_ref())
+                .await?
+                .is_some();
+            if claimed {
+                return Ok(Some(ApplicationHostUse::EnvironmentHostname));
+            }
+        }
+
+        Ok(None)
     }
 }
 
@@ -3560,5 +4575,1033 @@ mod tests {
 
         let loaded = handle.await.expect("waiter task panicked");
         assert!(loaded, "waiter must wake and report loaded after a bump");
+    }
+}
+
+#[cfg(test)]
+mod unavailable_route_tests {
+    use super::CachedPeerTable;
+    use crate::test_utils::TestDBMockOperations;
+    use sea_orm::{ActiveModelTrait, Set};
+    use temps_database::test_utils::TestDatabase;
+    use temps_entities::{custom_routes, environment_domains};
+
+    // ── Hosts without a live backend (issue #1334) ────────────────────
+    //
+    // A deployment whose containers are all down used to vanish from the
+    // route table, so the proxy fell back to the console and answered the
+    // app's hostname with the console SPA and HTTP 200. These hosts must stay
+    // unroutable but be reported through `get_unavailable_route`.
+
+    /// Isolated database, or `None` when Docker is unavailable.
+    async fn database_or_skip() -> Option<TestDatabase> {
+        match TestDatabase::with_migrations().await {
+            Ok(database) => Some(database),
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Skipping unavailable-route test: Docker runtime unavailable: {error}");
+                None
+            }
+            Err(error) => panic!("Could not create isolated test database: {error}"),
+        }
+    }
+
+    /// One container row for `deployment_id` in `status`.
+    async fn insert_container(
+        test_db: &TestDBMockOperations,
+        deployment_id: i32,
+        status: &str,
+        host_port: Option<i32>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use temps_entities::deployment_containers;
+        deployment_containers::ActiveModel {
+            deployment_id: Set(deployment_id),
+            container_id: Set(format!("container-{status}-{deployment_id}")),
+            container_name: Set(format!("container-{status}-{deployment_id}")),
+            container_port: Set(3000),
+            host_port: Set(host_port),
+            image_name: Set(Some("test-image:latest".to_string())),
+            status: Set(Some(status.to_string())),
+            deployed_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await?;
+        Ok(())
+    }
+
+    async fn insert_environment_domain(
+        test_db: &TestDBMockOperations,
+        environment_id: i32,
+        domain: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        environment_domains::ActiveModel {
+            domain: Set(domain.to_string()),
+            environment_id: Set(environment_id),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await?;
+        Ok(())
+    }
+
+    /// Assert `host` is not routable and is reported unavailable for exactly
+    /// this project/environment/deployment.
+    fn assert_unavailable(
+        route_table: &CachedPeerTable,
+        host: &str,
+        ids: (i32, i32, i32),
+        reason: crate::route_table::UnavailableReason,
+    ) {
+        assert!(
+            route_table.get_route_by_host(host).is_none()
+                && route_table.get_route(host).is_none()
+                && route_table.resolve_route_for_sni(host).is_none(),
+            "{host} has no live backend and must not be routable"
+        );
+        let unavailable = route_table
+            .get_unavailable_route(host)
+            .unwrap_or_else(|| panic!("{host} must be reported as unavailable"));
+        assert_eq!(
+            (
+                unavailable.project.id,
+                unavailable.environment.id,
+                unavailable.deployment.id
+            ),
+            ids,
+            "{host} must be attributed to its own project/environment/deployment"
+        );
+        assert_eq!(unavailable.reason, reason, "{host}");
+    }
+
+    #[tokio::test]
+    async fn exited_only_container_reports_app_hosts_unavailable(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::route_table::UnavailableReason;
+        use temps_entities::environments;
+
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        let (project, environment, deployment) = test_db
+            .create_test_project_with_domain("exited-app.example.com")
+            .await?;
+        environments::ActiveModel {
+            id: Set(environment.id),
+            subdomain: Set("exited-app-production".to_string()),
+            ..Default::default()
+        }
+        .update(test_db.db.as_ref())
+        .await?;
+        // Docker reported the container as exited (`docker stop` or a crash).
+        insert_container(&test_db, deployment.id, "exited", Some(9700)).await?;
+        insert_environment_domain(&test_db, environment.id, "exited-app.preview.example.com")
+            .await?;
+
+        let route_table = CachedPeerTable::new(test_db.db.clone());
+        route_table.load_routes().await?;
+
+        let ids = (project.id, environment.id, deployment.id);
+        // Section 1 (environment domain), section 4 (the environment's own
+        // hostname and its internal name).
+        for host in [
+            "exited-app.preview.example.com".to_string(),
+            "exited-app-production".to_string(),
+            format!("production.{}.temps.local", project.slug),
+        ] {
+            assert_unavailable(&route_table, &host, ids, UnavailableReason::NoLiveBackend);
+        }
+        assert!(
+            route_table
+                .get_unavailable_route("unknown.example.com")
+                .is_none(),
+            "a host no project owns is not an application outage"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn host_mode_container_without_published_port_is_unavailable(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::route_table::UnavailableReason;
+
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        let (project, environment, deployment) = test_db
+            .create_test_project_with_domain("no-port.example.com")
+            .await?;
+        // Still "running" in the database, but the health monitor cleared
+        // the host port because Docker no longer publishes one.
+        insert_container(&test_db, deployment.id, "running", None).await?;
+        insert_environment_domain(&test_db, environment.id, "no-port.preview.example.com").await?;
+
+        // `CachedPeerTable::new` runs in Host execution mode, where a
+        // container is only reachable through its published port.
+        let route_table = CachedPeerTable::new(test_db.db.clone());
+        route_table.load_routes().await?;
+
+        assert_unavailable(
+            &route_table,
+            "no-port.preview.example.com",
+            (project.id, environment.id, deployment.id),
+            UnavailableReason::NoLiveBackend,
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn paused_deployment_hosts_are_unavailable() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::route_table::UnavailableReason;
+        use temps_entities::deployments;
+
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        let (project, environment, deployment) = test_db
+            .create_test_project_with_domain("paused-app.example.com")
+            .await?;
+        // Even a container row that still says "running" is not routed
+        // while the deployment is paused.
+        insert_container(&test_db, deployment.id, "running", Some(9701)).await?;
+        deployments::ActiveModel {
+            id: Set(deployment.id),
+            state: Set("paused".to_string()),
+            ..Default::default()
+        }
+        .update(test_db.db.as_ref())
+        .await?;
+        insert_environment_domain(&test_db, environment.id, "paused-app.preview.example.com")
+            .await?;
+
+        let route_table = CachedPeerTable::new(test_db.db.clone());
+        route_table.load_routes().await?;
+
+        assert_unavailable(
+            &route_table,
+            "paused-app.preview.example.com",
+            (project.id, environment.id, deployment.id),
+            UnavailableReason::Paused,
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sleeping_on_demand_environment_is_left_to_the_wake_path(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use temps_entities::environments;
+
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        let (_project, environment, deployment) = test_db
+            .create_test_project_with_domain("sleeping-app.example.com")
+            .await?;
+        environments::ActiveModel {
+            id: Set(environment.id),
+            sleeping: Set(true),
+            ..Default::default()
+        }
+        .update(test_db.db.as_ref())
+        .await?;
+        insert_container(&test_db, deployment.id, "exited", Some(9702)).await?;
+        insert_environment_domain(&test_db, environment.id, "sleeping-app.preview.example.com")
+            .await?;
+
+        let route_table = CachedPeerTable::new(test_db.db.clone());
+        let sleeping = route_table.load_routes().await?;
+
+        let host = "sleeping-app.preview.example.com";
+        assert!(route_table.get_route_by_host(host).is_none());
+        assert!(
+            route_table.get_unavailable_route(host).is_none(),
+            "a sleeping environment must keep waking on request, not answer 503"
+        );
+        assert!(
+            sleeping
+                .iter()
+                .any(|entry| entry.domain == host && entry.environment_id == environment.id),
+            "the sleeping environment must still be handed to the wake path: {sleeping:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_route_always_wins_over_an_unavailable_entry(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::route_table::UnavailableReason;
+
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        let (project, environment, deployment) = test_db
+            .create_test_project_with_domain("down-app.example.com")
+            .await?;
+        insert_container(&test_db, deployment.id, "exited", Some(9703)).await?;
+        for domain in [
+            "shared.example.com",
+            "app.wild.example.com",
+            "only-down.example.com",
+        ] {
+            insert_environment_domain(&test_db, environment.id, domain).await?;
+        }
+        // Operator routes that resolve two of those hosts to a live upstream:
+        // one exact, one through a wildcard.
+        for domain in ["shared.example.com", "*.wild.example.com"] {
+            custom_routes::ActiveModel {
+                domain: Set(domain.to_string()),
+                host: Set("localhost".to_string()),
+                port: Set(8080),
+                enabled: Set(true),
+                ..Default::default()
+            }
+            .insert(test_db.db.as_ref())
+            .await?;
+        }
+
+        let route_table = CachedPeerTable::new(test_db.db.clone());
+        route_table.load_routes().await?;
+
+        for host in ["shared.example.com", "app.wild.example.com"] {
+            assert!(
+                route_table.get_route_by_host(host).is_some(),
+                "{host} has a live route"
+            );
+            assert!(
+                route_table.get_unavailable_route(host).is_none(),
+                "{host} has a live route and must not be reported unavailable"
+            );
+        }
+        assert_unavailable(
+            &route_table,
+            "only-down.example.com",
+            (project.id, environment.id, deployment.id),
+            UnavailableReason::NoLiveBackend,
+        );
+
+        Ok(())
+    }
+
+    // ── What already uses a hostname (ADR-051) ────────────────────────
+    //
+    // Before a hostname is reserved for the platform, every way the proxy
+    // can serve it has to be ruled out. Stored domain rows are not enough:
+    // a wildcard route covers names that are stored nowhere, and a name
+    // generated from an environment's subdomain is not a domain row at all.
+
+    async fn set_preview_domain(
+        test_db: &TestDBMockOperations,
+        preview_domain: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use sea_orm::{ActiveModelBehavior, EntityTrait};
+        use temps_entities::settings;
+
+        let app_settings = temps_core::AppSettings {
+            external_url: Some("https://console.example.com".to_string()),
+            preview_domain: preview_domain.to_string(),
+            ..Default::default()
+        };
+        settings::Entity::insert(settings::ActiveModel {
+            id: Set(1),
+            data: Set(app_settings.to_json()),
+            ..settings::ActiveModel::new()
+        })
+        .on_conflict(
+            sea_orm::sea_query::OnConflict::column(settings::Column::Id)
+                .update_column(settings::Column::Data)
+                .to_owned(),
+        )
+        .exec(test_db.db.as_ref())
+        .await?;
+        Ok(())
+    }
+
+    async fn set_subdomain(
+        test_db: &TestDBMockOperations,
+        environment_id: i32,
+        subdomain: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        temps_entities::environments::ActiveModel {
+            id: Set(environment_id),
+            subdomain: Set(subdomain.to_string()),
+            ..Default::default()
+        }
+        .update(test_db.db.as_ref())
+        .await?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_stored_wildcard_covers_exactly_one_label() {
+        use super::stored_hostname_covers;
+
+        assert!(stored_hostname_covers("app.example.com", "app.example.com"));
+        assert!(stored_hostname_covers(
+            "App.Example.com.",
+            "app.example.com"
+        ));
+        assert!(stored_hostname_covers("*.example.com", "app.example.com"));
+        assert!(!stored_hostname_covers("*.example.com", "example.com"));
+        assert!(!stored_hostname_covers("*.example.com", "a.b.example.com"));
+        assert!(!stored_hostname_covers("*.example.com", "app.example.org"));
+        assert!(!stored_hostname_covers("*.", "app.example.com"));
+        assert!(!stored_hostname_covers(
+            "other.example.com",
+            "app.example.com"
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_name_served_through_a_wildcard_or_generated_for_an_environment_is_in_use(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::route_table::ApplicationHostUse;
+        use temps_entities::project_custom_domains;
+
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        set_preview_domain(&test_db, "preview.example.com").await?;
+        let (project, environment, deployment) = test_db
+            .create_test_project_with_domain("shop.example.com")
+            .await?;
+        set_subdomain(&test_db, environment.id, "shop-production").await?;
+        insert_container(&test_db, deployment.id, "running", Some(9741)).await?;
+        project_custom_domains::ActiveModel {
+            domain: Set("*.example.com".to_string()),
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            status: Set("active".to_string()),
+            redirect_to: Set(None),
+            status_code: Set(None),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await?;
+
+        let route_table = CachedPeerTable::new(test_db.db.clone());
+
+        // Stored nowhere as a row: only the wildcard route covers it.
+        assert_eq!(
+            route_table.application_use_of("app.example.com").await?,
+            Some(ApplicationHostUse::LiveRoute),
+            "a name the wildcard route serves is in use"
+        );
+        // Generated from the environment's subdomain, not a domain row either.
+        assert_eq!(
+            route_table
+                .application_use_of(" Shop-Production.preview.example.com. ")
+                .await?,
+            Some(ApplicationHostUse::LiveRoute),
+            "an environment's generated hostname is in use"
+        );
+
+        // A wildcard stands for one label, and unrelated names stay free.
+        assert_eq!(
+            route_table.application_use_of("a.b.example.com").await?,
+            None
+        );
+        assert_eq!(
+            route_table.application_use_of("hooks.example.org").await?,
+            None
+        );
+        assert_eq!(route_table.application_use_of("  ").await?, None);
+        // The console hostname is already reserved; no application is on it.
+        assert_eq!(
+            route_table
+                .application_use_of("console.example.com")
+                .await?,
+            None
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_stopped_sleeping_or_not_yet_deployed_environment_still_holds_its_hostname(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::route_table::ApplicationHostUse;
+        use temps_entities::environments;
+
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        set_preview_domain(&test_db, "preview.example.com").await?;
+
+        // Stopped: its only container exited.
+        let (_project, stopped_env, stopped_deployment) = test_db
+            .create_test_project_with_domain("stopped.example.com")
+            .await?;
+        set_subdomain(&test_db, stopped_env.id, "stopped-production").await?;
+        insert_container(&test_db, stopped_deployment.id, "exited", Some(9742)).await?;
+        insert_environment_domain(&test_db, stopped_env.id, "stopped.example.com").await?;
+
+        // Asleep: an on-demand environment waiting to be woken.
+        let (_project, sleeping_env, sleeping_deployment) = test_db
+            .create_test_project_with_domain("sleeping.example.com")
+            .await?;
+        set_subdomain(&test_db, sleeping_env.id, "sleeping-production").await?;
+        environments::ActiveModel {
+            id: Set(sleeping_env.id),
+            sleeping: Set(true),
+            ..Default::default()
+        }
+        .update(test_db.db.as_ref())
+        .await?;
+        insert_container(&test_db, sleeping_deployment.id, "exited", Some(9743)).await?;
+        insert_environment_domain(&test_db, sleeping_env.id, "sleeping.example.com").await?;
+
+        // Never deployed: no route yet, but the name is promised to it.
+        let (_project, draft_env, _draft_deployment) = test_db
+            .create_test_project_with_domain("draft.example.com")
+            .await?;
+        environments::ActiveModel {
+            id: Set(draft_env.id),
+            subdomain: Set("draft-staging".to_string()),
+            current_deployment_id: Set(None),
+            ..Default::default()
+        }
+        .update(test_db.db.as_ref())
+        .await?;
+
+        let route_table = CachedPeerTable::new(test_db.db.clone());
+
+        assert_eq!(
+            route_table
+                .application_use_of("stopped.example.com")
+                .await?,
+            Some(ApplicationHostUse::StoppedDeployment)
+        );
+        assert_eq!(
+            route_table
+                .application_use_of("sleeping.example.com")
+                .await?,
+            Some(ApplicationHostUse::SleepingEnvironment)
+        );
+        assert_eq!(
+            route_table
+                .application_use_of("sleeping-production.preview.example.com")
+                .await?,
+            Some(ApplicationHostUse::SleepingEnvironment)
+        );
+        assert_eq!(
+            route_table
+                .application_use_of("draft-staging.preview.example.com")
+                .await?,
+            Some(ApplicationHostUse::EnvironmentHostname)
+        );
+
+        // A name under the preview domain that no environment generates.
+        assert_eq!(
+            route_table
+                .application_use_of("hooks.preview.example.com")
+                .await?,
+            None
+        );
+        // A deleted environment gives its name back.
+        environments::ActiveModel {
+            id: Set(draft_env.id),
+            deleted_at: Set(Some(chrono::Utc::now())),
+            ..Default::default()
+        }
+        .update(test_db.db.as_ref())
+        .await?;
+        assert_eq!(
+            route_table
+                .application_use_of("draft-staging.preview.example.com")
+                .await?,
+            None
+        );
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod route_generation_tests {
+    // ── One authoritative route generation (issue #1356) ──────────────
+    //
+    // `route_generation` is the target the worker completion gate waits for
+    // every node to ACK, and nodes ACK what the route-sync endpoint of
+    // `temps serve` gave them. The split-mode `temps proxy` used to write the
+    // same row from its own reload counter, so the target could be a number
+    // no worker would ever be given.
+
+    use super::{
+        adopt_claimed_generation, claim_route_generation, claim_route_generation_within,
+        CachedPeerTable, RouteGenerationError, RouteGenerationRole, ROUTE_GENERATION_CLAIM_TIMEOUT,
+    };
+    use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+    use std::collections::HashSet;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+    use temps_database::test_utils::TestDatabase;
+
+    /// Isolated database, or `None` when Docker is unavailable.
+    async fn database_or_skip() -> Option<TestDatabase> {
+        match TestDatabase::with_migrations().await {
+            Ok(database) => Some(database),
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Skipping route generation test: Docker runtime unavailable: {error}");
+                None
+            }
+            Err(error) => panic!("Could not create isolated test database: {error}"),
+        }
+    }
+
+    async fn persisted(db: &DatabaseConnection) -> Option<i64> {
+        db.query_one(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT current FROM route_generation WHERE id = 1".to_string(),
+        ))
+        .await
+        .expect("read route_generation")
+        .map(|row| row.try_get::<i64>("", "current").expect("current column"))
+    }
+
+    async fn execute(db: &DatabaseConnection, sql: &str) {
+        db.execute(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            sql.to_string(),
+        ))
+        .await
+        .unwrap_or_else(|error| panic!("{sql}: {error}"));
+    }
+
+    #[test]
+    fn adoption_publishes_only_committed_claims_and_never_goes_backwards() {
+        let counter = AtomicU64::new(0);
+        // The normal case: the claim is ahead, and is used as-is.
+        assert_eq!(adopt_claimed_generation(&counter, 41), 41);
+        assert_eq!(adopt_claimed_generation(&counter, 42), 42);
+        // A claim overtaken by a later one (the retry racing a reload) leaves
+        // the later, also committed, number in place and invents none.
+        assert_eq!(adopt_claimed_generation(&counter, 7), 42);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Acquire), 42);
+        // A claim far ahead (a restored database) is adopted.
+        assert_eq!(adopt_claimed_generation(&counter, 1_000), 1_000);
+    }
+
+    #[test]
+    fn concurrent_adoption_only_ever_publishes_a_claimed_value() {
+        let counter = Arc::new(AtomicU64::new(0));
+        let handles: Vec<_> = (0..8u64)
+            .map(|thread| {
+                let counter = counter.clone();
+                std::thread::spawn(move || {
+                    (0..500u64)
+                        .map(|i| {
+                            let claimed = i * 8 + thread + 1;
+                            (claimed, adopt_claimed_generation(&counter, claimed))
+                        })
+                        .collect::<Vec<(u64, u64)>>()
+                })
+            })
+            .collect();
+        let claimed: HashSet<u64> = (1..=8 * 500).collect();
+        for handle in handles {
+            let results = handle.join().expect("adopting thread");
+            for (mine, published) in &results {
+                assert!(
+                    published >= mine,
+                    "published {published} below claim {mine}"
+                );
+                assert!(
+                    claimed.contains(published),
+                    "published {published}, which nobody claimed"
+                );
+            }
+            assert!(
+                results.windows(2).all(|pair| pair[0].1 <= pair[1].1),
+                "one caller never sees the generation go backwards"
+            );
+        }
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Acquire),
+            8 * 500,
+            "the counter ends at the highest claim"
+        );
+    }
+
+    #[test]
+    fn route_generation_role_defaults_to_authoritative_and_can_be_made_local() {
+        let table = CachedPeerTable::new(Arc::new(DatabaseConnection::Disconnected));
+        assert_eq!(
+            table.route_generation_role(),
+            RouteGenerationRole::Authoritative
+        );
+        table.set_route_generation_role(RouteGenerationRole::Local);
+        assert_eq!(table.route_generation_role(), RouteGenerationRole::Local);
+    }
+
+    /// A restarted control plane continues the persisted route generation
+    /// instead of starting again at 1 below every agent's last ACK, and the
+    /// row always equals the generation the snapshot endpoint serves.
+    #[tokio::test]
+    async fn authoritative_generation_continues_across_restarts() {
+        let Some(database) = database_or_skip().await else {
+            return;
+        };
+        let db = database.db.clone();
+
+        let first = CachedPeerTable::new(db.clone());
+        first.load_routes().await.expect("first load");
+        first.load_routes().await.expect("second load");
+        assert_eq!(first.current_generation(), 2);
+        assert_eq!(persisted(&db).await, Some(2));
+
+        // A previous process got further than this one ever will on its own.
+        execute(&db, "UPDATE route_generation SET current = 41 WHERE id = 1").await;
+        let restarted = CachedPeerTable::new(db.clone());
+        restarted.load_routes().await.expect("load after restart");
+        assert_eq!(restarted.current_generation(), 42);
+        assert_eq!(persisted(&db).await, Some(42));
+        restarted.load_routes().await.expect("reload");
+        assert_eq!(restarted.current_generation(), 43);
+        assert_eq!(persisted(&db).await, Some(43));
+
+        // A database restored below the running process never takes the
+        // numbering backwards: the next claim starts above both.
+        execute(&db, "UPDATE route_generation SET current = 3 WHERE id = 1").await;
+        restarted.load_routes().await.expect("reload after restore");
+        assert_eq!(restarted.current_generation(), 44);
+        assert_eq!(persisted(&db).await, Some(44));
+    }
+
+    /// The split-mode regression: a `temps proxy` that reloads more often
+    /// than `temps serve` must not move the completion gate's target.
+    #[tokio::test]
+    async fn a_local_table_never_moves_the_persisted_generation() {
+        let Some(database) = database_or_skip().await else {
+            return;
+        };
+        let db = database.db.clone();
+
+        let serve = CachedPeerTable::new(db.clone());
+        let proxy = CachedPeerTable::new(db.clone());
+        proxy.set_route_generation_role(RouteGenerationRole::Local);
+
+        serve.load_routes().await.expect("serve load");
+        assert_eq!(serve.current_generation(), 1);
+        for _ in 0..5 {
+            proxy.load_routes().await.expect("proxy load");
+        }
+        assert_eq!(proxy.current_generation(), 5, "the proxy still counts");
+        assert_eq!(
+            persisted(&db).await,
+            Some(1),
+            "the gate's target is still the generation serve gave the workers"
+        );
+
+        serve.load_routes().await.expect("serve reload");
+        assert_eq!(serve.current_generation(), 2);
+        assert_eq!(persisted(&db).await, Some(2));
+        // A proxy restart neither continues from nor writes the row.
+        let restarted_proxy = CachedPeerTable::new(db.clone());
+        restarted_proxy.set_route_generation_role(RouteGenerationRole::Local);
+        restarted_proxy.load_routes().await.expect("proxy restart");
+        assert_eq!(restarted_proxy.current_generation(), 1);
+        assert_eq!(persisted(&db).await, Some(2));
+    }
+
+    /// Concurrent claimers (two control-plane replicas, or a racing reload)
+    /// each get a distinct generation, and the row ends at the highest one.
+    #[tokio::test]
+    async fn concurrent_claims_never_collide_or_go_backwards() {
+        let Some(database) = database_or_skip().await else {
+            return;
+        };
+        let db = database.db.clone();
+
+        let tasks: Vec<_> = (0..32u64)
+            .map(|i| {
+                let db = db.clone();
+                tokio::spawn(async move {
+                    let mut claimed = Vec::new();
+                    for _ in 0..5 {
+                        // Stale and fresh in-memory values alike.
+                        claimed.push(
+                            claim_route_generation(db.as_ref(), i % 4)
+                                .await
+                                .expect("claim"),
+                        );
+                    }
+                    claimed
+                })
+            })
+            .collect();
+        let mut seen = HashSet::new();
+        for task in tasks {
+            let claimed = task.await.expect("claim task");
+            assert!(
+                claimed.windows(2).all(|pair| pair[0] < pair[1]),
+                "one claimer's generations must strictly increase: {claimed:?}"
+            );
+            for value in claimed {
+                assert!(seen.insert(value), "generation {value} was claimed twice");
+            }
+        }
+        assert_eq!(seen.len(), 32 * 5);
+        let highest = seen.iter().copied().max().expect("claims");
+        assert_eq!(persisted(&db).await, Some(highest as i64));
+
+        // Two authoritative tables sharing the row interleave without
+        // repeating a number.
+        let a = CachedPeerTable::new(db.clone());
+        let b = CachedPeerTable::new(db.clone());
+        a.load_routes().await.expect("a");
+        b.load_routes().await.expect("b");
+        a.load_routes().await.expect("a again");
+        assert_eq!(b.current_generation(), highest + 2);
+        assert_eq!(a.current_generation(), highest + 3);
+        assert_eq!(persisted(&db).await, Some(highest as i64 + 3));
+    }
+
+    /// Wait until the retry task publishes `expected`.
+    async fn wait_for_generation(table: &CachedPeerTable, expected: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while table.current_generation() != expected {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "generation stayed at {} instead of reaching {expected}",
+                table.current_generation()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// A reload whose claim fails publishes no generation, so no number a
+    /// worker sees can be missing from the row; its routes are live in the
+    /// process, and a background retry publishes them once a claim commits.
+    #[tokio::test]
+    async fn a_failed_claim_publishes_nothing_until_a_retried_claim_commits() {
+        let Some(database) = database_or_skip().await else {
+            return;
+        };
+        let db = database.db.clone();
+
+        let table = CachedPeerTable::new(db.clone());
+        table.load_routes().await.expect("load");
+        assert_eq!(table.current_generation(), 1);
+
+        execute(&db, "DELETE FROM route_generation WHERE id = 1").await;
+        let missing = claim_route_generation(db.as_ref(), 1)
+            .await
+            .expect_err("no row to claim from");
+        assert!(
+            missing
+                .to_string()
+                .contains("route_generation singleton row (id = 1)"),
+            "{missing}"
+        );
+        for _ in 0..2 {
+            let unpublished = table
+                .load_routes()
+                .await
+                .expect_err("a reload without a claimed generation is not complete");
+            assert!(
+                matches!(
+                    unpublished,
+                    super::RouteLoadError::GenerationUnpublished {
+                        source: RouteGenerationError::MissingRow { previous: 1 },
+                        ..
+                    }
+                ),
+                "{unpublished:?}"
+            );
+            assert!(
+                unpublished
+                    .to_string()
+                    .contains("not yet published to worker nodes"),
+                "{unpublished}"
+            );
+        }
+        assert!(table.has_loaded());
+        assert_eq!(table.current_generation(), 1, "nothing published");
+        assert_eq!(persisted(&db).await, None, "nothing re-creates the row");
+
+        execute(
+            &db,
+            "INSERT INTO route_generation (id, current) VALUES (1, 0)",
+        )
+        .await;
+        wait_for_generation(&table, 2).await;
+        assert_eq!(persisted(&db).await, Some(2));
+
+        table.load_routes().await.expect("load with the row back");
+        assert_eq!(table.current_generation(), 3);
+        assert_eq!(persisted(&db).await, Some(3));
+    }
+
+    /// A stalled database cannot hold a reload's waiters asleep: the claim
+    /// gives up within its bound, Postgres cancels it so it never commits,
+    /// and the generation is published by the retry once the stall ends.
+    #[tokio::test]
+    async fn a_stalled_claim_gives_up_without_committing_and_is_retried() {
+        use sea_orm::TransactionTrait;
+        let Some(database) = database_or_skip().await else {
+            return;
+        };
+        let db = database.db.clone();
+
+        let table = CachedPeerTable::new(db.clone());
+        table.load_routes().await.expect("load");
+        assert_eq!(table.current_generation(), 1);
+
+        // Another session holds the row, so every claim waits on its lock.
+        let blocker = db.begin().await.expect("blocking transaction");
+        blocker
+            .execute(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT current FROM route_generation WHERE id = 1 FOR UPDATE".to_string(),
+            ))
+            .await
+            .expect("lock the row");
+
+        let started = std::time::Instant::now();
+        let error =
+            claim_route_generation_within(db.as_ref(), 1, std::time::Duration::from_millis(200))
+                .await
+                .expect_err("a claim behind a held lock gives up");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the claim must give up near its bound, took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(
+                error,
+                RouteGenerationError::Claim { previous: 1, .. }
+                    | RouteGenerationError::Timeout { previous: 1, .. }
+            ),
+            "{error:?}"
+        );
+
+        let started = std::time::Instant::now();
+        table
+            .load_routes()
+            .await
+            .expect_err("a reload whose claim stalled is not complete");
+        assert!(
+            started.elapsed() < ROUTE_GENERATION_CLAIM_TIMEOUT + std::time::Duration::from_secs(3),
+            "the reload must not wait on the database beyond the claim bound, took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(table.current_generation(), 1, "nothing published yet");
+
+        blocker.rollback().await.expect("release the row");
+        // Had any cancelled claim committed, the retry would land above 2.
+        wait_for_generation(&table, 2).await;
+        assert_eq!(persisted(&db).await, Some(2));
+    }
+
+    /// A claim whose commit fails is not published, and the row is
+    /// unchanged; once commits succeed the retry publishes the next value.
+    #[tokio::test]
+    async fn a_claim_whose_commit_fails_is_never_published() {
+        let Some(database) = database_or_skip().await else {
+            return;
+        };
+        let db = database.db.clone();
+        execute(
+            &db,
+            "UPDATE route_generation SET current = 100 WHERE id = 1",
+        )
+        .await;
+        // Fails every transaction that changed the row, at COMMIT time.
+        execute(
+            &db,
+            "CREATE FUNCTION fail_route_generation_commit() RETURNS trigger \
+             LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic commit failure'; END $$",
+        )
+        .await;
+        execute(
+            &db,
+            "CREATE CONSTRAINT TRIGGER fail_route_generation_commit AFTER UPDATE ON \
+             route_generation DEFERRABLE INITIALLY DEFERRED FOR EACH ROW \
+             EXECUTE FUNCTION fail_route_generation_commit()",
+        )
+        .await;
+
+        let error = claim_route_generation(db.as_ref(), 0)
+            .await
+            .expect_err("an uncommitted claim is an error");
+        assert!(
+            error.to_string().contains("synthetic commit failure"),
+            "{error}"
+        );
+        assert_eq!(persisted(&db).await, Some(100), "the commit rolled back");
+
+        let table = CachedPeerTable::new(db.clone());
+        table
+            .load_routes()
+            .await
+            .expect_err("a reload whose claim did not commit is not complete");
+        assert!(table.has_loaded(), "routes are live in this process");
+        assert_eq!(table.current_generation(), 0, "nothing published");
+
+        execute(
+            &db,
+            "DROP TRIGGER fail_route_generation_commit ON route_generation",
+        )
+        .await;
+        wait_for_generation(&table, 101).await;
+        assert_eq!(persisted(&db).await, Some(101));
+    }
+
+    /// A generation a node has acknowledged is never issued again, even when
+    /// the row is below it (for example a database restored from an older
+    /// backup), so a worker holding it cannot mistake a new snapshot for one
+    /// it already has.
+    #[tokio::test]
+    async fn a_restarted_process_never_reissues_a_generation_a_node_acknowledged() {
+        let Some(database) = database_or_skip().await else {
+            return;
+        };
+        let db = database.db.clone();
+        execute(
+            &db,
+            "UPDATE route_generation SET current = 100 WHERE id = 1",
+        )
+        .await;
+        execute(
+            &db,
+            "INSERT INTO nodes (name, token_hash, address, private_address, role, status, \
+             labels, capacity) VALUES ('worker-1', 'synthetic-hash', '127.0.0.1', '10.0.0.2', \
+             'worker', 'active', '{}', '{}')",
+        )
+        .await;
+        // The worker acknowledged 101 before the row was set back to 100.
+        execute(
+            &db,
+            "INSERT INTO node_route_state (node_id, applied_generation, health) \
+             SELECT id, 101, 'healthy' FROM nodes WHERE name = 'worker-1'",
+        )
+        .await;
+
+        let restarted = CachedPeerTable::new(db.clone());
+        restarted
+            .load_routes()
+            .await
+            .expect("first load after restart");
+        assert_eq!(restarted.current_generation(), 102);
+        assert_eq!(persisted(&db).await, Some(102));
     }
 }

@@ -72,6 +72,7 @@ import {
   fmtDate,
   fmtDateTime,
   fmtRelativeTime,
+  useUrlBoundText,
   useUrlState,
   type DetailFact,
 } from '@temps-sdk/ds'
@@ -97,7 +98,7 @@ import {
   Search,
   XCircle,
 } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 
@@ -303,8 +304,17 @@ export function S3SourceDetail() {
   >()
   const backupSearch = getBackupsUrlState('q') ?? ''
   const backupPage = Number(getBackupsUrlState('page') ?? '1') || 1
-  const setBackupSearch = (value: string) =>
-    patchBackupsUrlState({ q: value || undefined })
+  // Search text and the page reset it implies are one URL update; the box
+  // keeps what was typed locally so a router transition can't drop keystrokes.
+  const commitBackupSearch = useCallback(
+    (value: string) =>
+      patchBackupsUrlState({ q: value || undefined, page: undefined }),
+    [patchBackupsUrlState]
+  )
+  const [backupSearchText, setBackupSearchText] = useUrlBoundText(
+    backupSearch,
+    commitBackupSearch
+  )
   const setBackupPage = (value: number | ((current: number) => number)) => {
     const next = typeof value === 'function' ? value(backupPage) : value
     patchBackupsUrlState({ page: next > 1 ? next : undefined })
@@ -445,7 +455,7 @@ export function S3SourceDetail() {
               >
                 <Link to={`/backups/s3-sources/${sourceId}/schedules/new`}>
                   <Plus className="h-4 w-4 sm:mr-2" />
-                  <span className="hidden sm:inline">New Schedule</span>
+                  <span className="max-sm:sr-only">New Schedule</span>
                 </Link>
               </Button>
             </CardHeader>
@@ -533,7 +543,7 @@ export function S3SourceDetail() {
                                     className={cn(
                                       'truncate text-base sm:text-sm',
                                       !schedule.enabled
-                                        ? 'text-muted-foreground/60'
+                                        ? 'text-muted-foreground'
                                         : 'text-muted-foreground'
                                     )}
                                     title={schedule.description}
@@ -693,11 +703,8 @@ export function S3SourceDetail() {
                   <Input
                     type="search"
                     placeholder="Search by service, engine, state, or UUID…"
-                    value={backupSearch}
-                    onChange={(e) => {
-                      setBackupSearch(e.target.value)
-                      setBackupPage(1)
-                    }}
+                    value={backupSearchText}
+                    onChange={(e) => setBackupSearchText(e.target.value)}
                     className="pl-9"
                   />
                 </div>
@@ -885,7 +892,7 @@ export function S3SourceDetail() {
                       disabled={backupPage === 1}
                     >
                       <ChevronLeft className="h-4 w-4" />
-                      <span className="hidden sm:inline">Previous</span>
+                      <span className="max-sm:sr-only">Previous</span>
                     </Button>
                     <span className="hidden text-xs text-muted-foreground sm:inline">
                       Page {backupPage} of {backupTotalPages}
@@ -898,7 +905,7 @@ export function S3SourceDetail() {
                       }
                       disabled={backupPage === backupTotalPages}
                     >
-                      <span className="hidden sm:inline">Next</span>
+                      <span className="max-sm:sr-only">Next</span>
                       <ChevronRight className="h-4 w-4" />
                     </Button>
                   </div>

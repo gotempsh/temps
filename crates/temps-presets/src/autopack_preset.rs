@@ -13,11 +13,11 @@
 use std::path::Path;
 
 use async_trait::async_trait;
-use autopack_core::{analyze, App, Environment};
+use autopack_core::{analyze, App, Config, Environment, Procfile};
 use autopack_dockerfile::to_dockerfile;
 use tracing::{debug, info, warn};
 
-use crate::{DockerfileConfig, DockerfileWithArgs, Preset, ProjectType};
+use crate::{BuildPlanFailure, DockerfileConfig, DockerfileWithArgs, Preset, ProjectType};
 
 /// Builds any application autopack recognises.
 #[derive(Debug, Clone, Copy, Default)]
@@ -55,7 +55,7 @@ pub(crate) fn render(
     }
 
     let workspace_app = if provider.is_none() || provider == Some("node") {
-        pnpm_app_directory(config)?
+        node_app_directory(config)?
     } else {
         None
     };
@@ -118,7 +118,15 @@ pub(crate) fn render(
         selected_env.set("AUTOPACK_PROVIDER", "node");
         let selected_analysis = analyze(&selected, &selected_env, &autopack_providers::registry())
             .map_err(|e| e.to_string())?;
-        let start = selected_analysis
+        let root_package: autopack_providers::node::PackageJson = app
+            .read_json_opt("package.json")
+            .map_err(|e| e.to_string())?
+            .unwrap_or_default();
+        let manager = autopack_providers::node::PackageManager::detect(&app, &root_package);
+        let selected_package: autopack_providers::node::PackageJson = selected
+            .read_json("package.json")
+            .map_err(|e| e.to_string())?;
+        let inferred_start = selected_analysis
             .plan
             .deploy
             .start_command
@@ -126,6 +134,33 @@ pub(crate) fn render(
             .ok_or_else(|| {
                 format!("No start command found for workspace application {relative}")
             })?;
+        let selected_manager =
+            autopack_providers::node::PackageManager::detect(&selected, &selected_package);
+        let explicit_start = Config::load(&selected, &selected_env)
+            .map_err(|e| e.to_string())?
+            .deploy
+            .is_some_and(|deploy| deploy.start_command.is_some())
+            || Procfile::load(&selected)
+                .map_err(|e| e.to_string())?
+                .is_some_and(|procfile| procfile.web().is_some());
+        // Keep direct starts so the application receives SIGTERM. Yarn Berry
+        // needs its launcher to activate the package loader, while compound
+        // start scripts need the root manager rather than the app's fallback.
+        let start = if explicit_start {
+            inferred_start.to_string()
+        } else if manager != autopack_providers::node::PackageManager::Pnpm
+            && (inferred_start == selected_manager.run_command("start")
+                || (manager == autopack_providers::node::PackageManager::YarnBerry
+                    && selected_package.script("start") == Some(inferred_start)))
+        {
+            manager.run_command("start")
+        } else if matches!(manager, autopack_providers::node::PackageManager::YarnBerry)
+            && inferred_start.starts_with("node ")
+        {
+            format!("yarn {inferred_start}")
+        } else {
+            inferred_start.to_string()
+        };
         env.set("AUTOPACK_PROVIDER", "node");
         env.set(
             "AUTOPACK_START_CMD",
@@ -134,7 +169,13 @@ pub(crate) fn render(
         if config.build_command.is_none() {
             env.set(
                 "AUTOPACK_BUILD_CMD",
-                format!("pnpm --filter './{relative}...' --if-present run build"),
+                if manager == autopack_providers::node::PackageManager::Pnpm {
+                    format!("pnpm --filter './{relative}...' --if-present run build")
+                } else if selected_package.script("build").is_some() {
+                    format!("cd /app/{relative} && {}", manager.run_command("build"))
+                } else {
+                    ":".to_string()
+                },
             );
         } else if let Some(command) = config.build_command {
             env.set(
@@ -173,7 +214,72 @@ pub(crate) fn render(
             }
         }
     }
-    let analysis = analyze(&app, &env, &registry).map_err(|e| e.to_string())?;
+    let mut analysis = analyze(&app, &env, &registry).map_err(|e| e.to_string())?;
+    // A nested application whose build needs the repository root as context
+    // (#1342: Python with a root requirements file; Go modules, Cargo
+    // crates and Elixir umbrella apps with sibling dependencies, see
+    // `compiled_workspace_app`).
+    // Analysis stays on the selected application; install and build copy the
+    // repository and run in the application's directory, so relative pip,
+    // `replace` and `path` dependencies resolve.
+    let nested_prefix = if analysis.provider == "python" {
+        python_app_directory(config.root_local_path, config.local_path)?
+            .map(|relative| (format!("cd /app/{relative} && "), relative, false))
+    } else if let Some(language) =
+        crate::CompiledLanguage::from_autopack_provider(&analysis.provider)
+    {
+        // Rendered into the failing Dockerfile and the build log.
+        crate::compiled_workspace_app(config.root_local_path, config.local_path, language)
+            .map_err(|error| error.to_string())?
+            .map(|compiled| {
+                let mut prefix = format!("cd /app/{} && ", compiled.relative);
+                match compiled.language {
+                    crate::CompiledLanguage::Go if compiled.ignore_go_work => {
+                        prefix.push_str("export GOWORK=off && ");
+                    }
+                    crate::CompiledLanguage::Go => {}
+                    // Mix reads the umbrella's lockfile, configuration and
+                    // sibling apps through the child's own relative paths.
+                    crate::CompiledLanguage::Elixir => {}
+                    // A workspace member's output lands in the workspace's
+                    // target directory. Use the cached /app/target either
+                    // way, and keep the crate-relative `target/` path the
+                    // plan copies the binary from.
+                    crate::CompiledLanguage::Cargo => prefix.push_str(
+                        "export CARGO_TARGET_DIR=/app/target && if [ ! -L target ]; then rm -rf target \
+                         && ln -s /app/target target; fi && ",
+                    ),
+                }
+                (prefix, compiled.relative, true)
+            })
+    } else {
+        None
+    };
+    if let Some((prefix, relative, compiled_binary)) = nested_prefix {
+        for step in &mut analysis.plan.steps {
+            if matches!(step.name.as_str(), "install" | "build") {
+                for input in &mut step.inputs {
+                    if input.local {
+                        *input = autopack_core::plan::Layer::local();
+                    }
+                }
+                for command in &mut step.commands {
+                    if let autopack_core::plan::Command::Exec(exec) = command {
+                        exec.cmd = format!("{prefix}{}", exec.cmd);
+                    }
+                }
+            }
+        }
+        // A Go, Cargo or Elixir release build's absolute start command is
+        // the built binary and runs as planned. Anything else, including an absolute Python
+        // launcher such as `/usr/bin/env gunicorn app:app`, names modules and
+        // files relative to the application, so it starts in that directory.
+        if let Some(start) = &mut analysis.plan.deploy.start_command {
+            if !(compiled_binary && start.starts_with('/')) {
+                *start = format!("cd /app/{relative} && {start}");
+            }
+        }
+    }
 
     info!(
         provider = %analysis.provider,
@@ -193,38 +299,160 @@ pub(crate) fn render(
     }
 
     let dockerfile = to_dockerfile(&analysis.plan).map_err(|e| e.to_string())?;
-    Ok(DockerfileWithArgs::new(dockerfile))
+    let mut rendered = DockerfileWithArgs::new(dockerfile);
+    // The tracing line above only reaches the server log. Carry the same notes
+    // back to the build job so the user sees which settings were ignored in the
+    // deployment log, next to the build they affect.
+    rendered.warnings = untranslated_config_notes(
+        analysis
+            .metadata
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+    );
+    Ok(rendered)
 }
 
-/// A pnpm workspace app directory safe to use in Dockerfile paths and shell filters.
-/// Check membership here too: presets may also be invoked outside the build job.
+/// Settings from a compatibility config (`nixpacks.toml`, `railpack.json`)
+/// that autopack could not carry over, in the order autopack reported them.
+///
+/// Autopack records each as a `configNote<N>` metadata entry whose text names
+/// the skipped keys (e.g. "nixPkgs with no mise equivalent were skipped: ...").
+/// Ordering is by `N`, not by map order, so the log reads the same way as
+/// autopack's own output.
+pub(crate) fn untranslated_config_notes<'a>(
+    metadata: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Vec<String> {
+    let mut notes: Vec<(u32, String)> = metadata
+        .into_iter()
+        .filter_map(|(key, value)| {
+            let index = key.strip_prefix("configNote")?.parse::<u32>().ok()?;
+            let value = value.trim();
+            (!value.is_empty()).then(|| (index, value.to_string()))
+        })
+        .collect();
+    notes.sort_by_key(|(index, _)| *index);
+    notes
+        .into_iter()
+        .map(|(_, note)| format!("Build config setting not applied: {note}"))
+        .collect()
+}
+
+/// Retain the pnpm-only helper for templates that use pnpm filters.
 pub(crate) fn pnpm_app_directory(config: &DockerfileConfig<'_>) -> Result<Option<String>, String> {
-    if config.root_local_path == config.local_path
-        || !config.root_local_path.join("pnpm-workspace.yaml").is_file()
-    {
+    if !config.root_local_path.join("pnpm-workspace.yaml").is_file() {
+        return Ok(None);
+    }
+    node_app_directory(config)
+}
+
+/// A selected workspace package confined to the explicit repository root.
+pub(crate) fn node_app_directory(config: &DockerfileConfig<'_>) -> Result<Option<String>, String> {
+    if config.root_local_path == config.local_path {
         return Ok(None);
     }
     let relative = config
         .local_path
         .strip_prefix(config.root_local_path)
-        .map_err(|_| "Application directory escapes the pnpm workspace root".to_string())?;
+        .map_err(|_| "Application directory escapes the workspace root".to_string())?;
+    if relative
+        .components()
+        .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return Err("Application directory escapes the workspace root".to_string());
+    }
+    if !super::pnpm_workspace::app_is_member(config.root_local_path, config.local_path)? {
+        return Ok(None);
+    }
     let text = relative
         .to_str()
-        .ok_or_else(|| "pnpm workspace application directory must be UTF-8".to_string())?;
+        .ok_or_else(|| "Workspace application directory must be UTF-8".to_string())?;
     if text.is_empty()
         || !text
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "/_.-".contains(c))
+    {
+        return Err(format!(
+            "Unsupported workspace application directory: {text}"
+        ));
+    }
+    Ok(Some(text.to_string()))
+}
+
+/// The selected pip application when it needs a sibling package in the source
+/// repository. Dependency paths may leave the app, never the repository.
+pub fn python_app_directory(root: &Path, selected: &Path) -> Result<Option<String>, String> {
+    if root == selected {
+        return Ok(None);
+    }
+    let relative = selected
+        .strip_prefix(root)
+        .map_err(|_| "Python application directory escapes the source repository".to_string())?;
+    if relative.as_os_str().is_empty()
         || relative
             .components()
             .any(|c| !matches!(c, std::path::Component::Normal(_)))
     {
-        return Err(format!(
-            "Unsupported pnpm workspace application directory: {text}"
-        ));
+        return Err("Python application directory escapes the source repository".to_string());
     }
-    if !super::pnpm_workspace::app_is_member(config.root_local_path, config.local_path)? {
+    let repository = App::new(root).map_err(|e| e.to_string())?;
+    let requirements = relative.join("requirements.txt");
+    if !repository.has_file(&requirements) {
         return Ok(None);
+    }
+    let metadata =
+        std::fs::symlink_metadata(root.join(&requirements)).map_err(|e| e.to_string())?;
+    if !metadata.is_file() {
+        return Err("Python requirements.txt must be a regular non-symlink file".to_string());
+    }
+    if metadata.len() > 1024 * 1024 {
+        return Err("Python requirements.txt exceeds the 1 MiB planning limit".to_string());
+    }
+    let contents = repository
+        .read_file(&requirements)
+        .map_err(|e| e.to_string())?;
+    let mut needs_repository = false;
+    for line in contents.lines() {
+        let requirement = line
+            .trim()
+            .strip_prefix("-e ")
+            .or_else(|| line.trim().strip_prefix("--editable "))
+            .unwrap_or(line.trim());
+        let requirement = requirement.split(" #").next().unwrap_or(requirement).trim();
+        if !requirement.starts_with("../") && !requirement.starts_with("./") {
+            continue;
+        }
+        // Extras select optional dependencies; they are not part of the
+        // local filesystem path. pip still receives the untouched requirement.
+        let dependency_path = requirement
+            .strip_suffix(']')
+            .and_then(|with_extras| with_extras.rsplit_once('['))
+            .map_or(requirement, |(path, _)| path);
+        let mut resolved = std::path::PathBuf::new();
+        for component in relative.join(dependency_path).components() {
+            match component {
+                std::path::Component::Normal(part) => resolved.push(part),
+                std::path::Component::CurDir => {},
+                std::path::Component::ParentDir if resolved.pop() => {},
+                _ => return Err(format!("Local Python dependency '{requirement}' escapes the source repository. Include the package inside the uploaded repository, or use a Dockerfile with an explicit build context.")),
+            }
+        }
+        if !repository.has_dir(&resolved) && !repository.has_file(&resolved) {
+            return Err(format!("Local Python dependency '{requirement}' is missing or leaves the source repository through a symlink. Upload the complete repository or use a Dockerfile with an explicit repository build context."));
+        }
+        needs_repository |= !resolved.starts_with(relative);
+    }
+    if !needs_repository {
+        return Ok(None);
+    }
+    let text = relative
+        .to_str()
+        .ok_or_else(|| "Python application directory must be UTF-8".to_string())?;
+    if text.is_empty()
+        || !text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/_.-".contains(c))
+    {
+        return Err("Unsupported Python application directory: use a Dockerfile with an explicit repository build context".to_string());
     }
     Ok(Some(text.to_string()))
 }
@@ -243,6 +471,8 @@ fn is_build_arg_name(name: &str) -> bool {
 /// The trait cannot return an error, and returning an empty or plausible
 /// Dockerfile would turn a detection failure into a confusing runtime failure
 /// several minutes later — or, worse, an image that builds and then exits.
+/// The failure is also recorded as [`BuildPlanFailure::Unplannable`] so the
+/// deployment pipeline can refuse to build at all.
 pub(crate) fn render_or_explain(
     config: &DockerfileConfig<'_>,
     provider: Option<&str>,
@@ -251,37 +481,22 @@ pub(crate) fn render_or_explain(
         Ok(dockerfile) => dockerfile,
         Err(message) => {
             warn!("autopack could not plan this application: {message}");
-            // `message` can itself contain newlines (e.g. a multi-line "how to
-            // fix this" hint). A raw newline inside the `RUN echo '...'`
-            // argument would split it into a second physical Dockerfile line
-            // that Docker parses as its own instruction — collapse to spaces
-            // so the RUN instruction stays on one line; the comment block
-            // above still renders the message with its original line breaks.
-            let single_line_message = message.split_whitespace().collect::<Vec<_>>().join(" ");
-            DockerfileWithArgs::new(format!(
-                "# autopack could not plan this application.\n\
-                 #\n\
-                 # {}\n\
-                 FROM debian:bookworm-slim\n\
-                 RUN echo {} >&2 && exit 1\n",
-                message.replace('\n', "\n# "),
-                shell_quote(&single_line_message)
-            ))
+            // `failing` keeps the RUN instruction on one physical line even
+            // when `message` spans several (e.g. a multi-line "how to fix
+            // this" hint); the comment block keeps the original line breaks.
+            DockerfileWithArgs::failing(BuildPlanFailure::Unplannable {
+                preset: match provider {
+                    Some(provider) => format!("autopack ({provider})"),
+                    None => "autopack".to_string(),
+                },
+                reason: message.trim().to_string(),
+            })
         }
     }
 }
 
-/// Quote a message for safe interpolation into a shell command.
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', r"'\''"))
-}
-
 #[async_trait]
 impl Preset for AutopackPreset {
-    fn uses_autopack(&self) -> bool {
-        true
-    }
-
     fn project_type(&self) -> ProjectType {
         ProjectType::Server
     }
@@ -581,9 +796,9 @@ mod tests {
 
     #[test]
     fn without_build_vars_the_dockerfile_still_builds_on_a_worker() {
-        // Worker builds render without build variables, because a worker
-        // never receives their values. That must leave no `ARG` behind, or
-        // every Autopack build on a worker is refused.
+        // A build with no variable to pass declares no `ARG`; one with
+        // variables declares each, wherever it builds, so the values reach
+        // the build step that inlines them.
         let dir = fixture(&[
             (
                 "package.json",
@@ -606,41 +821,6 @@ mod tests {
             "{}",
             result.content
         );
-    }
-
-    #[tokio::test]
-    async fn presets_that_report_autopack_render_with_it() {
-        // `uses_autopack` decides whether a worker build omits build
-        // variables, so it has to match what the preset actually renders.
-        let dir = fixture(&[
-            (
-                "package.json",
-                r#"{"scripts":{"build":"node build.js","start":"node server.js"}}"#,
-            ),
-            ("package-lock.json", "{}"),
-        ]);
-        let mut reported = Vec::new();
-        for preset in crate::all_presets() {
-            if !preset.uses_autopack() {
-                continue;
-            }
-            reported.push(preset.slug());
-            let result = preset.dockerfile(buildkit_config(dir.path())).await;
-            // Either a generated plan or the fallback explaining why there is none.
-            assert!(
-                result.content.contains("Generated by autopack")
-                    || result.content.contains("autopack could not plan"),
-                "{} does not render with Autopack:\n{}",
-                preset.slug(),
-                result.content
-            );
-        }
-        for slug in ["autopack", "nixpacks", "python", "go", "rust", "java"] {
-            assert!(
-                reported.iter().any(|s| s == slug),
-                "{slug} must report Autopack"
-            );
-        }
     }
 
     #[tokio::test]
@@ -716,6 +896,149 @@ mod tests {
         );
     }
     #[test]
+    fn nested_go_module_with_a_sibling_replace_builds_in_its_directory() {
+        let repo = fixture(&[
+            ("go.work", "go 1.22\n\nuse (\n\t./apps/api\n\t./packages/shared\n)\n"),
+            (
+                "apps/api/go.mod",
+                "module example.test/qa/api\n\ngo 1.22\n\nrequire example.test/qa/shared v0.0.0\n\nreplace example.test/qa/shared => ../../packages/shared\n",
+            ),
+            (
+                "apps/api/main.go",
+                "package main\n\nimport \"net/http\"\n\nfunc main() { http.ListenAndServe(\":8080\", nil) }\n",
+            ),
+            ("packages/shared/go.mod", "module example.test/qa/shared\n\ngo 1.22\n"),
+            ("packages/shared/shared.go", "package shared\n"),
+        ]);
+        let app = repo.path().join("apps/api");
+        let mut config = DockerfileConfig::new(repo.path(), &app, "fixture");
+        config.use_buildkit = true;
+        let nested = render(&config, Some("go")).unwrap().content;
+        assert!(nested.contains("cd /app/apps/api && "), "{nested}");
+        assert!(!nested.contains("GOWORK=off"), "{nested}");
+
+        // Built alone (the default), nothing changes.
+        let alone = render(&buildkit_config(&app), Some("go")).unwrap().content;
+        assert!(!alone.contains("cd /app/apps/api"), "{alone}");
+    }
+
+    #[test]
+    fn nested_cargo_crate_with_a_sibling_path_dependency_builds_in_its_directory() {
+        let repo = fixture(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"apps/api\", \"packages/shared\"]\nresolver = \"2\"\n",
+            ),
+            (
+                "apps/api/Cargo.toml",
+                "[package]\nname = \"qa-api\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"qa-api\"\npath = \"src/main.rs\"\n\n[dependencies]\nqa-shared = { path = \"../../packages/shared\" }\n",
+            ),
+            ("apps/api/src/main.rs", "fn main() {}\n"),
+            (
+                "packages/shared/Cargo.toml",
+                "[package]\nname = \"qa-shared\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("packages/shared/src/lib.rs", ""),
+        ]);
+        let app = repo.path().join("apps/api");
+        let mut config = DockerfileConfig::new(repo.path(), &app, "fixture");
+        config.use_buildkit = true;
+        let nested = render(&config, Some("rust")).unwrap().content;
+        assert!(nested.contains("cd /app/apps/api && "), "{nested}");
+        assert!(nested.contains("CARGO_TARGET_DIR=/app/target"), "{nested}");
+    }
+
+    /// A minimal Elixir umbrella: the root `mix.exs`, an `apps/api` child
+    /// depending on its sibling with `{:shared, in_umbrella: true}`, and
+    /// `apps/shared`.
+    const ELIXIR_UMBRELLA: &[(&str, &str)] = &[
+        (
+            "mix.exs",
+            "defmodule Umbrella.MixProject do\n  use Mix.Project\n\n  def project do\n    [apps_path: \"apps\", version: \"0.1.0\", start_permanent: Mix.env() == :prod, deps: []]\n  end\nend\n",
+        ),
+        (
+            "apps/api/mix.exs",
+            "defmodule Api.MixProject do\n  use Mix.Project\n\n  def project do\n    [\n      app: :api,\n      version: \"0.1.0\",\n      build_path: \"../../_build\",\n      config_path: \"../../config/config.exs\",\n      deps_path: \"../../deps\",\n      lockfile: \"../../mix.lock\",\n      elixir: \"~> 1.17\",\n      deps: deps()\n    ]\n  end\n\n  def application do\n    [extra_applications: [:logger], mod: {Api.Application, []}]\n  end\n\n  defp deps do\n    [{:shared, in_umbrella: true}]\n  end\nend\n",
+        ),
+        (
+            "apps/api/lib/api/application.ex",
+            "defmodule Api.Application do\n  use Application\n\n  def start(_type, _args) do\n    Supervisor.start_link([], strategy: :one_for_one, name: Api.Supervisor)\n  end\nend\n",
+        ),
+        (
+            "apps/shared/mix.exs",
+            "defmodule Shared.MixProject do\n  use Mix.Project\n\n  def project do\n    [\n      app: :shared,\n      version: \"0.1.0\",\n      build_path: \"../../_build\",\n      config_path: \"../../config/config.exs\",\n      deps_path: \"../../deps\",\n      lockfile: \"../../mix.lock\",\n      elixir: \"~> 1.17\",\n      deps: []\n    ]\n  end\nend\n",
+        ),
+        (
+            "apps/shared/lib/shared.ex",
+            "defmodule Shared do\n  def hello, do: :world\nend\n",
+        ),
+    ];
+
+    /// #1386: an umbrella child keeps the umbrella in its build, so the
+    /// `in_umbrella` sibling and the root `mix.lock`/`config` resolve. Mix
+    /// runs in the child's directory; the release path stays absolute.
+    #[test]
+    fn nested_elixir_umbrella_app_builds_in_its_directory_with_its_siblings() {
+        let repo = fixture(ELIXIR_UMBRELLA);
+        let app = repo.path().join("apps/api");
+        let mut config = DockerfileConfig::new(repo.path(), &app, "fixture");
+        config.use_buildkit = true;
+        for provider in [Some("elixir"), None] {
+            let nested = render(&config, provider).unwrap().content;
+            assert!(
+                nested.contains("cd /app/apps/api && sh -c 'mix deps.get --only prod'"),
+                "{nested}"
+            );
+            assert!(
+                nested.contains("cd /app/apps/api && sh -c 'mix deps.compile'"),
+                "{nested}"
+            );
+            assert!(
+                nested.contains("cd /app/apps/api && sh -c 'mix release --overwrite --path /app/release'"),
+                "{nested}"
+            );
+            // The install step no longer copies the child's manifest alone.
+            assert!(!nested.contains("COPY mix.exs /app/mix.exs"), "{nested}");
+            assert!(nested.contains("/app/release/bin/api start"), "{nested}");
+            assert!(!nested.contains("cd /app/apps/api && /app/release"), "{nested}");
+        }
+
+        // The umbrella root itself, and the child built as its own
+        // repository, plan exactly as before. (Autopack's Elixir provider
+        // needs an `app:` name, which an umbrella root does not have; that
+        // refusal is unchanged.)
+        match render(&buildkit_config(repo.path()), Some("elixir")) {
+            Ok(root) => assert!(!root.content.contains("cd /app/apps"), "{}", root.content),
+            Err(error) => assert!(error.contains("app: :name"), "{error}"),
+        }
+        let alone = render(&buildkit_config(&app), Some("elixir"))
+            .unwrap()
+            .content;
+        assert!(!alone.contains("cd /app/apps/api"), "{alone}");
+    }
+
+    /// A standalone Phoenix application inside a larger repository has
+    /// nothing outside its directory to resolve, so it still builds alone.
+    #[test]
+    fn nested_standalone_phoenix_app_still_builds_alone() {
+        let repo = fixture(&[
+            ("README.md", "# docs"),
+            (
+                "services/web/mix.exs",
+                "defmodule Web.MixProject do\n  use Mix.Project\n\n  def project do\n    [app: :web, version: \"0.1.0\", elixir: \"~> 1.17\", deps: [{:phoenix, \"~> 1.7\"}, {:jason, \"~> 1.4\", only: [:prod]}]]\n  end\nend\n",
+            ),
+            ("services/web/mix.lock", "%{}"),
+            ("services/web/config/config.exs", "import Config\n"),
+        ]);
+        let app = repo.path().join("services/web");
+        let mut config = DockerfileConfig::new(repo.path(), &app, "fixture");
+        config.use_buildkit = true;
+        let content = render(&config, Some("elixir")).unwrap().content;
+        assert!(!content.contains("cd /app/services/web"), "{content}");
+        assert!(content.contains("/app/release/bin/web start"), "{content}");
+    }
+
+    #[test]
     fn nested_pnpm_server_uses_root_version_lock_and_selected_entrypoint() {
         let repo = fixture(&[
             (
@@ -751,6 +1074,336 @@ mod tests {
             "{result}"
         );
         assert!(!result.contains("node wrong.js"), "{result}");
+    }
+
+    #[test]
+    fn python_sibling_packages_keep_install_build_and_start_cwd() {
+        let repo = fixture(&[
+            (
+                "apps/api/requirements.txt",
+                "../../packages/shared\nflask==3.1.2",
+            ),
+            (
+                "apps/api/app.py",
+                "from flask import Flask\napp = Flask(__name__)",
+            ),
+            (
+                "packages/shared/pyproject.toml",
+                "[project]\nname='fixture-shared'\nversion='1.0.0'",
+            ),
+        ]);
+        let app = repo.path().join("apps/api");
+        let config = DockerfileConfig::new(repo.path(), &app, "fixture").with_buildkit(true);
+        assert_eq!(
+            python_app_directory(repo.path(), &app).unwrap(),
+            Some("apps/api".to_string())
+        );
+        let rendered = render(&config, Some("python")).unwrap().content;
+        assert!(rendered.contains("COPY . /app"), "{rendered}");
+        assert!(
+            rendered.contains("cd /app/apps/api && sh -c 'pip install -r requirements.txt'"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("cd /app/apps/api && gunicorn app:app"),
+            "{rendered}"
+        );
+    }
+
+    /// An absolute launcher does not make the module it serves absolute: a
+    /// nested Python app's `Procfile` start still runs in the app directory.
+    #[test]
+    fn nested_python_absolute_start_command_keeps_the_app_directory() {
+        let repo = fixture(&[
+            (
+                "apps/api/requirements.txt",
+                "../../packages/shared\nflask==3.1.2\ngunicorn==23.0.0",
+            ),
+            (
+                "apps/api/app.py",
+                "from flask import Flask\napp = Flask(__name__)",
+            ),
+            ("apps/api/Procfile", "web: /usr/bin/env gunicorn app:app"),
+            (
+                "packages/shared/pyproject.toml",
+                "[project]\nname='fixture-shared'\nversion='1.0.0'",
+            ),
+        ]);
+        let app = repo.path().join("apps/api");
+        let config = DockerfileConfig::new(repo.path(), &app, "fixture").with_buildkit(true);
+        let rendered = render(&config, Some("python")).unwrap().content;
+        assert!(
+            rendered.contains("cd /app/apps/api && /usr/bin/env gunicorn app:app"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn python_dependency_paths_cannot_escape_the_supplied_repository() {
+        let repo = fixture(&[
+            ("apps/api/requirements.txt", "../../../outside"),
+            ("apps/api/app.py", ""),
+        ]);
+        let app = repo.path().join("apps/api");
+        let error = python_app_directory(repo.path(), &app).unwrap_err();
+        assert!(error.contains("escapes the source repository"), "{error}");
+        assert!(error.contains("Dockerfile"), "{error}");
+        std::fs::write(app.join("requirements.txt"), "../../packages/missing").unwrap();
+        assert!(python_app_directory(repo.path(), &app)
+            .unwrap_err()
+            .contains("missing"));
+        std::fs::write(app.join("requirements.txt"), "flask==3.1.2").unwrap();
+        assert_eq!(python_app_directory(repo.path(), &app).unwrap(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn python_local_dependency_symlinks_never_import_host_files() {
+        let outside = tempfile::tempdir().unwrap();
+        let repo = fixture(&[("apps/api/requirements.txt", "../../packages/shared")]);
+        std::fs::create_dir_all(repo.path().join("packages")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), repo.path().join("packages/shared")).unwrap();
+        assert!(
+            python_app_directory(repo.path(), &repo.path().join("apps/api"))
+                .unwrap_err()
+                .contains("symlink")
+        );
+    }
+
+    #[test]
+    fn standalone_app_paths_do_not_receive_python_shell_restrictions() {
+        for directory in ["apps/my api", "apps/café"] {
+            let requirement = format!("{directory}/requirements.txt");
+            let local = format!("{directory}/vendor/shared/pyproject.toml");
+            let repo = fixture(&[
+                (&requirement, "flask==3.1.2"),
+                (&local, "[project]\nname='shared'\nversion='1.0.0'"),
+            ]);
+            let app = repo.path().join(directory);
+            assert_eq!(python_app_directory(repo.path(), &app).unwrap(), None);
+            std::fs::write(app.join("requirements.txt"), "./vendor/shared").unwrap();
+            assert_eq!(python_app_directory(repo.path(), &app).unwrap(), None);
+            std::fs::remove_file(app.join("requirements.txt")).unwrap();
+            assert_eq!(python_app_directory(repo.path(), &app).unwrap(), None);
+            std::fs::write(
+                app.join("package.json"),
+                r#"{"scripts":{"start":"node server.js"}}"#,
+            )
+            .unwrap();
+            std::fs::write(app.join("server.js"), "").unwrap();
+            let config = DockerfileConfig::new(repo.path(), &app, "fixture").with_buildkit(true);
+            assert!(render(&config, Some("node")).is_ok());
+        }
+    }
+
+    #[test]
+    fn node_workspace_requirements_do_not_force_python_context_validation() {
+        let repo = fixture(&[
+            (
+                "package.json",
+                r#"{"private":true,"workspaces":["apps/*"]}"#,
+            ),
+            (
+                "apps/api/package.json",
+                r#"{"scripts":{"start":"node server.js"}}"#,
+            ),
+            ("apps/api/server.js", ""),
+            ("apps/api/requirements.txt", "../../../outside"),
+        ]);
+        let app = repo.path().join("apps/api");
+        let config = DockerfileConfig::new(repo.path(), &app, "fixture").with_buildkit(true);
+        assert!(render(&config, None).is_ok());
+    }
+
+    #[test]
+    fn python_local_package_extras_preserve_the_dependency_path_and_context() {
+        let repo = fixture(&[
+            ("apps/api/requirements.txt", "./vendor/shared[http]"),
+            (
+                "apps/api/vendor/shared/pyproject.toml",
+                "[project]\nname='local'\nversion='1.0.0'",
+            ),
+            (
+                "packages/shared/pyproject.toml",
+                "[project]\nname='sibling'\nversion='1.0.0'",
+            ),
+        ]);
+        let app = repo.path().join("apps/api");
+        assert_eq!(python_app_directory(repo.path(), &app).unwrap(), None);
+        for requirement in [
+            "../../packages/shared[http,cli]",
+            "-e ../../packages/shared[http]",
+        ] {
+            std::fs::write(app.join("requirements.txt"), requirement).unwrap();
+            assert_eq!(
+                python_app_directory(repo.path(), &app).unwrap(),
+                Some("apps/api".to_string())
+            );
+            assert_eq!(
+                std::fs::read_to_string(app.join("requirements.txt")).unwrap(),
+                requirement
+            );
+        }
+        std::fs::write(app.join("requirements.txt"), "../../../outside[http]").unwrap();
+        assert!(python_app_directory(repo.path(), &app)
+            .unwrap_err()
+            .contains("escapes"));
+    }
+
+    #[test]
+    fn npm_yarn_and_bun_use_root_manager_and_selected_app() {
+        for (pin, manager, install) in [
+            ("npm@10.9.0", "npm", "npm install"),
+            ("yarn@4.6.0", "yarn", "yarn install"),
+            ("bun@1.2.22", "bun", "bun install"),
+        ] {
+            let root = serde_json::json!({"private":true,"packageManager":pin,"workspaces":["apps/*","packages/*"],"scripts":{"start":"node wrong.js","build":"node wrong.js"}}).to_string();
+            let repo = fixture(&[
+                ("package.json", &root),
+                (
+                    "apps/api/package.json",
+                    r#"{"scripts":{"start":"node server.js","build":"node build.js"},"dependencies":{"@fixture/shared":"workspace:*"}}"#,
+                ),
+                ("apps/api/server.js", ""),
+                (
+                    "packages/shared/package.json",
+                    r#"{"name":"@fixture/shared","version":"1.0.0"}"#,
+                ),
+            ]);
+            let app = repo.path().join("apps/api");
+            let config = DockerfileConfig::new(repo.path(), &app, "fixture").with_buildkit(true);
+            let result = render(&config, Some("node")).unwrap().content;
+            assert!(result.contains(install), "{pin}: {result}");
+            assert!(
+                result.contains(&format!("cd /app/apps/api && {manager} run build")),
+                "{pin}: {result}"
+            );
+            let start = if manager == "yarn" {
+                "yarn run start"
+            } else {
+                "node server.js"
+            };
+            assert!(
+                result.contains(&format!(
+                    "PATH=/app/apps/api/node_modules/.bin:$PATH {start}"
+                )),
+                "{pin}: {result}"
+            );
+            assert!(!result.contains("node wrong.js"), "{pin}: {result}");
+            assert!(result.contains("COPY . /app"), "{pin}: {result}");
+        }
+    }
+
+    #[test]
+    fn workspace_manager_selection_preserves_explicit_app_start_commands() {
+        for pin in ["npm@10.9.0", "yarn@4.6.0", "bun@1.2.22"] {
+            let root =
+                serde_json::json!({"private":true,"packageManager":pin,"workspaces":["apps/*"]})
+                    .to_string();
+            for (file, contents) in [
+                ("Procfile", "web: node configured.js"),
+                (
+                    "autopack.json",
+                    r#"{"deploy":{"startCommand":"node configured.js"}}"#,
+                ),
+            ] {
+                let config_path = format!("apps/api/{file}");
+                let repo = fixture(&[
+                    ("package.json", &root),
+                    (
+                        "apps/api/package.json",
+                        r#"{"scripts":{"start":"node wrong.js"}}"#,
+                    ),
+                    (&config_path, contents),
+                    ("apps/api/configured.js", ""),
+                ]);
+                let app = repo.path().join("apps/api");
+                let config =
+                    DockerfileConfig::new(repo.path(), &app, "fixture").with_buildkit(true);
+                let result = render(&config, Some("node")).unwrap().content;
+                assert!(
+                    result
+                        .contains("PATH=/app/apps/api/node_modules/.bin:$PATH node configured.js"),
+                    "{pin}: {result}"
+                );
+                assert!(!result.contains("run start"), "{pin}: {result}");
+                assert!(!result.contains("node wrong.js"), "{pin}: {result}");
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_workspace_manager_commands_are_not_rewritten() {
+        for pin in ["yarn@4.6.0", "bun@1.2.22"] {
+            let root =
+                serde_json::json!({"private":true,"packageManager":pin,"workspaces":["apps/*"]})
+                    .to_string();
+            for (file, contents) in [
+                ("Procfile", "web: npm run start"),
+                (
+                    "autopack.json",
+                    r#"{"deploy":{"startCommand":"npm run start"}}"#,
+                ),
+                ("nixpacks.toml", "[start]\ncmd = 'npm run start'"),
+                ("", ""),
+            ] {
+                let config_path = format!("apps/api/{file}");
+                let mut files: Vec<(&str, &str)> = vec![
+                    ("package.json", &root),
+                    (
+                        "apps/api/package.json",
+                        r#"{"scripts":{"start":"node server.js"}}"#,
+                    ),
+                    ("apps/api/server.js", ""),
+                ];
+                if !file.is_empty() {
+                    files.push((&config_path, contents));
+                }
+                let repo = fixture(&files);
+                let app = repo.path().join("apps/api");
+                let vars = vec!["AUTOPACK_START_CMD=npm run start".to_string()];
+                let mut config =
+                    DockerfileConfig::new(repo.path(), &app, "fixture").with_buildkit(true);
+                if file.is_empty() {
+                    config = config.with_build_vars(&vars);
+                }
+                let result = render(&config, Some("node")).unwrap().content;
+                assert!(
+                    result.contains("PATH=/app/apps/api/node_modules/.bin:$PATH npm run start"),
+                    "{pin} {file}: {result}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compound_workspace_start_scripts_use_the_root_manager() {
+        for (pin, manager) in [
+            ("npm@10.9.0", "npm"),
+            ("yarn@4.6.0", "yarn"),
+            ("bun@1.2.22", "bun"),
+        ] {
+            let root =
+                serde_json::json!({"private":true,"packageManager":pin,"workspaces":["apps/*"]})
+                    .to_string();
+            let repo = fixture(&[
+                ("package.json", &root),
+                (
+                    "apps/api/package.json",
+                    r#"{"scripts":{"start":"node prepare.js && node server.js"}}"#,
+                ),
+                ("apps/api/server.js", ""),
+            ]);
+            let app = repo.path().join("apps/api");
+            let config = DockerfileConfig::new(repo.path(), &app, "fixture").with_buildkit(true);
+            let result = render(&config, Some("node")).unwrap().content;
+            assert!(
+                result.contains(&format!(
+                    "PATH=/app/apps/api/node_modules/.bin:$PATH {manager} run start"
+                )),
+                "{pin}: {result}"
+            );
+        }
     }
 
     #[test]
@@ -825,7 +1478,10 @@ mod tests {
 
     #[test]
     fn workspace_directory_rejects_escape_and_shell_metacharacters() {
-        let repo = fixture(&[("pnpm-workspace.yaml", "packages: [apps/*]")]);
+        let repo = fixture(&[
+            ("pnpm-workspace.yaml", "packages: [apps/*]"),
+            ("apps/web;echo/package.json", "{}"),
+        ]);
         for path in [
             repo.path().join("../other"),
             repo.path().join("apps/web;echo"),
@@ -900,5 +1556,75 @@ mod tests {
             let result = render(&buildkit_config(repo.path()), Some("ruby")).unwrap().content;
             assert!(result.contains("ruby:3.4"), "{result}");
         }
+    }
+
+    #[tokio::test]
+    async fn an_unplannable_app_reports_a_typed_plan_failure() {
+        let dir = fixture(&[("notes.txt", "nothing to build here")]);
+
+        let result = AutopackPreset::new()
+            .dockerfile_with_build_dir(dir.path())
+            .await;
+
+        let Some(BuildPlanFailure::Unplannable { preset, reason }) = result.plan_failure else {
+            panic!(
+                "expected an Unplannable plan failure, got {:?}",
+                result.plan_failure
+            );
+        };
+        assert_eq!(preset, "autopack");
+        assert!(reason.contains("no provider could be detected"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn a_plannable_app_reports_no_plan_failure() {
+        let dir = node_app();
+        let result = AutopackPreset::new()
+            .dockerfile_with_build_dir(dir.path())
+            .await;
+        assert!(result.plan_failure.is_none(), "{:?}", result.plan_failure);
+    }
+
+    #[test]
+    fn untranslated_config_notes_are_ordered_by_index_and_ignore_other_metadata() {
+        let notes = untranslated_config_notes([
+            ("provider", "node"),
+            ("configNote10", "tenth"),
+            (
+                "configNote2",
+                "phases other than setup/install/build were skipped: release",
+            ),
+            (
+                "configNote1",
+                "nixPkgs with no mise equivalent were skipped: ffmpeg",
+            ),
+            ("configNoteX", "not a numbered note"),
+            ("configNote3", "   "),
+        ]);
+        assert_eq!(
+            notes,
+            vec![
+                "Build config setting not applied: nixPkgs with no mise equivalent were skipped: ffmpeg",
+                "Build config setting not applied: phases other than setup/install/build were skipped: release",
+                "Build config setting not applied: tenth",
+            ]
+        );
+        assert!(untranslated_config_notes([("provider", "node")]).is_empty());
+    }
+
+    #[test]
+    fn legacy_nixpacks_keys_that_cannot_be_translated_surface_as_warnings() {
+        let dir = fixture(&[
+            ("package.json", r#"{"scripts":{"start":"node server.js"}}"#),
+            ("server.js", ""),
+            (
+                "nixpacks.toml",
+                "[phases.setup]\nnixPkgs = ['definitely-not-a-mise-tool']\n\n[phases.release]\ncmds = ['echo release']\n",
+            ),
+        ]);
+        let result = render(&buildkit_config(dir.path()), None).unwrap();
+        let joined = result.warnings.join("\n");
+        assert!(joined.contains("definitely-not-a-mise-tool"), "{joined}");
+        assert!(joined.contains("release"), "{joined}");
     }
 }

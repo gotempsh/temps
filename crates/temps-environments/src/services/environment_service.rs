@@ -19,6 +19,28 @@ use tracing::{info, warn};
 /// An empty target-node list means "remove this environment override".
 /// Persisting `Some([])` would instead create an explicit placement constraint
 /// that no node can satisfy, leaving workloads impossible to redeploy or drain.
+/// Synthetic `target_nodes` ID of the control plane, which has no `nodes` row.
+const CONTROL_PLANE_NODE_ID: i32 = 0;
+
+fn join_node_ids(ids: &[i32]) -> String {
+    ids.iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// IDs in `requested` that name neither the control plane nor an existing
+/// node, in ascending order without duplicates.
+fn unknown_target_node_ids(requested: &[i32], existing: &[i32]) -> Vec<i32> {
+    requested
+        .iter()
+        .copied()
+        .filter(|id| *id != CONTROL_PLANE_NODE_ID && !existing.contains(id))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 fn normalize_target_nodes(target_nodes: Vec<i32>) -> Option<Vec<i32>> {
     (!target_nodes.is_empty()).then_some(target_nodes)
 }
@@ -56,6 +78,18 @@ pub enum EnvironmentError {
 
     #[error("Invalid input: {0}")]
     InvalidInput(String),
+
+    #[error(
+        "Environment {environment_id}: target_nodes lists node ID(s) {} that do not exist (removed \
+         nodes keep their ID retired; a rejoined machine gets a new one). Existing nodes: {available}",
+        join_node_ids(unknown)
+    )]
+    UnknownTargetNodes {
+        environment_id: i32,
+        unknown: Vec<i32>,
+        /// `0 (control plane), 1 (worker-1), ...`, for the message.
+        available: String,
+    },
 
     #[error(
         "Branch '{branch}' is already used by environment '{env_name}' in project {project_id}"
@@ -101,6 +135,14 @@ impl From<EnvironmentError> for Problem {
             }
             EnvironmentError::InvalidInput(msg) => {
                 temps_core::error_builder::bad_request().detail(msg).build()
+            }
+            EnvironmentError::UnknownTargetNodes { ref unknown, .. } => {
+                let unknown = unknown.clone();
+                temps_core::error_builder::bad_request()
+                    .title("Unknown Target Nodes")
+                    .detail(error.to_string())
+                    .value("unknown_node_ids", unknown)
+                    .build()
             }
             EnvironmentError::DatabaseConnectionError(_) => {
                 // Log full details server-side, return generic message to client
@@ -848,6 +890,72 @@ impl EnvironmentService {
         Ok(environment)
     }
 
+    /// Refuse a placement that names nodes which do not exist.
+    ///
+    /// A stored unknown ID silently stops targeting anything: a removed node's
+    /// ID is never reused, and the same machine rejoining gets a new one, so
+    /// the scheduler would quietly place replicas on fewer nodes than asked.
+    ///
+    /// Must run inside the transaction that writes the config, after
+    /// [`temps_entities::deployment_config::lock_node_placements`]: node
+    /// removal takes the same lock, so no node can disappear between this
+    /// check and the commit.
+    async fn ensure_target_nodes_exist<C: ConnectionTrait>(
+        conn: &C,
+        environment_id: i32,
+        requested: &[i32],
+    ) -> Result<(), EnvironmentError> {
+        let candidates: Vec<i32> = requested
+            .iter()
+            .copied()
+            .filter(|id| *id != CONTROL_PLANE_NODE_ID)
+            .collect();
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let existing: Vec<i32> = temps_entities::nodes::Entity::find()
+            .select_only()
+            .column(temps_entities::nodes::Column::Id)
+            .filter(temps_entities::nodes::Column::Id.is_in(candidates))
+            .into_tuple()
+            .all(conn)
+            .await
+            .map_err(|e| EnvironmentError::DatabaseError {
+                reason: format!(
+                    "Failed to look up target nodes for environment {environment_id}: {e}"
+                ),
+            })?;
+        let unknown = unknown_target_node_ids(requested, &existing);
+        if unknown.is_empty() {
+            return Ok(());
+        }
+        // Bounded: clusters have a handful of nodes, and the message only
+        // needs enough to pick the right IDs.
+        let nodes: Vec<(i32, String)> = temps_entities::nodes::Entity::find()
+            .select_only()
+            .column(temps_entities::nodes::Column::Id)
+            .column(temps_entities::nodes::Column::Name)
+            .order_by_asc(temps_entities::nodes::Column::Id)
+            .limit(50)
+            .into_tuple()
+            .all(conn)
+            .await
+            .map_err(|e| EnvironmentError::DatabaseError {
+                reason: format!(
+                    "Failed to list nodes for environment {environment_id}'s placement error: {e}"
+                ),
+            })?;
+        let available = std::iter::once(format!("{CONTROL_PLANE_NODE_ID} (control plane)"))
+            .chain(nodes.into_iter().map(|(id, name)| format!("{id} ({name})")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(EnvironmentError::UnknownTargetNodes {
+            environment_id,
+            unknown,
+            available,
+        })
+    }
+
     /// Update an environment's settings.
     ///
     /// `ceiling_enforcement` reflects the caller's `SettingsWrite` permission:
@@ -862,8 +970,58 @@ impl EnvironmentService {
         settings: crate::handlers::UpdateEnvironmentSettingsRequest,
         ceiling_enforcement: temps_core::CeilingEnforcement,
     ) -> Result<environments::Model, EnvironmentError> {
-        // First get the environment to verify it exists and belongs to the project
-        let environment = self.get_environment(project_id_param, env_id).await?;
+        // Everything that does not need the environment row happens before
+        // the transaction below, so it never holds the placement lock (and
+        // its pooled connection) while waiting on other work: the instance
+        // settings read can need a second connection from the same pool, and
+        // concurrent saves queued on the lock would otherwise hold every
+        // connection it could use. Hashing is CPU-bound and gains nothing
+        // from the lock either.
+        let tenant_ceilings = if ceiling_enforcement == temps_core::CeilingEnforcement::Enforce {
+            let app_settings = self.config_service.get_settings().await.map_err(|e| {
+                EnvironmentError::Other(format!(
+                    "Failed to read instance settings to check resource ceilings for environment {env_id}: {e}"
+                ))
+            })?;
+            Some(app_settings.tenant_resource_ceilings)
+        } else {
+            None
+        };
+        let password_hash = match settings.password.as_deref() {
+            Some(password) if !password.is_empty() => {
+                use argon2::{Argon2, PasswordHasher};
+                let hash = Argon2::default()
+                    .hash_password(password.as_bytes())
+                    .map_err(|e| {
+                        EnvironmentError::InvalidInput(format!(
+                            "Failed to hash password for environment {}: {}",
+                            env_id, e
+                        ))
+                    })?
+                    .to_string();
+                Some(hash)
+            }
+            _ => None,
+        };
+
+        // One transaction under the node placement lock, which node removal
+        // also takes: the environment is read, its target nodes validated and
+        // its config written while no node can be removed. A save can then
+        // neither commit a removed node's ID nor write back a copy of the
+        // config read before a removal rewrote it. Rolled back on any error.
+        let txn = self.db.begin().await?;
+        temps_entities::deployment_config::lock_node_placements(&txn).await?;
+        let environment = environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(project_id_param))
+            .filter(environments::Column::Id.eq(env_id))
+            .filter(environments::Column::DeletedAt.is_null())
+            .one(&txn)
+            .await?
+            .ok_or_else(|| {
+                EnvironmentError::NotFound(format!(
+                    "Environment {env_id} not found in project {project_id_param}"
+                ))
+            })?;
 
         // Update the environment with new settings
         let mut active_model: environments::ActiveModel = environment.clone().into();
@@ -912,33 +1070,20 @@ impl EnvironmentService {
             deployment_config.security = Some(security);
         }
         // Handle password protection: hash plaintext password with argon2
-        if let Some(ref password) = settings.password {
+        // (hashed above, before the transaction)
+        if settings.password.is_some() {
             let mut security = deployment_config.security.clone().unwrap_or_default();
-            if password.is_empty() {
-                // Empty string removes password protection
-                security.password_protection = None;
-            } else {
-                use argon2::{Argon2, PasswordHasher};
-                let argon2 = Argon2::default();
-                let hash = argon2
-                    .hash_password(password.as_bytes())
-                    .map_err(|e| {
-                        EnvironmentError::InvalidInput(format!(
-                            "Failed to hash password for environment {}: {}",
-                            env_id, e
-                        ))
-                    })?
-                    .to_string();
-                security.password_protection = Some(
-                    temps_entities::deployment_config::PasswordProtectionConfig {
-                        enabled: true,
-                        password_hash: hash,
-                    },
-                );
-            }
+            security.password_protection = password_hash.map(|password_hash| {
+                // A non-empty password sets protection; an empty one removes it.
+                temps_entities::deployment_config::PasswordProtectionConfig {
+                    enabled: true,
+                    password_hash,
+                }
+            });
             deployment_config.security = Some(security);
         }
         if let Some(target_nodes) = settings.target_nodes {
+            Self::ensure_target_nodes_exist(&txn, env_id, &target_nodes).await?;
             deployment_config.target_nodes = normalize_target_nodes(target_nodes);
         }
         if let Some(target_labels) = settings.target_labels {
@@ -951,6 +1096,10 @@ impl EnvironmentService {
         // explicit value (including `false`) pins it for this environment.
         if let Some(cross_architecture_builds) = settings.cross_architecture_builds {
             deployment_config.cross_architecture_builds = Some(cross_architecture_builds);
+        }
+        // `null` clears the override so the project's build location applies.
+        if let Some(build_location) = settings.build_location {
+            deployment_config.build_location = build_location;
         }
         if let Some(on_demand) = settings.on_demand {
             deployment_config.on_demand = on_demand;
@@ -993,14 +1142,9 @@ impl EnvironmentService {
         // already bounded — except for configs written before the operator set
         // the ceiling, which no write path revisits (see the PR discussion on
         // retroactive enforcement).
-        if ceiling_enforcement == temps_core::CeilingEnforcement::Enforce {
-            let app_settings = self.config_service.get_settings().await.map_err(|e| {
-                EnvironmentError::Other(format!(
-                    "Failed to read instance settings to check resource ceilings for environment {env_id}: {e}"
-                ))
-            })?;
-            if let Err(violations) = deployment_config
-                .check_against_tenant_ceilings(&app_settings.tenant_resource_ceilings)
+        if let Some(tenant_ceilings) = &tenant_ceilings {
+            if let Err(violations) =
+                deployment_config.check_against_tenant_ceilings(tenant_ceilings)
             {
                 return Err(EnvironmentError::InvalidInput(violations.join("; ")));
             }
@@ -1027,7 +1171,10 @@ impl EnvironmentService {
         active_model.updated_at = Set(chrono::Utc::now());
 
         let updated_environment = active_model
-            .update(self.db.as_ref())
+            .update(&txn)
+            .await
+            .map_err(|e| EnvironmentError::DatabaseConnectionError(e.to_string()))?;
+        txn.commit()
             .await
             .map_err(|e| EnvironmentError::DatabaseConnectionError(e.to_string()))?;
 
@@ -1339,12 +1486,36 @@ impl EnvironmentService {
 
         let new_domain = environment_domains::ActiveModel {
             environment_id: Set(environment.id),
-            domain: Set(normalized),
+            domain: Set(normalized.clone()),
             created_at: Set(chrono::Utc::now()),
             ..Default::default()
         };
 
-        Ok(new_domain.insert(self.db.as_ref()).await?)
+        // A hostname attached to a status page (#1412) is reserved for it;
+        // checked and claimed under the shared hostname lock.
+        let txn = self.db.begin().await?;
+        let inserted = async {
+            temps_entities::status_page_domains::lock_hostname_claim(&txn, &normalized).await?;
+            if temps_entities::status_page_domains::attached_hostname_conflict(&txn, &normalized)
+                .await?
+            {
+                return Err(EnvironmentError::InvalidInput(format!(
+                    "Domain '{normalized}' is attached to a status page; remove it there first"
+                )));
+            }
+            Ok(new_domain.insert(&txn).await?)
+        }
+        .await;
+        match inserted {
+            Ok(domain) => {
+                txn.commit().await?;
+                Ok(domain)
+            }
+            Err(e) => {
+                let _ = txn.rollback().await;
+                Err(e)
+            }
+        }
     }
 
     pub async fn delete_environment_domain(
@@ -1599,6 +1770,40 @@ mod tests {
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
 
     #[test]
+    fn unknown_target_nodes_ignore_the_control_plane_and_existing_nodes() {
+        assert_eq!(
+            unknown_target_node_ids(&[0, 1, 3], &[1, 3]),
+            Vec::<i32>::new()
+        );
+        assert_eq!(
+            unknown_target_node_ids(&[0, 1, 2, 2, 7], &[1, 3]),
+            vec![2, 7]
+        );
+        assert_eq!(unknown_target_node_ids(&[], &[1]), Vec::<i32>::new());
+    }
+
+    #[test]
+    fn unknown_target_nodes_are_a_400_that_names_them() {
+        let error = EnvironmentError::UnknownTargetNodes {
+            environment_id: 4,
+            unknown: vec![2],
+            available: "0 (control plane), 1 (worker-1), 3 (worker-2)".to_string(),
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("node ID(s) 2 that do not exist"),
+            "{message}"
+        );
+        assert!(message.contains("3 (worker-2)"), "{message}");
+
+        let problem = Problem::from(error);
+        assert_eq!(problem.status_code, axum::http::StatusCode::BAD_REQUEST);
+        let body = serde_json::to_value(&problem.body).unwrap();
+        assert_eq!(body["title"], "Unknown Target Nodes");
+        assert_eq!(body["unknown_node_ids"], serde_json::json!([2]));
+    }
+
+    #[test]
     fn empty_target_nodes_clears_environment_placement_override() {
         assert_eq!(normalize_target_nodes(Vec::new()), None);
         assert_eq!(normalize_target_nodes(vec![1, 3]), Some(vec![1, 3]));
@@ -1846,6 +2051,7 @@ mod tests {
                     target_labels: None,
                     anti_affinity: None,
                     cross_architecture_builds: None,
+                    build_location: None,
                     protected: None,
                     attack_mode: None,
                     force_https: None,
@@ -1952,6 +2158,7 @@ mod tests {
                     target_labels: None,
                     anti_affinity: None,
                     cross_architecture_builds: None,
+                    build_location: None,
                     protected: None,
                     attack_mode: None,
                     force_https: None,
@@ -2008,6 +2215,7 @@ mod tests {
             target_labels: None,
             anti_affinity: None,
             cross_architecture_builds: None,
+            build_location: None,
             protected: None,
             attack_mode: None,
             force_https: None,
@@ -2086,6 +2294,11 @@ mod tests {
         let env = env_for_ceiling_test();
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
+                // The node placement lock the save takes first.
+                .append_exec_results(vec![MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
                 .append_query_results(vec![vec![env]])
                 .into_connection(),
         );
@@ -2662,5 +2875,262 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(result.unwrap().sleeping);
+    }
+
+    fn settings_with_target_nodes(
+        target_nodes: Vec<i32>,
+    ) -> crate::handlers::UpdateEnvironmentSettingsRequest {
+        crate::handlers::UpdateEnvironmentSettingsRequest {
+            branch: None,
+            cpu_request: None,
+            cpu_limit: None,
+            memory_request: None,
+            memory_limit: None,
+            replicas: None,
+            exposed_port: None,
+            automatic_deploy: None,
+            performance_metrics_enabled: None,
+            session_recording_enabled: None,
+            security: None,
+            target_nodes: Some(target_nodes),
+            target_labels: None,
+            anti_affinity: None,
+            cross_architecture_builds: None,
+            build_location: None,
+            protected: None,
+            attack_mode: None,
+            force_https: None,
+            on_demand: None,
+            idle_timeout_seconds: None,
+            wake_timeout_seconds: None,
+            request_timeout_seconds: None,
+            sse_idle_timeout_seconds: None,
+            websocket_idle_timeout_seconds: None,
+            max_concurrent_connections: None,
+            password: None,
+        }
+    }
+
+    /// A settings save racing a node removal: the removal holds the node
+    /// placement lock and deletes the node; the save must wait for it and
+    /// then reject the ID, instead of validating before the removal and
+    /// committing a deleted node's ID after it.
+    #[tokio::test]
+    async fn a_save_racing_a_node_removal_waits_and_then_rejects_the_removed_node() {
+        use sea_orm::TransactionTrait;
+        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+        use temps_entities::{preset::Preset, upstream_config::UpstreamList};
+
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                eprintln!("Docker unavailable, skipping placement race test: {error:#}");
+                return;
+            }
+            Err(error) => panic!("placement race test database setup failed: {error:#}"),
+        };
+        let db = test_db.connection_arc();
+        let node_id: i32 = db
+            .query_one(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "INSERT INTO nodes (name, token_hash, address, private_address, role, status, \
+                 labels, capacity, created_at, updated_at) VALUES ('worker-race', 'hash', \
+                 'https://10.100.0.9:3100', '10.100.0.9', 'worker', 'active', '{}', '{}', now(), \
+                 now()) RETURNING id"
+                    .to_string(),
+            ))
+            .await
+            .expect("insert node")
+            .expect("returned row")
+            .try_get("", "id")
+            .expect("node id");
+        let project = projects::ActiveModel {
+            name: Set("Placement race".to_string()),
+            slug: Set("placement-race".to_string()),
+            repo_owner: Set("owner".to_string()),
+            repo_name: Set("repo".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::NextJs),
+            directory: Set("/".to_string()),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            is_deleted: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert project");
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            slug: Set("production".to_string()),
+            host: Set("race.example.test".to_string()),
+            subdomain: Set("race.example.test".to_string()),
+            upstreams: Set(UpstreamList::default()),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert environment");
+
+        // The "removal": takes the placement lock, then deletes the node.
+        let removal = db.begin().await.expect("begin removal");
+        temps_entities::deployment_config::lock_node_placements(&removal)
+            .await
+            .expect("removal takes the lock");
+
+        let server_config = temps_config::ServerConfig::new(
+            "127.0.0.1:3000".to_string(),
+            "postgres://localhost/test".to_string(),
+            None,
+            None,
+        )
+        .unwrap();
+        let config_service = Arc::new(temps_config::ConfigService::new(
+            Arc::new(server_config),
+            db.clone(),
+        ));
+        let service = EnvironmentService::new(db.clone(), config_service);
+        let (project_id, environment_id) = (project.id, environment.id);
+        let save = tokio::spawn(async move {
+            service
+                .update_environment_settings(
+                    project_id,
+                    environment_id,
+                    settings_with_target_nodes(vec![0, node_id]),
+                    temps_core::CeilingEnforcement::Bypass,
+                )
+                .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !save.is_finished(),
+            "the save must wait while a removal holds the placement lock"
+        );
+
+        removal
+            .execute(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "DELETE FROM nodes WHERE id = $1",
+                [node_id.into()],
+            ))
+            .await
+            .expect("delete node");
+        removal.commit().await.expect("commit removal");
+
+        let result = save.await.expect("save task");
+        match result {
+            Err(EnvironmentError::UnknownTargetNodes { unknown, .. }) => {
+                assert_eq!(unknown, vec![node_id]);
+            }
+            other => panic!("expected UnknownTargetNodes, got {:?}", other.map(|e| e.id)),
+        }
+        let stored = environments::Entity::find_by_id(environment_id)
+            .one(db.as_ref())
+            .await
+            .expect("read environment")
+            .expect("environment exists");
+        assert_eq!(
+            stored
+                .deployment_config
+                .and_then(|config| config.target_nodes),
+            None,
+            "the removed node's ID must not be stored"
+        );
+    }
+
+    /// The save holds a pooled connection for its transaction. Reading the
+    /// instance settings inside it would need a second connection, so on a
+    /// busy pool (here: a pool of one) the save could never finish. They are
+    /// read before the transaction starts.
+    #[tokio::test]
+    async fn a_ceiling_checked_save_needs_only_one_pooled_connection() {
+        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+        use temps_entities::{preset::Preset, upstream_config::UpstreamList};
+
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                eprintln!("Docker unavailable, skipping single-connection save test: {error:#}");
+                return;
+            }
+            Err(error) => panic!("single-connection save test database setup failed: {error:#}"),
+        };
+        let setup = test_db.connection_arc();
+        let project = projects::ActiveModel {
+            name: Set("Single connection".to_string()),
+            slug: Set("single-connection".to_string()),
+            repo_owner: Set("owner".to_string()),
+            repo_name: Set("repo".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::NextJs),
+            directory: Set("/".to_string()),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            is_deleted: Set(false),
+            ..Default::default()
+        }
+        .insert(setup.as_ref())
+        .await
+        .expect("insert project");
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            slug: Set("production".to_string()),
+            host: Set("single.example.test".to_string()),
+            subdomain: Set("single.example.test".to_string()),
+            upstreams: Set(UpstreamList::default()),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(setup.as_ref())
+        .await
+        .expect("insert environment");
+
+        let mut options = temps_database::connect_options(test_db.database_url.clone());
+        options
+            .max_connections(1)
+            .min_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(5));
+        let single = Arc::new(
+            sea_orm::Database::connect(options)
+                .await
+                .expect("connect a one-connection pool"),
+        );
+        let server_config = temps_config::ServerConfig::new(
+            "127.0.0.1:3000".to_string(),
+            "postgres://localhost/test".to_string(),
+            None,
+            None,
+        )
+        .unwrap();
+        // Same pool, cold cache: the settings read needs a connection.
+        let config_service = Arc::new(temps_config::ConfigService::new(
+            Arc::new(server_config),
+            single.clone(),
+        ));
+        let service = EnvironmentService::new(single, config_service);
+
+        let mut request = settings_with_target_nodes(vec![0]);
+        request.replicas = Some(2);
+        let saved = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            service.update_environment_settings(
+                project.id,
+                environment.id,
+                request,
+                temps_core::CeilingEnforcement::Enforce,
+            ),
+        )
+        .await
+        .expect("the save must not wait for a second pooled connection")
+        .expect("the save succeeds");
+        let config = saved.deployment_config.expect("config stored");
+        assert_eq!(config.replicas, 2);
+        assert_eq!(config.target_nodes, Some(vec![0]));
     }
 }

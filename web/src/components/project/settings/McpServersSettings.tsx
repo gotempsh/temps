@@ -99,8 +99,7 @@ export function McpServersSettings({ project }: McpServersSettingsProps) {
     <div>
       <div className="flex items-center justify-between mb-4">
         <div>
-          <h2 className="text-lg font-semibold">MCP Servers</h2>
-          <p className="text-sm text-muted-foreground mt-1">
+          <p className="text-sm text-muted-foreground">
             Define MCP server configurations that can be assigned to AI
             workflows. Configs are merged into{' '}
             <code className="text-xs bg-muted px-1 rounded">
@@ -170,7 +169,12 @@ export function McpServersSettings({ project }: McpServersSettingsProps) {
                     </div>
                     <DropdownMenu>
                       <DropdownMenuTrigger asChild>
-                        <Button variant="ghost" size="icon" className="h-8 w-8">
+                        <Button
+                          aria-label="Open menu"
+                          variant="ghost"
+                          size="icon"
+                          className="h-8 w-8"
+                        >
                           <EllipsisVertical className="h-4 w-4" />
                         </Button>
                       </DropdownMenuTrigger>

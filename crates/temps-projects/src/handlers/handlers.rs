@@ -528,6 +528,7 @@ async fn authorize_storage_service_scopes(
         get_project_template,
         list_project_template_tags,
         create_project_from_template,
+        super::operations::list_operations,
     ),
     components(
         schemas(
@@ -535,6 +536,8 @@ async fn authorize_storage_service_scopes(
             super::types::ProjectEnvVarInput,
             DropInspectionResponse,
             DropPresetCandidate,
+            temps_core::drop_entries::DropSkippedPath,
+            temps_core::drop_entries::DropSkipReason,
             ChangeProjectSourceRequest,
             SetAlternateSourcesRequest,
             ProjectResponse,
@@ -563,12 +566,19 @@ async fn authorize_storage_service_scopes(
             super::templates::CreateProjectFromTemplateRequest,
             super::templates::EnvVarInput,
             super::templates::CreateProjectFromTemplateResponse,
+            super::operations::ListOperationsQuery,
+            super::operations::OperationsListResponse,
+            crate::services::operations::OperationEntry,
+            crate::services::operations::OperationKind,
+            crate::services::operations::OperationStatus,
+            crate::services::operations::OperationStatusFilter,
         )
     ),
     tags(
         (name = "Projects", description = "Project management endpoints"),
         (name = "Presets", description = "Available deployment presets"),
-        (name = "Templates", description = "Project template endpoints")
+        (name = "Templates", description = "Project template endpoints"),
+        (name = "Operations", description = "Recent and in-flight operations across projects")
     ),
     nest(
         (path = "/projects", api = super::custom_domains::CustomDomainsApiDoc)
@@ -633,6 +643,15 @@ pub struct DropPresetCandidate {
 pub struct DropInspectionResponse {
     pub suggested_name: String,
     pub candidates: Vec<DropPresetCandidate>,
+    /// What the deployment will leave out of this archive: version control,
+    /// installed dependencies, environment files that may hold secrets, OS
+    /// metadata. Directories are listed once. At most 50 paths; see
+    /// `skipped_file_count` for the total.
+    #[serde(default)]
+    pub skipped_entries: Vec<temps_core::drop_entries::DropSkippedPath>,
+    /// Archive entries left out in total, including any not listed.
+    #[serde(default)]
+    pub skipped_file_count: u64,
 }
 
 #[derive(utoipa::ToSchema)]
@@ -721,10 +740,13 @@ pub async fn inspect_drop_archive(
     // `spawn_blocking` as the ZIP walk so it stays off the async runtime AND
     // stays covered by `inspection_permit`, which is released when this closure
     // returns.
-    let candidates = tokio::task::spawn_blocking(move || {
+    let (candidates, skipped) = tokio::task::spawn_blocking(move || {
         let _inspection_permit = inspection_permit;
-        let manifests = inspect_zip_manifests(&archive_path)?;
-        Ok::<_, Problem>(drop_inspection_candidates(&manifests))
+        let inspection = inspect_zip_archive(&archive_path)?;
+        Ok::<_, Problem>((
+            drop_inspection_candidates(&inspection.manifests),
+            inspection.skipped,
+        ))
     })
     .await
     .map_err(|error| {
@@ -734,11 +756,7 @@ pub async fn inspect_drop_archive(
     })??;
 
     if candidates.is_empty() {
-        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
-            .with_title("No Deployable Project Found")
-            .with_detail(
-                "The archive does not contain a supported project manifest or index.html",
-            ));
+        return Err(no_deployable_project_problem());
     }
 
     let suggested_name = filename
@@ -751,7 +769,32 @@ pub async fn inspect_drop_archive(
     Ok(Json(DropInspectionResponse {
         suggested_name,
         candidates,
+        skipped_entries: skipped.paths(),
+        skipped_file_count: skipped.total_files(),
     }))
+}
+
+/// Problem type the console keys its "nothing to deploy" onboarding state on.
+pub const DROP_NO_PROJECT_PROBLEM_TYPE: &str = "https://temps.sh/probs/drop-no-deployable-project";
+
+/// Rejection for an archive with no recognisable project root.
+///
+/// Retrying detection on the same files cannot succeed, so the detail names
+/// what Temps looks for and the one change that always works (a Dockerfile);
+/// `supported_files` lets the console render that list without parsing prose.
+fn no_deployable_project_problem() -> Problem {
+    let signals = temps_presets::project_signal_names();
+    problemdetails::new(StatusCode::BAD_REQUEST)
+        .with_type(DROP_NO_PROJECT_PROBLEM_TYPE)
+        .with_title("No Deployable Project Found")
+        .with_detail(format!(
+            "No deployable project was found in the archive. Temps looks for one of \
+             {} at the archive root or in a folder up to 4 levels deep. Add a \
+             Dockerfile to deploy any other application, or add the manifest \
+             your language uses.",
+            signals.join(", ")
+        ))
+        .with_value("supported_files", signals)
 }
 
 /// Bound the picker without letting one root's alternatives crowd out later
@@ -818,7 +861,38 @@ fn compose_path_for_candidate(
         .map(|file_name| (*file_name).to_string())
 }
 
+/// Rejection for an archive entry that is private material. Names the entry,
+/// in `detail` and as `entry`, so the console can say which file to remove.
+fn sensitive_zip_entry_problem(
+    entry: &str,
+    reason: temps_core::drop_entries::DropRefusalReason,
+) -> Problem {
+    problemdetails::new(StatusCode::BAD_REQUEST)
+        .with_title("Sensitive ZIP Entry")
+        .with_detail(format!(
+            "Archive entry '{entry}' {reason}. Remove it from the archive and upload again: \
+             Drop never accepts private keys or credentials. Environment files (.env, \
+             .env.local), node_modules/ and .git/ do not need removing; they are left out \
+             automatically, and templates such as .env.example are kept"
+        ))
+        .with_value("entry", entry)
+}
+
+/// Manifests of a Drop archive, for detection; see [`inspect_zip_archive`].
+#[cfg(test)]
 fn inspect_zip_manifests(path: &std::path::Path) -> Result<BTreeMap<String, String>, Problem> {
+    inspect_zip_archive(path).map(|inspection| inspection.manifests)
+}
+
+/// What [`inspect_zip_archive`] read from a Drop archive.
+struct DropZipInspection {
+    /// Every kept entry's path; the contents of the manifests detection reads.
+    manifests: BTreeMap<String, String>,
+    /// Entries left out under the Drop rules, for the console's notice.
+    skipped: temps_core::drop_entries::DropSkipReport,
+}
+
+fn inspect_zip_archive(path: &std::path::Path) -> Result<DropZipInspection, Problem> {
     const MAX_FILES: usize = 20_000;
     const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
     /// Aggregate budget across every manifest we buffer. `MAX_FILES` x
@@ -854,6 +928,7 @@ fn inspect_zip_manifests(path: &std::path::Path) -> Result<BTreeMap<String, Stri
     }
 
     let mut manifests = BTreeMap::new();
+    let mut skipped = temps_core::drop_entries::DropSkipReport::default();
     let mut total_manifest_bytes: u64 = 0;
     let mut manifest_count: usize = 0;
     let mut total_path_bytes: usize = 0;
@@ -866,33 +941,34 @@ fn inspect_zip_manifests(path: &std::path::Path) -> Result<BTreeMap<String, Stri
         if entry.is_dir() {
             continue;
         }
+        // The decoded name is what `enclosed_name` and the classifier see
+        // (legacy CP437 names included), so diagnostics must show the same
+        // one. `ZipFile::name` is fallible since zip 9; only on an actual
+        // decode error fall back to a lossy rendering of the raw bytes.
+        let display_name = || match entry.name() {
+            Ok(name) => name,
+            Err(_) => String::from_utf8_lossy(entry.name_raw()),
+        };
         let path = entry.enclosed_name().ok_or_else(|| {
             problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Unsafe ZIP Entry")
                 .with_detail(format!(
                     "Archive entry '{}' escapes the project root",
-                    entry.name()
+                    display_name()
                 ))
         })?;
-        if path.components().any(|component| {
-            let std::path::Component::Normal(value) = component else {
-                return false;
-            };
-            let name = value.to_string_lossy();
-            name == ".git"
-                || name == "node_modules"
-                || name == ".env"
-                || name.starts_with(".env.")
-                || name.ends_with(".pem")
-                || name.ends_with(".key")
-                || name == "credentials.json"
-        }) {
-            return Err(problemdetails::new(StatusCode::BAD_REQUEST)
-                .with_title("Sensitive ZIP Entry")
-                .with_detail(format!(
-                    "Archive entry '{}' must be excluded from Drop uploads",
-                    entry.name()
-                )));
+        match temps_core::drop_entries::classify_drop_entry(&path) {
+            temps_core::drop_entries::DropEntryDisposition::Keep => {}
+            temps_core::drop_entries::DropEntryDisposition::Skip {
+                reason,
+                reported_path,
+            } => {
+                skipped.record(reason, reported_path);
+                continue;
+            }
+            temps_core::drop_entries::DropEntryDisposition::Refuse { reason } => {
+                return Err(sensitive_zip_entry_problem(&display_name(), reason));
+            }
         }
         if entry
             .unix_mode()
@@ -900,7 +976,7 @@ fn inspect_zip_manifests(path: &std::path::Path) -> Result<BTreeMap<String, Stri
         {
             return Err(problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Unsupported ZIP Entry")
-                .with_detail(format!("Symbolic link '{}' is not allowed", entry.name())));
+                .with_detail(format!("Symbolic link '{}' is not allowed", display_name())));
         }
         let normalized = path.to_string_lossy().replace('\\', "/");
         let (directory, basename) = normalized.rsplit_once('/').unwrap_or((".", &normalized));
@@ -963,7 +1039,7 @@ fn inspect_zip_manifests(path: &std::path::Path) -> Result<BTreeMap<String, Stri
         }
         manifests.insert(normalized, contents);
     }
-    Ok(manifests)
+    Ok(DropZipInspection { manifests, skipped })
 }
 
 /// Tell project creators whether Cloudflare is ready and what their new-project default is.
@@ -1127,13 +1203,23 @@ pub(super) async fn resolve_hidden_projects(
     state: &Arc<AppState>,
     auth: &temps_auth::context::AuthContext,
 ) -> Result<Vec<i32>, Problem> {
+    hidden_project_ids_for_caller(state.project_access_checker.as_ref(), auth).await
+}
+
+/// [`resolve_hidden_projects`] for handlers that hold the optional checker
+/// directly rather than the projects `AppState`. Same rules, same fail-closed
+/// behaviour.
+pub(crate) async fn hidden_project_ids_for_caller(
+    project_access_checker: Option<&Arc<dyn temps_core::ProjectAccessChecker>>,
+    auth: &temps_auth::context::AuthContext,
+) -> Result<Vec<i32>, Problem> {
     if auth.is_deployment_token()
         || auth.is_admin()
         || auth.has_role(&temps_auth::permissions::Role::PlatformAdmin)
     {
         return Ok(Vec::new());
     }
-    let Some(checker) = state.project_access_checker.as_ref() else {
+    let Some(checker) = project_access_checker else {
         return Ok(Vec::new());
     };
     // Fail closed, matching `project_permission_guard!`. Unreachable today
@@ -1593,6 +1679,12 @@ pub async fn delete_project(
     let project = state.project_service.get_project(id).await?;
 
     state.project_service.begin_project_deletion(id).await?;
+
+    // Stop serving anything public for this project now: if cleanup below
+    // fails, the project stays fenced but `ProjectDeleted` is never emitted.
+    if let Some(hook) = &state.project_deletion_hook {
+        hook.project_deletion_started(id).await;
+    }
 
     state
         .deployment_canceller
@@ -2131,6 +2223,9 @@ pub async fn update_project_deployment_config(
             "cross_architecture_builds".to_string(),
             "updated".to_string(),
         );
+    }
+    if config.build_location.is_some() {
+        updated_fields.insert("build_location".to_string(), "updated".to_string());
     }
     if config.request_timeout_seconds.is_some() {
         updated_fields.insert("request_timeout_seconds".to_string(), "updated".to_string());
@@ -3169,15 +3264,6 @@ fn has_template_runtime_overrides(
         || request.health_check_path.is_some()
 }
 
-fn is_pinned_sha256_image_reference(image: &str) -> bool {
-    image.rsplit_once('@').is_some_and(|(name, digest)| {
-        !name.trim().is_empty()
-            && digest.strip_prefix("sha256:").is_some_and(|hash| {
-                hash.len() == 64 && hash.chars().all(|character| character.is_ascii_hexdigit())
-            })
-    })
-}
-
 fn resolve_image_template_runtime(
     template: &temps_core::templates::ProjectTemplate,
     request: &super::templates::CreateProjectFromTemplateRequest,
@@ -3209,7 +3295,7 @@ fn resolve_image_template_runtime(
                 .to_string(),
         });
     }
-    if !is_pinned_sha256_image_reference(image_ref) {
+    if !temps_core::templates::is_pinned_image_reference(image_ref) {
         return Err(TemplateRuntimeOverrideError::InvalidImage {
             reason: "use an immutable image reference ending in @sha256:<64 hex characters>"
                 .to_string(),
@@ -4127,13 +4213,14 @@ mod tests {
         authorize_storage_service_scopes, canonicalize_template_environment_variables,
         canonicalize_template_upgrade_environment_variables, compose_path_for_candidate,
         drop_inspection_candidates, drop_preset_candidate_from, image_deployment_dispatch_feedback,
-        image_template_preset_config, inspect_zip_manifests,
-        missing_required_template_configuration, parse_owner_repo_from_git_url,
-        production_environment_variable_names, project_created_from_template_telemetry_event,
-        require_git_settings_permissions, require_template_creation_permissions,
-        resolve_image_template_runtime, service_template_changes,
-        validate_template_service_selection, DropPresetCandidate, TemplateEnvironmentError,
-        TemplateRuntimeOverrideError, TemplateServiceSelectionError, MAX_DROP_CANDIDATES,
+        image_template_preset_config, inspect_zip_archive, inspect_zip_manifests,
+        missing_required_template_configuration, no_deployable_project_problem,
+        parse_owner_repo_from_git_url, production_environment_variable_names,
+        project_created_from_template_telemetry_event, require_git_settings_permissions,
+        require_template_creation_permissions, resolve_image_template_runtime,
+        service_template_changes, validate_template_service_selection, DropPresetCandidate,
+        TemplateEnvironmentError, TemplateRuntimeOverrideError, TemplateServiceSelectionError,
+        DROP_NO_PROJECT_PROBLEM_TYPE, MAX_DROP_CANDIDATES,
     };
     use axum::http::StatusCode;
     use chrono::Utc;
@@ -4679,9 +4766,235 @@ mod tests {
             assert_eq!(response.label, label);
             assert!(!response.is_static);
         }
-        // Adding language manifests must not bypass the archive secret policy.
+        // Adding language manifests must not bypass the archive secret policy:
+        // an environment file is never read or kept, and a key still refuses
+        // the upload.
         let zip = drop_test_zip(&[("composer.json", "{}"), (".env", "APP_KEY=fixture-only")]);
+        let manifests = inspect_zip_manifests(zip.path()).unwrap();
+        assert!(!manifests.contains_key(".env"));
+        let zip = drop_test_zip(&[("composer.json", "{}"), ("storage/oauth-private.key", "x")]);
         assert!(inspect_zip_manifests(zip.path()).is_err());
+    }
+
+    #[test]
+    fn drop_offers_server_languages_that_ship_no_js_manifest() {
+        // The file layouts of the official Deno, Phoenix, plain-PHP and
+        // Vapor starters, zipped from the application root.
+        for (files, slug, label) in [
+            (
+                vec![("main.ts", "Deno.serve(() => new Response('ok'));")],
+                "nixpacks-deno",
+                "Deno",
+            ),
+            (
+                vec![
+                    ("mix.exs", "defmodule Hello.MixProject do end"),
+                    ("config/config.exs", "import Config"),
+                    (
+                        "lib/hello_web/router.ex",
+                        "defmodule HelloWeb.Router do end",
+                    ),
+                ],
+                "nixpacks-elixir",
+                "Elixir",
+            ),
+            (
+                vec![
+                    ("index.php", "<?php echo 'ok';"),
+                    ("nixpacks.toml", "[start]\ncmd = \"php -S 0.0.0.0:8000\""),
+                ],
+                "nixpacks-php",
+                "PHP",
+            ),
+            (
+                vec![
+                    ("Package.swift", "// swift-tools-version:5.9"),
+                    ("Sources/App/main.swift", "print(1)"),
+                ],
+                "nixpacks-swift",
+                "Swift",
+            ),
+        ] {
+            let zip = drop_test_zip(&files);
+            let manifests = inspect_zip_manifests(zip.path()).unwrap();
+            let candidates = drop_inspection_candidates(&manifests);
+            assert_eq!(candidates.len(), 1, "{slug}: {candidates:?}");
+            assert_eq!(candidates[0].directory, ".");
+            assert_eq!(candidates[0].preset, slug);
+            assert_eq!(candidates[0].label, label);
+            assert!(
+                !candidates[0].is_static,
+                "{slug} must not be served as files"
+            );
+            // Recognising more files must not loosen the archive policy:
+            // private keys still refuse the upload, and an environment file
+            // is still never read or kept.
+            let mut with_key = files.clone();
+            with_key.push(("certs/server.key", "fixture-only"));
+            assert!(inspect_zip_manifests(drop_test_zip(&with_key).path()).is_err());
+            let mut with_env = files.clone();
+            with_env.push((".env", "fixture-only"));
+            let manifests = inspect_zip_manifests(drop_test_zip(&with_env).path()).unwrap();
+            assert!(!manifests.contains_key(".env"));
+        }
+    }
+
+    /// A Rust web app with a Dockerfile and a committed `.env.example` used to
+    /// be refused as a whole ("Sensitive ZIP Entry ... '.env.example'").
+    #[test]
+    fn drop_keeps_environment_templates() {
+        let zip = drop_test_zip(&[
+            (".env.example", "DATABASE_URL=postgres://localhost/app"),
+            (
+                "Cargo.toml",
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"",
+            ),
+            ("Cargo.lock", "version = 3"),
+            ("Dockerfile", "FROM rust:1\n"),
+            ("src/main.rs", "fn main() {}"),
+        ]);
+        let inspection = inspect_zip_archive(zip.path()).unwrap();
+        assert!(inspection.manifests.contains_key(".env.example"));
+        assert!(inspection.skipped.is_empty());
+        let candidates = drop_inspection_candidates(&inspection.manifests);
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.directory == "."),
+            "{candidates:?}"
+        );
+    }
+
+    /// Secrets and generated directories are left out and reported, the way
+    /// a dropped folder already treats them, instead of refusing the ZIP.
+    #[test]
+    fn drop_leaves_out_env_files_and_generated_directories_and_reports_them() {
+        let zip = drop_test_zip(&[
+            ("package.json", "{\"name\":\"web\"}"),
+            ("index.js", "console.log(1)"),
+            (".env", "fixture-only"),
+            ("config/.env.production", "fixture-only"),
+            ("node_modules/left-pad/index.js", "module.exports = 1"),
+            ("node_modules/left-pad/package.json", "{}"),
+            (".git/config", "[core]"),
+            ("node_modules/some-lib/test/fixture.pem", "fixture-only"),
+        ]);
+        let inspection = inspect_zip_archive(zip.path()).unwrap();
+        for left_out in [".env", "config/.env.production", ".git/config"] {
+            assert!(!inspection.manifests.contains_key(left_out), "{left_out}");
+        }
+        assert!(inspection
+            .manifests
+            .keys()
+            .all(|path| !path.starts_with("node_modules/")));
+        assert_eq!(inspection.skipped.total_files(), 6);
+        let listed: Vec<(String, u64)> = inspection
+            .skipped
+            .paths()
+            .into_iter()
+            .map(|skipped| (skipped.path, skipped.files))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                (".env".to_string(), 1),
+                (".git/".to_string(), 1),
+                ("config/.env.production".to_string(), 1),
+                ("node_modules/".to_string(), 3),
+            ]
+        );
+        assert_eq!(
+            drop_inspection_candidates(&inspection.manifests)[0].directory,
+            "."
+        );
+    }
+
+    #[test]
+    fn drop_refuses_private_material_and_names_the_entry() {
+        let zip = drop_test_zip(&[("package.json", "{}"), ("certs/server.key", "fixture-only")]);
+        let problem = inspect_zip_archive(zip.path()).err().unwrap();
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+        assert_eq!(problem.body["title"], "Sensitive ZIP Entry");
+        assert_eq!(problem.body["entry"], "certs/server.key");
+        let detail = problem.body["detail"].as_str().unwrap();
+        assert!(detail.contains("'certs/server.key'"), "{detail}");
+        assert!(detail.contains("private key"), "{detail}");
+    }
+
+    /// A legacy archive writes names in CP437 with no UTF-8 flag. zip decodes
+    /// those names, so the classifier sees `café/server.key`; the diagnostic
+    /// the console turns into "remove X from the archive" must say the same,
+    /// not the replacement-character rendering of the raw bytes.
+    #[test]
+    fn drop_names_a_legacy_cp437_entry_with_its_decoded_name() {
+        // `X` is patched to 0x82 (é in CP437) below. Same length, so offsets
+        // and CRCs are untouched, and an ASCII name carries no UTF-8 flag.
+        let zip = drop_test_zip(&[("package.json", "{}"), ("cafX/server.key", "fixture-only")]);
+        let mut bytes = std::fs::read(zip.path()).unwrap();
+        let mut patched = 0;
+        while let Some(at) = bytes.windows(4).position(|window| window == b"cafX") {
+            bytes[at + 3] = 0x82;
+            patched += 1;
+        }
+        assert_eq!(patched, 2, "local header and central directory");
+        std::fs::write(zip.path(), &bytes).unwrap();
+
+        let problem = inspect_zip_archive(zip.path()).err().unwrap();
+        assert_eq!(problem.body["title"], "Sensitive ZIP Entry");
+        assert_eq!(problem.body["entry"], "caf\u{e9}/server.key");
+        let detail = problem.body["detail"].as_str().unwrap();
+        assert!(detail.contains("'caf\u{e9}/server.key'"), "{detail}");
+    }
+
+    #[test]
+    fn drop_never_offers_a_static_deploy_that_would_publish_php_source() {
+        let zip = drop_test_zip(&[
+            ("index.html", "<!doctype html>"),
+            ("api/index.php", "<?php echo getenv('DB_PASSWORD');"),
+        ]);
+        let manifests = inspect_zip_manifests(zip.path()).unwrap();
+        let candidates = drop_inspection_candidates(&manifests);
+        assert!(
+            candidates.iter().all(|candidate| !candidate.is_static),
+            "{candidates:?}"
+        );
+        assert_eq!(candidates[0].directory, ".");
+        assert_eq!(candidates[0].preset, "nixpacks-php");
+    }
+
+    #[test]
+    fn drop_without_a_project_says_what_to_add() {
+        let zip = drop_test_zip(&[("notes.txt", "hello"), ("lib/util.ts", "export {}")]);
+        let manifests = inspect_zip_manifests(zip.path()).unwrap();
+        assert!(drop_inspection_candidates(&manifests).is_empty());
+
+        let problem = no_deployable_project_problem();
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            problem.body.get("type").and_then(|value| value.as_str()),
+            Some(DROP_NO_PROJECT_PROBLEM_TYPE)
+        );
+        let detail = problem.body["detail"].as_str().unwrap();
+        assert!(detail.contains("Add a Dockerfile"), "{detail}");
+        let supported: Vec<&str> = problem.body["supported_files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect();
+        for expected in [
+            "Dockerfile",
+            "package.json",
+            "mix.exs",
+            "Package.swift",
+            "deno.json",
+            "index.php",
+        ] {
+            assert!(
+                supported.contains(&expected),
+                "{expected} missing: {supported:?}"
+            );
+        }
     }
 
     #[test]
@@ -4718,6 +5031,7 @@ mod tests {
         let zip = drop_test_zip(&[
             ("composer.json", "{}"),
             ("vendor/private/.env", "fixture-only"),
+            ("vendor/private/tls.key", "fixture-only"),
         ]);
         assert!(inspect_zip_manifests(zip.path()).is_err());
         // The size cap remains enforced for an actual application manifest.

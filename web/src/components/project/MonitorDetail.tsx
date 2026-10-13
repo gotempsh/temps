@@ -364,11 +364,14 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-4">
-          <Link to={`/projects/${project.slug}/monitors`}>
-            <Button variant="outline" size="icon">
+          <Button asChild variant="outline" size="icon">
+            <Link
+              to={`/projects/${project.slug}/monitors`}
+              aria-label="Back to monitors"
+            >
               <ArrowLeft className="h-4 w-4" />
-            </Button>
-          </Link>
+            </Link>
+          </Button>
           <div>
             <h2 className="text-2xl font-bold tracking-tight">
               {monitor.name}

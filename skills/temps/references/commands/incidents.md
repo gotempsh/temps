@@ -14,6 +14,7 @@ Manage incidents for status pages and monitoring
 - `create` (`add`) - Create a new incident
 - `show` - Show incident details
 - `update-status` - Update an incident status
+- `set-visibility` - Show or hide an incident update on published status pages
 - `updates` - List status updates for an incident
 - `bucketed` - Get bucketed incident data for a project
 
@@ -68,6 +69,20 @@ Update an incident status
 | `--id <id>` | Incident ID | - | Yes |
 | `-s, --status <status>` | New status (investigating, identified, monitoring, resolved) | - | No |
 | `-m, --message <message>` | Status update message | - | No |
+| `--public` | Show this update on published status pages (private by default) | - | No |
+
+### `incidents set-visibility`
+
+Show or hide an incident update on published status pages
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Incident ID | - | Yes |
+| `--update-id <id>` | Incident update ID (see `incidents updates`) | - | Yes |
+| `--public` | Show the update on published status pages | - | No |
+| `--private` | Hide the update from published status pages | - | No |
 
 ### `incidents updates`
 

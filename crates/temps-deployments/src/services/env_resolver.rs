@@ -621,8 +621,10 @@ impl DeploymentEnvResolver {
             project.id, environment.id
         );
 
-        // Get base URL from config service for DSN generation
-        match self.config_service.get_external_url_or_default().await {
+        // The DSN is reported to by the application and by browser SDKs it
+        // ships, so it is built from the public ingress URL (ADR-051), which
+        // defaults to the external URL.
+        match self.config_service.get_public_ingress_url().await {
             Ok(base_url) => {
                 match self
                     .dsn_service

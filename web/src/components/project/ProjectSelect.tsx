@@ -37,6 +37,9 @@ interface ProjectSelectProps {
   placeholder?: string
   disabled?: boolean
   className?: string
+  /** Controls the dropdown, e.g. to open it from a call-to-action elsewhere. */
+  open?: boolean
+  onOpenChange?: (open: boolean) => void
 }
 
 /**
@@ -55,9 +58,20 @@ export function ProjectSelect({
   placeholder = 'Select project…',
   disabled,
   className,
+  open: openProp,
+  onOpenChange,
 }: ProjectSelectProps) {
-  const [open, setOpen] = React.useState(false)
+  const [uncontrolledOpen, setUncontrolledOpen] = React.useState(false)
+  const open = openProp ?? uncontrolledOpen
+  const setOpen = (next: boolean) => {
+    if (openProp === undefined) setUncontrolledOpen(next)
+    onOpenChange?.(next)
+  }
   const queryClient = useQueryClient()
+  // A button with role="combobox" takes no name from its content, so without
+  // `ariaLabel` the picker would be an unnamed control. Fall back to the
+  // visible value (e.g. "All projects") by reference.
+  const valueId = React.useId()
 
   const projectsQuery = useQuery({
     queryKey: ['project-selector-catalog'],
@@ -132,6 +146,7 @@ export function ProjectSelect({
           variant="outline"
           role="combobox"
           aria-label={ariaLabel}
+          aria-labelledby={ariaLabel ? undefined : valueId}
           aria-expanded={open}
           disabled={disabled}
           className={cn(
@@ -142,7 +157,9 @@ export function ProjectSelect({
         >
           <span className="flex min-w-0 items-center">
             {selected && projectImage(selected)}
-            <span className="truncate">{triggerLabel}</span>
+            <span id={valueId} className="truncate">
+              {triggerLabel}
+            </span>
           </span>
           <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
         </Button>

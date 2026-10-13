@@ -20,8 +20,11 @@
 //! deltas-and-tombstones protocol would save bytes but cost a more
 //! complex apply path on the agent. We optimise for *correctness under
 //! restart and reconnect*: the agent can hydrate from a single snapshot
-//! and never has to reconcile partial state. CP restart resets the
-//! generation counter; agents detect (`current < applied`) and re-fetch.
+//! and never has to reconcile partial state. The generation is claimed
+//! from the durable `route_generation` row by this process alone (see
+//! `RouteGenerationRole`), so it continues across CP restarts; a `since`
+//! that differs from the current generation (e.g. after a database
+//! restore) returns at once and the agent re-fetches.
 //!
 //! ## Auth
 //!
@@ -146,6 +149,32 @@ pub struct AcmeChallengeResponse {
     pub key_authorization: String,
 }
 
+/// Projects and environments that store a rate-limit policy. Only the
+/// control-plane proxy enforces rate limits (#1288), so any such policy keeps
+/// public ingress on the control plane. Counts stored policies regardless of
+/// the security switch: over-counting only forgoes direct worker ingress,
+/// while under-counting would serve a limited project unlimited.
+async fn count_project_rate_limit_policies(db: &DatabaseConnection) -> Result<i64, sea_orm::DbErr> {
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+    let row = db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT \
+               (SELECT COUNT(*) FROM projects \
+                 WHERE deleted_at IS NULL \
+                   AND jsonb_typeof(deployment_config -> 'security' -> 'rateLimiting') = 'object') \
+             + (SELECT COUNT(*) FROM environments \
+                 WHERE deleted_at IS NULL \
+                   AND jsonb_typeof(deployment_config -> 'security' -> 'rateLimiting') = 'object') \
+             AS policies",
+        ))
+        .await?;
+    match row {
+        Some(row) => row.try_get::<i64>("", "policies"),
+        None => Ok(0),
+    }
+}
+
 #[derive(Debug, Error)]
 enum SnapshotBuildError {
     #[error("Failed to {operation} for node {node_id}: {source}")]
@@ -241,9 +270,12 @@ pub async fn get_routes_snapshot(
     let armed = notifier.notified();
     tokio::pin!(armed);
 
-    // Fast path: generation already moved past `since` — return now.
+    // Fast path: generation already moved past `since` — return now. A
+    // `since` ahead of this server (its generation was reset, e.g. a restore)
+    // also returns now: waiting for the counter to exceed it would leave the
+    // agent on stale routes, unwoken by every reload, for the full poll.
     let mut current = app_state.peer_table.current_generation();
-    if current > q.since {
+    if current != q.since {
         return Ok(Json(
             build_snapshot(&app_state, &node, current)
                 .await
@@ -265,7 +297,7 @@ pub async fn get_routes_snapshot(
         // by this point we're already inside the wait, so a race here
         // only costs another loop iteration, bounded by the outer timeout.
         loop {
-            if app_state.peer_table.current_generation() > q.since {
+            if app_state.peer_table.current_generation() != q.since {
                 break;
             }
             let notified = notifier.notified();
@@ -302,6 +334,24 @@ pub async fn post_routes_ack(
     // existing column type in node_dns_state. Workers ack u64s but
     // route_generation in practice fits comfortably in i64 (we'd
     // need 9.2e18 reloads to overflow).
+    //
+    // A generation this server has not issued (an agent still on a snapshot
+    // from before a reset) proves nothing about the current routes; storing
+    // it would satisfy the completion gate for routes the node never
+    // received. Its next poll returns at once with the current snapshot.
+    if body.applied_generation > server_generation {
+        warn!(
+            node_id,
+            applied_generation = body.applied_generation,
+            server_generation,
+            "ignoring route ACK for a generation this server has not issued"
+        );
+        return Ok(Json(RouteAckResponse {
+            node_id,
+            applied_generation: body.applied_generation,
+            server_generation,
+        }));
+    }
     let applied_i64: i64 = body.applied_generation.try_into().unwrap_or(i64::MAX);
     let now = chrono::Utc::now();
     let upsert = node_route_state::ActiveModel {
@@ -439,6 +489,13 @@ async fn build_snapshot(
                 operation: "inspect public-ingress IP policy",
                 source,
             })?;
+        let project_rate_limit_count = count_project_rate_limit_policies(state.db.as_ref())
+            .await
+            .map_err(|source| SnapshotBuildError::Database {
+            node_id: node.id,
+            operation: "inspect project rate-limit policies",
+            source,
+        })?;
         let custom_request_policy = !state.request_policy_gate.supports_worker_ingress();
         let registered_worker_addresses: std::collections::HashSet<std::net::IpAddr> =
             nodes::Entity::find()
@@ -457,6 +514,7 @@ async fn build_snapshot(
         let policy_requires_control_plane = app_settings.rate_limiting.enabled
             || app_settings.security_headers.enabled
             || ip_policy_count > 0
+            || project_rate_limit_count > 0
             || custom_request_policy;
         let public_route_count = state.peer_table.worker_public_route_count();
         let raw_public_routes = if policy_requires_control_plane {
@@ -487,6 +545,9 @@ async fn build_snapshot(
         }
         if app_settings.security_headers.enabled {
             unsupported_reasons.push("global security headers are enabled".to_string());
+        }
+        if project_rate_limit_count > 0 {
+            unsupported_reasons.push("project rate limits are configured".to_string());
         }
         if ip_policy_count > 0 {
             unsupported_reasons.push("IP access-control rules are configured".to_string());
@@ -826,6 +887,7 @@ mod tests {
         let (project, environment, deployment) = test_db
             .create_test_project_with_domain("worker-public.example.test")
             .await?;
+        let project_id = project.id;
         let node = test_node(true);
         nodes::ActiveModel::from(node.clone())
             .insert(test_db.db.as_ref())
@@ -906,6 +968,50 @@ mod tests {
                     reason == "a custom request-policy provider requires control-plane ingress"
                 }));
         }
+
+        // A project-level rate limit is only enforced by the control-plane
+        // proxy (#1288), so it must also keep public ingress there.
+        assert_eq!(
+            count_project_rate_limit_policies(test_db.db.as_ref()).await?,
+            0
+        );
+        {
+            use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+            test_db
+                .db
+                .execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "UPDATE projects SET deployment_config = jsonb_set(\
+                       COALESCE(deployment_config, '{}'::jsonb), '{security}', \
+                       '{\"enabled\": true, \"rateLimiting\": {\"maxRequestsPerMinute\": 2}}'::jsonb) \
+                     WHERE id = $1",
+                    [project_id.into()],
+                ))
+                .await?;
+        }
+        assert_eq!(
+            count_project_rate_limit_policies(test_db.db.as_ref()).await?,
+            1
+        );
+        let open_gate = Arc::new(temps_core::RequestPolicyGateSlot::new_default());
+        assert!(open_gate.set(Arc::new(temps_core::OpenRequestPolicyGate)));
+        let limited_snapshot = build_snapshot(
+            &RouteSyncAppState {
+                db: test_db.db.clone(),
+                peer_table: Arc::clone(&peer_table),
+                encryption_service: Arc::clone(&encryption_service),
+                request_policy_gate: open_gate,
+            },
+            &node,
+            1,
+        )
+        .await?;
+        assert!(limited_snapshot.public_ingress.routes.is_empty());
+        assert!(limited_snapshot
+            .public_ingress
+            .unsupported_reasons
+            .iter()
+            .any(|reason| reason == "project rate limits are configured"));
 
         test_db.cleanup().await?;
         Ok(())

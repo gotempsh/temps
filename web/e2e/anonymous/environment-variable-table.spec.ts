@@ -229,9 +229,21 @@ for (const width of [1440, 390]) {
         reveals.push(path)
         body = { value: 'https://example.com' }
       } else if (path.endsWith('/last-deployment')) {
-        await route.fulfill({ status: 404, json: { detail: 'No deployments' } })
+        await route.fulfill({ json: { deployment: null } })
         return
       } else if (path.includes('active-visitors')) body = { count: 0 }
+      // The header's operations tray reads a page object; the default `[]`
+      // crashes it into the header error boundary, taking the breadcrumb
+      // this test asserts with it.
+      else if (path === '/operations') {
+        body = {
+          operations: [],
+          page: 1,
+          page_size: 20,
+          running_count: 0,
+          total: 0,
+        }
+      }
       await route.fulfill({ json: body })
     })
     await page.goto('/projects/example-app/environment-variables')
@@ -366,7 +378,7 @@ for (const width of [1440, 390]) {
     })
     await expect(
       breadcrumbs.getByRole('link', {
-        name: 'Environment variables',
+        name: 'Environment Variables',
         exact: true,
       })
     ).toHaveAttribute('href', '/projects/example-app/environment-variables')
@@ -524,11 +536,11 @@ for (const width of [1440, 390]) {
       page.getByRole('heading', { name: 'Variable not found' })
     ).toBeVisible()
     await page
-      .getByRole('link', { name: 'Back to environment variables', exact: true })
+      .getByRole('link', { name: 'Back to Environment Variables', exact: true })
       .click()
     await expect(table).toBeVisible()
     await expect(breadcrumbs.locator('[aria-current="page"]')).toHaveText(
-      'Environment variables'
+      'Environment Variables'
     )
     await page.goto('/projects/example-app/environment-variables/not-a-number')
     await expect(

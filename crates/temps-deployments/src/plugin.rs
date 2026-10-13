@@ -367,6 +367,11 @@ impl TempsPlugin for DeploymentsPlugin {
                 );
             }
 
+            // One capture slot per deployment, shared by the pipeline's
+            // TakeScreenshotJob and on-demand `take_screenshot` operations.
+            let capture_guard = Arc::new(crate::jobs::DeploymentCaptureGuard::default());
+            context.register_service(capture_guard.clone());
+
             // Create WorkflowExecutionService
             let workflow_execution_service = Arc::new(WorkflowExecutionService::new(
                 db.clone(),
@@ -383,6 +388,7 @@ impl TempsPlugin for DeploymentsPlugin {
                     .unwrap_or_else(|| Arc::new(crate::jobs::NoOpAgentSyncService)),
                 config_service.clone(),
                 screenshot_service,
+                capture_guard.clone(),
                 docker_handle,
             ));
 
@@ -610,6 +616,26 @@ impl TempsPlugin for DeploymentsPlugin {
                 }
             }
 
+            // Failed cron invocations raise alarms (#1289). The monitoring
+            // plugin registers after this one, so the alarm service is only
+            // resolvable here.
+            match (
+                context.get_service::<temps_monitoring::alarm_service::AlarmService>(),
+                context.get_service::<crate::services::DatabaseCronConfigService>(),
+            ) {
+                (Some(alarm_service), Some(cron_service)) => {
+                    cron_service.set_alarm_service(alarm_service);
+                    tracing::debug!("AlarmService wired into cron scheduler");
+                }
+                (None, _) => tracing::warn!(
+                    "AlarmService not available - failed cron invocations will only be \
+                     recorded in their execution history, with no alarm or notification"
+                ),
+                (Some(_), None) => tracing::warn!(
+                    "Cron scheduler service is not registered; cron failure alarms are off"
+                ),
+            }
+
             // Wire auditing for deploy-path security events — currently the
             // ADR-045 record that a deployment received the host Docker
             // socket. Optional: an install with no audit sink still deploys,
@@ -698,6 +724,13 @@ impl TempsPlugin for DeploymentsPlugin {
         let db = context.require_service::<sea_orm::DatabaseConnection>();
         let queue_service = context.require_service::<dyn temps_core::JobQueue>();
         let config_service = context.require_service::<temps_config::ConfigService>();
+        let screenshot_operations = Arc::new(crate::services::ScreenshotOperationService::new(
+            db.clone(),
+            context.require_service::<temps_screenshots::ScreenshotService>(),
+            config_service.clone(),
+            external_deployment_manager.clone(),
+            context.require_service::<crate::jobs::DeploymentCaptureGuard>(),
+        ));
         let external_service_manager =
             context.require_service::<temps_providers::ExternalServiceManager>();
         let dsn_service = context.require_service::<temps_error_tracking::DSNService>();
@@ -868,6 +901,7 @@ impl TempsPlugin for DeploymentsPlugin {
             log_service,
             cron_service,
             external_deployment_manager,
+            screenshot_operations,
             remote_deployment_service,
             db,
             workflow_planner,

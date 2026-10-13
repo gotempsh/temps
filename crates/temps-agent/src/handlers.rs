@@ -403,6 +403,7 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         pull_image,
         crate::build_handler::build_image,
         crate::build_handler::export_image,
+        crate::build_handler::extract_image_path,
         crate::build_handler::inspect_image,
         health_check,
         crate::service_handlers::create_service,

@@ -213,35 +213,35 @@ export function EmailAnalytics() {
             count={stats.delivered}
             rate={null}
             icon={Send}
-            color="text-emerald-500"
+            color="text-emerald-700 dark:text-emerald-500"
           />
           <RateCard
             title="Opened"
             count={stats.opened}
             rate={stats.open_rate}
             icon={Eye}
-            color="text-blue-500"
+            color="text-blue-600 dark:text-blue-500"
           />
           <RateCard
             title="Clicked"
             count={stats.clicked}
             rate={stats.click_rate}
             icon={MousePointerClick}
-            color="text-green-500"
+            color="text-green-700 dark:text-green-500"
           />
           <RateCard
             title="Bounced"
             count={stats.bounced}
             rate={stats.bounce_rate}
             icon={MailWarning}
-            color="text-red-500"
+            color="text-red-700 dark:text-red-500"
           />
           <RateCard
             title="Complained"
             count={stats.complained}
             rate={null}
             icon={AlertTriangle}
-            color="text-orange-500"
+            color="text-orange-700 dark:text-orange-500"
           />
         </div>
       )}
@@ -411,7 +411,7 @@ export function EmailAnalytics() {
                       disabled={page === 1}
                     >
                       <ChevronLeft className="h-4 w-4" />
-                      <span className="hidden sm:inline">Previous</span>
+                      <span className="max-sm:sr-only">Previous</span>
                     </Button>
                     <Button
                       variant="outline"
@@ -419,7 +419,7 @@ export function EmailAnalytics() {
                       onClick={() => setPage((p) => p + 1)}
                       disabled={page >= totalPages}
                     >
-                      <span className="hidden sm:inline">Next</span>
+                      <span className="max-sm:sr-only">Next</span>
                       <ChevronRight className="h-4 w-4" />
                     </Button>
                   </div>

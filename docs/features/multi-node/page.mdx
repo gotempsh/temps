@@ -144,7 +144,7 @@ temps join <url> <token> --private-address 10.0.0.5 \
 ```
 
 - `--name` — A friendly name for this node (defaults to the hostname)
-- `--labels` — Key-value pairs for scheduling hints (e.g., `region=us-east,tier=production`)
+- `--labels` — Key-value pairs for scheduling hints (e.g., `region=us-east,tier=production`). The `temps.sh/role` key is reserved: `temps.sh/role=builder` makes a [build-only node](#control-plane-builds) and `temps.sh/role=dedicated` makes a [dedicated node](#dedicated-nodes)
 - `--agent-address` — The address the agent server listens on (default: `0.0.0.0:3100`)
 
 After joining, the node is registered and the agent config is saved to `~/.temps/agent.json`. Start the agent separately:
@@ -408,13 +408,60 @@ A node is considered **active** if it has sent a heartbeat within the last 90 se
 When you deploy an application with multiple replicas, the **node scheduler** decides which node each replica lands on:
 
 1. It starts from every node with `status = "active"` and a heartbeat within the last 90 seconds, plus the control plane itself (node `0`). If no active worker nodes exist, all replicas run locally on the control plane — unless it was started with [`--profile control-plane`](#control-plane-profile), in which case the deployment fails with an explanation instead.
-2. **Target nodes** and **label selectors**, if set in the environment's or project's deployment settings, narrow the pool first. A label selector matches a node only if every key matches (a list of values matches any of them). The control plane has no labels, so a label selector never places replicas on it; target node `0` selects it explicitly. If these constraints leave no eligible node, the deployment fails with an error instead of ignoring them.
+2. **Target nodes** and **label selectors**, if set in the environment's or project's deployment settings, narrow the pool first. A label selector matches a node only if every key matches (a list of values matches any of them). The control plane has no labels, so a label selector never places replicas on it; target node `0` selects it explicitly. If these constraints leave no eligible node, the deployment fails with an error instead of ignoring them. Build-only nodes (`temps.sh/role=builder`) never take replicas, and [dedicated nodes](#dedicated-nodes) (`temps.sh/role=dedicated`) take them only when the target nodes list names them.
 3. **Architecture compatibility** narrows it further: a node is only eligible if this deployment has a built image for the platform its agent last reported (`linux/amd64`, `linux/arm64`, ...) — otherwise the container would pull the image, start, and immediately fail with `exec format error`. A node that hasn't reported its architecture yet (e.g. mid-upgrade) is kept in the pool with a warning instead of being dropped. Either way, the deploy log says so, e.g. `Skipping node 'worker-2' runs linux/arm64, and this deployment only has images for [linux/amd64]`. This filter needs to know which platforms the image exists for, either from a cross-architecture build or by inspecting the image on the control plane. When it can't tell (for example, the image isn't in the control plane's local image store, or the control plane has no local Docker daemon), the filter is skipped: every node stays eligible, and the deploy log doesn't mention it.
 4. From what's left, replicas are placed with **least-loaded** scheduling by default — each replica goes to the node with the lowest load score (60% CPU, 40% memory usage, from the node's last heartbeat), falling back to round-robin when no node reports capacity data. The control plane doesn't report capacity, so it (like any node without capacity data) counts as 50% loaded. Nodes at or above a 90% load score are skipped unless every remaining node is over that threshold, in which case the threshold is relaxed rather than failing the deployment.
 5. **Anti-affinity** (on by default) tries to give each replica its own node. When there are simply fewer nodes than replicas, replicas wrap around and share nodes. But if nodes were excluded for a lasting reason — for example, an architecture mismatch — and that leaves too few eligible nodes, the deployment fails with an error naming the excluded nodes instead of silently stacking replicas on the same node.
 6. Each container records which node it was assigned to in the database.
 
 The deployment job creates a `RemoteNodeDeployer` for each remote assignment, which communicates with the worker's agent API to deploy, stop, and manage containers.
+
+---
+
+## Dedicated nodes {{ anchor: true, id: 'dedicated-nodes' }}
+
+Some hosts should only run workloads you put there on purpose: a machine with GPUs or KVM, a host isolated for one team, or any server you don't want the scheduler to fill with unrelated deployments. Join such a host with the `dedicated` role:
+
+```bash
+temps join <url> <token> --private-address 10.0.0.7 \
+  --name gpu-1 \
+  --labels temps.sh/role=dedicated,gpu=true
+```
+
+A dedicated node runs an environment **only if that environment lists the node's ID in its target nodes**. Everything else passes it over:
+
+- **Unpinned deployments** (no target nodes) never land on it.
+- **Label selectors alone never select it**, even when every label matches — `gpu=true` matches a kind of machine, a target node ID names this one. A selector combined with a target node list that includes the node still works: both have to match.
+- **Worker builds** (build location *Worker node*, or a control plane without Docker) run on it only for an environment that pins it.
+- **Sandboxes** are never placed on it automatically; a sandbox that requests it by ID or name (`--node gpu-1`, `"node": "gpu-1"`) still runs there, subject to the sandbox node allow-list.
+- **Cross-architecture builds** skip its architecture unless an environment being deployed pins it.
+
+To pin an environment, open the project's **Settings > Environments**, pick the environment, and select the node under **Node scheduling > Target Nodes**. The console marks dedicated nodes with a *Dedicated* badge there and in **Settings > Nodes**. Over the API, set `target_nodes` in the environment settings:
+
+```bash
+curl -X PUT https://temps.example.com/api/projects/{project_id}/environments/{env_id}/settings \
+  -H "Authorization: Bearer $TEMPS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"target_nodes": [7]}'
+```
+
+Pinning other nodes alongside it (`[7, 3]`) spreads that environment over both. Node `0` is the control plane.
+
+When an unpinned deployment has nowhere else to go — every worker is dedicated and the control plane cannot take it — the deployment fails, naming the nodes it passed over. If that is clear from the configuration alone (the control plane runs with `--profile control-plane`, or a label selector excludes it), it fails as it starts: no job runs, and the source is never downloaded or built. If it depends on the image (the control plane cannot run the architecture that was built), it can only be known once the build has finished, so it fails at the deploy step, before anything is transferred to a node. Either way the error reads:
+
+```
+No eligible node for this deployment: node 7 (gpu-1) is dedicated (temps.sh/role=dedicated) and only runs environments that pin it in target_nodes. ...
+```
+
+If the control plane can run the workload, unpinned deployments simply stay on it, and the deploy log notes `Skipping node 'gpu-1' is dedicated ...`. A dedicated node is not counted when anti-affinity decides whether there are enough nodes: marking a node dedicated never makes an unpinned multi-replica deployment fail where it previously wrapped around.
+
+**Changing an existing node's role.** The agent reports its labels on every heartbeat, from the `labels` object in the `~/.temps/agent.json` that `temps join` wrote. To make an existing node dedicated, add `"temps.sh/role": "dedicated"` there and restart `temps agent`; the control plane picks it up on the next heartbeat (within 30 seconds), and the scheduler reads it at every placement decision. Workloads already running on a node when it becomes dedicated are **not moved or stopped** — they keep running until their next deployment, which is then placed under the new rules (so an unpinned environment moves off the node on its next deploy). Sandboxes already on the node keep running too. To stop using the node for something now, redeploy that environment or drain the node.
+
+A node has one role: `builder` and `dedicated` are mutually exclusive values of the same `temps.sh/role` label. A build-only node never hosts replicas, pinned or not.
+
+Like every label, the role is reported by the node itself, so it is a placement policy you set on hosts you control, not an isolation boundary against a compromised worker.
+
+Filtering dedicated nodes is a check over the active node list the scheduler already loads for each placement; it adds no queries and no per-request work.
 
 ---
 
@@ -425,7 +472,7 @@ Sandboxes can run on any node: the control plane or a worker joined with `temps 
 ### Where a new sandbox goes
 
 - **No node requested, control plane allowed** (the default): the sandbox runs on the control plane. A single-node install behaves exactly as before.
-- **No node requested, control plane not allowed**: the sandbox goes to the allowed, active worker with the fewest live sandboxes.
+- **No node requested, control plane not allowed**: the sandbox goes to the allowed, active worker with the fewest live sandboxes. [Dedicated nodes](#dedicated-nodes) are skipped; if only dedicated nodes are left, the request fails and names them.
 - **A node requested**: the sandbox runs there or the request fails. It never falls back to another node.
 
 ```bash
@@ -437,7 +484,7 @@ Over the API, pass the optional `node` field to `POST /api/v1/sandboxes` (`"node
 
 ### Choosing which nodes run sandboxes
 
-By default every node may run sandboxes, including nodes added later. Administrators can restrict this to an allow-list in the console under **AI Workflows > Sandbox > Sandbox nodes**, or from the CLI:
+By default every node may run sandboxes, including nodes added later. Administrators can restrict this to an allow-list in the console under **AI runtime settings > Sandbox > Sandbox nodes**, or from the CLI:
 
 ```bash
 bunx @temps-sdk/cli sandbox nodes                     # every node, whether it is allowed, and why not
@@ -464,7 +511,7 @@ These features only work for sandboxes on the control plane for now. On a worker
 - snapshots, both taking and restoring them
 - preview URLs (the sandbox page explains why there is none)
 - disk resize and workspace volumes
-- the Firecracker backend, and the git, model and harness relays
+- the Firecracker and microsandbox backends, and the git, model and harness relays
 
 Create the sandbox with `--node control-plane` when you need one of them.
 
@@ -524,7 +571,7 @@ background tasks:
 | Vulnerability scanning | Trivy scans images in the *local* image store, and in this profile no image is ever stored here | Nowhere, in this profile. Reported as `vulnerability_scanning: false` — see the note below |
 | Agent sandboxes and the sandbox API | The sandbox API is built on the local container provider, so it is not constructed here, even for sandboxes that would run on workers | A `full`-profile control plane, which can also [place sandboxes on worker nodes](#sandboxes) |
 | Workload importers | Every importer adopts containers from the local daemon | A `full`-profile host |
-| Image builds from source | Builds run against a local daemon; there is none | Not yet supported — see [Building from source](#control-plane-builds) below |
+| Image builds from source | Builds run against a local daemon; there is none | A worker node — see [Building from source](#control-plane-builds) below |
 | On-demand wake/sleep, workspace preview gateway, Traefik label discovery | All operate on local containers | The node that owns the containers |
 
 <Note>
@@ -590,20 +637,65 @@ control plane tells the target worker to pull the image, and the worker pulls
 it directly from the registry. No image data passes through the control plane
 and no local daemon is involved.
 
-Deployments that **build from source** do not work in this profile yet. The
-build path runs against a local daemon, and this process has none. A build is
-refused with an explicit error rather than being attempted:
+Deployments that **build from source** run on a worker node. The control
+plane archives the repository it already checked out, uploads it to the chosen
+node over the authenticated agent channel, and streams the build output back
+into the deployment log. The image stays on the node that built it; a replica
+placed on another node receives it straight from the builder. No Docker daemon
+on the control plane is involved at any point.
 
-```
-This control plane runs no image builds (serve profile 'control-plane').
-Deploy a prebuilt image from a registry instead, or run the full profile on a
-node with Docker.
-```
+The build runs on a node joined with `--labels temps.sh/role=builder` of the
+target architecture when there is one — such nodes build but never host
+replicas — and otherwise on a worker eligible to run the deployment. A
+[dedicated node](#dedicated-nodes) is only eligible for an environment that
+pins it in its target nodes.
 
-Moving the build onto the worker node that will run the image is tracked in
-[issue #1034](https://github.com/gotempsh/temps/issues/1034) — it moves
-application source and build secrets across the control-plane → worker trust
-boundary, so it needs its own security review before implementation starts.
+**Static sites** (Vite, Create React App, Astro, ...) build the same way. The
+control plane then fetches only the output directory (for example `/app/dist`)
+from the node that built it, checks it under the same size, file-count and
+file-type limits as a local build, and serves it from its own proxy like any
+other static deployment. Static output does not depend on CPU architecture, so
+any eligible worker can build it, including on a mixed-architecture cluster.
+
+When the nodes a deployment may run on span **more than one architecture**
+(for example arm64 and amd64 workers), it builds one image per architecture,
+each natively on a worker of that architecture, in parallel — see
+[Worker builds on a mixed cluster](#mixed-architecture-worker-builds).
+
+Current limits of worker builds:
+
+- **Secrets stay on the control plane.** A worker build receives the values
+  of variables that are not secret: your project variables that are not marked
+  secret, and the platform's public ones (the bind address, the browser
+  Sentry DSN and tunnel, the API and telemetry endpoints). They travel to the
+  node inside the build request, over the same authenticated agent channel as
+  the source, and are applied as `docker build --build-arg` values, so a
+  `VITE_*`, `NEXT_PUBLIC_*` or `PUBLIC_*` variable is inlined into the bundle
+  exactly as on a local build. Variables marked secret, linked-service
+  credentials, the deployment token and generated package-registry
+  credentials (`NPM_TOKEN`/`.npmrc`) are never sent:
+  - A generated Dockerfile builds without them and the build log names what
+    was withheld. If one of them is a variable the framework inlines into the
+    bundle (for example a secret `VITE_*`), the log warns that it will be
+    empty; with build location *Worker node* on a server that can build
+    locally, that build stays on the control plane instead.
+  - Your own Dockerfile may declare any `ARG`. One that would read a withheld
+    value is refused by name before anything is uploaded, rather than built
+    without it. Read the value when the container runs, recreate it as a
+    non-secret variable if it is not sensitive, or build on the control plane.
+  - A build that needs `NPM_TOKEN`/`.npmrc` fails with a message naming what
+    was withheld.
+- **Upgrade agents with the control plane.** Build-argument values use
+  version 2 of the worker build protocol. A build with no value to send still
+  uses version 1, so an older agent keeps building those; one that receives a
+  version 2 request refuses it and the deployment asks you to upgrade Temps on
+  that worker.
+
+Build caches stay separate per project on a shared worker: like the control
+plane, a worker scopes `RUN --mount=type=cache` mounts by project, environment
+and branch, so one project's build cannot read or overwrite another's package
+or compiler cache. Upgrade `temps agent` on build nodes to get this; an older
+agent builds without the namespace.
 
 ---
 
@@ -671,6 +763,43 @@ If emulated build times don't suit you, the alternatives are to restrict the
 environment to nodes of a single architecture with target nodes or labels, or
 to push a pre-built image.
 
+### Worker builds on a mixed cluster {{ anchor: true, id: 'mixed-architecture-worker-builds' }}
+
+With `--profile control-plane`, a deployment whose eligible nodes span several
+architectures needs no setting and no emulation. Temps builds each
+architecture on a worker of that architecture — a `temps.sh/role=builder`
+node when there is one, otherwise a worker the deployment could run on — and
+all of them in parallel. The first architecture keeps the plain tag; the
+others are suffixed, as above. A cluster whose workers share one architecture
+builds once, exactly as before.
+
+- **Logs.** Every line of each build is prefixed with its platform
+  (`[linux/arm64] ...`) in the deployment's build log, followed by which
+  worker built which image.
+- **All or nothing.** If one architecture fails, the builds still running are
+  stopped and the deployment fails with that architecture's error. It is never
+  rolled out on only some of its architectures.
+- **Placement.** Each replica lands on a node whose architecture has an image,
+  and receives that image from the worker that built it, over the same
+  authenticated agent channel as any other worker-built image. Rollbacks and
+  promotions reuse the same per-architecture images; a replica that moves to a
+  node of another architecture runs that architecture's image, and a deploy
+  that would need an architecture it never built fails instead of running the
+  wrong one.
+- **Caches.** Each architecture gets its own `RUN --mount=type=cache`
+  namespace, so native artifacts (`node_modules`, `target/`) built for one
+  architecture are never reused by another.
+- **No worker for an architecture.** Before anything is built, each chosen
+  worker is checked over its agent connection (10-second limit). Candidates
+  are tried in order: every `temps.sh/role=builder` node of that
+  architecture, lowest id first, then the workers the deployment could run
+  on. An unreachable worker, or one whose agent reports another
+  architecture, is replaced by the next candidate; if none is left, the
+  deployment fails naming the architecture, for example
+  `Deployment 42 targets linux/amd64 nodes, but no linux/amd64 worker can
+  build its image`. Bring such a worker online, or restrict target nodes or
+  labels to the architectures that have one.
+
 ### Replica counts on a mixed cluster
 
 With anti-affinity on (the default), Temps places one replica per node. If an
@@ -690,8 +819,10 @@ node's native architecture automatically.
 Multi-node is functional but still evolving. Known limitations:
 
 - **No bin-packing** — placement is least-loaded plus anti-affinity, not full bin-packing across resource dimensions.
-- **Worker sandboxes are a subset** — sandboxes on worker nodes have no terminal, agent runtime (Fleet), snapshots, preview URLs, disk resize, workspace volumes or Firecracker backend yet. See [Sandboxes on worker nodes](#sandboxes).
+- **Worker sandboxes are a subset** — sandboxes on worker nodes have no terminal, agent runtime (Fleet), snapshots, preview URLs, disk resize, workspace volumes or Firecracker/microsandbox backends yet. See [Sandboxes on worker nodes](#sandboxes).
 - **Sandboxes don't move** — a sandbox stays on the node it was created on. Draining a node does not move its sandboxes; [evict them](#sandboxes) before removing the node.
+- **Drain rebuilds what it moves** — a deployment whose only replicas are on the draining node is rebuilt elsewhere from its source: the Git ref it was built from, the same image for image deployments, or the retained ZIP for uploaded-source deployments. If any such deployment has nothing to rebuild from (for example its uploaded archive is gone), the drain is refused with a `409` that names it (the first 50 individually, the rest counted), and the node is left unchanged; redeploy or delete that workload first.
+- **Removing a node cleans up what Temps left on it** — before a drained node is removed, Temps removes the containers it placed there that no deployment needs but that may still exist, such as a failed deployment's container, or one a drain's redeploy replaced while the node was unreachable. With the agent running, Temps asks the node about each of those containers individually: one that is still there is removed after its labels confirm the owning project, and only Docker reporting it not found counts as already gone, so nothing it placed there is forgotten. Containers that earlier releases recorded as removed on a worker without confirming it are checked the same way after upgrading. Containers of a current or still-running deployment block removal until the drain has moved them, and so do those of the deployment a rollout in progress would fall back to if its new deployment fails its checks; retry once the rollout finishes. If the node's agent cannot confirm that a container is gone, removal is refused with a `409` listing each container (the first 50 are described individually and the rest are counted). Start `temps agent` on the node, or remove them on that host with `docker rm -f`, then retry. If the host is gone for good, remove it with `?force=true` (**Remove Anyway** in the console's remove dialog, or `temps node remove <id> --yes --force`): the containers are recorded as orphaned on that node, listed in the response, and later project deletion skips them instead of failing. Because removal deletes containers on the host, it asks an administrator with MFA enrolled to verify again in the console, as draining does; API keys and CLI tokens are not prompted.
 - **Sandboxes need a `full`-profile control plane** — a control plane started with `--profile control-plane` serves no sandbox API, so it cannot place sandboxes on workers either.
 
 ---

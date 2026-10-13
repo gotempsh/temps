@@ -11,6 +11,7 @@ import { PlatformAccessContext } from '@/contexts/PlatformAccessContext-shared'
 import {
   getDomainByIdOptions,
   getDomainOrderOptions,
+  listDnsProvidersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { DomainDetail } from './DomainDetail'
 
@@ -73,7 +74,11 @@ for (const error of [
     const client = createClient()
     fail(client, domainKey, error)
     const html = render(client)
-    expect(html).toContain('Domain unavailable')
+    expect(html).toContain(
+      error instanceof TypeError || error.status === 500
+        ? 'Domain unavailable'
+        : 'Domain: access denied'
+    )
     expect(html).not.toContain('Domain not found')
     expect(html).toContain('Retry')
     expect(html).toContain('Back to Domains')
@@ -95,20 +100,23 @@ test('cached domain and order survive failed refreshes without offering a new or
   const client = createClient()
   client.setQueryData(domainKey, domain)
   client.setQueryData(orderKey, {
-    id: 2,
-    domain_id: 1,
-    identifiers: [],
-    order_url: 'https://acme.example.test/order/2',
-    status: 'pending',
-    email: 'operator@example.test',
-    created_at: domain.created_at,
-    updated_at: domain.updated_at,
+    order: {
+      id: 2,
+      domain_id: 1,
+      identifiers: [],
+      order_url: 'https://acme.example.test/order/2',
+      status: 'pending',
+      email: 'operator@example.test',
+      created_at: domain.created_at,
+      updated_at: domain.updated_at,
+    },
+    reason: null,
   })
   fail(client, domainKey, new TypeError('Failed to fetch'))
   fail(client, orderKey, { title: 'Forbidden', status: 403 })
   const html = render(client)
   expect(html).toContain('app.example.test')
-  expect(html).toContain('Certificate order unavailable')
+  expect(html).toContain('Certificate order: access denied')
   expect(html).toContain('Showing last-known data')
   expect(html).toContain('ACME order')
   expect(html).not.toContain('Create new order')
@@ -118,15 +126,15 @@ test('cached domain and order survive failed refreshes without offering a new or
     staleTime: 0,
   })
   client.removeQueries({ queryKey: orderKey })
-  await client
-    .fetchQuery({
-      queryKey: orderKey,
-      queryFn: async () => {
-        throw { title: 'Not Found', status: 404 }
-      },
-      staleTime: 0,
-    })
-    .catch(() => {})
+  // "No order yet" is a normal 200 answer with an explicit null, not an error.
+  await client.fetchQuery({
+    queryKey: orderKey,
+    queryFn: async () => ({
+      order: null,
+      reason: 'No ACME order has been created for this domain.',
+    }),
+    staleTime: 0,
+  })
   const recovered = render(client)
   expect(recovered).not.toContain('unavailable')
   expect(recovered).toContain('Create order')
@@ -155,15 +163,18 @@ for (const status of ['active', 'active_renewal_failed']) {
         client.setQueryData(domainKey, pendingDomain)
         if (cachedOrder) {
           client.setQueryData(orderKey, {
-            id: 2,
-            domain_id: 1,
-            status: 'pending',
-            authorizations: { challenge_type: method },
-            identifiers: [],
-            order_url: 'https://acme.example.test/order/2',
-            email: 'operator@example.test',
-            created_at: domain.created_at,
-            updated_at: domain.updated_at,
+            order: {
+              id: 2,
+              domain_id: 1,
+              status: 'pending',
+              authorizations: { challenge_type: method },
+              identifiers: [],
+              order_url: 'https://acme.example.test/order/2',
+              email: 'operator@example.test',
+              created_at: domain.created_at,
+              updated_at: domain.updated_at,
+            },
+            reason: null,
           })
         }
         fail(client, orderKey, orderError)
@@ -200,3 +211,152 @@ for (const status of ['active', 'active_renewal_failed']) {
     }
   }
 }
+
+function dnsChallengeClient() {
+  const client = createClient()
+  client.setQueryData(domainKey, domain)
+  client.setQueryData(orderKey, {
+    order: {
+      id: 2,
+      domain_id: 1,
+      status: 'pending',
+      identifiers: [],
+      authorizations: {
+        challenge_type: 'dns-01',
+        dns_txt_records: [
+          {
+            name: '_acme-challenge.app.example.test',
+            value: 'challenge-value',
+          },
+        ],
+      },
+      order_url: 'https://acme.example.test/order/2',
+      email: 'operator@example.test',
+      created_at: domain.created_at,
+      updated_at: domain.updated_at,
+    },
+    reason: null,
+  })
+  return client
+}
+const providersKey = listDnsProvidersOptions().queryKey
+
+test('DNS challenge with no provider onboards and preserves the manual steps', () => {
+  const client = dnsChallengeClient()
+  client.setQueryData(providersKey, [])
+  const html = render(client)
+  expect(html).toContain('Auto-provision records')
+  expect(html).toContain('No DNS provider is configured')
+  expect(html).toContain('href="/dns-providers"')
+  expect(html).toContain('Add DNS provider')
+  expect(html).toContain('challenge-value')
+  expect(html).toContain('Verify &amp; finalize')
+  client.clear()
+})
+
+test('DNS provider loading is distinct from missing configuration', () => {
+  const client = dnsChallengeClient()
+  const html = render(client)
+  expect(html).toContain('Loading DNS providers')
+  expect(html).not.toContain('No DNS provider is configured')
+  client.clear()
+})
+
+test('DNS provider failure offers retry instead of implying no configuration', () => {
+  const client = dnsChallengeClient()
+  fail(client, providersKey, new TypeError('Failed to fetch'))
+  const html = render(client)
+  expect(html).toContain('Could not load DNS providers')
+  expect(html).toContain('Retry DNS providers')
+  expect(html).not.toContain('No DNS provider is configured')
+  expect(html).toContain('challenge-value')
+  client.clear()
+})
+
+test('DNS provider refresh failure retains the configured provider and retry', () => {
+  const client = dnsChallengeClient()
+  client.setQueryData(providersKey, [
+    {
+      id: 1,
+      name: 'Configured DNS',
+      provider_type: 'cloudflare',
+      credentials: {},
+      flat_hostnames_supported: true,
+      is_active: true,
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
+    },
+  ])
+  fail(client, providersKey, new TypeError('Failed to fetch'))
+  const html = render(client)
+  expect(html).toContain('Auto-create')
+  expect(html).toContain('Retry DNS providers')
+  expect(html).not.toContain('No DNS provider is configured')
+  client.clear()
+})
+
+const failedDomain = {
+  ...domain,
+  status: 'failed',
+  last_error: 'ACME challenge was rejected',
+  last_error_type: 'challenge_invalidated',
+}
+
+function orderWithStatus(status: string) {
+  return {
+    order: {
+      id: 2,
+      domain_id: 1,
+      status,
+      identifiers: [],
+      authorizations: {
+        challenge_type: 'dns-01',
+        dns_txt_records: [
+          { name: '_acme-challenge.app.example.test', value: 'stale-value' },
+        ],
+      },
+      order_url: 'https://acme.example.test/order/2',
+      email: 'operator@example.test',
+      created_at: domain.created_at,
+      updated_at: domain.updated_at,
+    },
+    reason: null,
+  }
+}
+
+test('failed domain whose challenge the CA invalidated starts a new order instead of resubmitting', () => {
+  const client = createClient()
+  client.setQueryData(domainKey, failedDomain)
+  client.setQueryData(orderKey, orderWithStatus('invalid'))
+  const html = render(client)
+  expect(html).toContain('Verification failed')
+  expect(html).toContain('ACME challenge was rejected')
+  expect(html).toContain('Start new order')
+  expect(html).not.toContain('Retry verification')
+  // The dead challenge's TXT value must not be offered as a record to publish.
+  expect(html).not.toContain('stale-value')
+  client.clear()
+})
+
+test('failed domain without any order starts a new order', () => {
+  const client = createClient()
+  client.setQueryData(domainKey, failedDomain)
+  client.setQueryData(orderKey, {
+    order: null,
+    reason: 'No ACME order has been created for this domain.',
+  })
+  const html = render(client)
+  expect(html).toContain('Start new order')
+  expect(html).not.toContain('Retry verification')
+  client.clear()
+})
+
+test('failed domain whose order is still open can verify again', () => {
+  const client = createClient()
+  client.setQueryData(domainKey, failedDomain)
+  client.setQueryData(orderKey, orderWithStatus('pending'))
+  const html = render(client)
+  expect(html).toContain('Retry verification')
+  expect(html).not.toContain('Start new order')
+  client.clear()
+})

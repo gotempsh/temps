@@ -6,7 +6,7 @@ use crate::handlers::backup_handler::{
 };
 use anyhow::Result;
 use aws_sdk_s3::error::ProvideErrorMetadata;
-use aws_sdk_s3::{Client as S3Client, Config};
+use aws_sdk_s3::Client as S3Client;
 use chrono::{DateTime, Duration, Timelike, Utc};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseBackend, DatabaseConnection, EntityTrait,
@@ -15,7 +15,6 @@ use sea_orm::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use serde_yaml;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -26,6 +25,7 @@ use tokio::time;
 use tracing::{debug, error, info, warn};
 use urlencoding;
 use uuid::Uuid;
+use yaml_serde;
 
 use cron::Schedule;
 use temps_core::notifications::BackupFailureData;
@@ -610,6 +610,194 @@ fn retention_expiry(
     started_at.checked_add_signed(Duration::days(i64::from(retention_period_days)))
 }
 
+/// Owns one uniquely named, labelled cleanup helper before creation starts.
+/// The create task retains this guard even if its caller is cancelled.
+struct OrphanWalgHelper {
+    docker: bollard::Docker,
+    name: String,
+    backup_id: String,
+    id: Option<String>,
+    armed: bool,
+}
+
+impl Drop for OrphanWalgHelper {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let docker = self.docker.clone();
+        let name = self.name.clone();
+        let backup_id = self.backup_id.clone();
+        let known_id = self.id.take();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let cleanup = async {
+                    let id = match known_id {
+                        Some(id) => id,
+                        None => {
+                            let container = match docker.inspect_container(&name, None::<bollard::query_parameters::InspectContainerOptions>).await {
+                                Ok(container) => container,
+                                Err(bollard::errors::Error::DockerResponseServerError { status_code: 404, .. }) => return Ok(()),
+                                Err(error) => return Err(error),
+                            };
+                            // A name lookup after an ambiguous create failure
+                            // may remove only this request's labelled helper.
+                            let owned = container.config.as_ref()
+                                .and_then(|config| config.labels.as_ref())
+                                .and_then(|labels| labels.get("temps.backup_cleanup_id"))
+                                == Some(&backup_id);
+                            if !owned {
+                                warn!(helper_name = %name, "Refusing to remove an unowned WAL-G helper name");
+                                return Ok(());
+                            }
+                            let Some(id) = container.id else { return Ok(()) };
+                            id
+                        }
+                    };
+                    docker.remove_container(&id, Some(bollard::query_parameters::RemoveContainerOptions {
+                        force: true, v: true, ..Default::default()
+                    })).await
+                };
+                match time::timeout(std::time::Duration::from_secs(10), cleanup).await {
+                    Ok(Ok(())) | Ok(Err(bollard::errors::Error::DockerResponseServerError { status_code: 404, .. })) => {}
+                    Ok(Err(error)) => warn!(helper_name = %name, %error, "Orphan WAL-G helper removal failed; inspect this labelled helper before retrying cleanup"),
+                    Err(error) => warn!(helper_name = %name, %error, "Orphan WAL-G helper removal timed out; inspect this labelled helper before retrying cleanup"),
+                }
+            });
+        }
+    }
+}
+
+async fn create_owned_orphan_helper(
+    docker: bollard::Docker,
+    name: String,
+    backup_id: String,
+    config: bollard::models::ContainerCreateBody,
+) -> Result<(String, OrphanWalgHelper), BackupError> {
+    match docker
+        .inspect_container(
+            &name,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await
+    {
+        Ok(_) => {
+            return Err(BackupError::Validation(format!(
+                "Refusing to reuse existing orphan cleanup helper '{name}'"
+            )))
+        }
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => {}
+        Err(error) => {
+            return Err(BackupError::ExternalService(format!(
+                "Failed to check new orphan cleanup helper '{name}': {error}"
+            )))
+        }
+    }
+    // Do not cancel an in-flight Docker create merely because the enclosing
+    // deletion deadline expires. Docker may already have committed creation.
+    // When this task finishes after its receiver disappeared, its owned guard
+    // is dropped and removes the helper even if it was never started.
+    tokio::spawn(async move {
+        let mut owner = OrphanWalgHelper {
+            docker: docker.clone(),
+            name: name.clone(),
+            backup_id,
+            id: None,
+            armed: true,
+        };
+        let created = docker
+            .create_container(
+                Some(bollard::query_parameters::CreateContainerOptions {
+                    name: Some(name.clone()),
+                    ..Default::default()
+                }),
+                config,
+            )
+            .await
+            .map_err(|error| {
+                if matches!(
+                    error,
+                    bollard::errors::Error::DockerResponseServerError {
+                        status_code: 409,
+                        ..
+                    }
+                ) {
+                    owner.armed = false;
+                }
+                BackupError::ExternalService(format!(
+                    "Failed to create orphan cleanup helper '{name}': {error}"
+                ))
+            })?;
+        owner.id = Some(created.id.clone());
+        Ok::<_, BackupError>((created.id, owner))
+    })
+    .await
+    .map_err(|error| {
+        BackupError::ExternalService(format!(
+            "Orphan cleanup helper creation task failed: {error}"
+        ))
+    })?
+}
+
+/// Backup provenance is retained independently of the live service. Require
+/// agreement across every retained child before choosing an orphan repository.
+fn retained_walg_service_identity(
+    children: &[temps_entities::external_service_backups::Model],
+    service_id: i32,
+    backup_id: &str,
+) -> Result<(String, String), BackupError> {
+    let mut identity = None;
+    for child in children {
+        if child.service_id != service_id {
+            return Err(BackupError::Validation(format!("Backup {backup_id} has inconsistent retained service identity; refusing orphan deletion")));
+        }
+        let candidate = child.service_name_snapshot.as_deref()
+            .filter(|name| !name.is_empty())
+            .zip(child.service_type_snapshot.as_deref().filter(|kind| !kind.is_empty()))
+            .ok_or_else(|| BackupError::Validation(format!("Backup {backup_id} has no retained service provenance. Its repository cannot be safely deleted after service {service_id} was removed")))?;
+        if identity.is_some_and(|previous| previous != candidate) {
+            return Err(BackupError::Validation(format!("Backup {backup_id} has conflicting retained service provenance; refusing orphan deletion")));
+        }
+        identity = Some(candidate);
+    }
+    identity
+        .map(|(name, kind)| (name.to_string(), kind.to_string()))
+        .ok_or_else(|| {
+            BackupError::Validation(format!(
+                "Backup {backup_id} has no retained service provenance; refusing orphan deletion"
+            ))
+        })
+}
+
+/// Prefer the admitted repository identity even while the live service has
+/// been renamed. A live identity is only a compatibility fallback for legacy
+/// backups with no snapshots; partial or conflicting snapshots fail closed.
+fn deletion_walg_service_identity(
+    children: &[temps_entities::external_service_backups::Model],
+    service_id: i32,
+    backup_id: &str,
+    live_identity: Option<(&str, &str)>,
+) -> Result<(String, String), BackupError> {
+    if live_identity.is_none()
+        || children.iter().any(|child| {
+            child.service_name_snapshot.is_some() || child.service_type_snapshot.is_some()
+        })
+    {
+        return retained_walg_service_identity(children, service_id, backup_id);
+    }
+    if children.iter().any(|child| child.service_id != service_id) {
+        return Err(BackupError::Validation(format!(
+            "Backup {backup_id} has inconsistent retained service identity; refusing deletion"
+        )));
+    }
+    match live_identity {
+        Some((name, kind)) => Ok((name.to_string(), kind.to_string())),
+        None => retained_walg_service_identity(children, service_id, backup_id),
+    }
+}
+
 /// A validated engine selection, never inferred from an operator-controlled S3 path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WalgDeletionEngine {
@@ -666,6 +854,19 @@ impl WalgDeletionEngine {
             )));
         }
         Ok(())
+    }
+}
+
+/// Longest engine error kept per service in an aggregated failure message.
+const MAX_FAILURE_CAUSE_CHARS: usize = 300;
+
+/// One service's failure cause, short enough to aggregate several of them
+/// into a single message an operator can read.
+fn bounded_failure_cause(cause: &str) -> String {
+    let cause = cause.trim();
+    match cause.char_indices().nth(MAX_FAILURE_CAUSE_CHARS) {
+        Some((cut, _)) => format!("{}...", &cause[..cut]),
+        None => cause.to_string(),
     }
 }
 
@@ -788,6 +989,21 @@ pub enum BackupError {
 
     #[error("S3 error: {0}")]
     S3(String),
+
+    /// An S3 destination could not be verified: it is unreachable, or it
+    /// rejected the configured credentials or bucket. Returned by creating,
+    /// updating and testing a destination; nothing is saved.
+    #[error(
+        "Could not verify S3 bucket '{bucket}' at {endpoint}: {}. {}. Cause: {cause}",
+        .kind.summary(),
+        .kind.hint()
+    )]
+    S3Unreachable {
+        endpoint: String,
+        bucket: String,
+        kind: crate::services::s3_probe::S3ProbeFailureKind,
+        cause: String,
+    },
 
     #[error("Schedule error: {0}")]
     Schedule(String),
@@ -1432,6 +1648,28 @@ pub struct BackupService {
 }
 
 impl BackupService {
+    /// Why running a backup of external service `service_id` with
+    /// `engine_key` would restart its database now, or `None`. Only the
+    /// WAL-G PostgreSQL engine can restart a service (to turn archiving on).
+    pub async fn backup_restart_reason(
+        &self,
+        service_id: i32,
+        engine_key: &str,
+    ) -> Result<Option<String>, BackupError> {
+        if engine_key != "postgres_walg" {
+            return Ok(None);
+        }
+        self.external_service_manager
+            .backup_restart_reason(service_id)
+            .await
+            .map_err(|e| {
+                BackupError::ExternalService(format!(
+                    "Failed to check whether backing up service {} restarts it: {}",
+                    service_id, e
+                ))
+            })
+    }
+
     pub fn new(
         db: Arc<DatabaseConnection>,
         external_service_manager: Arc<ExternalServiceManager>,
@@ -1758,7 +1996,7 @@ impl BackupService {
         // credentials. Legacy manifests wrote it in plaintext. New recovery
         // sets encrypt it with a key derived from the S3 secret already needed
         // to download the backup, so bucket contents alone do not expose it.
-        let server_config = serde_yaml::to_string(&self.config_service.get_server_config())
+        let server_config = yaml_serde::to_string(&self.config_service.get_server_config())
             .map_err(|error| {
                 BackupError::Configuration(format!(
                     "Failed to serialize server config for recovery set {}: {}",
@@ -2106,7 +2344,11 @@ SELECT cp.id
                 }
                 Err(e) => {
                     error!("Failed to backup external service {}: {}", service.name, e);
-                    failed_services.push(service.name.clone());
+                    failed_services.push(format!(
+                        "{} ({})",
+                        service.name,
+                        bounded_failure_cause(&e.to_string())
+                    ));
 
                     // Send notification about this specific failure
                     let error_msg = format!("External service backup failed: {}", e);
@@ -2133,13 +2375,13 @@ SELECT cp.id
         if !failed_services.is_empty() {
             error!(
                 "Backup completed with failures. Failed services: {}",
-                failed_services.join(", ")
+                failed_services.join("; ")
             );
             return Err(BackupError::Internal {
                 message: format!(
                     "Whole-instance backup {} is incomplete because these services failed: {}",
                     backup.backup_id,
-                    failed_services.join(", ")
+                    failed_services.join("; ")
                 ),
             });
         }
@@ -3102,32 +3344,14 @@ SELECT cp.id
             "backup-service",
         );
 
-        let mut config_builder = Config::builder()
-            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
-            .region(aws_sdk_s3::config::Region::new(s3_source.region.clone()))
-            .force_path_style(s3_source.force_path_style.unwrap_or(true)) // Default to true for Minio
-            .credentials_provider(creds)
-            .http_client(crate::engines::v2_common::bundled_roots_http_client())
-            // aws-sdk-s3 defaults to computing a flexible checksum and sending it via
-            // aws-chunked trailers on every PutObject/UploadPart. Most third-party
-            // S3-compatible providers (Cloudflare R2, OVH, MinIO, Backblaze) don't
-            // implement that trailer format and reject or corrupt the upload, so only
-            // compute checksums when a caller explicitly asks for one.
-            .request_checksum_calculation(
-                aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
-            );
-
-        // Only set endpoint URL if endpoint is specified (for Minio/custom S3)
-        if let Some(endpoint) = &s3_source.endpoint {
-            let endpoint_url = if endpoint.starts_with("http") {
-                endpoint.clone()
-            } else {
-                format!("http://{}", endpoint)
-            };
-            config_builder = config_builder.endpoint_url(endpoint_url);
-        }
-
-        let config = config_builder.build();
+        // Default to path style for MinIO and other S3-compatible stores.
+        let config = crate::engines::v2_common::s3_config_builder(
+            &s3_source.region,
+            s3_source.force_path_style.unwrap_or(true),
+            creds,
+            s3_source.endpoint.as_deref(),
+        )
+        .build();
 
         Ok(S3Client::from_conf(config))
     }
@@ -3145,250 +3369,40 @@ SELECT cp.id
             "backup-service",
         );
 
-        let mut config_builder = Config::builder()
-            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
-            .region(aws_sdk_s3::config::Region::new(request.region.clone()))
-            .force_path_style(request.force_path_style.unwrap_or(true))
-            .credentials_provider(creds)
-            .http_client(crate::engines::v2_common::bundled_roots_http_client())
-            // See create_s3_client() above for why this is forced to WhenRequired.
-            .request_checksum_calculation(
-                aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
-            );
-
-        // Only set endpoint URL if endpoint is specified (for MinIO)
-        if let Some(endpoint) = &request.endpoint {
-            let endpoint_url = if endpoint.starts_with("http") {
-                endpoint.clone()
-            } else {
-                format!("http://{}", endpoint)
-            };
-            config_builder = config_builder.endpoint_url(endpoint_url);
-        }
-
-        let config = config_builder.build();
+        let config = crate::engines::v2_common::s3_config_builder(
+            &request.region,
+            request.force_path_style.unwrap_or(true),
+            creds,
+            request.endpoint.as_deref(),
+        )
+        // This client only verifies a destination while an operator
+        // waits; bound it so an endpoint that never answers cannot hold
+        // the request open.
+        .timeout_config(
+            aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+                .operation_timeout(crate::services::s3_probe::S3_PROBE_OPERATION_TIMEOUT)
+                .build(),
+        )
+        .build();
         Ok(S3Client::from_conf(config))
     }
 
-    /// Test S3 connection and auto-create bucket if it doesn't exist
-    async fn test_and_create_s3_bucket(
+    /// Verify that the destination described by `request` is reachable and
+    /// accepts its credentials, classifying the failure when it is not.
+    async fn verify_s3_destination(
         &self,
-        s3_client: &S3Client,
-        bucket_name: &str,
+        request: &CreateS3SourceRequest,
+        on_missing: crate::services::s3_probe::MissingBucket,
     ) -> Result<(), BackupError> {
-        // Try to check if bucket exists by listing objects with max-keys=1
-        // This is a lightweight way to test access to the bucket
-        match s3_client
-            .list_objects_v2()
-            .bucket(bucket_name)
-            .max_keys(1)
-            .send()
-            .await
-        {
-            Ok(_) => {
-                debug!("S3 bucket '{}' exists and is accessible", bucket_name);
-                Ok(())
-            }
-            Err(e) => {
-                // Check if it's a "NoSuchBucket" error
-                let error_code = e
-                    .as_service_error()
-                    .and_then(|se| se.code())
-                    .map(|s| s.to_string());
-
-                if error_code.as_deref() == Some("NoSuchBucket") {
-                    // Bucket doesn't exist, try to create it
-                    debug!("S3 bucket '{}' does not exist, creating it...", bucket_name);
-                    s3_client
-                        .create_bucket()
-                        .bucket(bucket_name)
-                        .send()
-                        .await
-                        .map_err(|e| {
-                            // Parse create bucket error for better messaging
-                            let error_msg = self.parse_s3_error(&e, bucket_name, "create");
-                            BackupError::S3(error_msg)
-                        })?;
-                    info!("Successfully created S3 bucket '{}'", bucket_name);
-                    Ok(())
-                } else {
-                    // Other S3 error (invalid credentials, no access, etc.)
-                    let error_msg = self.parse_s3_error(&e, bucket_name, "access");
-                    Err(BackupError::S3(error_msg))
-                }
-            }
-        }
-    }
-
-    /// Parse S3 SDK errors and provide user-friendly, actionable error messages
-    fn parse_s3_error<E>(&self, error: &E, bucket_name: &str, operation: &str) -> String
-    where
-        E: std::error::Error + std::fmt::Display,
-    {
-        let error_str = error.to_string();
-
-        // Check for common error patterns and provide actionable guidance
-
-        // Connection/Network errors
-        if error_str.contains("ConnectorError")
-            || error_str.contains("connection")
-            || error_str.contains("ConnectionRefused")
-            || error_str.contains("tcp connect error")
-        {
-            return format!(
-                "Unable to connect to S3 endpoint for bucket '{}'. \
-                Please verify:\n\
-                • The endpoint URL is correct and reachable\n\
-                • Network/firewall allows connections to the S3 service\n\
-                • The S3 service is running (for MinIO/LocalStack)\n\
-                Technical details: {}",
-                bucket_name, error_str
-            );
-        }
-
-        // DNS resolution errors
-        if error_str.contains("dns error")
-            || error_str.contains("failed to lookup address")
-            || error_str.contains("Name or service not known")
-        {
-            return format!(
-                "Failed to resolve S3 endpoint hostname for bucket '{}'. \
-                Please verify:\n\
-                • The endpoint URL is correct\n\
-                • DNS is properly configured\n\
-                • The hostname is valid and resolvable\n\
-                Technical details: {}",
-                bucket_name, error_str
-            );
-        }
-
-        // Timeout errors
-        if error_str.contains("timeout") || error_str.contains("timed out") {
-            return format!(
-                "Connection to S3 endpoint timed out for bucket '{}'. \
-                Please verify:\n\
-                • The S3 service is running and responsive\n\
-                • Network latency is acceptable\n\
-                • Firewall rules allow connections\n\
-                Technical details: {}",
-                bucket_name, error_str
-            );
-        }
-
-        // Authentication errors
-        if error_str.contains("InvalidAccessKeyId")
-            || error_str.contains("SignatureDoesNotMatch")
-            || error_str.contains("InvalidSecurity")
-        {
-            return format!(
-                "Authentication failed for bucket '{}'. \
-                Please verify:\n\
-                • Access Key ID is correct\n\
-                • Secret Access Key is correct\n\
-                • Credentials have not expired\n\
-                • The credentials match the S3 service configuration\n\
-                Technical details: {}",
-                bucket_name, error_str
-            );
-        }
-
-        // Permission/Authorization errors
-        if error_str.contains("AccessDenied")
-            || error_str.contains("Forbidden")
-            || error_str.contains("403")
-        {
-            return format!(
-                "Access denied when trying to {} bucket '{}'. \
-                Please verify:\n\
-                • The credentials have sufficient permissions\n\
-                • The bucket exists and you have access to it\n\
-                • IAM policies allow the required S3 operations\n\
-                • Bucket policies do not restrict access\n\
-                Technical details: {}",
-                operation, bucket_name, error_str
-            );
-        }
-
-        // Bucket already exists (from another account)
-        if error_str.contains("BucketAlreadyExists") {
-            return format!(
-                "Bucket '{}' already exists in another account or region. \
-                Please:\n\
-                • Choose a different bucket name (bucket names must be globally unique)\n\
-                • Or verify you have access to this existing bucket\n\
-                Technical details: {}",
-                bucket_name, error_str
-            );
-        }
-
-        // Region mismatch
-        if error_str.contains("AuthorizationHeaderMalformed") || error_str.contains("region") {
-            return format!(
-                "Region configuration issue for bucket '{}'. \
-                Please verify:\n\
-                • The region is correctly specified\n\
-                • The bucket exists in the specified region\n\
-                • For MinIO/LocalStack, use a valid region (e.g., 'us-east-1')\n\
-                Technical details: {}",
-                bucket_name, error_str
-            );
-        }
-
-        // Invalid bucket name
-        if error_str.contains("InvalidBucketName") {
-            return format!(
-                "Invalid bucket name '{}'. \
-                Bucket names must:\n\
-                • Be between 3 and 63 characters long\n\
-                • Contain only lowercase letters, numbers, dots (.), and hyphens (-)\n\
-                • Begin and end with a letter or number\n\
-                • Not be formatted as an IP address\n\
-                Technical details: {}",
-                bucket_name, error_str
-            );
-        }
-
-        // SSL/TLS errors
-        if error_str.contains("ssl")
-            || error_str.contains("tls")
-            || error_str.contains("certificate")
-        {
-            return format!(
-                "SSL/TLS error when connecting to S3 for bucket '{}'. \
-                Please verify:\n\
-                • The endpoint URL scheme matches the service (http:// for local, https:// for AWS)\n\
-                • SSL certificates are valid (for custom endpoints)\n\
-                • For local development, ensure HTTP is configured correctly\n\
-                Technical details: {}",
-                bucket_name, error_str
-            );
-        }
-
-        // Generic S3 service error
-        if error_str.contains("service error") {
-            return format!(
-                "S3 service error when trying to {} bucket '{}'. \
-                This may be a temporary issue. Please:\n\
-                • Verify the S3 service is operational\n\
-                • Check service status/logs\n\
-                • Try again in a few moments\n\
-                Technical details: {}",
-                operation, bucket_name, error_str
-            );
-        }
-
-        // Default: return a formatted version of the error
-        format!(
-            "Failed to {} S3 bucket '{}': {}\n\
-            \n\
-            Please verify your S3 configuration:\n\
-            • Endpoint URL is correct\n\
-            • Access credentials are valid\n\
-            • Region is correctly specified\n\
-            • Bucket name is valid\n\
-            • Network connectivity to S3 service",
-            operation, bucket_name, error_str
+        let client = self.create_s3_client_from_request(request).await?;
+        verify_s3_bucket(
+            &client,
+            request.endpoint.as_deref(),
+            &request.region,
+            &request.bucket_name,
+            on_missing,
         )
+        .await
     }
 
     async fn upload_backup(
@@ -4474,37 +4488,51 @@ SELECT cp.id
                 })?;
             let service = temps_entities::external_services::Entity::find_by_id(service_id)
                 .one(&transaction)
-                .await?
-                .ok_or_else(|| BackupError::NotFound {
-                    resource: "ExternalService".to_string(),
-                    detail: format!("service id {} for backup {}", service_id, backup.backup_id),
-                })?;
+                .await?;
+            let (service_name, service_type) = deletion_walg_service_identity(
+                &children,
+                service_id,
+                &backup.backup_id,
+                service
+                    .as_ref()
+                    .map(|service| (service.name.as_str(), service.service_type.as_str())),
+            )?;
             let deletion_engine =
-                WalgDeletionEngine::resolve(engine, &service.service_type, &backup.backup_id)?;
+                WalgDeletionEngine::resolve(engine, &service_type, &backup.backup_id)?;
             deletion_engine.validate_repository(
                 &backup.s3_location,
                 &s3_source.bucket_name,
                 &s3_source.bucket_path,
-                &service.name,
+                &service_name,
             )?;
-            let container = if deletion_engine == WalgDeletionEngine::PostgresCluster {
-                temps_entities::service_members::Entity::find()
-                    .filter(temps_entities::service_members::Column::ServiceId.eq(service_id))
-                    .filter(temps_entities::service_members::Column::Role.eq("primary"))
-                    .filter(temps_entities::service_members::Column::Status.eq("running"))
-                    .one(&transaction)
-                    .await?
-                    .ok_or_else(|| {
-                        BackupError::Validation(format!(
-                            "WAL-G cluster backup {} has no running primary",
-                            backup.backup_id
-                        ))
-                    })?
-                    .container_name
+            let container = if let Some(service) = service.as_ref() {
+                Some(if deletion_engine == WalgDeletionEngine::PostgresCluster {
+                    temps_entities::service_members::Entity::find()
+                        .filter(temps_entities::service_members::Column::ServiceId.eq(service_id))
+                        .filter(temps_entities::service_members::Column::Role.eq("primary"))
+                        .filter(temps_entities::service_members::Column::Status.eq("running"))
+                        .one(&transaction)
+                        .await?
+                        .ok_or_else(|| {
+                            BackupError::Validation(format!(
+                                "WAL-G cluster backup {} has no running primary",
+                                backup.backup_id
+                            ))
+                        })?
+                        .container_name
+                } else {
+                    crate::engines::dispatch::service_container_name(service)
+                })
             } else {
-                crate::engines::dispatch::service_container_name(&service)
+                if !matches!(
+                    deletion_engine,
+                    WalgDeletionEngine::Postgres | WalgDeletionEngine::PostgresCluster
+                ) {
+                    return Err(BackupError::Validation(format!("Backup {} requires its {} service for safe WAL-G cleanup; orphan cleanup is supported for PostgreSQL repositories", backup.backup_id, service_type)));
+                }
+                None
             };
-            Some((service, container, target, deletion_engine))
+            Some((service_name, container, target, deletion_engine))
         } else {
             for location in std::iter::once(backup.s3_location.as_str())
                 .chain(children.iter().map(|child| child.s3_location.as_str()))
@@ -4560,14 +4588,14 @@ SELECT cp.id
             relative.starts_with("backups/")
         });
         let mut deleted_objects = 0_u64;
-        if let Some((service, container, target, deletion_engine)) = walg_plan {
+        if let Some((service_name, container, target, deletion_engine)) = walg_plan {
             time::timeout_at(
                 remote_deadline,
-                self.delete_walg_target(
+                self.delete_walg_target_with_optional_service(
                     &backup,
                     &s3_source,
-                    &service,
-                    &container,
+                    &service_name,
+                    container.as_deref(),
                     &target,
                     deletion_engine,
                 ),
@@ -4784,11 +4812,146 @@ SELECT cp.id
         Ok(deleted_objects)
     }
 
+    async fn delete_walg_target_with_optional_service(
+        &self,
+        backup: &Backup,
+        source: &S3Source,
+        service_name: &str,
+        container: Option<&str>,
+        target: &WalgTargetUserData,
+        engine: WalgDeletionEngine,
+    ) -> Result<(), BackupError> {
+        if let Some(container) = container {
+            return self
+                .delete_walg_target(backup, source, service_name, container, target, engine)
+                .await;
+        }
+        // The helper has no database volume and never starts PostgreSQL. It
+        // executes only the existing identity-checked WAL-G deletion path.
+        let docker = bollard::Docker::connect_with_local_defaults().map_err(|error| {
+            BackupError::ExternalService(format!(
+                "Failed to connect to Docker for orphan backup {} cleanup: {error}",
+                backup.backup_id
+            ))
+        })?;
+        let image_ref = "gotempsh/postgres-walg:18-bookworm";
+        let image = match docker.inspect_image(image_ref).await {
+            Ok(image) => image,
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => {
+                self.pull_postgres_image(image_ref).await.map_err(|error| {
+                    BackupError::ExternalService(format!(
+                        "Failed to pull WAL-G cleanup image for backup {}: {error}",
+                        backup.backup_id
+                    ))
+                })?;
+                docker.inspect_image(image_ref).await.map_err(|error| {
+                    BackupError::ExternalService(format!(
+                        "Failed to inspect WAL-G cleanup image for backup {}: {error}",
+                        backup.backup_id
+                    ))
+                })?
+            }
+            Err(error) => {
+                return Err(BackupError::ExternalService(format!(
+                    "Failed to inspect WAL-G cleanup image for backup {}: {error}",
+                    backup.backup_id
+                )))
+            }
+        };
+        let image_id = image.id.ok_or_else(|| {
+            BackupError::Configuration(format!(
+                "WAL-G cleanup image for backup {} has no immutable image identity",
+                backup.backup_id
+            ))
+        })?;
+        let helper = format!("temps-backup-cleanup-{}", Uuid::new_v4());
+        let (created_id, mut helper_owner) = create_owned_orphan_helper(
+            docker.clone(),
+            helper.clone(),
+            backup.backup_id.clone(),
+            bollard::models::ContainerCreateBody {
+                image: Some(image_id),
+                entrypoint: Some(vec!["sh".to_string(), "-c".to_string()]),
+                cmd: Some(vec!["sleep 360".to_string()]),
+                user: Some("65534:65534".to_string()),
+                labels: Some(std::collections::HashMap::from([(
+                    "temps.backup_cleanup_id".to_string(),
+                    backup.backup_id.clone(),
+                )])),
+                host_config: Some(bollard::models::HostConfig {
+                    auto_remove: Some(true),
+                    readonly_rootfs: Some(true),
+                    memory: Some(128 * 1024 * 1024),
+                    pids_limit: Some(64),
+                    cap_drop: Some(vec!["ALL".to_string()]),
+                    security_opt: Some(vec!["no-new-privileges:true".to_string()]),
+                    network_mode: Some(temps_core::NETWORK_NAME.to_string()),
+                    tmpfs: Some(std::collections::HashMap::from([
+                        ("/tmp".to_string(), "rw,noexec,nosuid,size=64m".to_string()),
+                        // Override the image's declared database volume;
+                        // cleanup must not allocate a persistent PGDATA.
+                        (
+                            "/var/lib/postgresql".to_string(),
+                            "rw,noexec,nosuid,size=1m,mode=1777".to_string(),
+                        ),
+                    ])),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let result = async {
+            docker
+                .start_container(
+                    &created_id,
+                    None::<bollard::query_parameters::StartContainerOptions>,
+                )
+                .await
+                .map_err(|error| {
+                    BackupError::ExternalService(format!(
+                        "Failed to start orphan backup {} cleanup helper: {error}",
+                        backup.backup_id
+                    ))
+                })?;
+            self.delete_walg_target(backup, source, service_name, &helper, target, engine)
+                .await
+        }
+        .await;
+        // Auto-removal plus the bounded sleep also clean a helper if the
+        // outer deadline cancels this future before explicit cleanup runs.
+        let cleanup = docker
+            .remove_container(
+                &created_id,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    v: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+        if let Err(error) = cleanup {
+            if !matches!(
+                error,
+                bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404,
+                    ..
+                }
+            ) {
+                return Err(BackupError::PartialDeletion { backup_id: backup.backup_id.clone(), deleted_objects: 0, reason: format!("WAL-G cleanup result: {result:?}; helper '{helper}' cleanup failed: {error}; inspect the helper labelled temps.backup_cleanup_id={} and remove only that owned helper if cleanup remains unsuccessful", backup.backup_id) });
+            }
+        }
+        helper_owner.armed = false;
+        result
+    }
+
     async fn delete_walg_target(
         &self,
         backup: &Backup,
         source: &S3Source,
-        service: &temps_entities::external_services::Model,
+        service_name: &str,
         container: &str,
         target_user_data: &WalgTargetUserData,
         engine: WalgDeletionEngine,
@@ -4797,7 +4960,7 @@ SELECT cp.id
             &backup.s3_location,
             &source.bucket_name,
             &source.bucket_path,
-            &service.name,
+            service_name,
         )?;
 
         let access_key = self
@@ -5461,8 +5624,7 @@ SELECT cp.id
         }
 
         // Test S3 connection and auto-create bucket before persisting
-        let s3_client = self.create_s3_client_from_request(&request).await?;
-        self.test_and_create_s3_bucket(&s3_client, &request.bucket_name)
+        self.verify_s3_destination(&request, crate::services::s3_probe::MissingBucket::Create)
             .await?;
 
         // First source is automatically default; subsequent sources require an explicit
@@ -5529,35 +5691,42 @@ SELECT cp.id
     }
 
     /// Test an S3 connection using stored (encrypted) credentials for an existing source.
-    /// Returns `Ok(())` on success, or `BackupError::S3` with user-friendly guidance on failure.
+    /// Returns `Ok(())` on success, or `BackupError::S3Unreachable` naming the
+    /// endpoint and the classified cause on failure.
     pub async fn test_s3_source_connection(&self, id: i32) -> Result<(), BackupError> {
         let source = self.get_s3_source(id).await?;
+        // The source's own client, so a temporary credential keeps its
+        // session token, bounded like every other reachability check.
         let client = self
             .create_s3_client(&source)
             .await
             .map_err(|e| BackupError::Internal {
                 message: format!("Failed to build S3 client for source {}: {}", id, e),
             })?;
-
-        match client
-            .list_objects_v2()
-            .bucket(&source.bucket_name)
-            .max_keys(1)
-            .send()
-            .await
-        {
-            Ok(_) => {
-                debug!(
-                    "S3 connection test succeeded for source {} (bucket {})",
-                    id, source.bucket_name
-                );
-                Ok(())
-            }
-            Err(e) => {
-                let error_msg = self.parse_s3_error(&e, &source.bucket_name, "access");
-                Err(BackupError::S3(error_msg))
-            }
-        }
+        let client = S3Client::from_conf(
+            client
+                .config()
+                .to_builder()
+                .timeout_config(
+                    aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+                        .operation_timeout(crate::services::s3_probe::S3_PROBE_OPERATION_TIMEOUT)
+                        .build(),
+                )
+                .build(),
+        );
+        verify_s3_bucket(
+            &client,
+            source.endpoint.as_deref(),
+            &source.region,
+            &source.bucket_name,
+            crate::services::s3_probe::MissingBucket::Fail,
+        )
+        .await?;
+        debug!(
+            "S3 connection test succeeded for source {} (bucket {})",
+            id, source.bucket_name
+        );
+        Ok(())
     }
 
     /// Test an S3 connection using credentials from a prospective request (before persistence).
@@ -5572,35 +5741,10 @@ SELECT cp.id
             ));
         }
 
-        let client = self.create_s3_client_from_request(request).await?;
-        match client
-            .list_objects_v2()
-            .bucket(&request.bucket_name)
-            .max_keys(1)
-            .send()
+        // A missing bucket is not a failure: the credentials work, and
+        // creating the source creates the bucket.
+        self.verify_s3_destination(request, crate::services::s3_probe::MissingBucket::Accept)
             .await
-        {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                let error_code = e
-                    .as_service_error()
-                    .and_then(|se| se.code())
-                    .map(|s| s.to_string());
-
-                // NoSuchBucket is not a hard failure — credentials are valid, bucket is
-                // just missing (would be auto-created on actual source creation).
-                if error_code.as_deref() == Some("NoSuchBucket") {
-                    debug!(
-                        "S3 connection test: credentials valid, bucket '{}' does not yet exist",
-                        request.bucket_name
-                    );
-                    Ok(())
-                } else {
-                    let error_msg = self.parse_s3_error(&e, &request.bucket_name, "access");
-                    Err(BackupError::S3(error_msg))
-                }
-            }
-        }
     }
 
     /// Atomically make the given source the default. All other sources will be set to
@@ -7907,6 +8051,92 @@ RETURNING id
             )));
         }
 
+        // Responses mask stored credentials as `***`, and an edit form sends
+        // that value back for a field the operator did not retype. It means
+        // "unchanged": storing it would replace a working credential.
+        let is_unchanged_credential =
+            |value: &Option<String>| value.as_deref().is_none_or(|v| v.is_empty() || v == "***");
+        let mut request = request;
+        if is_unchanged_credential(&request.access_key_id) {
+            request.access_key_id = None;
+        }
+        if is_unchanged_credential(&request.secret_key) {
+            request.secret_key = None;
+        }
+
+        // A change to where or how the destination is reached is verified
+        // exactly like a new destination, before anything is saved. A field
+        // sent back with its stored value (an edit form resubmitting the
+        // whole record for a rename, say) is not a change, so a temporarily
+        // unreachable destination never blocks an unrelated edit.
+        let decrypt = |field: &str, value: &str| {
+            self.encryption_service
+                .decrypt_string(value)
+                .map_err(|error| BackupError::Internal {
+                    message: format!(
+                        "Failed to decrypt the {} of S3 source {} ('{}'): {}",
+                        field, current.id, current.name, error
+                    ),
+                })
+        };
+        let differs = |supplied: &Option<String>, stored: &str| {
+            supplied.as_deref().is_some_and(|value| value != stored)
+        };
+        // A stored credential is only decrypted when a replacement was
+        // supplied, to compare them. One that cannot be decrypted any more
+        // (a changed server key, damaged data) is being replaced, which is
+        // exactly how an operator repairs it, so it counts as a change.
+        let credential_changed = |supplied: &Option<String>, stored: &str| {
+            supplied.as_deref().is_some_and(|value| {
+                match self.encryption_service.decrypt_string(stored) {
+                    Ok(stored) => value != stored,
+                    Err(_) => true,
+                }
+            })
+        };
+        let connection_changed = differs(&request.bucket_name, &current.bucket_name)
+            || credential_changed(&request.access_key_id, &current.access_key_id)
+            || credential_changed(&request.secret_key, &current.secret_key)
+            || differs(&request.region, &current.region)
+            || request
+                .endpoint
+                .as_deref()
+                .is_some_and(|endpoint| current.endpoint.as_deref() != Some(endpoint))
+            || request
+                .force_path_style
+                .is_some_and(|path_style| current.force_path_style != Some(path_style));
+        if connection_changed {
+            let probe = CreateS3SourceRequest {
+                name: current.name.clone(),
+                bucket_name: request
+                    .bucket_name
+                    .clone()
+                    .unwrap_or_else(|| current.bucket_name.clone()),
+                bucket_path: current.bucket_path.clone(),
+                access_key_id: match &request.access_key_id {
+                    Some(access_key_id) => access_key_id.clone(),
+                    None => decrypt("access key ID", &current.access_key_id)?,
+                },
+                secret_key: match &request.secret_key {
+                    Some(secret_key) => secret_key.clone(),
+                    None => decrypt("secret key", &current.secret_key)?,
+                },
+                region: request
+                    .region
+                    .clone()
+                    .unwrap_or_else(|| current.region.clone()),
+                endpoint: request
+                    .endpoint
+                    .clone()
+                    .or_else(|| current.endpoint.clone()),
+                force_path_style: request.force_path_style.or(current.force_path_style),
+                is_default: None,
+                backing_service_id: current.backing_service_id,
+            };
+            self.verify_s3_destination(&probe, crate::services::s3_probe::MissingBucket::Create)
+                .await?;
+        }
+
         let mut active = current.into_active_model();
 
         if let Some(name) = request.name {
@@ -7965,7 +8195,7 @@ RETURNING id
         )],
     ) -> Result<serde_json::Value, BackupError> {
         let config_yaml =
-            serde_yaml::to_string(&self.config_service.get_server_config()).map_err(|error| {
+            yaml_serde::to_string(&self.config_service.get_server_config()).map_err(|error| {
                 BackupError::Configuration(format!(
                     "Failed to serialize server config for backup {}: {}",
                     backup.backup_id, error
@@ -8962,8 +9192,6 @@ ORDER BY a.opened_at DESC
             expires_at: sea_orm::Set(None),
         };
 
-        let backup = backup.insert(self.db.as_ref()).await?;
-
         // Generate backup path
         let subpath = format!(
             "external_services/{}/{}/{}",
@@ -8996,6 +9224,9 @@ ORDER BY a.opened_at DESC
             .get_service_config(service_id)
             .await
             .map_err(|e| BackupError::ExternalService(e.to_string()))?;
+        // Resolved before the row exists, so a service that cannot be backed
+        // up at all leaves no `running` row behind.
+        let backup = backup.insert(self.db.as_ref()).await?;
 
         // Cluster topology: route through the manager which knows how
         // to find the current primary and dispatch exec to it (local
@@ -9014,7 +9245,7 @@ ORDER BY a.opened_at DESC
                         service.name, service.id, e
                     );
                     BackupError::ExternalService(e.to_string())
-                })?
+                })
         } else {
             // Standalone: use the per-engine trait impl as before.
             service_instance
@@ -9036,7 +9267,25 @@ ORDER BY a.opened_at DESC
                         service.name, service.service_type, service.id, e
                     );
                     BackupError::ExternalService(e.to_string())
-                })?
+                })
+        };
+        let backup_outcome = match backup_outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // Keep the cause on the row: callers such as the pre-upgrade
+                // backup report it, and the backup list shows it.
+                let mut failed: temps_entities::backups::ActiveModel = backup.clone().into();
+                failed.state = sea_orm::Set("failed".to_string());
+                failed.error_message = sea_orm::Set(Some(error.to_string()));
+                failed.finished_at = sea_orm::Set(Some(Utc::now()));
+                if let Err(update_error) = failed.update(self.db.as_ref()).await {
+                    error!(
+                        "Failed to mark backup {} of service '{}' (id={}) as failed: {}",
+                        backup.backup_id, service.name, service.id, update_error
+                    );
+                }
+                return Err(error);
+            }
         };
         info!(
             "Backup created at location: {} ({} bytes)",
@@ -9701,18 +9950,57 @@ impl temps_providers::externalsvc::postgres_upgrade::PreUpgradeBackupProvider fo
         s3_source_id: i32,
         created_by: i32,
     ) -> Result<i32, String> {
-        let backup = self
-            .create_backup(None, s3_source_id, "full", created_by)
+        // Back up the service being upgraded, not the whole instance: an
+        // unrelated service that cannot be backed up must not block this
+        // upgrade, and this service's own failure is reported with its cause
+        // rather than folded into an instance-wide summary.
+        let service = temps_entities::external_services::Entity::find_by_id(service_id)
+            .one(self.db.as_ref())
             .await
-            .map_err(|e| e.to_string())?;
-        // `create_backup` returns a `temps_entities::backups::Model`; the
-        // service-level backup id for external_services is surfaced via
-        // `external_service_backups`. For the upgrade row we record the
-        // `backups.id` itself (migration FK targets `backups(id)`), so we
-        // need the numeric id — which the model exposes directly.
-        let _ = service_id; // reserved for future: scope the search to this service
-        Ok(backup.id)
+            .map_err(|e| format!("failed to load service {service_id}: {e}"))?
+            .ok_or_else(|| format!("service {service_id} no longer exists"))?;
+        let child = self
+            .backup_external_service(&service, s3_source_id, "full", created_by)
+            .await
+            .map_err(|e| {
+                format!(
+                    "full backup of '{}' to S3 source {} failed: {}",
+                    service.name, s3_source_id, e
+                )
+            })?;
+        // The upgrade row's FK targets `backups(id)`, the parent of the
+        // per-service child row.
+        Ok(child.backup_id)
     }
+}
+
+/// Verify `bucket` through `client`, turning a failure into
+/// [`BackupError::S3Unreachable`] that names the endpoint and the cause.
+async fn verify_s3_bucket(
+    client: &S3Client,
+    endpoint: Option<&str>,
+    region: &str,
+    bucket: &str,
+    on_missing: crate::services::s3_probe::MissingBucket,
+) -> Result<(), BackupError> {
+    crate::services::s3_probe::check_bucket(client, bucket, on_missing)
+        .await
+        .map_err(|failure| {
+            let endpoint = crate::services::s3_probe::display_endpoint(endpoint, region);
+            warn!(
+                endpoint = %endpoint,
+                bucket = %bucket,
+                failure = failure.kind.slug(),
+                cause = %failure.cause,
+                "S3 destination could not be verified"
+            );
+            BackupError::S3Unreachable {
+                endpoint,
+                bucket: bucket.to_string(),
+                kind: failure.kind,
+                cause: failure.cause,
+            }
+        })
 }
 
 #[cfg(test)]
@@ -9811,6 +10099,250 @@ mod tests {
             service_name_snapshot: Some(format!("service-{service_id}")),
             service_type_snapshot: Some("postgres".to_string()),
         }
+    }
+
+    async fn fake_helper_docker(
+        create_failure: bool,
+    ) -> (
+        bollard::Docker,
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let deleted = Arc::new(tokio::sync::Notify::new());
+        let (server_started, server_release, server_deleted) =
+            (started.clone(), release.clone(), deleted.clone());
+        tokio::spawn(async move {
+            let mut created = false;
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = [0u8; 8192];
+                let read = stream.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..read]);
+                let (status, body) = if request.starts_with("POST ")
+                    && request.contains("/containers/create")
+                {
+                    server_started.notify_one();
+                    server_release.notified().await;
+                    created = true;
+                    if create_failure {
+                        (
+                            "500 Internal Server Error",
+                            r#"{"message":"ambiguous create response"}"#,
+                        )
+                    } else {
+                        ("201 Created", r#"{"Id":"owned-helper-id","Warnings":[]}"#)
+                    }
+                } else if request.starts_with("DELETE ") {
+                    assert!(created, "a helper must have been committed before removal");
+                    assert!(
+                        request.contains("/containers/owned-helper-id?"),
+                        "cleanup must use the immutable owned ID: {request}"
+                    );
+                    assert!(request.contains("force=true") && request.contains("v=true"));
+                    ("204 No Content", "")
+                } else if created {
+                    (
+                        "200 OK",
+                        r#"{"Id":"owned-helper-id","Name":"/owned-helper","Config":{"Labels":{"temps.backup_cleanup_id":"owned-backup"}}}"#,
+                    )
+                } else {
+                    ("404 Not Found", r#"{"message":"No such container"}"#)
+                };
+                let response = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                stream.write_all(response.as_bytes()).await.unwrap();
+                if request.starts_with("DELETE ") {
+                    server_deleted.notify_one();
+                    break;
+                }
+            }
+        });
+        let docker = bollard::Docker::connect_with_http(
+            &format!("http://{address}"),
+            10,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .unwrap();
+        (docker, started, release, deleted)
+    }
+
+    #[tokio::test]
+    async fn orphan_helper_cancellation_during_create_removes_unstarted_helper() {
+        let (docker, started, release, deleted) = fake_helper_docker(false).await;
+        let caller = tokio::spawn(create_owned_orphan_helper(
+            docker,
+            "owned-helper".to_string(),
+            "owned-backup".to_string(),
+            Default::default(),
+        ));
+        time::timeout(std::time::Duration::from_secs(10), started.notified())
+            .await
+            .unwrap();
+        caller.abort();
+        assert!(matches!(caller.await, Err(error) if error.is_cancelled()));
+        // Docker commits after the deletion request has been cancelled.
+        release.notify_one();
+        time::timeout(std::time::Duration::from_secs(10), deleted.notified())
+            .await
+            .expect("the unstarted helper must be removed after the create reply arrives");
+    }
+
+    #[tokio::test]
+    async fn orphan_helper_drop_before_start_removes_created_helper() {
+        let (docker, _, release, deleted) = fake_helper_docker(false).await;
+        release.notify_one();
+        let (_, owner) = create_owned_orphan_helper(
+            docker,
+            "owned-helper".to_string(),
+            "owned-backup".to_string(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        drop(owner);
+        time::timeout(std::time::Duration::from_secs(10), deleted.notified())
+            .await
+            .expect("Created-state helpers have no idle expiry and require owned cleanup");
+    }
+
+    #[tokio::test]
+    async fn orphan_helper_ambiguous_create_failure_checks_label_before_cleanup() {
+        let (docker, _, release, deleted) = fake_helper_docker(true).await;
+        release.notify_one();
+        assert!(create_owned_orphan_helper(
+            docker,
+            "owned-helper".to_string(),
+            "owned-backup".to_string(),
+            Default::default()
+        )
+        .await
+        .is_err());
+        time::timeout(std::time::Duration::from_secs(10), deleted.notified())
+            .await
+            .expect(
+                "a committed labelled helper must be removed after an ambiguous create failure",
+            );
+    }
+
+    #[test]
+    fn orphan_walg_cleanup_uses_consistent_retained_identity() {
+        let children = vec![
+            make_external_service_backup(1, 801, 101),
+            make_external_service_backup(2, 801, 101),
+        ];
+        assert_eq!(
+            retained_walg_service_identity(&children, 101, "backup-801").unwrap(),
+            ("service-101".to_string(), "postgres".to_string())
+        );
+        let engine =
+            WalgDeletionEngine::resolve("postgres_walg", "postgres", "backup-801").unwrap();
+        assert!(engine
+            .validate_repository(
+                "s3://bucket/external_services/postgres/service-101/walg",
+                "bucket",
+                "",
+                "service-101",
+            )
+            .is_ok());
+        assert!(engine
+            .validate_repository(
+                "s3://bucket/external_services/postgres/another-service/walg",
+                "bucket",
+                "",
+                "service-101",
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn renamed_live_service_keeps_original_walg_repository_identity() {
+        let child = make_external_service_backup(1, 801, 101);
+        let identity = deletion_walg_service_identity(
+            std::slice::from_ref(&child),
+            101,
+            "backup-801",
+            Some(("renamed-service", "postgres")),
+        )
+        .unwrap();
+        assert_eq!(
+            identity,
+            ("service-101".to_string(), "postgres".to_string())
+        );
+        let engine =
+            WalgDeletionEngine::resolve("postgres_walg", &identity.1, "backup-801").unwrap();
+        assert!(engine
+            .validate_repository(
+                "s3://bucket/owned/external_services/postgres/service-101/walg",
+                "bucket",
+                "owned",
+                &identity.0
+            )
+            .is_ok());
+        assert!(engine
+            .validate_repository(
+                "s3://bucket/owned/external_services/postgres/renamed-service/walg",
+                "bucket",
+                "owned",
+                &identity.0
+            )
+            .is_err());
+        assert!(engine
+            .validate_repository(
+                "s3://other/owned/external_services/postgres/service-101/walg",
+                "bucket",
+                "owned",
+                &identity.0
+            )
+            .is_err());
+        let mut legacy = child.clone();
+        legacy.service_name_snapshot = None;
+        legacy.service_type_snapshot = None;
+        assert_eq!(
+            deletion_walg_service_identity(
+                std::slice::from_ref(&legacy),
+                101,
+                "backup-801",
+                Some(("renamed-service", "postgres"))
+            )
+            .unwrap()
+            .0,
+            "renamed-service"
+        );
+        assert!(deletion_walg_service_identity(
+            std::slice::from_ref(&legacy),
+            101,
+            "backup-801",
+            None
+        )
+        .is_err());
+        legacy.service_type_snapshot = Some("postgres".to_string());
+        assert!(deletion_walg_service_identity(
+            &[child, legacy],
+            101,
+            "backup-801",
+            Some(("renamed-service", "postgres"))
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn orphan_walg_cleanup_refuses_missing_or_conflicting_provenance() {
+        let child = make_external_service_backup(1, 801, 101);
+        assert!(retained_walg_service_identity(&[], 101, "backup-801").is_err());
+        assert!(
+            retained_walg_service_identity(std::slice::from_ref(&child), 102, "backup-801")
+                .is_err()
+        );
+        let mut missing = child.clone();
+        missing.service_name_snapshot = None;
+        assert!(retained_walg_service_identity(&[missing], 101, "backup-801").is_err());
+        let mut conflicting = child.clone();
+        conflicting.service_type_snapshot = Some("redis".to_string());
+        assert!(retained_walg_service_identity(&[child, conflicting], 101, "backup-801").is_err());
     }
 
     fn make_collection_global_row(
@@ -10234,6 +10766,20 @@ mod tests {
         // Assert.
         assert!(matches!(error, BackupError::Database(_)));
         assert!(error.to_string().contains("producer lookup failed"));
+    }
+
+    /// #1355: a whole-instance failure names each failed service with its
+    /// own cause, trimmed so one verbose engine error cannot bury the rest.
+    #[test]
+    fn bounded_failure_cause_keeps_short_causes_and_truncates_long_ones() {
+        assert_eq!(
+            bounded_failure_cause("  wal-g: command not found \n"),
+            "wal-g: command not found"
+        );
+        let long = "é".repeat(MAX_FAILURE_CAUSE_CHARS + 50);
+        let bounded = bounded_failure_cause(&long);
+        assert!(bounded.ends_with("..."));
+        assert_eq!(bounded.chars().count(), MAX_FAILURE_CAUSE_CHARS + 3);
     }
 
     #[test]
@@ -12650,6 +13196,289 @@ mod tests {
             }
             _ => panic!("Expected validation error for empty name"),
         }
+    }
+
+    fn s3_probe_test_request(endpoint: &str) -> CreateS3SourceRequest {
+        CreateS3SourceRequest {
+            name: "probe".to_string(),
+            bucket_name: "probe".to_string(),
+            bucket_path: "p".to_string(),
+            access_key_id: "test-access-key".to_string(),
+            secret_key: "test-secret-key-never-in-messages".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: Some(endpoint.to_string()),
+            force_path_style: Some(true),
+            is_default: Some(false),
+            backing_service_id: None,
+        }
+    }
+
+    /// An S3 destination whose endpoint cannot be reached is the operator's
+    /// configuration to fix, so the create call must answer with a status and
+    /// a detail that say which endpoint failed and why -- not a bare 500. The
+    /// mock database has no results queued, so reaching the insert would
+    /// surface as a `Database` error instead of the connectivity failure.
+    #[tokio::test]
+    async fn test_create_s3_source_with_unresolvable_endpoint_names_endpoint_and_cause() {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let Ok(backup_service) = build_service_for_mock(db) else {
+            return;
+        };
+        let endpoint = "http://temps-s3-probe.invalid:9000";
+
+        let error = backup_service
+            .create_s3_source(s3_probe_test_request(endpoint))
+            .await
+            .expect_err("an unresolvable endpoint must not be saved");
+
+        let problem = temps_core::problemdetails::Problem::from(error);
+        assert_eq!(problem.status_code, axum::http::StatusCode::BAD_REQUEST);
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(detail.contains(endpoint), "detail: {detail}");
+        assert!(detail.contains("DNS"), "detail: {detail}");
+        assert!(!detail.contains("test-secret-key-never-in-messages"));
+    }
+
+    #[tokio::test]
+    async fn test_create_s3_source_with_refused_endpoint_names_endpoint_and_cause() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let Ok(backup_service) = build_service_for_mock(db) else {
+            return;
+        };
+        let endpoint = format!("http://127.0.0.1:{port}");
+
+        let error = backup_service
+            .create_s3_source(s3_probe_test_request(&endpoint))
+            .await
+            .expect_err("a refused endpoint must not be saved");
+
+        let problem = temps_core::problemdetails::Problem::from(error);
+        assert_eq!(problem.status_code, axum::http::StatusCode::BAD_GATEWAY);
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(detail.contains(&endpoint), "detail: {detail}");
+        assert!(detail.contains("refused"), "detail: {detail}");
+    }
+
+    fn operator_s3_source(encryption: &EncryptionService) -> s3_sources::Model {
+        s3_sources::Model {
+            id: 31,
+            backing_service_id: None,
+            name: "offsite".to_string(),
+            bucket_name: "offsite-bucket".to_string(),
+            bucket_path: "/".to_string(),
+            access_key_id: encryption.encrypt_string("stored-access-key").unwrap(),
+            secret_key: encryption.encrypt_string("stored-secret-key").unwrap(),
+            session_token: None,
+            credentials_expire_at: None,
+            region: "us-east-1".to_string(),
+            endpoint: Some("http://127.0.0.1:9".to_string()),
+            force_path_style: Some(true),
+            is_default: true,
+            managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// Repointing a destination at an endpoint that cannot be reached is
+    /// refused with the classified cause, before anything is written.
+    #[tokio::test]
+    async fn test_update_s3_source_to_an_unreachable_endpoint_saves_nothing() {
+        let encryption = EncryptionService::new("test_encryption_key_1234567890ab").unwrap();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![operator_s3_source(&encryption)]])
+                .into_connection(),
+        );
+        let Ok(service) = build_service_for_mock(db.clone()) else {
+            return;
+        };
+
+        let error = service
+            .update_s3_source(
+                31,
+                crate::handlers::backup_handler::UpdateS3SourceRequest {
+                    name: None,
+                    bucket_name: None,
+                    bucket_path: None,
+                    access_key_id: Some("***".to_string()),
+                    secret_key: Some(String::new()),
+                    region: None,
+                    endpoint: Some("http://temps-s3-probe.invalid:9000".to_string()),
+                    force_path_style: None,
+                },
+            )
+            .await
+            .expect_err("an unreachable endpoint must not be saved");
+
+        match &error {
+            BackupError::S3Unreachable {
+                endpoint,
+                bucket,
+                kind,
+                ..
+            } => {
+                assert_eq!(endpoint, "http://temps-s3-probe.invalid:9000");
+                assert_eq!(bucket, "offsite-bucket");
+                assert_eq!(*kind, crate::services::S3ProbeFailureKind::DnsResolution);
+            }
+            other => panic!("expected S3Unreachable, got {other:?}"),
+        }
+        assert!(!error.to_string().contains("stored-secret-key"));
+        drop(service);
+        let db = Arc::try_unwrap(db).expect("service must release the mock database");
+        assert_eq!(
+            db.into_transaction_log().len(),
+            1,
+            "only the source lookup may run; nothing is written"
+        );
+    }
+
+    /// Stored credentials that can no longer be decrypted (a changed server
+    /// key, damaged data) are repaired by replacing them: supplying both
+    /// replacements must not fail on reading the old ones. Here the new
+    /// endpoint is unreachable, so reaching the connectivity check (and
+    /// failing there, with nothing saved) proves the update got past them.
+    #[tokio::test]
+    async fn test_update_s3_source_replaces_credentials_that_cannot_be_decrypted() {
+        let encryption = EncryptionService::new("test_encryption_key_1234567890ab").unwrap();
+        let mut source = operator_s3_source(&encryption);
+        source.access_key_id = "not-decryptable".to_string();
+        source.secret_key = "not-decryptable-either".to_string();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![source]])
+                .into_connection(),
+        );
+        let Ok(service) = build_service_for_mock(db.clone()) else {
+            return;
+        };
+
+        let error = service
+            .update_s3_source(
+                31,
+                crate::handlers::backup_handler::UpdateS3SourceRequest {
+                    name: None,
+                    bucket_name: None,
+                    bucket_path: None,
+                    access_key_id: Some("new-access-key".to_string()),
+                    secret_key: Some("new-secret-key".to_string()),
+                    region: None,
+                    endpoint: Some("http://temps-s3-probe.invalid:9000".to_string()),
+                    force_path_style: None,
+                },
+            )
+            .await
+            .expect_err("the new endpoint is unreachable");
+        assert!(
+            matches!(error, BackupError::S3Unreachable { .. }),
+            "replacing undecryptable credentials must reach the connectivity check: {error:?}"
+        );
+    }
+
+    /// An edit form resubmits the whole record. Fields sent with their
+    /// stored values are not a change, so a rename never probes the
+    /// destination -- here one whose endpoint is unreachable -- and is saved.
+    #[tokio::test]
+    async fn test_update_s3_source_resubmitting_stored_values_does_not_probe() {
+        let encryption = EncryptionService::new("test_encryption_key_1234567890ab").unwrap();
+        let mut source = operator_s3_source(&encryption);
+        source.endpoint = Some("http://temps-s3-probe.invalid:9000".to_string());
+        let renamed = s3_sources::Model {
+            name: "renamed".to_string(),
+            ..source.clone()
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![source.clone()]])
+                .append_query_results(vec![vec![renamed]])
+                .into_connection(),
+        );
+        let Ok(service) = build_service_for_mock(db.clone()) else {
+            return;
+        };
+
+        let updated = service
+            .update_s3_source(
+                31,
+                crate::handlers::backup_handler::UpdateS3SourceRequest {
+                    name: Some("renamed".to_string()),
+                    bucket_name: Some(source.bucket_name.clone()),
+                    bucket_path: None,
+                    access_key_id: Some("stored-access-key".to_string()),
+                    secret_key: Some("stored-secret-key".to_string()),
+                    region: Some(source.region.clone()),
+                    endpoint: source.endpoint.clone(),
+                    force_path_style: source.force_path_style,
+                },
+            )
+            .await
+            .expect("unchanged connection settings need no connectivity check");
+        assert_eq!(updated.name, "renamed");
+    }
+
+    /// A rename sends the masked credentials back unchanged: nothing about
+    /// the connection changed, so nothing is probed and the stored
+    /// credentials are kept instead of being replaced by `***`.
+    #[tokio::test]
+    async fn test_update_s3_source_keeps_credentials_sent_back_masked() {
+        let encryption = EncryptionService::new("test_encryption_key_1234567890ab").unwrap();
+        let source = operator_s3_source(&encryption);
+        let renamed = s3_sources::Model {
+            name: "renamed".to_string(),
+            ..source.clone()
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![source.clone()]])
+                .append_query_results(vec![vec![renamed]])
+                .into_connection(),
+        );
+        let Ok(service) = build_service_for_mock(db.clone()) else {
+            return;
+        };
+
+        let updated = service
+            .update_s3_source(
+                31,
+                crate::handlers::backup_handler::UpdateS3SourceRequest {
+                    name: Some("renamed".to_string()),
+                    bucket_name: None,
+                    bucket_path: None,
+                    access_key_id: Some("***".to_string()),
+                    secret_key: Some("***".to_string()),
+                    region: None,
+                    endpoint: None,
+                    force_path_style: None,
+                },
+            )
+            .await
+            .expect("a rename needs no connectivity check");
+        assert_eq!(updated.name, "renamed");
+
+        drop(service);
+        let db = Arc::try_unwrap(db).expect("service must release the mock database");
+        let log = format!("{:?}", db.into_transaction_log());
+        assert!(
+            !log.contains("\"***\""),
+            "masked credentials were written: {log}"
+        );
     }
 
     // -------------------------------------------------------------------------

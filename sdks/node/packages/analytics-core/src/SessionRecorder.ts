@@ -5,7 +5,7 @@ import { record, type eventWithTime } from "rrweb";
 import { pack } from "@rrweb/packer";
 import { SESSION_RECORDER_ENDPOINT, DEFAULT_BASE_PATH, DEFAULT_EXCLUDED_PATHS } from "./constants";
 import { getOrCreateVisitorId } from "./identity";
-import { ingestKeyHeaders, withIngestKey } from "./utils";
+import { beaconBlob, ingestKeyHeaders, withIngestKey } from "./utils";
 import type { SessionRecordingConfig } from "./types";
 
 /** A session-replay request that can fail. */
@@ -397,7 +397,7 @@ export class SessionRecorder {
         // sendBeacon reports queueing, not delivery, so there is no ack to wait
         // for: release the batch and accept the small risk of loss on unload.
         if (navigator.sendBeacon) {
-          const blob = new Blob([JSON.stringify(payload)], { type: "application/json" });
+          const blob = beaconBlob(JSON.stringify(payload), this.ingestKey);
           if (!navigator.sendBeacon(unloadUrl, blob)) {
             await fetch(unloadUrl, {
               method: "POST",

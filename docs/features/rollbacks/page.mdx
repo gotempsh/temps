@@ -38,6 +38,8 @@ sequenceDiagram
 3. **Roll back** - Open the deployment's menu and choose **Rollback to this**
 4. **Done** - Temps creates a new deployment from that version's image and switches traffic to it once it's ready
 
+When a deployment fails, you don't have to look up the last good version yourself. The failure banner on the failed deployment's page, and the banner on the project overview, offer **Roll back to #N (last successful)**. That's the newest earlier deployment in the same environment that can be rolled back to. If #N is still live, which is usual because a failed deploy never takes traffic away from it, the rollback starts a fresh deployment of #N and makes it the project's latest deployment again.
+
 ### From CLI
 
 ```bash

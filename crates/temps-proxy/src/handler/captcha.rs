@@ -7,7 +7,7 @@
 //! to protect against DDoS attacks without requiring third-party CAPTCHA services.
 
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{header, StatusCode},
     response::{IntoResponse, Json},
     routing::{get, post},
@@ -182,7 +182,11 @@ async fn serve_wasm_binary() -> impl IntoResponse {
 /// Configure CAPTCHA routes
 pub fn create_routes() -> Router<Arc<CaptchaState>> {
     Router::new()
-        .route("/_temps/captcha/verify", post(verify_challenge))
+        // A solution is a challenge string and a nonce: a few hundred bytes.
+        .route(
+            "/_temps/captcha/verify",
+            post(verify_challenge).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
         .route("/__temps/temps_captcha_wasm.js", get(serve_wasm_js))
         .route(
             "/__temps/temps_captcha_wasm_bg.wasm",

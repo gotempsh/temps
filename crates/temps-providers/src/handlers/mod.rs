@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 pub mod audit;
+pub mod data_import_handlers;
 #[allow(clippy::module_inception)]
 pub mod handlers;
 pub mod metrics_handlers;

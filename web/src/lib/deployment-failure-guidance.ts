@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { settingsSectionHref } from './project-settings-sections'
 import type {
   DeploymentFailureInfo,
   DeploymentFailureStage,
@@ -40,24 +41,32 @@ export function failureSettingsLink(
   projectSlug: string
 ): FailureSettingsLink | null {
   if (!section) return null
-  const project = `/projects/${projectSlug}/settings`
   switch (section) {
     case 'source':
-      return { href: `${project}/build?tab=source`, label: 'Source settings' }
+      return {
+        href: settingsSectionHref(projectSlug, 'delivery', 'source'),
+        label: 'Source settings',
+      }
     case 'build':
-      return { href: `${project}/build?tab=build`, label: 'Build settings' }
+      return {
+        href: settingsSectionHref(projectSlug, 'delivery', 'build'),
+        label: 'Build settings',
+      }
     case 'deploy':
       return {
-        href: `${project}/build?tab=deploy`,
+        href: settingsSectionHref(projectSlug, 'delivery', 'deployment'),
         label: 'Deployment settings',
       }
     case 'environment_variables':
       return {
-        href: `${project}/environment-variables`,
-        label: 'Environment variables',
+        href: `/projects/${projectSlug}/environment-variables`,
+        label: 'Environment Variables',
       }
     case 'git':
-      return { href: `${project}/git`, label: 'Git settings' }
+      return {
+        href: settingsSectionHref(projectSlug, 'delivery', 'repository'),
+        label: 'Git settings',
+      }
     case 'docker_registry':
       return { href: '/settings/docker-registry', label: 'Docker registries' }
     case 'build_limits':
@@ -93,4 +102,22 @@ export function failureTimeoutSummary(
     parts.push(`ran ${formatSeconds(failure.timeout_elapsed_seconds)}`)
   }
   return parts.length > 0 ? parts.join(' · ') : null
+}
+
+/**
+ * The submitted image reference to show for a failed registry-image
+ * deployment, so the user can see exactly what was pulled and edit it. Null
+ * for failures that are not about that image (including a Dockerfile's base
+ * image, which the user did not submit as the deployment image).
+ */
+export function failedDeploymentImageRef(
+  failure: Pick<DeploymentFailureInfo, 'stage' | 'code'> | null | undefined,
+  externalImageRef: string | null | undefined
+): string | null {
+  const ref = externalImageRef?.trim()
+  if (!failure || !ref) return null
+  if (failure.stage !== 'image' || failure.code === 'base_image_pull') {
+    return null
+  }
+  return ref
 }

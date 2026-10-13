@@ -17,7 +17,7 @@ All webhook events follow this base structure:
 ```json
 {
   "id": "58fe24a7-3e21-451d-9210-33093e6f91cc",
-  "event_type": "deployment_succeeded",
+  "event_type": "deployment.succeeded",
   "timestamp": "2025-11-24T18:38:10.000Z",
   "project_id": 1,
   "payload": {
@@ -31,10 +31,14 @@ All webhook events follow this base structure:
 | Field | Type | Description |
 |-------|------|-------------|
 | `id` | `string` | Unique identifier for this event (UUID) |
-| `event_type` | `string` | Type of event (see Event Types below) |
+| `event_type` | `string` | Type of event (see Event Types below). Always the same dotted name you subscribe with and receive in the `X-Webhook-Event` header, for example `deployment.succeeded` |
 | `timestamp` | `string` | ISO 8601 timestamp when the event occurred |
 | `project_id` | `number` or `null` | ID of the project this event relates to |
 | `payload` | `object` | Event-specific data (structure varies by event type) |
+
+<Note>
+Earlier releases wrote the body's `event_type` with an underscore (`deployment_succeeded`) while subscriptions and the `X-Webhook-Event` header used the dotted name. They are now identical. Receivers that matched the underscore spelling must switch to the dotted one. Subscriptions you created earlier keep working, and the API reports them with the dotted names. Deliveries recorded before the change keep their original body in the history, and a retry re-sends the recorded body unchanged.
+</Note>
 
 ## Event Types
 
@@ -70,7 +74,7 @@ Triggered when a new deployment is initiated.
 ```json
 {
   "id": "58fe24a7-3e21-451d-9210-33093e6f91cc",
-  "event_type": "deployment_created",
+  "event_type": "deployment.created",
   "timestamp": "2025-11-24T18:35:00.000Z",
   "project_id": 1,
   "payload": {
@@ -101,7 +105,7 @@ Triggered when a deployment completes successfully.
 ```json
 {
   "id": "58fe24a7-3e21-451d-9210-33093e6f91cc",
-  "event_type": "deployment_succeeded",
+  "event_type": "deployment.succeeded",
   "timestamp": "2025-11-24T18:38:10.000Z",
   "project_id": 1,
   "payload": {
@@ -132,7 +136,7 @@ Triggered when a deployment fails.
 ```json
 {
   "id": "58fe24a7-3e21-451d-9210-33093e6f91cc",
-  "event_type": "deployment_failed",
+  "event_type": "deployment.failed",
   "timestamp": "2025-11-24T18:38:10.000Z",
   "project_id": 1,
   "payload": {
@@ -188,7 +192,7 @@ Triggered when a new project is created.
 ```json
 {
   "id": "9a8b7c6d-5e4f-3a2b-1c0d-9e8f7a6b5c4d",
-  "event_type": "project_created",
+  "event_type": "project.created",
   "timestamp": "2025-11-24T12:00:00.000Z",
   "project_id": 1,
   "payload": {
@@ -232,7 +236,7 @@ Triggered when a new domain is added to a project.
 ```json
 {
   "id": "7f6e5d4c-3b2a-1098-7654-3210fedcba98",
-  "event_type": "domain_created",
+  "event_type": "domain.created",
   "timestamp": "2025-11-24T14:30:00.000Z",
   "project_id": 1,
   "payload": {
@@ -257,7 +261,7 @@ Triggered when SSL is provisioned for a domain (via Let's Encrypt).
 ```json
 {
   "id": "7f6e5d4c-3b2a-1098-7654-3210fedcba98",
-  "event_type": "domain_provisioned",
+  "event_type": "domain.provisioned",
   "timestamp": "2025-11-24T14:35:00.000Z",
   "project_id": 1,
   "payload": {
@@ -460,14 +464,28 @@ Authorization: Bearer {token}
 ```json
 [
   {
-    "id": 3,
+    "id": 4,
+    "delivery_id": 3,
     "webhook_id": 1,
     "event_type": "deployment.succeeded",
     "event_id": "58fe24a7-3e21-451d-9210-33093e6f91cc",
-    "payload": "{\"id\":\"58fe24a7...\",\"event_type\":\"deployment_succeeded\",...}",
+    "payload": "{\"id\":\"58fe24a7...\",\"event_type\":\"deployment.succeeded\",...}",
     "success": true,
     "status_code": 200,
-    "response_body": "{\"received\":true}",
+    "error_message": null,
+    "attempt_number": 2,
+    "created_at": "2025-11-24T18:40:02.000Z",
+    "delivered_at": "2025-11-24T18:40:02.000Z"
+  },
+  {
+    "id": 3,
+    "delivery_id": 3,
+    "webhook_id": 1,
+    "event_type": "deployment.succeeded",
+    "event_id": "58fe24a7-3e21-451d-9210-33093e6f91cc",
+    "payload": "{\"id\":\"58fe24a7...\",\"event_type\":\"deployment.succeeded\",...}",
+    "success": false,
+    "status_code": 500,
     "error_message": null,
     "attempt_number": 1,
     "created_at": "2025-11-24T18:38:10.000Z",
@@ -490,13 +508,13 @@ Authorization: Bearer {token}
 ```json
 {
   "id": 3,
+  "delivery_id": 3,
   "webhook_id": 1,
   "event_type": "deployment.succeeded",
   "event_id": "58fe24a7-3e21-451d-9210-33093e6f91cc",
-  "payload": "{\"id\":\"58fe24a7-3e21-451d-9210-33093e6f91cc\",\"event_type\":\"deployment_succeeded\",\"timestamp\":\"2025-11-24T18:38:10.000Z\",\"project_id\":1,\"payload\":{\"deployment_id\":123,\"project_id\":1,\"project_name\":\"my-app\",\"environment\":\"production\",\"branch\":\"main\",\"commit_sha\":\"abc123\",\"commit_message\":\"Deploy v2.0\",\"url\":\"https://my-app.temps.dev\",\"status\":\"succeeded\",\"error_message\":null,\"started_at\":\"2025-11-24T18:35:00.000Z\",\"finished_at\":\"2025-11-24T18:38:10.000Z\"}}",
+  "payload": "{\"id\":\"58fe24a7-3e21-451d-9210-33093e6f91cc\",\"event_type\":\"deployment.succeeded\",\"timestamp\":\"2025-11-24T18:38:10.000Z\",\"project_id\":1,\"payload\":{\"deployment_id\":123,\"project_id\":1,\"project_name\":\"my-app\",\"environment\":\"production\",\"branch\":\"main\",\"commit_sha\":\"abc123\",\"commit_message\":\"Deploy v2.0\",\"url\":\"https://my-app.temps.dev\",\"status\":\"succeeded\",\"error_message\":null,\"started_at\":\"2025-11-24T18:35:00.000Z\",\"finished_at\":\"2025-11-24T18:38:10.000Z\"}}",
   "success": true,
   "status_code": 200,
-  "response_body": "{\"received\":true}",
   "error_message": null,
   "attempt_number": 1,
   "created_at": "2025-11-24T18:38:10.000Z",
@@ -504,25 +522,59 @@ Authorization: Bearer {token}
 }
 ```
 
-### Retry a Failed Delivery
+### Deliveries and attempts
 
-Retry a failed webhook delivery.
+A **delivery** is one event sent to one webhook. Every try at sending it, the original send and each retry, is an **attempt** and is recorded as its own history row:
+
+| Field | Meaning |
+|-------|---------|
+| `id` | The history row, one specific attempt. |
+| `delivery_id` | The delivery all attempts belong to. It never changes between attempts and equals the `id` of the first attempt. |
+| `attempt_number` | 1 for the original send, 2 for the first retry, and so on. |
+| `event_id` | The event. Also the same for every attempt. |
+
+A failed attempt keeps its own result (status code, error) after you retry it; the retry is a new row with the next `attempt_number` and the same `delivery_id`.
+
+The same values are sent to your endpoint as headers on every attempt:
+
+| Header | Value |
+|--------|-------|
+| `X-Webhook-Delivery` | The `delivery_id`. **Deduplicate on this**: it is the same on the original send and on every retry. |
+| `X-Webhook-Attempt` | The `attempt_number`, starting at 1. |
+| `X-Webhook-Event` | The event name, for example `deployment.succeeded`. |
+| `X-Webhook-Timestamp` | Unix time of this attempt. It changes between attempts and is part of the signature. |
+
+### Retry a Delivery
+
+Retry a webhook delivery. The stored payload is sent again and recorded as the next attempt of the same delivery (same `delivery_id` and `X-Webhook-Delivery`, next `attempt_number`). The `{delivery_id}` in the path may be the `id` of any attempt of that delivery.
 
 ```http
 POST /projects/{project_id}/webhooks/{webhook_id}/deliveries/{delivery_id}/retry
 Authorization: Bearer {token}
 ```
 
-**Response (200 OK):**
+**Response (200 OK):** the history row of the new attempt.
 
 ```json
 {
+  "id": 4,
+  "delivery_id": 3,
+  "webhook_id": 1,
+  "event_type": "deployment.succeeded",
+  "event_id": "58fe24a7-3e21-451d-9210-33093e6f91cc",
+  "payload": "{\"id\":\"58fe24a7...\",\"event_type\":\"deployment.succeeded\",...}",
   "success": true,
   "status_code": 200,
   "error_message": null,
-  "attempt_number": 2
+  "attempt_number": 2,
+  "created_at": "2025-11-24T18:40:02.000Z",
+  "delivered_at": "2025-11-24T18:40:02.000Z"
 }
 ```
+
+<Note>
+Deliveries recorded by earlier releases have their `delivery_id` filled in by grouping the rows of one webhook that carry the same `event_id`, and their attempts are renumbered 1, 2, 3... in the order they were made, so an old manually retried delivery no longer shows the failed row as attempt 2 and the retry as attempt 1. Two retries submitted at the same moment cannot both take the same attempt number: the second is rejected with `409` and nothing is sent.
+</Note>
 
 ## Security
 
@@ -537,6 +589,7 @@ POST /your-webhook-endpoint
 Content-Type: application/json
 X-Webhook-Event: deployment.succeeded
 X-Webhook-Delivery: 3
+X-Webhook-Attempt: 1
 X-Webhook-Timestamp: 1732471090
 X-Webhook-Signature: sha256=a1b2c3d4e5f6...
 ```
@@ -615,7 +668,13 @@ def webhook():
 3. **Validate event types** - Check that the event type is one you expect
 4. **Respond quickly** - Return a 2xx status code within 30 seconds
 5. **Process asynchronously** - Queue long-running tasks instead of processing them in the webhook handler
-6. **Handle retries idempotently** - Failed deliveries may be retried, so use the `event_id` to deduplicate
+6. **Handle retries idempotently** - Failed deliveries may be retried, so deduplicate on `X-Webhook-Delivery` (the same value on every attempt of one delivery); `X-Webhook-Attempt` tells you which attempt this is
+
+### Private network receivers
+
+By default Temps refuses webhook URLs that point at private (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), loopback, CGNAT (`100.64.0.0/10`) or link-local addresses, including hostnames that resolve to them. This stops anyone who can create a webhook from using Temps to probe your internal network. Plain `http://` URLs to public hosts are accepted.
+
+To deliver to a receiver on your own network, such as an internal automation server, an administrator can list its network under **Settings → Security → Trusted private networks** (for example `10.0.0.0/8` or a single host such as `192.168.1.20`). The same list applies to every other feature that sends requests to a user-supplied URL, including notification webhooks, uptime checks, AI gateway providers, self-hosted Git, OIDC providers and importers. Only private ranges can be trusted, and cloud metadata endpoints such as `169.254.169.254` stay blocked. See [Trust private networks for outbound requests](/docs/production-hardening#outbound-private-networks) before enabling it.
 
 ## Testing Webhooks
 

@@ -133,17 +133,23 @@ jobs:
           cargo test -p temps-presets --test starters -- --ignored --nocapture
 
   known-failing:
-    # java/spring-boot does not pass yet. It runs anyway and always reports
+    # These starters do not pass yet. They run anyway and always report
     # success, so the failure stays visible in the log without blocking a merge
     # — a red required check that everyone learns to ignore is worse than no
-    # check at all.
+    # check at all. Both are defects in the starters themselves, not in a
+    # preset, so the fix belongs in gotempsh/temps-examples; move each one
+    # into the matrix above once it is fixed there.
     #
-    # Spring deduces a REACTIVE application type from a classpath that only has
-    # spring-boot-starter-web, then fails for want of a ReactiveWebServerFactory.
-    # The boot jar is selected correctly (the `-plain.jar` exclusion works) and
-    # the application does start, so this is not jar selection. Not root-caused.
+    # java/spring-boot (#1319): src/main/resources/application.yaml forces
+    # `spring.main.web-application-type: reactive`, but build.gradle only has
+    # the servlet starter (spring-boot-starter-web), so startup fails for want
+    # of a ReactiveWebServerFactory. The image builds and the boot jar is the
+    # right one; selecting `servlet` (or dropping the override) makes it serve.
     #
-    # Tracked in the autopack repository; remove this job when it is fixed.
+    # dockerfile (#1318): built through its own Dockerfile, as the Dockerfile
+    # preset deploys it. `RUN npm ci` fails because no package-lock.json is
+    # checked in, and `CMD ["node", "dist/index.js"]` names a file the build
+    # script never produces (it writes dist/index.html).
     name: known-failing (report only)
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -169,7 +175,7 @@ jobs:
         continue-on-error: true
         env:
           TEMPS_EXAMPLES_DIR: ${{ github.workspace }}/temps-examples/examples/starters
-          TEMPS_STARTERS_ONLY: java/spring-boot
+          TEMPS_STARTERS_ONLY: java/spring-boot,dockerfile
           DOCKER_BUILDKIT: '1'
         run: |
           cargo test -p temps-presets --test starters -- --ignored --nocapture

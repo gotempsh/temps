@@ -112,6 +112,7 @@ export function LocationsChart({
             <CardTitle className="flex items-center gap-2">
               {canGoBack && (
                 <Button
+                  aria-label="Back"
                   variant="ghost"
                   size="icon"
                   className="h-6 w-6"

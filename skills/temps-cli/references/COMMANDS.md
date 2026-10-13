@@ -2,7 +2,7 @@
 
 > Auto-generated documentation for the Temps CLI.
 >
-> Generated from: `@temps-sdk/cli@0.1.36`
+> Generated from: `@temps-sdk/cli@0.1.37`
 >
 > Apply the authorization, target-context, and secret-handling rules in
 > [the Temps CLI skill](../SKILL.md) before executing a command.
@@ -10,10 +10,10 @@
 ## Installation
 
 ```bash
-bunx @temps-sdk/cli@0.1.36 [command]
+bunx @temps-sdk/cli@0.1.37 [command]
 
 # Fallback when Bun is unavailable
-npx @temps-sdk/cli@0.1.36 [command]
+npx @temps-sdk/cli@0.1.37 [command]
 ```
 
 ## Authentication
@@ -22,10 +22,10 @@ Before using most commands, you need to authenticate:
 
 ```bash
 # Login interactively
-bunx @temps-sdk/cli@0.1.36 login
+bunx @temps-sdk/cli@0.1.37 login
 
 # Or configure with wizard
-bunx @temps-sdk/cli@0.1.36 configure
+bunx @temps-sdk/cli@0.1.37 configure
 ```
 
 ## Global Options
@@ -95,6 +95,7 @@ Use this index or search for a top-level command heading to load only the releva
 - [`email-domains`](#email-domains) - Manage email domains for transactional email
 - [`email-providers`](#email-providers) - Manage email providers (SES, Scaleway) for transactional email
 - [`incidents`](#incidents) - Manage incidents for status pages and monitoring
+- [`status-pages`](#status-pages) - Publish public status pages for selected monitors
 - [`alarms`](#alarms) - List, acknowledge, and resolve alarms (container crashes, uptime, metrics, databases)
 - [`emails`](#emails) - Manage and send emails
 - [`load-balancer`](#load-balancer) - Manage load balancer routes
@@ -127,6 +128,8 @@ Use this index or search for a top-level command heading to load only the releva
 - [`cloud`](#cloud) - Temps Cloud
 - [`plugin`](#plugin) - Create, install, update and build TypeScript plugins
 - [`setup`](#setup) - PoC: install Temps on an existing Linux VPS over SSH and save a client context
+- [`start`](#start) - Run Temps on this computer, sign in the CLI and add the Temps skill for your coding agent
+- [`stop`](#stop) - Stop the Temps server and database started by `temps start`
 
 ## Commands
 
@@ -629,8 +632,8 @@ Show deployment status
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID (required) | - | No |
-| `-d, --deployment-id <id>` | Deployment ID (required) | - | No |
+| `-p, --project <project>` | Project slug or ID (defaults to the linked project) | - | No |
+| `-d, --deployment-id <id>` | Deployment ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
 ### `deployments rollback`
@@ -641,7 +644,7 @@ Rollback to previous deployment
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID (required) | - | No |
+| `-p, --project <project>` | Project slug or ID (defaults to the linked project) | - | No |
 | `-e, --environment <env>` | Target environment | `production` | No |
 | `--to <deployment>` | Rollback to specific deployment ID | - | No |
 
@@ -1503,7 +1506,7 @@ Create a backup schedule
 |------|-------------|---------|----------|
 | `-n, --name <name>` | Schedule name | - | No |
 | `-t, --type <type>` | Backup type (full, incremental) | - | No |
-| `-s, --schedule <cron>` | Schedule expression (cron format) | - | No |
+| `-s, --schedule <cron>` | Schedule expression: six-field cron with seconds first, e.g. "0 0 2 * * *" | - | No |
 | `-r, --retention <days>` | Retention period in days | - | No |
 | `-d, --description <desc>` | Description | - | No |
 | `--s3-source-id <id>` | S3 Source ID | - | No |
@@ -1712,6 +1715,7 @@ Run a backup for an external service
 | `--id <id>` | External service ID | - | Yes |
 | `--s3-source-id <id>` | S3 source ID to store the backup | - | Yes |
 | `-t, --type <type>` | Backup type (e.g., full, incremental) | - | No |
+| `--confirm-restart` | Allow the backup to restart the database (PostgreSQL with WAL archiving off restarts once to turn it on) | - | No |
 
 ## `runtime-logs` (alias: `rlogs`)
 
@@ -2143,6 +2147,12 @@ Manage external services (databases, caches, storage)
 - `restore` - Restore a service from a backup (in-place, new service, or PITR)
 - `restore-runs` - List recent restore runs for a service
 - `restore-run` - Show a single restore run
+- `restore-cancel` - Cancel a restore run that has not started writing data yet (refused once it has)
+- `import-data-availability` - Show whether a service can receive data imported from an external database, and what source it accepts
+- `import-data` - Copy a database from an external server into a database of this service (PostgreSQL, MariaDB/MySQL, MongoDB, Redis)
+- `import-data-runs` - List data imports into a service, newest first
+- `import-data-run` - Show one data import: outcome, phase, timings, who started it and the transfer output
+- `import-data-cancel` - Cancel a running data import (refused once the data has been copied)
 - `wal-health` - Probe a PostgreSQL service's WAL / archive_command health right now (archiver failures, backlog, stale replication slots) — diagnoses "Cloud backup mirror unavailable ... check that PostgreSQL's archive_command is succeeding" warnings
 
 ### `services list` (alias: `ls`)
@@ -2609,6 +2619,84 @@ Show a single restore run
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Restore run ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `services restore-cancel`
+
+Cancel a restore run that has not started writing data yet (refused once it has)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Restore run ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `services import-data-availability`
+
+Show whether a service can receive data imported from an external database, and what source it accepts
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `services import-data`
+
+Copy a database from an external server into a database of this service (PostgreSQL, MariaDB/MySQL, MongoDB, Redis)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID to import into | - | Yes |
+| `--target <name>` | Database that receives the data (created if missing; for Redis, the resource name, usually <project>_<environment>) | - | Yes |
+| `--source-url-env <var>` | Name of an environment variable holding the source connection string (recommended: keeps the password out of shell history) | - | No |
+| `--source-url <url>` | Source connection string (visible in shell history and the process list; prefer --source-url-env) | - | No |
+| `--replace` | Drop the target database first if it already holds data (DESTRUCTIVE) | - | No |
+| `--confirm-target <name>` | Required with --replace when not interactive: repeat the target name | - | No |
+| `--timeout <minutes>` | Stop the copy after this many minutes (server default when omitted) | - | No |
+| `-y, --yes` | Skip the confirmation prompt | - | No |
+| `--no-wait` | Return after starting instead of waiting for the result | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `services import-data-runs`
+
+List data imports into a service, newest first
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--page <n>` | Page number (default 1) | - | No |
+| `--page-size <n>` | Items per page (default 20, max 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `services import-data-run`
+
+Show one data import: outcome, phase, timings, who started it and the transfer output
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--run <id>` | Data import ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `services import-data-cancel`
+
+Cancel a running data import (refused once the data has been copied)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--run <id>` | Data import ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
 ### `services wal-health`
@@ -5871,6 +5959,7 @@ Manage incidents for status pages and monitoring
 - `create` (`add`) - Create a new incident
 - `show` - Show incident details
 - `update-status` - Update an incident status
+- `set-visibility` - Show or hide an incident update on published status pages
 - `updates` - List status updates for an incident
 - `bucketed` - Get bucketed incident data for a project
 
@@ -5925,6 +6014,20 @@ Update an incident status
 | `--id <id>` | Incident ID | - | Yes |
 | `-s, --status <status>` | New status (investigating, identified, monitoring, resolved) | - | No |
 | `-m, --message <message>` | Status update message | - | No |
+| `--public` | Show this update on published status pages (private by default) | - | No |
+
+### `incidents set-visibility`
+
+Show or hide an incident update on published status pages
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Incident ID | - | Yes |
+| `--update-id <id>` | Incident update ID (see `incidents updates`) | - | Yes |
+| `--public` | Show the update on published status pages | - | No |
+| `--private` | Hide the update from published status pages | - | No |
 
 ### `incidents updates`
 
@@ -5951,6 +6054,189 @@ Get bucketed incident data for a project
 | `--end-time <time>` | End time (ISO 8601) | - | No |
 | `--environment-id <id>` | Filter by environment ID | - | No |
 | `--json` | Output in JSON format | - | No |
+
+## `status-pages` (alias: `status-page`)
+
+Publish public status pages for selected monitors
+
+**Subcommands:**
+
+- `list` (`ls`) - List a project's status pages
+- `create` - Create a draft status page
+- `show` - Show a status page
+- `update` - Change the title, description or monitor selection
+- `publish` - Publish the page at its public URL
+- `unpublish` - Unpublish; the public URL returns 404 immediately
+- `rotate-url` - Replace the public URL; the old one stops working
+- `delete` (`rm`) - Delete a status page; its public URL returns 404 immediately
+- `domains` (`domain`) - Serve a status page on your own hostname
+
+### `status-pages list` (alias: `ls`)
+
+List a project's status pages
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `status-pages create`
+
+Create a draft status page
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `-t, --title <title>` | Public page title | - | Yes |
+| `-d, --description <text>` | Public description | - | No |
+| `-m, --monitor <id=name>` | Monitor to show and its public name (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `status-pages show`
+
+Show a status page
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `status-pages update`
+
+Change the title, description or monitor selection
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `-t, --title <title>` | Public page title | - | No |
+| `-d, --description <text>` | Public description ("" clears it) | - | No |
+| `-m, --monitor <id=name>` | Replace the selection; repeat for each monitor | - | No |
+| `--clear-monitors` | Remove every monitor (drafts only) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `status-pages publish`
+
+Publish the page at its public URL
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `status-pages unpublish`
+
+Unpublish; the public URL returns 404 immediately
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `status-pages rotate-url`
+
+Replace the public URL; the old one stops working
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `status-pages delete` (alias: `rm`)
+
+Delete a status page; its public URL returns 404 immediately
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `-y, --yes` | Skip the confirmation prompt | - | No |
+
+### `status-pages domains` (alias: `domain`)
+
+Serve a status page on your own hostname
+
+**Subcommands:**
+
+- `list` (`ls`) - List a status page's custom domains and the DNS records they need
+- `add` - Attach a hostname; it serves only after ownership is verified
+- `verify` - Prove ownership and issue the certificate
+- `renew` - Renew the certificate; the current one keeps serving meanwhile (DNS-01: prints the new TXT record)
+- `remove` (`rm`) - Detach a hostname; it answers 404 immediately and its certificate is deleted
+
+#### `status-pages domains list` (alias: `ls`)
+
+List a status page's custom domains and the DNS records they need
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `status-pages domains add`
+
+Attach a hostname; it serves only after ownership is verified
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--hostname <hostname>` | Hostname, e.g. status.example.com | - | Yes |
+| `--dns` | Verify with a DNS TXT record instead of HTTP | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `status-pages domains verify`
+
+Prove ownership and issue the certificate
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--domain-id <id>` | Custom domain ID (see `domains list`) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `status-pages domains renew`
+
+Renew the certificate; the current one keeps serving meanwhile (DNS-01: prints the new TXT record)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--domain-id <id>` | Custom domain ID (see `domains list`) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `status-pages domains remove` (alias: `rm`)
+
+Detach a hostname; it answers 404 immediately and its certificate is deleted
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--domain-id <id>` | Custom domain ID (see `domains list`) | - | Yes |
+| `-y, --yes` | Skip the confirmation prompt | - | No |
 
 ## `alarms` (alias: `alarm`)
 
@@ -7278,6 +7564,7 @@ Create a new sandbox
 | `--preview-password-length <n>` | Length of the generated preview password (8..=256, default 24) | - | No |
 | `--from-snapshot <snap-id>` | Create sandbox from a snapshot (mutually exclusive with --image) | - | No |
 | `--node <name|id>` | Node to run the sandbox on (name, id, or 'control-plane'). Omit to let Temps place it; see `sandbox nodes` | - | No |
+| `--backend <backend>` | Isolation backend: docker, firecracker, microsandbox. Omit for the host default. An unavailable backend fails instead of downgrading | - | No |
 | `--json` | Output as JSON | - | No |
 
 ### `sandbox list` (alias: `ls`)
@@ -8632,6 +8919,32 @@ PoC: install Temps on an existing Linux VPS over SSH and save a client context
 | `--no-telemetry` | Do not send setup analytics (default) | - | No |
 | `-y, --yes` | Approve the installation plan without prompting | - | No |
 
+## `start`
+
+Run Temps on this computer, sign in the CLI and add the Temps skill for your coding agent
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--channel <channel>` | Release channel for a fresh install: stable, beta or nightly | `beta` | No |
+| `--runtime-version <tag>` | Run this exact Temps release | - | No |
+| `--skills <scope>` | Where to add the Temps agent skill: project, global or none (default: project inside a project, otherwise global) | - | No |
+| `--port <port>` | Port for your apps and the console on a fresh install (default: 8080 or the next free port) | - | No |
+| `--make-default` | Make "local" the default CLI context even if another one is active | - | No |
+| `--json` | Print the result as JSON, for scripts and agents | - | No |
+
+## `stop`
+
+Stop the Temps server and database started by `temps start`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--delete-data` | Also delete everything in your local Temps: its apps, services, sandboxes, database and admin password (asks first) | - | No |
+| `-y, --yes` | Do not ask before deleting data | - | No |
+
 
 ---
 
@@ -8641,48 +8954,51 @@ PoC: install Temps on an existing Linux VPS over SSH and save a client context
 
 ```bash
 # Login to Temps
-bunx @temps-sdk/cli@0.1.36 login
+bunx @temps-sdk/cli@0.1.37 login
 
 # Create a new project on the intended server
-bunx @temps-sdk/cli@0.1.36 --target-context production projects create --name my-app
+bunx @temps-sdk/cli@0.1.37 --target-context production projects create --name my-app
 
 # Deploy to production
-bunx @temps-sdk/cli@0.1.36 --target-context production deploy --project my-app --environment production
+bunx @temps-sdk/cli@0.1.37 --target-context production deploy --project my-app --environment production
 
 # View deployment logs
-bunx @temps-sdk/cli@0.1.36 deployments logs --project my-app --follow
+bunx @temps-sdk/cli@0.1.37 deployments logs --project my-app --follow
 
 # Stream runtime container logs
-bunx @temps-sdk/cli@0.1.36 runtime-logs --project my-app
+bunx @temps-sdk/cli@0.1.37 runtime-logs --project my-app
 
 # List containers
-bunx @temps-sdk/cli@0.1.36 containers list --project-id 1 --environment-id 1
+bunx @temps-sdk/cli@0.1.37 containers list --project-id 1 --environment-id 1
 ```
 
 ### Managing Environments
 
 ```bash
 # List environments
-bunx @temps-sdk/cli@0.1.36 environments list --project my-app
+bunx @temps-sdk/cli@0.1.37 environments list --project my-app
 
-# Set environment variables on the intended server
-bunx @temps-sdk/cli@0.1.36 --target-context production environments vars set --project my-app --key DATABASE_URL
+# Set an environment variable on the intended server (prompts for the value)
+bunx @temps-sdk/cli@0.1.37 --target-context production environments vars set --project my-app DATABASE_URL --environments production
 
 # View environment variables
-bunx @temps-sdk/cli@0.1.36 environments vars list --project my-app
+bunx @temps-sdk/cli@0.1.37 environments vars list --project my-app
 ```
 
 ### Managing Domains
 
 ```bash
-# Add a custom domain on the intended server
-bunx @temps-sdk/cli@0.1.36 --target-context production domains add --project my-app --domain app.example.com
+# Request a certificate for a domain on the intended server
+bunx @temps-sdk/cli@0.1.37 --target-context production domains add --domain app.example.com
+
+# Route the domain to a project environment
+bunx @temps-sdk/cli@0.1.37 --target-context production custom-domains create --project-id 1 --environment-id 1 --domain app.example.com
 
 # List domains
-bunx @temps-sdk/cli@0.1.36 domains list --project my-app
+bunx @temps-sdk/cli@0.1.37 domains list
 
 # Remove a domain from the intended server
-bunx @temps-sdk/cli@0.1.36 --target-context production domains remove --project my-app --domain app.example.com
+bunx @temps-sdk/cli@0.1.37 --target-context production domains remove --domain app.example.com
 ```
 
 ## Environment Variables
@@ -8702,7 +9018,7 @@ Configuration is stored in:
 - **Config file**: `~/.temps/config.json`
 - **Credentials**: Stored securely in `~/.temps/` with restricted file permissions
 
-Use `bunx @temps-sdk/cli@0.1.36 configure show` to view current configuration.
+Use `bunx @temps-sdk/cli@0.1.37 configure show` to view current configuration.
 
 ## Support
 

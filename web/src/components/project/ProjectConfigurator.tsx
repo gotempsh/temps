@@ -418,7 +418,7 @@ function ComposeFileSelector({
                 {service.looksLikeDatabase && (
                   <Tooltip>
                     <TooltipTrigger asChild>
-                      <span className="flex items-center gap-1 text-xs text-amber-600 dark:text-amber-500">
+                      <span className="flex items-center gap-1 text-xs text-amber-700 dark:text-amber-500">
                         <Database className="h-3 w-3" />
                         <Info className="h-3 w-3" />
                       </span>
@@ -1778,6 +1778,7 @@ export function ProjectConfigurator({
       <div className="space-y-4">
         {areServicesPending && (
           <div
+            role="status"
             className="grid grid-cols-1 gap-3 md:grid-cols-2"
             aria-label="Loading databases"
           >
@@ -1945,6 +1946,7 @@ export function ProjectConfigurator({
                       : 'Select all'}
                   </Button>
                   <Button
+                    aria-label="Dismiss"
                     type="button"
                     variant="ghost"
                     size="sm"
@@ -1961,6 +1963,7 @@ export function ProjectConfigurator({
                   <div key={v.key} className="flex items-start gap-2">
                     <Checkbox
                       className="mt-2.5"
+                      aria-label={`Import ${v.key}`}
                       checked={selectedEnvExampleKeys.has(v.key)}
                       onCheckedChange={(checked) => {
                         setSelectedEnvExampleKeys((prev) => {

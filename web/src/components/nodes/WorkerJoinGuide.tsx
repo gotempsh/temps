@@ -44,6 +44,7 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
+import { ScrollRegion } from '@/components/ui/scroll-region'
 import { Button } from '@/components/ui/button'
 import { CopyButton } from '@/components/ui/copy-button'
 import { Input } from '@/components/ui/input'
@@ -101,9 +102,9 @@ export function useWireguardMesh() {
 function CommandLine({ command }: { command: string }) {
   return (
     <div className="mt-1 flex items-center gap-2 rounded-md bg-muted px-3 py-2 font-mono text-xs">
-      <span className="flex-1 overflow-x-auto whitespace-nowrap">
+      <ScrollRegion className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap">
         {command}
-      </span>
+      </ScrollRegion>
       <CopyButton minimal className="h-6 w-6 shrink-0" value={command} />
     </div>
   )
@@ -216,7 +217,7 @@ export function WorkerJoinGuide({
           <AlertTitle className="text-amber-700 dark:text-amber-400">
             No external URL configured
           </AlertTitle>
-          <AlertDescription className="text-amber-600 dark:text-amber-300">
+          <AlertDescription className="text-amber-700 dark:text-amber-300">
             These commands use this browser&apos;s address ({url}), which a
             worker on another machine may not reach.{' '}
             <Link to="/settings" className="font-medium underline">
@@ -436,7 +437,7 @@ function UrlJoin({
           <AlertTitle className="text-amber-700 dark:text-amber-400">
             Workers elsewhere cannot reach {url}
           </AlertTitle>
-          <AlertDescription className="text-amber-600 dark:text-amber-300">
+          <AlertDescription className="text-amber-700 dark:text-amber-300">
             That address only works on this machine or its private network. Use{' '}
             <strong>This server reaches the worker</strong> instead, or{' '}
             <Link to="/settings" className="font-medium underline">
@@ -452,7 +453,7 @@ function UrlJoin({
           <AlertTitle className="text-amber-700 dark:text-amber-400">
             Workers dial this server at a private address
           </AlertTitle>
-          <AlertDescription className="text-amber-600 dark:text-amber-300">
+          <AlertDescription className="text-amber-700 dark:text-amber-300">
             The mesh endpoint is {mesh.control_plane.endpoint}, which a machine
             on the internet cannot reach. Pair workers from here instead (This
             server reaches the worker), or start <code>temps serve</code> with{' '}
@@ -660,7 +661,7 @@ function CreatedPairing({
               ? 'This pairing was cancelled: create a new one'
               : 'This pairing expired: create a new one'}
           </AlertTitle>
-          <AlertDescription className="space-y-2 text-amber-600 dark:text-amber-300">
+          <AlertDescription className="space-y-2 text-amber-700 dark:text-amber-300">
             <p>
               Its command no longer works.{' '}
               {pairing.status === 'expired' &&
@@ -874,7 +875,7 @@ function MeshOnboarding({ mesh }: { mesh: WireguardMeshStatusResponse }) {
           <AlertTitle className="text-amber-700 dark:text-amber-400">
             This server cannot run the mesh yet
           </AlertTitle>
-          <AlertDescription className="text-amber-600 dark:text-amber-300">
+          <AlertDescription className="text-amber-700 dark:text-amber-300">
             {mesh.enable_blocker}
           </AlertDescription>
         </Alert>

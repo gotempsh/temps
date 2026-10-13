@@ -145,6 +145,199 @@ async fn check_database_connectivity(host: &str, port: u16) -> Result<(), String
     }
 }
 
+/// Default for how long `temps serve` waits for its database at startup.
+///
+/// Long enough to ride out a database container that starts alongside the
+/// server, or a short network outage, without a supervisor turning it into a
+/// restart loop; short enough that a wrong host is reported within minutes.
+pub const DEFAULT_DATABASE_STARTUP_WAIT: Duration = Duration::from_secs(120);
+
+/// Delay before the second startup attempt; doubled after every failure.
+const STARTUP_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(1);
+
+/// Ceiling for the delay between two startup attempts.
+const STARTUP_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
+
+/// Why one attempt to reach the database at startup failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartupAttemptFailure {
+    /// The database may still come up: nothing listens yet, the host is
+    /// unreachable or does not resolve yet, or PostgreSQL is starting up.
+    Transient(String),
+    /// Waiting cannot help: wrong credentials, a missing database, an invalid
+    /// URL. Reported at once instead of after the whole wait.
+    Permanent(String),
+}
+
+/// Delay after the `failed_attempts`-th failed attempt (1-based): 1 s, 2 s,
+/// 4 s, ... capped at [`STARTUP_RETRY_MAX_DELAY`].
+fn startup_retry_delay(failed_attempts: u32) -> Duration {
+    let exponent = failed_attempts.saturating_sub(1).min(16);
+    STARTUP_RETRY_INITIAL_DELAY
+        .saturating_mul(1u32 << exponent)
+        .min(STARTUP_RETRY_MAX_DELAY)
+}
+
+/// Run `attempt` until it succeeds, it fails permanently, or `max_wait` has
+/// elapsed, sleeping with exponential backoff between transient failures.
+///
+/// Every failed attempt is logged with its reason and the next delay. The
+/// final error names the target, the number of attempts, how long it waited,
+/// the last reason, and the setting that raises the limit. A `max_wait` of
+/// zero makes exactly one attempt.
+pub async fn retry_database_startup<T, F, Fut>(
+    target: &str,
+    max_wait: Duration,
+    mut attempt: F,
+) -> ServiceResult<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, StartupAttemptFailure>>,
+{
+    let started = tokio::time::Instant::now();
+    let give_up = |attempts: u32, reason: &str| {
+        ServiceError::Database(format!(
+            "Database at {target} is still unreachable after waiting {}s \
+             ({attempts} attempt(s)); last error: {reason}. Check that PostgreSQL \
+             is running and reachable from this host, or allow a longer wait with \
+             --database-startup-wait / TEMPS_DB_STARTUP_WAIT (seconds)",
+            started.elapsed().as_secs()
+        ))
+    };
+    let mut failed_attempts: u32 = 0;
+    loop {
+        // Each attempt gets only the time left, so a slow probe (a TCP check
+        // to a black-holed host, a login that hangs) cannot carry startup
+        // past the limit. A zero wait makes one attempt with its own
+        // timeouts, as before.
+        let outcome = if max_wait.is_zero() {
+            attempt().await
+        } else {
+            let remaining = max_wait.saturating_sub(started.elapsed());
+            match tokio::time::timeout(remaining, attempt()).await {
+                Ok(outcome) => outcome,
+                Err(_) => Err(StartupAttemptFailure::Transient(format!(
+                    "the attempt did not finish within the {}s left of the startup wait",
+                    remaining.as_secs()
+                ))),
+            }
+        };
+        let reason = match outcome {
+            Ok(value) => {
+                if failed_attempts > 0 {
+                    tracing::info!(
+                        target_database = %target,
+                        attempts = failed_attempts + 1,
+                        waited_secs = started.elapsed().as_secs(),
+                        "Database is reachable after waiting at startup"
+                    );
+                }
+                return Ok(value);
+            }
+            Err(StartupAttemptFailure::Permanent(reason)) => {
+                return Err(ServiceError::Database(format!(
+                    "Cannot use the database at {target}: {reason}. Waiting would not \
+                     help, so startup stops here; fix the database URL, credentials or \
+                     database name"
+                )));
+            }
+            Err(StartupAttemptFailure::Transient(reason)) => reason,
+        };
+        failed_attempts += 1;
+        let elapsed = started.elapsed();
+        let remaining = max_wait.saturating_sub(elapsed);
+        if remaining.is_zero() {
+            return Err(give_up(failed_attempts, &reason));
+        }
+        let delay = startup_retry_delay(failed_attempts);
+        if delay >= remaining {
+            // The next attempt would start with no time left to run in.
+            tokio::time::sleep(remaining).await;
+            return Err(give_up(failed_attempts, &reason));
+        }
+        tracing::warn!(
+            target_database = %target,
+            attempt = failed_attempts,
+            waited_secs = elapsed.as_secs(),
+            max_wait_secs = max_wait.as_secs(),
+            retry_in_ms = delay.as_millis() as u64,
+            reason = %reason,
+            "Database not reachable yet at startup; retrying"
+        );
+        tokio::time::sleep(delay).await;
+    }
+}
+
+/// Whether a failed connection attempt is worth retrying at startup.
+///
+/// Transport failures and the two server answers that mean "not yet"
+/// (`57P03` the database system is starting up, `53300` too many
+/// connections) are transient; any other answer from PostgreSQL (bad
+/// password, unknown database, permission denied) is permanent.
+fn classify_connect_error(error: &sea_orm::DbErr) -> StartupAttemptFailure {
+    use sea_orm::{DbErr, RuntimeErr};
+    let reason = error.to_string();
+    let sqlx_error = match error {
+        DbErr::Conn(RuntimeErr::SqlxError(sqlx_error)) => sqlx_error,
+        _ => return StartupAttemptFailure::Transient(reason),
+    };
+    match sqlx_error {
+        sqlx::Error::Database(database_error) => match database_error.code().as_deref() {
+            Some("57P03") | Some("53300") => StartupAttemptFailure::Transient(reason),
+            _ => StartupAttemptFailure::Permanent(reason),
+        },
+        sqlx::Error::Configuration(_) => StartupAttemptFailure::Permanent(reason),
+        _ => StartupAttemptFailure::Transient(reason),
+    }
+}
+
+/// One startup probe: the TCP check, then a real login with a single
+/// throwaway connection, so a PostgreSQL that accepts TCP but is still
+/// starting up counts as not ready yet.
+async fn probe_database_once(
+    database_url: &str,
+    host: &str,
+    port: u16,
+) -> Result<(), StartupAttemptFailure> {
+    check_database_connectivity(host, port)
+        .await
+        .map_err(StartupAttemptFailure::Transient)?;
+    let mut options = connect_options(database_url);
+    options
+        .max_connections(1)
+        .min_connections(0)
+        .connect_timeout(CONNECTIVITY_CHECK_TIMEOUT);
+    let probe = match timeout(CONNECTION_TIMEOUT, Database::connect(options)).await {
+        Ok(Ok(probe)) => probe,
+        Ok(Err(error)) => return Err(classify_connect_error(&error)),
+        Err(_) => {
+            return Err(StartupAttemptFailure::Transient(format!(
+                "login timed out after {} seconds",
+                CONNECTION_TIMEOUT.as_secs()
+            )))
+        }
+    };
+    let _ = probe.close().await;
+    Ok(())
+}
+
+/// Wait for the database at startup instead of exiting on the first failure.
+///
+/// `temps serve` calls this before it opens its pool. A database that comes
+/// up within `max_wait` (container started alongside the server, short
+/// outage) no longer turns a supervisor's restart policy into a restart loop.
+/// Each attempt is logged with its reason; the backoff starts at 1 s and
+/// doubles up to 30 s. Wrong credentials or a missing database fail at once.
+pub async fn wait_for_database(database_url: &str, max_wait: Duration) -> ServiceResult<()> {
+    let (host, port) = parse_database_url(database_url)
+        .map_err(|e| ServiceError::Database(format!("Invalid database URL: {}", e)))?;
+    let target = format!("{host}:{port}");
+    retry_database_startup(&target, max_wait, || {
+        probe_database_once(database_url, &host, port)
+    })
+    .await
+}
+
 /// Refuse an existing schema upgrade from a caller without backup preparation.
 /// Fresh databases may still be initialized without a rollback snapshot.
 pub async fn ensure_no_unprotected_upgrade(db: &DbConnection) -> ServiceResult<()> {
@@ -1236,7 +1429,187 @@ pub async fn reconcile_otel_trace_summaries(db: &DatabaseConnection) -> ServiceR
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
+
+    #[test]
+    fn startup_retry_backs_off_exponentially_up_to_a_ceiling() {
+        let delays: Vec<u64> = (1..=8)
+            .map(|attempt| startup_retry_delay(attempt).as_secs())
+            .collect();
+        assert_eq!(delays, vec![1, 2, 4, 8, 16, 30, 30, 30]);
+        assert_eq!(startup_retry_delay(u32::MAX), STARTUP_RETRY_MAX_DELAY);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_wait_retries_transient_failures_until_the_database_answers() {
+        let attempts = AtomicU32::new(0);
+        let started = tokio::time::Instant::now();
+        let result = retry_database_startup("db:5432", Duration::from_secs(60), || {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            async move {
+                if attempt < 3 {
+                    Err(StartupAttemptFailure::Transient(
+                        "Connection refused (os error 61)".to_string(),
+                    ))
+                } else {
+                    Ok(attempt)
+                }
+            }
+        })
+        .await;
+        assert_eq!(result.unwrap(), 3);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        // Slept 1 s, then 2 s.
+        assert_eq!(started.elapsed().as_secs(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_wait_gives_up_after_the_limit_with_a_clear_error() {
+        let attempts = AtomicU32::new(0);
+        let started = tokio::time::Instant::now();
+        let error = retry_database_startup("db:5432", Duration::from_secs(10), || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async {
+                Err::<(), _>(StartupAttemptFailure::Transient(
+                    "No route to host (os error 113)".to_string(),
+                ))
+            }
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        // Attempts at 0, 1, 3 and 7 s; the next one (8 s later) would start
+        // past the limit, so it waits out the rest and gives up at 10 s.
+        assert_eq!(attempts.load(Ordering::SeqCst), 4);
+        assert_eq!(started.elapsed().as_secs(), 10);
+        for expected in [
+            "db:5432",
+            "after waiting 10s",
+            "4 attempt(s)",
+            "No route to host",
+            "TEMPS_DB_STARTUP_WAIT",
+        ] {
+            assert!(error.contains(expected), "{expected:?} missing: {error}");
+        }
+    }
+
+    /// A probe that hangs (a black-holed host) must not carry startup past
+    /// the limit: the attempt is cut off when the wait runs out.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_attempt_cannot_outlast_the_startup_wait() {
+        let attempts = AtomicU32::new(0);
+        let started = tokio::time::Instant::now();
+        let error = retry_database_startup("db:5432", Duration::from_secs(5), || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok::<(), StartupAttemptFailure>(())
+            }
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(started.elapsed().as_secs(), 5);
+        assert!(error.contains("did not finish within the 5s"), "{error}");
+        assert!(error.contains("after waiting 5s"), "{error}");
+    }
+
+    /// With no wait configured the single attempt keeps its own timeouts and
+    /// is not cut short.
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_wait_does_not_cut_the_single_attempt_short() {
+        let result = retry_database_startup("db:5432", Duration::ZERO, || async {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            Ok::<u8, StartupAttemptFailure>(7)
+        })
+        .await;
+        assert_eq!(result.unwrap(), 7);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_wait_stops_at_once_when_waiting_cannot_help() {
+        let attempts = AtomicU32::new(0);
+        let error = retry_database_startup("db:5432", Duration::from_secs(60), || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async {
+                Err::<(), _>(StartupAttemptFailure::Permanent(
+                    "password authentication failed for user \"temps\"".to_string(),
+                ))
+            }
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(error.contains("password authentication failed"), "{error}");
+        assert!(error.contains("Waiting would not help"), "{error}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_startup_wait_makes_exactly_one_attempt() {
+        let attempts = AtomicU32::new(0);
+        let result = retry_database_startup("db:5432", Duration::ZERO, || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async {
+                Err::<(), _>(StartupAttemptFailure::Transient(
+                    "Connection refused".to_string(),
+                ))
+            }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn connection_errors_are_classified_by_whether_waiting_can_help() {
+        let refused = sea_orm::DbErr::Conn(sea_orm::RuntimeErr::SqlxError(sqlx::Error::Io(
+            std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+        )));
+        assert!(matches!(
+            classify_connect_error(&refused),
+            StartupAttemptFailure::Transient(_)
+        ));
+        let pool_timeout =
+            sea_orm::DbErr::Conn(sea_orm::RuntimeErr::SqlxError(sqlx::Error::PoolTimedOut));
+        assert!(matches!(
+            classify_connect_error(&pool_timeout),
+            StartupAttemptFailure::Transient(_)
+        ));
+        let bad_url = sea_orm::DbErr::Conn(sea_orm::RuntimeErr::SqlxError(
+            sqlx::Error::Configuration("invalid port".into()),
+        ));
+        assert!(matches!(
+            classify_connect_error(&bad_url),
+            StartupAttemptFailure::Permanent(_)
+        ));
+    }
+
+    /// Real sockets, real clock: nothing listens on the port, so every
+    /// attempt is refused and the wait ends with the final error.
+    #[tokio::test]
+    async fn wait_for_database_reports_an_unreachable_database_after_the_limit() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let url = format!("postgres://temps:temps@127.0.0.1:{port}/temps");
+
+        let started = std::time::Instant::now();
+        let error = wait_for_database(&url, Duration::from_secs(2))
+            .await
+            .unwrap_err()
+            .to_string();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(2),
+            "gave up early: {elapsed:?}"
+        );
+        assert!(elapsed < Duration::from_secs(10), "overshot: {elapsed:?}");
+        assert!(error.contains(&format!("127.0.0.1:{port}")), "{error}");
+        assert!(error.contains("still unreachable"), "{error}");
+    }
 
     #[test]
     fn test_parse_database_url_basic() {

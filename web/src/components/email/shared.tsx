@@ -67,7 +67,7 @@ export function StatusBadge({ status }: { status: string }) {
       return (
         <Badge
           variant="outline"
-          className="gap-1 border-amber-500 text-amber-600"
+          className="gap-1 border-amber-500 text-amber-700 dark:text-amber-600"
         >
           <AlertTriangle className="h-3 w-3" />
           Delivery unknown

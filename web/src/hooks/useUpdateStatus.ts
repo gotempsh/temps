@@ -3,6 +3,7 @@
 
 import { useQuery } from '@tanstack/react-query'
 import { getUpdateStatusOptions } from '@/api/client/@tanstack/react-query.gen'
+import { useIsInstanceAdmin } from './useIsInstanceAdmin'
 
 /**
  * Hook to fetch the server's release-update status.
@@ -11,10 +12,15 @@ import { getUpdateStatusOptions } from '@/api/client/@tanstack/react-query.gen'
  * (stable/beta) shortly after startup and then daily, so this endpoint is
  * cheap — it only reads an in-memory slot. Drives the app-wide upgrade
  * banner.
+ *
+ * The endpoint needs `settings:read` (instance administrators only), and only
+ * an administrator can act on an upgrade, so other roles never request it.
  */
 export function useUpdateStatus() {
+  const isAdmin = useIsInstanceAdmin()
   return useQuery({
     ...getUpdateStatusOptions(),
+    enabled: isAdmin,
     // The server re-checks daily; hourly refetch keeps a long-lived tab
     // current without hammering the endpoint.
     refetchInterval: 60 * 60 * 1000,

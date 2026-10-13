@@ -21,7 +21,7 @@ temps-presets = { path = "../temps-presets" }
 # From workspace
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = { workspace = true }
+yaml_serde = { workspace = true }
 chrono = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }

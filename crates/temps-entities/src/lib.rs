@@ -131,6 +131,7 @@ pub mod schedule_runs;
 pub mod secret_compose_services;
 pub mod secret_environments;
 pub mod secrets;
+pub mod service_data_imports;
 pub mod service_endpoints;
 pub mod service_members;
 pub mod sessions;
@@ -181,6 +182,9 @@ pub mod status_checks;
 pub mod status_incident_updates;
 pub mod status_incidents;
 pub mod status_monitors;
+pub mod status_page_domains;
+pub mod status_page_monitors;
+pub mod status_pages;
 
 // Metrics alert rules
 pub mod monitoring_alert_rules;

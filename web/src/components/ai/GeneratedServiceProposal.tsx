@@ -392,7 +392,7 @@ export function GeneratedServiceLinkProposal({
             Make this database available to the selected project and its
             application workspace.
           </p>
-          <div className="mt-1.5 flex items-center gap-1.5 text-xs font-medium text-amber-600 dark:text-amber-400">
+          <div className="mt-1.5 flex items-center gap-1.5 text-xs font-medium text-amber-700 dark:text-amber-400">
             <ShieldCheck className="size-4 shrink-0" />
             Awaiting your approval
           </div>

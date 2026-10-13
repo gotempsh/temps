@@ -706,11 +706,15 @@ impl ClickHouseLineIndex {
                     .with_setting("async_insert", "1")
                     .with_setting("wait_for_async_insert", "1");
 
-                let version = temps_clickhouse::server_version(&client)
-                    .await
-                    .map_err(|e| IndexUnavailable::Unreachable {
+                // `preflight` runs the same `SELECT version()`, but a response
+                // the client cannot decode comes back as an error that names
+                // the compression mode, the codec seen on the wire and both
+                // fixes, instead of a bare "decompression error".
+                let version = temps_clickhouse::preflight(&config).await.map_err(|e| {
+                    IndexUnavailable::Unreachable {
                         error: e.to_string(),
-                    })?;
+                    }
+                })?;
                 if !version.at_least(MIN_CLICKHOUSE_MAJOR, MIN_CLICKHOUSE_MINOR) {
                     return Err(IndexUnavailable::VersionTooOld { found: version });
                 }

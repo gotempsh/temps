@@ -13,6 +13,8 @@ use temps_deployer::static_deployer::{StaticDeployRequest, StaticDeployer};
 use temps_deployer::ImageBuilder;
 use temps_logs::{LogLevel, LogService};
 
+use super::builder_node::{image_builder_for_build, BuilderNodeResolver};
+
 /// Typed output from DeployStaticJob
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StaticDeploymentOutput {
@@ -42,6 +44,8 @@ pub struct DeployStaticJob {
     static_deployer: Arc<dyn StaticDeployer>,
     /// Image builder (for extracting files from container)
     image_builder: Arc<dyn ImageBuilder>,
+    /// Reaches the worker that built the image, when the build ran on one
+    builder_node_resolver: Option<Arc<dyn BuilderNodeResolver>>,
     /// Optional log service
     log_id: Option<String>,
     log_service: Option<Arc<LogService>>,
@@ -83,9 +87,16 @@ impl DeployStaticJob {
             deployment_slug,
             static_deployer,
             image_builder,
+            builder_node_resolver: None,
             log_id: None,
             log_service: None,
         }
+    }
+
+    /// Read worker-built images from the node that built them.
+    pub fn with_builder_node_resolver(mut self, resolver: Arc<dyn BuilderNodeResolver>) -> Self {
+        self.builder_node_resolver = Some(resolver);
+        self
     }
 
     pub fn with_log_id(mut self, log_id: String) -> Self {
@@ -101,7 +112,17 @@ impl DeployStaticJob {
     /// Write log message to job-specific log file and context
     async fn log(&self, context: &WorkflowContext, message: String) -> Result<(), WorkflowError> {
         let level = Self::detect_log_level(&message);
+        self.log_at(context, level, message).await
+    }
 
+    /// Write a log message at an explicit level, bypassing content sniffing
+    /// (a skipped path named `error.map` must not turn a warning into an error).
+    async fn log_at(
+        &self,
+        context: &WorkflowContext,
+        level: LogLevel,
+        message: String,
+    ) -> Result<(), WorkflowError> {
         if let (Some(ref log_id), Some(ref log_service)) = (&self.log_id, &self.log_service) {
             log_service
                 .append_structured_log(log_id, level, message.clone())
@@ -177,9 +198,32 @@ impl WorkflowTask for DeployStaticJob {
         )
         .await?;
 
+        let (image_builder, builder_node_id) = match image_builder_for_build(
+            &context,
+            &self.build_job_id,
+            &self.image_builder,
+            self.builder_node_resolver.as_ref(),
+        )
+        .await
+        {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                return Err(self
+                    .log_and_fail(
+                        &context,
+                        format!("❌ Cannot reach the node that built image {image_tag}: {error}"),
+                    )
+                    .await)
+            }
+        };
+
+        let source = match builder_node_id {
+            Some(node_id) => format!("image {image_tag} on build node {node_id}"),
+            None => format!("image {image_tag}"),
+        };
         self.log(
             &context,
-            format!("🐳 Extracting static files from image: {}", image_tag),
+            format!("🐳 Extracting static files from {source}"),
         )
         .await?;
 
@@ -212,8 +256,7 @@ impl WorkflowTask for DeployStaticJob {
         )
         .await?;
 
-        let extraction_result = self
-            .image_builder
+        let extraction_result = image_builder
             .extract_from_image(&image_tag, &self.static_output_dir, temp_dir.path())
             .await;
         if let Err(e) = extraction_result {
@@ -248,6 +291,11 @@ impl WorkflowTask for DeployStaticJob {
                     .await);
             }
         };
+
+        if let Some(summary) = result.skipped_summary() {
+            self.log_at(&context, LogLevel::Warning, format!("⚠️ {summary}"))
+                .await?;
+        }
 
         self.log(&context, format!("📍 Deployed to: {}", result.storage_path))
             .await?;
@@ -524,6 +572,97 @@ mod tests {
         );
     }
 
+    fn site_files(root: &std::path::Path, name: &str, file: &str) -> PathBuf {
+        let dir = root.join(name);
+        std_fs::create_dir_all(&dir).unwrap();
+        std_fs::write(dir.join(file), b"<html></html>").unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn worker_built_static_site_is_extracted_from_the_build_node() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_dir = temp_dir.path().join("static");
+        // The control plane's own builder must not be read: it never had the image.
+        let local = Arc::new(MockImageBuilder {
+            extract_dir: site_files(temp_dir.path(), "local", "local-only.html"),
+            extracted_destination: None,
+        });
+        let build_node = Arc::new(MockImageBuilder {
+            extract_dir: site_files(temp_dir.path(), "worker", "index.html"),
+            extracted_destination: None,
+        });
+        let resolver = Arc::new(crate::jobs::builder_node::tests::StaticResolver::new(
+            7, build_node,
+        ));
+        let job = DeployStaticJob::new(
+            "deploy_static".to_string(),
+            "build_image".to_string(),
+            "/app/dist".to_string(),
+            "my-project".to_string(),
+            "production".to_string(),
+            "deploy-worker".to_string(),
+            Arc::new(FilesystemStaticDeployer::new(base_dir.clone())),
+            local,
+        )
+        .with_builder_node_resolver(resolver.clone());
+        let mut context = crate::test_utils::create_test_context("test".to_string(), 1, 1, 1);
+        context
+            .set_output("build_image", "image_tag", "temps-site:abc")
+            .unwrap();
+        context
+            .set_output("build_image", "builder_node_id", Some(7))
+            .unwrap();
+
+        let result = job.execute(context).await.expect("worker static deploy");
+
+        let static_dir: String = result
+            .context
+            .get_output("deploy_static", "static_dir_location")
+            .unwrap()
+            .unwrap();
+        let deployed = base_dir.join(static_dir);
+        assert!(deployed.join("index.html").exists());
+        assert!(!deployed.join("local-only.html").exists());
+        assert_eq!(*resolver.lookups.lock().unwrap(), vec![7]);
+    }
+
+    #[tokio::test]
+    async fn worker_built_static_site_without_resolver_fails_naming_the_node() {
+        let temp_dir = TempDir::new().unwrap();
+        let job = DeployStaticJob::new(
+            "deploy_static".to_string(),
+            "build_image".to_string(),
+            "/app/dist".to_string(),
+            "my-project".to_string(),
+            "production".to_string(),
+            "deploy-worker".to_string(),
+            Arc::new(FilesystemStaticDeployer::new(
+                temp_dir.path().join("static"),
+            )),
+            Arc::new(MockImageBuilder {
+                extract_dir: site_files(temp_dir.path(), "local", "index.html"),
+                extracted_destination: None,
+            }),
+        );
+        let mut context = crate::test_utils::create_test_context("test".to_string(), 1, 1, 1);
+        context
+            .set_output("build_image", "image_tag", "temps-site:abc")
+            .unwrap();
+        context
+            .set_output("build_image", "builder_node_id", Some(7))
+            .unwrap();
+
+        let error = job
+            .execute(context)
+            .await
+            .expect_err("must not fall back to a builder without the image");
+
+        let message = error.to_string();
+        assert!(message.contains("node 7"), "{message}");
+        assert!(message.contains("temps-site:abc"), "{message}");
+    }
+
     #[tokio::test]
     async fn test_deploy_static_job_validation() {
         let temp_dir = TempDir::new().unwrap();
@@ -572,16 +711,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_sensitive_static_deploy_cleans_temporary_extraction() {
+    async fn static_deploy_skips_sensitive_files_and_cleans_temporary_extraction() {
         let temp_dir = TempDir::new().unwrap();
         let base_dir = temp_dir.path().join("static");
         let built_files_dir = temp_dir.path().join("built_files");
         std_fs::create_dir_all(&built_files_dir).unwrap();
         std_fs::write(built_files_dir.join("index.html"), b"ordinary").unwrap();
         std_fs::write(built_files_dir.join("app.js.map"), b"private source map").unwrap();
+        std_fs::write(built_files_dir.join(".nojekyll"), b"").unwrap();
 
         let extracted_destination = Arc::new(std::sync::Mutex::new(None));
-        let deployer = Arc::new(FilesystemStaticDeployer::new(base_dir));
+        let deployer = Arc::new(FilesystemStaticDeployer::new(base_dir.clone()));
         let image_builder = Arc::new(MockImageBuilder {
             extract_dir: built_files_dir,
             extracted_destination: Some(extracted_destination.clone()),
@@ -589,8 +729,8 @@ mod tests {
         let job = DeployStaticJob::new(
             "deploy_static".to_string(),
             "build_image".to_string(),
-            "/app/dist".to_string(),
-            "my-project".to_string(),
+            "/app/build".to_string(),
+            "docs-site".to_string(),
             "production".to_string(),
             "deploy-sensitive".to_string(),
             deployer,
@@ -601,9 +741,21 @@ mod tests {
             .set_output("build_image", "image_tag", "myapp:latest")
             .unwrap();
 
-        let result = job.execute(context).await;
+        let result = job
+            .execute(context)
+            .await
+            .expect("non-publishable files must be skipped, not fail the deployment");
 
-        assert!(result.is_err(), "source maps must not be published");
+        let static_dir: String = result
+            .context
+            .get_output("deploy_static", "static_dir_location")
+            .unwrap()
+            .unwrap();
+        let deployed = base_dir.join(static_dir);
+        assert!(deployed.join("index.html").is_file());
+        assert!(!deployed.join("app.js.map").exists());
+        assert!(!deployed.join(".nojekyll").exists());
+
         let extraction_path = extracted_destination
             .lock()
             .unwrap()
@@ -611,7 +763,7 @@ mod tests {
             .expect("mock extraction destination was recorded");
         assert!(
             !extraction_path.exists(),
-            "failed deployment leaked temporary extraction directory {}",
+            "deployment leaked temporary extraction directory {}",
             extraction_path.display()
         );
     }

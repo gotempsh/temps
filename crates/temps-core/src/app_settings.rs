@@ -21,6 +21,16 @@ pub struct AppSettings {
     /// mapping (which Temps adds to provisioned containers). Distinct from
     /// `external_url`, which is the public-facing address.
     pub internal_url: Option<String>,
+    /// Base URL handed to third parties that call back into Temps: email
+    /// open/click tracking, git provider webhooks, SES/SNS events, revenue
+    /// webhooks, the Sentry DSN (ADR-051). `None` (the default) falls back to
+    /// `external_url`, which is right whenever the console is publicly
+    /// reachable. Set it when the console host is restricted (VPN, firewall,
+    /// identity-aware proxy) so only this hostname has to be public: the proxy
+    /// serves nothing but the public callback routes on it. Read it through
+    /// [`AppSettings::effective_public_ingress_url`].
+    #[serde(default)]
+    pub public_ingress_url: Option<String>,
     pub preview_domain: String,
     /// Public edge target that generated DNS records point at when a managed
     /// domain opts into automatic record sync. An IPv4/IPv6 address produces an
@@ -110,6 +120,16 @@ pub struct AppSettings {
     /// to match; the generic settings update preserves the stored value.
     pub preview_gateway: PreviewGatewaySettings,
 
+    /// Managed KV service (Redis container) settings. Owned by
+    /// `PATCH /kv/settings`; the generic settings update preserves the stored
+    /// value.
+    pub kv: KvSettings,
+
+    /// Managed Blob service (RustFS container) settings. Owned by
+    /// `PATCH /blob/settings`; the generic settings update preserves the
+    /// stored value.
+    pub blob: BlobSettings,
+
     // On-demand (lazy) HTTP-01 TLS issuance settings (ADR-018). Off by default;
     // auto-enabled by `temps setup` for QuickStart (sslip.io) installs.
     pub on_demand_tls: OnDemandTlsSettings,
@@ -156,6 +176,16 @@ pub struct AppSettings {
     #[serde(default)]
     pub insecure_tls: bool,
 
+    /// Private networks (CIDRs or single addresses) that user-configured
+    /// outbound requests may reach: webhooks, notification channels, uptime
+    /// checks, AI gateway providers, self-hosted git, importers. Empty by
+    /// default, which keeps the SSRF guard blocking every private, loopback
+    /// and CGNAT destination. Only private ranges are accepted, and cloud
+    /// metadata endpoints stay blocked regardless. Published process-wide via
+    /// `url_validation::set_trusted_private_networks`.
+    #[serde(default)]
+    pub trusted_private_networks: Vec<String>,
+
     /// Build-time resource limits applied on the control plane to prevent
     /// `docker build` from saturating host CPU/RAM. Worker nodes are
     /// intentionally NOT subject to these limits (each worker is dedicated
@@ -185,6 +215,12 @@ pub struct AppSettings {
     /// Retention windows for raw proxy and OpenTelemetry telemetry.
     /// TimescaleDB policies are updated at runtime by the Settings API.
     pub observability_retention: ObservabilityRetentionSettings,
+
+    /// How Temps talks to the instance's ClickHouse server (wire compression
+    /// of query responses). Read once when the process starts, so a change
+    /// is applied by the next restart; the Settings API reports the mode the
+    /// running process actually uses next to the stored one.
+    pub clickhouse: ClickHouseSettings,
 
     /// Geolocation database refresh policy, MaxMind credential (encrypted at
     /// rest), and the self-recorded freshness metadata of the last refresh.
@@ -1118,10 +1154,11 @@ pub struct AgentSandboxSettings {
     /// Network access level: "full" (unrestricted), "restricted" (Temps network only), "none" (no network)
     #[schema(example = "full")]
     pub network_mode: String,
-    /// Default isolation backend for sandboxes: "docker" (default) or
-    /// "firecracker" (ADR-029; requires `temps firecracker setup`). Only
-    /// consulted when the Firecracker backend probes available — otherwise
-    /// Docker is used regardless.
+    /// Default isolation backend for sandboxes: "docker" (default),
+    /// "firecracker" (ADR-029; requires `temps firecracker setup`) or
+    /// "microsandbox" (ADR-050, experimental; requires `temps microsandbox
+    /// setup`). Only consulted when the selected microVM backend probes
+    /// available — otherwise Docker is used.
     #[serde(default)]
     #[schema(example = "docker")]
     pub sandbox_backend: Option<String>,
@@ -1469,6 +1506,35 @@ impl Default for PreviewGatewaySettings {
     }
 }
 
+/// Settings of the managed KV service (the Redis container behind `/kv`).
+///
+/// The Docker container is named `redis-<service name>`, so two Temps
+/// instances sharing one Docker daemon collide unless each has its own name.
+/// An unset value follows the per-instance default (the pre-existing
+/// `redis-temps-kv` for an install that already enabled KV, a name derived
+/// from this instance otherwise).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct KvSettings {
+    /// Docker container name of the KV Redis container. Empty means the
+    /// per-instance default. A custom value must start with `redis-`.
+    #[schema(example = "redis-temps-kv-staging")]
+    pub container_name: String,
+}
+
+/// Settings of the managed Blob service (the RustFS container behind `/blob`).
+///
+/// Same reasoning as [`KvSettings`]: the container is named
+/// `rustfs-<service name>`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct BlobSettings {
+    /// Docker container name of the Blob RustFS container. Empty means the
+    /// per-instance default. A custom value must start with `rustfs-`.
+    #[schema(example = "rustfs-temps-blob-staging")]
+    pub container_name: String,
+}
+
 /// On-demand (lazy) HTTP-01 TLS issuance settings (ADR-018).
 ///
 /// When `enabled`, the proxy's `certificate_callback` triggers ACME HTTP-01
@@ -1581,6 +1647,83 @@ pub struct MonitoringSettings {
     /// retained for compatibility and operator reference only.
     /// Example: `"http://localhost:8123"`.
     pub clickhouse_url: Option<String>,
+}
+
+/// Wire compression used on the HTTP connection to the instance's ClickHouse
+/// server.
+///
+/// The `clickhouse` client asks for compressed responses (`compress=1`) and
+/// decodes exactly one codec, LZ4, but it never says which codec it wants, so
+/// it silently depends on the server's `network_compression_method` default.
+/// ClickHouse 26.9 changed that default to ZSTD, after which every response
+/// that carries rows fails with `decompression error: incorrect magic
+/// number`. Temps therefore makes the choice itself and never leaves it to the
+/// server default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ClickHouseCompression {
+    /// Ask for LZ4-compressed responses and pin the server's
+    /// `network_compression_method` to `lz4` on every query, so the server
+    /// default can never disagree with what the client decodes. Default.
+    #[default]
+    Lz4,
+    /// Ask for uncompressed responses. The escape hatch for a proxy or load
+    /// balancer between Temps and ClickHouse that re-encodes response bodies
+    /// and breaks the LZ4 framing.
+    None,
+}
+
+impl ClickHouseCompression {
+    /// Every mode, in the order the settings UI should offer them.
+    pub const ALL: [ClickHouseCompression; 2] =
+        [ClickHouseCompression::Lz4, ClickHouseCompression::None];
+
+    /// The stable lowercase name used in the API, logs and error messages.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ClickHouseCompression::Lz4 => "lz4",
+            ClickHouseCompression::None => "none",
+        }
+    }
+}
+
+impl std::fmt::Display for ClickHouseCompression {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A value that is not one of the [`ClickHouseCompression`] modes.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("'{value}' is not a valid ClickHouse compression mode; expected one of: lz4, none")]
+pub struct ParseClickHouseCompressionError {
+    pub value: String,
+}
+
+impl std::str::FromStr for ClickHouseCompression {
+    type Err = ParseClickHouseCompressionError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "lz4" => Ok(ClickHouseCompression::Lz4),
+            "none" => Ok(ClickHouseCompression::None),
+            _ => Err(ParseClickHouseCompressionError {
+                value: s.to_string(),
+            }),
+        }
+    }
+}
+
+/// Settings for the connection to the instance's ClickHouse server.
+///
+/// The connection itself (URL, database, user, password) is bootstrap
+/// configuration in `TEMPS_CLICKHOUSE_*`; only behaviour an operator may need
+/// to change at runtime lives here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
+#[serde(default)]
+pub struct ClickHouseSettings {
+    /// Wire compression for query responses. See [`ClickHouseCompression`].
+    pub compression: ClickHouseCompression,
 }
 
 /// TimescaleDB compression policy configuration for append-only observability
@@ -1990,6 +2133,7 @@ impl Default for AppSettings {
         Self {
             external_url: None,
             internal_url: None,
+            public_ingress_url: None,
             preview_domain: DEFAULT_LOCAL_DOMAIN.to_string(),
             edge_target: None,
             cloudflare_new_projects: false,
@@ -2010,9 +2154,12 @@ impl Default for AppSettings {
             multi_node: MultiNodeSettings::default(),
             agent_sandbox: AgentSandboxSettings::default(),
             preview_gateway: PreviewGatewaySettings::default(),
+            kv: KvSettings::default(),
+            blob: BlobSettings::default(),
             on_demand_tls: OnDemandTlsSettings::default(),
             ai_config: AiConfigSettings::default(),
             insecure_tls: false,
+            trusted_private_networks: Vec::new(),
             ai_chat_limits: AiChatLimitsSettings::default(),
             ai_workspace_file_limits: AiWorkspaceFileLimitsSettings::default(),
             request_timeouts: RequestTimeoutSettings::default(),
@@ -2023,6 +2170,7 @@ impl Default for AppSettings {
             monitoring: MonitoringSettings::default(),
             observability_compression: ObservabilityCompressionSettings::default(),
             observability_retention: ObservabilityRetentionSettings::default(),
+            clickhouse: ClickHouseSettings::default(),
             geo: GeoSettings::default(),
             mcp_server: McpServerSettings::default(),
             setup_complete: false,
@@ -2239,8 +2387,18 @@ impl AppSettings {
                 Some(serde_json::Value::Bool(enabled)) => Some(*enabled),
                 Some(_) => Some(false),
             };
+            // Same for the ClickHouse wire-compression mode: resetting a saved
+            // `none` to the LZ4 default would silently re-break a deployment
+            // whose proxy corrupts LZ4 framing, over an unrelated bad section.
+            let clickhouse = value
+                .get("clickhouse")
+                .and_then(|section| {
+                    serde_json::from_value::<ClickHouseSettings>(section.clone()).ok()
+                })
+                .unwrap_or_default();
             Self {
                 anonymous_telemetry_enabled,
+                clickhouse,
                 ..Self::default()
             }
         })
@@ -2335,9 +2493,10 @@ impl AppSettings {
     /// True when `host` is owned by the platform itself and must never be
     /// claimed by a project domain.
     ///
-    /// Reserved hosts are the console hostname (`external_url`) and the
-    /// preview domain apex — routing either of them at a project makes the
-    /// console or every generated preview URL unreachable, and recovering
+    /// Reserved hosts are the console hostname (`external_url`), the public
+    /// ingress hostname (`public_ingress_url`) and the preview domain apex —
+    /// routing any of them at a project makes the console, every third-party
+    /// callback or every generated preview URL unreachable, and recovering
     /// requires shell/IP access to the box (issue #478).
     pub fn is_reserved_hostname(&self, host: &str) -> bool {
         let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
@@ -2345,6 +2504,9 @@ impl AppSettings {
             return false;
         }
         if self.console_hostname().as_deref() == Some(host.as_str()) {
+            return true;
+        }
+        if self.public_ingress_hostname().as_deref() == Some(host.as_str()) {
             return true;
         }
         let preview = self
@@ -2576,6 +2738,36 @@ mod tests {
             ..Default::default()
         };
         assert!(!s.is_reserved_hostname("anything.example.com"));
+    }
+
+    // ADR-051: the public ingress hostname is a platform host, exactly like
+    // the console hostname. A project that claimed it would swallow every
+    // third-party callback.
+    #[test]
+    fn reserved_hostname_covers_the_public_ingress_host() {
+        let s = AppSettings {
+            external_url: Some("https://console.example.com".to_string()),
+            public_ingress_url: Some("https://Hooks.example.com/".to_string()),
+            preview_domain: "apps.example.com".to_string(),
+            ..Default::default()
+        };
+        assert!(s.is_reserved_hostname("hooks.example.com"));
+        assert!(s.is_reserved_hostname("HOOKS.example.com."));
+        assert!(s.is_reserved_hostname("console.example.com"));
+        assert!(!s.is_reserved_hostname("other.example.com"));
+    }
+
+    #[test]
+    fn settings_stored_before_public_ingress_existed_still_load() {
+        let s = AppSettings::from_json(serde_json::json!({
+            "external_url": "https://console.example.com",
+            "preview_domain": "apps.example.com"
+        }));
+        assert_eq!(s.public_ingress_url, None);
+        assert_eq!(
+            s.effective_public_ingress_url(),
+            "https://console.example.com"
+        );
     }
 
     // ADR-024: cluster-DNS injection is experimental/beta and defaults OFF
@@ -2970,6 +3162,70 @@ mod tests {
         }));
         assert_eq!(parsed.geo, GeoSettings::default());
         assert!(!parsed.geo.license_key_configured());
+    }
+
+    #[test]
+    fn clickhouse_compression_defaults_to_lz4_for_legacy_settings_json() {
+        let parsed = AppSettings::from_json(serde_json::json!({
+            "external_url": "https://paas.example.com"
+        }));
+
+        assert_eq!(parsed.clickhouse.compression, ClickHouseCompression::Lz4);
+        assert_eq!(parsed.clickhouse, ClickHouseSettings::default());
+    }
+
+    #[test]
+    fn clickhouse_compression_round_trips_through_json_as_snake_case() {
+        let mut settings = AppSettings::default();
+        settings.clickhouse.compression = ClickHouseCompression::None;
+
+        let json = settings.to_json();
+        assert_eq!(json["clickhouse"]["compression"], "none");
+
+        let parsed = AppSettings::from_json(json);
+        assert_eq!(parsed.clickhouse.compression, ClickHouseCompression::None);
+    }
+
+    #[test]
+    fn clickhouse_compression_survives_an_unrelated_malformed_section() {
+        // `monitoring` is the wrong type, so the whole document fails to
+        // decode; the saved ClickHouse mode must not fall back to the default.
+        let parsed = AppSettings::from_json(serde_json::json!({
+            "monitoring": "not an object",
+            "clickhouse": { "compression": "none" }
+        }));
+
+        assert_eq!(parsed.clickhouse.compression, ClickHouseCompression::None);
+    }
+
+    #[test]
+    fn clickhouse_compression_rejects_unknown_wire_values() {
+        let result: Result<ClickHouseSettings, _> =
+            serde_json::from_value(serde_json::json!({ "compression": "zstd" }));
+        assert!(result.is_err(), "zstd is not a supported client mode");
+    }
+
+    #[test]
+    fn clickhouse_compression_parses_names_case_insensitively() {
+        assert_eq!(
+            "LZ4".parse::<ClickHouseCompression>(),
+            Ok(ClickHouseCompression::Lz4)
+        );
+        assert_eq!(
+            " none ".parse::<ClickHouseCompression>(),
+            Ok(ClickHouseCompression::None)
+        );
+        let error = "zstd".parse::<ClickHouseCompression>().unwrap_err();
+        assert_eq!(error.value, "zstd");
+        assert!(error.to_string().contains("expected one of: lz4, none"));
+    }
+
+    #[test]
+    fn clickhouse_compression_display_matches_wire_name() {
+        for mode in ClickHouseCompression::ALL {
+            assert_eq!(mode.to_string(), mode.as_str());
+            assert_eq!(mode.as_str().parse::<ClickHouseCompression>(), Ok(mode));
+        }
     }
 
     #[test]

@@ -53,6 +53,7 @@
 //! (`TraceSortField` / `SortOrder`) with no user-controlled input path.
 
 pub mod migrations;
+pub mod read_limits;
 
 use migrations::WriteTable;
 
@@ -91,6 +92,9 @@ pub struct ClickHouseOtelConfig {
     pub database: String,
     pub user: String,
     pub password: String,
+    /// Wire compression, resolved from the stored `clickhouse.compression`
+    /// setting. [`ClickHouseOtelConfig::new`] starts at the default (LZ4).
+    pub compression: temps_clickhouse::ClickHouseCompression,
 }
 
 // Manual Debug that masks the password so it can never leak into logs, panic
@@ -102,6 +106,7 @@ impl std::fmt::Debug for ClickHouseOtelConfig {
             .field("database", &self.database)
             .field("user", &self.user)
             .field("password", &"***")
+            .field("compression", &self.compression)
             .finish()
     }
 }
@@ -118,7 +123,29 @@ impl ClickHouseOtelConfig {
             database: database.into(),
             user: user.into(),
             password: password.into(),
+            compression: temps_clickhouse::ClickHouseCompression::default(),
         }
+    }
+
+    /// Use `compression` for the clients built from this config.
+    pub fn with_compression(
+        mut self,
+        compression: temps_clickhouse::ClickHouseCompression,
+    ) -> Self {
+        self.compression = compression;
+        self
+    }
+
+    /// Build a plain client for this config (no per-query limits), through
+    /// the one shared constructor that applies the compression mode.
+    pub fn client(&self) -> ::clickhouse::Client {
+        temps_clickhouse::build_client(
+            &self.url,
+            &self.database,
+            &self.user,
+            &self.password,
+            self.compression,
+        )
     }
 }
 
@@ -156,11 +183,16 @@ impl ClickHouseOtelClient {
     /// Does not validate connectivity; call [`health_check`] or run migrations
     /// to confirm the connection is live.
     pub fn new(config: ClickHouseOtelConfig) -> Self {
-        let client = ::clickhouse::Client::default()
-            .with_url(config.url)
-            .with_database(config.database)
-            .with_user(config.user)
-            .with_password(config.password)
+        let client = config
+            .client()
+            // NOTE: these limits belong to THIS client only, and it is built for
+            // the backfill CLI. `ClickHouseOtelStorage::new` builds its own
+            // client with no settings at all, so storage reads run under
+            // whatever the server profile says (a profile's `max_memory_usage`
+            // is what actually bounded them, not the 8 GiB below). Reads that
+            // must be bounded set their own per-query limits — see
+            // `storage::global_traces::local_clickhouse`.
+            //
             // Per-query blast radius. Without these, one authenticated read of
             // a very large project (an unbounded `count_traces`, a wide window,
             // a pathological offset) can hold many GB and many minutes on a
@@ -1278,11 +1310,31 @@ pub(crate) fn ch_ingest_err(operation: &str, err: ::clickhouse::error::Error) ->
 }
 
 /// Wrap a ClickHouse query error into an [`OtelError::Storage`] with context.
+///
+/// A read that hit one of the limits of [`read_limits`] says so -- which limit,
+/// and what to do about it -- instead of surfacing the server's raw text alone.
 pub(crate) fn ch_query_err(operation: &str, err: ::clickhouse::error::Error) -> OtelError {
-    let kind = ch_err_kind(&err);
-    OtelError::Storage {
-        message: format!("ClickHouse query {operation} failed: {err}"),
-        kind,
+    use read_limits::{classify, Failure};
+    match classify(&err) {
+        Failure::MemoryLimit => OtelError::Storage {
+            message: format!(
+                "ClickHouse query {operation} exceeded its {} MiB memory budget; \
+                 narrow the time window or filters: {err}",
+                read_limits::READ_MAX_MEMORY_BYTES >> 20
+            ),
+            kind: StorageErrorKind::ClickHouseOther,
+        },
+        Failure::Timeout => OtelError::Storage {
+            message: format!(
+                "ClickHouse query {operation} exceeded its {:?} time budget: {err}",
+                read_limits::READ_MAX_EXECUTION_TIME
+            ),
+            kind: StorageErrorKind::ClickHouseTimeout,
+        },
+        Failure::Other => OtelError::Storage {
+            message: format!("ClickHouse query {operation} failed: {err}"),
+            kind: ch_err_kind(&err),
+        },
     }
 }
 
@@ -1326,8 +1378,13 @@ pub fn trace_ref_version(first_seen_ms: i64) -> u64 {
 /// methods delegate to the inner `TimescaleDbStorage` until Phase 1–4
 /// implementations land (see module-level doc).
 pub struct ClickHouseOtelStorage {
-    /// ClickHouse client — cheap to clone (Arc-backed internally).
+    /// ClickHouse client — cheap to clone (Arc-backed internally). Used for
+    /// writes, migrations and health checks; carries no read limits.
     ch: ::clickhouse::Client,
+    /// The same connection with the read bounds of [`read_limits`] applied.
+    /// Every SELECT goes through this one, so no read depends on the server
+    /// profile alone for its memory or time ceiling.
+    read: ::clickhouse::Client,
     /// Postgres/TimescaleDB inner storage for delegation.
     ///
     /// All non-span methods and (for now) all span read methods are
@@ -1419,13 +1476,11 @@ impl ClickHouseOtelStorage {
         resolver: Arc<dyn temps_core::RetentionResolver>,
         facet_cache: Option<crate::services::FacetCache>,
     ) -> Self {
-        let ch = ::clickhouse::Client::default()
-            .with_url(&config.url)
-            .with_database(&config.database)
-            .with_user(&config.user)
-            .with_password(&config.password);
+        let ch = config.client();
+        let read = read_limits::bounded_read_client(&ch);
         Self {
             ch,
+            read,
             inner,
             resolver,
             facet_cache,
@@ -1476,7 +1531,14 @@ impl OtelStorage for ClickHouseOtelStorage {
         &self,
         query: crate::storage::global_traces::GlobalTraceQuery,
     ) -> StorageResult<crate::storage::global_traces::GlobalTraceStream> {
-        super::global_traces::clickhouse(&self.ch, &query, None).await
+        // Same lock-free snapshot the project trace list filters with, so a
+        // faceted attribute uses its indexed slot column here too.
+        let facets = self
+            .facet_cache
+            .as_ref()
+            .map(|c| c.load_full())
+            .unwrap_or_default();
+        super::global_traces::clickhouse_local(&self.read, &query, &facets).await
     }
     // ── Span write (ClickHouse — system of record) ──────────────────────────
 
@@ -1753,7 +1815,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         };
 
         // Apply binds sequentially to the query builder.
-        let mut q = self.ch.query(&sql);
+        let mut q = self.read.query(&sql);
         for b in all_binds {
             q = match b {
                 Bv::I32(v) => q.bind(v),
@@ -2078,7 +2140,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         all_binds.push(Bv::I64(offset as i64));
         let binds = all_binds;
 
-        let mut q = self.ch.query(&sql);
+        let mut q = self.read.query(&sql);
         for b in binds {
             q = match b {
                 Bv::I32(v) => q.bind(v),
@@ -2254,7 +2316,7 @@ impl OtelStorage for ClickHouseOtelStorage {
             )
         };
 
-        let mut q = self.ch.query(&sql);
+        let mut q = self.read.query(&sql);
         for b in binds {
             q = match b {
                 Bv::I32(v) => q.bind(v),
@@ -2292,7 +2354,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         }
 
         let rows = self
-            .ch
+            .read
             .query("SELECT 1 AS one FROM spans WHERE project_id = ? LIMIT 1")
             .bind(project_id)
             .fetch_all::<ChExistsRow>()
@@ -2337,7 +2399,7 @@ impl OtelStorage for ClickHouseOtelStorage {
                    ORDER BY start_time ASC";
 
         let rows = self
-            .ch
+            .read
             .query(sql)
             .bind(project_id)
             .bind(trace_id)
@@ -2478,7 +2540,7 @@ impl OtelStorage for ClickHouseOtelStorage {
             LIMIT ? OFFSET ?"#
         );
 
-        let mut q = bind_all(self.ch.query(&sql), binds);
+        let mut q = bind_all(self.read.query(&sql), binds);
         q = q
             .bind(query.min_count as i64)
             .bind(limit as i64)
@@ -2508,7 +2570,7 @@ impl OtelStorage for ClickHouseOtelStorage {
             )"#
         );
 
-        let q = bind_all(self.ch.query(&sql), binds).bind(query.min_count as i64);
+        let q = bind_all(self.read.query(&sql), binds).bind(query.min_count as i64);
 
         let row = q
             .fetch_one::<ChCountRow>()
@@ -2655,7 +2717,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         binds.push(Bv::I64(limit as i64));
         binds.push(Bv::I64(offset as i64));
 
-        let mut q = self.ch.query(&sql);
+        let mut q = self.read.query(&sql);
         for b in binds {
             q = match b {
                 Bv::I32(v) => q.bind(v),
@@ -2747,7 +2809,7 @@ impl OtelStorage for ClickHouseOtelStorage {
                    ORDER BY start_time ASC";
 
         let rows = self
-            .ch
+            .read
             .query(sql)
             .bind(project_id)
             .bind(trace_id)
@@ -2842,7 +2904,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         let where_sql = where_parts.join(" AND ");
         let sql = format!("SELECT uniqExact(trace_id) AS cnt FROM spans FINAL WHERE {where_sql}");
 
-        let mut q = self.ch.query(&sql);
+        let mut q = self.read.query(&sql);
         for b in binds {
             q = match b {
                 Bv::I32(v) => q.bind(v),
@@ -2878,7 +2940,7 @@ impl OtelStorage for ClickHouseOtelStorage {
                    ORDER BY start_time ASC";
 
         let rows = self
-            .ch
+            .read
             .query(sql)
             .bind(project_id)
             .bind(trace_id)
@@ -3175,7 +3237,7 @@ impl OtelStorage for ClickHouseOtelStorage {
 
         // Bind order: SELECT group keys first (the `attributes[?]` in the
         // projection), then WHERE params in clause order, then LIMIT.
-        let mut q = self.ch.query(&sql);
+        let mut q = self.read.query(&sql);
         for key in &query.group_by {
             q = q.bind(key.clone());
         }
@@ -3240,7 +3302,7 @@ impl OtelStorage for ClickHouseOtelStorage {
              ORDER BY bucket_ms ASC \
              LIMIT ?"
         );
-        let mut hq = self.ch.query(&hist_sql);
+        let mut hq = self.read.query(&hist_sql);
         for key in &query.group_by {
             hq = hq.bind(key.clone());
         }
@@ -3335,7 +3397,7 @@ impl OtelStorage for ClickHouseOtelStorage {
     /// List distinct metric names for a project from the CH `metrics` table.
     async fn list_metric_names(&self, project_id: i32) -> StorageResult<Vec<String>> {
         let rows = self
-            .ch
+            .read
             .query(
                 "SELECT DISTINCT metric_name FROM metrics \
                  WHERE project_id = ? ORDER BY metric_name",
@@ -3358,7 +3420,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         // Sample recent rows first (subquery LIMIT), then ARRAY JOIN the sampled
         // attribute-key arrays — keeps the unnest bounded on high-volume metrics.
         let rows = self
-            .ch
+            .read
             .query(
                 "SELECT DISTINCT label_key FROM ( \
                    SELECT mapKeys(attributes) AS ks FROM metrics \
@@ -3391,7 +3453,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         // `attributes[?]` reads the value for the chosen key; `mapContains` keeps
         // only rows that actually carry it. Sampled and capped like the keys query.
         let rows = self
-            .ch
+            .read
             .query(
                 "SELECT DISTINCT label_key FROM ( \
                    SELECT attributes[?] AS label_key FROM metrics \
@@ -3519,7 +3581,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         // min(first_seen) at query time keeps the earliest observation even
         // before ReplacingMergeTree merges collapse duplicate pairs.
         let ch_rows = self
-            .ch
+            .read
             .query(
                 "SELECT project_id, \
                         toInt64(toUnixTimestamp64Milli(min(first_seen))) AS first_seen_ms \
@@ -3675,7 +3737,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         "#;
 
         let ch_bytes = self
-            .ch
+            .read
             .query(CH_QUOTA_BYTES_SQL)
             .bind(project_id)
             .bind(project_id)
@@ -3771,7 +3833,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         );
 
         let mut q = self
-            .ch
+            .read
             .query(&sql)
             .bind(project_id)
             .bind(service_name)
@@ -3836,7 +3898,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         );
 
         let mut q = self
-            .ch
+            .read
             .query(&sql)
             .bind(project_id)
             .bind(service_name)
@@ -4249,9 +4311,73 @@ mod tests {
     }
 
     #[test]
+    fn ch_query_err_names_the_budget_a_read_exceeded() {
+        let memory = ::clickhouse::error::Error::BadResponse(
+            "Code: 241. DB::Exception: Query memory limit exceeded (MEMORY_LIMIT_EXCEEDED)".into(),
+        );
+        let message = ch_query_err("query_span_stats", memory).to_string();
+        assert!(message.contains("query_span_stats"), "{message}");
+        assert!(message.contains("1024 MiB memory budget"), "{message}");
+
+        let timeout = ::clickhouse::error::Error::BadResponse(
+            "Code: 159. DB::Exception: Timeout exceeded (TIMEOUT_EXCEEDED)".into(),
+        );
+        match ch_query_err("query_metrics", timeout) {
+            OtelError::Storage { kind, message } => {
+                assert_eq!(kind, StorageErrorKind::ClickHouseTimeout);
+                assert!(message.contains("60s time budget"), "{message}");
+            }
+            other => panic!("expected a storage error, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn empty_metric_series_array_has_explicit_clickhouse_type() {
         assert_eq!(EMPTY_STRING_ARRAY_SQL, "CAST([], 'Array(String)')");
         assert_ne!(EMPTY_STRING_ARRAY_SQL, "[]");
+    }
+
+    // ── Wire compression ────────────────────────────────────────────────────
+
+    /// The configured mode must land on every client the OTel backend builds:
+    /// the storage's write client, and the standalone client used by the
+    /// backfill commands.
+    #[test]
+    fn configured_compression_reaches_every_otel_client() {
+        use temps_clickhouse::ClickHouseCompression;
+
+        let build = |mode| {
+            let config = ClickHouseOtelConfig::new("http://127.0.0.1:1", "otel", "default", "")
+                .with_compression(mode);
+            let storage = ClickHouseOtelStorage::new(
+                config.clone(),
+                Arc::new(TimescaleDbStorage::new(
+                    Arc::new(sea_orm::DatabaseConnection::Disconnected),
+                    None,
+                )),
+                Arc::new(temps_core::FixedRetentionResolver),
+                None,
+            );
+            (
+                format!("{:?}", storage.ch_client()),
+                format!("{:?}", ClickHouseOtelClient::new(config).client()),
+            )
+        };
+
+        let (storage_lz4, client_lz4) = build(ClickHouseCompression::Lz4);
+        for debug in [&storage_lz4, &client_lz4] {
+            assert!(debug.contains("compression: Lz4"), "{debug}");
+            assert!(
+                debug.contains("\"network_compression_method\": \"lz4\""),
+                "{debug}"
+            );
+        }
+
+        let (storage_none, client_none) = build(ClickHouseCompression::None);
+        for debug in [&storage_none, &client_none] {
+            assert!(debug.contains("compression: None"), "{debug}");
+            assert!(!debug.contains("network_compression_method"), "{debug}");
+        }
     }
 
     // ── Migration write hold ────────────────────────────────────────────────
@@ -4261,12 +4387,7 @@ mod tests {
     /// from "attempted" without a ClickHouse server.
     fn unreachable_store() -> ClickHouseOtelStorage {
         ClickHouseOtelStorage::new(
-            ClickHouseOtelConfig {
-                url: "http://127.0.0.1:1".into(),
-                database: "otel".into(),
-                user: "default".into(),
-                password: String::new(),
-            },
+            ClickHouseOtelConfig::new("http://127.0.0.1:1", "otel", "default", ""),
             Arc::new(TimescaleDbStorage::new(
                 Arc::new(sea_orm::DatabaseConnection::Disconnected),
                 None,

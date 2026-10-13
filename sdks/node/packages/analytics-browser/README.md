@@ -30,7 +30,7 @@ After `init()`, a global `window.temps` handle is exposed for convenience.
 ```html
 <script
   defer
-  src="https://cdn.jsdelivr.net/npm/@temps-sdk/analytics-browser@0.0.1/dist/temps.min.js"
+  src="https://cdn.jsdelivr.net/npm/@temps-sdk/analytics-browser@0.0.6/dist/temps.min.js"
 ></script>
 ```
 
@@ -43,7 +43,7 @@ All `data-*` attributes on the script tag map to `AnalyticsOptions`
 ```html
 <script
   defer
-  src="https://cdn.jsdelivr.net/npm/@temps-sdk/analytics-browser@0.0.1/dist/temps.min.js"
+  src="https://cdn.jsdelivr.net/npm/@temps-sdk/analytics-browser@0.0.6/dist/temps.min.js"
   data-session-recording="true"
 ></script>
 ```

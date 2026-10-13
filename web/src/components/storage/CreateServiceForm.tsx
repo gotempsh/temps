@@ -40,6 +40,8 @@ import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import * as z from 'zod'
 
+import { problemDetail } from '@/lib/api-problem'
+
 import { advancedParamsHint } from '@/lib/service-link-copy'
 import {
   completeServiceCreation,
@@ -89,7 +91,7 @@ function BackupWarning({
 
   return (
     <div className="rounded-lg border border-amber-500/20 bg-amber-500/10 p-3 flex gap-2">
-      <AlertTriangle className="h-4 w-4 text-amber-600 dark:text-amber-400 mt-0.5 flex-shrink-0" />
+      <AlertTriangle className="h-4 w-4 text-amber-700 dark:text-amber-400 mt-0.5 flex-shrink-0" />
       <div className="space-y-1">
         <p className="text-sm font-medium text-amber-800 dark:text-amber-200">
           Atomic backups only
@@ -357,6 +359,23 @@ export function CreateServiceForm({
     meta: {
       errorTitle: 'Failed to create service',
     },
+    onError: (error) => {
+      if (
+        error &&
+        typeof error === 'object' &&
+        'error_code' in error &&
+        error.error_code === 'SERVICE_NAME_CONFLICT'
+      ) {
+        form.setError(
+          'name',
+          {
+            type: 'server',
+            message: problemDetail(error, 'Choose a unique service name.'),
+          },
+          { shouldFocus: true }
+        )
+      }
+    },
     onSuccess: (data) => {
       completeServiceCreation({
         createdService: data,
@@ -478,7 +497,7 @@ export function CreateServiceForm({
                           <ChevronRight className="h-4 w-4" />
                         )}
                         Advanced configuration
-                        <span className="text-xs text-muted-foreground/70">
+                        <span className="text-xs text-muted-foreground">
                           {advancedParamsHint(serviceType)}
                         </span>
                       </button>

@@ -954,6 +954,28 @@ impl WorkflowTask for DownloadRepoJob {
             }
         };
 
+        // A configured root directory the checkout does not contain would
+        // otherwise surface only in the build, as a bare "No such file or
+        // directory". Say here what is missing and what the checkout holds.
+        if let Some(directory) = self.project_directory.as_deref() {
+            if let Err(reason) = verify_project_directory(&repo_dir, directory) {
+                // No later job receives this checkout; remove it now.
+                let _checkout = repo_dir.parent().map(|temp_dir| {
+                    TempDirGuard::new(temp_dir.to_path_buf(), keep_deployment_temp_files())
+                });
+                let message = format!(
+                    "Invalid configuration: the project's root directory {reason}. Checked {}/{} \
+                     at {}. Change the root directory in the project's Git settings, or deploy a \
+                     ref that contains it.",
+                    self.repo_owner,
+                    self.repo_name,
+                    self.get_checkout_ref(&context)
+                );
+                self.log(&context, format!("ERROR: {message}")).await?;
+                return Err(WorkflowError::JobValidationFailed(message));
+            }
+        }
+
         // Set job outputs
         context.set_output(
             &self.job_id,
@@ -1045,6 +1067,240 @@ impl WorkflowTask for DownloadRepoJob {
     fn cleanup_after_workflow(&self) -> bool {
         true
     }
+}
+
+/// Upper bound on the directory names listed when a configured root
+/// directory is not in the checkout, and on the `.gitmodules` read for it.
+const MAX_LISTED_DIRECTORIES: usize = 20;
+const MAX_GITMODULES_BYTES: u64 = 1024 * 1024;
+
+/// Confirm the project's configured root directory is a directory inside the
+/// checkout. `Err` completes the sentence "the project's root directory ..."
+/// with what is wrong and, for a missing path, what the checkout contains.
+fn verify_project_directory(repo_dir: &std::path::Path, directory: &str) -> Result<(), String> {
+    let normalized = directory
+        .trim()
+        .replace('\\', "/")
+        .trim_matches('/')
+        .trim_start_matches("./")
+        .to_string();
+    if normalized.is_empty() || normalized == "." {
+        return Ok(());
+    }
+    let relative = std::path::Path::new(&normalized);
+    if relative
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(format!(
+            "'{directory}' is not a relative path inside the repository"
+        ));
+    }
+    let path = repo_dir.join(relative);
+
+    // A submodule is a separate repository: a clone leaves its directory
+    // empty and a provider archive leaves none at all.
+    if let Some(submodule) = enclosing_submodule(repo_dir, &normalized) {
+        let empty = std::fs::read_dir(&path)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(true);
+        if empty {
+            return Err(format!(
+                "'{normalized}' is inside Git submodule '{submodule}', a separate repository \
+                 whose files are not fetched with this one. Deploy the submodule's own \
+                 repository instead, or commit its files into this one"
+            ));
+        }
+    }
+
+    match std::fs::metadata(&path) {
+        Ok(metadata) if metadata.is_dir() => {
+            let escapes = match (repo_dir.canonicalize(), path.canonicalize()) {
+                (Ok(root), Ok(target)) => !target.starts_with(root),
+                _ => true,
+            };
+            if escapes {
+                Err(format!(
+                    "'{normalized}' is a symbolic link that leads outside the repository"
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        Ok(_) => Err(format!("'{normalized}' is a file, not a directory")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(missing_directory_reason(repo_dir, &normalized))
+        }
+        Err(error) => Err(format!("'{normalized}' cannot be read: {error}")),
+    }
+}
+
+/// The deepest existing part of `normalized`, the component missing below
+/// it, a case-insensitive near miss, and the directories that do exist there.
+fn missing_directory_reason(repo_dir: &std::path::Path, normalized: &str) -> String {
+    let mut current = repo_dir.to_path_buf();
+    let mut found: Vec<&str> = Vec::new();
+    // Directory names are listed into the deployment log, so never follow a
+    // link out of the checkout: a repository could otherwise point one at
+    // the host's filesystem and read its layout back.
+    let root = repo_dir.canonicalize().ok();
+    for component in normalized.split('/').filter(|part| !part.is_empty()) {
+        let candidate = current.join(component);
+        let leaves_checkout = std::fs::symlink_metadata(&candidate)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            && match (&root, candidate.canonicalize()) {
+                (Some(root), Ok(target)) => !target.starts_with(root),
+                // A dangling link is reported below without being followed.
+                (_, Err(_)) => false,
+                (None, Ok(_)) => true,
+            };
+        if leaves_checkout {
+            found.push(component);
+            return format!(
+                "'{normalized}' is not in the checked-out source: '{}' is a symbolic link that \
+                 leads outside the repository",
+                found.join("/")
+            );
+        }
+        let is_directory = std::fs::metadata(&candidate)
+            .map(|metadata| metadata.is_dir())
+            .unwrap_or(false);
+        if is_directory {
+            found.push(component);
+            current = candidate;
+            continue;
+        }
+        if std::fs::symlink_metadata(&candidate)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            found.push(component);
+            return format!(
+                "'{normalized}' is not a directory in the checked-out source: '{}' is a \
+                 symbolic link to a missing target",
+                found.join("/")
+            );
+        }
+        let listing = list_directories(&current, component);
+        let parent = if found.is_empty() {
+            "the repository root".to_string()
+        } else {
+            format!("'{}'", found.join("/"))
+        };
+        let mut reason = format!(
+            "'{normalized}' is not in the checked-out source: {parent} has no '{component}'"
+        );
+        if let Some(near) = &listing.near_miss {
+            let mut suggestion = found.clone();
+            suggestion.push(near.as_str());
+            reason.push_str(&format!(" (did you mean '{}'?)", suggestion.join("/")));
+        }
+        if listing.first.is_empty() {
+            reason.push_str(" and contains no directories");
+        } else {
+            let names: Vec<&str> = listing.first.iter().map(String::as_str).collect();
+            reason.push_str(&format!("; it contains {}", names.join(", ")));
+            if listing.truncated {
+                reason.push_str(&format!(
+                    " and {}{} more",
+                    if listing.scan_stopped {
+                        "at least "
+                    } else {
+                        ""
+                    },
+                    listing.total - listing.first.len()
+                ));
+            }
+        }
+        return reason;
+    }
+    // Every component exists, so the final one is not a directory (for
+    // example a dangling symbolic link).
+    format!("'{normalized}' is not a directory in the checked-out source")
+}
+
+/// Entries examined at most when listing one directory of a checkout.
+const MAX_SCANNED_ENTRIES: usize = 10_000;
+
+/// The directories in one checkout directory, for an explanation.
+struct DirectoryListing {
+    /// The alphabetically first [`MAX_LISTED_DIRECTORIES`] names.
+    first: std::collections::BTreeSet<String>,
+    /// Directories seen in total (a lower bound when `scan_stopped`).
+    total: usize,
+    truncated: bool,
+    /// More than [`MAX_SCANNED_ENTRIES`] entries: the rest were not read.
+    scan_stopped: bool,
+    /// A directory whose name differs from `wanted` only in case.
+    near_miss: Option<String>,
+}
+
+/// List `directory` in constant memory and bounded time: a checkout may hold
+/// any number of entries, and only a few names are ever shown.
+fn list_directories(directory: &std::path::Path, wanted: &str) -> DirectoryListing {
+    let mut listing = DirectoryListing {
+        first: std::collections::BTreeSet::new(),
+        total: 0,
+        truncated: false,
+        scan_stopped: false,
+        near_miss: None,
+    };
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return listing;
+    };
+    for (scanned, entry) in entries.filter_map(Result::ok).enumerate() {
+        if scanned >= MAX_SCANNED_ENTRIES {
+            listing.scan_stopped = true;
+            listing.truncated = true;
+            break;
+        }
+        if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if name == ".git" {
+            continue;
+        }
+        listing.total += 1;
+        if listing.near_miss.is_none() && name.eq_ignore_ascii_case(wanted) {
+            listing.near_miss = Some(name.clone());
+        }
+        listing.first.insert(name);
+        if listing.first.len() > MAX_LISTED_DIRECTORIES {
+            listing.first.pop_last();
+            listing.truncated = true;
+        }
+    }
+    listing
+}
+
+/// The `.gitmodules` path containing (or equal to) `normalized`, if any.
+fn enclosing_submodule(repo_dir: &std::path::Path, normalized: &str) -> Option<String> {
+    use std::io::Read;
+    let path = repo_dir.join(".gitmodules");
+    let metadata = std::fs::symlink_metadata(&path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_GITMODULES_BYTES {
+        return None;
+    }
+    let mut contents = String::new();
+    std::fs::File::open(&path)
+        .ok()?
+        .take(MAX_GITMODULES_BYTES)
+        .read_to_string(&mut contents)
+        .ok()?;
+    contents.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        if key.trim() != "path" {
+            return None;
+        }
+        let submodule = value.trim().trim_matches('"').trim_matches('/');
+        let inside = normalized == submodule
+            || normalized
+                .strip_prefix(submodule)
+                .is_some_and(|rest| rest.starts_with('/'));
+        (!submodule.is_empty() && inside).then(|| submodule.to_string())
+    })
 }
 
 /// Builder for DownloadRepoJob
@@ -2033,5 +2289,167 @@ mod tests {
         let db = Arc::try_unwrap(db).expect("job released the connection");
         let log = statements(db).join("\n");
         assert!(log.contains(&sha), "{log:?}");
+    }
+
+    fn nested_checkout() -> tempfile::TempDir {
+        let checkout = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(checkout.path().join("examples/starters/go/gin")).unwrap();
+        std::fs::create_dir_all(checkout.path().join("examples/starters/node")).unwrap();
+        std::fs::create_dir_all(checkout.path().join(".git")).unwrap();
+        std::fs::write(
+            checkout.path().join("examples/starters/go/gin/go.mod"),
+            "module app\n",
+        )
+        .unwrap();
+        checkout
+    }
+
+    #[test]
+    fn verify_project_directory_accepts_the_root_and_nested_directories() {
+        let checkout = nested_checkout();
+        for directory in [
+            "",
+            ".",
+            "./",
+            "examples/starters/go/gin",
+            "/examples/starters/go/gin/",
+            "./examples/starters/go/gin",
+        ] {
+            assert_eq!(
+                verify_project_directory(checkout.path(), directory),
+                Ok(()),
+                "{directory:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_project_directory_explains_a_missing_directory() {
+        let checkout = nested_checkout();
+        let reason = verify_project_directory(checkout.path(), "examples/starters/python/flask")
+            .unwrap_err();
+        assert!(
+            reason.contains("'examples/starters' has no 'python'"),
+            "{reason}"
+        );
+        assert!(reason.contains("it contains go, node"), "{reason}");
+
+        // A case near miss only fails on a case-sensitive filesystem.
+        if !checkout.path().join("EXAMPLES").exists() {
+            let reason =
+                verify_project_directory(checkout.path(), "Examples/starters").unwrap_err();
+            assert!(
+                reason.contains("the repository root has no 'Examples'"),
+                "{reason}"
+            );
+            assert!(reason.contains("did you mean 'examples'?"), "{reason}");
+            assert!(!reason.contains(".git"), "{reason}");
+        }
+
+        let reason = verify_project_directory(checkout.path(), "examples/starters/go/gin/go.mod")
+            .unwrap_err();
+        assert!(reason.contains("is a file, not a directory"), "{reason}");
+
+        let reason = verify_project_directory(checkout.path(), "../outside").unwrap_err();
+        assert!(reason.contains("not a relative path"), "{reason}");
+    }
+
+    /// A directory with many entries lists only the alphabetically first
+    /// names and counts the rest, without holding them all.
+    #[test]
+    fn a_large_directory_lists_the_first_names_and_counts_the_rest() {
+        let checkout = tempfile::tempdir().unwrap();
+        for index in 0..45 {
+            std::fs::create_dir(checkout.path().join(format!("svc-{index:02}"))).unwrap();
+        }
+        std::fs::write(checkout.path().join("README.md"), "files are not listed").unwrap();
+
+        let reason = verify_project_directory(checkout.path(), "svc-99").unwrap_err();
+
+        assert!(reason.contains("it contains svc-00, svc-01"), "{reason}");
+        assert!(reason.contains("svc-19 and 25 more"), "{reason}");
+        assert!(!reason.contains("svc-20"), "{reason}");
+        assert!(!reason.contains("README"), "{reason}");
+    }
+
+    #[test]
+    fn verify_project_directory_names_an_unfetched_submodule() {
+        let checkout = nested_checkout();
+        std::fs::write(
+            checkout.path().join(".gitmodules"),
+            "[submodule \"services\"]\n\tpath = services/api\n\turl = https://example.test/api.git\n",
+        )
+        .unwrap();
+        // Provider archives leave no directory; clones leave an empty one.
+        for create in [false, true] {
+            if create {
+                std::fs::create_dir_all(checkout.path().join("services/api")).unwrap();
+            }
+            let reason = verify_project_directory(checkout.path(), "services/api").unwrap_err();
+            assert!(
+                reason.contains("inside Git submodule 'services/api'"),
+                "{reason}"
+            );
+        }
+        // A sibling whose name merely starts with the submodule path is not in it.
+        assert!(enclosing_submodule(checkout.path(), "services/api-v2").is_none());
+        assert_eq!(
+            enclosing_submodule(checkout.path(), "services/api/cmd").as_deref(),
+            Some("services/api")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_project_directory_refuses_a_link_out_of_the_checkout() {
+        let checkout = nested_checkout();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), checkout.path().join("linked")).unwrap();
+        let reason = verify_project_directory(checkout.path(), "linked").unwrap_err();
+        assert!(reason.contains("leads outside the repository"), "{reason}");
+
+        std::os::unix::fs::symlink(
+            checkout.path().join("missing-target"),
+            checkout.path().join("dangling"),
+        )
+        .unwrap();
+        let reason = verify_project_directory(checkout.path(), "dangling").unwrap_err();
+        assert!(reason.contains("is not a directory"), "{reason}");
+    }
+
+    /// The missing-directory explanation lists directory names into the
+    /// deployment log; a link out of the checkout must not let a repository
+    /// read the host's layout through it.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_directory_behind_a_link_out_never_lists_the_link_target() {
+        let checkout = nested_checkout();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("host-private-directory")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), checkout.path().join("apps")).unwrap();
+
+        let reason = verify_project_directory(checkout.path(), "apps/api").unwrap_err();
+
+        assert!(reason.contains("'apps' is a symbolic link"), "{reason}");
+        assert!(reason.contains("leads outside the repository"), "{reason}");
+        assert!(!reason.contains("host-private-directory"), "{reason}");
+    }
+
+    /// A link that stays inside the checkout is still followed, so the
+    /// explanation keeps naming what the linked directory holds.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_directory_behind_a_link_inside_is_still_explained() {
+        let checkout = nested_checkout();
+        std::os::unix::fs::symlink(
+            checkout.path().join("examples/starters"),
+            checkout.path().join("starters"),
+        )
+        .unwrap();
+
+        let reason = verify_project_directory(checkout.path(), "starters/python").unwrap_err();
+
+        assert!(reason.contains("'starters' has no 'python'"), "{reason}");
+        assert!(reason.contains("go, node"), "{reason}");
     }
 }

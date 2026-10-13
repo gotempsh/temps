@@ -5,6 +5,7 @@ import {
   Activity,
   BarChart3,
   Bug,
+  CircleDollarSign,
   Bot,
   Box,
   Cloud,
@@ -131,7 +132,8 @@ export const platformToolGroups: PlatformToolGroup[] = [
       },
       {
         title: 'Delivery profiles',
-        description: 'Choose Direct, Cloudflare, or Bunny CDN delivery for project domains.',
+        description:
+          'Choose Direct, Cloudflare, or Bunny CDN delivery for project domains.',
         url: '/delivery-profiles',
         icon: Cloud,
         keywords: ['delivery', 'cdn', 'cloudflare', 'bunny', 'domains'],
@@ -165,6 +167,22 @@ export const platformToolGroups: PlatformToolGroup[] = [
         description: 'Compare traffic across projects.',
         url: '/analytics',
         icon: BarChart3,
+      },
+      {
+        title: 'Revenue',
+        description: 'Track MRR and revenue events across projects.',
+        url: '/revenue',
+        icon: CircleDollarSign,
+        keywords: [
+          'mrr',
+          'arr',
+          'stripe',
+          'payments',
+          'subscriptions',
+          'billing',
+          'churn',
+        ],
+        featureKey: 'revenue-tracking',
       },
       {
         title: 'Traces',

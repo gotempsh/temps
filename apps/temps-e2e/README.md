@@ -785,7 +785,10 @@ confirmed live that a deleted session's direct-by-ID playback now 404s.
 3. trigger a real backup (`POST /backups/external-services/{id}/run`) --
    202 + async job, per ADR-014 -- and poll `GET /backups/{backup_id}` to a
    real `completed` state (a real `wal-g backup-push`, a real S3 upload --
-   the postgres backup engine is WAL-G, not pg_dump)
+   the postgres backup engine is WAL-G, not pg_dump). The first WAL-G backup
+   restarts a service whose archiving is off, so the request sends
+   `confirm_restart: true`; without it the server answers `409
+   RESTART_CONFIRMATION_REQUIRED` and starts nothing
 4. write 2 MORE rows (count now 7) -- data the backup does NOT contain
 5. start an in-place restore from the backup taken at step 3
    (`POST /external-services/{id}/restore`) and poll
@@ -1347,9 +1350,35 @@ tears the whole thing down at the end. It does NOT accept `--url`/
 
     Cleanup always unpauses the worker, destroys leftover sandboxes and
     restores `allowed_node_ids` to `null`.
-14. remove the worker node (`DELETE /internal/nodes/{id}`); confirm it's
+14. dedicated nodes (`src/commands/multinode-dedicated-phases.ts`). The
+    drained worker hosts nothing at this point, so its agent can be
+    restarted safely:
+    - add `temps.sh/role=dedicated` to the worker's `/root/.temps/agent.json`
+      labels and `docker restart` it; wait until `GET /internal/nodes`
+      reports the label on a fresh heartbeat, then reactivate the worker.
+    - an **unpinned** application with 2 replicas and anti-affinity: both
+      replicas must be on the control plane's `docker ps` and none on the
+      worker's (without the role, anti-affinity would put one replica on the
+      worker), and the deploy log must say `'worker-1' is dedicated
+      (temps.sh/role=dedicated)`.
+    - a **selector-only** application (`target_labels`
+      `temps.sh/role=dedicated`, no `target_nodes`) must fail with `No
+      eligible node for this deployment: node <id> (worker-1) is dedicated
+      ...` before any of its jobs runs (every job `cancelled`, so nothing is
+      pulled or built) and start nothing on the worker.
+    - the same environment **pinned** with `target_nodes: [worker]` (selector
+      kept) must land on the worker and not on the control plane.
+    - `GET /v1/sandboxes/placement` lists the worker with `dedicated: true`;
+      with the allow-list set to `[worker]`, a sandbox created without `node`
+      is refused with `422 sandbox-dedicated-node-only`.
+    - tear those applications down and drain the worker again.
+
+    Cleanup always restores the sandbox allow-list to `null` and removes the
+    applications this phase created, retrying any the last step failed to
+    remove.
+15. remove the worker node (`DELETE /internal/nodes/{id}`); confirm it's
     gone from `GET /internal/nodes`.
-15. teardown (in a `finally`, same discipline as every other scenario):
+16. teardown (in a `finally`, same discipline as every other scenario):
     `docker compose down` (no `-v`, so the cargo-registry/cargo-git/
     workspace-target cache volumes survive for a near-instant re-run), then
     explicitly `docker volume rm` the identity/state volumes (postgres
@@ -1424,9 +1453,8 @@ row's status field flipped".
 4. `POST .../deployments/{A}/rollback`; assert live traffic reverts to
    `"version A"` byte-for-byte -- proves a real rollback, not just a state
    transition
-5. `POST .../deployments/{current}/pause`; assert the live URL genuinely
-   stops serving the app -- see the real-bug note below for what "paused"
-   actually renders as and why
+5. `POST .../deployments/{current}/pause`; assert the live URL returns HTTP
+   503 without the Temps console HTML
 6. `POST .../deployments/{current}/resume`; assert live traffic serves
    `"version A"` again
 7. create a second environment, `POST .../deployments/{B}/promote` into it;
@@ -1481,22 +1509,19 @@ yet to assert a body against.
    proxy kept retrying the OLD (still "valid-looking") container address and
    returned Pingora's own `503 Service Unavailable` ("Fail to connect ...
    Connection refused") -- not a clean "paused" signal, just an accident of
-   a stale cached route; the "an untested guess would reach for a 503"
-   sentence that used to be here was itself exactly that untested guess,
-   and turned out to be the pre-fix bug, not the fixed behavior. Fixed by
+   a stale cached route. Fixed by
    (a) filtering `route_table::load_routes` to `status IS NULL OR status =
    'running'`, so a stopped container's route is skipped once reloaded, and
    (b) having pause/resume publish `Job::ForceRouteReload` (the same
    in-process broadcast `mark_deployment_complete.rs` already uses after a
-   normal deploy) so the reload happens immediately. With both fixes,
-   pausing makes the route disappear entirely and the proxy falls through to
-   its existing unknown-host console-fallback response (HTTP 200,
-   `<title>Temps</title>`) -- that fallback is the real, asserted "paused"
-   behavior in step 5 above.
+   normal deploy) so the reload happens immediately. Known application
+   hosts now remain recorded as unavailable without a live backend, and the
+   proxy returns HTTP 503 instead of serving the console HTML. Step 5 asserts
+   both the status and absence of console HTML; resume must restore the exact
+   application body.
 
-Confirmed live 3x back to back (after the environment-flakiness note below),
-including that resume correctly restarts the SAME container (not a rebuild)
-and traffic recovers within ~1.5s of the resume call.
+Resume coverage requires the exact application version served before pause
+to return through the same live URL.
 
 Also worth noting for anyone re-running this: the local dev instance used to
 verify this crashed several times mid-run with no panic/error logged (just

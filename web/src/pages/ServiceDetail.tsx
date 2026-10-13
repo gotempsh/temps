@@ -4,7 +4,9 @@
 import { linkedResourceCopy } from '@/lib/service-link-copy'
 import {
   deleteServiceMutation,
+  getClusterHealthQueryKey,
   getProjectsOptions,
+  listS3SourcesOptions,
   getServiceOptions,
   getServicePreviewEnvironmentVariablesMaskedOptions,
   linkServiceToProjectMutation,
@@ -14,7 +16,10 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { revealServiceParameter } from '@/api/client/sdk.gen'
 import { cn } from '@/lib/utils'
-import { listExternalServiceBackupsOptions } from '@/lib/external-service-backups'
+import {
+  externalServiceBackupsQueryKey,
+  listExternalServiceBackupsOptions,
+} from '@/lib/external-service-backups'
 import { ClusterHealthPanel } from '@/components/storage/ClusterHealthPanel'
 import { MonitoringCard } from '@/components/storage/MonitoringCard'
 import { EditServiceDialog } from '@/components/storage/EditServiceDialog'
@@ -26,6 +31,15 @@ import {
 } from '@/components/storage/ServiceHealthCard'
 import { WalHealthPanel } from '@/components/storage/WalHealthPanel'
 import { TriggerBackupDialog } from '@/components/storage/TriggerBackupDialog'
+import {
+  ScheduleBackupsAction,
+  ServiceBackupsEmpty,
+} from '@/components/storage/ServiceBackupSetup'
+import {
+  SERVICE_BACKUPS_ANCHOR,
+  backupDestinationState,
+} from '@/lib/service-backup-setup'
+import { ActiveRestoreBanner } from '@/pages/service-restore/ActiveRestoreBanner'
 import { UpgradeServiceDialog } from '@/components/storage/UpgradeServiceDialog'
 import {
   listPgUpgrades,
@@ -69,6 +83,8 @@ import { Label } from '@/components/ui/label'
 import { ServiceLogo } from '@/components/ui/service-logo'
 import { Skeleton } from '@/components/ui/skeleton'
 import { TimeAgo } from '@/components/utils/TimeAgo'
+import { ServiceReadinessPanel } from '@/components/storage/ServiceReadinessPanel'
+import { isServiceSettling } from '@/lib/service-readiness'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
@@ -91,7 +107,12 @@ import {
   type DetailFact,
   type StatusTone,
 } from '@temps-sdk/ds'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import {
+  keepPreviousData,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -120,6 +141,7 @@ import {
   Radio,
   RefreshCcw,
   RotateCcw,
+  DatabaseZap,
   ScrollText,
   Server,
   Trash2,
@@ -167,6 +189,11 @@ function formatShortDuration(ms: number): string {
   const hours = Math.floor(minutes / 60)
   const remMinutes = minutes % 60
   return remMinutes ? `${hours}h ${remMinutes}m` : `${hours}h`
+}
+
+/** A running service, or one still waiting on its readiness check, can be stopped. */
+function isStoppable(status: string): boolean {
+  return status === 'running' || status === 'starting'
 }
 
 function memberDisplayRole(member: {
@@ -231,10 +258,8 @@ export function ServiceDetail() {
       path: { id: parseInt(id!) },
     }),
     enabled: !!id,
-    refetchInterval: (query) => {
-      const status = query.state.data?.service?.status
-      return status === 'creating' ? 2000 : false
-    },
+    refetchInterval: (query) =>
+      isServiceSettling(query.state.data?.service?.status) ? 2000 : false,
   })
   const parameterRevealScope = `${id}:${location.key}:${service?.service.updated_at ?? 'loading'}`
 
@@ -315,6 +340,7 @@ export function ServiceDetail() {
     data: serviceBackupsData,
     isLoading: isLoadingBackups,
     isFetching: isFetchingBackups,
+    isPlaceholderData: isBackupsPlaceholderData,
     refetch: refetchBackups,
   } = useQuery({
     ...listExternalServiceBackupsOptions(
@@ -323,22 +349,44 @@ export function ServiceDetail() {
       BACKUPS_PAGE_SIZE
     ),
     enabled: !!serviceId,
+    // Keep the previous page (and its `total`) on screen while the next page
+    // loads; without it `data` is undefined mid-navigation and the page-range
+    // clamp below would read total=0 and bounce the user back to page 1.
+    placeholderData: keepPreviousData,
   })
 
   const serviceBackups = serviceBackupsData?.backups ?? []
+
+  // Backup destinations decide whether the Backups card can offer to back
+  // this database up or must onboard a destination first.
+  const backupSourcesQuery = useQuery({
+    ...listS3SourcesOptions(),
+    retry: false,
+  })
+  const backupSources = backupSourcesQuery.data ?? []
+  const backupSetupState = backupDestinationState(backupSourcesQuery)
   const backupsTotalPages = Math.max(
     1,
     Math.ceil((serviceBackupsData?.total ?? 0) / BACKUPS_PAGE_SIZE)
   )
 
   useEffect(() => {
+    // Only trust the total once the requested page has actually loaded: before
+    // that (initial load, deep link, or placeholder data from the previous
+    // page) the total is unknown or stale and must not clamp the page.
+    if (!serviceBackupsData || isBackupsPlaceholderData) return
     if (backupsPage > backupsTotalPages) {
       // The server total can shrink after a backup is removed while this page
       // is open; synchronize the requested page back into the valid range.
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       setBackupsPage(backupsTotalPages)
     }
-  }, [backupsPage, backupsTotalPages])
+  }, [
+    backupsPage,
+    backupsTotalPages,
+    serviceBackupsData,
+    isBackupsPlaceholderData,
+    setBackupsPage,
+  ])
 
   const paginatedBackups = serviceBackups
 
@@ -402,17 +450,31 @@ export function ServiceDetail() {
 
   usePageTitle(service?.service?.name || 'Service Details')
 
-  // Notify when cluster creation completes or fails
+  // Links back from backup setup land on the Backups card (`#backups`).
+  const serviceLoaded = !!service
+  useEffect(() => {
+    if (!serviceLoaded || location.hash !== `#${SERVICE_BACKUPS_ANCHOR}`) return
+    document
+      .getElementById(SERVICE_BACKUPS_ANCHOR)
+      ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }, [serviceLoaded, location.hash])
+
+  // Notify when cluster creation or a readiness-gated start settles
   useEffect(() => {
     const currentStatus = service?.service?.status
     const prevStatus = prevStatusRef.current
+    const name = service?.service?.name ?? 'Service'
     if (prevStatus === 'creating' && currentStatus === 'running') {
       toast.success('Cluster created successfully')
     } else if (prevStatus === 'creating' && currentStatus === 'failed') {
       toast.error('Cluster creation failed')
+    } else if (prevStatus === 'starting' && currentStatus === 'running') {
+      toast.success(`${name} is ready and accepting requests`)
+    } else if (prevStatus === 'starting' && currentStatus === 'failed') {
+      toast.error(`${name} failed to initialize`)
     }
     prevStatusRef.current = currentStatus
-  }, [service?.service?.status])
+  }, [service?.service?.status, service?.service?.name])
 
   const startService = useMutation({
     ...startServiceMutation(),
@@ -489,7 +551,7 @@ export function ServiceDetail() {
       setMemberToRemove(null)
       refetch()
       queryClient.invalidateQueries({
-        queryKey: ['cluster-health', parseInt(id!)],
+        queryKey: getClusterHealthQueryKey({ path: { id: parseInt(id!) } }),
       })
     },
     onError: (error: Error) => {
@@ -533,7 +595,7 @@ export function ServiceDetail() {
       const ping = () => {
         refetch()
         queryClient.invalidateQueries({
-          queryKey: ['cluster-health', parseInt(id!)],
+          queryKey: getClusterHealthQueryKey({ path: { id: parseInt(id!) } }),
         })
       }
       ping()
@@ -568,9 +630,12 @@ export function ServiceDetail() {
   const handleServiceAction = async () => {
     if (!service) return
 
-    if (service.service.status === 'running') {
+    if (isStoppable(service.service.status)) {
       setIsStopDialogOpen(true)
-    } else if (service.service.status === 'stopped') {
+    } else if (
+      service.service.status === 'stopped' ||
+      service.service.status === 'failed'
+    ) {
       // Start can take 5–15s for Postgres (reconcile + recreate path).
       // toast.promise surfaces all three states without blocking the UI,
       // matching the rollback/promote patterns elsewhere in the app.
@@ -599,7 +664,7 @@ export function ServiceDetail() {
 
   const backAction = (
     <Button variant="ghost" size="icon" asChild>
-      <Link to="/storage">
+      <Link to="/storage" aria-label="Back to storage">
         <ArrowLeft className="h-4 w-4" />
       </Link>
     </Button>
@@ -649,6 +714,7 @@ export function ServiceDetail() {
     stopped: { tone: 'idle', label: 'Stopped' },
     pending: { tone: 'running', label: 'Pending' },
     creating: { tone: 'running', label: 'Creating' },
+    starting: { tone: 'running', label: 'Starting' },
     failed: { tone: 'error', label: 'Failed' },
   }
   const verdict = SERVICE_STATUS_VERDICT[service.service.status] ?? {
@@ -867,6 +933,15 @@ export function ServiceDetail() {
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   className="min-h-12 sm:min-h-8"
+                  onClick={() =>
+                    navigate(`/storage/${parseInt(id!)}/import-data`)
+                  }
+                >
+                  <DatabaseZap className="h-4 w-4 mr-2" />
+                  Import data…
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  className="min-h-12 sm:min-h-8"
                   onClick={() => setIsEditDialogOpen(true)}
                 >
                   <Pencil className="h-4 w-4 mr-2" />
@@ -898,18 +973,18 @@ export function ServiceDetail() {
                   }
                   className={cn(
                     'min-h-12 sm:min-h-8',
-                    service.service.status === 'running' &&
+                    isStoppable(service.service.status) &&
                       'text-destructive focus:text-destructive'
                   )}
                 >
                   {startService.isPending || stopService.isPending ? (
                     <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                  ) : service.service.status === 'running' ? (
+                  ) : isStoppable(service.service.status) ? (
                     <AlertCircle className="h-4 w-4 mr-2" />
                   ) : (
                     <RefreshCcw className="h-4 w-4 mr-2" />
                   )}
-                  {service.service.status === 'running'
+                  {isStoppable(service.service.status)
                     ? 'Stop'
                     : service.service.status === 'creating'
                       ? 'Creating...'
@@ -931,6 +1006,22 @@ export function ServiceDetail() {
           <>
             {error ? <Callout tone="error">{error}</Callout> : null}
 
+            <ActiveRestoreBanner serviceId={service.service.id} />
+
+            {/*
+              Why a service is still starting, or why it failed to
+              initialize and what to do next. Renders nothing otherwise.
+            */}
+            <ServiceReadinessPanel
+              serviceId={service.service.id}
+              status={service.service.status}
+              readiness={service.service.readiness}
+              onRetry={handleServiceAction}
+              retryPending={startService.isPending}
+              onTryAnotherImage={() => setIsUpgradeDialogOpen(true)}
+              onRecreate={() => setIsDeleteDialogOpen(true)}
+            />
+
             {/*
               Health is the highest-signal block on this page, so it sits
               directly under the header.
@@ -950,6 +1041,8 @@ export function ServiceDetail() {
                 serviceId={parseInt(id!)}
                 serviceType={service.service.service_type}
                 onUpgrade={() => setIsUpgradeDialogOpen(true)}
+                onBackup={() => setIsBackupDialogOpen(true)}
+                isImported={!!service.current_parameters?.container_name}
               />
             ) : null}
 
@@ -1202,7 +1295,7 @@ export function ServiceDetail() {
             />
 
             {/* Backups Section */}
-            <Card>
+            <Card id={SERVICE_BACKUPS_ANCHOR} className="scroll-mt-20">
               <CardHeader>
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                   <div className="space-y-1.5 min-w-0">
@@ -1220,7 +1313,7 @@ export function ServiceDetail() {
                       Backups of this service stored across your S3 sources
                     </CardDescription>
                   </div>
-                  <div className="flex shrink-0 items-center gap-2">
+                  <div className="flex shrink-0 flex-wrap items-center gap-2">
                     <Button
                       variant="outline"
                       size="icon"
@@ -1247,6 +1340,11 @@ export function ServiceDetail() {
                       <span className="hidden sm:inline">Trigger backup</span>
                       <span className="sm:hidden">Backup</span>
                     </Button>
+                    <ScheduleBackupsAction
+                      serviceId={service.service.id}
+                      state={backupSetupState}
+                      sources={backupSources}
+                    />
                   </div>
                 </div>
               </CardHeader>
@@ -1259,10 +1357,12 @@ export function ServiceDetail() {
                     </span>
                   </div>
                 ) : serviceBackups.length === 0 ? (
-                  <div className="text-sm text-muted-foreground text-center py-8">
-                    No backups found for this service yet. Trigger one or
-                    configure a schedule from an S3 source.
-                  </div>
+                  <ServiceBackupsEmpty
+                    serviceId={service.service.id}
+                    state={backupSetupState}
+                    sources={backupSources}
+                    onTriggerBackup={() => setIsBackupDialogOpen(true)}
+                  />
                 ) : (
                   <ul role="list" className="divide-y divide-border">
                     {paginatedBackups.map((backup) => {
@@ -1449,7 +1549,7 @@ export function ServiceDetail() {
                         disabled={backupsPage === 1}
                       >
                         <ChevronLeft className="h-4 w-4" />
-                        <span className="hidden sm:inline">Previous</span>
+                        <span className="max-sm:sr-only">Previous</span>
                       </Button>
                       <div className="hidden sm:flex items-center gap-1">
                         {backupsPageWindow.map((pageNum) => (
@@ -1476,7 +1576,7 @@ export function ServiceDetail() {
                         }
                         disabled={backupsPage === backupsTotalPages}
                       >
-                        <span className="hidden sm:inline">Next</span>
+                        <span className="max-sm:sr-only">Next</span>
                         <ChevronRight className="h-4 w-4" />
                       </Button>
                     </div>
@@ -2020,9 +2120,13 @@ export function ServiceDetail() {
         serviceName={service.service.name}
         onSuccess={() => {
           // Reload the service so any status transition (e.g. "backing_up")
-          // shows immediately, plus the S3 source list and every per-source
-          // backup index so the Backups card picks up the new entry.
+          // shows immediately, this service's Backups card (the enqueue
+          // already inserted a `pending` row, which then polls to a terminal
+          // state), plus the S3 source list and every per-source index.
           refetch()
+          queryClient.invalidateQueries({
+            queryKey: externalServiceBackupsQueryKey(parseInt(id!)),
+          })
           queryClient.invalidateQueries({
             queryKey: getServiceOptions({
               path: { id: parseInt(id!) },

@@ -34,7 +34,30 @@ use utoipa::ToSchema;
 ///
 /// v2: job-aware stages, Compose and registry-image codes, stage-specific
 /// timeout codes, and health-check codes for apps that never listen.
-pub const FAILURE_CLASSIFIER_VERSION: u8 = 2;
+///
+/// v3: deploy-time registry pulls (`pull_external_image`, worker pulls) are
+/// never classified as a build's base-image pull; containerd-style registry
+/// errors are recognised, and unreachable registries and unrecognised pull
+/// failures get their own codes.
+///
+/// v4: a worker refusing a build's inputs (build arguments, registry
+/// credentials, cache imports) is a configuration failure, not an invalid
+/// Dockerfile.
+///
+/// v5: a failed build is never reported as a missing built image (that code is
+/// reserved for a build that succeeded and then lost its image), and a
+/// Dockerfile `COPY`/`ADD` of a path that is not in the build context gets its
+/// own code, `dockerfile_copy_not_found`.
+///
+/// v6: failures of the static-site deploy jobs (`deploy_static`,
+/// `deploy_static_bundle`, `deploy_static_from_source`) are classified by what
+/// went wrong instead of falling through to `deploy`/`unknown`: a missing
+/// output path is `static_output_missing`, output the platform refuses to
+/// publish is `static_output_rejected`, an unreachable build node is
+/// `build_node_unreachable`, and any other extraction or publish error is
+/// `static_deploy_failed`. A Docker archive download is no longer reported as a
+/// dependency download.
+pub const FAILURE_CLASSIFIER_VERSION: u8 = 6;
 
 /// Marker Compose deployments put before embedded container log tails.
 const CONTAINER_LOGS_MARKER: &str = "container logs for unhealthy/stopped services:";
@@ -159,6 +182,26 @@ pub enum DeploymentFailureCode {
     VolumeMount,
     /// The new deployment never became routable.
     RouteActivation,
+    // ── v3 ──────────────────────────────────────────────────────────────
+    /// The registry was unreachable or answered with a server error while
+    /// pulling the deploy image (transient; a retry may succeed).
+    RegistryUnavailable,
+    /// Pulling the deploy image failed for a reason not covered above.
+    ImagePullFailed,
+    // ── v5 ──────────────────────────────────────────────────────────────
+    /// A Dockerfile `COPY`/`ADD` names a path that is not in the build
+    /// context.
+    DockerfileCopyNotFound,
+    // ── v6 ──────────────────────────────────────────────────────────────
+    /// The static output was extracted but the platform refuses to publish it
+    /// (too large, too many files, links or special files, sensitive files).
+    StaticOutputRejected,
+    /// The node that built the image could not be reached to fetch the static
+    /// output (transient; a retry may succeed).
+    BuildNodeUnreachable,
+    /// Extracting or publishing static files failed for a reason not covered
+    /// above.
+    StaticDeployFailed,
     Unknown,
 }
 
@@ -209,6 +252,12 @@ impl DeploymentFailureCode {
             Self::ComposeUnavailable => "compose_unavailable",
             Self::VolumeMount => "volume_mount",
             Self::RouteActivation => "route_activation",
+            Self::RegistryUnavailable => "registry_unavailable",
+            Self::ImagePullFailed => "image_pull_failed",
+            Self::DockerfileCopyNotFound => "dockerfile_copy_not_found",
+            Self::StaticOutputRejected => "static_output_rejected",
+            Self::BuildNodeUnreachable => "build_node_unreachable",
+            Self::StaticDeployFailed => "static_deploy_failed",
             Self::Unknown => "unknown",
         }
     }
@@ -259,6 +308,12 @@ impl DeploymentFailureCode {
         Self::ComposeUnavailable,
         Self::VolumeMount,
         Self::RouteActivation,
+        Self::RegistryUnavailable,
+        Self::ImagePullFailed,
+        Self::DockerfileCopyNotFound,
+        Self::StaticOutputRejected,
+        Self::BuildNodeUnreachable,
+        Self::StaticDeployFailed,
         Self::Unknown,
     ];
 }
@@ -594,6 +649,36 @@ pub const fn guidance_for(code: DeploymentFailureCode) -> FailureGuidance {
             "The deployment started but the proxy did not confirm its route in time, so it was rolled back. Retry; if it persists check the node's connectivity to the control plane.",
             None,
         ),
+        C::RegistryUnavailable => (
+            "Image registry unavailable",
+            "The registry could not be reached or returned a server error while pulling the deployment image. This is usually temporary: retry the deployment, and if it keeps failing check the registry's status and that this host can reach it.",
+            None,
+        ),
+        C::ImagePullFailed => (
+            "Deployment image could not be pulled",
+            "The image this deployment runs could not be pulled from its registry. Check the image reference and tag, add registry credentials if the image is private, then redeploy.",
+            Some(S::Source),
+        ),
+        C::StaticOutputRejected => (
+            "Static output cannot be published",
+            "The build produced files the platform refuses to publish as a static site: the output is larger than the static size or file-count limits, or it contains symbolic links, special files or sensitive files such as .env. Remove them from the output directory (or exclude them in the build), or point the output directory at the folder that holds only the site.",
+            Some(S::Build),
+        ),
+        C::BuildNodeUnreachable => (
+            "Build node unreachable",
+            "The build finished on a worker node, but Temps could not reach that node to fetch the built files. Check the node is online (Nodes page) and reachable from the control plane, then redeploy. If the node was removed, redeploy so the build runs on an available node.",
+            Some(S::Deploy),
+        ),
+        C::StaticDeployFailed => (
+            "Static files could not be published",
+            "The site built, but Temps could not extract or store its files. This is usually transient or caused by the host: check free disk space on the control plane and that Docker is healthy, then redeploy. If it repeats, the deployment log shows the exact step that failed.",
+            Some(S::Deploy),
+        ),
+        C::DockerfileCopyNotFound => (
+            "Dockerfile COPY source not found",
+            "A COPY or ADD instruction in the Dockerfile names a path that is not in the build context, so the build stopped before an image existed. The failing path is the one quoted in the build error (see cancelled_reason or the build_image log). Check its spelling relative to the build context and that it is not excluded by .dockerignore. Uploaded sources never include node_modules, .git, environment files or OS metadata: install dependencies inside the Dockerfile (RUN npm ci) instead of copying them, and put secrets in the environment's variables.",
+            Some(S::Build),
+        ),
         C::Unknown => (
             "Deployment failed",
             "Temps could not classify this failure. Open the failed stage below for the full error and logs; sending the failure report helps improve this message.",
@@ -605,6 +690,58 @@ pub const fn guidance_for(code: DeploymentFailureCode) -> FailureGuidance {
         remediation,
         settings_section,
     }
+}
+
+/// Whether a registry pull failure shows the registry *refused* the
+/// credentials. A token or authorization step that failed only because the
+/// registry (or its token service) was unreachable or erroring is an outage,
+/// not bad credentials, so it needs an explicit 401/403/denial alongside it.
+fn registry_refused_credentials(r: &str) -> bool {
+    let refusal = contains_any(
+        r,
+        &[
+            "401 unauthorized",
+            "403 forbidden",
+            "unauthorized",
+            "forbidden",
+            "insufficient_scope",
+            "denied",
+        ],
+    );
+    let token_step = contains_any(
+        r,
+        &[
+            "failed to authorize",
+            "failed to fetch anonymous token",
+            "failed to fetch oauth token",
+        ],
+    );
+    refusal && (token_step || r.contains("401 unauthorized"))
+}
+
+/// The path BuildKit reports as missing in a `COPY`/`ADD`:
+/// `failed to calculate checksum of ref ...: "/node_modules": not found`
+/// yields `/node_modules`. Handles reasons that were Debug-escaped (`\"`) as
+/// well as plain text. `None` when the text is not in that shape.
+fn buildkit_missing_path(lower: &str) -> Option<&str> {
+    let marker = [
+        "failed to calculate checksum",
+        "failed to compute cache key",
+    ]
+    .iter()
+    .filter_map(|marker| lower.find(marker))
+    .min()?;
+    let tail = &lower[marker..];
+    // Current daemons print `"<path>": not found`; older ones (Docker 20.10
+    // era, still found on self-hosted workers) print `"<path>" not found: not
+    // found`. Take whichever closes the quoted path first.
+    let end = ["\": not found", "\" not found"]
+        .iter()
+        .filter_map(|closing| tail.find(closing))
+        .min()?;
+    let quoted = tail[..end].trim_end_matches('\\');
+    let start = quoted.rfind('"')?;
+    Some(quoted[start + 1..].trim_end_matches('\\'))
 }
 
 /// Extract the id of the required job that failed, e.g. `build_image` from
@@ -821,28 +958,33 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
             "took too long",
         ],
     );
-    let base_image_signal = contains_any(
-        r,
-        &[
-            "failed to resolve source metadata",
-            "failed to fetch oauth token",
-            "failed to fetch anonymous token",
-            "error pulling image configuration",
-            "failed to load metadata for",
-        ],
-    ) || (phase == Some(JobPhase::Build)
-        && contains_any(
+    // A job that pulls the image the deployment runs never builds, so it can
+    // never have failed on a Dockerfile's FROM line — even when the registry
+    // error text (token fetch, image configuration) matches a build's.
+    let deploy_phase = matches!(phase, Some(JobPhase::ImagePull) | Some(JobPhase::Deploy));
+    let base_image_signal = !deploy_phase
+        && (contains_any(
             r,
             &[
-                "failed to pull image",
-                "pull access denied",
-                "manifest unknown",
+                "failed to resolve source metadata",
+                "failed to fetch oauth token",
+                "failed to fetch anonymous token",
+                "error pulling image configuration",
+                "failed to load metadata for",
             ],
-        ));
+        ) || (phase == Some(JobPhase::Build)
+            && contains_any(
+                r,
+                &[
+                    "failed to pull image",
+                    "pull access denied",
+                    "manifest unknown",
+                ],
+            )));
     // A deploy-time image pull: the registry image the deployment runs, as
     // opposed to a base image used while building.
     let deploy_image_pull = !base_image_signal
-        && (matches!(phase, Some(JobPhase::ImagePull) | Some(JobPhase::Deploy))
+        && (deploy_phase
             || contains_any(
                 r,
                 &[
@@ -852,6 +994,37 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
                     "image pull for '",
                 ],
             ));
+    // The text itself shows a registry pull failed. Generic network/HTTP
+    // wording only counts as a registry problem with this evidence, since a
+    // deploy job's health check can fail with the same words.
+    let pull_evidence = deploy_image_pull
+        && (phase == Some(JobPhase::ImagePull)
+            || contains_any(
+                r,
+                &[
+                    "failed to pull image",
+                    "pull error:",
+                    "from its registry",
+                    "image pull for '",
+                    "docker compose pull failed",
+                ],
+            ));
+
+    // ── Build planning (the preset refused before any build ran, so no
+    //    resource, network or registry signal can be the cause) ──────────
+    if r.contains("build plan failed for preset") {
+        return if r.contains("missing script: build") {
+            make(S::Build, C::MissingBuildScript)
+        } else {
+            make(S::Configuration, C::InvalidConfiguration)
+        };
+    }
+    // A worker refused the build's inputs before building anything (build
+    // arguments, registry credentials, cache imports). That is a placement
+    // limit with a remedy in the message, not an unparsable Dockerfile.
+    if contains_any(r, &["worker builds cannot", "worker builds do not support"]) {
+        return make(S::Configuration, C::InvalidConfiguration);
+    }
 
     // ── Resources ───────────────────────────────────────────────────────
     if contains_any(r, &["out of memory", "oomkilled", "exit code 137"]) || contains_word(r, "oom")
@@ -933,6 +1106,9 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
             "does not match the specified platform",
         ],
     ) || r.contains("no node can run this image")
+        // A mixed-architecture deployment with an architecture no worker
+        // can build natively (`NoBuilderForArchitecture`).
+        || r.contains("worker can build its image")
         || (r.contains("built for")
             && contains_any(r, &["but the control plane runs", "but node '"]));
     if platform_mismatch {
@@ -957,7 +1133,7 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
     {
         return make(S::Image, C::RegistryRateLimited);
     }
-    if deploy_image_pull
+    if (deploy_image_pull
         && contains_any(
             r,
             &[
@@ -969,12 +1145,13 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
                 "authentication required",
                 "status code 401",
             ],
-        )
+        ))
+        || (pull_evidence && registry_refused_credentials(r))
     {
         return make(S::Image, C::RegistryAuthentication);
     }
     if deploy_image_pull
-        && contains_any(
+        && (contains_any(
             r,
             &[
                 "manifest unknown",
@@ -984,10 +1161,36 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
                 "not found: manifest",
                 "manifest for",
                 "name unknown",
+                // Registries that hide private repositories (e.g. GHCR)
+                // answer a missing or inaccessible image with a bare denial.
+                "error from registry: denied",
+            ],
+        ) || (r.contains("failed to resolve reference") && r.contains(": not found")))
+    {
+        return make(S::Image, C::ImageNotFound);
+    }
+    // Docker reports a registry timeout as a 500 too; those stay timeouts.
+    if pull_evidence
+        && !timeout_signal
+        && contains_any(
+            r,
+            &[
+                "status code 500",
+                "status code 502",
+                "status code 503",
+                "status code 504",
+                "500 internal server error",
+                "502 bad gateway",
+                "503 service unavailable",
+                "504 gateway",
+                "received unexpected http status: 5",
+                "connection refused",
+                "connection reset",
+                "unexpected eof",
             ],
         )
     {
-        return make(S::Image, C::ImageNotFound);
+        return make(S::Image, C::RegistryUnavailable);
     }
 
     // ── Health checks and startup (specific runtime signals beat a generic
@@ -1078,6 +1281,95 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
         }
         let stage = phase.map(phase_stage).unwrap_or(S::Platform);
         return make(stage, C::Timeout);
+    }
+
+    // ── Static-site deploy (extract the output, publish it) ─────────────
+    // These jobs run after a successful build, so their messages are about
+    // the built files, not the build. They must be matched before the generic
+    // download, permission and "not found" rules below, which would
+    // otherwise misread the Docker archive text.
+    //
+    // The failed job's id decides when the reason names one. The message
+    // markers are only a fallback for a reason stored without that wrapper:
+    // a build's own output or a Dockerfile excerpt can contain "docker
+    // archive" or "static deployment ", and must keep the code its text earns.
+    let static_job = match failed_job_id(raw) {
+        Some(job) => matches!(
+            job,
+            "deploy_static"
+                | "deploy_static_bundle"
+                | "deploy_static_from_source"
+                | "persist_static_assets"
+        ),
+        None => contains_any(
+            r,
+            &[
+                "failed to extract files from container path",
+                "failed to deploy static files",
+                "cannot reach the node that built image",
+                "extracting static files",
+                "static deployment ",
+                "docker archive",
+            ],
+        ),
+    };
+    if static_job {
+        // The image itself is gone: that is the existing "built image
+        // missing" case, not a problem with the output path.
+        if contains_any(
+            r,
+            &[
+                "is not present on this node",
+                "no such image",
+                "built image not found",
+            ],
+        ) {
+            return make(S::Image, C::ImageMissing);
+        }
+        if contains_any(r, &["could not find the file", "could not find the path"]) {
+            // Docker's own wording for an absent archive path. A bare
+            // "No such file or directory" is not matched: it also comes from
+            // the host (temp directory, publish step), which is not the
+            // build's output.
+            return make(S::Build, C::StaticOutputMissing);
+        }
+        if contains_any(
+            r,
+            &[
+                "cannot reach the node that built image",
+                "connection refused",
+                "error sending request",
+                "error trying to connect",
+            ],
+        ) {
+            return make(S::Deploy, C::BuildNodeUnreachable);
+        }
+        if contains_any(
+            r,
+            &[
+                "resource limit exceeded",
+                "extracted-size limit",
+                "entry limit",
+                "per-entry limit",
+                "component depth limit",
+                "download limit",
+                // Bundle and direct-source jobs state their size limits in
+                // their own words.
+                "exceeds maximum allowed decompressed size",
+                "byte per-file limit",
+                "byte aggregate limit",
+                "disallowed type",
+                "symbolic link",
+                "non-regular filesystem entry",
+                "is not publishable",
+                "unsafe entry",
+                "path traversal",
+                "did not resolve to a confined directory",
+            ],
+        ) {
+            return make(S::Deploy, C::StaticOutputRejected);
+        }
+        return make(S::Deploy, C::StaticDeployFailed);
     }
 
     // ── Source ──────────────────────────────────────────────────────────
@@ -1185,6 +1477,34 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
     ) {
         return make(S::Build, C::CompileError);
     }
+    // BuildKit's COPY/ADD of a path that is not there: `failed to compute
+    // cache key: failed to calculate checksum of ref ...: "<path>": not found`.
+    // The kind of path decides the cause. Generated images build under /app, so
+    // an absolute /app path is a build stage's output that the build never
+    // produced (e.g. `COPY --from=builder /app/dist ...` after a build that
+    // wrote to `build/`). Any other path is a COPY/ADD source that is not in
+    // the build context (something the upload leaves out, a typo, a
+    // .dockerignore entry). Either way the build failed, so this runs before
+    // the generic Dockerfile and "image ... not found" rules, which the same
+    // text also matches.
+    if contains_any(
+        r,
+        &[
+            "failed to calculate checksum",
+            "failed to compute cache key",
+        ],
+    ) && r.contains("not found")
+    {
+        let is_build_output = match buildkit_missing_path(r) {
+            Some(path) => path.starts_with("/app/"),
+            None => r.contains("/app/"),
+        };
+        return if is_build_output {
+            make(S::Build, C::StaticOutputMissing)
+        } else {
+            make(S::Build, C::DockerfileCopyNotFound)
+        };
+    }
     if r.contains("dockerfile")
         && contains_any(
             r,
@@ -1204,9 +1524,28 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
             "manifest unknown",
         ],
     ) {
-        return make(S::Image, C::BaseImagePull);
+        // Only a build pulls base images; a deploy-time pull failure must
+        // not send the user to a FROM line they never wrote.
+        return if deploy_image_pull {
+            make(S::Image, C::ImagePullFailed)
+        } else {
+            make(S::Image, C::BaseImagePull)
+        };
     }
-    if r.contains("image") && contains_any(r, &["not found", "missing", "no such image"]) {
+    // `ImageMissing` means the build finished and the image was gone
+    // afterwards. A build that failed says "not found" about a build input
+    // (a COPY source, a base image), and the word "image" appears in its
+    // own prefix ("Failed to build image: ..."), so it needs an explicit
+    // sign that the produced image itself is what is missing.
+    let build_failed = phase == Some(JobPhase::Build) || r.contains("failed to build image");
+    // "No such image" is the daemon talking about whichever image it was asked
+    // for. During a build that is a base image, not the one just produced, so
+    // only the explicit "built image not found" counts there.
+    let built_image_gone = r.contains("built image not found");
+    if r.contains("image")
+        && contains_any(r, &["not found", "missing", "no such image"])
+        && (built_image_gone || !build_failed)
+    {
         return make(S::Image, C::ImageMissing);
     }
     if contains_any(
@@ -1477,6 +1816,271 @@ mod tests {
     }
 
     #[test]
+    fn missing_static_output_is_not_a_missing_image() {
+        let reason = wrapped(
+            "build_image",
+            "Failed to build image: Build failed: Docker stream error: failed to solve: failed to compute cache key: failed to calculate checksum of ref 3c1f::q8m2: \"/app/dist\": not found",
+        );
+        assert_class(&reason, S::Build, C::StaticOutputMissing);
+
+        let with_dockerfile_excerpt = wrapped(
+            "build_image",
+            "Failed to build image: Dockerfile:14\n--------------------\n  14 | >>> COPY --from=builder /app/build /usr/share/nginx/html\n--------------------\nERROR: failed to solve: failed to compute cache key: failed to calculate checksum of ref abc: \"/app/build\": not found",
+        );
+        assert_class(&with_dockerfile_excerpt, S::Build, C::StaticOutputMissing);
+
+        // A missing *context* file is a Dockerfile/source problem, not output.
+        let context_file = wrapped(
+            "build_image",
+            "Failed to build image: failed to solve: failed to compute cache key: failed to calculate checksum of ref abc: \"/requirements.txt\": not found",
+        );
+        assert_ne!(
+            classify_failure_reason(Some(&context_file)).code,
+            C::StaticOutputMissing
+        );
+
+        // The deploy-time "image not found" classification is unchanged.
+        let image = wrapped(
+            "deploy_container",
+            "Failed to deploy container: image 'app:latest' not found",
+        );
+        assert_ne!(
+            classify_failure_reason(Some(&image)).code,
+            C::StaticOutputMissing
+        );
+    }
+
+    /// BuildKit's report for `COPY node_modules ./` in an upload, whose
+    /// bundle never contains `node_modules`.
+    const COPY_NODE_MODULES: &str = "Failed to build image: Build failed: Docker stream error: Dockerfile:6\n--------------------\n   4 |     WORKDIR /app\n   5 |     COPY package.json ./\n   6 | >>> COPY node_modules ./\n   7 |     COPY . .\n--------------------\nERROR: failed to solve: failed to compute cache key: failed to calculate checksum of ref 3c1f::q8m2: \"/node_modules\": not found";
+
+    #[test]
+    fn copy_of_a_path_missing_from_the_bundle_is_a_build_failure_not_a_missing_image() {
+        // The bug: the words "image" (from "Failed to build image") and
+        // "not found" matched the generic missing-image rule.
+        let reason = wrapped("build_image", COPY_NODE_MODULES);
+        assert_class(&reason, S::Build, C::DockerfileCopyNotFound);
+
+        let info = describe_failure(Some(&reason)).unwrap();
+        assert_eq!(info.code.as_str(), "dockerfile_copy_not_found");
+        assert_eq!(info.failed_job.as_deref(), Some("build_image"));
+        assert_eq!(info.settings_section, Some(FailureSettingsSection::Build));
+        assert!(info.title.contains("COPY"), "{}", info.title);
+        assert!(
+            info.remediation.contains("build context") && info.remediation.contains("node_modules"),
+            "{}",
+            info.remediation
+        );
+        assert!(
+            !info.remediation.contains("disk space"),
+            "{}",
+            info.remediation
+        );
+        // The raw BuildKit line stays in the stored reason the API returns
+        // next to the classification.
+        assert!(reason.contains("node_modules"));
+    }
+
+    #[test]
+    fn copy_not_found_is_recognised_in_plain_and_escaped_reasons() {
+        let plain = "Failed to build image: failed to solve: failed to compute cache key: failed to calculate checksum of ref abc: \"/requirements.txt\": not found";
+        assert_class(plain, S::Build, C::DockerfileCopyNotFound);
+        assert_class(
+            &wrapped("build_image", plain),
+            S::Build,
+            C::DockerfileCopyNotFound,
+        );
+        // Nothing wraps it in a failed-job envelope at all.
+        assert_class(
+            "failed to calculate checksum of ref x: \"/dist\": not found",
+            S::Build,
+            C::DockerfileCopyNotFound,
+        );
+    }
+
+    #[test]
+    fn a_dockerfile_excerpt_naming_app_does_not_turn_a_context_miss_into_missing_output() {
+        // Only the failing path decides: `/app/` in the *destination* of the
+        // COPY shown in the excerpt must not make this a build-output problem.
+        let reason = wrapped(
+            "build_image",
+            "Failed to build image: Dockerfile:5\n--------------------\n   5 | >>> COPY vendor /app/vendor\n--------------------\nERROR: failed to solve: failed to compute cache key: failed to calculate checksum of ref abc: \"/vendor\": not found",
+        );
+        assert_class(&reason, S::Build, C::DockerfileCopyNotFound);
+
+        // A missing path under /app is still the stage output.
+        let output = wrapped(
+            "build_image",
+            "Failed to build image: Dockerfile:9\n--------------------\n   9 | >>> COPY --from=builder /app/dist /srv\n--------------------\nERROR: failed to solve: failed to compute cache key: failed to calculate checksum of ref abc: \"/app/dist\": not found",
+        );
+        assert_class(&output, S::Build, C::StaticOutputMissing);
+    }
+
+    #[test]
+    fn older_buildkit_wording_is_classified_like_the_current_one() {
+        let context_file = wrapped(
+            "build_image",
+            "Failed to build image: Build failed: Docker stream error: failed to solve: failed to compute cache key: \"/requirements.txt\" not found: not found",
+        );
+        assert_class(&context_file, S::Build, C::DockerfileCopyNotFound);
+
+        let output = wrapped(
+            "build_image",
+            "Failed to build image: Dockerfile:9\n   9 | >>> COPY --from=builder /app/dist /srv\nERROR: failed to solve: failed to compute cache key: \"/app/dist\" not found: not found",
+        );
+        assert_class(&output, S::Build, C::StaticOutputMissing);
+    }
+
+    #[test]
+    fn buildkit_missing_path_extracts_the_quoted_source() {
+        assert_eq!(
+            buildkit_missing_path(
+                "failed to compute cache key: failed to calculate checksum of ref a: \"/node_modules\": not found"
+            ),
+            Some("/node_modules")
+        );
+        assert_eq!(
+            buildkit_missing_path(
+                "failed to calculate checksum of ref a: \\\"/app/dist\\\": not found"
+            ),
+            Some("/app/dist")
+        );
+        // Older daemons close the quoted path with `" not found: not found`.
+        assert_eq!(
+            buildkit_missing_path(
+                "failed to compute cache key: \"/app/dist\" not found: not found"
+            ),
+            Some("/app/dist")
+        );
+        assert_eq!(
+            buildkit_missing_path(
+                "failed to calculate checksum of ref a: \\\"/node_modules\\\" not found: not found"
+            ),
+            Some("/node_modules")
+        );
+        assert_eq!(buildkit_missing_path("COPY node_modules ./"), None);
+        assert_eq!(
+            buildkit_missing_path("failed to compute cache key: no quoted path here: not found"),
+            None
+        );
+    }
+
+    #[test]
+    fn other_failed_builds_are_never_reported_as_a_missing_image() {
+        for inner in [
+            "Failed to build image: Build failed: failed to solve: process \"/bin/sh -c npm run build\" did not complete successfully: exit code: 1",
+            "Failed to build image: Build failed: Docker stream error: failed to solve: process \"/bin/sh -c pip install -r requirements.txt\" did not complete successfully: exit code: 1\nERROR: no matching distribution found for example-lib",
+            "Failed to build image for linux/amd64: the builder reported a missing layer for the build image cache",
+            "Failed to build image: Build failed: Docker stream error: failed to solve: rpc error: code = Unknown desc = no builder instance found",
+            "Failed to build image: Build failed: Docker stream error: No such image: registry.example.test/base:1.0",
+        ] {
+            let reason = wrapped("build_image", inner);
+            let got = classify_failure_reason(Some(&reason));
+            assert_ne!(got.code, C::ImageMissing, "reason: {inner}");
+            assert_eq!(got.stage, S::Build, "reason: {inner}");
+        }
+    }
+
+    #[test]
+    fn a_build_error_reaching_the_failure_summary_names_the_build_not_disk_space() {
+        let reason = wrapped(
+            "build_image",
+            "Failed to build image: Build failed: failed to solve: process \"/bin/sh -c make release\" did not complete successfully: exit code: 2",
+        );
+        let info = describe_failure(Some(&reason)).unwrap();
+        assert_eq!(info.stage, S::Build);
+        assert_eq!(info.code, C::BuildError);
+        assert!(!info.remediation.contains("disk space"));
+    }
+
+    #[test]
+    fn a_built_image_that_is_gone_afterwards_is_still_a_missing_image() {
+        // The builder finished and then could not find what it just built.
+        let built = wrapped(
+            "build_image",
+            "Failed to build image: Built image not found",
+        );
+        assert_class(&built, S::Image, C::ImageMissing);
+        let info = describe_failure(Some(&built)).unwrap();
+        assert!(info.remediation.contains("disk space"));
+
+        // Docker no longer has the image when the deploy job needs it.
+        let deploy = wrapped(
+            "deploy_container",
+            "Failed to deploy container: No such image: app:2f9c1e",
+        );
+        assert_class(&deploy, S::Image, C::ImageMissing);
+
+        let untouched = wrapped(
+            "deploy_container",
+            "Failed to deploy container: image 'app:latest' not found",
+        );
+        assert_class(&untouched, S::Image, C::ImageMissing);
+    }
+
+    #[test]
+    fn build_plan_failures_are_classified_before_building() {
+        let missing = wrapped(
+            "build_image",
+            "Build plan failed for preset 'vite': package.json at '/tmp/x/package.json' has no \"build\" script, so the build would stop with \"Missing script: build\". Add a build script to package.json (for a Vite app: \"build\": \"vite build\"), or set a custom build command in the project's build settings.",
+        );
+        assert_class(&missing, S::Build, C::MissingBuildScript);
+
+        let unplannable = wrapped(
+            "build_image",
+            "Build plan failed for preset 'autopack': autopack could not plan this application: python: no start command found; the image was not found to timeout. Select the preset that matches the application in the project's build settings, add a start command, or commit a Dockerfile.",
+        );
+        assert_class(&unplannable, S::Configuration, C::InvalidConfiguration);
+
+        let worker_inlined = wrapped(
+            "build_image",
+            "Build plan failed for preset 'vite': this build runs on worker node 7, which does not receive project variables yet, but VITE_API_URL is inlined into the application at build time and would be empty.",
+        );
+        assert_class(&worker_inlined, S::Configuration, C::InvalidConfiguration);
+    }
+
+    /// A worker refusing its build inputs is not an invalid Dockerfile: the
+    /// user may not even have written one.
+    #[test]
+    fn worker_build_input_refusals_are_configuration_not_dockerfile() {
+        for detail in [
+            "Failed to build image for linux/arm64: Invalid context: Worker builds cannot pass build-argument values yet, but 'Dockerfile' declares ARG TOKEN for a project variable that the build would silently lose. Build on the control plane, or remove the ARG",
+            "Failed to build image for linux/arm64: Invalid context: Worker builds cannot use Dockerfile ARG instructions until build-argument credential handling is reviewed",
+            "Failed to build image: Invalid context: Worker builds do not support cache_from image imports; use a local builder or remove cache_from",
+            "Worker builds cannot pass secret values: 'Dockerfile' declares ARG DATABASE_URL, but it is a secret, a platform credential or a BuildKit setting, which never leaves the control plane, so this build on worker node 2 would silently lose it.",
+            "Worker builds cannot tell which build arguments 'Dockerfile' reads: an ARG instruction names a variable reference, and secret values never leave the control plane.",
+            "Failed to build image: Invalid context: Worker builds cannot pass build argument 'BUILDKIT_SYNTAX': it is not a valid ARG name, or is a BUILDKIT_* argument a worker sets itself.",
+        ] {
+            assert_class(
+                &wrapped("build_image", detail),
+                S::Configuration,
+                C::InvalidConfiguration,
+            );
+        }
+    }
+
+    /// A configured root directory the checkout lacks is a configuration
+    /// problem, at the source stage or (defensively) at the build stage.
+    #[test]
+    fn missing_project_directory_is_invalid_configuration() {
+        let download = wrapped(
+            "download_repo",
+            "Job validation failed: Invalid configuration: the project's root directory 'examples/starters/python/flask' is not in the checked-out source: 'examples/starters' has no 'python'; it contains go, node. Checked qa/app at main. Change the root directory in the project's Git settings, or deploy a ref that contains it.",
+        );
+        assert_class(&download, S::Configuration, C::InvalidConfiguration);
+        let submodule = wrapped(
+            "download_repo",
+            "Job validation failed: Invalid configuration: the project's root directory 'services/api' is inside Git submodule 'services/api', a separate repository whose files are not fetched with this one. Deploy the submodule's own repository instead, or commit its files into this one. Checked qa/app at main.",
+        );
+        assert_class(&submodule, S::Configuration, C::InvalidConfiguration);
+        let build = wrapped(
+            "build_image",
+            "Job validation failed: Invalid configuration: build context 'examples/starters/go/gin' is not in the checked-out source at '/tmp/temps-deployments/deployment-1-1/repository'. Check the project's root directory and build context settings",
+        );
+        assert_class(&build, S::Configuration, C::InvalidConfiguration);
+    }
+
+    #[test]
     fn compose_service_build_specific_cause_wins() {
         let reason = wrapped(
             "deploy_compose",
@@ -1605,6 +2209,119 @@ mod tests {
             Some("Failed to pull image registry.example.test/team/app:missing from its registry: Pull error: Docker responded with status code 404: manifest for registry.example.test/team/app:missing not found: manifest unknown. Local daemon images are never used as a fallback")
         );
         assert_class(&reason, S::Image, C::ImageNotFound);
+    }
+
+    /// The suffix `pull_external_image` appends to every registry failure.
+    fn external_pull_failure(inner: &str) -> String {
+        format!(
+            "Job execution failed: Required job 'pull_external_image' failed: {:?}",
+            Some(format!(
+                "Failed to pull image docker.io/library/app:missing from its registry: Pull error: {inner}. Local daemon images are never used as a fallback; use the authorized local-image claim path for an image built on this host."
+            ))
+        )
+    }
+
+    #[test]
+    fn containerd_missing_tag_is_image_not_found_not_base_image() {
+        // Docker 29 (containerd image store) wording for a tag that does not
+        // exist. Before v3 this fell through to "Base image pull failed".
+        let reason = external_pull_failure(
+            "Docker responded with status code 404: failed to resolve reference \"docker.io/library/app:missing\": docker.io/library/app:missing: not found",
+        );
+        assert_class(&reason, S::Image, C::ImageNotFound);
+        let info = describe_failure(Some(&reason)).unwrap();
+        assert!(!info.remediation.contains("FROM"), "{}", info.remediation);
+        assert_eq!(info.settings_section, Some(FailureSettingsSection::Source));
+    }
+
+    #[test]
+    fn registry_denial_for_hidden_private_image_is_image_not_found() {
+        let reason = external_pull_failure(
+            "Docker responded with status code 500: error from registry: denied\ndenied",
+        );
+        assert_class(&reason, S::Image, C::ImageNotFound);
+    }
+
+    #[test]
+    fn external_pull_token_failure_is_registry_auth_not_base_image() {
+        let reason = external_pull_failure(
+            "Docker responded with status code 500: failed to resolve reference \"ghcr.io/team/app:1\": failed to authorize: failed to fetch anonymous token: unexpected status from GET request: 401 Unauthorized",
+        );
+        assert_class(&reason, S::Image, C::RegistryAuthentication);
+    }
+
+    #[test]
+    fn token_service_outage_is_not_bad_credentials() {
+        for inner in [
+            "Docker responded with status code 500: failed to resolve reference \"ghcr.io/team/app:1\": failed to authorize: failed to fetch anonymous token: unexpected status from GET request to https://ghcr.io/token: 503 Service Unavailable",
+            "Docker responded with status code 500: failed to resolve reference \"registry.example.test/team/app:1\": failed to authorize: failed to fetch oauth token: Post \"https://registry.example.test/token\": dial tcp 10.0.0.1:443: connect: connection refused",
+            "Docker responded with status code 500: failed to fetch anonymous token: unexpected status: 502 Bad Gateway",
+        ] {
+            assert_class(
+                &external_pull_failure(inner),
+                S::Image,
+                C::RegistryUnavailable,
+            );
+        }
+        // A token step the registry answered with a refusal is still auth.
+        assert_class(
+            &external_pull_failure(
+                "Docker responded with status code 500: failed to authorize: failed to fetch oauth token: unexpected status: 403 Forbidden",
+            ),
+            S::Image,
+            C::RegistryAuthentication,
+        );
+    }
+
+    #[test]
+    fn external_pull_registry_outage_is_registry_unavailable() {
+        for inner in [
+            "Docker responded with status code 500: received unexpected HTTP status: 503 Service Unavailable",
+            "Docker responded with status code 500: Get \"https://registry.example.test/v2/\": dial tcp 10.0.0.1:443: connect: connection refused",
+        ] {
+            assert_class(
+                &external_pull_failure(inner),
+                S::Image,
+                C::RegistryUnavailable,
+            );
+        }
+        // A registry timeout reported as a 500 is still a pull timeout.
+        assert_class(
+            &external_pull_failure(
+                "Docker responded with status code 500: Get \"https://registry.example.test/v2/\": net/http: request canceled while waiting for connection (Client.Timeout exceeded while awaiting headers)",
+            ),
+            S::Image,
+            C::ImagePullTimeout,
+        );
+    }
+
+    #[test]
+    fn unrecognised_external_pull_failure_never_mentions_a_from_line() {
+        let reason = external_pull_failure("Docker responded with status code 400: something new");
+        assert_class(&reason, S::Image, C::ImagePullFailed);
+        let info = describe_failure(Some(&reason)).unwrap();
+        assert!(!info.remediation.contains("FROM"), "{}", info.remediation);
+    }
+
+    #[test]
+    fn deploy_health_check_refusal_is_not_a_registry_outage() {
+        let reason = wrapped(
+            "deploy_container",
+            "Health check failed: GET http://10.0.0.5:3000/ returned connection refused",
+        );
+        let class = classify_failure_reason(Some(&reason));
+        assert_ne!(class.code, C::RegistryUnavailable);
+    }
+
+    #[test]
+    fn dockerfile_from_pull_failure_keeps_base_image_guidance() {
+        let reason = wrapped(
+            "build_image",
+            "Failed to build image: Build failed: failed to solve: docker.io/library/debian:no-such-tag: failed to resolve source metadata for docker.io/library/debian:no-such-tag: docker.io/library/debian:no-such-tag: not found",
+        );
+        assert_class(&reason, S::Image, C::BaseImagePull);
+        let info = describe_failure(Some(&reason)).unwrap();
+        assert!(info.remediation.contains("FROM"));
     }
 
     #[test]
@@ -1823,5 +2540,165 @@ mod tests {
         assert_eq!(info.classifier_version, FAILURE_CLASSIFIER_VERSION);
         assert!(describe_failure(None).is_none());
         assert!(describe_failure(Some("   ")).is_none());
+    }
+
+    // ── Static-site deploy jobs ─────────────────────────────────────────
+
+    fn static_extract(inner: &str) -> String {
+        wrapped(
+            "deploy_static",
+            &format!("❌ Failed to extract files from container path '/app/dist': {inner}"),
+        )
+    }
+
+    #[test]
+    fn static_output_path_missing_is_a_build_output_problem() {
+        // The platform's Docker archive text contains "failed to download",
+        // which must not be read as a dependency download.
+        let local = static_extract(
+            "Other error: Failed to download Docker archive for image 'temps-1-2:abc' path '/app/dist': Docker responded with status code 404: Could not find the file /app/dist in container 3f2a",
+        );
+        assert_class(&local, S::Build, C::StaticOutputMissing);
+
+        let worker = static_extract(
+            "Other error: Storage error: Cannot export path '/app/dist' from image 'temps-1-2:abc': Could not find the file /app/dist in container 9",
+        );
+        assert_class(&worker, S::Build, C::StaticOutputMissing);
+    }
+
+    #[test]
+    fn static_extraction_from_a_missing_image_is_image_missing() {
+        let reason = static_extract(
+            "Image not found: Node 'w1' refused to export path '/app/dist' of image 'i' (HTTP 404 Not Found): Image 'i' is not present on this node",
+        );
+        assert_class(&reason, S::Image, C::ImageMissing);
+    }
+
+    #[test]
+    fn static_build_node_failures_are_unreachable_node() {
+        let unresolved = wrapped(
+            "deploy_static",
+            "❌ Cannot reach the node that built image temps-1-2:abc: Other error: node 3 is not reachable",
+        );
+        assert_class(&unresolved, S::Deploy, C::BuildNodeUnreachable);
+
+        let send_error = static_extract(
+            "Other error: Cannot export path '/app/dist' of image 'i' from node 'w1': error sending request for url (http://10.0.0.5:3001/agent/images/extract)",
+        );
+        assert_class(&send_error, S::Deploy, C::BuildNodeUnreachable);
+    }
+
+    #[test]
+    fn static_output_the_platform_refuses_is_rejected_output() {
+        for inner in [
+            "Resource limit exceeded: Docker archive for image 'x' path '/app/dist' exceeds the 1073741824 byte extracted-size limit",
+            "Invalid context: Docker archive entry 'dist/x' for image 'x' path '/app/dist' has disallowed type Symlink; only regular files and directories are accepted",
+            "Other error: Docker archive for image 'x' path '/app/dist' exceeds the 100000 entry limit",
+        ] {
+            assert_class(&static_extract(inner), S::Deploy, C::StaticOutputRejected);
+        }
+        let publish = wrapped(
+            "deploy_static",
+            "❌ Failed to deploy static files: Static deployment source contains a symbolic link: /tmp/x/dist/link",
+        );
+        assert_class(&publish, S::Deploy, C::StaticOutputRejected);
+    }
+
+    #[test]
+    fn bundle_and_source_size_limits_are_rejected_output() {
+        let bundle = wrapped(
+            "deploy_static_bundle",
+            "Archive exceeds maximum allowed decompressed size of 2147483648 bytes",
+        );
+        assert_class(&bundle, S::Deploy, C::StaticOutputRejected);
+        for inner in [
+            "❌ Failed to deploy static files: file 'assets/video.mp4' exceeds the 524288000 byte per-file limit",
+            "❌ Failed to deploy static files: deployment exceeds the 2147483648 byte aggregate limit",
+        ] {
+            let reason = wrapped("deploy_static", inner);
+            assert_class(&reason, S::Deploy, C::StaticOutputRejected);
+        }
+    }
+
+    #[test]
+    fn other_static_publish_failures_are_static_deploy_failed() {
+        for (job, inner) in [
+            (
+                "deploy_static",
+                "❌ Failed to deploy static files: Static deployment destination already exists: /data/static/p/e/d",
+            ),
+            (
+                "deploy_static_from_source",
+                "❌ Failed to deploy static files: Source directory not found: /tmp/x/dist",
+            ),
+            (
+                "deploy_static_bundle",
+                "Failed to deploy static files: Static deployment destination already exists: /d",
+            ),
+            (
+                "deploy_static",
+                "❌ Failed to create secure temp directory: Read-only file system",
+            ),
+        ] {
+            assert_class(&wrapped(job, inner), S::Deploy, C::StaticDeployFailed);
+        }
+    }
+
+    #[test]
+    fn static_deploy_rules_do_not_capture_other_jobs() {
+        // A container deploy keeps its own classification, and a dependency
+        // download in a build is still a dependency download.
+        let container = wrapped("deploy_container", "Failed to deploy container: boom");
+        assert_class(&container, S::Runtime, C::ContainerStart);
+        let install = wrapped(
+            "build_image",
+            "Failed to download package registry.npmjs.org: connection reset",
+        );
+        assert_class(&install, S::DependencyInstall, C::DependencyDownload);
+    }
+
+    #[test]
+    fn static_markers_do_not_capture_another_jobs_failure() {
+        // Build output and Dockerfile excerpts are free text; a build that
+        // mentions a "docker archive" or a "static deployment" is still a
+        // build, and keeps the code its own text earns.
+        let compile = wrapped(
+            "build_image",
+            "Build failed: step 4/9 `echo static deployment ready` ok; TypeScript error: failed to compile src/index.ts",
+        );
+        assert_class(&compile, S::Build, C::CompileError);
+        let lockfile = wrapped(
+            "build_image",
+            "Docker archive helper installed; ERR_PNPM_OUTDATED_LOCKFILE: frozen lockfile",
+        );
+        assert_class(
+            &lockfile,
+            S::DependencyInstall,
+            C::DependencyLockfileOutOfSync,
+        );
+        let clone = wrapped(
+            "download_repo",
+            "Failed to clone repository; the repo ships a docker archive of fixtures",
+        );
+        assert_class(&clone, S::Source, C::RepositoryClone);
+
+        // Without the job wrapper the static markers still apply.
+        let unwrapped = "Failed to extract files from container path '/app/dist': Other error: Docker archive for image 'i' path '/app/dist': Could not find the file /app/dist in container 1";
+        assert_class(unwrapped, S::Build, C::StaticOutputMissing);
+    }
+
+    #[test]
+    fn host_io_errors_during_static_deploy_are_not_a_missing_output() {
+        let reason = wrapped(
+            "deploy_static",
+            "❌ Failed to deploy static files: IO error: No such file or directory (os error 2)",
+        );
+        assert_class(&reason, S::Deploy, C::StaticDeployFailed);
+    }
+
+    #[test]
+    fn disk_exhaustion_during_static_extraction_stays_disk_exhausted() {
+        let reason = static_extract("IO error: No space left on device (os error 28)");
+        assert_class(&reason, S::Resource, C::DiskExhausted);
     }
 }

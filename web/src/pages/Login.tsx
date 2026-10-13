@@ -9,7 +9,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AlertCircle } from 'lucide-react'
-import { useMemo, useState } from 'react'
+import { useMemo } from 'react'
 import { toast } from 'sonner'
 import { useNavigate, useSearchParams } from 'react-router'
 import { useAuth } from '@/contexts/AuthContext'
@@ -70,7 +70,6 @@ function oidcErrorMessage(reason: string | null): string {
 
 export const Login = () => {
   usePageTitle('Login')
-  const [isLoading, setIsLoading] = useState(false)
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const { refetch } = useAuth()
@@ -124,15 +123,11 @@ export const Login = () => {
     },
   })
 
-  const handleSubmit = async (data: { email: string; password: string }) => {
-    setIsLoading(true)
-    try {
-      await login.mutateAsync({
-        body: data,
-      })
-    } finally {
-      setIsLoading(false)
-    }
+  // `mutate`, not `mutateAsync`: a rejected sign-in is reported by the
+  // mutation's error handler (the "Login failed" toast) and must not also
+  // escape this submit handler as an unhandled promise rejection.
+  const handleSubmit = (data: { email: string; password: string }) => {
+    login.mutate({ body: data })
   }
 
   return (
@@ -167,7 +162,7 @@ export const Login = () => {
 
         <LoginForm
           onSubmit={handleSubmit}
-          isLoading={isLoading || login.isPending}
+          isLoading={login.isPending}
           oidcProviders={emailStatus?.oidc_providers ?? []}
           passwordResetAvailable={
             emailStatus?.password_reset_available ?? false

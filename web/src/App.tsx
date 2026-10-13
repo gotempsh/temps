@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { RedirectWithQuery } from '@/components/routing/RedirectWithQuery'
 import { CommandPalette } from '@/components/command/CommandPalette'
 import {
   CompactErrorFallback,
@@ -25,7 +26,7 @@ import {
 import { getCurrentUserOptions } from '@/api/client/@tanstack/react-query.gen'
 import { Loader2 } from 'lucide-react'
 import { lazy, Suspense, useEffect } from 'react'
-import { BrowserRouter, Navigate, Route, Routes } from 'react-router'
+import { BrowserRouter, Route, Routes } from 'react-router'
 import { toast, Toaster } from 'sonner'
 import { gitProviderSetupPath, problemSetupPath } from '@/lib/api-problem'
 import {
@@ -42,6 +43,8 @@ import {
 } from '@/lib/worker-nodes'
 import { ProblemDetails } from './api/client'
 import { client } from './api/client/client.gen'
+import { attachHttpStatus } from './lib/http-error-status'
+import { shouldRetryQuery } from './lib/query-retry'
 import { Header } from './components/dashboard/Header'
 import AppSidebar from './components/dashboard/Sidebar'
 import { DiskSpaceAlert } from './components/alerts/DiskSpaceAlert'
@@ -126,6 +129,16 @@ const ServiceQueryPerformance = lazy(() =>
 const ServiceRestore = lazy(() =>
   import('./pages/ServiceRestore').then((m) => ({
     default: m.ServiceRestore,
+  }))
+)
+const ServiceDataImport = lazy(() =>
+  import('./pages/ServiceDataImport').then((m) => ({
+    default: m.ServiceDataImport,
+  }))
+)
+const ServiceDataImportRun = lazy(() =>
+  import('./pages/ServiceDataImportRun').then((m) => ({
+    default: m.ServiceDataImportRun,
   }))
 )
 const MajorUpgradeDetail = lazy(() =>
@@ -330,6 +343,11 @@ const RateLimitingPage = lazy(() =>
 const RequestTimeoutsPage = lazy(() =>
   import('./pages/settings/RequestTimeoutsPage').then((m) => ({
     default: m.RequestTimeoutsPage,
+  }))
+)
+const OnDemandTlsPage = lazy(() =>
+  import('./pages/settings/OnDemandTlsPage').then((m) => ({
+    default: m.OnDemandTlsPage,
   }))
 )
 const DiskMonitoringPage = lazy(() =>
@@ -613,11 +631,11 @@ const FullAppRoutes = () => {
                     ))}
                     <Route
                       path="/"
-                      element={<Navigate to="/projects" replace />}
+                      element={<RedirectWithQuery to="/projects" />}
                     />
                     <Route
                       path="/dashboard"
-                      element={<Navigate to="/projects" replace />}
+                      element={<RedirectWithQuery to="/projects" />}
                     />
                     <Route path="/account" element={<Account />} />
                     <Route path="/setup" element={<Setup />} />
@@ -628,7 +646,7 @@ const FullAppRoutes = () => {
                     <Route
                       path="/drop"
                       element={
-                        <Navigate to="/projects/new?source=drop" replace />
+                        <RedirectWithQuery to="/projects/new?source=drop" />
                       }
                     />
                     <Route path="/revenue" element={<Revenue />} />
@@ -647,15 +665,18 @@ const FullAppRoutes = () => {
                     />
                     <Route path="/monitoring/server" element={<Server />} />
                     <Route path="/monitoring" element={<Monitoring />}>
-                      <Route index element={<Navigate to="alerts" replace />} />
+                      <Route
+                        index
+                        element={<RedirectWithQuery to="alerts" />}
+                      />
                       <Route
                         path="resources"
-                        element={<Navigate to="/proxy" replace />}
+                        element={<RedirectWithQuery to="/proxy" />}
                       />
                       <Route
                         path="providers/add"
                         element={
-                          <Navigate to="/settings/notifications/new" replace />
+                          <RedirectWithQuery to="/settings/notifications/new" />
                         }
                       />
                       <Route
@@ -666,7 +687,7 @@ const FullAppRoutes = () => {
                     </Route>
                     <Route
                       path="/alarms"
-                      element={<Navigate to="/monitoring/alarms" replace />}
+                      element={<RedirectWithQuery to="/monitoring/alarms" />}
                     />
                     {/* Observe section */}
                     <Route path="/analytics" element={<GlobalAnalytics />} />
@@ -763,6 +784,10 @@ const FullAppRoutes = () => {
                         element={<RequestTimeoutsPage />}
                       />
                       <Route
+                        path="on-demand-tls"
+                        element={<OnDemandTlsPage />}
+                      />
+                      <Route
                         path="metrics-monitoring"
                         element={<MetricsMonitoringPage />}
                       />
@@ -816,6 +841,14 @@ const FullAppRoutes = () => {
                     <Route
                       path="/storage/:id/restore"
                       element={<ServiceRestore />}
+                    />
+                    <Route
+                      path="/storage/:id/import-data"
+                      element={<ServiceDataImport />}
+                    />
+                    <Route
+                      path="/storage/:id/import-data/:runId"
+                      element={<ServiceDataImportRun />}
                     />
                     <Route
                       path="/storage/:id/upgrades/:upgradeId"
@@ -966,43 +999,43 @@ const FullAppRoutes = () => {
                     {/* Backward-compat: old /settings/<resource> links → new top-level */}
                     <Route
                       path="/settings/domains/*"
-                      element={<Navigate to="/domains" replace />}
+                      element={<RedirectWithQuery to="/domains" />}
                     />
                     <Route
                       path="/settings/email/*"
-                      element={<Navigate to="/email" replace />}
+                      element={<RedirectWithQuery to="/email" />}
                     />
                     <Route
                       path="/settings/ai-gateway/*"
-                      element={<Navigate to="/ai-gateway" replace />}
+                      element={<RedirectWithQuery to="/ai-gateway" />}
                     />
                     <Route
                       path="/settings/ai-providers"
-                      element={<Navigate to="/ai-gateway" replace />}
+                      element={<RedirectWithQuery to="/ai-gateway" />}
                     />
                     <Route
                       path="/settings/agent-sandbox/*"
-                      element={<Navigate to="/agent-sandbox" replace />}
+                      element={<RedirectWithQuery to="/agent-sandbox" />}
                     />
                     <Route
                       path="/settings/skills/*"
-                      element={<Navigate to="/skills" replace />}
+                      element={<RedirectWithQuery to="/skills" />}
                     />
                     <Route
                       path="/settings/mcp-servers/*"
-                      element={<Navigate to="/mcp-servers" replace />}
+                      element={<RedirectWithQuery to="/mcp-servers" />}
                     />
                     <Route
                       path="/settings/git-providers/*"
-                      element={<Navigate to="/git-providers" replace />}
+                      element={<RedirectWithQuery to="/git-providers" />}
                     />
                     <Route
                       path="/settings/dns-providers/*"
-                      element={<Navigate to="/dns-providers" replace />}
+                      element={<RedirectWithQuery to="/dns-providers" />}
                     />
                     <Route
                       path="/settings/backups/*"
-                      element={<Navigate to="/backups" replace />}
+                      element={<RedirectWithQuery to="/backups" />}
                     />
                     {/* Projects */}
                     <Route path="/projects/new" element={<NewProject />} />
@@ -1125,10 +1158,11 @@ const queryClient = new QueryClient({
       // Rust Problem type serializes only what was explicitly set via
       // .with_title()/.with_detail()/etc, and status is communicated solely
       // via the HTTP status line (see temps-core's problemdetails::Problem::
-      // into_response). So `error.status` is always undefined here; matching
-      // on it silently never fires. `title` is the only reliable signal in
-      // the body, and it's exactly what ProtectedLayout already keys off of
-      // to decide whether to show the login screen -- match it the same way.
+      // into_response). The client's error interceptor below copies it onto
+      // the thrown body, but errors from hand-written fetchers still lack it,
+      // so `title` remains the signal here -- it is exactly what
+      // ProtectedLayout keys off of to decide whether to show the login
+      // screen, and this handler must agree with it.
       const problem = error as { title?: string } | null
       const isUnauthorized =
         problem?.title === 'Authentication Required' ||
@@ -1171,6 +1205,10 @@ const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
       refetchOnWindowFocus: false,
+      // A 4xx is deterministic: retrying a 404 or 403 three times only
+      // delays the message by ~7s and repeats requests that cannot succeed.
+      // Network failures and 5xx keep their retries.
+      retry: shouldRetryQuery,
     },
     mutations: {
       onError: (error: unknown, _variables, context) => {
@@ -1247,6 +1285,12 @@ const queryClient = new QueryClient({
   },
 })
 client.setConfig({ baseUrl: '/api' })
+// Problem bodies carry no `status`; copy the HTTP status line onto every
+// thrown error so pages can tell a missing record (404) from a refused
+// (403) or failed (5xx) read, and the retry policy above can tell them apart.
+if (!client.interceptors.error.exists(attachHttpStatus)) {
+  client.interceptors.error.use(attachHttpStatus)
+}
 
 export interface TempsConsoleProps {
   extensions?: ConsoleExtensions
@@ -1258,6 +1302,13 @@ export const TempsConsole = ({
   baseUrl = '/api',
 }: TempsConsoleProps) => {
   client.setConfig({ baseUrl })
+
+  // Our own HTML shell declares `lang="en"`; an edition that mounts the
+  // console in its own shell may not. The console's text is English, so
+  // declare it unless the host page already chose a language (WCAG 3.1.1).
+  useEffect(() => {
+    if (!document.documentElement.lang) document.documentElement.lang = 'en'
+  }, [])
 
   return (
     <ThemeProvider defaultTheme="system" enableSystem attribute="class">

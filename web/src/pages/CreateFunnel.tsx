@@ -94,6 +94,7 @@ export function CreateFunnel({ project }: CreateFunnelProps) {
     <div className="relative">
       <div className="absolute top-0 left-0 p-6">
         <Button
+          aria-label="Back"
           variant="ghost"
           size="icon"
           onClick={() => navigate(`/projects/${project.slug}/analytics`)}

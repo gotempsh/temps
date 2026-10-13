@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useState } from 'react'
+import { Link } from 'react-router'
 import { ChevronDown, ChevronRight, Terminal } from 'lucide-react'
 
 import {
@@ -14,10 +15,10 @@ import {
 import { CodeBlock } from '@/components/ui/code-block'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 
-// Inline docs for creating sandboxes. Lives on the /sandboxes page because
-// we don't yet have a "New sandbox" UI flow — users go through the CLI,
-// REST, or the SDK. Keep the three examples behaviorally identical so a
-// reader can pick whichever fits their workflow and expect the same result.
+// Inline docs for creating sandboxes from outside the console. Lives on the
+// /sandboxes page next to the "New sandbox" button, so a reader can pick the
+// CLI, REST or SDK equivalent. Keep the three examples behaviorally identical
+// so whichever fits their workflow gives the same result.
 
 export const SANDBOX_CLI_EXAMPLE = `# Authenticate once (cached in ~/.temps/.contexts.json)
 bunx @temps-sdk/cli login https://your-temps-instance.com --context my-instance
@@ -127,6 +128,19 @@ interface CreateSandboxDocsProps {
   variant?: Variant
 }
 
+export function SandboxRestIntro() {
+  return (
+    <p className="text-xs text-muted-foreground">
+      Authenticate with a personal access token (create one under{' '}
+      <Link to="/settings/keys" className="underline">
+        API Keys
+      </Link>
+      ). Full schema is in the OpenAPI spec at{' '}
+      <code className="bg-muted px-1 rounded">/api/openapi.json</code>.
+    </p>
+  )
+}
+
 export function CreateSandboxDocs({
   variant = 'full',
 }: CreateSandboxDocsProps) {
@@ -161,14 +175,7 @@ export function CreateSandboxDocs({
         <CodeBlock code={SANDBOX_WORKSPACE_EXAMPLE} language="bash" />
       </TabsContent>
       <TabsContent value="rest" className="space-y-2">
-        <p className="text-xs text-muted-foreground">
-          Authenticate with a personal access token (create one under{' '}
-          <a href="/keys" className="underline">
-            API Keys
-          </a>
-          ). Full schema is in the OpenAPI spec at{' '}
-          <code className="bg-muted px-1 rounded">/api/openapi.json</code>.
-        </p>
+        <SandboxRestIntro />
         <CodeBlock code={SANDBOX_REST_EXAMPLE} language="bash" />
       </TabsContent>
       <TabsContent value="sdk" className="space-y-2">
@@ -194,12 +201,12 @@ export function CreateSandboxDocs({
         <CardHeader>
           <CardTitle className="flex items-center gap-2 text-base">
             <Terminal className="h-4 w-4" />
-            Create your first sandbox
+            Create sandboxes from your terminal or code
           </CardTitle>
           <CardDescription>
-            Sandboxes are created via the CLI, REST API, or SDK — there is no
-            create-in-UI flow yet. Pick whichever fits your workflow; all three
-            hit the same endpoint.
+            Use <strong>New sandbox</strong> above, or script it: the CLI, REST
+            API and SDK all hit the same endpoint, so pick whichever fits your
+            workflow.
           </CardDescription>
         </CardHeader>
         <CardContent>{body}</CardContent>

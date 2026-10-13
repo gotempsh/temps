@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# Generic sample stack used by compose scenario tests: the compose file lives
+# in a subdirectory, the web service keeps an anonymous volume for its
+# dependencies, a one-shot migration runs to completion before it starts, and
+# both read a shared env file next to the compose file.
+services:
+  migrate:
+    image: busybox:1.36
+    command: ["sh", "-c", "echo migrations applied"]
+    env_file: app.env
+
+  web:
+    image: busybox:1.36
+    command: ["sh", "-c", "mkdir -p /www && echo sample-compose-ok > /www/index.html && httpd -f -p 8080 -h /www"]
+    env_file:
+      - app.env
+    environment:
+      GREETING: ${GREETING:?GREETING must be set}
+    ports:
+      - "127.0.0.1::8080"
+    volumes:
+      - /app/node_modules
+    depends_on:
+      migrate:
+        condition: service_completed_successfully

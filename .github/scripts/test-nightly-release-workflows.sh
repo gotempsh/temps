@@ -88,12 +88,37 @@ abort "release tarballs must get provenance and SBOM attestations before publica
   attest_steps.any? { |step| step.dig("with", "sbom-path") == "release/temps-sbom.spdx.json" } &&
   publish.fetch("steps").index { |step| step["name"] == "Create GitHub Release" } >
     publish.fetch("steps").rindex { |step| step.fetch("uses", "").start_with?("actions/attest@") }
+# Only the highest stable version may become GitHub's Latest release, which
+# is what the installer's default channel downloads.
+release_step = publish.fetch("steps").find { |step| step["name"] == "Create GitHub Release" }
+abort "stable releases must not be marked Latest unconditionally" unless
+  release_step.fetch("run").include?("python3 .github/scripts/release_latest.py") &&
+  release_step.fetch("run").include?('PRERELEASE_FLAG="--latest=$make_latest"') &&
+  !release_step.fetch("run").include?('PRERELEASE_FLAG="--latest"')
+notes_step = publish.fetch("steps").find { |step| step["name"] == "Create release notes file" }
+abort "release notes must install the release they describe, not the stable channel" unless
+  notes_step.fetch("run").include?("/install.sh | bash -s -- ${{ github.ref_name }}")
+manifest_job = release.dig("jobs", "create-docker-manifest")
+image_attest = manifest_job.fetch("steps").select { |step| step.fetch("uses", "").start_with?("actions/attest@") }
+abort "the server image must get a registry-pushed provenance attestation by digest" unless
+  image_attest.length == 2 &&
+  image_attest.all? { |step| step.dig("with", "push-to-registry") == true && step["if"].to_s.include?("inputs.dry_run != true") } &&
+  image_attest.map { |step| step.dig("with", "subject-digest") }.sort ==
+    ["${{ steps.image.outputs.channel_digest }}", "${{ steps.image.outputs.digest }}"] &&
+  manifest_job.fetch("steps").index { |step| step["id"] == "image" } <
+    manifest_job.fetch("steps").index { |step| step.fetch("uses", "").start_with?("actions/attest@") }
 abort "public release can precede required daemon images" unless
   publish.fetch("needs").include?("runtime-image-manifest") &&
   publish.fetch("needs").include?("promote-runtime-images") && !publish.key?("if")
 %w[daemon-images build-and-push-sandbox-images build-and-push-preview-gateway].each do |name|
   abort "#{name} publishes before tests" unless Array(release.dig("jobs", name, "needs")).include?("require-tests")
 end
+database_call = release.dig("jobs", "database-images")
+abort "a release can publish without its managed-database images being pullable" unless
+  database_call && database_call["uses"] == "./.github/workflows/database-images.yml" &&
+  database_call["needs"].sort == %w[validate-release-ref require-tests].sort &&
+  database_call.dig("with", "ensure") == true && !database_call.key?("if") &&
+  !database_call.key?("continue-on-error") && publish.fetch("needs").include?("database-images")
 daemon_call = release.dig("jobs", "daemon-images")
 abort "daemon staging must follow ref validation without moving channel tags" unless
   daemon_call["needs"].sort == %w[validate-release-ref require-tests].sort &&
@@ -261,6 +286,7 @@ read_contents = {"contents" => "read"}
 publish_packages = {"contents" => "read", "packages" => "write"}
 expected_release_permissions = {
   "daemon-images" => publish_packages.merge("id-token" => "write"),
+  "database-images" => publish_packages.merge("id-token" => "write"),
   "validate-release-ref" => read_contents,
   "require-tests" => {"actions" => "read", "contents" => "read"},
   "runtime-image-manifest" => {"contents" => "read", "packages" => "read"},
@@ -272,7 +298,7 @@ expected_release_permissions = {
   "build-darwin-arm64" => read_contents,
   "create-release" => {"contents" => "write", "id-token" => "write", "attestations" => "write"},
   "build-and-push-docker" => publish_packages,
-  "create-docker-manifest" => publish_packages.merge("id-token" => "write"),
+  "create-docker-manifest" => publish_packages.merge("id-token" => "write", "attestations" => "write"),
   "prepare-sandbox-context" => read_contents,
   "build-and-push-sandbox-images" => publish_packages.merge("id-token" => "write"),
   "build-and-push-preview-gateway" => publish_packages.merge("id-token" => "write"),

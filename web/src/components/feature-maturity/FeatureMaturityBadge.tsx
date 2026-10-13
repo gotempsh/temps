@@ -43,7 +43,7 @@ export function FeatureMaturityBadge({
   const promise = experimental ? EXPERIMENTAL_TOOLTIP : BETA_TOOLTIP
   const Icon = experimental ? FlaskConical : TestTubeDiagonal
   const tone = experimental
-    ? 'text-amber-600 dark:text-amber-400'
+    ? 'text-amber-700 dark:text-amber-400'
     : 'text-blue-600 dark:text-blue-400'
 
   const toggle = (event: MouseEvent | KeyboardEvent) => {

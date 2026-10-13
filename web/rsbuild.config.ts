@@ -46,6 +46,28 @@ export const isApiWebSocket = (pathname: string, req: ProxyRequest) =>
   isApiPath(pathname) && isWebSocketUpgrade(req)
 export const isApiHttpRequest = (pathname: string, req: ProxyRequest) =>
   isApiPath(pathname) && !isWebSocketUpgrade(req)
+/**
+ * `changeOrigin` rewrites Host to the API target, so the server expects that
+ * origin, but the browser's Origin/Referer still name this dev server, and
+ * same-origin guards on unsafe session requests (e.g. email-domain project
+ * access) reject them with 403. Map those headers onto the target only when
+ * they name this dev server; any other origin passes through unchanged, so a
+ * cross-site request is still refused.
+ */
+export const rewriteDevServerOrigin = (
+  value: string | undefined,
+  devOrigin: string,
+  targetOrigin: string
+) => {
+  if (value === devOrigin) return targetOrigin
+  if (value?.startsWith(`${devOrigin}/`)) {
+    return targetOrigin + value.slice(devOrigin.length)
+  }
+  return undefined
+}
+
+/** HTML shell for the console; carries `<html lang="en">`. */
+export const htmlTemplatePath = path.resolve(import.meta.dirname, 'index.html')
 const consoleKitEntry = path.resolve(
   import.meta.dirname,
   'packages/console-kit/src/index.ts'
@@ -72,6 +94,10 @@ export default defineConfig({
   html: {
     title: 'Temps',
     favicon: './src/favicon.png',
+    // Rsbuild's built-in shell is a bare `<html>`; this one declares the
+    // document language so assistive technology reads it correctly
+    // (WCAG 3.1.1).
+    template: htmlTemplatePath,
   },
   server: {
     // API WebSockets go to the Console listener, the remaining /api surface
@@ -100,6 +126,21 @@ export default defineConfig({
         headers: {},
         changeOrigin: true,
         ws: false,
+        on: {
+          proxyReq: (proxyReq, req) => {
+            const devOrigin = `http://${req.headers.host}`
+            const targetOrigin = new URL(apiTarget).origin
+            for (const name of ['origin', 'referer']) {
+              const header = proxyReq.getHeader(name)
+              const rewritten = rewriteDevServerOrigin(
+                typeof header === 'string' ? header : undefined,
+                devOrigin,
+                targetOrigin
+              )
+              if (rewritten) proxyReq.setHeader(name, rewritten)
+            }
+          },
+        },
       },
     ],
     headers: {

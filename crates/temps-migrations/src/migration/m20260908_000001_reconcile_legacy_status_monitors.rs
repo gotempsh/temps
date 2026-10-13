@@ -3,6 +3,28 @@
 
 use sea_orm_migration::prelude::*;
 
+/// `status_checks` is a compressed hypertable, so re-pointing old checks at
+/// the canonical monitor decompresses chunks. TimescaleDB caps that per
+/// transaction (100k tuples by default) and aborts the migration past it.
+/// `0` lifts the cap. SeaORM 1.1 runs every pending PostgreSQL migration in
+/// one shared transaction, so `SET LOCAL` alone would leak into the
+/// migrations that follow; `RESET_DECOMPRESSION_LIMIT` restores the value
+/// the session started with as soon as this migration's DML is done.
+/// Both are no-ops on TimescaleDB releases older than 2.11, which have
+/// neither the cap nor the setting (setting it there would be an error).
+const LIFT_DECOMPRESSION_LIMIT: &str = "DO $$ BEGIN \
+     IF EXISTS (SELECT 1 FROM pg_settings \
+                WHERE name = 'timescaledb.max_tuples_decompressed_per_dml_transaction') THEN \
+         SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0; \
+     END IF; \
+ END $$";
+const RESET_DECOMPRESSION_LIMIT: &str = "DO $$ BEGIN \
+     IF EXISTS (SELECT 1 FROM pg_settings \
+                WHERE name = 'timescaledb.max_tuples_decompressed_per_dml_transaction') THEN \
+         RESET timescaledb.max_tuples_decompressed_per_dml_transaction; \
+     END IF; \
+ END $$";
+
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 
@@ -17,6 +39,10 @@ impl MigrationTrait for Migration {
         // move references from every duplicate automatic row to it, and remove
         // only duplicate rows with the reserved environment-monitor name or
         // explicit managed provenance. Custom-named monitors remain untouched.
+        manager
+            .get_connection()
+            .execute_unprepared(LIFT_DECOMPRESSION_LIMIT)
+            .await?;
         manager
             .get_connection()
             .execute_unprepared(
@@ -134,6 +160,10 @@ impl MigrationTrait for Migration {
                      _temps_m20260904_managed_monitor_ownership_backup",
             )
             .await?;
+        manager
+            .get_connection()
+            .execute_unprepared(RESET_DECOMPRESSION_LIMIT)
+            .await?;
 
         Ok(())
     }
@@ -142,6 +172,10 @@ impl MigrationTrait for Migration {
         // Restore only the rows and associations captured by up(). Checks or
         // incidents created on the canonical monitor after the migration stay
         // there; they did not belong to a duplicate in the pre-migration state.
+        manager
+            .get_connection()
+            .execute_unprepared(LIFT_DECOMPRESSION_LIMIT)
+            .await?;
         manager
             .get_connection()
             .execute_unprepared(
@@ -214,6 +248,10 @@ impl MigrationTrait for Migration {
                  DROP TABLE _temps_m20260908_monitor_canonical_backup; \
                  ALTER TABLE status_monitors DROP COLUMN check_path_revision",
             )
+            .await?;
+        manager
+            .get_connection()
+            .execute_unprepared(RESET_DECOMPRESSION_LIMIT)
             .await?;
 
         Ok(())

@@ -14,9 +14,10 @@ mod docker_context;
 use clap::{Parser, Subcommand};
 use commands::{
     AgentCommand, ApiKeyCommand, BackfillCommand, BackupCommand, BuildCommand, DeployCommand,
-    DoctorCommand, DomainCommand, EdgeCommand, FirecrackerCommand, JoinCommand, MigrateCommand,
-    NetworkCommand, NodeCommand, ProxyCommand, ResetPasswordCommand, SandboxCommand, ServeCommand,
-    ServicesCommand, SetupCommand, UpgradeCommand,
+    DoctorCommand, DomainCommand, EdgeCommand, FirecrackerCommand, JoinCommand,
+    MicrosandboxCommand, MigrateCommand, NetworkCommand, NodeCommand, ProxyCommand,
+    ResetPasswordCommand, SandboxCommand, ServeCommand, ServicesCommand, SetupCommand,
+    UpgradeCommand,
 };
 use tracing_subscriber::{layer::SubscriberExt, Layer};
 
@@ -97,6 +98,8 @@ pub enum Commands {
     Sandbox(SandboxCommand),
     /// Provision and manage the Firecracker microVM sandbox backend
     Firecracker(FirecrackerCommand),
+    /// Install and verify the experimental microsandbox microVM sandbox backend
+    Microsandbox(MicrosandboxCommand),
 }
 
 /// Install the global tracing subscriber. Safe to call once per process.
@@ -340,6 +343,7 @@ pub fn dispatch_with_request_policy_gate(
         Commands::Edge(edge_cmd) => edge_cmd.execute(),
         Commands::Sandbox(sandbox_cmd) => sandbox_cmd.execute(),
         Commands::Firecracker(firecracker_cmd) => firecracker_cmd.execute(),
+        Commands::Microsandbox(microsandbox_cmd) => microsandbox_cmd.execute(),
     }
 }
 
@@ -724,6 +728,7 @@ mod command_tree_tests {
             "edge",
             "firecracker setup",
             "join",
+            "microsandbox setup",
             "migrate",
             "network diag",
             "network peers",

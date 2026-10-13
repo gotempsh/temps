@@ -5,6 +5,7 @@ import { describe, expect, test } from 'bun:test'
 import type { DockerSocketCapability } from '@/api/client/types.gen'
 import {
   describeDockerSocket,
+  hostDockerAccessPlacement,
   shouldShowDockerSocketBadge,
   shouldShowDockerSocketOnboarding,
 } from './docker-socket'
@@ -96,5 +97,27 @@ describe('shouldShowDockerSocketBadge', () => {
     ).toBe(true)
     expect(shouldShowDockerSocketBadge(capability())).toBe(false)
     expect(shouldShowDockerSocketBadge(null)).toBe(false)
+  })
+})
+
+describe('hostDockerAccessPlacement', () => {
+  test('a granted project leads the page for everyone, admin or not', () => {
+    const granted = capability({
+      granted: true,
+      nodes: ['control-plane'],
+      reason: null,
+    })
+    expect(hostDockerAccessPlacement(granted, true)).toBe('prominent')
+    expect(hostDockerAccessPlacement(granted, false)).toBe('prominent')
+  })
+
+  test('an ordinary project keeps the onboarding in the collapsed advanced section', () => {
+    expect(hostDockerAccessPlacement(capability(), true)).toBe('advanced')
+  })
+
+  test('nothing is shown when the viewer cannot act or the server did not say', () => {
+    expect(hostDockerAccessPlacement(capability(), false)).toBe('hidden')
+    expect(hostDockerAccessPlacement(null, true)).toBe('hidden')
+    expect(hostDockerAccessPlacement(undefined, true)).toBe('hidden')
   })
 })

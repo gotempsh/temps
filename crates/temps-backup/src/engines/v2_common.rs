@@ -454,8 +454,6 @@ pub fn build_s3_client(
     encryption_service: &Arc<EncryptionService>,
     user_agent: &'static str,
 ) -> Result<S3Client, BackupError> {
-    use aws_sdk_s3::Config;
-
     let access_key = encryption_service
         .decrypt_string(&s3_source.access_key_id)
         .map_err(|e| BackupError::PermanentFailure {
@@ -479,23 +477,133 @@ pub fn build_s3_client(
         user_agent,
     );
 
-    let mut builder = Config::builder()
-        .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
-        .region(aws_sdk_s3::config::Region::new(s3_source.region.clone()))
-        .force_path_style(s3_source.force_path_style.unwrap_or(true))
-        .credentials_provider(creds)
-        .http_client(bundled_roots_http_client());
+    let builder = s3_config_builder(
+        &s3_source.region,
+        s3_source.force_path_style.unwrap_or(true),
+        creds,
+        s3_source.endpoint.as_deref(),
+    );
+    Ok(S3Client::from_conf(builder.build()))
+}
 
-    if let Some(endpoint) = &s3_source.endpoint {
-        let url = if endpoint.starts_with("http") {
-            endpoint.clone()
-        } else {
-            format!("http://{}", endpoint)
-        };
-        builder = builder.endpoint_url(url);
+/// Base configuration for every S3 client that talks to an operator's
+/// backup destination. Callers add per-use settings (timeouts) on top.
+///
+/// Request checksums are computed only when an operation requires one.
+/// The SDK's default (`WhenSupported`) adds a CRC32 to every
+/// `PutObject`/`UploadPart`, and for a streaming body (a backup file read
+/// from disk) sends it as an `aws-chunked` trailer with
+/// `x-amz-content-sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER`. Many
+/// S3-compatible stores don't implement that encoding: they compare the
+/// sentinel against the body's real SHA-256 and reject the upload with
+/// `XAmzContentSHA256Mismatch`, on every retry. With `WhenRequired` the
+/// upload is a plain SigV4 PUT, which AWS and every compatible store
+/// accept; operations that do require a checksum (`DeleteObjects`,
+/// `PutBucketLifecycleConfiguration`) still get one.
+///
+/// Uploads still carry an integrity header: `Content-MD5`, added by
+/// [`ContentMd5Interceptor`] for in-memory bodies and by
+/// [`upload_single_part`] for a file streamed from disk. A bucket with a
+/// default Object Lock retention period rejects an upload with neither
+/// `Content-MD5` nor a flexible checksum, and `Content-MD5` is the one
+/// every S3-compatible store accepts.
+pub(crate) fn s3_config_builder(
+    region: &str,
+    force_path_style: bool,
+    credentials: aws_sdk_s3::config::Credentials,
+    endpoint: Option<&str>,
+) -> aws_sdk_s3::config::Builder {
+    let mut builder = aws_sdk_s3::Config::builder()
+        .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+        .region(aws_sdk_s3::config::Region::new(region.to_string()))
+        .force_path_style(force_path_style)
+        .credentials_provider(credentials)
+        .http_client(bundled_roots_http_client())
+        .request_checksum_calculation(aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired)
+        .interceptor(ContentMd5Interceptor);
+
+    if let Some(endpoint) = endpoint {
+        builder = builder.endpoint_url(crate::services::s3_probe::endpoint_url(endpoint));
     }
 
-    Ok(S3Client::from_conf(builder.build()))
+    builder
+}
+
+/// Adds `Content-MD5` to every `PutObject` and `UploadPart` whose body is
+/// already in memory: metadata, backup indexes, multipart parts.
+///
+/// With checksums computed only when required (see [`s3_config_builder`]),
+/// neither operation would otherwise carry an integrity header, and a
+/// bucket with a default Object Lock retention period rejects such an
+/// upload. Living on the client rather than at each call site means a new
+/// upload can't forget it. A body streamed from disk has no bytes to hash
+/// here; [`upload_single_part`] computes its digest before sending.
+#[derive(Debug)]
+struct ContentMd5Interceptor;
+
+impl aws_sdk_s3::config::Intercept for ContentMd5Interceptor {
+    fn name(&self) -> &'static str {
+        "ContentMd5Interceptor"
+    }
+
+    fn modify_before_signing(
+        &self,
+        context: &mut aws_sdk_s3::config::interceptors::BeforeTransmitInterceptorContextMut<'_>,
+        _runtime_components: &aws_sdk_s3::config::RuntimeComponents,
+        cfg: &mut aws_sdk_s3::config::ConfigBag,
+    ) -> Result<(), aws_smithy_runtime_api::box_error::BoxError> {
+        let is_upload = cfg
+            .load::<aws_smithy_runtime_api::client::orchestrator::Metadata>()
+            .is_some_and(|metadata| matches!(metadata.name(), "PutObject" | "UploadPart"));
+        if !is_upload {
+            return Ok(());
+        }
+        let request = context.request_mut();
+        let has_integrity_header = request
+            .headers()
+            .iter_bytes()
+            .any(|(name, _)| name == "content-md5" || name.starts_with("x-amz-checksum-"));
+        if has_integrity_header {
+            return Ok(());
+        }
+        let Some(body) = request.body().bytes() else {
+            return Ok(());
+        };
+        let digest = content_md5(body);
+        request
+            .headers_mut()
+            .try_insert("content-md5", digest)
+            .map_err(|e| format!("failed to set Content-MD5 on an S3 upload: {}", e))?;
+        Ok(())
+    }
+}
+
+/// Base64 MD5 digest of `bytes`, in the form the `Content-MD5` header takes.
+fn content_md5(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(md5::compute(bytes).0)
+}
+
+/// `Content-MD5` of the file at `path`, read in fixed-size chunks so memory
+/// stays bounded whatever the file's size.
+async fn file_content_md5(path: &str) -> Result<String, BackupError> {
+    use base64::Engine as _;
+    use tokio::io::AsyncReadExt;
+
+    let read_error = |e: std::io::Error| BackupError::Failed {
+        reason: format!("failed to read {} to compute its Content-MD5: {}", path, e),
+    };
+    let mut file = tokio::fs::File::open(path).await.map_err(read_error)?;
+    let mut context = md5::Context::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer).await.map_err(read_error)?;
+        if read == 0 {
+            break;
+        }
+        context.consume(&buffer[..read]);
+    }
+    Ok(base64::engine::general_purpose::STANDARD.encode(context.finalize().0))
 }
 
 /// Convenience wrapper: load the row + build the client in one call. Most
@@ -601,6 +709,10 @@ pub async fn upload_single_part(
     content_type: &str,
     tags: Option<&BackupTags>,
 ) -> Result<(), BackupError> {
+    // The body is streamed from disk, so `ContentMd5Interceptor` can't hash
+    // it; the digest is computed here, one pass over a file that is at most
+    // `MULTIPART_THRESHOLD` bytes.
+    let content_md5 = file_content_md5(path).await?;
     let body = aws_sdk_s3::primitives::ByteStream::from_path(std::path::Path::new(path))
         .await
         .map_err(|e| BackupError::Failed {
@@ -615,6 +727,7 @@ pub async fn upload_single_part(
         .bucket(bucket)
         .key(key)
         .body(body)
+        .content_md5(content_md5)
         .content_type(content_type)
         .send()
         .await
@@ -1441,5 +1554,493 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert_eq!(state.aborts.load(Ordering::SeqCst), 1);
+    }
+
+    /// What a stub store saw for one upload request: the headers the SDK
+    /// signed and the bytes that arrived on the wire.
+    struct RecordedPut {
+        headers: axum::http::HeaderMap,
+        body: Vec<u8>,
+    }
+
+    type RecordedPuts = Arc<std::sync::Mutex<Vec<RecordedPut>>>;
+
+    /// Records each `PUT`, so a test can check how the request was encoded
+    /// rather than only that it succeeded, and enforces what a bucket with
+    /// a default Object Lock retention period enforces: an upload with
+    /// neither `Content-MD5` nor a flexible checksum is rejected, and so is
+    /// one whose `Content-MD5` doesn't match the body.
+    async fn recording_stub_handler(
+        axum::extract::State(puts): axum::extract::State<RecordedPuts>,
+        method: axum::http::Method,
+        uri: axum::http::Uri,
+        headers: axum::http::HeaderMap,
+        body: axum::body::Bytes,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let xml = |body: &'static str| {
+            (
+                axum::http::StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/xml")],
+                body,
+            )
+                .into_response()
+        };
+        let rejected = |code: &str, message: &str| {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                [(axum::http::header::CONTENT_TYPE, "application/xml")],
+                format!("<Error><Code>{code}</Code><Message>{message}</Message></Error>"),
+            )
+                .into_response()
+        };
+        let query = uri.query().unwrap_or_default();
+        match method {
+            axum::http::Method::PUT => {
+                let content_md5 = headers
+                    .get("content-md5")
+                    .map(|value| value.to_str().expect("ascii header").to_string());
+                let has_checksum = headers
+                    .keys()
+                    .any(|name| name.as_str().starts_with("x-amz-checksum-"));
+                let body = body.to_vec();
+                let digest_matches = content_md5
+                    .as_deref()
+                    .map(|md5| md5 == super::content_md5(&body));
+                puts.lock()
+                    .expect("puts lock")
+                    .push(RecordedPut { headers, body });
+                match (digest_matches, has_checksum) {
+                    (None, false) => rejected(
+                        "InvalidRequest",
+                        "Content-MD5 OR x-amz-checksum- HTTP header is required for Put \
+                         Object requests with Object Lock parameters",
+                    ),
+                    (Some(false), _) => rejected(
+                        "BadDigest",
+                        "The Content-MD5 you specified did not match what we received.",
+                    ),
+                    _ => (
+                        axum::http::StatusCode::OK,
+                        [(axum::http::header::ETAG, "\"etag\"")],
+                        "",
+                    )
+                        .into_response(),
+                }
+            }
+            axum::http::Method::POST if query.contains("uploads") => xml(
+                "<InitiateMultipartUploadResult><Bucket>b</Bucket><Key>k</Key>\
+                 <UploadId>upload-1</UploadId></InitiateMultipartUploadResult>",
+            ),
+            axum::http::Method::POST => xml(
+                "<CompleteMultipartUploadResult><Location>l</Location><Bucket>b</Bucket>\
+                 <Key>k</Key><ETag>\"done\"</ETag></CompleteMultipartUploadResult>",
+            ),
+            _ => axum::http::StatusCode::NO_CONTENT.into_response(),
+        }
+    }
+
+    /// A client built by the production [`super::s3_config_builder`],
+    /// pointed at a recording stub store.
+    async fn spawn_recording_stub() -> Option<(aws_sdk_s3::Client, RecordedPuts)> {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("sandbox denied TCP bind; skipping recording stub test");
+                return None;
+            }
+            Err(error) => panic!("bind recording stub: {error}"),
+        };
+        let address = listener.local_addr().expect("stub address");
+        let puts: RecordedPuts = Default::default();
+        let app = axum::Router::new()
+            .route(
+                "/{bucket}/{*key}",
+                axum::routing::any(recording_stub_handler),
+            )
+            // Parts are 5 MiB; Axum's default body limit is 2 MiB.
+            .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
+            .with_state(puts.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve recording stub");
+        });
+        // A bare `host:port`, the way an operator enters a private endpoint.
+        let endpoint = address.to_string();
+        let config = super::s3_config_builder(
+            "us-east-1",
+            true,
+            aws_sdk_s3::config::Credentials::new("test", "test", None, None, "test"),
+            Some(&endpoint),
+        )
+        .build();
+        Some((aws_sdk_s3::Client::from_conf(config), puts))
+    }
+
+    /// The upload must be a plain SigV4 request: no `aws-chunked` body, no
+    /// streaming payload sentinel, and no optional flexible checksum.
+    /// S3-compatible stores that don't implement the aws-chunked trailer
+    /// format reject anything else with `XAmzContentSHA256Mismatch`. It
+    /// must still carry a `Content-MD5` of exactly the bytes received,
+    /// which a bucket with Object Lock retention requires.
+    fn assert_plain_sigv4_put(put: &RecordedPut, what: &str) {
+        let header = |name: &str| {
+            put.headers
+                .get(name)
+                .map(|value| value.to_str().expect("ascii header").to_string())
+        };
+        let content_encoding = header("content-encoding").unwrap_or_default();
+        assert!(
+            !content_encoding.contains("aws-chunked"),
+            "{what} was sent aws-chunked (content-encoding: {content_encoding})"
+        );
+        let content_sha256 = header("x-amz-content-sha256").expect("signed payload hash");
+        assert!(
+            !content_sha256.starts_with("STREAMING-"),
+            "{what} used a streaming payload: x-amz-content-sha256 = {content_sha256}"
+        );
+        assert_eq!(header("x-amz-trailer"), None, "{what} declared a trailer");
+        assert_eq!(
+            header("x-amz-sdk-checksum-algorithm"),
+            None,
+            "{what} requested an optional flexible checksum"
+        );
+        let checksums: Vec<_> = put
+            .headers
+            .keys()
+            .filter(|name| name.as_str().starts_with("x-amz-checksum-"))
+            .collect();
+        assert!(
+            checksums.is_empty(),
+            "{what} carried optional checksum headers {checksums:?}"
+        );
+        // `content_md5` itself is pinned to reference vectors in
+        // `content_md5_matches_reference_digests`.
+        assert_eq!(
+            header("content-md5"),
+            Some(super::content_md5(&put.body)),
+            "{what} must carry the Content-MD5 of the bytes the store received"
+        );
+    }
+
+    #[test]
+    fn content_md5_matches_reference_digests() {
+        assert_eq!(super::content_md5(b""), "1B2M2Y8AsgTpgAmY7PhCfg==");
+        assert_eq!(
+            super::content_md5(b"The quick brown fox jumps over the lazy dog"),
+            "nhB9nTcrtoJr2B01QqQZ1g=="
+        );
+    }
+
+    /// The streamed digest of a file spanning many read chunks equals the
+    /// digest of its bytes in memory.
+    #[tokio::test]
+    async fn file_content_md5_matches_the_in_memory_digest() {
+        let file = twelve_mib_file();
+        let path = file.path().to_str().expect("utf-8 path").to_string();
+        let streamed = super::file_content_md5(&path)
+            .await
+            .expect("digest of a readable file");
+        assert_eq!(
+            streamed,
+            super::content_md5(&std::fs::read(&path).expect("file"))
+        );
+    }
+
+    #[tokio::test]
+    async fn file_content_md5_of_a_missing_file_names_the_path() {
+        let error = super::file_content_md5("/nonexistent/backup.sql.gz")
+            .await
+            .expect_err("a missing file has no digest");
+        assert!(
+            error.to_string().contains("/nonexistent/backup.sql.gz"),
+            "the reason names the file: {error}"
+        );
+    }
+
+    /// A backup file below the multipart threshold is uploaded as a plain
+    /// SigV4 PUT whose body is the file itself, not an aws-chunked stream.
+    #[tokio::test]
+    async fn a_single_part_upload_is_a_plain_sigv4_put() {
+        let Some((client, puts)) = spawn_recording_stub().await else {
+            return;
+        };
+        let file = twelve_mib_file();
+        let path = file.path().to_str().expect("utf-8 path").to_string();
+        super::upload_single_part(&client, "b", "k", &path, "application/gzip", None)
+            .await
+            .expect("single-part upload succeeds");
+
+        let puts = puts.lock().expect("puts lock");
+        assert_eq!(puts.len(), 1, "one PUT for a single-part upload");
+        assert_plain_sigv4_put(&puts[0], "single-part upload");
+        assert!(
+            puts[0].body == std::fs::read(&path).expect("file"),
+            "the store received the file bytes unframed"
+        );
+    }
+
+    /// Every part of a multipart upload goes out without optional
+    /// checksums, the same as a single-part upload.
+    #[tokio::test]
+    async fn multipart_upload_parts_are_plain_sigv4_puts() {
+        let Some((client, puts)) = spawn_recording_stub().await else {
+            return;
+        };
+        let file = twelve_mib_file();
+        let path = file.path().to_str().expect("utf-8 path").to_string();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        super::upload_multipart(
+            &client,
+            "b",
+            "k",
+            &path,
+            "application/octet-stream",
+            None,
+            &cancel,
+        )
+        .await
+        .expect("multipart upload succeeds");
+
+        let puts = puts.lock().expect("puts lock");
+        assert_eq!(puts.len(), 3, "three parts for a 12 MiB file");
+        for (index, put) in puts.iter().enumerate() {
+            assert_plain_sigv4_put(put, &format!("part {}", index + 1));
+        }
+    }
+
+    /// An in-memory upload (the metadata companion) gets its `Content-MD5`
+    /// from the client's interceptor, with no help from the call site.
+    #[tokio::test]
+    async fn an_in_memory_upload_gets_content_md5_from_the_client() {
+        let Some((client, puts)) = spawn_recording_stub().await else {
+            return;
+        };
+        super::write_metadata_companion(
+            &client,
+            "b",
+            "backups/metadata.json",
+            "postgres",
+            "uuid-1",
+            "backups/backup.sql.gz",
+            42,
+            7,
+            "gzip",
+            None,
+        )
+        .await
+        .expect("metadata upload succeeds");
+
+        let puts = puts.lock().expect("puts lock");
+        assert_eq!(puts.len(), 1, "one PUT for the metadata companion");
+        assert_plain_sigv4_put(&puts[0], "metadata upload");
+    }
+
+    // ── Object Lock against a real S3-compatible server ─────────────────────
+    //
+    // The stub above enforces AWS's documented rule for buckets with a
+    // default Object Lock retention period (no integrity header ->
+    // InvalidRequest) and checks each `Content-MD5` against this crate's own
+    // `content_md5`. Self-hosted S3-compatible servers don't enforce that
+    // rule (RustFS and LocalStack both accept such an upload), so a real
+    // server can't reproduce the rejection itself. What one can check is
+    // everything else: that our digests pass a real server's `Content-MD5`
+    // verification, and that every backup upload lands in a locked bucket
+    // under its default retention.
+
+    const LOCKED_BUCKET: &str = "locked-backups";
+
+    struct ObjectLockFixture {
+        _container: testcontainers::ContainerAsync<testcontainers::GenericImage>,
+        /// Built by the production [`super::s3_config_builder`].
+        client: aws_sdk_s3::Client,
+    }
+
+    /// Start RustFS and create [`LOCKED_BUCKET`] with Object Lock and a
+    /// one-day GOVERNANCE default retention. `None` when Docker is not
+    /// available, so the test skips instead of failing.
+    async fn object_lock_fixture() -> Option<ObjectLockFixture> {
+        use crate::test_rustfs::{
+            rustfs_container_request, wait_for_rustfs_ready, RUSTFS_ACCESS_KEY, RUSTFS_S3_PORT,
+            RUSTFS_SECRET_KEY,
+        };
+        use testcontainers::runners::AsyncRunner;
+
+        let docker = match bollard::Docker::connect_with_local_defaults() {
+            Ok(docker) => docker,
+            Err(e) => {
+                println!("Docker not available, skipping Object Lock test: {e}");
+                return None;
+            }
+        };
+        if let Err(e) = docker.ping().await {
+            println!("Docker daemon not reachable, skipping Object Lock test: {e}");
+            return None;
+        }
+
+        let container = rustfs_container_request()
+            .start()
+            .await
+            .expect("start RustFS container");
+        let port = container
+            .get_host_port_ipv4(RUSTFS_S3_PORT)
+            .await
+            .expect("RustFS S3 port");
+        wait_for_rustfs_ready(port)
+            .await
+            .expect("RustFS did not become healthy");
+
+        let endpoint = format!("127.0.0.1:{port}");
+        let credentials = aws_sdk_s3::config::Credentials::new(
+            RUSTFS_ACCESS_KEY,
+            RUSTFS_SECRET_KEY,
+            None,
+            None,
+            "object-lock-test",
+        );
+        let client = aws_sdk_s3::Client::from_conf(
+            super::s3_config_builder("us-east-1", true, credentials, Some(&endpoint)).build(),
+        );
+
+        client
+            .create_bucket()
+            .bucket(LOCKED_BUCKET)
+            .object_lock_enabled_for_bucket(true)
+            .send()
+            .await
+            .expect("create Object Lock bucket");
+        client
+            .put_object_lock_configuration()
+            .bucket(LOCKED_BUCKET)
+            .object_lock_configuration(
+                aws_sdk_s3::types::ObjectLockConfiguration::builder()
+                    .object_lock_enabled(aws_sdk_s3::types::ObjectLockEnabled::Enabled)
+                    .rule(
+                        aws_sdk_s3::types::ObjectLockRule::builder()
+                            .default_retention(
+                                aws_sdk_s3::types::DefaultRetention::builder()
+                                    .mode(aws_sdk_s3::types::ObjectLockRetentionMode::Governance)
+                                    .days(1)
+                                    .build(),
+                            )
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await
+            .expect("set default retention");
+
+        Some(ObjectLockFixture {
+            _container: container,
+            client,
+        })
+    }
+
+    /// The retention mode the server recorded for `key`, proving the upload
+    /// landed under the bucket's default retention rather than beside it.
+    async fn retention_mode(client: &aws_sdk_s3::Client, key: &str) -> Option<String> {
+        client
+            .head_object()
+            .bucket(LOCKED_BUCKET)
+            .key(key)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("head_object {key}: {e:?}"))
+            .object_lock_mode()
+            .map(|mode| mode.as_str().to_string())
+    }
+
+    /// The server really verifies `Content-MD5`: a digest that doesn't match
+    /// the body is rejected. Without this, the test below would pass
+    /// against a server that ignores the header, proving nothing about the
+    /// digests this crate computes.
+    #[tokio::test]
+    async fn a_locked_bucket_rejects_a_wrong_content_md5() {
+        let Some(fixture) = object_lock_fixture().await else {
+            return;
+        };
+        let error = fixture
+            .client
+            .put_object()
+            .bucket(LOCKED_BUCKET)
+            .key("wrong-digest.json")
+            .body(b"{}".to_vec().into())
+            // The MD5 of an empty body, not of `{}`. The interceptor leaves
+            // a `Content-MD5` the caller already set untouched.
+            .content_md5(super::content_md5(b""))
+            .send()
+            .await
+            .expect_err("a wrong Content-MD5 is rejected");
+        assert_eq!(
+            error
+                .raw_response()
+                .map(|response| response.status().as_u16()),
+            Some(400),
+            "expected a 400 rejection: {}",
+            super::describe_sdk_error("put_object with a wrong Content-MD5", &error)
+        );
+    }
+
+    /// Every kind of backup upload succeeds on a bucket with a default
+    /// Object Lock retention period, and each object is stored under it.
+    #[tokio::test]
+    async fn backup_uploads_succeed_on_a_bucket_with_default_object_lock_retention() {
+        let Some(fixture) = object_lock_fixture().await else {
+            return;
+        };
+        let client = &fixture.client;
+        let file = twelve_mib_file();
+        let path = file.path().to_str().expect("utf-8 path").to_string();
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        super::upload_single_part(
+            client,
+            LOCKED_BUCKET,
+            "single/backup.sql.gz",
+            &path,
+            "application/gzip",
+            None,
+        )
+        .await
+        .expect("single-part upload to a locked bucket");
+        super::upload_multipart(
+            client,
+            LOCKED_BUCKET,
+            "multi/backup.sql.gz",
+            &path,
+            "application/gzip",
+            None,
+            &cancel,
+        )
+        .await
+        .expect("multipart upload to a locked bucket");
+        super::write_metadata_companion(
+            client,
+            LOCKED_BUCKET,
+            "single/metadata.json",
+            "postgres",
+            "uuid-1",
+            "single/backup.sql.gz",
+            12 * 1024 * 1024,
+            1,
+            "gzip",
+            None,
+        )
+        .await
+        .expect("metadata upload to a locked bucket");
+
+        for key in [
+            "single/backup.sql.gz",
+            "multi/backup.sql.gz",
+            "single/metadata.json",
+        ] {
+            assert_eq!(
+                retention_mode(client, key).await.as_deref(),
+                Some("GOVERNANCE"),
+                "{key} is stored under the bucket's default retention"
+            );
+        }
     }
 }

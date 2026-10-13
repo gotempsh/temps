@@ -423,9 +423,21 @@ impl DeployStaticBundleJob {
                 WorkflowError::JobExecutionFailed(format!("Failed to read zip entry {}: {}", i, e))
             })?;
 
-            // Validate the raw name first because zip 8 normalizes absolute
+            // Validate the raw name first because zip normalizes absolute
             // roots and prefixes into relative paths in `enclosed_name()`.
-            validate_zip_entry_name(file.name())?;
+            //
+            // `ZipFile::name` returns a `Result` since zip 9, and
+            // `enclosed_name` maps its error to `None`. The decode fallback
+            // is effectively infallible, but if it ever failed the `None` arm
+            // below would skip the entry silently, deploying a bundle with a
+            // file missing. Fail closed instead.
+            let entry_name = file
+                .name()
+                .map_err(|e| WorkflowError::InvalidArchiveEntry {
+                    path: String::from_utf8_lossy(file.name_raw()).into_owned(),
+                    reason: format!("entry {i} has a name that cannot be decoded: {e}"),
+                })?;
+            validate_zip_entry_name(&entry_name)?;
 
             // Fix #18: `enclosed_name()` resolves safe internal `..` segments
             // and rejects traversal beyond the archive root. The returned path
@@ -675,6 +687,10 @@ impl WorkflowTask for DeployStaticBundleJob {
         let result = self.static_deployer.deploy(request).await.map_err(|e| {
             WorkflowError::JobExecutionFailed(format!("Failed to deploy static files: {}", e))
         })?;
+
+        if let Some(summary) = result.skipped_summary() {
+            self.log(LogLevel::Warning, &summary).await;
+        }
 
         self.log(
             LogLevel::Success,

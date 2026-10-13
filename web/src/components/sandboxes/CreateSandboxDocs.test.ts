@@ -2,10 +2,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
+import { createElement } from 'react'
+import { renderToStaticMarkup } from 'react-dom/server'
+import { MemoryRouter } from 'react-router'
 import {
   SANDBOX_CLI_EXAMPLE,
   SANDBOX_REST_EXAMPLE,
   SANDBOX_WORKSPACE_EXAMPLE,
+  SandboxRestIntro,
 } from './CreateSandboxDocs'
 
 describe('sandbox CLI onboarding', () => {
@@ -40,4 +44,13 @@ describe('sandbox REST example', () => {
     })
     expect(SANDBOX_REST_EXAMPLE).toContain('/api/v1/sandboxes')
   })
+})
+
+test('REST onboarding links to the routed API Keys page', () => {
+  const html = renderToStaticMarkup(
+    createElement(MemoryRouter, null, createElement(SandboxRestIntro))
+  )
+  expect(html).toContain('href="/settings/keys"')
+  expect(html).toContain('API Keys')
+  expect(html).not.toContain('href="/keys"')
 })

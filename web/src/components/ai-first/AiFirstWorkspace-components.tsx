@@ -1715,8 +1715,9 @@ function PersistentAiFirstWorkspace() {
               title="Harnesses"
             >
               <Terminal className="size-4 sm:mr-1.5" />
-              <span className="hidden sm:inline">Harnesses</span>
+              <span className="max-sm:sr-only">Harnesses</span>
               <span
+                role="img"
                 aria-label={
                   harnessesLoading
                     ? 'Harness readiness is being checked'
@@ -1744,7 +1745,7 @@ function PersistentAiFirstWorkspace() {
           >
             <a href="/projects" title="Classic console">
               <X className="size-4 sm:mr-1.5" />
-              <span className="hidden sm:inline">Classic console</span>
+              <span className="max-sm:sr-only">Classic console</span>
             </a>
           </Button>
         </div>
@@ -2474,6 +2475,7 @@ export function ThreadStatusIndicator({
 
   return (
     <span
+      role="img"
       className={cn(
         'inline-flex shrink-0 items-center gap-1 text-[9px] font-medium',
         presentation.text
@@ -2742,7 +2744,7 @@ export function WorkspaceFilesPanel({
                         : change.status === 'untracked' ||
                             change.status === 'added'
                           ? 'text-success'
-                          : 'text-amber-600 dark:text-amber-300'
+                          : 'text-amber-700 dark:text-amber-300'
                     )}
                   >
                     {change.status?.slice(0, 1) ?? 'M'}
@@ -2806,7 +2808,7 @@ export function WorkspaceFilesPanel({
             file paths and credential-like diff values are hidden.
           </p>
           {changes?.changes_truncated && (
-            <p className="text-[10px] text-amber-600 dark:text-amber-300">
+            <p className="text-[10px] text-amber-700 dark:text-amber-300">
               Working changes are capped at the first 200 safe paths.
             </p>
           )}
@@ -4318,7 +4320,7 @@ function CreateThreadDialog({
             Platform actions remain explicitly approval-gated.
           </p>
           {harnesses.length === 0 && (
-            <p className="rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-sm text-amber-600">
+            <p className="rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-sm text-amber-700 dark:text-amber-600">
               No development harness is ready. Authenticate Claude Code, Codex,
               or OpenCode in Agent Sandbox settings.
             </p>

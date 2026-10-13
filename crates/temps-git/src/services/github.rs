@@ -958,6 +958,36 @@ impl GithubAppService {
                 GithubAppServiceError::Other(format!("Failed to create connection: {}", e))
             })?;
 
+        // App installations skip the manager's PAT/OAuth token probe. Verify
+        // the installation as soon as its connection exists, with a deadline,
+        // so the UI does not wait for the daily health sweep.
+        if let Err(error) = self
+            .git_provider_manager
+            .probe_and_record_initial_installation_health(
+                &connection,
+                self.verify_installation(installation_id_p),
+            )
+            .await
+        {
+            warn!(
+                connection_id = connection.id,
+                installation_id = installation_id_p,
+                error = %error,
+                "Failed to record initial GitHub App installation health"
+            );
+        }
+
+        let connection = self
+            .git_provider_manager
+            .get_connection(connection.id)
+            .await
+            .map_err(|error| {
+                GithubAppServiceError::Other(format!(
+                    "Failed to reload connection {} after initial installation health check: {}",
+                    connection.id, error
+                ))
+            })?;
+
         // Pass the connection ID to sync_repositories
         self.sync_repositories(installation.id.0 as i32, Some(connection.id))
             .await?;

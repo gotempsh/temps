@@ -129,7 +129,7 @@ export function AiAgentsChart({
     if (startDate) params.set('start_date', startDate.toISOString())
     if (endDate) params.set('end_date', endDate.toISOString())
     params.set('filters', 'open')
-    navigate(`/projects/${project.slug}/logs?${params.toString()}`)
+    navigate(`/projects/${project.slug}/request-logs?${params.toString()}`)
   }
 
   return (

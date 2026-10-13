@@ -16,6 +16,7 @@ import { DomainSelector } from '@/components/domains/DomainSelector'
 import {
   Form,
   FormControl,
+  FormDescription,
   FormField,
   FormItem,
   FormLabel,
@@ -410,6 +411,10 @@ export function DomainForm({
                   </div>
                 )}
               </div>
+              <FormDescription>
+                Visitors keep the page they asked for: /pricing?plan=pro on
+                this domain goes to /pricing?plan=pro on the target.
+              </FormDescription>
             </FormItem>
           )}
         />

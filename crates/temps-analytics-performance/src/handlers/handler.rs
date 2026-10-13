@@ -7,26 +7,25 @@ use crate::services::service::{
     PerformanceMetricsResponse, RecordPerformanceMetricsConfig, SpeedSegmentFilters,
     UpdatePerformanceMetricsConfig,
 };
-use axum::http::header::{self, HeaderMap, HeaderName};
+use axum::http::header::{self, HeaderMap};
 use axum::Extension;
 use axum::{
     extract::{Query, RawQuery, State},
-    http::{Method, StatusCode},
+    http::StatusCode,
     response::{IntoResponse, Json},
     routing::{get, post},
     Router,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::Duration;
 use temps_analytics::ingest_keys::{
-    extract_analytics_key, resolve_client_identity, resolve_keyed_ingest_scope,
-    stamp_retry_after_on_rate_limited, ANALYTICS_INGEST_KEY_HEADER,
+    extract_analytics_key, keyed_ingest_cors, resolve_client_identity, resolve_keyed_ingest_scope,
+    stamp_retry_after_on_rate_limited, wildcard_ingest_cors, IngestBranch, IngestJson,
+    KeyedIngestCors,
 };
 use temps_auth::{project_access_guard, AuthContext, Permission, RequireAuth};
 use temps_core::problemdetails::Problem;
 use temps_core::DateTime;
-use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info};
 use utoipa::{OpenApi, ToSchema};
 
@@ -251,43 +250,23 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
 }
 
 /// Public ingest routes for performance metrics — called by browser SDKs.
-pub fn configure_public_routes() -> Router<Arc<AppState>> {
+///
+/// CORS is two layers: the wildcard policy every request has always had, and,
+/// outside it, the keyed policy that grants credentialed CORS to the origins an
+/// ingest key admits (gotempsh/temps#1416). See
+/// [`temps_analytics::ingest_keys::cors`].
+pub fn configure_public_routes(cors: KeyedIngestCors) -> Router<Arc<AppState>> {
     Router::new()
         .route("/_temps/speed", post(record_speed_metrics))
         .route("/_temps/speed/update", post(update_speed_metrics))
         .layer(axum::middleware::map_response(
             stamp_retry_after_on_rate_limited,
         ))
-        .layer(public_ingest_cors())
-}
-
-/// CORS for the public performance ingest routes.
-///
-/// Required by ADR-040: with an ingest key the request is cross-origin by
-/// definition, and without this layer the browser blocks it before it ever
-/// leaves the page.
-///
-/// `allow_credentials` stays at its default `false`, and must never be set
-/// true. Key-based ingest needs no cookies by design; credentialed CORS on a
-/// wildcard origin would be a real vulnerability, and browsers reject the
-/// combination outright.
-pub(crate) fn public_ingest_cors() -> CorsLayer {
-    CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods([Method::POST, Method::OPTIONS])
-        .allow_headers([
-            header::CONTENT_TYPE,
-            HeaderName::from_static(ANALYTICS_INGEST_KEY_HEADER),
-        ])
-        // `Retry-After` is not one of the seven CORS-safelisted response
-        // headers, so without this a cross-origin browser SDK — the stated
-        // consumer of keyed ingest — gets the 429 but cannot read the header
-        // that tells it when to come back, and falls back to guessing or
-        // hammering. Exposed explicitly rather than via `Any` because
-        // `Access-Control-Expose-Headers: *` is ignored by browsers for
-        // credentialed requests and is a wider grant than is needed.
-        .expose_headers([header::RETRY_AFTER])
-        .max_age(Duration::from_secs(600))
+        .layer(wildcard_ingest_cors())
+        .layer(axum::middleware::from_fn_with_state(
+            cors,
+            keyed_ingest_cors,
+        ))
 }
 
 /// Get performance metrics
@@ -303,7 +282,7 @@ pub(crate) fn public_ingest_cors() -> CorsLayer {
         ("deployment_id" = Option<i32>, Query, description = "Deployment ID (optional)"),
         ("device_type" = Option<String>, Query, description = "Device type filter: desktop or mobile (optional)"),
         ("include_bots" = Option<bool>, Query, description = "Include crawler/datacenter bot samples (default false)"),
-        ("filter_path" = Option<String>, Query, description = "Filter to one page pathname (optional)"),
+        ("filter_path" = Option<String>, Query, description = "Filter to one page pathname, exact match (optional). `path` is accepted as an alias."),
         ("filter_country" = Option<String>, Query, description = "Filter to one country (optional)"),
         ("filter_region" = Option<String>, Query, description = "Filter to one region (optional)"),
         ("filter_city" = Option<String>, Query, description = "Filter to one city (optional)"),
@@ -367,7 +346,7 @@ async fn get_performance_metrics(
         ("deployment_id" = Option<i32>, Query, description = "Deployment ID (optional)"),
         ("device_type" = Option<String>, Query, description = "Device type filter: desktop or mobile (optional)"),
         ("include_bots" = Option<bool>, Query, description = "Include crawler/datacenter bot samples (default false)"),
-        ("filter_path" = Option<String>, Query, description = "Filter to one page pathname (optional)"),
+        ("filter_path" = Option<String>, Query, description = "Filter to one page pathname, exact match (optional). `path` is accepted as an alias."),
         ("filter_country" = Option<String>, Query, description = "Filter to one country (optional)"),
         ("filter_region" = Option<String>, Query, description = "Filter to one region (optional)"),
         ("filter_city" = Option<String>, Query, description = "Filter to one city (optional)"),
@@ -432,7 +411,7 @@ async fn get_metrics_over_time(
         ("group_by" = String, Query, description = "Group by: path, country, region, city, device_type, browser, operating_system"),
         ("device_type" = Option<String>, Query, description = "Device type filter: desktop or mobile (optional)"),
         ("include_bots" = Option<bool>, Query, description = "Include crawler/datacenter bot samples (default false)"),
-        ("filter_path" = Option<String>, Query, description = "Filter to one page pathname (optional)"),
+        ("filter_path" = Option<String>, Query, description = "Filter to one page pathname, exact match (optional). `path` is accepted as an alias."),
         ("filter_country" = Option<String>, Query, description = "Filter to one country (optional)"),
         ("filter_region" = Option<String>, Query, description = "Filter to one region (optional)"),
         ("filter_city" = Option<String>, Query, description = "Filter to one city (optional)"),
@@ -613,7 +592,7 @@ pub async fn record_speed_metrics(
     Extension(metadata): Extension<temps_core::RequestMetadata>,
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
-    Json(payload): Json<SpeedMetricsPayload>,
+    IngestJson(payload): IngestJson<SpeedMetricsPayload>,
 ) -> impl IntoResponse {
     info!("Recording speed metrics from client");
 
@@ -626,8 +605,7 @@ pub async fn record_speed_metrics(
     // ADR-040 §3. A presented ingest key resolves the scope outright; `Host` is
     // never consulted for resolution in that branch, and an unresolvable key is
     // a 401 rather than a silent fall-through to `Host`.
-    let (scope, is_keyed) = if let Some(key) = extract_analytics_key(&headers, raw_query.as_deref())
-    {
+    let (scope, branch) = if let Some(key) = extract_analytics_key(&headers, raw_query.as_deref()) {
         let origin = headers
             .get(header::ORIGIN)
             .and_then(|value| value.to_str().ok());
@@ -647,7 +625,7 @@ pub async fn record_speed_metrics(
                     resolved.environment_id,
                     resolved.deployment_id
                 );
-                (MetricScope::from(resolved), true)
+                (MetricScope::from(resolved), IngestBranch::keyed(&headers))
             }
             Err(problem) => return problem.into_response(),
         }
@@ -679,7 +657,7 @@ pub async fn record_speed_metrics(
                     host, scope.project_id, scope.environment_id, scope.deployment_id
                 );
 
-                (scope, false)
+                (scope, IngestBranch::HostResolved)
             }
             None => {
                 error!("Host {} not found in route table", host);
@@ -723,12 +701,12 @@ pub async fn record_speed_metrics(
     let session_id = resolve_client_identity(
         metadata.session_id_cookie,
         payload.session_id.clone(),
-        is_keyed,
+        branch,
     );
     let visitor_id = resolve_client_identity(
         metadata.visitor_id_cookie,
         payload.visitor_id.clone(),
-        is_keyed,
+        branch,
     );
 
     match state
@@ -798,7 +776,7 @@ pub async fn update_speed_metrics(
     Extension(metadata): Extension<temps_core::RequestMetadata>,
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
-    Json(payload): Json<UpdateSpeedMetricsPayload>,
+    IngestJson(payload): IngestJson<UpdateSpeedMetricsPayload>,
 ) -> impl IntoResponse {
     info!("Updating late performance metrics from client");
 
@@ -811,8 +789,7 @@ pub async fn update_speed_metrics(
     // ADR-040 §3. This route is called via `navigator.sendBeacon`, which cannot
     // set headers — so the `?temps_key=` fallback is the only way a keyed
     // client can authenticate here, and `extract_analytics_key` accepts both.
-    let (scope, is_keyed) = if let Some(key) = extract_analytics_key(&headers, raw_query.as_deref())
-    {
+    let (scope, branch) = if let Some(key) = extract_analytics_key(&headers, raw_query.as_deref()) {
         let origin = headers
             .get(header::ORIGIN)
             .and_then(|value| value.to_str().ok());
@@ -832,7 +809,7 @@ pub async fn update_speed_metrics(
                     resolved.environment_id,
                     resolved.deployment_id
                 );
-                (MetricScope::from(resolved), true)
+                (MetricScope::from(resolved), IngestBranch::keyed(&headers))
             }
             Err(problem) => return problem.into_response(),
         }
@@ -866,7 +843,7 @@ pub async fn update_speed_metrics(
                     host, scope.project_id, scope.environment_id, scope.deployment_id
                 );
 
-                (scope, false)
+                (scope, IngestBranch::HostResolved)
             }
             None => {
                 error!("Host {} not found in route table", host);
@@ -889,15 +866,15 @@ pub async fn update_speed_metrics(
     let session_id = resolve_client_identity(
         metadata.session_id_cookie,
         payload.session_id.clone(),
-        is_keyed,
+        branch,
     );
     let visitor_id = resolve_client_identity(
         metadata.visitor_id_cookie,
         payload.visitor_id.clone(),
-        is_keyed,
+        branch,
     );
 
-    if is_keyed && session_id.is_none() && visitor_id.is_none() {
+    if branch.is_keyed() && session_id.is_none() && visitor_id.is_none() {
         error!(
             "Keyed speed-metrics update carries no resolvable identity; refusing to guess a row"
         );
@@ -1366,7 +1343,11 @@ mod tests {
             },
         );
 
-        configure_public_routes()
+        let cors = KeyedIngestCors::new(
+            state.ingest_key_service.clone(),
+            state.ingest_rate_limiter.clone(),
+        );
+        configure_public_routes(cors)
             .layer(metadata_middleware)
             .with_state(state)
     }
@@ -1850,7 +1831,7 @@ mod tests {
                 "/_temps/speed",
                 axum::routing::post(|| async { axum::http::StatusCode::TOO_MANY_REQUESTS }),
             )
-            .layer(public_ingest_cors());
+            .layer(wildcard_ingest_cors());
 
         let response = tower::ServiceExt::oneshot(
             app,
@@ -1878,5 +1859,176 @@ mod tests {
                 .any(|name| name == "retry-after"),
             "Retry-After must be in access-control-expose-headers, got {exposed:?}"
         );
+    }
+    /// gotempsh/temps#1416: the SDK beacons late Web Vitals as `text/plain`
+    /// so the browser sends them cross-origin without a preflight. Both
+    /// `/speed` and `/speed/update` must accept it on the keyed path, store
+    /// the same data a JSON body would, and grant the site's origin
+    /// credentialed CORS.
+    #[tokio::test]
+    async fn keyed_speed_beacons_accept_text_plain() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_db_project(db.as_ref()).await;
+        let state = build_state(db.clone());
+        let site = "https://shop.example.com";
+
+        let key = state
+            .ingest_key_service
+            .create(
+                project.id,
+                None,
+                None,
+                Some(vec![site.to_string()]),
+                None,
+                None,
+            )
+            .await
+            .expect("minting an ingest key must succeed");
+
+        let beacon = |path: &str, body: serde_json::Value| {
+            Request::builder()
+                .method("POST")
+                .uri(format!("{path}?temps_key={}", key.public_key))
+                .header("host", "analytics.temps.test")
+                .header("origin", site)
+                .header("sec-fetch-site", "cross-site")
+                .header("content-type", "text/plain;charset=UTF-8")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        let mut seed_payload = speed_payload();
+        seed_payload["visitorId"] = serde_json::json!("text-plain-speed-visitor");
+        let response = setup_public_app(state.clone())
+            .oneshot(beacon("/_temps/speed", seed_payload))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|value| value.to_str().ok()),
+            Some(site)
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-credentials")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+
+        let response = setup_public_app(state.clone())
+            .oneshot(beacon(
+                "/_temps/speed/update",
+                serde_json::json!({
+                    "cls": 0.03,
+                    "inp": 55.0,
+                    "visitorId": "text-plain-speed-visitor",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let metrics = stored_metrics(db.as_ref()).await;
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].cls, Some(0.03));
+        assert_eq!(metrics[0].inp, Some(55.0));
+
+        // A malformed text/plain body is a clear 4xx and writes nothing.
+        let response = setup_public_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/_temps/speed?temps_key={}", key.public_key))
+                    .header("host", "analytics.temps.test")
+                    .header("origin", site)
+                    .header("content-type", "text/plain")
+                    .body(Body::from("lcp=1200"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(stored_metrics(db.as_ref()).await.len(), 1);
+
+        // Without a key, text/plain stays unsupported, exactly as before.
+        let response = setup_public_app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_temps/speed")
+                    .header("host", "analytics.temps.test")
+                    .header("content-type", "text/plain")
+                    .body(Body::from(speed_payload().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        test_db.cleanup().await;
+    }
+}
+
+#[cfg(test)]
+mod query_tests {
+    use super::*;
+    use axum::http::Uri;
+
+    fn grouped(query: &str) -> GroupedPageMetricsQuery {
+        let uri: Uri = format!("/performance/page-metrics?{query}")
+            .parse()
+            .unwrap();
+        Query::<GroupedPageMetricsQuery>::try_from_uri(&uri)
+            .map(|Query(q)| q)
+            .unwrap_or_else(|e| panic!("query {query:?} failed to parse: {e}"))
+    }
+
+    const RANGE: &str =
+        "start_date=2026-10-01T00:00:00Z&end_date=2026-10-08T00:00:00Z&project_id=5";
+
+    #[test]
+    fn grouped_query_reads_filter_path_alongside_typed_fields() {
+        let q = grouped(&format!(
+            "{RANGE}&environment_id=3&include_bots=true&group_by=operating_system&filter_path=%2Fpricing"
+        ));
+        assert_eq!(q.project_id, 5);
+        assert_eq!(q.environment_id, Some(3));
+        assert_eq!(q.include_bots, Some(true));
+        assert_eq!(q.group_by, "operating_system");
+        assert_eq!(q.segment.filter_path.as_deref(), Some("/pricing"));
+    }
+
+    #[test]
+    fn grouped_query_accepts_path_alias() {
+        let q = grouped(&format!(
+            "{RANGE}&group_by=country&path=%2Fdocs%2Fquickstart"
+        ));
+        assert_eq!(q.segment.filter_path.as_deref(), Some("/docs/quickstart"));
+    }
+
+    #[test]
+    fn grouped_query_without_path_filter_is_unfiltered() {
+        let q = grouped(&format!("{RANGE}&group_by=path"));
+        assert_eq!(q.segment.filter_path, None);
+    }
+
+    #[test]
+    fn metrics_query_accepts_path_alias() {
+        let uri: Uri = format!("/performance/metrics?{RANGE}&path=%2Fpricing")
+            .parse()
+            .unwrap();
+        let Query(q) = Query::<PerformanceMetricsQuery>::try_from_uri(&uri).unwrap();
+        assert_eq!(q.segment.filter_path.as_deref(), Some("/pricing"));
     }
 }

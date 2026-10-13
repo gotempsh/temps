@@ -6,6 +6,7 @@ pub mod firecracker;
 pub mod git_credential_bundle;
 pub mod local;
 pub mod managed;
+pub mod microsandbox;
 pub mod node_routing;
 pub mod pty_agent_bundle;
 pub mod remote;
@@ -89,10 +90,11 @@ impl KillSignal {
     }
 }
 
-/// Which isolation backend a sandbox runs on (ADR-029). Docker containers
-/// and Firecracker microVMs coexist on the same host behind the same
-/// `SandboxProvider` seam; `routing::RoutingSandboxProvider` dispatches
-/// between them. `Local` is the dev-only fork-exec fallback.
+/// Which isolation backend a sandbox runs on (ADR-029, ADR-050). Docker
+/// containers, Firecracker microVMs and microsandbox (libkrun) microVMs
+/// coexist on the same host behind the same `SandboxProvider` seam;
+/// `routing::RoutingSandboxProvider` dispatches between them. `Local` is the
+/// dev-only fork-exec fallback.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
 )]
@@ -100,6 +102,8 @@ impl KillSignal {
 pub enum SandboxBackend {
     Docker,
     Firecracker,
+    /// Experimental libkrun microVM backend (ADR-050).
+    Microsandbox,
     Local,
 }
 
@@ -109,6 +113,7 @@ impl std::str::FromStr for SandboxBackend {
         match s {
             "docker" => Ok(Self::Docker),
             "firecracker" => Ok(Self::Firecracker),
+            "microsandbox" => Ok(Self::Microsandbox),
             "local" => Ok(Self::Local),
             other => Err(format!("unknown sandbox backend '{}'", other)),
         }
@@ -120,6 +125,7 @@ impl std::fmt::Display for SandboxBackend {
         f.write_str(match self {
             Self::Docker => "docker",
             Self::Firecracker => "firecracker",
+            Self::Microsandbox => "microsandbox",
             Self::Local => "local",
         })
     }
@@ -672,6 +678,22 @@ pub trait SandboxProvider: Send + Sync {
         target_path: &str,
     ) -> Result<(), AgentError>;
 
+    /// Bring the sandbox's work dir back into `host_dir`, the host checkout
+    /// it was created from, so callers that read a run's results from the
+    /// host (change detection, PR file collection) see the agent's edits.
+    ///
+    /// The default does nothing: it is correct for backends whose work dir
+    /// *is* `host_dir` (Docker bind-mounts it). Backends that copy the
+    /// workspace into a guest override it.
+    async fn sync_workspace_to_host(
+        &self,
+        handle: &SandboxHandle,
+        host_dir: &std::path::Path,
+    ) -> Result<(), AgentError> {
+        let _ = (handle, host_dir);
+        Ok(())
+    }
+
     /// Kill processes inside the sandbox matching a pgrep/pkill pattern.
     ///
     /// `signal` is constrained to [`KillSignal`] — only SIGTERM/SIGKILL are
@@ -1097,6 +1119,31 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::process::Command;
+
+    #[test]
+    fn sandbox_backend_round_trips_through_its_string_form() {
+        for backend in [
+            SandboxBackend::Docker,
+            SandboxBackend::Firecracker,
+            SandboxBackend::Microsandbox,
+            SandboxBackend::Local,
+        ] {
+            let text = backend.to_string();
+            assert_eq!(text.parse::<SandboxBackend>().unwrap(), backend);
+            // serde and Display/FromStr must agree: the API persists one
+            // and parses the other.
+            assert_eq!(
+                serde_json::to_value(backend).unwrap(),
+                serde_json::Value::String(text)
+            );
+        }
+        assert_eq!(
+            "microsandbox".parse::<SandboxBackend>().unwrap(),
+            SandboxBackend::Microsandbox
+        );
+        let err = "libkrun".parse::<SandboxBackend>().unwrap_err();
+        assert!(err.contains("libkrun"), "{err}");
+    }
 
     #[test]
     fn kill_signal_term_is_15() {

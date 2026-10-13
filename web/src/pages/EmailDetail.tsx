@@ -4,7 +4,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 import { HighlightedCode } from '@/components/ui/code-block'
 
-import { getEmailOptions } from '@/api/client/@tanstack/react-query.gen'
+import {
+  getEmailOptions,
+  getEmailQueryKey,
+} from '@/api/client/@tanstack/react-query.gen'
+import { resendEmail } from '@/api/client'
+import { problemMessage } from '@/components/email/sharedUtils'
 import { client } from '@/api/client/client.gen'
 import { EmailResponse } from '@/api/client/types.gen'
 import { EmailEventTimeline } from '@/components/email/EmailEventTimeline'
@@ -30,7 +35,7 @@ import {
   type DetailFact,
   type StatusTone,
 } from '@temps-sdk/ds'
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertCircle,
   ArrowLeft,
@@ -38,9 +43,21 @@ import {
   Eye,
   FileText,
   MousePointerClick,
+  Send,
 } from 'lucide-react'
+import { toast } from 'sonner'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { Link, useParams } from 'react-router'
+
+// Mirrors the server's resend rules (EmailService::resend): only captured
+// emails can be delivered again, and never ones whose recipients were
+// suppressed after a hard bounce or complaint.
+function canResend(email: EmailResponse): boolean {
+  return (
+    email.status === 'captured' &&
+    !email.error_message?.startsWith('Recipient(s) suppressed')
+  )
+}
 
 // A small, page-local key-value list. Used here for both the custom-headers
 // aside panel and the "Message details" card in `main` — genuinely a
@@ -167,7 +184,7 @@ function SourceView({
           className="bg-background/80 backdrop-blur-sm"
         />
       </div>
-      <div className="border rounded-lg bg-muted/30 p-4 max-h-[600px] overflow-auto">
+      <div tabIndex={0} className="border rounded-lg bg-muted/30 p-4 max-h-[600px] overflow-auto">
         <pre className="text-xs font-mono whitespace-pre-wrap break-all">
           <HighlightedCode
             code={type === 'html' ? content : content}
@@ -307,7 +324,15 @@ function EmailDetailContent({ email }: { email: EmailResponse }) {
     <>
       {email.error_message ? (
         <Callout tone="error" title="Delivery error">
-          {email.error_message}
+          <p>{email.error_message}</p>
+          {email.status === 'captured' && email.domain_id != null ? (
+            <Link
+              to={`/email/domains/${email.domain_id}`}
+              className="mt-1 inline-block text-sm font-medium text-foreground underline underline-offset-4"
+            >
+              Open domain
+            </Link>
+          ) : null}
         </Callout>
       ) : null}
 
@@ -352,7 +377,7 @@ function EmailDetailContent({ email }: { email: EmailResponse }) {
                         href={link.original_url}
                         target="_blank"
                         rel="noopener noreferrer"
-                        className="text-blue-500 hover:underline truncate min-w-0 flex-1"
+                        className="text-blue-600 dark:text-blue-500 hover:underline truncate min-w-0 flex-1"
                         title={link.original_url}
                       >
                         {link.original_url}
@@ -484,6 +509,40 @@ export function EmailDetail() {
 
   usePageTitle(email ? `Email: ${email.subject}` : 'Email Details')
 
+  const queryClient = useQueryClient()
+  const resendMutation = useMutation({
+    mutationFn: async () => {
+      const response = await resendEmail({ path: { id: id! } })
+      if (response.error || !response.data) {
+        throw new Error(
+          problemMessage(response.error, 'Failed to resend email')
+        )
+      }
+      return response.data
+    },
+    onSuccess: async (result) => {
+      await queryClient.invalidateQueries({
+        queryKey: getEmailQueryKey({ path: { id: id! } }),
+      })
+      void queryClient.invalidateQueries({ queryKey: ['emails'] })
+      if (result.status === 'sent') {
+        toast.success('Email sent')
+      } else if (result.status === 'captured') {
+        toast.warning('Email captured again', {
+          description: 'The cause is still present — see the delivery error.',
+        })
+      } else {
+        toast.warning(`Email ${result.status.replace('_', ' ')}`, {
+          description:
+            'The provider did not confirm delivery; it will not be retried automatically.',
+        })
+      }
+    },
+    onError: (error: Error) => {
+      toast.error('Could not resend email', { description: error.message })
+    },
+  })
+
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Email', href: '/email?tab=emails' },
@@ -536,7 +595,23 @@ export function EmailDetail() {
         </span>
       }
       verdict={<Status tone={verdict.tone} label={verdict.label} />}
-      actions={backAction}
+      actions={
+        <>
+          {backAction}
+          {canResend(email) && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => resendMutation.mutate()}
+              busy={resendMutation.isPending}
+              busyLabel="Resending…"
+            >
+              <Send className="mr-2 h-4 w-4" />
+              Resend
+            </Button>
+          )}
+        </>
+      }
       facts={emailFacts(email)}
       main={<EmailDetailContent email={email} />}
       aside={

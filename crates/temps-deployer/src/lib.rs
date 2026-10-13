@@ -864,6 +864,23 @@ pub trait ImageBuilder: Send + Sync {
         )))
     }
 
+    /// Stream `source_path` inside `image_name` out as the raw tar Docker's
+    /// container-archive API produces, without unpacking it.
+    ///
+    /// This is how a worker hands the files of an image it built (a static
+    /// site's output directory, immutable assets) to the control plane, which
+    /// validates and unpacks them itself. Builders that cannot serve it keep
+    /// the default, which refuses with a message naming the image and path.
+    async fn export_path_stream(
+        &self,
+        image_name: &str,
+        source_path: &str,
+    ) -> Result<ImageImportStream, BuilderError> {
+        Err(BuilderError::Other(format!(
+            "This image builder cannot export path '{source_path}' from image '{image_name}'"
+        )))
+    }
+
     /// Extract files from an image to a destination path
     async fn extract_from_image(
         &self,

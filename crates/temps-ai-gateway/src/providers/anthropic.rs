@@ -9,14 +9,14 @@ use std::time::Duration;
 use tokio_stream::Stream;
 
 use crate::error::AiGatewayError;
-use crate::providers::{external_http_client, AiProvider, ProviderCapability, ProviderInfo};
+use crate::providers::{AiProvider, ProviderCapability, ProviderHttpClient, ProviderInfo};
 use crate::types::*;
 
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 
 pub struct AnthropicProvider {
     info: ProviderInfo,
-    client: reqwest::Client,
+    client: ProviderHttpClient,
 }
 
 impl Default for AnthropicProvider {
@@ -27,7 +27,7 @@ impl Default for AnthropicProvider {
 
 impl AnthropicProvider {
     pub fn new() -> Self {
-        let client = external_http_client(Duration::from_secs(300));
+        let client = ProviderHttpClient::new(Duration::from_secs(300));
 
         Self {
             info: ProviderInfo {

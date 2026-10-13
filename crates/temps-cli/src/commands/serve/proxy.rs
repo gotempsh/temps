@@ -278,6 +278,7 @@ pub fn start_proxy_server(
     console_startup: Arc<temps_core::console_startup::ConsoleStartupState>,
 ) -> anyhow::Result<()> {
     let console_address = config.console_address.clone();
+    let console_ingress_address = config.public_surface_address().map(str::to_string);
     // Runtime for the startup settings fetch AND, when ADR-018 on-demand TLS is
     // enabled, the long-lived home of `OnDemandCertManager`'s issuance consumer
     // (`OnDemandCertManager::new` calls `tokio::spawn` on whatever runtime is
@@ -432,6 +433,7 @@ pub fn start_proxy_server(
     let proxy_config = temps_proxy::ProxyConfig {
         address,
         console_address,
+        console_ingress_address,
         internal_dns_sync_address,
         tls_address,
         preview_domain,

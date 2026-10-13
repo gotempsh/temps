@@ -8,6 +8,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use utoipa::ToSchema;
 
+/// Docker interprets name filters as regular-expression substring matches.
+/// Anchor and escape a single resource identity before listing containers.
+pub(crate) fn exact_container_name_filter(name: &str) -> String {
+    format!("^/{}$", regex::escape(name.trim_start_matches('/')))
+}
+
 /// Return the Docker summary whose name exactly matches `expected_name`.
 ///
 /// Docker's `name` list filter is substring-based: filtering for `redis-cache`
@@ -27,6 +33,7 @@ pub(crate) fn exact_named_container<'a>(
 }
 
 pub mod cluster_role;
+pub mod container_download;
 pub(crate) mod container_upload;
 pub mod exec_util;
 pub mod managed_s3;
@@ -41,6 +48,7 @@ pub mod postgres_role_reconciler;
 pub mod postgres_upgrade;
 pub mod postgres_wal_health;
 pub mod rc_client;
+pub mod recreate_guard;
 pub mod redis;
 pub mod restore_helper;
 pub mod restore_image;
@@ -61,6 +69,15 @@ mod runtime_provisioning_tests {
         validate_runtime_target, HealthProbeResult, RuntimeProvisioningError, ServiceConfig,
         ServiceHealthProbeError, ServiceType,
     };
+
+    #[test]
+    fn exact_container_filter_does_not_match_a_sibling_or_regex_metacharacters() {
+        let filter =
+            regex::Regex::new(&super::exact_container_name_filter("/postgres-app.db")).unwrap();
+        assert!(filter.is_match("/postgres-app.db"));
+        assert!(!filter.is_match("/postgres-app.db-sibling"));
+        assert!(!filter.is_match("/postgres-appXdb"));
+    }
 
     #[test]
     fn docker_substring_name_match_is_not_treated_as_the_requested_container() {
@@ -724,6 +741,26 @@ async fn validate_owned_container_port(
 /// file's length). When the engine can't compute size locally — for example
 /// WAL-G, which streams chunks straight to S3 — it returns `None` and the
 /// service-layer orchestrator falls back to listing the S3 prefix.
+/// Docker objects a managed service derives from its name: the containers it
+/// runs and the volumes holding its data. `remove()` deletes exactly these, so
+/// anything that must not delete foreign data (such as tearing down a
+/// cancelled restore) checks them first.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DockerResourceNames {
+    pub containers: Vec<String>,
+    pub volumes: Vec<String>,
+}
+
+impl DockerResourceNames {
+    /// Every container and volume name, containers first.
+    pub fn all(&self) -> impl Iterator<Item = &str> {
+        self.containers
+            .iter()
+            .chain(self.volumes.iter())
+            .map(String::as_str)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BackupOutcome {
     /// Where the backup landed (S3 URL or relative key, engine-specific).
@@ -1440,7 +1477,72 @@ pub struct RestoreContext<'a> {
     /// unchanged from the target's config and the caller is warned that
     /// the password is whatever the backup's original credentials were.
     pub source_config: ServiceConfig,
+    /// The target's live settings before origin credentials are merged.
+    /// Pre-restore SQL probes must authenticate with these settings; restored
+    /// data and new managed clones use `source_config` instead.
+    pub live_target_config: ServiceConfig,
     pub pool: &'a temps_database::DbConnection,
+    /// Cancellation and write-boundary hooks for this restore. Engines poll
+    /// [`RestoreGate::is_cancelled`] while they fetch the backup and call
+    /// [`RestoreGate::begin_target_writes`] right before their first write to
+    /// the target's live data. Callers that cannot cancel pass
+    /// [`NoopRestoreGate`].
+    pub gate: &'a dyn RestoreGate,
+}
+
+/// Returned by [`RestoreGate::begin_target_writes`] when a cancellation won
+/// the race against the restore's first write: the engine must remove its
+/// scratch data and return without touching the target.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("Restore of {target} was cancelled before it wrote to the target")]
+pub struct RestoreCancelled {
+    /// Name of the service (or container) the restore was writing to.
+    pub target: String,
+}
+
+/// A cancelled restore staged its backup with a process that could not be
+/// confirmed stopped, so it may still be writing into the service's scratch
+/// data. The run must keep holding the service until it is confirmed gone.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("Restore of {target} was cancelled, but its staged download could not be confirmed stopped: {reason}")]
+pub struct StagedRestoreStillRunning {
+    /// Name of the service (or container) the restore was staging for.
+    pub target: String,
+    /// Why the stop could not be confirmed.
+    pub reason: String,
+}
+
+/// Hooks a restore orchestrator hands to an engine so a restore can be
+/// cancelled while it is still only *reading* the backup.
+///
+/// The orchestrator owns the decision: `begin_target_writes` is the single
+/// point after which an in-place restore can no longer be stopped. An engine
+/// that honours the gate (see [`ExternalService::defers_target_writes`])
+/// must call it exactly once, after the backup is staged and before the
+/// first write to the target's data. Engines that do not honour it are gated
+/// by the orchestrator before they are called, which is always safe.
+#[async_trait]
+pub trait RestoreGate: Send + Sync {
+    /// Whether a cancellation is pending. Cheap; called between chunks.
+    fn is_cancelled(&self) -> bool;
+
+    /// Enter the write phase. `Err` means a cancellation was recorded first.
+    async fn begin_target_writes(&self) -> std::result::Result<(), RestoreCancelled>;
+}
+
+/// A gate for callers with no cancellation (CLI restores, tests): never
+/// cancelled, always allows writes.
+pub struct NoopRestoreGate;
+
+#[async_trait]
+impl RestoreGate for NoopRestoreGate {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+
+    async fn begin_target_writes(&self) -> std::result::Result<(), RestoreCancelled> {
+        Ok(())
+    }
 }
 
 /// Outcome of a restore-to-new-service operation.
@@ -1763,6 +1865,15 @@ pub trait ExternalService: Send + Sync {
         Ok(())
     }
 
+    /// This engine's support for importing data from an external database
+    /// (see [`crate::data_import`]). `None` — the default — means the engine
+    /// cannot receive imports; the console then says so instead of hiding
+    /// the feature. Engines opt in by implementing
+    /// [`crate::data_import::DataImportEngine`] and returning `Some(self)`.
+    fn data_import(&self) -> Option<&dyn crate::data_import::DataImportEngine> {
+        None
+    }
+
     /// Get service type
     fn get_type(&self) -> ServiceType;
 
@@ -1787,6 +1898,39 @@ pub trait ExternalService: Send + Sync {
 
     /// Remove the service and its data completely
     async fn remove(&self) -> Result<()>;
+
+    /// The engine and storage a container created now from `service_config`
+    /// would use, so a caller that has to replace this service's container
+    /// can do it through [`recreate_guard`]. `None` means the engine cannot
+    /// be replaced by a generic caller, which must then refuse.
+    fn recreate_plan(
+        &self,
+        _service_config: &ServiceConfig,
+    ) -> Option<(
+        recreate_guard::ManagedEngine,
+        recreate_guard::ReplacementStorage,
+    )> {
+        None
+    }
+
+    /// Docker container and volume names this service owns, derived from its
+    /// name. `None` when the engine does not report them, which callers must
+    /// treat as "unknown" and never as "nothing exists".
+    fn docker_resource_names(&self) -> Option<DockerResourceNames> {
+        None
+    }
+
+    /// Startup readiness gate (see [`crate::readiness`]). Engines whose
+    /// container accepts connections before it can serve a real request
+    /// return a target here, and the manager keeps the service `starting`
+    /// until the target reports a usable answer. `None` (the default) marks
+    /// the service `running` as soon as its container starts.
+    fn readiness_target(
+        &self,
+        _service_config: &ServiceConfig,
+    ) -> Option<Box<dyn crate::readiness::ReadinessTarget>> {
+        None
+    }
 
     fn get_environment_variables(
         &self,
@@ -1895,6 +2039,31 @@ pub trait ExternalService: Send + Sync {
         _service_config: ServiceConfig,
     ) -> Result<()> {
         Err(anyhow::anyhow!("Restore not implemented for this service"))
+    }
+
+    /// Whether `restore_in_place` (and an in-place `restore_pitr`) for a
+    /// backup at `backup_location` stages the backup first and calls
+    /// [`RestoreGate::begin_target_writes`] before writing to the target.
+    ///
+    /// Returning `true` lets an in-place restore be cancelled while the
+    /// backup downloads. The default is `false`: the orchestrator then closes
+    /// the gate itself before calling the engine, exactly as before.
+    fn defers_target_writes(&self, _backup_location: &str) -> bool {
+        false
+    }
+
+    /// Stop any restore download this service staged and is still running,
+    /// and confirm it has exited.
+    ///
+    /// An engine that stages a backup with a process detached from the
+    /// orchestrator (PostgreSQL's WAL-G `backup-fetch`) must make sure it is
+    /// gone before a cancelled or abandoned run releases the service: a
+    /// fetch that keeps writing into the shared scratch directory would mix
+    /// with the next restore's files. `Ok` means nothing is running any more;
+    /// an error means that could not be confirmed. Engines that stage
+    /// in-process have nothing to stop.
+    async fn stop_staged_restore(&self) -> Result<()> {
+        Ok(())
     }
 
     /// Restore into the existing service with access to the selected backup row.

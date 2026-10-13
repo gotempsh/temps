@@ -263,6 +263,7 @@ fn fence_target(
 fn phase_description(phase: &str) -> &str {
     match phase {
         "prepare" => "preparation",
+        "download" => "the backup download",
         "provision" => "provisioning of the new service",
         "restore" => "the data restore",
         "recover" => "point-in-time recovery",
@@ -336,6 +337,8 @@ mod tests {
             created_by: 1,
             created_at: now,
             updated_at: now,
+            cancel_requested_at: None,
+            cancel_requested_by: None,
         }
     }
 

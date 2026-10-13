@@ -111,7 +111,9 @@ impl reqwest::dns::Resolve for BlocklistResolver {
             // misconfigured round-robin DNS (mix of public + private) fails
             // loudly instead of silently succeeding on the private IP.
             for addr in &addrs {
-                if is_blocked_ip(&addr.ip()) {
+                if is_blocked_ip(&addr.ip())
+                    && !temps_core::url_validation::is_trusted_private_destination(addr.ip())
+                {
                     return Err(format!(
                         "OIDC issuer '{}' resolved to a blocked private/internal IP ({}) at \
                          connect time; possible DNS rebinding attack",
@@ -1671,7 +1673,9 @@ async fn assert_issuer_host_allowed(issuer: &str) -> Result<(), OidcError> {
         })?
         .collect();
     for addr in addrs {
-        if is_blocked_ip(&addr.ip()) {
+        if is_blocked_ip(&addr.ip())
+            && !temps_core::url_validation::is_trusted_private_destination(addr.ip())
+        {
             tracing::warn!(
                 target: "temps_auth::oidc::abuse",
                 issuer = %issuer,
@@ -1681,7 +1685,7 @@ async fn assert_issuer_host_allowed(issuer: &str) -> Result<(), OidcError> {
             );
             return Err(OidcError::InvalidIssuer {
                 reason: format!(
-                    "issuer {host} resolves to non-public IP {} (use a public DNS name, or run the IdP on localhost)",
+                    "issuer {host} resolves to non-public IP {} (use a public DNS name, run the IdP on localhost, or add its network under Settings > Security > Trusted private networks)",
                     addr.ip()
                 ),
             });

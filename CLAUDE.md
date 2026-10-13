@@ -1073,7 +1073,7 @@ if (isLoading) return <Spinner />
 - **Side panels**: `flex-col lg:flex-row`; panel uses `w-full lg:w-[Npx]`
 - **Pagination**: use the shared `ResponsivePagination` component. Below `sm`, show one row with labeled Previous and Next buttons around compact `{page} / {totalPages}` context; hide page-size, first/last, and direct-page controls. At `sm` and above, show the full "Showing X–Y of Z" and advanced controls.
 - **Headers**: use the shared PageHeader from `web/src/components/layout/PageContainer.tsx`.
-- **Button text**: `hidden sm:inline` for labels next to icons; icon-only on mobile
+- **Button text**: `max-sm:sr-only` for labels next to icons (icon-only on mobile, label still the accessible name); never `hidden sm:inline`, which removes the name below `sm`
 - **Min-width**: add `min-w-[Npx]` on scrollable containers so content doesn't collapse
 
 ### Testing with Playwright
@@ -1093,8 +1093,10 @@ All use `TEMPS_` prefix:
 | `TEMPS_ADDRESS` | `127.0.0.1:3000` | No |
 | `TEMPS_TLS_ADDRESS` | -- | No |
 | `TEMPS_CONSOLE_ADDRESS` | -- | No |
+| `TEMPS_CONSOLE_INGRESS_ADDRESS` | random loopback port (`temps serve`) | No -- listener serving only the console's public routes (ADR-051). Bootstrap config like `TEMPS_CONSOLE_ADDRESS`; set it only in split topology, identically on `temps serve --role=console` and `temps proxy`. Always an address of its own: never reuse `TEMPS_CONSOLE_ADDRESS`, which also serves MCP |
 | `TEMPS_DATA_DIR` | `~/.temps` | No |
 | `TEMPS_LOG_LEVEL` | -- | No |
+| `TEMPS_DB_STARTUP_WAIT` | `120` | No -- seconds `temps serve` keeps retrying an unreachable database at startup (exponential backoff, one log line per attempt) before it exits; `0` tries once. Bootstrap-time: it is read before any database connection exists. |
 
 Process-wide ops/debug toggles (not bootstrap config, not per-tenant -- see the admin-tuning-knob exception to the "no env vars" rule above):
 

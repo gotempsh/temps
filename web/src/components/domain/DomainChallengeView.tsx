@@ -11,6 +11,7 @@ import { DomainResponse } from '@/api/client/types.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { selectDomainOrder } from '@/lib/empty-state-selectors'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   AlertTriangle,
@@ -70,6 +71,8 @@ export function DomainChallengeView({
       },
     }),
     enabled: domain.status !== 'active',
+    // `null` means the domain has no ACME order yet (a 200, not an error).
+    select: selectDomainOrder,
     retry: false,
   })
 

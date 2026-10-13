@@ -58,6 +58,7 @@ syntax may have changed.
 - [`email-domains`](email-domains.md)
 - [`email-providers`](email-providers.md)
 - [`incidents`](incidents.md)
+- [`status-pages`](status-pages.md)
 - [`alarms`](alarms.md)
 - [`emails`](emails.md)
 - [`load-balancer`](load-balancer.md)
@@ -90,3 +91,5 @@ syntax may have changed.
 - [`cloud`](cloud.md)
 - [`plugin`](plugin.md)
 - [`setup`](setup.md)
+- [`start`](start.md)
+- [`stop`](stop.md)

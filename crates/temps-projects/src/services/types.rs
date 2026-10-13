@@ -531,6 +531,20 @@ pub enum ProjectError {
     #[error("Invalid git URL '{url}': {reason}")]
     InvalidGitUrl { url: String, reason: String },
 
+    /// The configured root directory is not in the repository at the
+    /// configured branch (issue #1350). Only raised on proof of absence: the
+    /// provider listed the parent directory and it has no such entry.
+    #[error(
+        "Root directory '{directory}' does not exist in {repository} on branch '{branch}': \
+         {explanation}. Choose a directory that exists on that branch, or push it first."
+    )]
+    DirectoryNotInRepository {
+        repository: String,
+        branch: String,
+        directory: String,
+        explanation: String,
+    },
+
     /// The caller tried to move a slug this host grants `/var/run/docker.sock`
     /// to (ADR 045) without being an instance admin — either taking it
     /// (create, or rename onto it) or giving it up (rename away from it).

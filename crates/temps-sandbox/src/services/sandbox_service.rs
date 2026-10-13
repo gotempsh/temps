@@ -174,7 +174,8 @@ pub struct CreateSandboxRequest {
     /// `metadata` JSON column and surfaced as `routes[]` in the SDK-
     /// shaped responses.
     pub ports: Vec<u16>,
-    /// Isolation backend: "docker" (default) or "firecracker". `None` →
+    /// Isolation backend: "docker" (default), "firecracker" or
+    /// "microsandbox" (ADR-050). `None` →
     /// the host's configured default (docker unless the operator changed
     /// it). Unknown values are a validation error, and requesting a
     /// backend the host doesn't have fails create rather than downgrading.
@@ -233,17 +234,30 @@ pub struct ApplicationWorkspaceConfig {
 pub fn managed_application_workspace_image(runtime: &str) -> Option<&'static str> {
     use temps_core::release_images;
     match runtime {
-        "node" | "bun" => Some(
-            release_images::DAEMON_NODEJS.unwrap_or("ghcr.io/gotempsh/temps-sandbox-nodejs:0.3.4"),
-        ),
-        "python" => Some(
-            release_images::DAEMON_PYTHON.unwrap_or("ghcr.io/gotempsh/temps-sandbox-python:0.3.4"),
-        ),
-        "rust" | "go" | "full" => {
-            Some(release_images::DAEMON_ALL.unwrap_or("ghcr.io/gotempsh/temps-sandbox-all:0.3.4"))
-        }
+        "node" | "bun" => Some(pinned_or_fallback(
+            release_images::DAEMON_NODEJS,
+            "ghcr.io/gotempsh/temps-sandbox-nodejs:0.3.4-beta",
+        )),
+        "python" => Some(pinned_or_fallback(
+            release_images::DAEMON_PYTHON,
+            "ghcr.io/gotempsh/temps-sandbox-python:0.3.4-beta",
+        )),
+        "rust" | "go" | "full" => Some(pinned_or_fallback(
+            release_images::DAEMON_ALL,
+            "ghcr.io/gotempsh/temps-sandbox-all:0.3.4-beta",
+        )),
         _ => None,
     }
+}
+
+/// The image a release manifest pinned, or the fallback for builds without
+/// one. The fallback must be a tag that is actually published: stable tags
+/// only exist once a release publishes them, so source builds use the `-beta`
+/// tag that every main-branch build publishes (see
+/// `tools/sandbox-runtime/image_metadata.py`, which reads the version from the
+/// literals in `managed_application_workspace_image`).
+fn pinned_or_fallback(pinned: Option<&'static str>, fallback: &'static str) -> &'static str {
+    pinned.unwrap_or(fallback)
 }
 
 pub fn is_managed_application_workspace_image(image: &str) -> bool {
@@ -251,6 +265,11 @@ pub fn is_managed_application_workspace_image(image: &str) -> bool {
         ["0.2.0", "0.3.0", "0.3.1", "0.3.2", "0.3.3", "0.3.4"]
             .iter()
             .any(|version| image == format!("ghcr.io/gotempsh/temps-sandbox-{flavor}:{version}"))
+    }) || ["nodejs", "python", "all"].iter().any(|flavor| {
+        // Builds without a release manifest fall back to the `-beta` tag that
+        // main-branch builds publish; the stable tag only exists once the
+        // release publishes it.
+        image == format!("ghcr.io/gotempsh/temps-sandbox-{flavor}:0.3.4-beta")
     }) || image == "ghcr.io/gotempsh/temps-sandbox-node:0.1.0"
         || ["nodejs", "python", "all"].iter().any(|flavor| {
             let prefix = format!("ghcr.io/gotempsh/temps-sandbox-{flavor}@sha256:");
@@ -611,7 +630,8 @@ pub struct SandboxSummary {
     /// column). Empty when the sandbox was created without declaring
     /// any ports.
     pub ports: Vec<u16>,
-    /// Isolation backend the sandbox runs on ("docker" | "firecracker").
+    /// Isolation backend the sandbox runs on ("docker" | "firecracker" |
+    /// "microsandbox").
     /// `None` on rows created before the column existed.
     pub backend: Option<String>,
     /// Configured root disk size in MB (from metadata). `None` = default.
@@ -2032,23 +2052,11 @@ impl SandboxService {
         let expires_at = now + chrono::Duration::seconds(timeout as i64);
 
         // Validate the requested backend before any DB/container work.
-        // Only the two public backends are accepted — "local" is a dev
+        // Only the public backends are accepted — "local" is a dev
         // fallback, never a caller choice. `None` = host default (docker
         // unless the operator changed it), so existing clients see no
         // behavior change.
-        let backend = match req.backend.as_deref() {
-            None => None,
-            Some("docker") => Some(temps_agents::sandbox::SandboxBackend::Docker),
-            Some("firecracker") => Some(temps_agents::sandbox::SandboxBackend::Firecracker),
-            Some(other) => {
-                return Err(SandboxError::Validation {
-                    message: format!(
-                        "unknown backend '{}' (expected \"docker\" or \"firecracker\")",
-                        other
-                    ),
-                })
-            }
-        };
+        let backend = parse_requested_backend(req.backend.as_deref())?;
 
         // ADR-048: decide which node hosts the sandbox before anything is
         // created. Explicit requests are validated against the operator
@@ -2069,6 +2077,13 @@ impl SandboxService {
                         .to_string(),
                 });
             }
+            if backend == Some(temps_agents::sandbox::SandboxBackend::Microsandbox) {
+                return Err(SandboxError::Validation {
+                    message: "the microsandbox backend is not available on worker nodes \
+                              (ADR-050); use the docker backend or the control plane"
+                        .to_string(),
+                });
+            }
         }
 
         // Fail closed if the caller asked for a backend this host can't
@@ -2078,7 +2093,7 @@ impl SandboxService {
         if let (Some(b), None) = (backend, node_id) {
             if !self.registry.provider_arc().supports_backend(b) {
                 return Err(SandboxError::Validation {
-                    message: format!("backend '{}' is not available on this host", b),
+                    message: backend_unavailable_message(b),
                 });
             }
         }
@@ -2248,6 +2263,12 @@ impl SandboxService {
                     self.remove_work_dir(&public_id_value).await;
                 }
                 self.mark_destroyed(row.id).await.ok();
+                if e.image_pull_failure().is_some() {
+                    // The image could not be pulled: report which image and
+                    // why, so the caller can tell a missing tag from a
+                    // sandbox runtime fault.
+                    return Err(from_agent_error(&public_id_value, e));
+                }
                 return Err(SandboxError::CreateFailed {
                     user_id,
                     reason: e.to_string(),
@@ -5120,6 +5141,55 @@ fn source_target_restore_script() -> &'static str {
     "if [ \"$(id -u)\" -eq 0 ] && [ -d /dev/fd/9 ] && id -u temps >/dev/null 2>&1; then chown \"$(id -u temps):$(id -g temps)\" /dev/fd/9; chmod 755 /dev/fd/9; fi"
 }
 
+/// Parse the backend a create request asked for. `None` = host default.
+fn parse_requested_backend(
+    requested: Option<&str>,
+) -> Result<Option<temps_agents::sandbox::SandboxBackend>, SandboxError> {
+    use temps_agents::sandbox::SandboxBackend;
+    match requested {
+        None => Ok(None),
+        Some("docker") => Ok(Some(SandboxBackend::Docker)),
+        Some("firecracker") => Ok(Some(SandboxBackend::Firecracker)),
+        Some("microsandbox") => Ok(Some(SandboxBackend::Microsandbox)),
+        Some(other) => Err(SandboxError::Validation {
+            message: format!(
+                "unknown backend '{}' (expected \"docker\", \"firecracker\" or \"microsandbox\")",
+                other
+            ),
+        }),
+    }
+}
+
+/// Why an explicitly requested backend was rejected on this host. For
+/// microsandbox the host probe says exactly what is missing (platform,
+/// hypervisor, or runtime) and where to fix it.
+fn backend_unavailable_message(backend: temps_agents::sandbox::SandboxBackend) -> String {
+    match backend {
+        temps_agents::sandbox::SandboxBackend::Microsandbox => {
+            let capability = temps_agents::sandbox::microsandbox::microsandbox_capability(
+                &temps_agents::sandbox::microsandbox::host_data_dir(),
+            );
+            match capability.reason {
+                Some(reason) => format!(
+                    "backend 'microsandbox' is not available on this host: {} (see {})",
+                    reason,
+                    temps_agents::sandbox::microsandbox::SETUP_PATH
+                ),
+                // Ready now but not registered: the server started before
+                // the runtime was installed.
+                None => "backend 'microsandbox' is not available on this host: the runtime \
+                         was installed after the server started; restart temps to enable it"
+                    .to_string(),
+            }
+        }
+        temps_agents::sandbox::SandboxBackend::Docker
+        | temps_agents::sandbox::SandboxBackend::Firecracker
+        | temps_agents::sandbox::SandboxBackend::Local => {
+            format!("backend '{}' is not available on this host", backend)
+        }
+    }
+}
+
 fn source_import_staging_dir(
     backend: temps_agents::sandbox::SandboxBackend,
     internal_id: i32,
@@ -5127,7 +5197,8 @@ fn source_import_staging_dir(
     let private_root = match backend {
         temps_agents::sandbox::SandboxBackend::Local => "/tmp",
         temps_agents::sandbox::SandboxBackend::Docker => "/run/temps-source-import",
-        temps_agents::sandbox::SandboxBackend::Firecracker => "/root",
+        temps_agents::sandbox::SandboxBackend::Firecracker
+        | temps_agents::sandbox::SandboxBackend::Microsandbox => "/root",
     };
     format!("{private_root}/.temps-source-import-{internal_id}")
 }
@@ -5264,6 +5335,29 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn release_manifest_pin_wins_over_the_published_beta_fallback() {
+        let pinned = "ghcr.io/gotempsh/temps-sandbox-nodejs@sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let fallback = "ghcr.io/gotempsh/temps-sandbox-nodejs:0.3.4-beta";
+        assert_eq!(pinned_or_fallback(Some(pinned), fallback), pinned);
+        assert_eq!(pinned_or_fallback(None, fallback), fallback);
+    }
+
+    #[test]
+    fn source_build_fallbacks_are_beta_tags_the_allowlist_accepts() {
+        for flavor in ["nodejs", "python", "all"] {
+            let image = format!("ghcr.io/gotempsh/temps-sandbox-{flavor}:0.3.4-beta");
+            assert!(is_managed_application_workspace_image(&image), "{image}");
+        }
+        if temps_core::release_images::REVISION.is_none() {
+            for runtime in ["node", "bun", "python", "rust", "go", "full"] {
+                let image = managed_application_workspace_image(runtime)
+                    .expect("managed runtime resolves to an image");
+                assert!(image.ends_with(":0.3.4-beta"), "{runtime} -> {image}");
+            }
+        }
+    }
+
+    #[test]
     fn application_workspace_runtimes_resolve_to_managed_daemon_images() {
         // A candidate can pass runtime preflight but fail persistence if its
         // pinned tag is absent from the database image CHECK constraint.
@@ -5272,9 +5366,14 @@ pub(crate) mod tests {
             let image = managed_application_workspace_image(runtime)
                 .expect("managed runtime must resolve to an image");
             if temps_core::release_images::REVISION.is_none() {
+                let beta_migration = include_str!("../../../temps-migrations/src/migration/m20261012_000003_managed_daemon_beta_images.rs");
                 assert!(
-                    migration.contains(&format!("'{image}'")),
-                    "migration does not allow {image}"
+                    migration.contains(&format!("'{image}'"))
+                        || (image.ends_with("-beta")
+                            && beta_migration.contains(
+                                "temps-sandbox-(nodejs|python|all):[0-9]+[.][0-9]+[.][0-9]+-beta"
+                            )),
+                    "no migration allows {image}"
                 );
             } else {
                 assert!(is_managed_application_workspace_image(image));
@@ -5285,20 +5384,20 @@ pub(crate) mod tests {
         }
         assert_eq!(
             managed_application_workspace_image("node"),
-            Some("ghcr.io/gotempsh/temps-sandbox-nodejs:0.3.4")
+            Some("ghcr.io/gotempsh/temps-sandbox-nodejs:0.3.4-beta")
         );
         assert_eq!(
             managed_application_workspace_image("bun"),
-            Some("ghcr.io/gotempsh/temps-sandbox-nodejs:0.3.4")
+            Some("ghcr.io/gotempsh/temps-sandbox-nodejs:0.3.4-beta")
         );
         assert_eq!(
             managed_application_workspace_image("python"),
-            Some("ghcr.io/gotempsh/temps-sandbox-python:0.3.4")
+            Some("ghcr.io/gotempsh/temps-sandbox-python:0.3.4-beta")
         );
         for runtime in ["rust", "go", "full"] {
             assert_eq!(
                 managed_application_workspace_image(runtime),
-                Some("ghcr.io/gotempsh/temps-sandbox-all:0.3.4")
+                Some("ghcr.io/gotempsh/temps-sandbox-all:0.3.4-beta")
             );
         }
         assert_eq!(managed_application_workspace_image("custom"), None);
@@ -5323,6 +5422,17 @@ pub(crate) mod tests {
         ));
         assert!(is_managed_application_workspace_image(
             "ghcr.io/gotempsh/temps-sandbox-all:0.3.4"
+        ));
+        for flavor in ["nodejs", "python", "all"] {
+            assert!(
+                is_managed_application_workspace_image(&format!(
+                    "ghcr.io/gotempsh/temps-sandbox-{flavor}:0.3.4-beta"
+                )),
+                "the beta tag published by main builds must stay accepted for {flavor}"
+            );
+        }
+        assert!(!is_managed_application_workspace_image(
+            "ghcr.io/gotempsh/temps-sandbox-nodejs:9.9.9-beta"
         ));
         assert!(!is_managed_application_workspace_image(
             "ghcr.io/gotempsh/temps-sandbox-nodejs:0.1.0"
@@ -5417,6 +5527,60 @@ pub(crate) mod tests {
         assert!(cleanup.contains("/workspace/projects/web/.git"));
         assert!(!cleanup.contains("/workspace/.git "));
         assert!(git_metadata_cleanup_script("/workspace/projects/web", false).is_empty());
+    }
+
+    #[test]
+    fn requested_backend_accepts_public_backends_only() {
+        use temps_agents::sandbox::SandboxBackend;
+        assert_eq!(parse_requested_backend(None).unwrap(), None);
+        assert_eq!(
+            parse_requested_backend(Some("docker")).unwrap(),
+            Some(SandboxBackend::Docker)
+        );
+        assert_eq!(
+            parse_requested_backend(Some("firecracker")).unwrap(),
+            Some(SandboxBackend::Firecracker)
+        );
+        assert_eq!(
+            parse_requested_backend(Some("microsandbox")).unwrap(),
+            Some(SandboxBackend::Microsandbox)
+        );
+        // "local" is a dev fallback, never a caller choice.
+        for rejected in ["local", "libkrun", ""] {
+            match parse_requested_backend(Some(rejected)) {
+                Err(SandboxError::Validation { message }) => {
+                    assert!(message.contains(&format!("'{rejected}'")), "{message}");
+                    assert!(message.contains("microsandbox"), "{message}");
+                }
+                other => panic!("expected validation error for {rejected:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn unavailable_microsandbox_explains_itself() {
+        let message =
+            backend_unavailable_message(temps_agents::sandbox::SandboxBackend::Microsandbox);
+        assert!(
+            message.starts_with("backend 'microsandbox' is not available on this host: "),
+            "{message}"
+        );
+        assert_eq!(
+            backend_unavailable_message(temps_agents::sandbox::SandboxBackend::Firecracker),
+            "backend 'firecracker' is not available on this host"
+        );
+    }
+
+    #[test]
+    fn microvm_backends_stage_source_imports_under_root_home() {
+        assert_eq!(
+            source_import_staging_dir(temps_agents::sandbox::SandboxBackend::Microsandbox, 42),
+            "/root/.temps-source-import-42"
+        );
+        assert_eq!(
+            source_import_staging_dir(temps_agents::sandbox::SandboxBackend::Firecracker, 42),
+            "/root/.temps-source-import-42"
+        );
     }
 
     #[test]
@@ -5634,6 +5798,7 @@ pub(crate) mod tests {
             tls_address: None,
             console_address: "127.0.0.1:0".into(),
             console_admin_address: None,
+            console_ingress_address: None,
             admin_allowed_ips: Vec::new(),
             admin_allowed_hosts: Vec::new(),
             admin_trust_forwarded_for: false,
@@ -6378,6 +6543,7 @@ mod storage_cleanup_tests {
             tls_address: None,
             console_address: "127.0.0.1:3001".into(),
             console_admin_address: None,
+            console_ingress_address: None,
             admin_allowed_ips: Vec::new(),
             admin_allowed_hosts: Vec::new(),
             admin_trust_forwarded_for: false,

@@ -86,7 +86,7 @@ export function AutofixOnboardingDialog() {
                     className={cn(
                       'mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-full text-xs font-medium',
                       step.done
-                        ? 'bg-green-500/10 text-green-600 dark:text-green-400'
+                        ? 'bg-green-500/10 text-green-700 dark:text-green-400'
                         : 'bg-muted text-muted-foreground'
                     )}
                     aria-hidden="true"

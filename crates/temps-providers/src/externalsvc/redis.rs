@@ -196,7 +196,7 @@ fn example_docker_image() -> &'static str {
 use super::port_util::{find_available_port, find_available_port_async, is_port_conflict_error};
 
 pub struct RedisService {
-    name: String,
+    name: std::sync::RwLock<String>,
     config: Arc<RwLock<Option<RedisConfig>>>,
     /// Resource limits captured at init time, applied to recreate paths
     /// (start, upgrade) so the container keeps the same constraints.
@@ -207,11 +207,34 @@ pub struct RedisService {
 impl RedisService {
     pub fn new(name: String, docker: Arc<Docker>) -> Self {
         Self {
-            name,
+            name: std::sync::RwLock::new(name),
             config: Arc::new(RwLock::new(None)),
             resource_limits: Arc::new(RwLock::new(ServiceResourceLimits::default())),
             docker,
         }
+    }
+
+    /// The instance name this engine currently works under: the service name
+    /// its container (`{prefix}-{name}`) and volumes are derived from.
+    pub fn instance_name(&self) -> String {
+        self.name
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Point this engine at a different instance name.
+    ///
+    /// Only meaningful before the service is created: the managed KV and Blob
+    /// plugins build their engine once at startup, and the operator may pick
+    /// another container name (while the service does not exist) before
+    /// enabling it. Renaming an engine whose container exists would make it
+    /// lose track of that container.
+    pub fn set_instance_name(&self, name: String) {
+        *self
+            .name
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = name;
     }
 
     /// Create a fresh Redis connection
@@ -274,7 +297,7 @@ impl RedisService {
     /// callers reasoning about the container should ask rather than re-derive
     /// `redis-{name}` themselves. See `externalsvc::naming`.
     pub fn get_container_name(&self) -> String {
-        format!("redis-{}", self.name)
+        redis_container_name(&self.instance_name())
     }
 
     /// The container this service actually runs in: the imported container's
@@ -376,7 +399,14 @@ impl RedisService {
                     *config = attempt_config;
                     return Ok(());
                 }
-                Err(e) if attempt < MAX_ATTEMPTS && is_port_conflict_error(&e.to_string()) => {
+                // A failed guarded recreate has already put the original
+                // back under this name; never remove it as "the failed attempt".
+                Err(e)
+                    if attempt < MAX_ATTEMPTS
+                        && e.downcast_ref::<super::recreate_guard::RecreateGuardError>()
+                            .is_none()
+                        && is_port_conflict_error(&e.to_string()) =>
+                {
                     warn!(
                         "Port {} for Redis container was already allocated (attempt {}/{}), retrying with a fresh port: {}",
                         attempt_config.port, attempt, MAX_ATTEMPTS, e
@@ -433,8 +463,12 @@ impl RedisService {
 
         if let Some(existing_container) = super::exact_named_container(&containers, &container_name)
         {
-            // Check if we need to recreate with a new image
-            let existing_image = existing_container.image.as_deref().unwrap_or("");
+            // The reference the container was created from; the list API
+            // reports an image ID once the tag has moved to a newer digest.
+            let existing_image = super::recreate_guard::created_image(docker, &container_name)
+                .await
+                .or_else(|| existing_container.image.clone())
+                .unwrap_or_default();
 
             if existing_image == config.docker_image {
                 info!(
@@ -445,40 +479,74 @@ impl RedisService {
             }
 
             info!(
-                "Container {} already exists with different image (current: {}, requested: {}), removing it to recreate",
+                "Container {} already exists with different image (current: {}, requested: {}), recreating it",
                 container_name, existing_image, config.docker_image
             );
-
-            // Stop the container first
-            let _ = docker
-                .stop_container(
-                    &container_name,
-                    None::<bollard::query_parameters::StopContainerOptions>,
-                )
-                .await;
-
-            // Remove the container
-            docker
-                .remove_container(
-                    &container_name,
-                    Some(bollard::query_parameters::RemoveContainerOptions {
-                        force: true,
-                        v: true,
-                        ..Default::default()
-                    }),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to remove existing container: {}", e))?;
-
-            info!("Removed existing container {}", container_name);
+            self.recreate_container_guarded(docker, config, password, resource_limits)
+                .await?;
+            return Ok(());
         }
 
+        self.create_fresh_container(docker, config, password, resource_limits)
+            .await
+    }
+
+    /// Replace this service's container with one built from `config`,
+    /// through the shared guard (same data volume or refuse; original kept
+    /// until the new one shows the same keyspaces; restored otherwise).
+    async fn recreate_container_guarded(
+        &self,
+        docker: &Docker,
+        config: &RedisConfig,
+        password: &str,
+        resource_limits: &ServiceResourceLimits,
+    ) -> Result<()> {
+        let container_name = self.get_container_name();
+        let service_name = self.instance_name();
+        super::recreate_guard::recreate_preserving_data(
+            super::recreate_guard::RecreateRequest {
+                docker,
+                engine: super::recreate_guard::ManagedEngine::Redis,
+                service_name: &service_name,
+                container_name: &container_name,
+                replacement: self.replacement_storage(),
+                operation: "changing its image",
+            },
+            || self.create_fresh_container(docker, config, password, resource_limits),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// The storage a container created by this service mounts, for
+    /// [`recreate_guard`](super::recreate_guard).
+    fn replacement_storage(&self) -> super::recreate_guard::ReplacementStorage {
+        super::recreate_guard::ReplacementStorage {
+            data_dir: "/data".to_string(),
+            mounts: vec![super::recreate_guard::PlannedMount {
+                volume: format!("redis_data_{}", self.instance_name()),
+                target: "/data".to_string(),
+            }],
+        }
+    }
+
+    /// Create, start and wait for a new container. The caller has made sure
+    /// no container with this name exists.
+    async fn create_fresh_container(
+        &self,
+        docker: &Docker,
+        config: &RedisConfig,
+        password: &str,
+        resource_limits: &ServiceResourceLimits,
+    ) -> Result<()> {
+        let container_name = self.get_container_name();
         let service_label_key = format!("{}service_type", temps_core::DOCKER_LABEL_PREFIX);
+        let instance_name = self.instance_name();
         let name_label_key = format!("{}service_name", temps_core::DOCKER_LABEL_PREFIX);
 
         let container_labels = HashMap::from([
             (service_label_key.as_str(), "redis"),
-            (name_label_key.as_str(), self.name.as_str()),
+            (name_label_key.as_str(), instance_name.as_str()),
         ]);
 
         let env_vars = [format!("REDIS_PASSWORD={}", password)];
@@ -496,7 +564,7 @@ impl RedisService {
             redis_cmd.push(password.to_string());
         }
 
-        let volume_name = format!("redis_data_{}", self.name);
+        let volume_name = format!("redis_data_{}", self.instance_name());
         let mut host_config = bollard::models::HostConfig {
             port_bindings: Some(crate::utils::local_port_binding("6379/tcp", &config.port)),
             mounts: Some(vec![bollard::models::Mount {
@@ -736,7 +804,18 @@ impl RedisService {
     }
 
     fn database_owner_key(db_number: u8) -> String {
-        format!("_temps:redis_db_owner:{}", db_number)
+        format!("{}{}", Self::DATABASE_OWNER_KEY_PREFIX, db_number)
+    }
+
+    const DATABASE_OWNER_KEY_PREFIX: &'static str = "_temps:redis_db_owner:";
+
+    /// Set by a data import that created the resource's logical database,
+    /// to `"{run_id}:{db_number}"`. The import may release that database
+    /// after a failure only while its claim is still there; anything else
+    /// that starts using the resource (provisioning, another import)
+    /// removes the claim first. See [`Self::allocate_database`].
+    fn import_claim_key(resource_name: &str) -> String {
+        format!("_temps:redis_import_claim:{}", resource_name)
     }
 
     /// Owner value recorded for a logical DB that already held data when we
@@ -785,7 +864,27 @@ impl RedisService {
     /// allocate/drop for the same resource aren't expected to run
     /// concurrently (provision and deprovision are serialized per resource
     /// at the caller).
+    ///
+    /// Provisioning *adopts* the resource: it removes a failed data import's
+    /// claim on it and reads the mapping in one atomic step, so an import
+    /// releasing the database it created either finishes before (and the
+    /// mapping is gone) or finds its claim gone and releases nothing.
     async fn allocate_database(&self, resource_name: &str) -> Result<u8> {
+        self.allocate_database_for(resource_name, None).await
+    }
+
+    /// [`Self::allocate_database`] on behalf of `import_run`, when set: the
+    /// import that holds a pending claim on the resource (`"{run}:pending"`)
+    /// allocates without adopting, and if this call creates the mapping it
+    /// confirms the claim as `"{run}:{db}"` in the same atomic step. A run
+    /// that reuses a mapping, or whose pending claim was adopted meanwhile,
+    /// ends up with no confirmed claim and can never release.
+    pub(super) async fn allocate_database_for(
+        &self,
+        resource_name: &str,
+        import_run: Option<i32>,
+    ) -> Result<u8> {
+        let adopt = import_run.is_none();
         let mut conn = self.get_connection().await?;
         redis::cmd("SELECT")
             .arg(0)
@@ -794,7 +893,12 @@ impl RedisService {
             .map_err(|e| anyhow::anyhow!("Failed to select Redis metadata DB 0: {}", e))?;
 
         let mapping_key = Self::resource_mapping_key(resource_name);
-        let existing: Option<u8> = conn.get(&mapping_key).await.map_err(|e| {
+        let existing: Option<u8> = if adopt {
+            Self::adopt_resource(&mut conn, resource_name).await
+        } else {
+            conn.get(&mapping_key).await
+        }
+        .map_err(|e| {
             anyhow::anyhow!(
                 "Failed to read Redis DB mapping for resource '{}': {}",
                 resource_name,
@@ -878,16 +982,32 @@ impl RedisService {
                     continue;
                 }
 
-                conn.set::<_, _, ()>(&mapping_key, db_number)
+                let stored = match import_run {
+                    None => conn.set::<_, _, ()>(&mapping_key, db_number).await,
+                    Some(run) => redis::Script::new(
+                        "redis.call('SET', KEYS[1], ARGV[1]) \
+                             if redis.call('GET', KEYS[2]) == ARGV[2] then \
+                               redis.call('SET', KEYS[2], ARGV[3]) \
+                             end \
+                             return 1",
+                    )
+                    .key(&mapping_key)
+                    .key(Self::import_claim_key(resource_name))
+                    .arg(db_number)
+                    .arg(format!("{run}:pending"))
+                    .arg(format!("{run}:{db_number}"))
+                    .invoke_async::<i64>(&mut conn)
                     .await
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "Failed to store Redis DB {} mapping for resource '{}': {}",
-                            db_number,
-                            resource_name,
-                            e
-                        )
-                    })?;
+                    .map(|_| ()),
+                };
+                stored.map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to store Redis DB {} mapping for resource '{}': {}",
+                        db_number,
+                        resource_name,
+                        e
+                    )
+                })?;
                 return Ok(db_number);
             }
 
@@ -918,6 +1038,22 @@ impl RedisService {
             "No Redis logical databases are available for resource '{}'; DB 0 is reserved for metadata and DBs 1-15 are already allocated or hold unattributable data",
             resource_name
         ))
+    }
+
+    /// Remove a data import's claim on `resource_name` and read its mapping,
+    /// atomically (one script). `conn` must have DB 0 selected.
+    pub(super) async fn adopt_resource(
+        conn: &mut redis::aio::ConnectionManager,
+        resource_name: &str,
+    ) -> redis::RedisResult<Option<u8>> {
+        redis::Script::new(
+            "redis.call('DEL', KEYS[1]) \
+             return redis.call('GET', KEYS[2])",
+        )
+        .key(Self::import_claim_key(resource_name))
+        .key(Self::resource_mapping_key(resource_name))
+        .invoke_async(conn)
+        .await
     }
 
     async fn drop_database(&self, resource_name: &str) -> Result<()> {
@@ -974,13 +1110,16 @@ impl RedisService {
             .query_async::<()>(&mut conn)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to reselect Redis metadata DB 0: {}", e))?;
-        conn.del::<_, ()>(&mapping_key).await.map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to delete Redis DB mapping for resource '{}': {}",
-                resource_name,
-                e
-            )
-        })?;
+        // A data import's claim goes with the mapping it refers to.
+        conn.del::<_, ()>(&[mapping_key.clone(), Self::import_claim_key(resource_name)])
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to delete Redis DB mapping for resource '{}': {}",
+                    resource_name,
+                    e
+                )
+            })?;
         conn.del::<_, ()>(Self::database_owner_key(db_number))
             .await
             .map_err(|e| {
@@ -1521,13 +1660,26 @@ impl RedisService {
     ///    enabled; the manifest-based directory is required.
     /// 4. Re-enables the restart policy (always) regardless of outcome.
     /// 5. Starts the container and waits for the healthcheck.
+    ///
+    /// `gate` lets a cancelled restore stop while the snapshot downloads:
+    /// the download checks it between chunks, and it is checked again after
+    /// decompression, before the container is stopped or written.
     async fn restore_from_legacy(
         &self,
         s3_client: &aws_sdk_s3::Client,
         backup_location: &str,
         s3_source: &temps_entities::s3_sources::Model,
+        gate: &dyn super::RestoreGate,
     ) -> Result<()> {
         info!("Restoring Redis from rdb.gz backup: {}", backup_location);
+        let cancelled = || {
+            anyhow::Error::new(super::RestoreCancelled {
+                target: self.get_container_name(),
+            })
+        };
+        if gate.is_cancelled() {
+            return Err(cancelled());
+        }
 
         // ── 1. Stream the .rdb.gz from S3 and gunzip it on the host ─────────
         //
@@ -1551,6 +1703,7 @@ impl RedisService {
             &s3_source.bucket_name,
             backup_location,
             &gz_host_path,
+            gate,
         )
         .await?;
         super::restore_staging::gunzip_file(
@@ -1560,6 +1713,11 @@ impl RedisService {
         )
         .await?;
         let _ = tokio::fs::remove_file(&gz_host_path).await;
+        // Last check before the container is stopped and its data replaced;
+        // the temp dir (and what was staged in it) is removed on return.
+        if gate.is_cancelled() {
+            return Err(cancelled());
+        }
 
         // ── 3. Resolve the target container name ─────────────────────────────
         let container_name = self
@@ -1941,7 +2099,7 @@ impl RedisService {
                 s3_location: Set("".to_string()),
                 metadata: Set(serde_json::json!({
                     "service_type": "redis",
-                    "service_name": self.name,
+                    "service_name": self.instance_name(),
                     "backup_tool": "bgsave",
                 })),
                 compression_type: Set("none".to_string()),
@@ -2126,8 +2284,43 @@ impl RedisService {
     }
 }
 
+/// Container name of a service named `name`. The single derivation shared by
+/// the engine and anything that must find its container without an instance.
+pub(crate) fn redis_container_name(name: &str) -> String {
+    format!("redis-{}", name)
+}
+
+/// Data volumes of a service named `name`, as `remove()` deletes them.
+pub(crate) fn redis_volume_names(name: &str) -> [String; 1] {
+    [format!("redis_data_{}", name)]
+}
+
 #[async_trait]
 impl ExternalService for RedisService {
+    fn recreate_plan(
+        &self,
+        _service_config: &ServiceConfig,
+    ) -> Option<(
+        super::recreate_guard::ManagedEngine,
+        super::recreate_guard::ReplacementStorage,
+    )> {
+        Some((
+            super::recreate_guard::ManagedEngine::Redis,
+            self.replacement_storage(),
+        ))
+    }
+
+    fn docker_resource_names(&self) -> Option<super::DockerResourceNames> {
+        Some(super::DockerResourceNames {
+            containers: vec![redis_container_name(&self.instance_name())],
+            volumes: redis_volume_names(&self.instance_name()).to_vec(),
+        })
+    }
+
+    fn data_import(&self) -> Option<&dyn crate::data_import::DataImportEngine> {
+        Some(self)
+    }
+
     fn get_effective_address(&self, service_config: ServiceConfig) -> Result<(String, String)> {
         self.get_effective_address_for_environment(
             service_config,
@@ -2188,7 +2381,7 @@ impl ExternalService for RedisService {
         } else {
             info!(
                 "Redis service '{}' is imported from container '{}'; skipping container creation",
-                self.name,
+                self.instance_name(),
                 self.get_live_container_name(&redis_config)
             );
         }
@@ -2315,7 +2508,7 @@ impl ExternalService for RedisService {
     }
 
     fn get_name(&self) -> String {
-        self.name.clone()
+        self.instance_name()
     }
 
     fn get_connection_info(&self) -> Result<String> {
@@ -2522,9 +2715,12 @@ impl ExternalService for RedisService {
 
         // Then remove container and volume if Docker is available
         let container_name = self.get_container_name();
-        let volume_name = format!("redis_data_{}", self.name);
+        let [volume_name] = redis_volume_names(&self.instance_name());
 
-        info!("Removing Redis container and volume for {}", self.name);
+        info!(
+            "Removing Redis container and volume for {}",
+            self.instance_name()
+        );
 
         // Remove container if it exists
         let containers = self
@@ -2664,7 +2860,7 @@ impl ExternalService for RedisService {
 
         let metadata = serde_json::json!({
             "service_type": "redis",
-            "service_name": self.name,
+            "service_name": self.instance_name(),
             "backup_tool": "wal-g",
         });
 
@@ -2777,8 +2973,15 @@ impl ExternalService for RedisService {
                 .await
         } else {
             // Legacy backup: fall back to old tar-based approach
-            self.restore_from_legacy(s3_client, backup_location, s3_source)
-                .await
+            // This entry point has no cancellation: the orchestrator closes the
+            // gate before calling a Redis in-place restore.
+            self.restore_from_legacy(
+                s3_client,
+                backup_location,
+                s3_source,
+                &super::NoopRestoreGate,
+            )
+            .await
         }
     }
 
@@ -2889,7 +3092,7 @@ impl ExternalService for RedisService {
 
         if backup_location_kind == RedisBackupLocationKind::RdbGzip {
             if let Err(error) = new_service
-                .restore_from_legacy(ctx.s3_client, ctx.backup_location, ctx.s3_source)
+                .restore_from_legacy(ctx.s3_client, ctx.backup_location, ctx.s3_source, ctx.gate)
                 .await
             {
                 let _ = self
@@ -3107,6 +3310,9 @@ impl ExternalService for RedisService {
         info!("Starting Redis upgrade");
 
         let _old_redis_config = self.get_redis_config(old_config)?;
+        // The service's own limits: a provider built for this call has
+        // none loaded, and the new container must keep them.
+        let upgrade_limits = ServiceResourceLimits::from_parameters(&new_config.parameters);
         let mut new_redis_config = self.get_redis_config(new_config)?;
 
         // Verify the new image can be pulled BEFORE stopping the old container
@@ -3118,16 +3324,43 @@ impl ExternalService for RedisService {
             .await?;
         info!("New Docker image verified and is available");
 
-        // Stop the old container
-        info!("Stopping old Redis container");
-        self.stop().await?;
+        // No stop here: replacing the container goes through the recreate
+        // guard, which stops the original itself once it has checked the new
+        // container will see its data, and fingerprints it while it runs.
 
-        // Create container with new image (keeping the same volume for data persistence)
-        info!("Starting Redis container with new image");
-        let limits = self.resource_limits.read().await.clone();
+        // Compare with the build the tag resolves to now, not only the
+        // reference string: asking again for a re-published tag must
+        // replace the container with its new digest.
+        let limits = upgrade_limits;
         let password = new_redis_config.password.clone();
-        self.create_container(&self.docker, &mut new_redis_config, &password, &limits)
-            .await?;
+        match super::recreate_guard::runs_current_image(
+            &self.docker,
+            &self.get_container_name(),
+            &new_redis_config.docker_image,
+        )
+        .await
+        {
+            Some(true) => info!(
+                "Redis container {} already runs the current {} build",
+                self.get_container_name(),
+                new_redis_config.docker_image
+            ),
+            Some(false) => {
+                info!("Replacing Redis container with the new image");
+                self.recreate_container_guarded(
+                    &self.docker,
+                    &new_redis_config,
+                    &password,
+                    &limits,
+                )
+                .await?;
+            }
+            None => {
+                info!("Starting Redis container with new image");
+                self.create_container(&self.docker, &mut new_redis_config, &password, &limits)
+                    .await?;
+            }
+        }
         *self.config.write().await = Some(new_redis_config);
 
         info!("Redis upgrade completed successfully");
@@ -3272,6 +3505,9 @@ impl ExternalService for RedisService {
     }
 }
 
+/// Importing data from an external Redis server (see `crate::data_import`).
+mod data_import;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3374,6 +3610,84 @@ mod tests {
         assert!(
             !error.contains(marker),
             "container output must stay in operator logs, not user-facing errors: {error}"
+        );
+    }
+
+    /// A gate whose cancellation is already recorded.
+    struct CancelledGate;
+
+    #[async_trait::async_trait]
+    impl crate::externalsvc::RestoreGate for CancelledGate {
+        fn is_cancelled(&self) -> bool {
+            true
+        }
+        async fn begin_target_writes(
+            &self,
+        ) -> std::result::Result<(), crate::externalsvc::RestoreCancelled> {
+            Err(crate::externalsvc::RestoreCancelled {
+                target: "redis-copy".into(),
+            })
+        }
+    }
+
+    /// REGRESSION (Greptile on #1295): a cancelled restore of a `.rdb.gz`
+    /// backup must stop before downloading the snapshot or touching the
+    /// container. The restore's own gate reaches the download, which also
+    /// checks it between chunks.
+    #[tokio::test]
+    async fn cancelled_rdb_restore_stops_before_downloading() {
+        // Never contacted: the restore must stop before any Docker call.
+        let docker = Arc::new(
+            Docker::connect_with_http("http://127.0.0.1:9", 1, bollard::API_DEFAULT_VERSION)
+                .expect("lazy Docker client"),
+        );
+        let service = RedisService::new("copy".to_string(), docker);
+        // No endpoint is reachable: a request would fail with a network
+        // error instead of the cancellation this asserts.
+        let s3_client = aws_sdk_s3::Client::from_conf(
+            aws_sdk_s3::Config::builder()
+                .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                .region(aws_sdk_s3::config::Region::new("us-east-1"))
+                .endpoint_url("http://127.0.0.1:9")
+                .build(),
+        );
+        let now = chrono::Utc::now();
+        let s3_source = temps_entities::s3_sources::Model {
+            id: 1,
+            backing_service_id: None,
+            name: "source-1".to_string(),
+            bucket_name: "backups".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: None,
+            bucket_path: String::new(),
+            access_key_id: "ciphertext".to_string(),
+            secret_key: "ciphertext".to_string(),
+            session_token: None,
+            credentials_expire_at: None,
+            force_path_style: Some(true),
+            is_default: false,
+            managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let error = service
+            .restore_from_legacy(
+                &s3_client,
+                "external_services/redis/cache/backup.rdb.gz",
+                &s3_source,
+                &CancelledGate,
+            )
+            .await
+            .expect_err("a cancelled restore must not proceed");
+
+        assert!(
+            error
+                .downcast_ref::<crate::externalsvc::RestoreCancelled>()
+                .is_some(),
+            "expected a cancellation, got: {error}"
         );
     }
 
@@ -4670,7 +4984,12 @@ mod tests {
             assert!(changed.contains("OK"), "{changed}");
 
             service
-                .restore_from_legacy(&minio.s3_client, key, &minio.s3_source)
+                .restore_from_legacy(
+                    &minio.s3_client,
+                    key,
+                    &minio.s3_source,
+                    &crate::externalsvc::NoopRestoreGate,
+                )
                 .await
                 .expect("rdb.gz restore");
 

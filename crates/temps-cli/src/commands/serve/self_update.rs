@@ -90,6 +90,8 @@ pub struct BinarySelfUpdater {
     /// Database URL passed explicitly to the migrate child process so it works
     /// even when the parent was started with `--database-url` (not the env var).
     database_url: String,
+    /// `temps serve --pre-migration-backup`, forwarded to the migrate child.
+    pre_migration_backup: bool,
 }
 
 impl BinarySelfUpdater {
@@ -108,6 +110,7 @@ impl BinarySelfUpdater {
         topology_caveat: Option<String>,
         update_status: Arc<UpdateStatusSlot>,
         database_url: String,
+        pre_migration_backup: bool,
     ) -> Self {
         let binary_path = std::env::current_exe()
             .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
@@ -133,6 +136,7 @@ impl BinarySelfUpdater {
             update_status,
             state: Arc::new(RwLock::new(UpdaterState::default())),
             database_url,
+            pre_migration_backup,
         };
 
         let last_attempt = updater.reconcile_journal();
@@ -507,6 +511,7 @@ impl SelfUpdater for BinarySelfUpdater {
             channel,
             state: self.state.clone(),
             database_url: self.database_url.clone(),
+            pre_migration_backup: self.pre_migration_backup.then(|| self.data_dir.clone()),
         };
         tokio::spawn(job.run());
 
@@ -600,6 +605,9 @@ struct UpdateJob {
     /// guaranteed to be in its environment regardless of how the parent
     /// received it (flag vs env var).
     database_url: String,
+    /// Data dir to pass with `--pre-migration-backup` to the migrate child,
+    /// when `temps serve` was started with that flag.
+    pre_migration_backup: Option<PathBuf>,
 }
 
 /// Failure discriminator for `UpdateJob::execute`.
@@ -991,9 +999,7 @@ impl UpdateJob {
         };
 
         let mut child = tokio::process::Command::new(&self.binary_path)
-            .arg("migrate")
-            .arg("--yes")
-            .arg("--progress-format=json")
+            .args(migrate_child_args(self.pre_migration_backup.as_deref()))
             // Explicit env set: if the parent received the DB URL as a
             // `--database-url` flag it is not in the environment, so a naive
             // child spawn would fail clap's required-arg check.
@@ -1282,6 +1288,24 @@ fn preflight_staged_binary(staged_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Arguments for the `temps migrate` child of an update. With
+/// `pre_migration_backup` (the data dir of a `temps serve
+/// --pre-migration-backup`), the child takes the backup into that same data
+/// dir.
+pub(crate) fn migrate_child_args(pre_migration_backup: Option<&Path>) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "migrate".into(),
+        "--yes".into(),
+        "--progress-format=json".into(),
+    ];
+    if let Some(data_dir) = pre_migration_backup {
+        args.push(crate::commands::schema_upgrade::BACKUP_FLAG.into());
+        args.push("--data-dir".into());
+        args.push(data_dir.as_os_str().to_owned());
+    }
+    args
+}
+
 /// Copy the current binary aside as `<binary>.bak`, returning where it went.
 ///
 /// A copy (not a rename) so the target is never momentarily absent — if the
@@ -1420,6 +1444,7 @@ mod tests {
             // Tests don't exercise the migrate subprocess, so the URL value
             // doesn't matter — it only needs to be present in the struct.
             database_url: String::new(),
+            pre_migration_backup: false,
         }
     }
 
@@ -1834,6 +1859,25 @@ mod tests {
 
         drop(staged_path);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrate_child_takes_the_backup_only_when_serve_was_started_with_it() {
+        assert_eq!(
+            migrate_child_args(None),
+            vec!["migrate", "--yes", "--progress-format=json"]
+        );
+        assert_eq!(
+            migrate_child_args(Some(Path::new("/srv/temps-data"))),
+            vec![
+                "migrate",
+                "--yes",
+                "--progress-format=json",
+                "--pre-migration-backup",
+                "--data-dir",
+                "/srv/temps-data",
+            ]
+        );
     }
 
     #[test]
