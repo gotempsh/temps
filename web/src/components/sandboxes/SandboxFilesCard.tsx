@@ -5,6 +5,7 @@ import { useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { exec } from '@/api/client'
 import { FileText, Loader2, Save } from 'lucide-react'
 import { toast } from 'sonner'
 import { z } from 'zod'
@@ -17,6 +18,7 @@ import {
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import {
   Card,
   CardContent,
@@ -37,14 +39,23 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Textarea } from '@/components/ui/textarea'
 import { problemDetail } from '@/lib/api-problem'
 import {
+  DEFAULT_FILE_MODE,
   MAX_EDITABLE_BYTES,
   decodeFile,
   defaultFilePath,
   encodeText,
+  fileModeArgv,
   filesUnavailableReason,
+  formatFileMode,
   isEditableFile,
+  parseFileMode,
   validateSandboxPath,
 } from './sandbox-files'
+
+/** Cache key for a file's permission bits (read via `stat`, see the card). */
+function fileModeQueryKey(sandboxId: string, path: string) {
+  return [{ _id: 'sandboxFileMode', sandboxId, path }] as const
+}
 
 const pathFormSchema = z.object({
   path: z.string().superRefine((value, context) => {
@@ -110,6 +121,29 @@ export function SandboxFilesCard({
     gcTime: 0,
   })
 
+  // `fs/write` rewrites a file at 0644 unless a mode is sent, and `fs/stat`
+  // does not report one, so read it (`stat -c %a`) and send it back with the
+  // save. Without this, editing a script drops its executable bit and a 0600
+  // file becomes world-readable. `null` means it could not be read.
+  const modeQuery = useQuery({
+    queryKey: fileModeQueryKey(sandboxId, openPath ?? ''),
+    queryFn: async (): Promise<number | null> => {
+      const { data } = await exec({
+        path: { id: sandboxId },
+        body: { cmd: fileModeArgv(openPath ?? '') },
+        throwOnError: true,
+      })
+      return data.exit_code === 0 ? parseFileMode(data.stdout) : null
+    },
+    enabled:
+      openPath !== null && blocked === null && !!stat?.exists && readable,
+    retry: false,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+    staleTime: 0,
+    gcTime: 0,
+  })
+
   // Opening the same path again must show what is in the sandbox now: the
   // terminal beside this card can change the file, and saving a stale buffer
   // would silently overwrite that change.
@@ -125,7 +159,9 @@ export function SandboxFilesCard({
     }
     const wasReadable = readable
     const fresh = await statQuery.refetch()
-    if (wasReadable && isEditableFile(fresh.data)) await readQuery.refetch()
+    if (wasReadable && isEditableFile(fresh.data)) {
+      await Promise.all([readQuery.refetch(), modeQuery.refetch()])
+    }
     setGeneration((current) => current + 1)
   }
 
@@ -138,9 +174,9 @@ export function SandboxFilesCard({
         </CardTitle>
         <CardDescription>
           Open a text file by its absolute path, edit it and save it back into
-          the sandbox. Opening a file again reloads it and discards unsaved
-          edits. Browsing directories needs a listing endpoint that does not
-          exist yet.
+          the sandbox; its permissions are kept. Opening a file again reloads it
+          and discards unsaved edits. Browsing directories needs a listing
+          endpoint that does not exist yet.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -197,7 +233,8 @@ export function SandboxFilesCard({
           statError={statQuery.isError ? statQuery.error : null}
           statLoading={statQuery.isPending}
           stat={stat}
-          readLoading={readable && readQuery.isPending}
+          readLoading={readable && (readQuery.isPending || modeQuery.isPending)}
+          mode={modeQuery.isSuccess ? modeQuery.data : null}
           readError={readQuery.isError ? readQuery.error : null}
           contentsB64={readQuery.data?.contents_b64}
           generation={generation}
@@ -221,6 +258,8 @@ interface FileSectionProps {
   readLoading: boolean
   readError: unknown
   contentsB64: string | undefined
+  /** Permission bits of an existing file; `null` when they could not be read. */
+  mode: number | null
   generation: number
 }
 
@@ -234,6 +273,7 @@ function FileSection({
   readLoading,
   readError,
   contentsB64,
+  mode,
   generation,
 }: FileSectionProps) {
   if (path === null) return null
@@ -313,6 +353,7 @@ function FileSection({
       path={path}
       exists={stat.exists}
       initial={initial}
+      mode={stat.exists ? mode : DEFAULT_FILE_MODE}
       locked={locked}
     />
   )
@@ -323,12 +364,15 @@ function FileEditor({
   path,
   exists,
   initial,
+  mode,
   locked,
 }: {
   sandboxId: string
   path: string
   exists: boolean
   initial: string
+  /** Mode to write with; `null` when an existing file's mode is unknown. */
+  mode: number | null
   locked: boolean
 }) {
   const queryClient = useQueryClient()
@@ -338,6 +382,7 @@ function FileEditor({
   // flight stays in the editor, still marked unsaved.
   const [saved, setSaved] = useState(initial)
   const dirty = draft !== saved
+  const [confirmUnknownMode, setConfirmUnknownMode] = useState(false)
 
   const save = useMutation({
     ...writeFileMutation(),
@@ -355,6 +400,11 @@ function FileEditor({
           contents_b64: variables.body.contents_b64,
         }
       )
+      // Same for the mode, so a new file does not flash a loading state.
+      queryClient.setQueryData(
+        fileModeQueryKey(sandboxId, path),
+        variables.body.mode ?? DEFAULT_FILE_MODE
+      )
       void queryClient.invalidateQueries({
         predicate: (query) =>
           (query.queryKey[0] as { _id?: string } | undefined)?._id ===
@@ -363,26 +413,43 @@ function FileEditor({
     },
   })
 
+  const send = () => {
+    const sent = draft
+    save.mutate(
+      {
+        path: { id: sandboxId },
+        body: {
+          path,
+          contents_b64: encodeText(sent),
+          // Always explicit: omitting it makes the API write 0644.
+          mode: mode ?? DEFAULT_FILE_MODE,
+        },
+      },
+      { onSuccess: () => setSaved(sent) }
+    )
+  }
+
   return (
     <div className="space-y-2">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex min-w-0 items-center gap-2">
           <span className="truncate font-mono text-xs">{path}</span>
           {!exists && <Badge variant="neutral-subtle">new file</Badge>}
+          {exists && mode !== null && (
+            <Badge variant="outline" className="font-mono">
+              {formatFileMode(mode)}
+            </Badge>
+          )}
           {dirty && <Badge variant="warning-subtle">unsaved changes</Badge>}
         </div>
         <Button
           size="sm"
           disabled={!dirty || save.isPending || locked}
           onClick={() => {
-            const sent = draft
-            save.mutate(
-              {
-                path: { id: sandboxId },
-                body: { path, contents_b64: encodeText(sent) },
-              },
-              { onSuccess: () => setSaved(sent) }
-            )
+            // An existing file whose permissions could not be read would be
+            // reset to 0644: say so first instead of doing it silently.
+            if (exists && mode === null) setConfirmUnknownMode(true)
+            else send()
           }}
         >
           {save.isPending ? (
@@ -400,6 +467,24 @@ function FileEditor({
         readOnly={locked}
         spellCheck={false}
         className="min-h-[240px] font-mono text-xs"
+      />
+      <ConfirmDialog
+        open={confirmUnknownMode}
+        onOpenChange={setConfirmUnknownMode}
+        title="Save without the file's permissions?"
+        description={
+          <>
+            The permissions of <span className="font-mono">{path}</span> could
+            not be read, so saving will reset it to 0644 (rw-r--r--). If it is a
+            script or holds credentials, edit it from the terminal instead.
+          </>
+        }
+        confirmLabel="Save anyway"
+        destructive={false}
+        onConfirm={() => {
+          setConfirmUnknownMode(false)
+          send()
+        }}
       />
     </div>
   )

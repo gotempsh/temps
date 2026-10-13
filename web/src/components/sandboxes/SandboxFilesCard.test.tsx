@@ -40,9 +40,16 @@ function renderCard(props: { status?: string; lifecycle?: string } = {}) {
 
 const PATH = '/home/user/work/notes.txt'
 
+/** `stat -c %a` answer for the file's permission bits. */
+const modeRoute = (stdout = '644\n', exitCode = 0) => ({
+  'POST /v1/sandboxes/sbx_1/exec': () =>
+    jsonResponse({ exit_code: exitCode, stdout, stderr: '' }),
+})
+
 test('opens a file, edits it and saves the new contents as base64', async () => {
   let written: unknown
   const api = mockApi({
+    ...modeRoute(),
     'GET /v1/sandboxes/sbx_1/fs/stat': () =>
       jsonResponse({
         path: PATH,
@@ -85,6 +92,7 @@ test('opens a file, edits it and saves the new contents as base64', async () => 
   expect(written).toEqual({
     path: PATH,
     contents_b64: encodeText('héllo, world\n'),
+    mode: 0o644,
   })
   api.restore()
 })
@@ -165,6 +173,7 @@ test('opening the same file again reloads it, so a stale buffer is never saved o
   let current = 'from the terminal, version 1\n'
   let reads = 0
   const api = mockApi({
+    ...modeRoute(),
     'GET /v1/sandboxes/sbx_1/fs/stat': () =>
       jsonResponse({
         path: PATH,
@@ -322,6 +331,7 @@ test('text typed while a save is in flight is kept and still marked unsaved', as
   })
   const written: string[] = []
   const api = mockApi({
+    ...modeRoute(),
     'GET /v1/sandboxes/sbx_1/fs/stat': () =>
       jsonResponse({
         path: PATH,
@@ -376,6 +386,7 @@ test('text typed while a save is in flight is kept and still marked unsaved', as
 
 test('a sandbox that stops keeps the unsaved edit, read-only, and resumes with it intact', async () => {
   const api = mockApi({
+    ...modeRoute(),
     'GET /v1/sandboxes/sbx_1/fs/stat': () =>
       jsonResponse({
         path: PATH,
@@ -419,5 +430,137 @@ test('a sandbox that stops keeps the unsaved edit, read-only, and resumes with i
   expect(resumed.value).toBe('unsaved work')
   expect(resumed.readOnly).toBe(false)
   expect(view.getByText('unsaved changes')).toBeTruthy()
+  api.restore()
+})
+
+test("saving sends the file's own mode so an executable keeps its bit", async () => {
+  let body: { mode?: number } | undefined
+  const execCalls: string[][] = []
+  const api = mockApi({
+    'POST /v1/sandboxes/sbx_1/exec': async (request) => {
+      const payload = (await request.json()) as { cmd: string[] }
+      execCalls.push(payload.cmd)
+      return jsonResponse({ exit_code: 0, stdout: '755\n', stderr: '' })
+    },
+    'GET /v1/sandboxes/sbx_1/fs/stat': () =>
+      jsonResponse({
+        path: PATH,
+        exists: true,
+        is_file: true,
+        is_dir: false,
+        size: 12,
+      }),
+    'GET /v1/sandboxes/sbx_1/fs/read': () =>
+      jsonResponse({
+        path: PATH,
+        size: 12,
+        contents_b64: encodeText('#!/bin/sh\n'),
+      }),
+    'POST /v1/sandboxes/sbx_1/fs/write': async (request) => {
+      body = (await request.json()) as { mode?: number }
+      return new Response(null, { status: 204 })
+    },
+  })
+  const view = renderCard()
+
+  fireEvent.change(view.getByLabelText('File path'), {
+    target: { value: PATH },
+  })
+  fireEvent.click(view.getByRole('button', { name: 'Open file' }))
+  const editor = (await view.findByLabelText(
+    `Contents of ${PATH}`
+  )) as HTMLTextAreaElement
+  expect(view.getByText('0755')).toBeTruthy()
+
+  fireEvent.change(editor, { target: { value: '#!/bin/sh\necho hi\n' } })
+  fireEvent.click(view.getByRole('button', { name: 'Save' }))
+
+  await waitFor(() => expect(body).toBeDefined())
+  expect(body?.mode).toBe(0o755)
+  expect(execCalls).toEqual([['stat', '-c', '%a', '--', PATH]])
+  api.restore()
+})
+
+test('an unreadable mode asks before saving, and does nothing if declined', async () => {
+  const writes: unknown[] = []
+  const api = mockApi({
+    ...modeRoute('', 1),
+    'GET /v1/sandboxes/sbx_1/fs/stat': () =>
+      jsonResponse({
+        path: PATH,
+        exists: true,
+        is_file: true,
+        is_dir: false,
+        size: 5,
+      }),
+    'GET /v1/sandboxes/sbx_1/fs/read': () =>
+      jsonResponse({ path: PATH, size: 5, contents_b64: encodeText('start') }),
+    'POST /v1/sandboxes/sbx_1/fs/write': async (request) => {
+      writes.push(await request.json())
+      return new Response(null, { status: 204 })
+    },
+  })
+  const view = renderCard()
+
+  fireEvent.change(view.getByLabelText('File path'), {
+    target: { value: PATH },
+  })
+  fireEvent.click(view.getByRole('button', { name: 'Open file' }))
+  const editor = (await view.findByLabelText(
+    `Contents of ${PATH}`
+  )) as HTMLTextAreaElement
+  fireEvent.change(editor, { target: { value: 'changed' } })
+  fireEvent.click(view.getByRole('button', { name: 'Save' }))
+
+  await view.findByText(/could not be read, so saving will reset it to 0644/)
+  expect(writes).toHaveLength(0)
+
+  fireEvent.click(view.getByRole('button', { name: 'Cancel' }))
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  expect(writes).toHaveLength(0)
+
+  fireEvent.click(view.getByRole('button', { name: 'Save' }))
+  fireEvent.click(await view.findByRole('button', { name: 'Save anyway' }))
+  await waitFor(() => expect(writes).toHaveLength(1))
+  expect((writes[0] as { mode: number }).mode).toBe(0o644)
+  api.restore()
+})
+
+test('a new file is written at 0644 without reading any mode', async () => {
+  let execCalled = false
+  let body: { mode?: number } | undefined
+  const api = mockApi({
+    'POST /v1/sandboxes/sbx_1/exec': () => {
+      execCalled = true
+      return jsonResponse({ exit_code: 0, stdout: '644\n', stderr: '' })
+    },
+    'GET /v1/sandboxes/sbx_1/fs/stat': () =>
+      jsonResponse({
+        path: PATH,
+        exists: false,
+        is_file: false,
+        is_dir: false,
+        size: 0,
+      }),
+    'POST /v1/sandboxes/sbx_1/fs/write': async (request) => {
+      body = (await request.json()) as { mode?: number }
+      return new Response(null, { status: 204 })
+    },
+  })
+  const view = renderCard()
+
+  fireEvent.change(view.getByLabelText('File path'), {
+    target: { value: PATH },
+  })
+  fireEvent.click(view.getByRole('button', { name: 'Open file' }))
+  const editor = (await view.findByLabelText(
+    `Contents of ${PATH}`
+  )) as HTMLTextAreaElement
+  fireEvent.change(editor, { target: { value: 'hello' } })
+  fireEvent.click(view.getByRole('button', { name: 'Save' }))
+
+  await waitFor(() => expect(body).toBeDefined())
+  expect(body?.mode).toBe(0o644)
+  expect(execCalled).toBe(false)
   api.restore()
 })

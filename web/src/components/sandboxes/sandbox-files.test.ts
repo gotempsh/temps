@@ -6,7 +6,10 @@ import {
   decodeFile,
   defaultFilePath,
   encodeText,
+  fileModeArgv,
   filesUnavailableReason,
+  formatFileMode,
+  parseFileMode,
   isEditableFile,
   MAX_EDITABLE_BYTES,
   validateSandboxPath,
@@ -95,5 +98,39 @@ describe('isEditableFile', () => {
       false
     )
     expect(isEditableFile(undefined)).toBe(false)
+  })
+})
+
+describe('file mode helpers', () => {
+  test('stat is asked for the octal permission bits, after --', () => {
+    expect(fileModeArgv('/a b/run.sh')).toEqual([
+      'stat',
+      '-c',
+      '%a',
+      '--',
+      '/a b/run.sh',
+    ])
+  })
+
+  test('parses stat output into the numeric mode', () => {
+    expect(parseFileMode('755\n')).toBe(0o755)
+    expect(parseFileMode('0644')).toBe(0o644)
+    expect(parseFileMode('4755\n')).toBe(0o4755)
+    expect(parseFileMode('600')).toBe(0o600)
+  })
+
+  test('rejects anything that is not an octal mode', () => {
+    expect(parseFileMode('')).toBeNull()
+    expect(parseFileMode('stat: cannot stat')).toBeNull()
+    expect(parseFileMode('999')).toBeNull()
+    expect(parseFileMode('75')).toBeNull()
+    expect(parseFileMode('12345')).toBeNull()
+  })
+
+  test('formats a mode the way chmod users write it', () => {
+    expect(formatFileMode(0o755)).toBe('0755')
+    expect(formatFileMode(0o600)).toBe('0600')
+    expect(formatFileMode(0o4755)).toBe('4755')
+    expect(formatFileMode(0)).toBe('0000')
   })
 })

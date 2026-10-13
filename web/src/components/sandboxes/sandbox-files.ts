@@ -77,6 +77,30 @@ export function decodeFile(contentsB64: string): DecodedFile {
   }
 }
 
+/** Mode a file is created with when none is sent (the API's own default). */
+export const DEFAULT_FILE_MODE = 0o644
+
+/**
+ * Command that prints a file's permission bits in octal (`755`, `4755`).
+ * `fs/stat` carries no mode, and `fs/write` resets a file to 0644 unless a
+ * mode is sent, so the console reads it first and sends it back.
+ */
+export function fileModeArgv(path: string): string[] {
+  return ['stat', '-c', '%a', '--', path]
+}
+
+/** Parse the output of {@link fileModeArgv}; `null` when it is not a mode. */
+export function parseFileMode(stdout: string): number | null {
+  const text = stdout.trim()
+  if (!/^[0-7]{3,4}$/.test(text)) return null
+  return parseInt(text, 8)
+}
+
+/** `0o755` -> `"0755"`, as `ls`/`chmod` users write it. */
+export function formatFileMode(mode: number): string {
+  return mode.toString(8).padStart(4, '0')
+}
+
 /** Why the files panel cannot be used for this sandbox right now. */
 export function filesUnavailableReason(sandbox: {
   status: string
