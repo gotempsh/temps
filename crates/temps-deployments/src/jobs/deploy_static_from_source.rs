@@ -251,6 +251,7 @@ impl DeployStaticFromSourceJob {
                         )));
                     }
                     tokio::fs::copy(&source_path, &dest_path).await?;
+                    stats.file_count = stats.file_count.saturating_add(1);
                 }
             }
             Ok(())
@@ -266,6 +267,11 @@ impl DeployStaticFromSourceJob {
 struct CopyStats {
     skipped: Vec<String>,
     entry_count: u32,
+    /// Files actually staged. Needed here because this copy removes the
+    /// sensitive entries before `StaticDeployer::deploy` runs, so the deployer
+    /// sees an empty tree with nothing skipped and its own "nothing was
+    /// published" guard cannot fire.
+    file_count: u32,
     total_bytes: u64,
 }
 
@@ -366,6 +372,29 @@ impl WorkflowTask for DeployStaticFromSourceJob {
                 ),
             )
             .await?;
+
+            // Mirrors `ensure_something_published` in the deployers: a tree
+            // whose every entry was filtered out must not "succeed" with an
+            // empty site that serves only 404s.
+            if stats.file_count == 0 {
+                return Err(self
+                    .log_and_fail(
+                        &context,
+                        format!(
+                            "❌ No publishable files found in '{}': {} path(s) were skipped as not eligible for publishing (e.g. {})",
+                            source_dir.display(),
+                            stats.skipped.len(),
+                            stats
+                                .skipped
+                                .iter()
+                                .take(5)
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    )
+                    .await);
+            }
         }
 
         let request = StaticDeployRequest {
@@ -518,6 +547,63 @@ mod tests {
         // ordinary (if surprising) publishable content, same as it would be
         // if this repo were deployed via an uploaded archive instead.
         assert!(full_path.join("README.md").exists());
+    }
+
+    fn job_for(deployer: Arc<FilesystemStaticDeployer>) -> DeployStaticFromSourceJob {
+        DeployStaticFromSourceJob::new(
+            "deploy_static".to_string(),
+            "download_repo".to_string(),
+            ".".to_string(),
+            "docs-site".to_string(),
+            "production".to_string(),
+            "deploy-empty".to_string(),
+            deployer,
+        )
+    }
+
+    #[tokio::test]
+    async fn fails_when_every_entry_is_filtered_out_instead_of_deploying_an_empty_site() {
+        let repo = tempfile::tempdir().unwrap();
+        write_file(&repo.path().join(".gitignore"), "node_modules\n");
+        write_file(&repo.path().join(".github/workflows/ci.yml"), "name: ci\n");
+
+        let base_dir = tempfile::tempdir().unwrap();
+        let deployer = Arc::new(FilesystemStaticDeployer::new(base_dir.path().to_path_buf()));
+        let job = job_for(deployer);
+
+        let error = job
+            .execute(context_with_repo_dir(repo.path()))
+            .await
+            .expect_err("a source tree with no publishable file must not deploy");
+
+        let message = error.to_string();
+        assert!(message.contains("No publishable files"), "{message}");
+        assert!(message.contains(".gitignore"), "{message}");
+        assert!(
+            !base_dir.path().join("projects").exists(),
+            "nothing may be written to static storage for a rejected tree"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_source_tree_without_skips_keeps_deploying() {
+        // Same contract as `StaticDeployer::deploy`: only a tree that had
+        // entries skipped *and* nothing left is rejected.
+        let repo = tempfile::tempdir().unwrap();
+        let base_dir = tempfile::tempdir().unwrap();
+        let deployer = Arc::new(FilesystemStaticDeployer::new(base_dir.path().to_path_buf()));
+        let job = job_for(deployer);
+
+        let context = job
+            .execute(context_with_repo_dir(repo.path()))
+            .await
+            .expect("an empty tree with nothing skipped keeps the existing behavior")
+            .context;
+        let file_count: u32 = context
+            .get_output("deploy_static", "file_count")
+            .unwrap()
+            .unwrap();
+        assert_eq!(file_count, 0);
     }
 
     #[tokio::test]
