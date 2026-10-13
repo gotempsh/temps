@@ -41,6 +41,7 @@ import {
   type ChatRuntimeSelection,
 } from '@/components/ai/chat-runtime-options'
 import { WorkspaceHarnessSetup } from './WorkspaceHarnessSetup'
+import { HarnessUpdateBar } from './HarnessUpdateBar'
 import { SetupWizardShell } from '@/components/project/setup/SetupWizardShell'
 import { workspaceFirstTask } from './workspace-first-task'
 import { Textarea } from '@/components/ui/textarea'
@@ -3564,6 +3565,11 @@ export function ApplicationStartScreen({
             )}
             {step === 4 && selectedProvider && (
               <div className="space-y-3">
+                <HarnessUpdateBar
+                  providerId={selectedProvider.id}
+                  providerName={selectedProvider.name}
+                  enabled={selectedProvider.workspace_ready}
+                />
                 <div className="rounded-xl border bg-background focus-within:ring-2 focus-within:ring-ring/30">
                   <Textarea
                     autoFocus
