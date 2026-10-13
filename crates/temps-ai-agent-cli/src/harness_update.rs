@@ -40,29 +40,52 @@ pub(crate) fn harness_package(provider_id: &str) -> Option<HarnessPackage> {
     }
 }
 
+/// Run `argv` under coreutils `timeout` so the command ends itself inside the
+/// sandbox. Dropping the client side of an exec does not stop the process; a
+/// stalled registry request or install would otherwise outlive its caller.
+fn bounded(seconds: u64, argv: Vec<String>) -> Vec<String> {
+    let mut command = vec![
+        "timeout".to_string(),
+        "-k".to_string(),
+        "10".to_string(),
+        seconds.to_string(),
+    ];
+    command.extend(argv);
+    command
+}
+
 pub(crate) fn version_command(package: HarnessPackage) -> Vec<String> {
-    vec![package.binary.to_string(), "--version".to_string()]
+    bounded(
+        VERSION_COMMAND_TIMEOUT.as_secs().saturating_sub(10).max(1),
+        vec![package.binary.to_string(), "--version".to_string()],
+    )
 }
 
 pub(crate) fn latest_version_command(package: HarnessPackage) -> Vec<String> {
-    vec![
-        "npm".to_string(),
-        "view".to_string(),
-        package.npm_package.to_string(),
-        "version".to_string(),
-    ]
+    bounded(
+        LATEST_COMMAND_TIMEOUT.as_secs().saturating_sub(10).max(1),
+        vec![
+            "npm".to_string(),
+            "view".to_string(),
+            package.npm_package.to_string(),
+            "version".to_string(),
+        ],
+    )
 }
 
 pub(crate) fn update_command(package: HarnessPackage) -> Vec<String> {
-    vec![
-        "npm".to_string(),
-        "install".to_string(),
-        "-g".to_string(),
-        format!("{}@latest", package.npm_package),
-        "--no-fund".to_string(),
-        "--no-audit".to_string(),
-        "--loglevel=error".to_string(),
-    ]
+    bounded(
+        UPDATE_COMMAND_TIMEOUT.as_secs().saturating_sub(30),
+        vec![
+            "npm".to_string(),
+            "install".to_string(),
+            "-g".to_string(),
+            format!("{}@latest", package.npm_package),
+            "--no-fund".to_string(),
+            "--no-audit".to_string(),
+            "--loglevel=error".to_string(),
+        ],
+    )
 }
 
 /// First `major.minor.patch` (optionally with a pre-release suffix) in `text`.
@@ -120,16 +143,42 @@ mod tests {
     }
 
     #[test]
-    fn commands_are_fixed_argument_vectors() {
+    fn commands_are_fixed_argument_vectors_that_bound_themselves() {
         let package = harness_package("claude_cli").expect("package");
-        assert_eq!(version_command(package), ["claude", "--version"]);
+        assert_eq!(
+            version_command(package),
+            ["timeout", "-k", "10", "10", "claude", "--version"]
+        );
         assert_eq!(
             latest_version_command(package),
-            ["npm", "view", "@anthropic-ai/claude-code", "version"]
+            [
+                "timeout",
+                "-k",
+                "10",
+                "20",
+                "npm",
+                "view",
+                "@anthropic-ai/claude-code",
+                "version"
+            ]
         );
         let update = update_command(package);
-        assert_eq!(&update[..3], ["npm", "install", "-g"]);
-        assert_eq!(update[3], "@anthropic-ai/claude-code@latest");
+        assert_eq!(&update[..5], ["timeout", "-k", "10", "270", "npm"]);
+        assert_eq!(
+            &update[5..8],
+            ["install", "-g", "@anthropic-ai/claude-code@latest"]
+        );
+    }
+
+    #[test]
+    fn the_in_sandbox_limit_expires_before_the_client_side_one() {
+        // Otherwise the client could give up (and release the workspace)
+        // while the command is still running.
+        let package = harness_package("codex_cli").expect("package");
+        let limit = |command: Vec<String>| -> u64 { command[3].parse().expect("seconds") };
+        assert!(limit(update_command(package)) + 10 < UPDATE_COMMAND_TIMEOUT.as_secs());
+        assert!(limit(latest_version_command(package)) + 10 <= LATEST_COMMAND_TIMEOUT.as_secs());
+        assert!(limit(version_command(package)) + 10 <= VERSION_COMMAND_TIMEOUT.as_secs());
     }
 
     #[test]
