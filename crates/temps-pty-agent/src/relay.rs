@@ -46,6 +46,10 @@ pub enum RelayError {
 /// this only bounds an agent that has stopped responding.
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
+/// How long to wait for the agent to accept a connection. A socket whose
+/// listener stopped accepting must fail the relay or probe, not park it.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Which side of the relay ended first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelayEnd {
@@ -113,12 +117,7 @@ where
 /// Connect to the agent at `socket_path` and relay stdin/stdout to it.
 pub async fn run(socket_path: &str) -> Result<RelayEnd, RelayError> {
     let path = Path::new(socket_path);
-    let socket = UnixStream::connect(path)
-        .await
-        .map_err(|source| RelayError::Connect {
-            path: path.to_path_buf(),
-            source,
-        })?;
+    let socket = connect_within(path, CONNECT_TIMEOUT).await?;
     relay_streams(socket, tokio::io::stdin(), tokio::io::stdout())
         .await
         .map_err(|source| RelayError::Io {
@@ -133,14 +132,27 @@ pub async fn run(socket_path: &str) -> Result<RelayEnd, RelayError> {
 /// starting. Connecting is the only reliable test: a socket file left behind
 /// by a crashed agent still exists, but nothing answers on it.
 pub async fn probe(socket_path: &str) -> Result<(), RelayError> {
-    let path = Path::new(socket_path);
-    UnixStream::connect(path)
+    connect_within(Path::new(socket_path), CONNECT_TIMEOUT)
         .await
         .map(drop)
-        .map_err(|source| RelayError::Connect {
+}
+
+/// Connect to `path`, giving up after `deadline`.
+async fn connect_within(path: &Path, deadline: Duration) -> Result<UnixStream, RelayError> {
+    match tokio::time::timeout(deadline, UnixStream::connect(path)).await {
+        Ok(Ok(socket)) => Ok(socket),
+        Ok(Err(source)) => Err(RelayError::Connect {
             path: path.to_path_buf(),
             source,
-        })
+        }),
+        Err(_) => Err(RelayError::Connect {
+            path: path.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("no answer within {}s", deadline.as_secs()),
+            ),
+        }),
+    }
 }
 
 #[cfg(test)]
