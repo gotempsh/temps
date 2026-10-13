@@ -6,10 +6,13 @@ import {
   decodeFile,
   defaultFilePath,
   encodeText,
-  fileModeArgv,
+  filePropertiesArgv,
   filesUnavailableReason,
   formatFileMode,
-  parseFileMode,
+  parseFileProperties,
+  propertiesAfterSave,
+  saveRisks,
+  writeMode,
   isEditableFile,
   MAX_EDITABLE_BYTES,
   validateSandboxPath,
@@ -101,36 +104,109 @@ describe('isEditableFile', () => {
   })
 })
 
-describe('file mode helpers', () => {
-  test('stat is asked for the octal permission bits, after --', () => {
-    expect(fileModeArgv('/a b/run.sh')).toEqual([
-      'stat',
-      '-c',
-      '%a',
-      '--',
-      '/a b/run.sh',
-    ])
+describe('file property probe', () => {
+  test('follows symlinks (-L) and passes the path as $1, not in the script', () => {
+    const argv = filePropertiesArgv('/a b/run.sh; rm -rf /')
+    expect(argv.slice(0, 2)).toEqual(['sh', '-c'])
+    const script = argv[2]!
+    expect(script).toContain('stat -L -c')
+    expect(script).not.toContain('rm -rf')
+    expect(argv[argv.length - 1]).toBe('/a b/run.sh; rm -rf /')
   })
 
-  test('parses stat output into the numeric mode', () => {
-    expect(parseFileMode('755\n')).toBe(0o755)
-    expect(parseFileMode('0644')).toBe(0o644)
-    expect(parseFileMode('4755\n')).toBe(0o4755)
-    expect(parseFileMode('600')).toBe(0o600)
+  test('parses mode, owner and the symlink marker', () => {
+    expect(parseFileProperties('755 1000\n')).toEqual({
+      mode: 0o755,
+      uid: 1000,
+      symlink: false,
+    })
+    expect(parseFileProperties('600 0\nsymlink\n')).toEqual({
+      mode: 0o600,
+      uid: 0,
+      symlink: true,
+    })
+    expect(parseFileProperties('4755 1000')?.mode).toBe(0o4755)
   })
 
-  test('rejects anything that is not an octal mode', () => {
-    expect(parseFileMode('')).toBeNull()
-    expect(parseFileMode('stat: cannot stat')).toBeNull()
-    expect(parseFileMode('999')).toBeNull()
-    expect(parseFileMode('75')).toBeNull()
-    expect(parseFileMode('12345')).toBeNull()
+  test('rejects anything that is not the probe output', () => {
+    expect(parseFileProperties('')).toBeNull()
+    expect(parseFileProperties('stat: cannot stat')).toBeNull()
+    expect(parseFileProperties('755')).toBeNull()
+    expect(parseFileProperties('999 1000')).toBeNull()
+    expect(parseFileProperties('75 1000')).toBeNull()
   })
 
   test('formats a mode the way chmod users write it', () => {
     expect(formatFileMode(0o755)).toBe('0755')
     expect(formatFileMode(0o600)).toBe('0600')
-    expect(formatFileMode(0o4755)).toBe('4755')
     expect(formatFileMode(0)).toBe('0000')
+  })
+})
+
+describe('writeMode', () => {
+  test('writes back the rwx bits only', () => {
+    expect(writeMode({ mode: 0o755, uid: 1000, symlink: false })).toBe(0o755)
+    expect(writeMode({ mode: 0o4755, uid: 1000, symlink: false })).toBe(0o755)
+    expect(writeMode({ mode: 0o1777, uid: 0, symlink: false })).toBe(0o777)
+  })
+
+  test('falls back to 0644 when the mode is unknown', () => {
+    expect(writeMode(null)).toBe(0o644)
+  })
+})
+
+describe('saveRisks', () => {
+  const file = (
+    over: Partial<{ mode: number; uid: number; symlink: boolean }>
+  ) => ({
+    mode: 0o644,
+    uid: 1000,
+    symlink: false,
+    ...over,
+  })
+
+  test('a plain sandbox-user file inside the home is a faithful save', () => {
+    expect(
+      saveRisks('/home/temps/workspace/a.sh', file({ mode: 0o755 }))
+    ).toEqual([])
+  })
+
+  test('warns when permissions are unknown', () => {
+    expect(saveRisks('/home/temps/a', null)[0]).toContain('could not be read')
+  })
+
+  test('warns that a symlink is replaced by a regular file', () => {
+    const risks = saveRisks('/home/temps/link', file({ symlink: true }))
+    expect(risks).toHaveLength(1)
+    expect(risks[0]).toContain('symbolic link')
+  })
+
+  test('warns when a sandbox-user file outside the home would become root-owned', () => {
+    const risks = saveRisks('/srv/app/.env', file({ mode: 0o600 }))
+    expect(risks).toHaveLength(1)
+    expect(risks[0]).toContain('as root')
+    // /home/temps-other is not inside /home/temps.
+    expect(saveRisks('/home/temps-other/x', file({}))).toHaveLength(1)
+  })
+
+  test('a root-owned file outside the home is already root, so nothing changes', () => {
+    expect(saveRisks('/etc/motd', file({ uid: 0 }))).toEqual([])
+  })
+
+  test('warns that setuid/setgid/sticky bits are not kept', () => {
+    const risks = saveRisks('/home/temps/bin/tool', file({ mode: 0o4755 }))
+    expect(risks).toHaveLength(1)
+    expect(risks[0]).toContain('setuid')
+  })
+})
+
+describe('propertiesAfterSave', () => {
+  test('is sandbox-user owned inside the home and root outside it', () => {
+    expect(propertiesAfterSave('/home/temps/a', 0o600)).toEqual({
+      mode: 0o600,
+      uid: 1000,
+      symlink: false,
+    })
+    expect(propertiesAfterSave('/tmp/a', 0o600).uid).toBe(0)
   })
 })

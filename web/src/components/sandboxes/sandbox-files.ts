@@ -81,19 +81,107 @@ export function decodeFile(contentsB64: string): DecodedFile {
 export const DEFAULT_FILE_MODE = 0o644
 
 /**
- * Command that prints a file's permission bits in octal (`755`, `4755`).
- * `fs/stat` carries no mode, and `fs/write` resets a file to 0644 unless a
- * mode is sent, so the console reads it first and sends it back.
+ * Where the sandbox hands uploaded files to the sandbox user. Anywhere else
+ * `fs/write` creates them as `root:root` (see `runtime_user_owns_uploaded_file`
+ * in the sandbox provider), which the console cannot undo: the sandbox user
+ * cannot `chown` a root-owned file back.
  */
-export function fileModeArgv(path: string): string[] {
-  return ['stat', '-c', '%a', '--', path]
+export const SANDBOX_HOME = '/home/temps'
+const SANDBOX_USER_UID = 1000
+
+/** What the console needs to know about an existing file before rewriting it. */
+export interface FileProperties {
+  /** Permission bits including setuid/setgid/sticky, as `stat` reports them. */
+  mode: number
+  /** Numeric owner. */
+  uid: number
+  /** The path is a symbolic link (the mode and owner are the target's). */
+  symlink: boolean
 }
 
-/** Parse the output of {@link fileModeArgv}; `null` when it is not a mode. */
-export function parseFileMode(stdout: string): number | null {
-  const text = stdout.trim()
-  if (!/^[0-7]{3,4}$/.test(text)) return null
-  return parseInt(text, 8)
+/**
+ * Command that prints `<octal mode> <uid>` for a file, then `symlink` when the
+ * path is a link. `fs/stat` carries neither, and `fs/write` resets a file to
+ * 0644 unless a mode is sent, so the console reads them first.
+ *
+ * `-L` reports the link's target: without it a symlink's own mode is always
+ * 777, which would then be written onto the saved file. The path travels as
+ * `$1`, never inside the script text.
+ */
+export function filePropertiesArgv(path: string): string[] {
+  return [
+    'sh',
+    '-c',
+    'stat -L -c "%a %u" -- "$1" && if [ -L "$1" ]; then echo symlink; fi',
+    'sh',
+    path,
+  ]
+}
+
+/** Parse the output of {@link filePropertiesArgv}; `null` when it is not. */
+export function parseFileProperties(stdout: string): FileProperties | null {
+  const [first, second] = stdout.trim().split('\n')
+  const match = /^([0-7]{3,4}) (\d+)$/.exec((first ?? '').trim())
+  if (!match) return null
+  return {
+    mode: parseInt(match[1]!, 8),
+    uid: Number(match[2]),
+    symlink: (second ?? '').trim() === 'symlink',
+  }
+}
+
+/** The permission bits the console writes back: the rwx bits only. */
+export function writeMode(properties: FileProperties | null): number {
+  return properties ? properties.mode & 0o777 : DEFAULT_FILE_MODE
+}
+
+/** True when `path` is inside the sandbox user's home. */
+export function isUnderSandboxHome(path: string): boolean {
+  return path === SANDBOX_HOME || path.startsWith(`${SANDBOX_HOME}/`)
+}
+
+/**
+ * What saving would change besides the text, for an existing file. Empty means
+ * the save is faithful and needs no confirmation.
+ */
+export function saveRisks(
+  path: string,
+  properties: FileProperties | null
+): string[] {
+  if (!properties) {
+    return [
+      'Its permissions could not be read, so it will be reset to 0644 (rw-r--r--).',
+    ]
+  }
+  const risks: string[] = []
+  if (properties.symlink) {
+    risks.push(
+      'This path is a symbolic link. Saving replaces the link with a regular file holding your text; the file it pointed to is not changed.'
+    )
+  }
+  if (!isUnderSandboxHome(path) && properties.uid !== 0) {
+    risks.push(
+      `Outside ${SANDBOX_HOME} the sandbox writes files as root, so the sandbox user may lose access to it (this matters most for 0600 files).`
+    )
+  }
+  if ((properties.mode & ~0o777) !== 0) {
+    risks.push(
+      'Its setuid, setgid or sticky bit is not kept; only the rwx permissions are written back.'
+    )
+  }
+  return risks
+}
+
+/** Properties a file has right after the console wrote it (for the cache). */
+export function propertiesAfterSave(
+  path: string,
+  mode: number
+): FileProperties {
+  return {
+    mode,
+    uid: isUnderSandboxHome(path) ? SANDBOX_USER_UID : 0,
+    symlink: false,
+  }
 }
 
 /** `0o755` -> `"0755"`, as `ls`/`chmod` users write it. */
