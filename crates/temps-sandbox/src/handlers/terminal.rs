@@ -247,10 +247,47 @@ enum ServerEvent<'a> {
     },
 }
 
+/// Command for the default terminal tab: a login `bash` when the guest has
+/// one, a login `sh` otherwise.
+///
+/// Login so `~/.bashrc` / `/etc/profile` run and the AI CLIs are on PATH; the
+/// image seeds PATH there precisely because non-login shells miss them.
+///
+/// The fallback matters for the microVM backends, whose default image is
+/// `alpine:3.20` — no `bash` at all, so a hardcoded `/bin/bash -l` made the
+/// tab exit with "not found" the moment it opened. `command -v` is a shell
+/// builtin (available in busybox `ash` and `dash` alike), so the probe costs
+/// no extra process and never depends on `which` being installed.
 fn default_shell_cmd() -> String {
-    // Login shell so ~/.bashrc runs and the AI CLIs are on PATH. The image
-    // seeds PATH there precisely because non-login shells miss them.
-    "/bin/bash -l".to_string()
+    "if command -v bash >/dev/null 2>&1; then exec bash -l; else exec sh -l; fi".to_string()
+}
+
+/// Backend-specific remedy appended to a failed terminal attach.
+///
+/// The Docker backend's PTY agent ships *inside* the sandbox image, so a
+/// failure there points at the image. The microVM backends inject the agent
+/// from a binary staged on the host by their setup command, so the same
+/// hint would send the user hunting for an image problem that does not exist.
+fn terminal_unavailable_hint(backend: temps_agents::sandbox::SandboxBackend) -> &'static str {
+    use temps_agents::sandbox::SandboxBackend;
+    match backend {
+        SandboxBackend::Docker => {
+            "Interactive terminals need the temps PTY agent, which ships in the \
+             default sandbox image."
+        }
+        SandboxBackend::Firecracker => {
+            "Firecracker terminals need the guest PTY agent staged on the host \
+             (`temps firecracker setup --pty-agent-bin <path>`); sandboxes created \
+             before it was staged must be recreated."
+        }
+        SandboxBackend::Microsandbox => {
+            "microsandbox terminals need the guest PTY agent staged on the host \
+             (`temps microsandbox setup --pty-agent-bin <path>`) and a guest with `/bin/sh`."
+        }
+        SandboxBackend::Local => {
+            "Interactive terminals are not supported by the local sandbox backend."
+        }
+    }
 }
 
 /// Wrap the requested program so the PTY is in a sane line discipline before
@@ -309,7 +346,8 @@ fn wrap_with_sane_termios(cmd: &str) -> String {
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Sandbox not found"),
-        (status = 409, description = "Sandbox is not in a state that can be attached to"),
+        (status = 409, description = "Terminal unavailable: the sandbox is not running, or its backend's guest terminal agent is missing (the problem detail names the fix)"),
+        (status = 429, description = "Too many concurrent terminals for this instance or account"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -388,16 +426,17 @@ pub async fn terminal(
             if let temps_agents::error::AgentError::SandboxUnsupportedOnNode { .. } = e {
                 return Problem::from(crate::error::from_agent_error(&id, e));
             }
-            // Most likely cause on a real deployment: a sandbox created from
-            // a custom image that doesn't carry the PTY agent. Say so, rather
-            // than leaving the user with a terminal that never echoes.
+            // Say what is actually missing for *this* backend, rather than
+            // leaving the user with a bare 409 or a terminal that never
+            // echoes. The provider's own message already carries the
+            // specific cause; the hint adds where to fix it.
             problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Terminal Unavailable")
                 .with_detail(format!(
-                    "Could not attach a terminal to sandbox {}: {}. \
-                     Interactive terminals need the temps PTY agent, which \
-                     ships in the default sandbox image.",
-                    id, e
+                    "Could not attach a terminal to sandbox {}: {}. {}",
+                    id,
+                    e,
+                    terminal_unavailable_hint(handle.backend)
                 ))
         })?;
 
@@ -840,7 +879,45 @@ mod tests {
         // inside a shell that does not work.
         let wrapped = wrap_with_sane_termios(&default_shell_cmd());
         assert!(wrapped.starts_with("stty sane"), "{wrapped}");
-        assert!(wrapped.contains("'/bin/bash -l'"), "{wrapped}");
+        assert!(wrapped.contains("exec bash -l"), "{wrapped}");
+        assert!(wrapped.contains("exec sh -l"), "{wrapped}");
+        // The default has no single quotes, so wrapping it leaves the inner
+        // command in one piece for the nested `sh -c`.
+        assert_eq!(wrapped.matches('\'').count(), 2, "{wrapped}");
+    }
+
+    /// Run `default_shell_cmd()` under `/bin/sh -c` with `PATH` restricted to
+    /// a directory holding only the named stand-in programs, each of which
+    /// prints `<name>:<args>` instead of starting a shell.
+    fn run_default_shell_with(programs: &[&str]) -> String {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        for name in programs {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\necho {name}:\"$@\"\n")).expect("write");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(default_shell_cmd())
+            .env_clear()
+            .env("PATH", dir.path())
+            .output()
+            .expect("run /bin/sh");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn default_shell_prefers_bash_when_the_guest_has_it() {
+        assert_eq!(run_default_shell_with(&["bash", "sh"]), "bash:-l");
+    }
+
+    #[test]
+    fn default_shell_falls_back_to_sh_on_a_guest_without_bash() {
+        // The alpine microVM images: a tab that ran `bash -l` died with
+        // "not found" before the user saw a prompt.
+        assert_eq!(run_default_shell_with(&["sh"]), "sh:-l");
     }
 
     #[test]
@@ -892,6 +969,31 @@ mod tests {
             wrap_with_sane_termios("sh").contains("2>/dev/null"),
             "stty failure must be swallowed"
         );
+    }
+
+    #[test]
+    fn terminal_hints_point_each_backend_at_its_own_fix() {
+        use temps_agents::sandbox::SandboxBackend;
+        let docker = terminal_unavailable_hint(SandboxBackend::Docker);
+        assert!(docker.contains("sandbox image"), "{docker}");
+
+        // The microVM backends have no image-borne agent; sending their
+        // users to the sandbox image would be a dead end.
+        let firecracker = terminal_unavailable_hint(SandboxBackend::Firecracker);
+        assert!(
+            firecracker.contains("temps firecracker setup"),
+            "{firecracker}"
+        );
+        assert!(!firecracker.contains("sandbox image"), "{firecracker}");
+
+        let microsandbox = terminal_unavailable_hint(SandboxBackend::Microsandbox);
+        assert!(
+            microsandbox.contains("temps microsandbox setup"),
+            "{microsandbox}"
+        );
+        assert!(!microsandbox.contains("sandbox image"), "{microsandbox}");
+
+        assert!(terminal_unavailable_hint(SandboxBackend::Local).contains("not supported"));
     }
 
     #[test]
